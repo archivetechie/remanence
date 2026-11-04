@@ -1217,8 +1217,10 @@ mod tests {
     }
 
     fn locate_timeout() -> ParityError {
-        ParityError::TapeIo(remanence_library::TapeIoError::Transport(
-            remanence_library::scsi::ScsiError::InvalidInput("LOCATE timed out"),
+        ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::Transport(
+                remanence_library::scsi::ScsiError::InvalidInput("LOCATE timed out"),
+            ),
         ))
     }
 
@@ -1230,11 +1232,13 @@ mod tests {
         sense[2] = 0x08;
         sense[7] = 10;
         sense[13] = 0x05;
-        ParityError::TapeIo(remanence_library::TapeIoError::CheckCondition(
-            remanence_library::scsi::ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: 0,
-            },
+        ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ),
         ))
     }
 

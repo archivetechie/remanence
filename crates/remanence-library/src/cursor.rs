@@ -6,6 +6,18 @@ use crate::{TapeIoError, TapePosition};
 #[doc(hidden)]
 pub trait CursorSource {
     type Error: From<TapeIoError>;
+    /// Finish a cursor adapter fact in the source owner's context.
+    fn finish_cursor_error(&mut self, kind: crate::TapeIoErrorKind) -> TapeIoError {
+        TapeIoError::new_with_context(
+            kind,
+            crate::outcome::CommandClass::Position,
+            crate::outcome::OperationContext {
+                phase: crate::outcome::Phase::Admission,
+                ..Default::default()
+            },
+        )
+    }
+
     fn identity_generation(&self) -> u64 {
         0
     }
@@ -39,30 +51,40 @@ pub fn prove_cursor<S: CursorSource + ?Sized>(
     block_size: u32,
 ) -> Result<CursorProof, S::Error> {
     let generation = source.identity_generation();
-    let predecessor = expected
-        .lba
-        .checked_sub(1)
-        .ok_or_else(|| TapeIoError::OperationFailed("origin requires bootstrap proof".into()))?;
+    let predecessor = expected.lba.checked_sub(1).ok_or_else(|| {
+        crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+            "origin requires bootstrap proof".into(),
+        ))
+    })?;
     if block_size == 0 || block_size > crate::scsi::read_write::MAX_TRANSFER_LEN {
-        return Err(TapeIoError::OperationFailed("invalid cursor proof block size".into()).into());
+        return Err(
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                "invalid cursor proof block size".into(),
+            ))
+            .into(),
+        );
     }
     source.locate(expected.partition, predecessor)?;
     if !source.read_filemark(&mut vec![0; block_size as usize])? {
-        return Err(TapeIoError::CursorPredecessorNotFilemark.into());
+        return Err(source
+            .finish_cursor_error(crate::TapeIoErrorKind::CursorPredecessorNotFilemark)
+            .into());
     }
     let actual = source.position()?;
     if actual.partition != expected.partition || actual.lba != expected.lba {
-        return Err(TapeIoError::OperationFailed(format!(
-            "commit cursor position mismatch: expected {expected:?}, got {actual:?}"
-        ))
-        .into());
+        return Err(source
+            .finish_cursor_error(crate::TapeIoErrorKind::OperationFailed(format!(
+                "commit cursor position mismatch: expected {expected:?}, got {actual:?}"
+            )))
+            .into());
     }
     if source.identity_generation() != generation {
-        return Err(TapeIoError::IdentityInvalidated {
-            proved: generation,
-            current: source.identity_generation(),
-        }
-        .into());
+        return Err(source
+            .finish_cursor_error(crate::TapeIoErrorKind::IdentityInvalidated {
+                proved: generation,
+                current: source.identity_generation(),
+            })
+            .into());
     }
     Ok(CursorProof {
         position: actual,
@@ -72,23 +94,35 @@ pub fn prove_cursor<S: CursorSource + ?Sized>(
 
 impl CursorSource for crate::DriveHandle {
     type Error = TapeIoError;
+    fn finish_cursor_error(&mut self, kind: crate::TapeIoErrorKind) -> TapeIoError {
+        self.finish_adapter_error(kind, crate::outcome::CommandClass::Position)
+    }
+
     fn identity_generation(&self) -> u64 {
         self.identity_generation()
     }
     fn locate(&mut self, partition: u32, lba: u64) -> Result<(), TapeIoError> {
         let actual = self.locate(lba)?;
         if actual.partition != partition || actual.lba != lba {
-            return Err(TapeIoError::OperationFailed(
-                "cursor predecessor locate mismatch".into(),
-            ));
+            return Err(
+                self.finish_cursor_error(crate::TapeIoErrorKind::OperationFailed(
+                    "cursor predecessor locate mismatch".into(),
+                )),
+            );
         }
         Ok(())
     }
     fn read_filemark(&mut self, block: &mut [u8]) -> Result<bool, TapeIoError> {
         match self.read_block(block) {
-            Err(TapeIoError::FilemarkEncountered) => Ok(true),
-            Err(TapeIoError::ReadBufferTooSmall { .. }) => {
-                Err(TapeIoError::CursorPredecessorNotFilemark)
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::FilemarkEncountered,
+                ..
+            }) => Ok(true),
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::ReadBufferTooSmall { .. },
+                ..
+            }) => {
+                Err(self.finish_cursor_error(crate::TapeIoErrorKind::CursorPredecessorNotFilemark))
             }
             Ok(_) => Ok(false),
             Err(error) => Err(error),

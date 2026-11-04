@@ -997,7 +997,7 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use remanence_library::{scsi::ScsiError, TapeIoError};
+    use remanence_library::scsi::ScsiError;
 
     use crate::raw::SpaceFilemarksOutcome;
     use crate::tape_index_replica::{
@@ -1196,13 +1196,15 @@ mod tests {
 
     fn injected_read_error(kind: ReadFaultKind) -> ParityError {
         let error = match kind {
-            ReadFaultKind::Transport => TapeIoError::Transport(ScsiError::TransportError {
-                status: 0,
-                host_status: 0,
-                driver_status: 0x06,
-                info: 1,
-                sense: Vec::new(),
-            }),
+            ReadFaultKind::Transport => remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::Transport(ScsiError::TransportError {
+                    status: 0,
+                    host_status: 0,
+                    driver_status: 0x06,
+                    info: 1,
+                    sense: Vec::new(),
+                }),
+            ),
             ReadFaultKind::Medium | ReadFaultKind::Hardware => {
                 let mut sense = vec![0u8; 18];
                 sense[0] = 0x70;
@@ -1213,15 +1215,19 @@ mod tests {
                 };
                 sense[7] = 10;
                 sense[12] = 0x11;
-                TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                    sense,
-                    bytes_transferred: 0,
-                })
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    }),
+                )
             }
-            ReadFaultKind::BufferTooSmall => TapeIoError::ReadBufferTooSmall {
-                actual: BLOCK_SIZE.saturating_add(1),
-                provided: BLOCK_SIZE,
-            },
+            ReadFaultKind::BufferTooSmall => remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: BLOCK_SIZE.saturating_add(1),
+                    provided: BLOCK_SIZE,
+                },
+            ),
         };
         ParityError::TapeIo(error)
     }
@@ -1233,8 +1239,10 @@ mod tests {
 
         fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
             if self.locate_fault_lba == Some(hint.lba) {
-                return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-                    "injected locate failure".to_string(),
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "injected locate failure".to_string(),
+                    ),
                 )));
             }
             if let Some((requested_lba, observed)) = self.locate_mismatch {
@@ -1307,6 +1315,22 @@ mod tests {
     }
 
     impl RawTapeSink for MemorySink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
             self.position = hint;
             self.overwrite_locates += 1;

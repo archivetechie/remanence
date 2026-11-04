@@ -978,6 +978,26 @@ fn scan_with_builders(
                     add(&format!("constructor::{}", token.text));
                 }
             }
+            "sense-decision" => {
+                if !token.literal
+                    && matches!(
+                        token.text.as_str(),
+                        "decode_sense"
+                            | "decode_usable_sense"
+                            | "decode_scsi_sense"
+                            | "decode_sense_key_asc"
+                            | "classify"
+                            | "from_scsi"
+                            | "from_sense"
+                    )
+                    && (t.get(i + 1).is_some_and(|x| x.text == "(")
+                        || (name != "<module>"
+                            && sequence(&t[i.saturating_sub(2)..i], &[":", ":"])))
+                    && t.get(i.wrapping_sub(1)).is_none_or(|x| x.text != "fn")
+                {
+                    add(&token.text);
+                }
+            }
             "text-decision" => {
                 if path.starts_with("crates/remanence-cli/src/dev/") {
                     continue;
@@ -1939,4 +1959,32 @@ fn pool_write_replay_reason_accounts_for_committed_state() {
         .expect("pool-write census row");
     assert!(row.contains("enum-as-text"));
     assert!(row.contains("copy.status == \"committed\""));
+}
+
+/// All production sense decisions stay within the decoder and completion evidence producers.
+#[test]
+fn b3b_sense_decision_census() {
+    census("sense-decision");
+}
+
+/// Finishing-site checks include indirect normalizer references, while excluding test modules.
+#[test]
+fn b3b_finishing_site_scanner_detects_consumer_reclassification() {
+    let source = r#"
+        fn renderer(error: &Error) {
+            let outcome = classify(input);
+            let evidence = CompletionEvidence::from_scsi(error);
+            optional.map(CompletionEvidence::from_sense);
+            decode_usable_sense(bytes);
+        }
+        #[cfg(test)] mod tests { fn fixture() { classify(input); } }
+    "#;
+    let found = scan("crates/example/src/lib.rs", source, "sense-decision");
+    assert_eq!(found.len(), 4, "{found:?}");
+    for name in ["classify", "from_scsi", "from_sense", "decode_usable_sense"] {
+        assert_eq!(
+            found.get(&format!("crates/example/src/lib.rs::renderer::{name}")),
+            Some(&1)
+        );
+    }
 }

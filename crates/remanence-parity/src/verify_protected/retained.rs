@@ -7,10 +7,13 @@ use super::*;
 use crate::raw::{
     read_records_default, RawReadBatch, RawReadOutcome, ReadRun, SpaceFilemarksOutcome,
 };
-use remanence_library::{ScsiError, TapeIoError};
 use std::collections::BTreeMap;
 
 const METADATA_BUDGET: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "b3b_retained_tests.rs"]
+mod b3b_retained_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -31,11 +34,10 @@ pub(super) fn with_metadata_budget<T>(budget: usize, run: impl FnOnce() -> T) ->
 }
 
 /// Raw classifications retain their reported positions and measured lengths.
-/// Medium sense is copied because the enclosing I/O error is not cloneable.
+/// Copyable read failures retain their complete original classification.
 enum Record {
     Read(RawReadOutcome, Box<[u8]>),
-    Medium { sense: Vec<u8>, transferred: u32 },
-    TooSmall { actual: u32, provided: u32 },
+    Failure(remanence_library::TapeIoError),
 }
 
 struct RetainedRecord {
@@ -50,26 +52,20 @@ impl RetainedRecord {
                 let copied = bytes.len().min(buf.len());
                 buf[..copied].copy_from_slice(&bytes[..copied]);
                 if bytes.len() > buf.len() {
-                    return Err(TapeIoError::ReadBufferTooSmall {
-                        actual: bytes.len() as u32,
-                        provided: buf.len() as u32,
-                    }
+                    return Err(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: bytes.len() as u32,
+                            provided: buf.len() as u32,
+                        },
+                    )
                     .into());
                 }
                 Ok(*outcome)
             }
-            Record::Medium { sense, transferred } => {
-                Err(TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                    sense: sense.clone(),
-                    bytes_transferred: *transferred,
-                })
-                .into())
-            }
-            Record::TooSmall { actual, provided } => Err(TapeIoError::ReadBufferTooSmall {
-                actual: *actual,
-                provided: *provided,
-            }
-            .into()),
+            Record::Failure(error) => Err(error
+                .clone_read_failure()
+                .expect("retention accepts only copyable read failures")
+                .into()),
         }
     }
 }
@@ -374,19 +370,18 @@ impl RawTapeSource for RetainedSource<'_> {
                     Some(Record::Read(*outcome, bytes.into()))
                 }
                 Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(error) => {
-                    let (sense, transferred) =
-                        error.check_condition_transfer().expect("medium sense");
-                    Some(Record::Medium {
-                        sense: sense.to_vec(),
-                        transferred,
-                    })
+                    Some(Record::Failure(
+                        error.clone_read_failure().expect("medium sense"),
+                    ))
                 }
-                Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { actual, provided })) => {
-                    Some(Record::TooSmall {
-                        actual: *actual,
-                        provided: *provided,
-                    })
-                }
+                Err(ParityError::TapeIo(
+                    error @ remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { .. },
+                        ..
+                    },
+                )) => Some(Record::Failure(
+                    error.clone_read_failure().expect("read length"),
+                )),
                 _ => None,
             };
             if let Some(record) = record {
@@ -449,6 +444,7 @@ impl RawTapeSource for RetainedSource<'_> {
 mod tests {
     use super::*;
     use crate::filemark_map::FilemarkMap;
+    use remanence_library::ScsiError;
 
     #[derive(Clone, Copy)]
     enum ReadFault {
@@ -491,14 +487,20 @@ mod tests {
             self.cursor.lba += 1;
             if let Some(fault) = self.fault {
                 return Err(match fault {
-                    ReadFault::Medium => TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                        sense: vec![0x72, 3, 0x11, 0],
-                        bytes_transferred: 0,
-                    }),
-                    ReadFault::TooSmall => TapeIoError::ReadBufferTooSmall {
-                        actual: buf.len() as u32 + 1,
-                        provided: buf.len() as u32,
-                    },
+                    ReadFault::Medium => remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::CheckCondition(
+                            ScsiError::CheckCondition {
+                                sense: vec![0x72, 3, 0x11, 0],
+                                bytes_transferred: 0,
+                            },
+                        ),
+                    ),
+                    ReadFault::TooSmall => remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: buf.len() as u32 + 1,
+                            provided: buf.len() as u32,
+                        },
+                    ),
                 }
                 .into());
             }

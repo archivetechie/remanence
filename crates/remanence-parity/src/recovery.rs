@@ -984,8 +984,14 @@ impl DirectoryCache {
         *self = match read_final_sidecar_directory(source, &scoped_map.map, tape_uuid, block_size) {
             Ok(Some(directory)) => Self::Loaded(directory),
             Ok(None) | Err(ParityError::FilemarkMapDigestMismatch { .. }) => Self::Absent,
-            Err(ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)) => {
-                return Err(remanence_library::TapeIoError::Cancelled.into());
+            Err(ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::Cancelled,
+                ..
+            })) => {
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::Cancelled,
+                )
+                .into());
             }
             Err(_) => Self::Failed,
         };
@@ -1979,23 +1985,23 @@ mod tests {
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
             self.read_lbas.push(self.cursor);
             if self.transport_fault_lbas.contains(&self.cursor) {
-                return Err(ParityError::TapeIo(
-                    remanence_library::TapeIoError::Transport(
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::Transport(
                         remanence_library::scsi::ScsiError::InvalidInput("test transport fault"),
                     ),
-                ));
+                )));
             }
             if self.unreadable_lbas.contains(&self.cursor) {
                 // A current medium error (MEDIUM ERROR, 03/11/00), as a drive
                 // reports an unreadable record.
-                return Err(ParityError::TapeIo(
-                    remanence_library::TapeIoError::CheckCondition(
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
                         remanence_library::scsi::ScsiError::CheckCondition {
                             sense: vec![0x72, 0x03, 0x11, 0x00],
                             bytes_transferred: 0,
                         },
                     ),
-                ));
+                )));
             }
             let Some(record) = self.records.get(self.cursor) else {
                 return Ok(RawReadOutcome::EndOfData {
@@ -2007,12 +2013,12 @@ mod tests {
                 // a drive reports it (ILI with a negative residual).
                 Record::Block(block) if block.len() > buf.len() => {
                     self.cursor += 1;
-                    Err(ParityError::TapeIo(
-                        remanence_library::TapeIoError::ReadBufferTooSmall {
+                    Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
                             actual: block.len() as u32,
                             provided: buf.len() as u32,
                         },
-                    ))
+                    )))
                 }
                 Record::Block(block) => {
                     let bytes = block.len();
@@ -2062,6 +2068,22 @@ mod tests {
     }
 
     impl RawTapeSink for AppendRawVecSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             if self.cursor != self.records.len() {
                 return Err(ParityError::Invariant(

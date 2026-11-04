@@ -2,9 +2,7 @@
 
 use super::*;
 use crate::error::{AuditOp, AuditOutcome, RescanError};
-use crate::handle::tape_io::{
-    MediaFamily, MediaReadiness, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
-};
+use crate::handle::tape_io::{MediaFamily, MediaReadinessWaitEvent, MediaReadinessWaitOptions};
 use crate::model::{DriveBay, ElementLayout, IePort, InstalledDrive, Slot};
 use crate::transport::{FixtureTransport, RecordingLog, RecordingTransport, TransferOutcome};
 use crate::StaticAllowlist;
@@ -566,7 +564,13 @@ fn move_medium_preflight_refused_emits_refused_no_cdb() {
     let err = handle
         .move_medium(0x0100, 0x0400, &policy)
         .expect_err("move should refuse");
-    assert!(matches!(err, MoveError::SourceEmpty { addr: 0x0100 }));
+    assert!(matches!(
+        err,
+        crate::MoveError {
+            kind: crate::MoveErrorKind::SourceEmpty { addr: 0x0100 },
+            ..
+        }
+    ));
 
     // Snapshot unchanged.
     assert_eq!(handle.library(), &snapshot_before);
@@ -631,7 +635,10 @@ fn move_medium_refused_when_drive_is_derived_and_policy_disallows() {
         .move_medium(0x0400, 0x0100, &strict_for_move)
         .expect_err("derived bay + non-permissive policy must refuse");
     match err {
-        MoveError::DerivedDriveBay { addr, serial } => {
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DerivedDriveBay { addr, serial },
+            ..
+        } => {
             // The drive bay address (0x0100), not the slot (0x0400).
             // The derived bay is the *destination* in this move.
             assert_eq!(addr, 0x0100);
@@ -692,7 +699,10 @@ fn move_medium_derived_source_reports_bay_addr_not_dest() {
         .move_medium(0x0100, 0x0400, &strict_for_move)
         .expect_err("derived source + non-permissive policy must refuse");
     match err {
-        MoveError::DerivedDriveBay { addr, serial } => {
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DerivedDriveBay { addr, serial },
+            ..
+        } => {
             assert_eq!(addr, 0x0100, "bay address, not destination slot");
             assert_eq!(serial, "DRV_A");
         }
@@ -1698,10 +1708,14 @@ fn drive_handle_load_transport_error_marks_parent_dirty() {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         let err = drive.load().expect_err("SSC LOAD must fail at transport");
         match err {
-            DriveOpError::ScsiError(ScsiError::TransportError {
-                driver_status: 0x06,
+            crate::DriveOpError {
+                kind:
+                    crate::DriveOpErrorKind::ScsiError(ScsiError::TransportError {
+                        driver_status: 0x06,
+                        ..
+                    }),
                 ..
-            }) => {}
+            } => {}
             other => panic!("expected DriveOpError::ScsiError(TransportError), got {other:?}"),
         }
     }
@@ -1853,7 +1867,13 @@ fn drive_handle_rewind_transport_error_marks_parent_dirty() {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         let err = drive.rewind().expect_err("REWIND must fail at transport");
         assert!(
-            matches!(err, TapeIoError::Transport(_)),
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::Transport(_),
+                    ..
+                }
+            ),
             "expected Transport variant, got {err:?}"
         );
     }
@@ -1997,7 +2017,13 @@ fn drive_handle_position_maps_no_medium_from_sense() {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         let err = drive.position().expect_err("READ POSITION must fail");
         assert!(
-            matches!(err, TapeIoError::NoMedium),
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::NoMedium,
+                    ..
+                }
+            ),
             "expected NoMedium, got {err:?}"
         );
     }
@@ -2231,7 +2257,10 @@ fn drive_handle_space_rejects_sequential_filemarks() {
             .space(5, SpaceKind::SequentialFilemarks)
             .expect_err("SequentialFilemarks must be refused");
         match err {
-            TapeIoError::InvalidRequest(ScsiError::InvalidInput(msg)) => {
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(msg)),
+                ..
+            } => {
                 assert!(
                     msg.contains("SequentialFilemarks"),
                     "error mentions the kind: {msg}"
@@ -2298,7 +2327,13 @@ fn drive_handle_locate_transport_error_marks_parent_dirty() {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         let err = drive.locate(42).expect_err("LOCATE must fail at transport");
         assert!(
-            matches!(err, TapeIoError::Transport(_)),
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::Transport(_),
+                    ..
+                }
+            ),
             "expected Transport, got {err:?}"
         );
     }
@@ -2544,7 +2579,10 @@ fn drive_handle_read_block_buffer_too_small_via_ili_negative_information() {
         drive.read_block(&mut buf).expect_err("buffer too small")
     };
     match err {
-        TapeIoError::ReadBufferTooSmall { actual, provided } => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::ReadBufferTooSmall { actual, provided },
+            ..
+        } => {
             assert_eq!(actual, 65_536);
             assert_eq!(provided, 1024);
         }
@@ -2612,7 +2650,13 @@ fn drive_handle_read_block_filemark_is_structured_boundary() {
         drive.read_block(&mut buf).expect_err("filemark boundary")
     };
 
-    assert!(matches!(err, TapeIoError::FilemarkEncountered));
+    assert!(matches!(
+        err,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::FilemarkEncountered,
+            ..
+        }
+    ));
     assert!(
         !handle.is_dirty(),
         "READ filemark is a known boundary, not completion unknown"
@@ -2681,7 +2725,10 @@ fn drive_handle_rejects_client_side_cdb_bounds_before_dispatch() {
 
 fn assert_invalid_request_contains(err: TapeIoError, needle: &str) {
     match err {
-        TapeIoError::InvalidRequest(ScsiError::InvalidInput(msg)) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(msg)),
+            ..
+        } => {
             assert!(msg.contains(needle), "{msg}");
         }
         other => panic!("expected InvalidRequest containing {needle:?}, got {other:?}"),
@@ -3072,7 +3119,10 @@ fn pipelined_good_accounting_survives_tripwire_mismatch() {
         .write_block_batch_pipelined(&[1; 4], 4, &cdb)
         .expect_err("tripwire mismatch follows a GOOD data completion");
     match err {
-        TapeIoError::GoodWriteTripwire { outcome, cause } => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::GoodWriteTripwire { outcome, cause },
+            ..
+        } => {
             assert_eq!(outcome.records_written, 1);
             assert!(cause.to_string().contains("position drift"));
         }
@@ -3113,13 +3163,16 @@ fn fixed_batch_good_short_residual_is_uncommittable_before_cursor_advance() {
 
         assert!(matches!(
             error,
-            TapeIoError::PartialBatchUncommittable {
-                requested_records: 4,
-                written_records: 3,
-                requested_bytes: 16,
-                written_bytes: 15,
-                end_of_medium: false,
-                sense: None,
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::PartialBatchUncommittable {
+                    requested_records: 4,
+                    written_records: 3,
+                    requested_bytes: 16,
+                    written_bytes: 15,
+                    end_of_medium: false,
+                    sense: None,
+                },
+                ..
             }
         ));
         assert!(
@@ -3194,13 +3247,17 @@ fn unpositioned_write_rejects_nonexact_bytes_before_success_audit() {
             .expect_err("nonexact unpositioned completion must fail");
 
         match error {
-            TapeIoError::PartialBatchUncommittable {
-                requested_records,
-                written_records,
-                requested_bytes,
-                written_bytes,
-                end_of_medium,
-                sense,
+            crate::TapeIoError {
+                kind:
+                    crate::TapeIoErrorKind::PartialBatchUncommittable {
+                        requested_records,
+                        written_records,
+                        requested_bytes,
+                        written_bytes,
+                        end_of_medium,
+                        sense,
+                    },
+                ..
             } => {
                 assert_eq!(requested_records, 1);
                 assert_eq!(written_records, u32::from(reported_bytes >= 16));
@@ -3327,7 +3384,10 @@ fn recovered_error_matrix_preserves_current_success_and_rejects_terminal_or_defe
         );
         assert!(matches!(
             drive.write_block_batch_pipelined(&[3; 16], 4, &cdb),
-            Err(TapeIoError::PartialBatchUncommittable { .. })
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::PartialBatchUncommittable { .. },
+                ..
+            })
         ));
     }
 
@@ -3342,7 +3402,10 @@ fn recovered_error_matrix_preserves_current_success_and_rejects_terminal_or_defe
         );
         assert!(matches!(
             drive.write_block_batch_pipelined(&[4; 16], 4, &cdb),
-            Err(TapeIoError::Transport(_))
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::Transport(_),
+                ..
+            })
         ));
     }
 }
@@ -3369,7 +3432,10 @@ fn reset_unit_attention_same_handle_recovers_via_mode_and_position_reverificatio
         .expect("GOOD batch before reset");
     assert!(matches!(
         drive.write_block_batch_pipelined(&[2; 4], 4, &cdb),
-        Err(TapeIoError::StateInvalidatingReset(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::StateInvalidatingReset(_),
+            ..
+        })
     ));
     assert!(drive.expected_position.is_none());
     assert_eq!(drive.validated_fixed_block_size, None);
@@ -3424,7 +3490,10 @@ fn check_removal_reset_recovery(prevent: bool) {
         };
         assert!(matches!(
             result,
-            Err(DriveOpError::ScsiError(ScsiError::CheckCondition { .. }))
+            Err(crate::DriveOpError {
+                kind: crate::DriveOpErrorKind::ScsiError(ScsiError::CheckCondition { .. }),
+                ..
+            })
         ));
         assert!(drive.identity_generation() > generation);
         assert!(!drive.position_known);
@@ -3441,11 +3510,17 @@ fn check_removal_reset_recovery(prevent: bool) {
             let before = log.lock().unwrap().len();
             assert!(matches!(
                 drive.read_block_batch(&mut [0; 4], 4, 1, 1),
-                Err(TapeIoError::InvalidRequest(_))
+                Err(crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::InvalidRequest(_),
+                    ..
+                })
             ));
             assert!(matches!(
                 drive.write_block_batch_pipelined(&[0; 4], 4, &cdb),
-                Err(TapeIoError::InvalidRequest(_))
+                Err(crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::InvalidRequest(_),
+                    ..
+                })
             ));
             assert_eq!(
                 log.lock().unwrap().len(),
@@ -3525,12 +3600,18 @@ fn completion_unknown_read_requires_explicit_position_proof_before_reuse() {
     let mut buffer = [0u8; 4];
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 1, 1),
-        Err(TapeIoError::Transport(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::Transport(_),
+            ..
+        })
     ));
     assert_eq!(drive.mode_reverification_required, None);
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 1, 1),
-        Err(TapeIoError::InvalidRequest(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(_),
+            ..
+        })
     ));
     drive.position().expect("explicit READ POSITION proof");
     let outcome = drive
@@ -3563,7 +3644,10 @@ fn fixed_read_ili_withholds_data_invalidates_cursor_and_blocks_cached_reuse() {
     assert!(!drive.position_known);
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::InvalidRequest(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(_),
+            ..
+        })
     ));
     assert_eq!(
         commands
@@ -3603,7 +3687,10 @@ fn fixed_read_ili_before_any_record_also_invalidates_and_stops() {
     assert!(drive.expected_position.is_none());
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::InvalidRequest(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(_),
+            ..
+        })
     ));
     assert_eq!(
         commands
@@ -3635,7 +3722,10 @@ fn recovered_fixed_read_with_valid_nonzero_residual_is_completion_unknown() {
 
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::Transport(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::Transport(_),
+            ..
+        })
     ));
     assert!(!audit.lock().expect("audit").iter().any(|event| {
         matches!(event, CapturedEvent::FinishedRecovered { sense, .. } if sense == &recovered)
@@ -3665,7 +3755,10 @@ fn deferred_recovered_fixed_read_is_always_completion_unknown() {
         let mut buffer = [0xa5; 16];
         assert!(matches!(
             drive.read_block_batch(&mut buffer, 4, 4, 4),
-            Err(TapeIoError::Transport(_))
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::Transport(_),
+                ..
+            })
         ));
         assert!(drive.expected_position.is_none());
     }
@@ -3691,7 +3784,10 @@ fn fixed_read_filemark_residual_cannot_claim_bytes_transport_did_not_move() {
 
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::Transport(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::Transport(_),
+            ..
+        })
     ));
 }
 
@@ -3715,7 +3811,10 @@ fn fixed_read_recovered_full_cannot_claim_bytes_transport_did_not_move() {
 
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::Transport(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::Transport(_),
+            ..
+        })
     ));
 }
 
@@ -3745,7 +3844,13 @@ fn write_residual_claim_is_completion_unknown(
     } else {
         drive.write_block_batch(&[0x5a; 16], 4)
     };
-    matches!(result, Err(TapeIoError::Transport(_)))
+    matches!(
+        result,
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::Transport(_),
+            ..
+        })
+    )
 }
 
 #[test]
@@ -3915,10 +4020,10 @@ fn fixed_read_good_requires_exact_transfer_before_cursor_advance() {
             assert!(error.is_completion_unknown());
             assert!(matches!(
                 error,
-                TapeIoError::GoodReadLengthMismatch {
+                crate::TapeIoError { kind: crate::TapeIoErrorKind::GoodReadLengthMismatch {
                     requested_bytes: 16,
                     bytes_transferred: actual,
-                } if actual == bytes_transferred
+                }, .. } if actual == bytes_transferred
             ));
             assert!(drive.expected_position.is_none());
             assert!(!drive.position_known);
@@ -3937,7 +4042,10 @@ fn fixed_read_good_requires_exact_transfer_before_cursor_advance() {
             ));
             assert!(matches!(
                 drive.read_block_batch(&mut [0; 16], 4, 4, 4),
-                Err(TapeIoError::InvalidRequest(_))
+                Err(crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::InvalidRequest(_),
+                    ..
+                })
             ));
         }
         assert_eq!(
@@ -4025,12 +4133,12 @@ fn eom_write_with_failed_position_arbitration_preserves_write_audit_and_classifi
         .expect_err("EOM WRITE and arbitration RP both fail");
     assert!(matches!(
         error,
-        TapeIoError::WriteFailureWithPositionError { ref write_error, ref position_error }
-            if matches!(write_error.as_ref(), TapeIoError::PartialBatchUncommittable {
+        crate::TapeIoError { kind: crate::TapeIoErrorKind::WriteFailureWithPositionError { ref write_error, ref position_error }, .. }
+            if matches!(write_error.as_ref(), crate::TapeIoError { kind: crate::TapeIoErrorKind::PartialBatchUncommittable {
                 requested_records: 4,
                 written_records: 2,
                 ..
-            }) && position_error.to_string().contains("arbitration READ POSITION failed")
+            }, .. }) && position_error.to_string().contains("arbitration READ POSITION failed")
     ));
     drive.flush_pending_pipeline_audit();
     let audit = audit.lock().expect("audit");
@@ -4073,7 +4181,10 @@ fn reset_and_nexus_loss_unit_attention_use_state_invalidating_class() {
     let mut buffer = [0u8; 4];
     assert!(matches!(
         read_drive.read_block_batch(&mut buffer, 4, 1, 1),
-        Err(TapeIoError::StateInvalidatingReset(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::StateInvalidatingReset(_),
+            ..
+        })
     ));
     assert!(read_drive.expected_position.is_none());
     assert_eq!(read_drive.mode_reverification_required, Some(4));
@@ -4098,7 +4209,10 @@ fn reset_and_nexus_loss_unit_attention_use_state_invalidating_class() {
     filemark_drive.validated_fixed_block_size = Some(4);
     assert!(matches!(
         filemark_drive.write_filemarks_pipelined(1),
-        Err(TapeIoError::StateInvalidatingReset(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::StateInvalidatingReset(_),
+            ..
+        })
     ));
     assert!(filemark_drive.expected_position.is_none());
     assert_eq!(filemark_drive.mode_reverification_required, Some(4));
@@ -4129,7 +4243,7 @@ fn pipelined_hard_eom_filemark_is_safety_relevant_with_sense_preserved() {
         .expect_err("hard EOM filemark fences instead of committing the session");
     assert!(matches!(
         err,
-        TapeIoError::HardEndOfMedium { sense: actual } if actual == sense
+        crate::TapeIoError { kind: crate::TapeIoErrorKind::HardEndOfMedium { sense: actual }, .. } if actual == sense
     ));
     assert!(!drive.pending_pipeline_audits.is_empty());
 }
@@ -4439,14 +4553,16 @@ fn drive_handle_write_block_batch_decodes_valid_fixed_residual() {
         error
     };
 
-    assert!(matches!(error, TapeIoError::PartialBatchUncommittable {
+    assert!(
+        matches!(error, crate::TapeIoError { kind: crate::TapeIoErrorKind::PartialBatchUncommittable {
         requested_records: 4,
         written_records: 3,
         requested_bytes: 16,
         written_bytes: 12,
         end_of_medium: false,
         sense: Some(ref raw),
-    } if raw == &fixed_residual_sense(1)));
+    }, .. } if raw == &fixed_residual_sense(1))
+    );
     let rp_count = log.borrow().iter().filter(|cdb| cdb[0] == 0x34).count();
     assert_eq!(rp_count, 1, "partial residual does not add a follow-up RP");
     assert!(!handle.is_dirty());
@@ -4516,7 +4632,10 @@ fn drive_handle_write_block_batch_deferred_sense_is_completion_unknown_without_r
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         assert!(matches!(
             drive.write_block_batch(&[0x22u8; 16], 4),
-            Err(TapeIoError::Transport(_))
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::Transport(_),
+                ..
+            })
         ));
     }
 
@@ -4619,7 +4738,10 @@ fn drive_handle_write_block_batch_transport_unknown_has_no_followup_rp() {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         assert!(matches!(
             drive.write_block_batch(&[0x33u8; 16], 4),
-            Err(TapeIoError::Transport(_))
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::Transport(_),
+                ..
+            })
         ));
     }
 
@@ -4907,7 +5029,10 @@ fn drive_handle_write_block_invalid_field_uses_cached_block_limit() {
             .expect_err("WRITE invalid-field maps to BlockTooLarge")
     };
     match err {
-        TapeIoError::BlockTooLarge { requested, limit } => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::BlockTooLarge { requested, limit },
+            ..
+        } => {
             assert_eq!(requested, 8192);
             assert_eq!(limit, 4096);
         }
@@ -5067,7 +5192,7 @@ fn deferred_filemark_check_condition_surfaces_at_zero_count_batch_barrier() {
 
     assert!(matches!(
         error,
-        TapeIoError::CheckCondition(ScsiError::CheckCondition { sense, .. })
+        crate::TapeIoError { kind: crate::TapeIoErrorKind::CheckCondition(ScsiError::CheckCondition { sense, .. }), .. }
             if sense == deferred
     ));
     let filemark_cdbs = commands
@@ -5226,7 +5351,16 @@ fn drive_handle_write_filemarks_transport_error_marks_parent_dirty() {
     {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         let err = drive.write_filemarks(1).expect_err("transport err on WF");
-        assert!(matches!(err, TapeIoError::Transport(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::Transport(_),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
     assert!(handle.is_dirty());
     assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
@@ -5307,7 +5441,16 @@ fn drive_handle_write_block_transport_error_marks_parent_dirty() {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
         drive.write_block(&payload).expect_err("transport err")
     };
-    assert!(matches!(err, TapeIoError::Transport(_)), "got {err:?}");
+    assert!(
+        matches!(
+            err,
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::Transport(_),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
     assert!(handle.is_dirty());
     assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
 }
@@ -5398,14 +5541,20 @@ fn drive_handle_write_refuses_until_position_reestablished_after_transport_error
         let payload = vec![0u8; 1024];
         assert!(matches!(
             drive.write_block(&payload),
-            Err(TapeIoError::Transport(_))
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::Transport(_),
+                ..
+            })
         ));
 
         let err = drive
             .write_block(&payload)
             .expect_err("write must be refused until position is known again");
         match err {
-            TapeIoError::InvalidRequest(ScsiError::InvalidInput(msg)) => {
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(msg)),
+                ..
+            } => {
                 assert!(msg.contains("position is unknown"), "{msg}");
             }
             other => panic!("expected InvalidRequest for unknown position, got {other:?}"),
@@ -5415,7 +5564,10 @@ fn drive_handle_write_refuses_until_position_reestablished_after_transport_error
         assert_eq!(pos.lba, 123);
         assert!(matches!(
             drive.write_block(&payload),
-            Err(TapeIoError::IdentityInvalidated { .. })
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+                ..
+            })
         ));
         // The fixture stands in for a caller re-establishing identity evidence.
         drive
@@ -5601,7 +5753,10 @@ fn drive_handle_read_config_surfaces_malformed_mode_response() {
         drive.read_config().expect_err("malformed MODE response")
     };
     match err {
-        TapeIoError::MalformedModeResponse(_) => {}
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedModeResponse(_),
+            ..
+        } => {}
         other => panic!("expected MalformedModeResponse, got {other:?}"),
     }
     assert!(!handle.is_dirty(), "parse failure is not a transport error");
@@ -5664,7 +5819,13 @@ fn drive_handle_read_tape_alerts_rejects_short_successful_transfer() {
             .expect_err("short TapeAlert page is malformed")
     };
 
-    assert!(matches!(err, TapeIoError::MalformedResponse(_)));
+    assert!(matches!(
+        err,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedResponse(_),
+            ..
+        }
+    ));
     assert!(!handle.is_dirty(), "parse failure is not a transport error");
 }
 
@@ -5800,10 +5961,10 @@ fn drive_handle_probe_media_readiness_classifies_lto9_initializing() {
 
     assert_eq!(
         readiness,
-        MediaReadiness::BecomingReady {
+        crate::MediaReadiness::new(crate::MediaReadinessKind::BecomingReady {
             ascq: 0x01,
             media_initializing: true
-        }
+        })
     );
     assert!(!handle.is_dirty(), "TUR CHECK CONDITION is not dirty");
     let log = log.borrow();
@@ -6189,7 +6350,10 @@ fn drive_handle_write_config_rejects_fixed_block_size_zero() {
         drive.write_config(bad).expect_err("size_bytes=0 rejected")
     };
     match err {
-        TapeIoError::InvalidRequest(ScsiError::InvalidInput(msg)) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(msg)),
+            ..
+        } => {
             assert!(msg.contains("size_bytes: 0"), "{msg}");
         }
         other => panic!("expected InvalidRequest(InvalidInput), got {other:?}"),
@@ -6237,7 +6401,10 @@ fn drive_handle_write_config_rejects_fixed_block_size_above_24_bits() {
             .expect_err("size_bytes > 24-bit rejected")
     };
     match err {
-        TapeIoError::InvalidRequest(ScsiError::InvalidInput(msg)) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(msg)),
+            ..
+        } => {
             assert!(msg.contains("24-bit"), "{msg}");
         }
         other => panic!("expected InvalidRequest(InvalidInput), got {other:?}"),
@@ -6317,7 +6484,10 @@ fn drive_handle_read_config_rejects_short_rbl_response() {
             .expect_err("short RBL must surface as malformed")
     };
     match err {
-        TapeIoError::MalformedModeResponse(msg) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedModeResponse(msg),
+            ..
+        } => {
             assert!(msg.contains("READ BLOCK LIMITS"), "{msg}");
         }
         other => panic!("expected MalformedModeResponse, got {other:?}"),
@@ -6484,7 +6654,10 @@ fn load_returns_move_phase_error_on_preflight_fail() {
     // SameElement triggers because src == dst.
     assert!(matches!(
         err,
-        LoadError::Move(MoveError::SameElement { addr: 0x0100 })
+        LoadError::Move(crate::MoveError {
+            kind: crate::MoveErrorKind::SameElement { addr: 0x0100 },
+            ..
+        })
     ));
 
     // No 0xA5 / 0x1B CDBs.
@@ -6649,7 +6822,10 @@ fn unload_with_unknown_bay_returns_address_unknown() {
     // 0x9999 is not in the library's drive_bays.
     let err = handle.unload(0x9999, None, &policy).unwrap_err();
     match err {
-        UnloadError::Move(MoveError::AddressUnknown { library, addr }) => {
+        UnloadError::Move(crate::MoveError {
+            kind: crate::MoveErrorKind::AddressUnknown { library, addr },
+            ..
+        }) => {
             assert_eq!(library, "LIB_UL03");
             assert_eq!(addr, 0x9999);
         }
@@ -6882,7 +7058,10 @@ fn unload_returns_move_error_after_unload_keeps_snapshot() {
 
     let err = handle.unload(0x0100, None, &policy).unwrap_err();
     match err {
-        UnloadError::Move(MoveError::ScsiError(_)) => {}
+        UnloadError::Move(crate::MoveError {
+            kind: crate::MoveErrorKind::ScsiError(_),
+            ..
+        }) => {}
         other => panic!("expected UnloadError::Move(ScsiError), got {other:?}"),
     }
 
@@ -6921,7 +7100,10 @@ fn unload_refuses_when_no_destination_and_no_source_slot() {
     let err = handle.unload(0x0100, None, &policy).unwrap_err();
     assert!(matches!(
         err,
-        UnloadError::Move(MoveError::SourceEmpty { addr: 0x0100 })
+        UnloadError::Move(crate::MoveError {
+            kind: crate::MoveErrorKind::SourceEmpty { addr: 0x0100 },
+            ..
+        })
     ));
 
     // Snapshot unchanged; is_dirty unchanged.
@@ -7112,7 +7294,13 @@ fn export_refused_when_all_ie_ports_full() {
     handle.set_audit_hook(hook);
 
     let err = handle.export(0x0400, &policy).unwrap_err();
-    assert!(matches!(err, MoveError::DestinationFull { .. }));
+    assert!(matches!(
+        err,
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DestinationFull { .. },
+            ..
+        }
+    ));
 
     let events = audit.lock().unwrap().clone();
     assert_eq!(events.len(), 1);
@@ -7192,7 +7380,13 @@ fn import_refused_when_no_ie_port_occupied() {
     handle.set_audit_hook(hook);
 
     let err = handle.import(0x0400, &policy).unwrap_err();
-    assert!(matches!(err, MoveError::SourceEmpty { .. }));
+    assert!(matches!(
+        err,
+        crate::MoveError {
+            kind: crate::MoveErrorKind::SourceEmpty { .. },
+            ..
+        }
+    ));
 
     let events = audit.lock().unwrap().clone();
     assert_eq!(events.len(), 1);
@@ -7555,10 +7749,14 @@ fn move_with_transport_error_marks_snapshot_dirty() {
         .move_medium(0x0400, 0x0100, &policy)
         .expect_err("MOVE must fail with the injected transport error");
     match err {
-        MoveError::ScsiError(ScsiError::TransportError {
-            driver_status: 0x06,
+        crate::MoveError {
+            kind:
+                crate::MoveErrorKind::ScsiError(ScsiError::TransportError {
+                    driver_status: 0x06,
+                    ..
+                }),
             ..
-        }) => {}
+        } => {}
         other => panic!("expected MoveError::ScsiError(TransportError), got {other:?}"),
     }
 
@@ -7696,10 +7894,14 @@ fn composed_unload_with_drive_transport_error_marks_dirty() {
 
     let err = handle.unload(0x0100, None, &policy).unwrap_err();
     match err {
-        UnloadError::DriveUnload(DriveOpError::ScsiError(ScsiError::TransportError {
-            driver_status: 0x06,
+        UnloadError::DriveUnload(crate::DriveOpError {
+            kind:
+                crate::DriveOpErrorKind::ScsiError(ScsiError::TransportError {
+                    driver_status: 0x06,
+                    ..
+                }),
             ..
-        })) => {}
+        }) => {}
         other => panic!("expected DriveUnload(ScsiError::TransportError), got {other:?}"),
     }
     assert!(
@@ -7864,10 +8066,14 @@ fn composed_load_drive_transport_error_records_completion_unknown() {
         .load(0x0400, 0x0100, &policy)
         .expect_err("load must fail at SSC LOAD");
     match err {
-        LoadError::DriveLoad(DriveOpError::ScsiError(ScsiError::TransportError {
-            driver_status: 0x06,
+        LoadError::DriveLoad(crate::DriveOpError {
+            kind:
+                crate::DriveOpErrorKind::ScsiError(ScsiError::TransportError {
+                    driver_status: 0x06,
+                    ..
+                }),
             ..
-        })) => {}
+        }) => {}
         other => panic!("expected DriveLoad(ScsiError::TransportError), got {other:?}"),
     }
     assert_eq!(
@@ -7951,7 +8157,10 @@ fn standalone_removal_commands_audit_the_drive_and_release_invalidates_proof() {
     assert!(drive.identity_generation() > generation);
     assert!(matches!(
         drive.write_block_with_identity_generation(&[0; 64], generation),
-        Err(TapeIoError::IdentityInvalidated { .. })
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+            ..
+        })
     ));
     let events = events.lock().unwrap();
     assert_eq!(events.len(), 2);
@@ -7981,11 +8190,17 @@ fn standalone_policy_denies_unlisted_devices_and_ephemeral_audit_authority() {
     drive.prevent_medium_removal().unwrap();
     assert!(matches!(
         drive.write_block(&[0; 64]),
-        Err(TapeIoError::EphemeralReadOnly)
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::EphemeralReadOnly,
+            ..
+        })
     ));
     assert!(matches!(
         drive.write_filemarks(1),
-        Err(TapeIoError::EphemeralReadOnly)
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::EphemeralReadOnly,
+            ..
+        })
     ));
 }
 

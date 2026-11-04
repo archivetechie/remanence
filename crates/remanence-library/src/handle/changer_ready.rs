@@ -329,17 +329,8 @@ pub fn changer_sense_name(asc: u8, ascq: u8) -> Option<&'static str> {
     })
 }
 
-fn decoded(err: &ScsiError) -> Option<(u8, u8, u8)> {
-    let sense = match err {
-        #[cfg(target_os = "linux")]
-        ScsiError::CheckCondition { sense, .. } => sense,
-        _ => return None,
-    };
-    let sense = remanence_scsi::decode_usable_sense(sense)?;
-    // Deferred sense reports an earlier command, not this one's readiness.
-    if !(sense.is_fixed_format() || sense.is_descriptor_format()) {
-        return None;
-    }
+fn decoded(err: &crate::MoveError) -> Option<(u8, u8, u8)> {
+    let sense = err.completion_evidence().current_sense()?;
     Some((sense.key, sense.asc, sense.ascq))
 }
 
@@ -353,14 +344,14 @@ fn ready_transition(key: u8, asc: u8, ascq: u8) -> bool {
 
 /// Classify a failed MOVE MEDIUM's first attempt. `Some` only for the
 /// not-ready senses that start a wait; see the module table.
-pub fn classify_changer_not_ready(err: &ScsiError) -> Option<ChangerNotReady> {
+pub fn classify_changer_not_ready(err: &crate::MoveError) -> Option<ChangerNotReady> {
     let (key, asc, ascq) = decoded(err)?;
     not_ready_condition(key, asc, ascq).then_some(ChangerNotReady::Sense { key, asc, ascq })
 }
 
 /// Classify a changer answer once a wait has started: the not-ready senses
 /// plus the unit attentions a changer reports as it becomes ready again.
-pub fn classify_changer_ready_transition(err: &ScsiError) -> Option<ChangerNotReady> {
+pub fn classify_changer_ready_transition(err: &crate::MoveError) -> Option<ChangerNotReady> {
     let (key, asc, ascq) = decoded(err)?;
     (not_ready_condition(key, asc, ascq) || ready_transition(key, asc, ascq))
         .then_some(ChangerNotReady::Sense { key, asc, ascq })
@@ -441,18 +432,99 @@ fn element_probe(status: &ElementStatusData, address: u16) -> Result<(), Probe> 
 }
 
 /// Classify a failed readiness poll command.
-fn poll_failure(command: &str, err: &ScsiError) -> Probe {
+fn poll_failure(command: &str, err: &crate::MoveError) -> Probe {
+    let display: &dyn std::fmt::Display = match &err.kind {
+        crate::MoveErrorKind::ScsiError(raw) => raw,
+        _ => err,
+    };
     if let Some(condition) = classify_changer_ready_transition(err) {
         return Probe::Waiting(condition);
     }
     #[cfg(target_os = "linux")]
-    if let ScsiError::UnexpectedStatus {
-        status: 0x08 | 0x28,
-    } = err
-    {
-        return Probe::Busy(format!("{command}: {err}"));
+    if matches!(
+        err.kind,
+        crate::MoveErrorKind::ScsiError(ScsiError::UnexpectedStatus {
+            status: 0x08 | 0x28
+        })
+    ) {
+        return Probe::Busy(format!("{command}: {display}"));
     }
-    Probe::Unavailable(format!("{command}: {err}"))
+    Probe::Unavailable(format!("{command}: {display}"))
+}
+
+/// Preserve the two-phase RES protocol while finishing each physical CDB once.
+/// The final payload stays pending until the existing parser has accepted it.
+pub(super) fn finish_element_status(
+    transport: &mut dyn crate::SgTransport,
+) -> Result<ElementStatusData, crate::MoveError> {
+    struct Capture<'a> {
+        inner: &'a mut dyn crate::SgTransport,
+        pending: Option<crate::outcome::CompletionEvidence>,
+    }
+    impl Capture<'_> {
+        fn finish(&mut self, parse_failed: bool) -> crate::outcome::ClassifiedOutcome {
+            let mut evidence = self.pending.take().expect("RES dispatched");
+            if parse_failed && !evidence.failed {
+                // A malformed response fails the public result without changing
+                // the transport's known completion (the normalizer has the same rule).
+                evidence.failed = true;
+            }
+            crate::outcome::classify(crate::outcome::OutcomeInput {
+                class: crate::outcome::CommandClass::SenseStatus,
+                context: crate::outcome::OperationContext {
+                    region: crate::outcome::Region::NotTape,
+                    ..Default::default()
+                },
+                evidence,
+            })
+        }
+    }
+    impl crate::SgTransport for Capture<'_> {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<crate::transport::TransferOutcome, ScsiError> {
+            if self.pending.is_some() {
+                self.finish(false);
+            }
+            let result = self.inner.execute_in(cdb, buf);
+            let mut evidence = result.as_ref().err().map_or_else(
+                crate::outcome::CompletionEvidence::success,
+                crate::outcome::CompletionEvidence::from_scsi,
+            );
+            if evidence.dispatch == crate::outcome::Dispatch::NotIssued {
+                evidence = crate::outcome::CompletionEvidence::unknown();
+            }
+            evidence.opcode = cdb.first().copied();
+            self.pending = Some(evidence);
+            result
+        }
+        fn execute_none(&mut self, _: &[u8]) -> Result<(), ScsiError> {
+            unreachable!("RES is data-in only")
+        }
+        fn execute_out(
+            &mut self,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<crate::transport::TransferOutcome, ScsiError> {
+            unreachable!("RES is data-in only")
+        }
+        fn set_timeout_for(&mut self, class: TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+    }
+    let mut capture = Capture {
+        inner: transport,
+        pending: None,
+    };
+    let result = crate::discovery::issue_res(&mut capture, 0, true, true);
+    let outcome = capture.finish(result.is_err());
+    result.map_err(|error| {
+        let mut error = crate::MoveError::pending(crate::MoveErrorKind::ScsiError(error));
+        error.set_outcome(outcome);
+        error
+    })
 }
 
 /// A transient element exception on `address` in the handle's inventory.
@@ -515,7 +587,7 @@ impl ChangerHandle {
     /// attentions.
     pub(super) fn transient_move_failure(
         &self,
-        err: &ScsiError,
+        err: &crate::MoveError,
         retries: u32,
     ) -> Option<ChangerNotReady> {
         if !self.ready_wait.is_enabled() || retries >= self.ready_wait.max_retries {
@@ -536,21 +608,25 @@ impl ChangerHandle {
             transport.set_timeout_for(TimeoutClass::Inquiry);
             transport.execute_none(&[0u8; 6])
         };
+        let outcome = crate::outcome::finish_control(
+            crate::outcome::CommandClass::SenseStatus,
+            Default::default(),
+            0,
+            tur.as_ref().err(),
+        );
         if let Err(err) = tur {
-            return poll_failure("TEST UNIT READY", &err);
+            let mut error = crate::MoveError::pending(crate::MoveErrorKind::ScsiError(err));
+            error.set_outcome(outcome);
+            return poll_failure("TEST UNIT READY", &error);
         }
-        let status = crate::discovery::issue_res(
+        let status = match finish_element_status(
             self.transport
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_mut(),
-            0,
-            true,
-            true,
-        );
-        let status = match status {
+        ) {
             Ok(status) => status,
-            Err(err) => return poll_failure("READ ELEMENT STATUS", &err),
+            Err(error) => return poll_failure("READ ELEMENT STATUS", &error),
         };
         for address in [src, dst] {
             if let Err(probe) = element_probe(&status, address) {
@@ -734,6 +810,31 @@ impl ChangerHandle {
 mod tests {
     use super::*;
 
+    /// A RES header and its payload are separate commands even on parser failure or fallback.
+    #[test]
+    fn b3b_changer_element_status_census() {
+        use crate::outcome::census;
+        for replies in [
+            vec![vec![0; 8], vec![0; 8]],
+            vec![vec![0; 8], vec![0]],
+            vec![],
+        ] {
+            let expected_ok = replies.last().is_some_and(|bytes| bytes.len() == 8);
+            let mut transport = crate::FixtureTransport::new().with_responses(replies);
+            let before = census::count();
+            let result = finish_element_status(&mut transport);
+            assert_eq!(result.is_ok(), expected_ok);
+            assert_eq!(transport.cdb_log.len(), 2);
+            assert_eq!(census::count() - before, 2);
+            if let Err(error) = result {
+                let before = (census::total(), census::normalizations());
+                assert_eq!(error.outcome().evidence.opcode, Some(0xb8));
+                let _ = poll_failure("READ ELEMENT STATUS", &error);
+                assert_eq!((census::total(), census::normalizations()), before);
+            }
+        }
+    }
+
     fn check(key: u8, asc: u8, ascq: u8) -> ScsiError {
         let mut sense = vec![0u8; 18];
         sense[0] = 0x70;
@@ -751,7 +852,7 @@ mod tests {
     fn first_attempt_waits_only_for_not_ready_senses() {
         for (key, asc, ascq) in [(0x02, 0x3b, 0x12), (0x02, 0x04, 0x01), (0x02, 0x04, 0x18)] {
             assert_eq!(
-                classify_changer_not_ready(&check(key, asc, ascq)),
+                classify_changer_not_ready(&crate::MoveError::from(check(key, asc, ascq))),
                 Some(ChangerNotReady::Sense { key, asc, ascq }),
                 "{key:02x}/{asc:02x}/{ascq:02x}"
             );
@@ -773,19 +874,19 @@ mod tests {
             (0x05, 0x53, 0x02),
         ] {
             assert_eq!(
-                classify_changer_not_ready(&check(key, asc, ascq)),
+                classify_changer_not_ready(&crate::MoveError::from(check(key, asc, ascq))),
                 None,
                 "{key:02x}/{asc:02x}/{ascq:02x}"
             );
         }
         assert_eq!(
-            classify_changer_not_ready(&ScsiError::TransportError {
+            classify_changer_not_ready(&crate::MoveError::from(ScsiError::TransportError {
                 status: 0,
                 host_status: 3,
                 driver_status: 0,
                 info: 1,
                 sense: Vec::new(),
-            }),
+            })),
             None
         );
     }
@@ -797,10 +898,10 @@ mod tests {
         descriptor[1] = 0x02;
         descriptor[2] = 0x3b;
         descriptor[3] = 0x12;
-        let current = ScsiError::CheckCondition {
+        let current = crate::MoveError::from(ScsiError::CheckCondition {
             sense: descriptor.clone(),
             bytes_transferred: 0,
-        };
+        });
         assert!(classify_changer_not_ready(&current).is_some());
         for code in [0x71u8, 0x73] {
             let mut sense = if code == 0x71 {
@@ -812,10 +913,10 @@ mod tests {
                 descriptor.clone()
             };
             sense[0] = code;
-            let deferred = ScsiError::CheckCondition {
+            let deferred = crate::MoveError::from(ScsiError::CheckCondition {
                 sense,
                 bytes_transferred: 0,
-            };
+            });
             assert_eq!(classify_changer_not_ready(&deferred), None, "{code:02x}");
             assert_eq!(
                 classify_changer_ready_transition(&deferred),
@@ -853,13 +954,15 @@ mod tests {
             (0x06, 0x3b, 0x13),
         ] {
             assert!(
-                classify_changer_ready_transition(&check(key, asc, ascq)).is_some(),
+                classify_changer_ready_transition(&crate::MoveError::from(check(key, asc, ascq)))
+                    .is_some(),
                 "{key:02x}/{asc:02x}/{ascq:02x}"
             );
         }
         for (key, asc, ascq) in [(0x06, 0x28, 0x01), (0x06, 0x2a, 0x01), (0x05, 0x3b, 0x0e)] {
             assert!(
-                classify_changer_ready_transition(&check(key, asc, ascq)).is_none(),
+                classify_changer_ready_transition(&crate::MoveError::from(check(key, asc, ascq)))
+                    .is_none(),
                 "{key:02x}/{asc:02x}/{ascq:02x}"
             );
         }

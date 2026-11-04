@@ -1,5 +1,6 @@
 //! Startup media-readiness reconciliation and transport/status mapping.
 
+use crate::closeout_obligation::RetryCauseExt as _;
 use std::time::Duration;
 
 use remanence_library::{
@@ -796,24 +797,70 @@ pub(crate) fn media_readiness_state_name(
     readiness: &remanence_library::MediaReadiness,
 ) -> &'static str {
     match readiness {
-        remanence_library::MediaReadiness::Ready => "ready",
-        remanence_library::MediaReadiness::BecomingReady {
-            media_initializing: true,
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::Ready,
+            ..
+        } => "ready",
+        remanence_library::MediaReadiness {
+            kind:
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    media_initializing: true,
+                    ..
+                },
             ..
         } => "media_initializing",
-        remanence_library::MediaReadiness::BecomingReady { .. } => "becoming_ready",
-        remanence_library::MediaReadiness::UnitAttention { .. } => "unit_attention",
-        remanence_library::MediaReadiness::TargetBusy { .. } => "target_busy",
-        remanence_library::MediaReadiness::ReservationConflict => "reservation_conflict",
-        remanence_library::MediaReadiness::TransportUnknown { .. } => "transport_unknown",
-        remanence_library::MediaReadiness::NoMedium { .. }
-        | remanence_library::MediaReadiness::RepeatedUnitAttention { .. }
-        | remanence_library::MediaReadiness::TerminalNotReady { .. }
-        | remanence_library::MediaReadiness::CheckCondition { .. }
-        | remanence_library::MediaReadiness::UndecodedCheckCondition { .. }
-        | remanence_library::MediaReadiness::TaskAborted
-        | remanence_library::MediaReadiness::UnexpectedStatus { .. }
-        | remanence_library::MediaReadiness::InvalidRequest { .. } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { .. },
+            ..
+        } => "becoming_ready",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { .. },
+            ..
+        } => "unit_attention",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TargetBusy { .. },
+            ..
+        } => "target_busy",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::ReservationConflict,
+            ..
+        } => "reservation_conflict",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TransportUnknown { .. },
+            ..
+        } => "transport_unknown",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TaskAborted,
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnexpectedStatus { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::InvalidRequest { .. },
+            ..
+        } => "terminal_error",
     }
 }
 
@@ -836,36 +883,90 @@ pub(crate) fn media_readiness_sense_key(
     readiness: &remanence_library::MediaReadiness,
 ) -> Option<u8> {
     match readiness {
-        remanence_library::MediaReadiness::BecomingReady { .. }
-        | remanence_library::MediaReadiness::TerminalNotReady { .. } => Some(0x02),
-        remanence_library::MediaReadiness::NoMedium { .. } => Some(0x02),
-        remanence_library::MediaReadiness::UnitAttention { .. }
-        | remanence_library::MediaReadiness::RepeatedUnitAttention { .. } => Some(0x06),
-        remanence_library::MediaReadiness::CheckCondition { key, .. } => Some(*key),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { .. },
+            ..
+        } => Some(0x02),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+            ..
+        } => Some(0x02),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { .. },
+            ..
+        } => Some(0x06),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { key, .. },
+            ..
+        } => Some(*key),
         _ => None,
     }
 }
 
 pub(crate) fn media_readiness_asc(readiness: &remanence_library::MediaReadiness) -> Option<u8> {
     match readiness {
-        remanence_library::MediaReadiness::BecomingReady { .. }
-        | remanence_library::MediaReadiness::TerminalNotReady { .. } => Some(0x04),
-        remanence_library::MediaReadiness::NoMedium { .. } => Some(0x3a),
-        remanence_library::MediaReadiness::UnitAttention { asc, .. }
-        | remanence_library::MediaReadiness::RepeatedUnitAttention { asc, .. }
-        | remanence_library::MediaReadiness::CheckCondition { asc, .. } => Some(*asc),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { .. },
+            ..
+        } => Some(0x04),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+            ..
+        } => Some(0x3a),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { asc, .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { asc, .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { asc, .. },
+            ..
+        } => Some(*asc),
         _ => None,
     }
 }
 
 pub(crate) fn media_readiness_ascq(readiness: &remanence_library::MediaReadiness) -> Option<u8> {
     match readiness {
-        remanence_library::MediaReadiness::BecomingReady { ascq, .. }
-        | remanence_library::MediaReadiness::NoMedium { ascq }
-        | remanence_library::MediaReadiness::TerminalNotReady { ascq, .. }
-        | remanence_library::MediaReadiness::UnitAttention { ascq, .. }
-        | remanence_library::MediaReadiness::RepeatedUnitAttention { ascq, .. }
-        | remanence_library::MediaReadiness::CheckCondition { ascq, .. } => Some(*ascq),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { ascq, .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { ascq },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { ascq, .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { ascq, .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { ascq, .. },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { ascq, .. },
+            ..
+        } => Some(*ascq),
         _ => None,
     }
 }
@@ -874,10 +975,22 @@ pub(crate) fn media_readiness_target_status(
     readiness: &remanence_library::MediaReadiness,
 ) -> Option<u8> {
     match readiness {
-        remanence_library::MediaReadiness::TargetBusy { status }
-        | remanence_library::MediaReadiness::UnexpectedStatus { status } => Some(*status),
-        remanence_library::MediaReadiness::ReservationConflict => Some(0x18),
-        remanence_library::MediaReadiness::TaskAborted => Some(0x40),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TargetBusy { status },
+            ..
+        }
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnexpectedStatus { status },
+            ..
+        } => Some(*status),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::ReservationConflict,
+            ..
+        } => Some(0x18),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TaskAborted,
+            ..
+        } => Some(0x40),
         _ => None,
     }
 }
@@ -887,7 +1000,10 @@ pub(crate) fn media_readiness_transport_class(
 ) -> Option<String> {
     matches!(
         readiness,
-        remanence_library::MediaReadiness::TransportUnknown { .. }
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TransportUnknown { .. },
+            ..
+        }
     )
     .then(|| "unknown".to_string())
 }
@@ -896,9 +1012,10 @@ pub(crate) fn media_readiness_sense_raw(
     readiness: &remanence_library::MediaReadiness,
 ) -> Option<String> {
     match readiness {
-        remanence_library::MediaReadiness::UndecodedCheckCondition { sense } => {
-            Some(bytes_to_hex(sense))
-        }
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { sense },
+            ..
+        } => Some(bytes_to_hex(sense)),
         _ => None,
     }
 }
@@ -907,18 +1024,29 @@ pub(crate) fn media_readiness_error_json(
     readiness: &remanence_library::MediaReadiness,
 ) -> Option<String> {
     match readiness {
-        remanence_library::MediaReadiness::RepeatedUnitAttention { .. } => Some(json_detail(
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { .. },
+            ..
+        } => Some(json_detail(
             "repeated_unit_attention",
             "unit attention repeated during startup readiness reconciliation",
         )),
-        remanence_library::MediaReadiness::TerminalNotReady { action, .. } => {
-            Some(json_detail("terminal_not_ready", action))
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { action, .. },
+            ..
+        } => Some(json_detail("terminal_not_ready", action)),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TransportUnknown { detail },
+            ..
         }
-        remanence_library::MediaReadiness::TransportUnknown { detail }
-        | remanence_library::MediaReadiness::InvalidRequest { detail } => {
-            Some(json_detail("startup_reconcile_error", detail))
-        }
-        remanence_library::MediaReadiness::UndecodedCheckCondition { .. } => Some(json_detail(
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::InvalidRequest { detail },
+            ..
+        } => Some(json_detail("startup_reconcile_error", detail)),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { .. },
+            ..
+        } => Some(json_detail(
             "undecoded_check_condition",
             "TEST UNIT READY returned undecoded sense data",
         )),

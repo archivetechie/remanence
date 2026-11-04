@@ -399,7 +399,11 @@ impl BlockRead for EncryptedCandidate<'_, '_> {
             self.offset += range.plaintext_len;
             Ok(range.plaintext_len as usize)
         })();
-        run.map_err(remanence_library::TapeIoError::OperationFailed)
+        run.map_err(|value| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(value),
+            )
+        })
     }
 }
 
@@ -453,8 +457,6 @@ pub(crate) fn scan_append_suffix_observed(
     inspect_all: bool,
     tail: Option<&crate::write_owner::session_tail::SessionTail>,
 ) -> Result<AppendSuffix, crate::append_admission::AdmissionError> {
-    use crate::append_admission::AdmissionError;
-    use remanence_library::TapeIoError;
     use remanence_parity::TapeFileKind;
     use remanence_state::tape_log::{TailFilemark, TailIdentity};
     use sha2::{Digest, Sha256};
@@ -490,7 +492,11 @@ pub(crate) fn scan_append_suffix_observed(
                     {
                         let spaced = drive
                             .space(1, remanence_library::SpaceKind::Filemarks)
-                            .map_err(AdmissionError::Io)?;
+                            .map_err(|value| {
+                                crate::append_admission::AdmissionError::new(
+                                    crate::append_admission::AdmissionErrorKind::Io(value),
+                                )
+                            })?;
                         if spaced.position_after.partition != 0
                             || spaced.position_after.lba <= start
                         {
@@ -502,7 +508,11 @@ pub(crate) fn scan_append_suffix_observed(
                         }
                         match drive.read_block(&mut block) {
                             Err(e) if e.is_physical_eod() => break true,
-                            Err(e) => return Err(AdmissionError::Io(e)),
+                            Err(e) => {
+                                return Err(crate::append_admission::AdmissionError::new(
+                                    crate::append_admission::AdmissionErrorKind::Io(e),
+                                ))
+                            }
                             Ok(_) => return Err("control suffix did not reach physical EOD".into()),
                         }
                     }
@@ -515,12 +525,19 @@ pub(crate) fn scan_append_suffix_observed(
                         next_progress = scanned.saturating_add(1 << 30);
                     }
                 }
-                Err(TapeIoError::FilemarkEncountered) => {
+                Err(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                    ..
+                }) => {
                     lba = lba.checked_add(1).ok_or("suffix LBA overflow")?;
                     break false;
                 }
                 Err(e) if e.is_physical_eod() => break true,
-                Err(e) => return Err(AdmissionError::Io(e)),
+                Err(e) => {
+                    return Err(crate::append_admission::AdmissionError::new(
+                        crate::append_admission::AdmissionErrorKind::Io(e),
+                    ))
+                }
             }
         };
         // Only physical EOD without a closing filemark proves truncation.
@@ -535,7 +552,11 @@ pub(crate) fn scan_append_suffix_observed(
                     blocks,
                     TailFilemark::Absent,
                 )
-                .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
+                .map_err(|e| {
+                    crate::append_admission::AdmissionError::new(
+                        crate::append_admission::AdmissionErrorKind::Unproved(e.to_string()),
+                    )
+                })?;
             }
             result.torn_fragment = true;
             return Ok(result);
@@ -595,7 +616,13 @@ pub(crate) fn scan_append_suffix_observed(
                         }
                     };
                     if let Some(error) = candidate.probe_error.take() {
-                        return Err(AdmissionError::Io(TapeIoError::OperationFailed(error)));
+                        return Err(crate::append_admission::AdmissionError::new(
+                            crate::append_admission::AdmissionErrorKind::Io(
+                                remanence_library::TapeIoError::new(
+                                    remanence_library::TapeIoErrorKind::OperationFailed(error),
+                                ),
+                            ),
+                        ));
                     }
                     match classified {
                         Ok(Some(id)) => {
@@ -605,7 +632,13 @@ pub(crate) fn scan_append_suffix_observed(
                                     blocks,
                                     TailFilemark::Present,
                                 )
-                                .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
+                                .map_err(|e| {
+                                    crate::append_admission::AdmissionError::new(
+                                        crate::append_admission::AdmissionErrorKind::Unproved(
+                                            e.to_string(),
+                                        ),
+                                    )
+                                })?;
                             }
                             result.objects.push(id);
                         }
@@ -617,7 +650,11 @@ pub(crate) fn scan_append_suffix_observed(
                                 .push(format!("unclassifiable at LBA {start}: {detail}"));
                         }
                     }
-                    drive.locate(lba).map_err(AdmissionError::Io)?;
+                    drive.locate(lba).map_err(|value| {
+                        crate::append_admission::AdmissionError::new(
+                            crate::append_admission::AdmissionErrorKind::Io(value),
+                        )
+                    })?;
                 }
                 TapeFileKind::TapeIndexReplica => {
                     result.unnameable = true;
@@ -693,7 +730,13 @@ pub(crate) fn scan_append_suffix_observed(
                             return Err("crash sidecar contains a non-fixed-size block".into());
                         }
                         tail.observe(TailIdentity::Sidecar(hash), blocks, TailFilemark::Present)
-                            .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
+                            .map_err(|e| {
+                                crate::append_admission::AdmissionError::new(
+                                    crate::append_admission::AdmissionErrorKind::Unproved(
+                                        e.to_string(),
+                                    ),
+                                )
+                            })?;
                     }
                     let own = prefix.is_some_and(|p| {
                         p.committed_bundle.entries.iter().any(|e| {
@@ -753,9 +796,11 @@ impl<'a> TapeCandidate<'a> {
         let len = blocks
             .checked_mul(u64::from(size))
             .ok_or("candidate length overflow")?;
-        drive
-            .locate(start)
-            .map_err(crate::append_admission::AdmissionError::Io)?;
+        drive.locate(start).map_err(|value| {
+            crate::append_admission::AdmissionError::new(
+                crate::append_admission::AdmissionErrorKind::Io(value),
+            )
+        })?;
         Ok(Self {
             drive,
             start,
@@ -817,8 +862,11 @@ impl Seek for TapeCandidate<'_> {
 }
 impl BlockRead for TapeCandidate<'_> {
     fn read_block(&mut self, out: &mut [u8]) -> Result<usize, remanence_library::TapeIoError> {
-        self.read(out)
-            .map_err(|e| remanence_library::TapeIoError::OperationFailed(e.to_string()))
+        self.read(out).map_err(|e| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(e.to_string()),
+            )
+        })
     }
 }
 
@@ -832,9 +880,12 @@ pub(crate) fn prove_named_plain_identity(
     expected: &str,
     partial: bool,
 ) -> Result<(), crate::append_admission::AdmissionError> {
-    use crate::append_admission::AdmissionError;
     let bad = || {
-        AdmissionError::Unproved("SessionSuffixContradiction: named object header differs".into())
+        crate::append_admission::AdmissionError::pending(
+            crate::append_admission::AdmissionErrorKind::Unproved(
+                "SessionSuffixContradiction: named object header differs".into(),
+            ),
+        )
     };
     let mut source = TapeCandidate::new(drive, start, blocks, size)?;
     let mut header = [0; 512];
@@ -930,4 +981,19 @@ pub(crate) fn prove_named_plain_identity(
         remaining -= length;
     }
     Err(bad())
+}
+
+/// Keep the candidate alive while its borrowed drive experiences a real injected pipeline failure.
+#[cfg(test)]
+pub(crate) fn b3b_check_candidate_after_failure(
+    drive: &mut DriveHandle,
+    size: u32,
+    fail: impl FnOnce(&mut DriveHandle),
+    expected: &[u8],
+) {
+    let mut candidate = TapeCandidate::new(drive, 2, 1, size).unwrap();
+    fail(candidate.drive);
+    let mut bytes = vec![0; expected.len()];
+    candidate.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, expected);
 }

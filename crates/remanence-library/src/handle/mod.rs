@@ -580,7 +580,7 @@ impl ChangerHandle {
             // before we lost the connection. Mark dirty so callers
             // don't trust the snapshot until they've rescanned
             // successfully (or re-`discover()`d).
-            let dirty = completion_unknown(&e);
+            let dirty = completion_unknown(&crate::outcome::CompletionEvidence::from_scsi(&e), &e);
             if dirty {
                 self.mark_dirty(DirtyCause::CompletionUnknown);
             }
@@ -765,10 +765,10 @@ impl ChangerHandle {
         // bay regardless of whether it was the source or destination.
         if let Some((bay_addr, installed)) = plan.derived_drive_bay(&self.library) {
             if !policy.allows_derived_drive_identity(&self.library.serial) {
-                let e = MoveError::DerivedDriveBay {
+                let e = crate::MoveError::new(crate::MoveErrorKind::DerivedDriveBay {
                     addr: bay_addr,
                     serial: installed.serial.clone(),
-                };
+                });
                 fire_refused(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &self.library.serial,
@@ -826,14 +826,14 @@ impl ChangerHandle {
                         let refresh = self.check_elements(&[src, dst]);
                         let error = match refresh {
                             Err(error) => error,
-                            Ok(()) => MoveError::NotReady {
+                            Ok(()) => crate::MoveError::new(crate::MoveErrorKind::NotReady {
                                 src,
                                 dst,
                                 detail: self
                                     .endpoint_unavailable(src, dst)
                                     .unwrap_or(condition)
                                     .to_string(),
-                            },
+                            }),
                         };
                         fire_refused(
                             &mut lock_drive_shared(&self.shared).audit_hook,
@@ -856,8 +856,7 @@ impl ChangerHandle {
         loop {
             match self.issue_planned_move(src, dst, &plan, op, admit) {
                 Ok(()) => return Ok(()),
-                Err(MoveError::Admission(message)) => return Err(MoveError::Admission(message)),
-                Err(MoveError::ScsiError(e)) => {
+                Err(e) if matches!(&e.kind, crate::MoveErrorKind::ScsiError(_)) => {
                     let transient = if wait_spent {
                         None
                     } else {
@@ -906,19 +905,25 @@ impl ChangerHandle {
                     // Refresh after every failed move, including destination-full and
                     // not-ready sense. No automatic retry uses the old inventory.
                     let refresh = self.check_elements(&[src, dst]);
-                    if let ScsiError::CheckCondition { sense, .. } = &e {
-                        if let Some(sense) = remanence_scsi::decode_usable_sense(sense) {
-                            if sense.key == 0x05 && sense.asc == 0x3b {
-                                match sense.ascq {
-                                    0x0d => return Err(MoveError::DestinationFull { addr: dst }),
-                                    0x0e => return Err(MoveError::SourceEmpty { addr: src }),
-                                    _ => {}
-                                }
+                    if let Some(sense) = e.completion_evidence().decoded.filter(|_| {
+                        matches!(
+                            &e.kind,
+                            crate::MoveErrorKind::ScsiError(ScsiError::CheckCondition { .. })
+                        )
+                    }) {
+                        if sense.key == 0x05 && sense.asc == 0x3b {
+                            let kind = match sense.ascq {
+                                0x0d => Some(crate::MoveErrorKind::DestinationFull { addr: dst }),
+                                0x0e => Some(crate::MoveErrorKind::SourceEmpty { addr: src }),
+                                _ => None,
+                            };
+                            if let Some(kind) = kind {
+                                return Err(e.with_kind(kind));
                             }
                         }
                     }
                     refresh?;
-                    return Err(MoveError::ScsiError(e));
+                    return Err(e);
                 }
                 Err(error) => return Err(error),
             }
@@ -957,11 +962,11 @@ impl ChangerHandle {
         for (addr, expected) in [src, dst].into_iter().zip(observed) {
             let found = element_state(&self.library, addr)?;
             if &found != expected {
-                let error = MoveError::InventoryChanged {
+                let error = crate::MoveError::new(crate::MoveErrorKind::InventoryChanged {
                     addr,
                     expected: format!("{expected:?}"),
                     found: format!("{found:?}"),
-                };
+                });
                 return Err(refuse(self, error));
             }
         }
@@ -1007,7 +1012,7 @@ impl ChangerHandle {
             transport.set_timeout_for(TimeoutClass::Move);
             if let Err(message) = admit() {
                 drop(transport);
-                let error = MoveError::Admission(message);
+                let error = MoveError::new(crate::MoveErrorKind::Admission(message));
                 fire_refused(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &self.library.serial,
@@ -1018,6 +1023,18 @@ impl ChangerHandle {
             }
             transport.execute_none(&cdb)
         };
+        let classified = crate::outcome::finish_control(
+            crate::outcome::CommandClass::Move,
+            crate::outcome::OperationContext {
+                phase: crate::outcome::Phase::Motion,
+                partition: crate::outcome::PartitionIdentity::Changer(
+                    self.library.serial.as_bytes().to_vec(),
+                ),
+                ..Default::default()
+            },
+            cdb[0],
+            result.as_ref().err(),
+        );
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
@@ -1062,7 +1079,7 @@ impl ChangerHandle {
                 // a bus reset would have the same shape. Mark the
                 // snapshot dirty so the caller refreshes before
                 // trusting any address near `src` or `dst`.
-                let dirty = completion_unknown(&e);
+                let dirty = completion_unknown(&classified.evidence, &e);
                 if dirty {
                     self.mark_dirty(DirtyCause::CompletionUnknown);
                 }
@@ -1076,7 +1093,9 @@ impl ChangerHandle {
                         at: SystemTime::now(),
                     },
                 );
-                Err(MoveError::ScsiError(e))
+                let mut error = crate::MoveError::pending(crate::MoveErrorKind::ScsiError(e));
+                error.set_outcome(classified);
+                Err(error)
             }
         }
     }
@@ -1441,9 +1460,7 @@ impl LibraryHandle {
         };
         if let Err(ref err) = result {
             let cause = match err {
-                LoadError::DriveLoad(DriveOpError::ScsiError(scsi_err))
-                    if completion_unknown(scsi_err) =>
-                {
+                LoadError::DriveLoad(error) if drive_completion_unknown(error) => {
                     DirtyCause::CompletionUnknown
                 }
                 _ => DirtyCause::PartialFailure,
@@ -1541,12 +1558,12 @@ impl LibraryHandle {
                         // variant so the audit log and the caller's
                         // error handling can tell them apart.
                         let e = if bay_entry.is_none() {
-                            MoveError::AddressUnknown {
+                            crate::MoveError::new(crate::MoveErrorKind::AddressUnknown {
                                 library: self.changer.library.serial.clone(),
                                 addr: bay,
-                            }
+                            })
                         } else {
-                            MoveError::SourceEmpty { addr: bay }
+                            crate::MoveError::new(crate::MoveErrorKind::SourceEmpty { addr: bay })
                         };
                         fire_refused(
                             &mut lock_drive_shared(&self.changer.shared).audit_hook,
@@ -1568,7 +1585,9 @@ impl LibraryHandle {
             .map_err(UnloadError::Move)?
             .0
         {
-            return Err(UnloadError::Move(MoveError::DestinationFull { addr: dst }));
+            return Err(UnloadError::Move(crate::MoveError::new(
+                crate::MoveErrorKind::DestinationFull { addr: dst },
+            )));
         }
         let op = AuditOp::Unload {
             bay,
@@ -1588,13 +1607,13 @@ impl LibraryHandle {
             }
             Err(e) => Err(UnloadError::OpenDrive(e)),
         };
-        if let Err(UnloadError::DriveUnload(DriveOpError::ScsiError(ref e))) = drive_result {
+        if let Err(UnloadError::DriveUnload(ref e)) = drive_result {
             // SSC UNLOAD ambiguous: the drive may have ejected the
             // cartridge mechanically even though we didn't get the
             // status back. Bay state ("loaded = true") can no
             // longer be trusted; mark snapshot dirty so the
             // operator refreshes before the next op.
-            if completion_unknown(e) {
+            if drive_completion_unknown(e) {
                 self.changer.mark_dirty(DirtyCause::CompletionUnknown);
             }
         }
@@ -1637,9 +1656,9 @@ impl ChangerHandle {
                     .first()
                     .map(|p| p.element_address)
                     .unwrap_or(0);
-                let e = MoveError::DestinationFull {
+                let e = crate::MoveError::new(crate::MoveErrorKind::DestinationFull {
                     addr: representative,
-                };
+                });
                 let op = AuditOp::Export { slot, ie: None };
                 fire_refused(
                     &mut lock_drive_shared(&self.shared).audit_hook,
@@ -1678,9 +1697,9 @@ impl ChangerHandle {
                     .first()
                     .map(|p| p.element_address)
                     .unwrap_or(0);
-                let e = MoveError::SourceEmpty {
+                let e = crate::MoveError::new(crate::MoveErrorKind::SourceEmpty {
                     addr: representative,
-                };
+                });
                 let op = AuditOp::Import { ie: None, slot };
                 fire_refused(
                     &mut lock_drive_shared(&self.shared).audit_hook,
@@ -2290,7 +2309,11 @@ impl DriveHandle {
         self.transport
             .configure_reserved_buffer(wanted)
             .map(|granted| granted.min(wanted))
-            .map_err(tape_io::map_scsi)
+            .map_err(|error| {
+                let mut error = tape_io::map_scsi(error);
+                error.finish_synthetic();
+                error
+            })
     }
 
     /// Actual sg reserved buffer size reported for batch sizing at open.
@@ -2401,7 +2424,9 @@ impl DriveHandle {
         use remanence_scsi::load_unload as lu;
         if !load {
             if let MountEndpoint::Durable(DriveKey::Bay { bay, .. }) = &self.endpoint {
-                check_shared_elements(&self.shared, &[*bay]).map_err(DriveOpError::Inventory)?;
+                check_shared_elements(&self.shared, &[*bay]).map_err(|value| {
+                    crate::DriveOpError::new(crate::DriveOpErrorKind::Inventory(value))
+                })?;
                 if !element_state(
                     &lock_drive_shared(&self.shared)
                         .inventory
@@ -2411,23 +2436,23 @@ impl DriveHandle {
                 )?
                 .0
                 {
-                    return Err(DriveOpError::Inventory(MoveError::SourceEmpty {
-                        addr: *bay,
-                    }));
+                    return Err(crate::DriveOpError::new(
+                        crate::DriveOpErrorKind::Inventory(crate::MoveError::new(
+                            crate::MoveErrorKind::SourceEmpty { addr: *bay },
+                        )),
+                    ));
                 }
             }
         }
         let cdb = lu::build_cdb_with_immed(load, immed);
 
-        // Invalidate before dispatch: even a failed LOAD/UNLOAD may have
-        // changed the cartridge. Keep the long mechanical-command timeout.
-        self.transport.reset_media_write_fence_for_load_boundary();
+        // The dispatch gate invalidates load identity only after admission.
         self.issue_drive_control_with_admission(&cdb, op, TimeoutClass::LoadUnload, &mut || {
             admit().map_err(|error| {
                 if load {
-                    DriveOpError::LoadAdmission(error)
+                    crate::DriveOpErrorKind::LoadAdmission(error)
                 } else {
-                    DriveOpError::UnloadAdmission(error)
+                    crate::DriveOpErrorKind::UnloadAdmission(error)
                 }
             })
         })
@@ -2447,8 +2472,19 @@ impl DriveHandle {
         cdb: &[u8],
         op: AuditOp,
         timeout: TimeoutClass,
-        admit: &mut dyn FnMut() -> Result<(), DriveOpError>,
+        admit: &mut dyn FnMut() -> Result<(), crate::DriveOpErrorKind>,
     ) -> Result<(), DriveOpError> {
+        let mut context = self.transport.outcomes.context();
+        context.partition = match self.endpoint().durable_key() {
+            Some(crate::DriveKey::Bay { library_serial, .. }) => {
+                crate::outcome::PartitionIdentity::Changer(library_serial.as_bytes().to_vec())
+            }
+            Some(crate::DriveKey::Standalone { drive_serial }) => {
+                crate::outcome::PartitionIdentity::Standalone(drive_serial.as_bytes().to_vec())
+            }
+            None => crate::outcome::PartitionIdentity::Unknown,
+        };
+        let _context = self.transport.outcomes.scope(context);
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Started {
@@ -2460,12 +2496,19 @@ impl DriveHandle {
         );
         self.transport.set_timeout_for(timeout);
         let started = Instant::now();
-        let result = self
+        let boundary = self
             .transport
-            .execute_none_nonmedia_with_admission(cdb, admit);
-        let result = match result {
-            Err(DriveOpError::ScsiError(error)) => Err(error),
-            Err(error) => {
+            .outcomes
+            .begin(crate::outcome::CommandClass::from_cdb(cdb));
+        let mut result = self
+            .transport
+            .execute_none_nonmedia_with_admission(cdb, admit)
+            .map_err(crate::DriveOpError::pending);
+        self.transport
+            .outcomes
+            .finish_control(boundary, result.as_mut().err());
+        if let Err(error) = &result {
+            if !matches!(&error.kind, crate::DriveOpErrorKind::ScsiError(_)) {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Refused {
@@ -2475,10 +2518,9 @@ impl DriveHandle {
                         at: SystemTime::now(),
                     },
                 );
-                return Err(error);
+                return result;
             }
-            Ok(()) => Ok(()),
-        };
+        }
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
@@ -2497,10 +2539,13 @@ impl DriveHandle {
                 );
                 Ok(())
             }
-            Err(e) => {
+            Err(error) => {
+                let crate::DriveOpErrorKind::ScsiError(e) = &error.kind else {
+                    unreachable!("control error kind")
+                };
                 #[cfg(target_os = "linux")]
-                if let ScsiError::CheckCondition { sense, .. } = &e {
-                    if tape_io::is_reset_unit_attention(sense) {
+                if let Some(sense) = error.completion_evidence().current_sense() {
+                    if sense.key == 6 && sense.asc == 0x29 && matches!(sense.ascq, 0..=4 | 7) {
                         self.invalidate_for_reset_unit_attention();
                     }
                 }
@@ -2510,14 +2555,15 @@ impl DriveHandle {
                 // directly. The audit event still carries the
                 // `dirty: …` field for callers that consume the
                 // audit stream independently of the snapshot.
-                let dirty = completion_unknown(&e);
+                let classified = error.outcome().clone();
+                let dirty = completion_unknown(&classified.evidence, e);
                 if dirty {
                     self.mark_position_unknown();
                     lock_drive_shared(&self.shared)
                         .dirty
                         .mark(DirtyCause::CompletionUnknown);
                 }
-                let outcome = scsi_outcome(&e, dirty);
+                let outcome = scsi_outcome(e, dirty);
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
@@ -2527,7 +2573,7 @@ impl DriveHandle {
                         at: SystemTime::now(),
                     },
                 );
-                Err(DriveOpError::ScsiError(e))
+                Err(error)
             }
         }
     }
@@ -2610,21 +2656,26 @@ fn scsi_outcome(err: &ScsiError, dirty: bool) -> AuditOutcome {
 ///   failure. Completion known: command was not accepted. Not dirty.
 /// - [`ScsiError::InvalidInput`] / `Truncated` / `InvalidResponse`
 ///   — pre-flight or post-flight parse failures. Not dirty.
-fn completion_unknown(err: &ScsiError) -> bool {
-    match err {
-        ScsiError::TransportError { .. } => true,
-        #[cfg(target_os = "linux")]
-        ScsiError::Io(_) => true,
-        #[cfg(target_os = "linux")]
-        ScsiError::CheckCondition { sense, .. } => {
-            remanence_scsi::decode_usable_sense(sense).is_none()
-        }
-        #[cfg(target_os = "linux")]
-        ScsiError::UnexpectedStatus { .. } => false,
-        ScsiError::Cancelled
+fn completion_unknown(evidence: &crate::outcome::CompletionEvidence, error: &ScsiError) -> bool {
+    match error {
+        ScsiError::TransportError { .. } | ScsiError::Io(_) => true,
+        ScsiError::CheckCondition { .. } => evidence.decoded.is_none(),
+        ScsiError::UnexpectedStatus { .. }
+        | ScsiError::Cancelled
         | ScsiError::InvalidInput(_)
+        | ScsiError::HostCapacityRefused(_)
         | ScsiError::Truncated { .. }
         | ScsiError::InvalidResponse { .. } => false,
+    }
+}
+
+/// Preserve the composed-operation dirty rule while reading captured evidence only.
+fn drive_completion_unknown(error: &DriveOpError) -> bool {
+    match &error.kind {
+        crate::DriveOpErrorKind::ScsiError(raw) => {
+            completion_unknown(&error.outcome().evidence, raw)
+        }
+        _ => false,
     }
 }
 
@@ -2632,17 +2683,50 @@ fn completion_unknown(err: &ScsiError) -> bool {
 /// of the [`MoveError`] that caused the refusal.
 fn fire_refused(hook: &mut Option<AuditHook>, library_serial: &str, op: AuditOp, err: &MoveError) {
     let reason: &'static str = match err {
-        MoveError::Admission(_) => "Admission",
-        MoveError::AddressUnknown { .. } => "AddressUnknown",
-        MoveError::SourceEmpty { .. } => "SourceEmpty",
-        MoveError::DestinationFull { .. } => "DestinationFull",
-        MoveError::SameElement { .. } => "SameElement",
-        MoveError::DriveBayUnresolved { .. } => "DriveBayUnresolved",
-        MoveError::DriveBayMissingDevice { .. } => "DriveBayMissingDevice",
-        MoveError::DerivedDriveBay { .. } => "DerivedDriveBay",
-        MoveError::ScsiError(_) => "ScsiError",
-        MoveError::InventoryChanged { .. } => "InventoryChanged",
-        MoveError::NotReady { .. } => "NotReady",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::Admission(_),
+            ..
+        } => "Admission",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::AddressUnknown { .. },
+            ..
+        } => "AddressUnknown",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::SourceEmpty { .. },
+            ..
+        } => "SourceEmpty",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DestinationFull { .. },
+            ..
+        } => "DestinationFull",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::SameElement { .. },
+            ..
+        } => "SameElement",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DriveBayUnresolved { .. },
+            ..
+        } => "DriveBayUnresolved",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DriveBayMissingDevice { .. },
+            ..
+        } => "DriveBayMissingDevice",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::DerivedDriveBay { .. },
+            ..
+        } => "DerivedDriveBay",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::ScsiError(_),
+            ..
+        } => "ScsiError",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::InventoryChanged { .. },
+            ..
+        } => "InventoryChanged",
+        crate::MoveError {
+            kind: crate::MoveErrorKind::NotReady { .. },
+            ..
+        } => "NotReady",
     };
     fire_audit(
         hook,
@@ -2836,19 +2920,18 @@ fn check_shared_elements(
         match (state.changer_transport.clone(), state.inventory.clone()) {
             (Some(transport), Some(inventory)) => (transport, inventory),
             _ => {
-                return Err(MoveError::InventoryChanged {
-                    addr: addresses[0],
-                    expected: "a changer inventory for this handle".into(),
-                    found: "no changer transport shared with this handle".into(),
-                })
+                return Err(crate::MoveError::new(
+                    crate::MoveErrorKind::InventoryChanged {
+                        addr: addresses[0],
+                        expected: "a changer inventory for this handle".into(),
+                        found: "no changer transport shared with this handle".into(),
+                    },
+                ))
             }
         }
     };
-    let data = crate::discovery::issue_res(
+    let data = changer_ready::finish_element_status(
         transport.lock().unwrap_or_else(|e| e.into_inner()).as_mut(),
-        0,
-        true,
-        true,
     )
     .inspect_err(|_| {
         lock_drive_shared(shared)
@@ -2859,11 +2942,11 @@ fn check_shared_elements(
         lock_drive_shared(shared)
             .dirty
             .mark(DirtyCause::CompletionUnknown);
-        MoveError::InventoryChanged {
+        crate::MoveError::new(crate::MoveErrorKind::InventoryChanged {
             addr: addresses[0],
             expected: "known element layout".into(),
             found: err.to_string(),
-        }
+        })
     })?;
     lock_drive_shared(shared).inventory = Some(found.clone());
     let mut refusal = None;
@@ -2873,11 +2956,13 @@ fn check_shared_elements(
         if old != new {
             tracing::warn!(element = addr, expected = ?old, found = ?new, "element inventory changes; command refused");
             if refusal.is_none() {
-                refusal = Some(MoveError::InventoryChanged {
-                    addr,
-                    expected: format!("{old:?}"),
-                    found: format!("{new:?}"),
-                });
+                refusal = Some(crate::MoveError::new(
+                    crate::MoveErrorKind::InventoryChanged {
+                        addr,
+                        expected: format!("{old:?}"),
+                        found: format!("{new:?}"),
+                    },
+                ));
             }
         }
     }
@@ -2907,8 +2992,10 @@ fn element_state(library: &Library, addr: u16) -> Result<(bool, Option<String>),
     {
         return Ok((port.full, port.cartridge.clone()));
     }
-    Err(MoveError::AddressUnknown {
-        library: library.serial.clone(),
-        addr,
-    })
+    Err(crate::MoveError::new(
+        crate::MoveErrorKind::AddressUnknown {
+            library: library.serial.clone(),
+            addr,
+        },
+    ))
 }

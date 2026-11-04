@@ -190,9 +190,10 @@ crates/remanence-library/src/handle/mod.rs::fire_refused::AuditEvent::Refused	1
 crates/remanence-library/src/handle/mod.rs::fire_refused::fire_audit	1
 crates/remanence-library/src/handle/mod.rs::fire_warnings::AuditEvent::Warning	1
 crates/remanence-library/src/handle/mod.rs::fire_warnings::fire_audit	1
-crates/remanence-library/src/handle/mod.rs::issue_drive_control::AuditEvent::Finished	2
-crates/remanence-library/src/handle/mod.rs::issue_drive_control::AuditEvent::Started	1
-crates/remanence-library/src/handle/mod.rs::issue_drive_control::fire_audit	3
+crates/remanence-library/src/handle/mod.rs::issue_drive_control_with_admission::AuditEvent::Finished	2
+crates/remanence-library/src/handle/mod.rs::issue_drive_control_with_admission::AuditEvent::Refused	1
+crates/remanence-library/src/handle/mod.rs::issue_drive_control_with_admission::AuditEvent::Started	1
+crates/remanence-library/src/handle/mod.rs::issue_drive_control_with_admission::fire_audit	4
 crates/remanence-library/src/handle/mod.rs::issue_planned_move::AuditEvent::Finished	2
 crates/remanence-library/src/handle/mod.rs::issue_planned_move::AuditEvent::Started	1
 crates/remanence-library/src/handle/mod.rs::issue_planned_move::fire_audit	3

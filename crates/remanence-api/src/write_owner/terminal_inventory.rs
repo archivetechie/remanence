@@ -69,9 +69,10 @@ pub(crate) fn prepare_catalog_recovery_read(
     source
         .locate_physical(PhysicalPositionHint::new(0))
         .map_err(|error| match error {
-            remanence_parity::ParityError::TapeIo(remanence_library::TapeIoError::Cancelled) => {
-                Status::cancelled("tape verification cancelled")
-            }
+            remanence_parity::ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::Cancelled,
+                ..
+            }) => Status::cancelled("tape verification cancelled"),
             error => Status::unavailable(format!("locate BOT: {error}")),
         })?;
     let mut block = vec![0; block_size as usize];
@@ -92,9 +93,10 @@ pub(crate) fn prepare_catalog_recovery_read(
             prepared.bootstrap_unreadable_reason = Some(format!("read BOT: {error}"));
             return Ok(prepared);
         }
-        Err(ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)) => {
-            return Err(Status::cancelled("tape verification cancelled"))
-        }
+        Err(ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        })) => return Err(Status::cancelled("tape verification cancelled")),
         Err(error) => return Err(Status::unavailable(format!("read BOT: {error}"))),
     }
     match prepared
@@ -142,22 +144,25 @@ pub(crate) fn prepare_drive_for_fixed_read(
 ) -> Result<(), Status> {
     let started = Instant::now();
     let current_cfg = drive.read_config().map_err(|err| match err {
-        remanence_library::TapeIoError::Cancelled => {
-            Status::cancelled("tape verification cancelled")
-        }
+        remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        } => Status::cancelled("tape verification cancelled"),
         err => Status::internal(format!("read drive config: {err}")),
     })?;
     let target_cfg = crate::drive_mode::fixed_uncompressed_target(current_cfg, block_size);
     drive.write_config(target_cfg).map_err(|err| match err {
-        remanence_library::TapeIoError::Cancelled => {
-            Status::cancelled("tape verification cancelled")
-        }
+        remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        } => Status::cancelled("tape verification cancelled"),
         err => Status::internal(format!("set fixed read config: {err}")),
     })?;
     let verified = drive.read_config().map_err(|err| match err {
-        remanence_library::TapeIoError::Cancelled => {
-            Status::cancelled("tape verification cancelled")
-        }
+        remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        } => Status::cancelled("tape verification cancelled"),
         err => Status::internal(format!("verify fixed read config: {err}")),
     })?;
     if verified.block_size != target_cfg.block_size {

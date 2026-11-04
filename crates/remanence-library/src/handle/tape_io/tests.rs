@@ -15,50 +15,56 @@ fn ramp_detector_reports_end_of_first_qualifying_five_second_window() {
 
 #[test]
 fn check_condition_is_not_completion_unknown() {
-    let e = TapeIoError::CheckCondition(ScsiError::CheckCondition {
-        sense: vec![0x70, 0, 5, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0],
-        bytes_transferred: 0,
-    });
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::CheckCondition(
+        ScsiError::CheckCondition {
+            sense: vec![0x70, 0, 5, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0],
+            bytes_transferred: 0,
+        },
+    ));
     assert!(!e.is_completion_unknown());
 }
 
 #[test]
 fn transport_is_completion_unknown() {
-    let e = TapeIoError::Transport(ScsiError::TransportError {
-        status: 0,
-        host_status: 0,
-        driver_status: 0x06,
-        info: 1,
-        sense: Vec::new(),
-    });
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::Transport(
+        ScsiError::TransportError {
+            status: 0,
+            host_status: 0,
+            driver_status: 0x06,
+            info: 1,
+            sense: Vec::new(),
+        },
+    ));
     assert!(e.is_completion_unknown());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn unexpected_status_is_not_completion_unknown() {
-    let e = TapeIoError::UnexpectedStatus(ScsiError::UnexpectedStatus { status: 0x08 });
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::UnexpectedStatus(
+        ScsiError::UnexpectedStatus { status: 0x08 },
+    ));
     assert!(!e.is_completion_unknown());
 }
 
 #[test]
 fn no_medium_is_not_completion_unknown() {
-    let e = TapeIoError::NoMedium;
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::NoMedium);
     assert!(!e.is_completion_unknown());
 }
 
 #[test]
 fn write_protected_is_not_completion_unknown() {
-    let e = TapeIoError::WriteProtected;
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::WriteProtected);
     assert!(!e.is_completion_unknown());
 }
 
 #[test]
 fn block_too_large_carries_drive_reported_limit() {
-    let e = TapeIoError::BlockTooLarge {
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::BlockTooLarge {
         requested: 32 * 1024 * 1024,
         limit: 16 * 1024 * 1024,
-    };
+    });
     // Display includes both values for operator legibility.
     let s = e.to_string();
     assert!(s.contains("33554432"), "requested in display: {s}");
@@ -67,10 +73,10 @@ fn block_too_large_carries_drive_reported_limit() {
 
 #[test]
 fn read_buffer_too_small_carries_both_sizes() {
-    let e = TapeIoError::ReadBufferTooSmall {
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::ReadBufferTooSmall {
         actual: 1_048_576,
         provided: 65_536,
-    };
+    });
     let s = e.to_string();
     assert!(s.contains("1048576"));
     assert!(s.contains("65536"));
@@ -78,9 +84,9 @@ fn read_buffer_too_small_carries_both_sizes() {
 
 #[test]
 fn operation_failed_preserves_context_without_dirty_signal() {
-    let e = TapeIoError::OperationFailed(
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
         "RawTapeSink operation failed: resume append error: catalog callback failed".into(),
-    );
+    ));
     assert!(!e.is_completion_unknown());
     let s = e.to_string();
     assert!(s.contains("RawTapeSink operation failed"));
@@ -107,7 +113,13 @@ fn map_scsi_check_condition_default_path() {
         sense: fixed_sense(0x05, 0x24, 0x00), // INVALID FIELD IN CDB
         bytes_transferred: 0,
     };
-    assert!(matches!(map_scsi(e), TapeIoError::CheckCondition(_)));
+    assert!(matches!(
+        finished_map_scsi(e),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::CheckCondition(_),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -116,7 +128,13 @@ fn map_scsi_no_medium() {
         sense: fixed_sense(0x02, 0x3A, 0x00), // NOT READY / MEDIUM NOT PRESENT
         bytes_transferred: 0,
     };
-    assert!(matches!(map_scsi(e), TapeIoError::NoMedium));
+    assert!(matches!(
+        finished_map_scsi(e),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::NoMedium,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -125,7 +143,13 @@ fn map_scsi_write_protected() {
         sense: fixed_sense(0x07, 0x27, 0x00), // DATA PROTECT / WRITE PROTECTED
         bytes_transferred: 0,
     };
-    assert!(matches!(map_scsi(e), TapeIoError::WriteProtected));
+    assert!(matches!(
+        finished_map_scsi(e),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::WriteProtected,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -134,7 +158,13 @@ fn map_scsi_data_protect_other_asc() {
         sense: fixed_sense(0x07, 0x74, 0x05), // DATA PROTECT / other (encryption mismatch)
         bytes_transferred: 0,
     };
-    assert!(matches!(map_scsi(e), TapeIoError::DataProtect(_)));
+    assert!(matches!(
+        finished_map_scsi(e),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::DataProtect(_),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -146,30 +176,54 @@ fn map_scsi_transport_error_is_completion_unknown() {
         info: 1,
         sense: Vec::new(),
     };
-    let mapped = map_scsi(e);
-    assert!(matches!(mapped, TapeIoError::Transport(_)));
+    let mapped = finished_map_scsi(e);
+    assert!(matches!(
+        mapped,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::Transport(_),
+            ..
+        }
+    ));
     assert!(mapped.is_completion_unknown());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn map_scsi_unexpected_status_is_not_completion_unknown() {
-    let mapped = map_scsi(ScsiError::UnexpectedStatus { status: 0x18 });
-    assert!(matches!(mapped, TapeIoError::UnexpectedStatus(_)));
+    let mapped = finished_map_scsi(ScsiError::UnexpectedStatus { status: 0x18 });
+    assert!(matches!(
+        mapped,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::UnexpectedStatus(_),
+            ..
+        }
+    ));
     assert!(!mapped.is_completion_unknown());
 }
 
 #[test]
 fn map_scsi_invalid_input_is_invalid_request() {
-    let mapped = map_scsi(ScsiError::InvalidInput("test request bug"));
-    assert!(matches!(mapped, TapeIoError::InvalidRequest(_)));
+    let mapped = finished_map_scsi(ScsiError::InvalidInput("test request bug"));
+    assert!(matches!(
+        mapped,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::InvalidRequest(_),
+            ..
+        }
+    ));
     assert!(!mapped.is_completion_unknown());
 }
 
 #[test]
 fn map_scsi_truncated_response_is_malformed_response() {
-    let mapped = map_scsi(ScsiError::Truncated { got: 4, need: 32 });
-    assert!(matches!(mapped, TapeIoError::MalformedResponse(_)));
+    let mapped = finished_map_scsi(ScsiError::Truncated { got: 4, need: 32 });
+    assert!(matches!(
+        mapped,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedResponse(_),
+            ..
+        }
+    ));
     assert!(!mapped.is_completion_unknown());
 }
 
@@ -187,7 +241,13 @@ fn map_scsi_descriptor_sense_maps_key_asc() {
         sense,
         bytes_transferred: 0,
     };
-    assert!(matches!(map_scsi(e), TapeIoError::NoMedium));
+    assert!(matches!(
+        finished_map_scsi(e),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::NoMedium,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -266,7 +326,10 @@ fn parse_read_position_rejects_short_buffer() {
     let buf = [0u8; 20];
     let err = parse_read_position_long(&buf).expect_err("short buffer rejected");
     match err {
-        TapeIoError::MalformedResponse(ScsiError::Truncated { got, need }) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedResponse(ScsiError::Truncated { got, need }),
+            ..
+        } => {
             assert_eq!(got, 20);
             assert_eq!(need, 32);
         }
@@ -276,10 +339,12 @@ fn parse_read_position_rejects_short_buffer() {
 
 #[test]
 fn tape_outcome_extracts_sense_from_check_condition() {
-    let e = TapeIoError::CheckCondition(ScsiError::CheckCondition {
-        sense: vec![0x70, 0, 0x05, 0, 0, 0, 0, 24],
-        bytes_transferred: 0,
-    });
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::CheckCondition(
+        ScsiError::CheckCondition {
+            sense: vec![0x70, 0, 0x05, 0, 0, 0, 0, 24],
+            bytes_transferred: 0,
+        },
+    ));
     let outcome = tape_outcome(&e, false);
     match outcome {
         AuditOutcome::ScsiError { sense, dirty, .. } => {
@@ -298,13 +363,13 @@ fn tape_outcome_extracts_sense_from_corrected_residue() {
         0x00, 0x64, 0x02, 0x20, 0x00, 0x06, 0x01, 0x41, 0x4f, 0x58, 0x30, 0x33, 0x32, 0x4c, 0x00,
         0x00, 0x00,
     ];
-    let error = TapeIoError::CheckConditionWithResidue {
+    let error = crate::TapeIoError::new(crate::TapeIoErrorKind::CheckConditionWithResidue {
         source: ScsiError::CheckCondition {
             sense: sense.clone(),
             bytes_transferred: 262_144,
         },
         bytes_transferred: 0,
-    };
+    });
     let expected = format!("drive rejected the command: SCSI check condition (bytes_transferred=0; kernel reported 262144): sense={sense:02x?}");
     assert_eq!(error.to_string(), expected);
     let source = std::error::Error::source(&error).unwrap();
@@ -331,13 +396,15 @@ fn tape_outcome_extracts_sense_from_corrected_residue() {
 
 #[test]
 fn tape_outcome_marks_dirty_when_caller_says() {
-    let e = TapeIoError::Transport(ScsiError::TransportError {
-        status: 0,
-        host_status: 0,
-        driver_status: 0x06,
-        info: 1,
-        sense: Vec::new(),
-    });
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::Transport(
+        ScsiError::TransportError {
+            status: 0,
+            host_status: 0,
+            driver_status: 0x06,
+            info: 1,
+            sense: Vec::new(),
+        },
+    ));
     let outcome = tape_outcome(&e, true);
     match outcome {
         AuditOutcome::ScsiError { dirty, .. } => assert!(dirty),
@@ -347,7 +414,7 @@ fn tape_outcome_marks_dirty_when_caller_says() {
 
 #[test]
 fn tape_outcome_no_medium_has_no_sense() {
-    let e = TapeIoError::NoMedium;
+    let e = crate::TapeIoError::new(crate::TapeIoErrorKind::NoMedium);
     let outcome = tape_outcome(&e, false);
     match outcome {
         AuditOutcome::ScsiError { sense, .. } => assert!(sense.is_none()),
@@ -794,7 +861,10 @@ fn parse_mode_sense_rejects_short_header() {
     let buf = [0u8; 3];
     assert!(matches!(
         parse_mode_sense_data_compression(&buf),
-        Err(TapeIoError::MalformedModeResponse(_))
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedModeResponse(_),
+            ..
+        })
     ));
 }
 
@@ -804,7 +874,10 @@ fn parse_mode_sense_rejects_unexpected_bdl() {
     buf[3] = 0; // no block descriptor
     let err = parse_mode_sense_data_compression(&buf).unwrap_err();
     match err {
-        TapeIoError::MalformedModeResponse(msg) => assert!(msg.contains("block descriptor")),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedModeResponse(msg),
+            ..
+        } => assert!(msg.contains("block descriptor")),
         other => panic!("expected MalformedModeResponse, got {other:?}"),
     }
 }
@@ -815,7 +888,10 @@ fn parse_mode_sense_rejects_wrong_page_code() {
     buf[12] = 0x10; // device-config page instead of compression
     let err = parse_mode_sense_data_compression(&buf).unwrap_err();
     match err {
-        TapeIoError::MalformedModeResponse(msg) => assert!(msg.contains("0x10")),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::MalformedModeResponse(msg),
+            ..
+        } => assert!(msg.contains("0x10")),
         other => panic!("expected MalformedModeResponse, got {other:?}"),
     }
 }
@@ -927,7 +1003,6 @@ mod reowp_drive_surface {
     use remanence_scsi::report_supported_opcodes::OpcodeSupport;
     use remanence_scsi::ScsiError;
 
-    use crate::handle::tape_io::TapeIoError;
     use crate::handle::DriveHandle;
     use crate::transport::{FixtureTransport, SgTransport, TransferOutcome};
 
@@ -1067,7 +1142,13 @@ mod reowp_drive_surface {
             .read_end_of_wrap_position()
             .expect_err("rejection surfaces");
         assert!(
-            matches!(err, TapeIoError::CheckCondition(_)),
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::CheckCondition(_),
+                    ..
+                }
+            ),
             "drive rejection must map to CheckCondition, got {err:?}"
         );
     }
@@ -1136,7 +1217,13 @@ mod reowp_drive_surface {
             if accepted {
                 result.expect("unsupported partition page means one partition");
             } else {
-                assert!(matches!(result, Err(TapeIoError::PartitionProbeFailed(_))));
+                assert!(matches!(
+                    result,
+                    Err(crate::TapeIoError {
+                        kind: crate::TapeIoErrorKind::PartitionProbeFailed(_),
+                        ..
+                    })
+                ));
             }
         }
     }
@@ -1154,7 +1241,13 @@ mod reowp_drive_surface {
             .read_end_of_wrap_position()
             .expect_err("ragged payload rejected");
         assert!(
-            matches!(err, TapeIoError::MalformedResponse(_)),
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::MalformedResponse(_),
+                    ..
+                }
+            ),
             "expected MalformedResponse, got {err:?}"
         );
     }
@@ -1218,4 +1311,9 @@ fn long_position_report_file_identifier_and_validity() {
         assert_eq!(report.logical_object_number_unknown, flags & LONU_BIT != 0);
         assert_eq!(report.mark_position_unknown, flags & MPU_BIT != 0);
     }
+}
+
+/// Adapt direct mapper fixtures to the public finalized error carrier.
+fn finished_map_scsi(error: ScsiError) -> TapeIoError {
+    TapeIoError::new(super::map_scsi(error).kind)
 }

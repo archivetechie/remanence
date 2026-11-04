@@ -37,7 +37,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use remanence_scsi::{decode_sense, ScsiError};
+use remanence_scsi::ScsiError;
 
 use super::TapeIoError;
 use crate::transport::{SgTransport, TimeoutClass, TransferOutcome};
@@ -354,6 +354,7 @@ pub(in crate::handle) struct MediaFencedTransport {
     observer: Option<Box<dyn MediaDispatchObserver>>,
     deadline: Option<std::sync::Arc<std::sync::OnceLock<Instant>>>,
     completion_unknown: bool,
+    pub(in crate::handle) outcomes: crate::outcome::CommandOutcomes,
 }
 
 impl MediaFencedTransport {
@@ -374,6 +375,7 @@ impl MediaFencedTransport {
             observer: None,
             deadline: None,
             completion_unknown: false,
+            outcomes: Default::default(),
         }
     }
 
@@ -420,10 +422,12 @@ impl MediaFencedTransport {
         proved: u64,
     ) -> Result<(), TapeIoError> {
         if proved != self.identity_generation {
-            return Err(TapeIoError::IdentityInvalidated {
-                proved,
-                current: self.identity_generation,
-            });
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::IdentityInvalidated {
+                    proved,
+                    current: self.identity_generation,
+                },
+            ));
         }
         Ok(())
     }
@@ -490,6 +494,7 @@ impl MediaFencedTransport {
         self.verification.check_cancelled()?;
         self.check_command_deadline()?;
         let result = self.inner.execute_in(cdb, buf);
+        let gate_error = self.record_command(cdb, buf.len(), result.as_ref().map(Some));
         #[cfg(feature = "field-kit")]
         crate::field_trace::record(
             &self.field_identity,
@@ -498,13 +503,20 @@ impl MediaFencedTransport {
             &result.as_ref().map(Clone::clone),
             started.elapsed(),
         );
-        self.verification
-            .dispatch(cdb, buf, &result, started.elapsed());
+        self.verification.dispatch_completed(
+            cdb,
+            buf,
+            &result,
+            started.elapsed(),
+            self.outcomes
+                .current_evidence()
+                .expect("captured completion"),
+        );
         if let Ok(outcome) = &result {
             self.note_outcome(outcome);
         }
-        if let Err(error) = &result {
-            self.note_error(error, cdb.first() == Some(&0x00));
+        if let Some(evidence) = gate_error {
+            self.note_error(&evidence, cdb.first() == Some(&0x00));
         }
         result
     }
@@ -536,7 +548,13 @@ impl MediaFencedTransport {
         self.verification.check_cancelled()?;
         self.check_command_deadline()?;
         admit()?;
+        // A refused LOAD/UNLOAD has not changed the cartridge or its proof.
+        // Once admitted, invalidate before dispatch even if completion fails.
+        if cdb.first() == Some(&0x1b) {
+            self.reset_media_write_fence_for_load_boundary();
+        }
         let result = self.inner.execute_none(cdb);
+        let gate_error = self.record_command(cdb, 0, result.as_ref().map(|_| None));
         #[cfg(feature = "field-kit")]
         crate::field_trace::record(
             &self.field_identity,
@@ -545,10 +563,17 @@ impl MediaFencedTransport {
             &result.as_ref().map(|_| TransferOutcome::clean(0)),
             started.elapsed(),
         );
-        self.verification
-            .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)), started.elapsed());
-        if let Err(error) = &result {
-            self.note_error(error, cdb.first() == Some(&0x00));
+        self.verification.dispatch_completed(
+            cdb,
+            &[],
+            &Ok(TransferOutcome::clean(0)),
+            started.elapsed(),
+            self.outcomes
+                .current_evidence()
+                .expect("captured completion"),
+        );
+        if let Some(evidence) = gate_error {
+            self.note_error(&evidence, cdb.first() == Some(&0x00));
         }
         result.map_err(E::from)
     }
@@ -611,9 +636,11 @@ impl MediaFencedTransport {
     ) -> Result<Option<TransferOutcome>, MediaDispatchError> {
         let Some(class) = classify_write_direction_cdb(cdb) else {
             return Err(MediaDispatchError::NotDispatched(
-                TapeIoError::InvalidRequest(ScsiError::InvalidInput(
-                    "media-dispatch gate refused an unclassified write-direction CDB; \
+                crate::TapeIoError::pending(crate::TapeIoErrorKind::InvalidRequest(
+                    ScsiError::InvalidInput(
+                        "media-dispatch gate refused an unclassified write-direction CDB; \
                      classify the opcode in the gate before dispatching it",
+                    ),
                 )),
             ));
         };
@@ -626,16 +653,16 @@ impl MediaFencedTransport {
         };
         if !phase_valid {
             return Err(MediaDispatchError::NotDispatched(
-                TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                crate::TapeIoError::pending(crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(
                     "media-dispatch gate refused a CDB whose data phase does not match its opcode",
-                )),
+                ))),
             ));
         }
 
         if class == WriteDirectionClass::MediaModifying {
             if !self.writable {
                 return Err(MediaDispatchError::NotDispatched(
-                    TapeIoError::EphemeralReadOnly,
+                    crate::TapeIoError::pending(crate::TapeIoErrorKind::EphemeralReadOnly),
                 ));
             }
             self.check_identity_generation(self.write_identity_generation)
@@ -644,7 +671,9 @@ impl MediaFencedTransport {
         if class == WriteDirectionClass::MediaModifying && !self.fenced_this_load {
             if let Err(fence_error) = self.fence.fence_media_write() {
                 return Err(MediaDispatchError::NotDispatched(
-                    TapeIoError::WriteFenceNotDurable(fence_error),
+                    crate::TapeIoError::pending(crate::TapeIoErrorKind::WriteFenceNotDurable(
+                        fence_error,
+                    )),
                 ));
             }
             self.fenced_this_load = true;
@@ -652,8 +681,10 @@ impl MediaFencedTransport {
 
         let next_dispatch_count = if class == WriteDirectionClass::MediaModifying {
             self.media_write_dispatch_count.checked_add(1).ok_or(
-                MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(
-                    ScsiError::InvalidInput("media dispatch counter exhausted"),
+                MediaDispatchError::NotDispatched(crate::TapeIoError::pending(
+                    crate::TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(
+                        "media dispatch counter exhausted",
+                    )),
                 )),
             )?
         } else {
@@ -664,17 +695,25 @@ impl MediaFencedTransport {
             .check_cancelled()
             .map_err(MediaDispatchError::Scsi)?;
         self.check_command_deadline().map_err(|error| {
-            MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(error))
+            MediaDispatchError::NotDispatched(crate::TapeIoError::pending(
+                crate::TapeIoErrorKind::InvalidRequest(error),
+            ))
         })?;
         if let Some(observer) = self.observer.as_mut() {
             observer
                 .dispatching(cdb, data_out)
                 .map_err(MediaDispatchError::NotDispatched)?;
         }
-        let result = match data_out {
+        let (result, gate_error) = match data_out {
             Some(buf) => {
                 let started = Instant::now();
                 let result = self.inner.execute_out(cdb, buf);
+                // A typed host refusal proves that no media command was issued.
+                // Record the final watermark with the single completion carrier.
+                if !matches!(&result, Err(ScsiError::HostCapacityRefused(_))) {
+                    self.media_write_dispatch_count = next_dispatch_count;
+                }
+                let gate_error = self.record_command(cdb, buf.len(), result.as_ref().map(Some));
                 #[cfg(feature = "field-kit")]
                 crate::field_trace::record(
                     &self.field_identity,
@@ -683,16 +722,29 @@ impl MediaFencedTransport {
                     &result.as_ref().map(Clone::clone),
                     started.elapsed(),
                 );
-                self.verification
-                    .dispatch(cdb, buf, &result, started.elapsed());
+                self.verification.dispatch_completed(
+                    cdb,
+                    buf,
+                    &result,
+                    started.elapsed(),
+                    self.outcomes
+                        .current_evidence()
+                        .expect("captured completion"),
+                );
                 if let Ok(outcome) = &result {
                     self.note_outcome(outcome);
                 }
-                result.map(Some)
+                (result.map(Some), gate_error)
             }
             None => {
                 let started = Instant::now();
                 let result = self.inner.execute_none(cdb);
+                // A typed host refusal proves that no media command was issued.
+                // Record the final watermark with the single completion carrier.
+                if !matches!(&result, Err(ScsiError::HostCapacityRefused(_))) {
+                    self.media_write_dispatch_count = next_dispatch_count;
+                }
+                let gate_error = self.record_command(cdb, 0, result.as_ref().map(|_| None));
                 #[cfg(feature = "field-kit")]
                 crate::field_trace::record(
                     &self.field_identity,
@@ -701,28 +753,87 @@ impl MediaFencedTransport {
                     &result.as_ref().map(|_| TransferOutcome::clean(0)),
                     started.elapsed(),
                 );
-                self.verification.dispatch(
+                self.verification.dispatch_completed(
                     cdb,
                     &[],
                     &Ok(TransferOutcome::clean(0)),
                     started.elapsed(),
+                    self.outcomes
+                        .current_evidence()
+                        .expect("captured completion"),
                 );
-                result.map(|()| None)
+                (result.map(|()| None), gate_error)
             }
         };
-        // InvalidInput (including sg ENOMEM/EINVAL) proves the CDB was not
-        // issued. Do not make a refused write look fenceable to session owners.
-        // The pre-dispatch calibration fence deliberately remains in force.
-        if !matches!(&result, Err(ScsiError::InvalidInput(_))) {
-            self.media_write_dispatch_count = next_dispatch_count;
-        }
         if let Some(observer) = self.observer.as_mut() {
             observer.settled(cdb, &result);
         }
-        result.map_err(|error| {
-            self.note_error(&error, false);
-            MediaDispatchError::Scsi(error)
-        })
+        if let Some(evidence) = gate_error {
+            self.note_error(&evidence, false);
+        }
+        result.map_err(MediaDispatchError::Scsi)
+    }
+
+    /// Capture the issued CDB's own completion. Command owners finalize it after
+    /// parsing, EOM arbitration and position proof produce the public result.
+    fn record_command(
+        &mut self,
+        cdb: &[u8],
+        requested: usize,
+        result: Result<Option<&TransferOutcome>, &ScsiError>,
+    ) -> Option<crate::outcome::CompletionEvidence> {
+        use crate::outcome::{CommandClass, CompletionEvidence};
+        let class = CommandClass::from_cdb(cdb);
+        let mut evidence = match result {
+            Ok(transfer) => {
+                let mut evidence = CompletionEvidence::success();
+                if let Some(transfer) = transfer {
+                    evidence.host_transferred_bytes = Some(u64::from(transfer.bytes_transferred));
+                    evidence.transferred_bytes = evidence.host_transferred_bytes;
+                }
+                evidence
+            }
+            Err(error) => CompletionEvidence::from_scsi(error),
+        };
+        // Gate invalidation uses the raw transport result, at its original
+        // point after observers. In particular, InvalidInput during a control
+        // probe does not invalidate identity; the issued-command carrier below
+        // cannot assume it proves a dispatched WRITE did not execute.
+        let gate_error = evidence.failed.then(|| evidence.clone());
+        let fixed = matches!(class, CommandClass::Read | CommandClass::Write)
+            && cdb.get(1).is_some_and(|v| v & 1 != 0);
+        let records = if fixed && cdb.len() >= 5 {
+            Some(u32::from_be_bytes([0, cdb[2], cdb[3], cdb[4]]))
+        } else {
+            None
+        };
+        let size = records
+            .filter(|n| *n != 0)
+            .and_then(|n| u32::try_from(requested).ok().map(|bytes| bytes / n));
+        evidence.requested_bytes = Some(requested as u64);
+        evidence.requested_records = records;
+        evidence.block_size = size;
+        // This record is made only after the inner transport was called. Host
+        // adapters may return InvalidInput after a dispatched operation; that
+        // error alone does not prove the device command was refused beforehand.
+        // HostCapacityRefused instead carries the ioctl boundary's explicit
+        // pre-dispatch guarantee and retains the normalized NotIssued evidence.
+        if evidence.dispatch == crate::outcome::Dispatch::NotIssued
+            && !matches!(result, Err(ScsiError::HostCapacityRefused(_)))
+        {
+            evidence = CompletionEvidence::unknown();
+        }
+        evidence.opcode = cdb.first().copied();
+        evidence.service_action = match evidence.opcode {
+            Some(0x34 | 0xa3 | 0xa4 | 0x9e | 0x9f) => cdb.get(1).map(|v| u16::from(v & 0x1f)),
+            _ => None,
+        };
+        evidence.requested_bytes = Some(requested as u64);
+        evidence.requested_records = records;
+        evidence.block_size = size;
+        self.outcomes
+            .record(class, evidence, self.media_write_dispatch_count);
+        gate_error
     }
 
     /// Any UNIT ATTENTION observed on this transport means device
@@ -740,16 +851,22 @@ impl MediaFencedTransport {
         }
     }
 
-    fn note_error(&mut self, error: &ScsiError, readiness_check: bool) {
-        if self.deadline.is_some() && crate::handle::completion_unknown(error) {
+    fn note_error(&mut self, evidence: &crate::outcome::CompletionEvidence, readiness_check: bool) {
+        // Preserve the existing gate distinction: a usable deferred CHECK
+        // CONDITION invalidates identity, but does not set the shutdown flag.
+        // Host/driver failure stays unknown even with captured deferred sense.
+        let deferred = evidence.scsi_status == Some(2)
+            && evidence.host_status.is_none()
+            && evidence.driver_status.is_none()
+            && evidence.decoded.is_some_and(|sense| sense.is_deferred());
+        let unknown = evidence.completion == crate::outcome::Completion::Unknown && !deferred;
+        if self.deadline.is_some() && unknown {
             self.completion_unknown = true;
         }
-        let unit_attention = matches!(error, ScsiError::CheckCondition { sense, .. }
-            if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x06));
-        let deferred = matches!(error, ScsiError::CheckCondition { sense, .. }
-            if super::sense_is_deferred(sense));
-        if readiness_check || unit_attention || deferred || crate::handle::completion_unknown(error)
-        {
+        let unit_attention = evidence
+            .current_sense()
+            .is_some_and(|decoded| decoded.key == 0x06);
+        if readiness_check || unit_attention || deferred || unknown {
             self.invalidate_identity();
         }
     }
@@ -769,6 +886,23 @@ impl fmt::Debug for MediaFencedTransport {
 mod tests {
     use super::*;
     use crate::transport::FixtureTransport;
+
+    /// Truncated attention is unknown completion, invalidating identity and latching shutdown uncertainty.
+    #[test]
+    fn b3b_media_gate_truncated_attention_is_unknown() {
+        let (mut transport, _) = fenced_fixture();
+        transport.set_command_deadline(Some(std::sync::Arc::new(std::sync::OnceLock::new())));
+        let error = ScsiError::CheckCondition {
+            sense: vec![0x70, 0, 6],
+            bytes_transferred: 0,
+        };
+        let evidence = crate::outcome::CompletionEvidence::from_scsi(&error);
+        assert!(evidence.current_sense().is_none());
+        let generation = transport.identity_generation();
+        transport.note_error(&evidence, false);
+        assert!(transport.identity_generation() > generation);
+        assert!(transport.command_completion_unknown());
+    }
 
     /// Once cancellation is requested, no dispatch direction reaches the transport.
     #[test]
@@ -881,7 +1015,10 @@ mod tests {
             .dispatch_media_out(&[0x19, 0, 0, 0, 0, 0], &[])
             .expect_err("ERASE(6) is unclassified and must be refused");
         match err {
-            MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(_)) => {}
+            MediaDispatchError::NotDispatched(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::InvalidRequest(_),
+                ..
+            }) => {}
             other => panic!("expected NotDispatched(InvalidRequest), got {other:?}"),
         }
         assert_eq!(control.fence_transactions(), 0, "no fence ran");
@@ -897,7 +1034,10 @@ mod tests {
             .expect_err("filemarks with data-out must be refused");
         assert!(matches!(
             err,
-            MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(_))
+            MediaDispatchError::NotDispatched(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::InvalidRequest(_),
+                ..
+            })
         ));
         // WRITE(6) with no data phase.
         let err = transport
@@ -905,7 +1045,10 @@ mod tests {
             .expect_err("WRITE with no data phase must be refused");
         assert!(matches!(
             err,
-            MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(_))
+            MediaDispatchError::NotDispatched(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::InvalidRequest(_),
+                ..
+            })
         ));
         assert_eq!(control.fence_transactions(), 0);
     }
@@ -922,7 +1065,10 @@ mod tests {
             .dispatch_media_out(&[0x0A, 0, 0, 0, 1, 0], &[0u8; 1])
             .expect_err("failed fence must refuse dispatch");
         match err {
-            MediaDispatchError::NotDispatched(TapeIoError::WriteFenceNotDurable(inner)) => {
+            MediaDispatchError::NotDispatched(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::WriteFenceNotDurable(inner),
+                ..
+            }) => {
                 assert!(inner.reason().contains("journal write failed"));
             }
             other => panic!("expected WriteFenceNotDurable, got {other:?}"),
@@ -955,7 +1101,10 @@ mod tests {
             .expect_err("exhausted allocator must fail closed");
         assert!(matches!(
             err,
-            MediaDispatchError::NotDispatched(TapeIoError::WriteFenceNotDurable(_))
+            MediaDispatchError::NotDispatched(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::WriteFenceNotDurable(_),
+                ..
+            })
         ));
         assert_eq!(control.write_epoch(), u64::MAX, "no wrap");
         assert!(!transport.media_write_fenced_this_load());
@@ -1038,23 +1187,28 @@ mod tests {
         gate.install_media_write_fence(Box::new(control.clone()));
         assert!(matches!(
             gate.bind_identity_generation(proved),
-            Err(TapeIoError::IdentityInvalidated { .. })
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+                ..
+            })
         ));
         for fixed in [0, 1] {
             assert!(matches!(
                 gate.dispatch_media_out(&[0x0a, fixed, 0, 0, 1, 0], &[0; 64]),
-                Err(MediaDispatchError::NotDispatched(
-                    TapeIoError::IdentityInvalidated { .. }
-                ))
+                Err(MediaDispatchError::NotDispatched(crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+                    ..
+                }))
             ));
         }
         for immed in [0, 1] {
             for count in [0, 1] {
                 assert!(matches!(
                     gate.dispatch_media_none(&[0x10, immed, 0, 0, count, 0]),
-                    Err(MediaDispatchError::NotDispatched(
-                        TapeIoError::IdentityInvalidated { .. }
-                    ))
+                    Err(MediaDispatchError::NotDispatched(crate::TapeIoError {
+                        kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+                        ..
+                    }))
                 ));
             }
         }

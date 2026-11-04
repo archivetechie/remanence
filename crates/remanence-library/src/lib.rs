@@ -30,6 +30,7 @@ pub use endpoint::{DriveKey, MountEndpoint};
 pub mod handle;
 pub mod model;
 pub mod ops;
+pub mod outcome;
 pub mod physical_io;
 pub mod sysfs;
 pub mod transport;
@@ -45,8 +46,8 @@ pub use discovery::discover;
 pub use discovery::{discover_enumerated_with, discover_with};
 pub use error::{
     AuditEvent, AuditOp, AuditOutcome, AuditSubject, DiscoveryError, DiscoveryWarning,
-    DriveOpError, IoErrorKind, LoadError, MoveError, OpenError, RescanError, RescanWarning,
-    UnloadError,
+    DriveOpError, DriveOpErrorKind, IoErrorKind, LoadError, MoveError, MoveErrorKind, OpenError,
+    RescanError, RescanWarning, UnloadError,
 };
 pub use handle::changer_ready::{
     changer_sense_name, classify_changer_not_ready, classify_changer_ready_transition,
@@ -60,13 +61,14 @@ pub use handle::tape_io::{
     media_readiness_sense_name, verification_read_completion, wrap_map_is_servable,
     AppendBoundaryProof, AppendSession, BlockSize, ComputedPosition, DevicePositionProof,
     DriveErrorCounters, InMemoryCalibrationControl, MediaDispatchObserver, MediaFamily,
-    MediaReadiness, MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
-    MediaWriteFence, MediaWriteFenceError, NoCalibrationControl, PipelinedReadDiagnostics,
-    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
-    ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
-    TapeConfig, TapeIoError, TapePosition, TapePositionReport, VerificationReadCompletion,
-    WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
-    WriteUnpositionedOutcome, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+    MediaReadiness, MediaReadinessKind, MediaReadinessPoll, MediaReadinessWaitEvent,
+    MediaReadinessWaitOptions, MediaWriteFence, MediaWriteFenceError, NoCalibrationControl,
+    PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome,
+    ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags,
+    SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError, TapeIoErrorKind,
+    TapePosition, TapePositionReport, VerificationReadCompletion, WormMediaState,
+    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
+    MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
 pub use handle::{
     ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,

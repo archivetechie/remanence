@@ -893,7 +893,11 @@ fn read_objects(
                 file,
                 OpenTrust::RequireValidated,
             )
-            .map_err(|e| TapeIoError::OperationFailed(e.to_string()))?;
+            .map_err(|e| {
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(e.to_string()),
+                )
+            })?;
             source.set_audit_hook(Some(log.clone()));
             BlockSource::locate(&mut source, block)?;
             let mut buf = vec![0; block_size as usize];

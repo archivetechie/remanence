@@ -1,21 +1,27 @@
 //! Bounded native-session suffix proofs. Named tails constrain physical command
 //! completion; crash-only TornPrefix identities additionally bind every byte.
 use super::AdmissionError;
-use remanence_library::{DriveHandle, TapeIoError};
+use remanence_library::DriveHandle;
 use remanence_state::tape_log::{TailFile, TailFilemark, TailIdentity};
 use sha2::{Digest, Sha256};
 
 fn contradiction(detail: &str) -> AdmissionError {
-    AdmissionError::Unproved(format!("SessionSuffixContradiction: {detail}"))
+    crate::append_admission::AdmissionError::pending(
+        crate::append_admission::AdmissionErrorKind::Unproved(format!(
+            "SessionSuffixContradiction: {detail}"
+        )),
+    )
 }
 
 pub(super) fn eod(drive: &mut DriveHandle, size: u32) -> Result<(), AdmissionError> {
     let mut block = vec![0; size as usize];
     match drive.read_block(&mut block) {
         Err(e) if e.is_physical_eod() => Ok(()),
-        Err(TapeIoError::FilemarkEncountered) | Ok(_) => {
-            Err(contradiction("unexpected file after named suffix"))
-        }
+        Err(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+            ..
+        })
+        | Ok(_) => Err(contradiction("unexpected file after named suffix")),
         Err(e) => Err(e.into()),
     }
 }
@@ -37,7 +43,11 @@ pub(super) fn own_closeout(
                 digest.update(&block);
                 count += 1;
             }
-            Ok(_) | Err(TapeIoError::FilemarkEncountered) => {
+            Ok(_)
+            | Err(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                ..
+            }) => {
                 return Err(contradiction(
                     "closeout sidecar differs from checked encoding",
                 ))
@@ -47,7 +57,10 @@ pub(super) fn own_closeout(
     }
     match drive.read_block(&mut block) {
         Err(e) if e.is_physical_eod() => Ok((count, false, digest.finalize().into())),
-        Err(TapeIoError::FilemarkEncountered) => {
+        Err(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+            ..
+        }) => {
             eod(drive, size)?;
             Ok((count, true, digest.finalize().into()))
         }
@@ -81,7 +94,10 @@ pub(super) fn named_file(
                 count += 1;
             }
             Ok(_) => return Err(contradiction("tail block count or geometry differs")),
-            Err(TapeIoError::FilemarkEncountered) => break true,
+            Err(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                ..
+            }) => break true,
             Err(e) if e.is_physical_eod() => break false,
             Err(e) => return Err(e.into()),
         }

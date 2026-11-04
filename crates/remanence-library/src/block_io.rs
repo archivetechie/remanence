@@ -64,6 +64,21 @@ use crate::handle::DriveHandle;
 /// parity layer (Layer 3c) both consume `&mut dyn BlockSink` and
 /// are oblivious to which implementation they have.
 pub trait BlockSink {
+    /// Finish an adapter fact using the drive that owns this write operation.
+    fn finish_adapter_error(&mut self, kind: crate::TapeIoErrorKind) -> TapeIoError {
+        match self.append_admission_drive() {
+            Some(drive) => drive.finish_adapter_error(kind, crate::outcome::CommandClass::Write),
+            None => TapeIoError::new_with_context(
+                kind,
+                crate::outcome::CommandClass::Write,
+                crate::outcome::OperationContext {
+                    phase: crate::outcome::Phase::Append,
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
     /// Physical drive behind a direct sink, when one exists. Terminal owners
     /// use this to run the shared read-capable admission before emitting a plan.
     fn append_admission_drive(&mut self) -> Option<&mut DriveHandle> {
@@ -82,14 +97,18 @@ pub trait BlockSink {
         block_size_bytes: u32,
     ) -> Result<WriteBatchOutcome, TapeIoError> {
         if block_size_bytes == 0 {
-            return Err(TapeIoError::OperationFailed(
-                "write_block_batch block size must be nonzero".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "write_block_batch block size must be nonzero".to_string(),
+                ),
             ));
         }
         let block_size = block_size_bytes as usize;
         if buf.is_empty() || !buf.len().is_multiple_of(block_size) {
-            return Err(TapeIoError::OperationFailed(
-                "write_block_batch buffer must contain whole records".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "write_block_batch buffer must contain whole records".to_string(),
+                ),
             ));
         }
         let mut records = 0u32;
@@ -100,10 +119,14 @@ pub trait BlockSink {
         for block in buf.chunks_exact(block_size) {
             let outcome = self.write_block(block)?;
             records = records.checked_add(1).ok_or_else(|| {
-                TapeIoError::OperationFailed("write batch record count overflow".to_string())
+                self.finish_adapter_error(crate::TapeIoErrorKind::OperationFailed(
+                    "write batch record count overflow".to_string(),
+                ))
             })?;
             bytes = bytes.checked_add(outcome.bytes_written).ok_or_else(|| {
-                TapeIoError::OperationFailed("write batch byte count overflow".to_string())
+                self.finish_adapter_error(crate::TapeIoErrorKind::OperationFailed(
+                    "write batch byte count overflow".to_string(),
+                ))
             })?;
             early_warning |= outcome.early_warning;
             end_of_medium |= outcome.end_of_medium;
@@ -219,8 +242,10 @@ pub trait BlockSink {
     /// tape file. Real drives use SSC SPACE(EOD); fixtures may model the
     /// same motion with their captured end position.
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
-        Err(TapeIoError::OperationFailed(
-            "block sink does not support space to end-of-data".to_string(),
+        Err(crate::TapeIoError::new(
+            crate::TapeIoErrorKind::OperationFailed(
+                "block sink does not support space to end-of-data".to_string(),
+            ),
         ))
     }
 
@@ -231,8 +256,10 @@ pub trait BlockSink {
 
     /// Position by absolute logical block address for checkpoint recovery.
     fn locate(&mut self, _lba: u64) -> Result<TapePosition, TapeIoError> {
-        Err(TapeIoError::OperationFailed(
-            "block sink does not support LOCATE".to_string(),
+        Err(crate::TapeIoError::new(
+            crate::TapeIoErrorKind::OperationFailed(
+                "block sink does not support LOCATE".to_string(),
+            ),
         ))
     }
 
@@ -280,8 +307,10 @@ pub trait BlockSource: BlockRead {
     /// Prove and re-arm an append cursor through its owning drive. Sources that
     /// cannot bind a proof to the write session refuse without moving the head.
     fn prove_cursor(&mut self, _cursor: TapePosition, _block_size: u32) -> Result<(), TapeIoError> {
-        Err(TapeIoError::OperationFailed(
-            "block source does not support cursor proof".into(),
+        Err(crate::TapeIoError::new(
+            crate::TapeIoErrorKind::OperationFailed(
+                "block source does not support cursor proof".into(),
+            ),
         ))
     }
 
@@ -295,13 +324,17 @@ pub trait BlockSource: BlockRead {
         remaining_records_in_file: u32,
     ) -> Result<ReadBatchOutcome, TapeIoError> {
         if requested_records == 0 || remaining_records_in_file == 0 {
-            return Err(TapeIoError::OperationFailed(
-                "read_block_batch record counts must be nonzero".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "read_block_batch record counts must be nonzero".to_string(),
+                ),
             ));
         }
         if block_size_bytes == 0 {
-            return Err(TapeIoError::OperationFailed(
-                "read_block_batch block size must be nonzero".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "read_block_batch block size must be nonzero".to_string(),
+                ),
             ));
         }
         let block_size = block_size_bytes as usize;
@@ -309,11 +342,15 @@ pub trait BlockSource: BlockRead {
             .min(remaining_records_in_file)
             .min(self.read_batch_blocks(block_size_bytes));
         let needed = (records as usize).checked_mul(block_size).ok_or_else(|| {
-            TapeIoError::OperationFailed("read batch byte count overflow".to_string())
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                "read batch byte count overflow".to_string(),
+            ))
         })?;
         if buf.len() < needed {
-            return Err(TapeIoError::OperationFailed(
-                "read_block_batch buffer too small".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "read_block_batch buffer too small".to_string(),
+                ),
             ));
         }
         let mut records_read = 0u32;
@@ -321,13 +358,17 @@ pub trait BlockSource: BlockRead {
         for slot in buf[..needed].chunks_exact_mut(block_size) {
             let read = self.read_block(slot)?;
             if read != block_size {
-                return Err(TapeIoError::OperationFailed(format!(
-                    "short fixed batch read: expected {block_size}, got {read}"
-                )));
+                return Err(crate::TapeIoError::new(
+                    crate::TapeIoErrorKind::OperationFailed(format!(
+                        "short fixed batch read: expected {block_size}, got {read}"
+                    )),
+                ));
             }
             records_read += 1;
             bytes_read = bytes_read.checked_add(block_size_bytes).ok_or_else(|| {
-                TapeIoError::OperationFailed("read batch byte count overflow".to_string())
+                crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                    "read batch byte count overflow".to_string(),
+                ))
             })?;
         }
         let position_after = self.position()?;
@@ -354,10 +395,14 @@ pub trait BlockSource: BlockRead {
             .min(self.read_batch_blocks(block_size_bytes).max(1));
         let selected_bytes = (selected_records as usize)
             .checked_mul(block_size_bytes as usize)
-            .ok_or_else(|| TapeIoError::OperationFailed("read handoff size overflow".into()))?;
-        buffer
-            .resize(selected_bytes)
-            .map_err(|message| TapeIoError::OperationFailed(message.to_string()))?;
+            .ok_or_else(|| {
+                crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                    "read handoff size overflow".into(),
+                ))
+            })?;
+        buffer.resize(selected_bytes).map_err(|message| {
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(message.to_string()))
+        })?;
         let outcome = self.read_block_batch(
             buffer.as_mut_slice(),
             block_size_bytes,
@@ -366,8 +411,9 @@ pub trait BlockSource: BlockRead {
         )?;
         let position_after = outcome.position_after;
         let evidence = outcome.position_evidence();
-        let handoff = ReadBufferHandoff::from_outcome(buffer, outcome)
-            .map_err(|message| TapeIoError::OperationFailed(message.to_string()))?;
+        let handoff = ReadBufferHandoff::from_outcome(buffer, outcome).map_err(|message| {
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(message.to_string()))
+        })?;
         Ok(ReadHandoffOutcome {
             position_after,
             evidence,
@@ -392,10 +438,12 @@ pub trait BlockSource: BlockRead {
     ) -> Result<DevicePositionProof, TapeIoError> {
         let observed = self.position()?;
         if observed.partition != expected.partition || observed.lba != expected.lba {
-            return Err(TapeIoError::OperationFailed(format!(
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(format!(
                 "read position drift: expected partition {} lba {}, observed partition {} lba {}",
                 expected.partition, expected.lba, observed.partition, observed.lba
-            )));
+            )),
+            ));
         }
         Ok(DevicePositionProof::from_device_position(observed))
     }
@@ -736,19 +784,22 @@ impl FileBlockSink {
 impl BlockSink for FileBlockSink {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         if buf.len() != self.block_size {
-            return Err(TapeIoError::OperationFailed(format!(
-                "file block sink expected {} bytes, got {}",
-                self.block_size,
-                buf.len()
-            )));
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(format!(
+                    "file block sink expected {} bytes, got {}",
+                    self.block_size,
+                    buf.len()
+                )),
+            ));
         }
         self.file
             .write_all(buf)
             .map_err(|err| file_operation_error("write file block", err))?;
-        self.next_lba = self
-            .next_lba
-            .checked_add(1)
-            .ok_or_else(|| TapeIoError::OperationFailed("file block LBA overflow".to_string()))?;
+        self.next_lba = self.next_lba.checked_add(1).ok_or_else(|| {
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                "file block LBA overflow".to_string(),
+            ))
+        })?;
         Ok(WriteOutcome::from_device_position(
             buf.len() as u32,
             false,
@@ -759,8 +810,10 @@ impl BlockSink for FileBlockSink {
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         if count != 0 {
-            return Err(TapeIoError::OperationFailed(
-                "file block sink does not support filemarks".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "file block sink does not support filemarks".to_string(),
+                ),
             ));
         }
         Ok(WriteFilemarksOutcome::from_device_position(
@@ -808,15 +861,19 @@ impl FileBlockSource {
             .len();
         let block_size_u64 = block_size as u64;
         if !len.is_multiple_of(block_size_u64) {
-            return Err(TapeIoError::OperationFailed(format!(
-                "file block source length {len} is not a multiple of block size {block_size}"
-            )));
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(format!(
+                    "file block source length {len} is not a multiple of block size {block_size}"
+                )),
+            ));
         }
         let block_count = len / block_size_u64;
         if block_count > i64::MAX as u64 {
-            return Err(TapeIoError::OperationFailed(format!(
-                "file block source block count {block_count} exceeds i64::MAX"
-            )));
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(format!(
+                    "file block source block count {block_count} exceeds i64::MAX"
+                )),
+            ));
         }
         Ok(Self {
             file,
@@ -861,11 +918,11 @@ impl BlockRead for FileBlockSource {
     fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
         let lba = self.cursor;
         if lba >= self.block_count {
-            return Err(TapeIoError::CheckCondition(
-                remanence_scsi::ScsiError::CheckCondition {
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
                     sense: synth_blank_check_eod_sense(),
                     bytes_transferred: 0,
-                },
+                }),
             ));
         }
 
@@ -876,21 +933,26 @@ impl BlockRead for FileBlockSource {
 
         if buf.len() < self.block_size {
             self.cursor = self.cursor.checked_add(1).ok_or_else(|| {
-                TapeIoError::OperationFailed("file block LBA overflow".to_string())
+                crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                    "file block LBA overflow".to_string(),
+                ))
             })?;
-            return Err(TapeIoError::ReadBufferTooSmall {
-                actual: self.block_size as u32,
-                provided: buf.len() as u32,
-            });
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: self.block_size as u32,
+                    provided: buf.len() as u32,
+                },
+            ));
         }
 
         self.file
             .read_exact(&mut buf[..self.block_size])
             .map_err(|err| file_operation_error("read file block", err))?;
-        self.cursor = self
-            .cursor
-            .checked_add(1)
-            .ok_or_else(|| TapeIoError::OperationFailed("file block LBA overflow".to_string()))?;
+        self.cursor = self.cursor.checked_add(1).ok_or_else(|| {
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                "file block LBA overflow".to_string(),
+            ))
+        })?;
         Ok(self.block_size)
     }
 }
@@ -904,11 +966,11 @@ impl BlockSource for FileBlockSource {
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         if lba > self.block_count {
             self.cursor = self.block_count;
-            return Err(TapeIoError::CheckCondition(
-                remanence_scsi::ScsiError::CheckCondition {
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
                     sense: synth_blank_check_eod_sense(),
                     bytes_transferred: 0,
-                },
+                }),
             ));
         }
         self.cursor = lba;
@@ -947,21 +1009,26 @@ impl BlockSource for FileBlockSource {
 
 fn validate_file_block_size(block_size: usize) -> Result<(), TapeIoError> {
     if block_size == 0 {
-        return Err(TapeIoError::OperationFailed(
-            "file block size must be nonzero".to_string(),
+        return Err(crate::TapeIoError::new(
+            crate::TapeIoErrorKind::OperationFailed("file block size must be nonzero".to_string()),
         ));
     }
     if block_size > u32::MAX as usize {
-        return Err(TapeIoError::OperationFailed(format!(
-            "file block size {block_size} exceeds u32::MAX"
-        )));
+        return Err(crate::TapeIoError::new(
+            crate::TapeIoErrorKind::OperationFailed(format!(
+                "file block size {block_size} exceeds u32::MAX"
+            )),
+        ));
     }
     Ok(())
 }
 
 fn block_offset(lba: u64, block_size: usize) -> Result<u64, TapeIoError> {
-    lba.checked_mul(block_size as u64)
-        .ok_or_else(|| TapeIoError::OperationFailed("file block offset overflow".to_string()))
+    lba.checked_mul(block_size as u64).ok_or_else(|| {
+        crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+            "file block offset overflow".to_string(),
+        ))
+    })
 }
 
 fn file_tape_position(lba: u64, end_of_partition: bool) -> TapePosition {
@@ -975,11 +1042,16 @@ fn file_tape_position(lba: u64, end_of_partition: bool) -> TapePosition {
 }
 
 fn file_io_error(operation: &str, path: &Path, err: std::io::Error) -> TapeIoError {
-    TapeIoError::OperationFailed(format!("{operation} {}: {err}", path.display()))
+    crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(format!(
+        "{operation} {}: {err}",
+        path.display()
+    )))
 }
 
 fn file_operation_error(operation: &str, err: std::io::Error) -> TapeIoError {
-    TapeIoError::OperationFailed(format!("{operation}: {err}"))
+    crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(format!(
+        "{operation}: {err}"
+    )))
 }
 
 // =====================================================================
@@ -1035,10 +1107,11 @@ impl VecBlockSink {
 impl BlockSink for VecBlockSink {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         let lba = self.next_lba;
-        let next_lba = self
-            .next_lba
-            .checked_add(1)
-            .ok_or_else(|| TapeIoError::OperationFailed("VecBlockSink LBA overflow".to_string()))?;
+        let next_lba = self.next_lba.checked_add(1).ok_or_else(|| {
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
+                "VecBlockSink LBA overflow".to_string(),
+            ))
+        })?;
         self.block_lbas.push(lba);
         self.blocks.push(buf.to_vec());
         self.next_lba = next_lba;
@@ -1092,10 +1165,12 @@ impl BlockSink for VecBlockSink {
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         if lba > self.eod_lba {
             self.next_lba = self.eod_lba;
-            return Err(TapeIoError::OperationFailed(format!(
-                "VecBlockSink LOCATE target {lba} is beyond physical EOD {}",
-                self.eod_lba
-            )));
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(format!(
+                    "VecBlockSink LOCATE target {lba} is beyond physical EOD {}",
+                    self.eod_lba
+                )),
+            ));
         }
         self.next_lba = lba;
         Ok(TapePosition {
@@ -1243,7 +1318,9 @@ impl BlockRead for VecBlockSource {
                     requested: buf.len(),
                     returned: 0,
                 });
-                Err(TapeIoError::ReadBufferTooSmall { actual, provided })
+                Err(crate::TapeIoError::new(
+                    crate::TapeIoErrorKind::ReadBufferTooSmall { actual, provided },
+                ))
             }
             Some(b) => {
                 let n = b.len();
@@ -1266,21 +1343,25 @@ impl BlockRead for VecBlockSource {
                     let mut sense = synth_blank_check_eod_sense();
                     sense[0] |= 0x80;
                     sense[3..7].copy_from_slice(&kernel_bytes.to_be_bytes());
-                    return Err(TapeIoError::CheckConditionWithResidue {
-                        source: remanence_scsi::ScsiError::CheckCondition {
-                            sense,
-                            bytes_transferred: kernel_bytes,
+                    return Err(crate::TapeIoError::new(
+                        crate::TapeIoErrorKind::CheckConditionWithResidue {
+                            source: remanence_scsi::ScsiError::CheckCondition {
+                                sense,
+                                bytes_transferred: kernel_bytes,
+                            },
+                            bytes_transferred: 0,
                         },
-                        bytes_transferred: 0,
-                    });
+                    ));
                 }
                 // EOD per IBM §5.2.15 / Annex B Table B.9:
                 // sense key 0x08 BLANK CHECK + ASC/ASCQ 00/05.
-                Err(TapeIoError::CheckCondition(
-                    remanence_scsi::ScsiError::CheckCondition {
-                        sense: synth_blank_check_eod_sense(),
-                        bytes_transferred: 0,
-                    },
+                Err(crate::TapeIoError::new(
+                    crate::TapeIoErrorKind::CheckCondition(
+                        remanence_scsi::ScsiError::CheckCondition {
+                            sense: synth_blank_check_eod_sense(),
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ))
             }
         }
@@ -1296,25 +1377,29 @@ impl BlockSource for VecBlockSource {
         remaining_records_in_file: u32,
     ) -> Result<ReadBatchOutcome, TapeIoError> {
         if block_size_bytes == 0 || requested_records == 0 || remaining_records_in_file == 0 {
-            return Err(TapeIoError::OperationFailed(
-                "VecBlockSource read_block_batch requires nonzero block and record counts"
-                    .to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "VecBlockSource read_block_batch requires nonzero block and record counts"
+                        .to_string(),
+                ),
             ));
         }
         let records = requested_records.min(remaining_records_in_file);
         let block_size = usize::try_from(block_size_bytes).map_err(|_| {
-            TapeIoError::OperationFailed(
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
                 "VecBlockSource read_block_batch block size exceeds usize".to_string(),
-            )
+            ))
         })?;
         let transfer_len = block_size.checked_mul(records as usize).ok_or_else(|| {
-            TapeIoError::OperationFailed(
+            crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
                 "VecBlockSource read_block_batch transfer length overflow".to_string(),
-            )
+            ))
         })?;
         if buf.len() < transfer_len {
-            return Err(TapeIoError::OperationFailed(
-                "VecBlockSource read_block_batch buffer is too small".to_string(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(
+                    "VecBlockSource read_block_batch buffer is too small".to_string(),
+                ),
             ));
         }
 
@@ -1323,16 +1408,18 @@ impl BlockSource for VecBlockSource {
         for record_index in 0..records {
             let lba = self.cursor + u64::from(record_index);
             let block = self.blocks.get(lba as usize).ok_or_else(|| {
-                TapeIoError::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
-                    sense: synth_blank_check_eod_sense(),
-                    bytes_transferred: bytes_read as u32,
-                })
+                crate::TapeIoError::new(crate::TapeIoErrorKind::CheckCondition(
+                    remanence_scsi::ScsiError::CheckCondition {
+                        sense: synth_blank_check_eod_sense(),
+                        bytes_transferred: bytes_read as u32,
+                    },
+                ))
             })?;
             if block.len() != block_size {
-                return Err(TapeIoError::OperationFailed(format!(
+                return Err(crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(format!(
                     "VecBlockSource read_block_batch fixed block mismatch: expected {block_size} got {}",
                     block.len()
-                )));
+                ))));
             }
             let end = bytes_read + block_size;
             buf[bytes_read..end].copy_from_slice(block);
@@ -1386,11 +1473,11 @@ impl BlockSource for VecBlockSource {
         let blocks_len = self.blocks.len() as u64;
         if lba > blocks_len {
             self.cursor = blocks_len;
-            return Err(TapeIoError::CheckCondition(
-                remanence_scsi::ScsiError::CheckCondition {
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
                     sense: synth_blank_check_eod_sense(),
                     bytes_transferred: 0,
-                },
+                }),
             ));
         }
         self.cursor = lba;
@@ -1501,8 +1588,10 @@ mod tests {
             _remaining_records_in_file: u32,
         ) -> Result<ReadBatchOutcome, TapeIoError> {
             if self.fail_closed {
-                return Err(TapeIoError::OperationFailed(
-                    "scripted fail-closed READ".to_string(),
+                return Err(crate::TapeIoError::new(
+                    crate::TapeIoErrorKind::OperationFailed(
+                        "scripted fail-closed READ".to_string(),
+                    ),
                 ));
             }
             buf[..4].copy_from_slice(&[1, 2, 3, 4]);
@@ -1604,7 +1693,13 @@ mod tests {
 
         let result = source.read_buffer_handoff(vec![0xa5; 16].into(), 4, 4, 4);
 
-        assert!(matches!(result, Err(TapeIoError::OperationFailed(_))));
+        assert!(matches!(
+            result,
+            Err(crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::OperationFailed(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1644,7 +1739,16 @@ mod tests {
         let mut sink = FileBlockSink::create(&path, 4).expect("create sink");
 
         let err = sink.write_block(&[1, 2, 3]).expect_err("short write");
-        assert!(matches!(err, TapeIoError::OperationFailed(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::OperationFailed(_),
+                    ..
+                }
+            ),
+            "{err}"
+        );
         sink.flush().expect("flush");
         assert_eq!(fs::metadata(path).unwrap().len(), 0);
         assert_eq!(sink.next_lba(), 0);
@@ -1657,7 +1761,16 @@ mod tests {
         fs::write(&path, [1, 2, 3]).unwrap();
 
         let err = FileBlockSource::open(&path, 4).expect_err("unaligned length");
-        assert!(matches!(err, TapeIoError::OperationFailed(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::OperationFailed(_),
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1672,7 +1785,10 @@ mod tests {
             .read_block(&mut small)
             .expect_err("small read buffer");
         match err {
-            TapeIoError::ReadBufferTooSmall { actual, provided } => {
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::ReadBufferTooSmall { actual, provided },
+                ..
+            } => {
                 assert_eq!(actual, 4);
                 assert_eq!(provided, 2);
             }
@@ -1701,7 +1817,16 @@ mod tests {
         assert!(result.position_after.end_of_partition);
 
         let err = source.locate(4).expect_err("past EOD");
-        assert!(matches!(err, TapeIoError::CheckCondition(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::CheckCondition(_),
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert_eq!(source.cursor(), 3);
     }
 
@@ -1714,7 +1839,16 @@ mod tests {
         let zero = sink.write_filemarks(0).expect("zero filemarks");
         assert_eq!(zero.position_after.lba, 0);
         let err = sink.write_filemarks(1).expect_err("filemarks");
-        assert!(matches!(err, TapeIoError::OperationFailed(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                crate::TapeIoError {
+                    kind: crate::TapeIoErrorKind::OperationFailed(_),
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1759,12 +1893,15 @@ mod tests {
         assert!(error.is_physical_eod());
         assert!(matches!(
             error,
-            TapeIoError::CheckConditionWithResidue {
-                source: remanence_scsi::ScsiError::CheckCondition {
-                    bytes_transferred: 262_144,
-                    ..
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::CheckConditionWithResidue {
+                    source: remanence_scsi::ScsiError::CheckCondition {
+                        bytes_transferred: 262_144,
+                        ..
+                    },
+                    bytes_transferred: 0,
                 },
-                bytes_transferred: 0,
+                ..
             }
         ));
         assert_eq!(source.cursor(), 1);
@@ -1814,10 +1951,14 @@ mod tests {
         let mut src = VecBlockSource::new(vec![vec![1], vec![2], vec![3]]);
         let err = src.locate(100).expect_err("past-EOD locate");
         match err {
-            TapeIoError::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
-                sense,
+            crate::TapeIoError {
+                kind:
+                    crate::TapeIoErrorKind::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
+                        sense,
+                        ..
+                    }),
                 ..
-            }) => {
+            } => {
                 assert_eq!(sense[2] & 0x0F, 0x08, "BLANK CHECK key");
                 assert_eq!(sense[12], 0x00, "ASC");
                 assert_eq!(sense[13], 0x05, "ASCQ EOD");
@@ -1853,10 +1994,14 @@ mod tests {
         // Table B.9.
         let err = src.read_block(&mut buf).expect_err("past-EOD");
         match err {
-            TapeIoError::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
-                sense,
+            crate::TapeIoError {
+                kind:
+                    crate::TapeIoErrorKind::CheckCondition(remanence_scsi::ScsiError::CheckCondition {
+                        sense,
+                        ..
+                    }),
                 ..
-            }) => {
+            } => {
                 assert_eq!(sense[2] & 0x0F, 0x08, "sense key BLANK CHECK");
                 assert_eq!(sense[12], 0x00, "ASC");
                 assert_eq!(sense[13], 0x05, "ASCQ — END-OF-DATA DETECTED");
@@ -1875,7 +2020,10 @@ mod tests {
         let mut buf = [0u8; 8];
         let err = src.read_block(&mut buf).expect_err("ReadBufferTooSmall");
         match err {
-            TapeIoError::ReadBufferTooSmall { actual, provided } => {
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::ReadBufferTooSmall { actual, provided },
+                ..
+            } => {
                 assert_eq!(actual, 64);
                 assert_eq!(provided, 8);
             }

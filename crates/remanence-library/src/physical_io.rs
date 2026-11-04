@@ -8,9 +8,6 @@
 
 use crate::handle::tape_io::{BlockSize, SpaceKind, TapeConfig, TapeIoError, TapePosition};
 use crate::handle::DriveHandle;
-#[cfg(target_os = "linux")]
-use crate::scsi::decode_sense;
-
 /// Physical block-address hint used by foreign-format readers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalTapePosition {
@@ -126,9 +123,9 @@ impl<'a> DriveHandlePhysicalSource<'a> {
     ) -> Result<PhysicalTapePosition, TapeIoError> {
         let position_after = PhysicalTapePosition {
             lba: position_before.lba.checked_add(1).ok_or_else(|| {
-                TapeIoError::OperationFailed(
+                crate::TapeIoError::new(crate::TapeIoErrorKind::OperationFailed(
                     "physical tape position overflow after block read".to_string(),
-                )
+                ))
             })?,
             partition: position_before.partition,
         };
@@ -158,10 +155,12 @@ impl PhysicalTapeSource for DriveHandlePhysicalSource<'_> {
         position: PhysicalTapePosition,
     ) -> Result<PhysicalTapePosition, TapeIoError> {
         if position.partition != 0 {
-            return Err(TapeIoError::OperationFailed(format!(
-                "physical locate only supports partition 0, got {}",
-                position.partition
-            )));
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed(format!(
+                    "physical locate only supports partition 0, got {}",
+                    position.partition
+                )),
+            ));
         }
         let position = self.drive.locate(position.lba)?.into();
         self.cursor_hint = Some(position);
@@ -214,14 +213,19 @@ enum PhysicalReadBoundary {
 
 /// A boundary with bytes transferred is not an end-of-data boundary.
 fn classify_read_boundary(err: &TapeIoError) -> Option<PhysicalReadBoundary> {
-    if matches!(err, TapeIoError::FilemarkEncountered) {
+    if matches!(
+        err,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::FilemarkEncountered,
+            ..
+        }
+    ) {
         return Some(PhysicalReadBoundary::Filemark);
     }
 
     #[cfg(target_os = "linux")]
     {
-        let (sense, _) = err.check_condition_transfer()?;
-        let decoded = decode_sense(sense)?;
+        let decoded = err.completion_evidence().current_sense()?;
 
         if decoded.filemark
             && decoded.valid
@@ -247,22 +251,37 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<PhysicalReadBoundary> {
 mod tests {
     use super::*;
 
+    /// P24 physical boundary rejects missing ASCQ and a three-byte FILEMARK flag.
+    #[test]
+    fn b3b_physical_boundary_requires_usable_sense() {
+        let mut advertised = [0; 14];
+        advertised[0] = 0xf0;
+        advertised[2] = 0x80;
+        advertised[7] = 10;
+        advertised[13] = 1;
+        for sense in [vec![0x70, 0, 0x80], advertised[..13].to_vec()] {
+            assert_eq!(classify_read_boundary(&check_condition(sense)), None);
+        }
+    }
+
     fn check_condition(sense: Vec<u8>) -> TapeIoError {
-        TapeIoError::CheckCondition(crate::scsi::ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        })
+        crate::TapeIoError::new(crate::TapeIoErrorKind::CheckCondition(
+            crate::scsi::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            },
+        ))
     }
 
     /// Construct a completion with separate corrected and kernel counts.
     fn check_condition_with_residue(sense: Vec<u8>, bytes_transferred: u32) -> TapeIoError {
-        TapeIoError::CheckConditionWithResidue {
+        crate::TapeIoError::new(crate::TapeIoErrorKind::CheckConditionWithResidue {
             source: crate::scsi::ScsiError::CheckCondition {
                 sense,
                 bytes_transferred: 262_144,
             },
             bytes_transferred,
-        }
+        })
     }
 
     /// Corrected zero-transfer EOD is a boundary; transferred data fails closed.
@@ -299,7 +318,9 @@ mod tests {
     #[test]
     fn classifies_structured_filemark_boundary() {
         assert_eq!(
-            classify_read_boundary(&TapeIoError::FilemarkEncountered),
+            classify_read_boundary(&crate::TapeIoError::new(
+                crate::TapeIoErrorKind::FilemarkEncountered
+            )),
             Some(PhysicalReadBoundary::Filemark)
         );
     }

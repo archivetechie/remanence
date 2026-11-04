@@ -92,6 +92,11 @@ pub enum ScsiError {
         sense: Vec<u8>,
     },
 
+    /// The host refused allocation or request size before dispatching any CDB.
+    /// Unlike a generic adapter InvalidInput, this proves no command was issued.
+    #[error("invalid argument: {0}")]
+    HostCapacityRefused(&'static str),
+
     /// A caller-supplied argument violated a documented constraint of the
     /// transport. Distinct from [`ScsiError::InvalidResponse`], which is
     /// about bytes coming back from the device.

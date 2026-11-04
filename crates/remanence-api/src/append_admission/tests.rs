@@ -15,18 +15,21 @@ type World = Arc<Mutex<VirtualWorld>>;
 type ProbeResponse = Arc<Mutex<Option<(Vec<u8>, u32)>>>;
 struct ProbeTransport {
     inner: ModelTransport,
+    last_read_fixed: bool,
     response: ProbeResponse,
     fail_read_after: Arc<Mutex<Option<usize>>>,
     response_skip: Arc<Mutex<usize>>,
     omit_kernel_residual: Arc<Mutex<bool>>,
     position_fault: Arc<Mutex<Option<(u64, u32)>>>,
     reported_partition: Arc<Mutex<u32>>,
+    position_fault_min_lba: Arc<Mutex<u64>>,
     commands: Arc<Mutex<Vec<u8>>>,
 }
 impl SgTransport for ProbeTransport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         self.commands.lock().unwrap().push(cdb[0]);
         if cdb[0] == 0x08 {
+            self.last_read_fixed = cdb[1] & 1 != 0;
             let mut countdown = self.fail_read_after.lock().unwrap();
             if let Some(remaining) = countdown.as_mut() {
                 if *remaining == 0 {
@@ -73,7 +76,12 @@ impl SgTransport for ProbeTransport {
         if cdb[0] == 0x34 && result.is_ok() {
             buf[4..8].copy_from_slice(&self.reported_partition.lock().unwrap().to_be_bytes());
             let commands = self.commands.lock().unwrap();
-            if commands.len() >= 2 && commands[commands.len() - 2] == 0x08 {
+            if commands.len() >= 2
+                && commands[commands.len() - 2] == 0x08
+                && u64::from_be_bytes(buf[8..16].try_into().unwrap())
+                    >= *self.position_fault_min_lba.lock().unwrap()
+                && (*self.position_fault_min_lba.lock().unwrap() == 0 || self.last_read_fixed)
+            {
                 if let Some((lba, partition)) = *self.position_fault.lock().unwrap() {
                     buf[4..8].copy_from_slice(&partition.to_be_bytes());
                     buf[8..16].copy_from_slice(&lba.to_be_bytes());
@@ -100,6 +108,7 @@ struct Fixture {
     omit_kernel_residual: Arc<Mutex<bool>>,
     position_fault: Arc<Mutex<Option<(u64, u32)>>>,
     reported_partition: Arc<Mutex<u32>>,
+    position_fault_min_lba: Arc<Mutex<u64>>,
     commands: Arc<Mutex<Vec<u8>>>,
 }
 fn fixture() -> Fixture {
@@ -121,6 +130,7 @@ fn fixture_with_size(size: u32) -> Fixture {
     world.put_tape_in_drive(0x100, "TAIL", None, tape);
     let world = Arc::new(Mutex::new(world));
     let response = Arc::new(Mutex::new(None));
+    let position_fault_min_lba = Arc::new(Mutex::new(0));
     let commands = Arc::new(Mutex::new(Vec::new()));
     let fail_read_after = Arc::new(Mutex::new(None));
     let response_skip = Arc::new(Mutex::new(0));
@@ -131,12 +141,14 @@ fn fixture_with_size(size: u32) -> Fixture {
         Path::new("/dev/sg-append-test"),
         Box::new(ProbeTransport {
             inner: ModelTransport::new(world.clone(), DeviceRole::Drive { bay: 0x100 }),
+            last_read_fixed: false,
             response: response.clone(),
             fail_read_after: fail_read_after.clone(),
             response_skip: response_skip.clone(),
             omit_kernel_residual: omit_kernel_residual.clone(),
             position_fault: position_fault.clone(),
             reported_partition: reported_partition.clone(),
+            position_fault_min_lba: position_fault_min_lba.clone(),
             commands: commands.clone(),
         }),
         &StaticAllowlist::new(["APPEND-DRIVE"]),
@@ -151,6 +163,7 @@ fn fixture_with_size(size: u32) -> Fixture {
         omit_kernel_residual,
         position_fault,
         reported_partition,
+        position_fault_min_lba,
         commands,
     }
 }
@@ -528,7 +541,13 @@ fn corrupt_trailer_short_block_and_fragment_before_complete_are_refused() {
             .extend(suffix);
         let error = checkpoint(&mut f.drive).unwrap_err();
         assert!(
-            matches!(error, AdmissionError::TailBeyondKnownState { .. }),
+            matches!(
+                error,
+                crate::append_admission::AdmissionError {
+                    kind: crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { .. },
+                    ..
+                }
+            ),
             "{error}"
         );
         assert_eq!(writes(&f.commands.lock().unwrap()), 0);
@@ -618,7 +637,10 @@ fn fresh_missing_delimiter_restores_position_and_requires_explicit_supersede() {
             AppendAuthority::Fresh,
             context(UUID, SIZE, 0, 0)
         ),
-        Err(AdmissionError::MissingBootstrapFilemark)
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
+            ..
+        })
     ));
     assert_eq!(f.drive.position().unwrap().lba, 0);
     assert_eq!(f.drive.media_write_dispatch_count(), 0);
@@ -657,8 +679,10 @@ fn large_torn_candidate_requires_no_temporary_directory() {
             buf: &[u8],
         ) -> Result<remanence_library::WriteOutcome, TapeIoError> {
             if self.0.blocks.len() == 2 {
-                return Err(TapeIoError::OperationFailed(
-                    "intentional fixture cut".into(),
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "intentional fixture cut".into(),
+                    ),
                 ));
             }
             self.0.write_block(buf)
@@ -738,7 +762,13 @@ fn transient_error_in_candidate_validation_does_not_classify_a_foreign_tail() {
         false,
     )
     .unwrap_err();
-    assert!(matches!(err, AdmissionError::Io(_)));
+    assert!(matches!(
+        err,
+        crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::Io(_),
+            ..
+        }
+    ));
     assert_eq!(writes(&f.commands.lock().unwrap()), 0);
 }
 
@@ -934,7 +964,10 @@ fn all_plaintext_cuts_are_torn_but_closed_corruption_and_complete_prefix_refuse(
         );
     assert!(matches!(
         checkpoint(&mut f.drive),
-        Err(AdmissionError::TailBeyondKnownState { .. })
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { .. },
+            ..
+        })
     ));
 }
 
@@ -991,7 +1024,10 @@ fn encrypted_multiblock_cuts_are_torn_and_closed_corrupt_footer_refuses() {
         );
     assert!(matches!(
         checkpoint(&mut f.drive),
-        Err(AdmissionError::TailBeyondKnownState { .. })
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { .. },
+            ..
+        })
     ));
 }
 
@@ -1254,7 +1290,13 @@ fn filemark_read_sense_and_transfer_matrix() {
                     *f.response.lock().unwrap() = Some((sense, bytes));
                     let result = f.drive.read_block(&mut [0; SIZE as usize]);
                     assert_eq!(
-                        matches!(result, Err(TapeIoError::FilemarkEncountered)),
+                        matches!(
+                            result,
+                            Err(remanence_library::TapeIoError {
+                                kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                                ..
+                            })
+                        ),
                         matches!(key, 0 | 1) && !ili && bytes == 0,
                         "valid={valid}, key={key}, ili={ili}, bytes={bytes}: {result:?}"
                     );
@@ -1519,7 +1561,7 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
         } else {
             let error = result.unwrap_err();
             assert!(
-                matches!(error, AdmissionError::SessionSuffixContradiction { .. }),
+                matches!(error, crate::append_admission::AdmissionError { kind: crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. }, .. }),
                 "{mutation}: {error}"
             );
             let cfg = crate::write_owner::TerminalWriteConfig {
@@ -1530,13 +1572,17 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
                 audit_fsync: true,
                 audit_append_lock: Arc::new(Mutex::new(())),
             };
-            let status = daemon_admission_error(
-                remanence_state::AuditActor::System,
-                &mut index,
-                &cfg,
-                UUID,
-                error,
-            );
+            let status = {
+                let outcome = crate::append_admission::admission_error_outcome(&error);
+                daemon_admission_error(
+                    remanence_state::AuditActor::System,
+                    &mut index,
+                    &cfg,
+                    UUID,
+                    error,
+                    &outcome,
+                )
+            };
             assert!(
                 status.message().contains("SessionSuffixContradiction:"),
                 "{status}"
@@ -1570,5 +1616,469 @@ fn b9_named_tail_accepts_buffer_loss_and_fences_below_sync() {
         if let Err(error) = result {
             assert!(error.to_string().contains("SessionSuffixContradiction"));
         }
+    }
+}
+
+/// Restoration may replace the handle record but cannot replace the suffix failure used by admission consumers.
+#[test]
+fn b3b_admission_carrier_and_renderer_census() {
+    use remanence_library::outcome::census;
+    let mut f = fixture();
+    *f.fail_read_after.lock().unwrap() = Some(2);
+    let before = (f.commands.lock().unwrap().len(), census::count());
+    let error = admit_append_boundary(
+        &mut f.drive,
+        AppendAuthority::Fresh,
+        context(UUID, SIZE, 0, 0),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error.kind, AdmissionErrorKind::SuffixIo { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        census::count() - before.1,
+        (f.commands.lock().unwrap().len() - before.0) as u64
+    );
+    let outcome = admission_error_outcome(&error);
+    assert_eq!(outcome.evidence.opcode, Some(8));
+    assert_eq!(outcome.evidence.current_sense().unwrap().key, 4);
+    assert_ne!(f.drive.last_command_outcome().unwrap(), &outcome);
+    let root = tempfile::tempdir().unwrap();
+    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let cfg = crate::write_owner::TerminalWriteConfig {
+        io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
+        mounted_endpoint: None,
+        checkpoint_journal_dir: root.path().join("tapes"),
+        audit_dir: root.path().join("audit"),
+        audit_fsync: true,
+        audit_append_lock: Arc::new(Mutex::new(())),
+    };
+    let before = (census::total(), census::normalizations());
+    assert_eq!(admission_error_outcome(&error), outcome);
+    let status = daemon_admission_error(
+        remanence_state::AuditActor::System,
+        &mut index,
+        &cfg,
+        UUID,
+        error,
+        &outcome,
+    );
+    assert_eq!(status.metadata().get("remanence-retry").unwrap(), "media");
+    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+    assert_eq!((census::total(), census::normalizations()), before);
+}
+
+/// A scoped native-session contradiction adds one fact after all real commands have finished.
+#[test]
+fn b3b_scoped_suffix_contradiction_classifies_once() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    use sha2::{Digest, Sha256};
+    const BLOCK: u32 = 262144;
+    let observed = vec![0x53; BLOCK as usize];
+    let mutation = "mutated";
+    let mut f = fixture_with_size(BLOCK);
+    let root = tempfile::tempdir().unwrap();
+    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    index
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: UUID,
+            voltag: "TAIL".into(),
+            block_size: BLOCK,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    std::fs::create_dir(root.path().join("tapes")).unwrap();
+    std::fs::create_dir(root.path().join("audit")).unwrap();
+    let authority =
+        remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
+            .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    lease
+        .publish_initialized(
+            BLOCK,
+            None,
+            remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    lease
+        .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
+    lease
+        .end_session(
+            [0x61; 16],
+            "2026-11-02T00:00:01Z".into(),
+            SessionEndReason::CrashRecovered,
+            None,
+            [Ok(TailFile {
+                tape_file_number: 1,
+                identity: TailIdentity::TornPrefix(Sha256::digest(&observed).into()),
+                known_blocks: 1,
+                synchronized_blocks: 1,
+                unknown_blocks: 0,
+                filemark: TailFilemark::Absent,
+                synchronized_filemark: false,
+            })],
+        )
+        .unwrap();
+    let snapshot = lease.freeze().unwrap();
+    let mut block = observed.clone();
+    if mutation == "mutated" {
+        block[100] ^= 1;
+    }
+    {
+        let mut world = f.world.lock().unwrap();
+        let tape = world.tapes.get_mut("TAIL").unwrap();
+        if mutation != "early_eod" {
+            tape.records.push(Record::Block(block));
+        }
+        if mutation == "extra" {
+            tape.records.push(Record::Block(observed.clone()));
+        }
+        if mutation == "filemark" {
+            tape.records.push(Record::Filemark);
+        }
+    }
+
+    let before = (
+        remanence_library::outcome::census::total(),
+        f.commands.lock().unwrap().len(),
+    );
+    let error = admit_append_boundary(
+        &mut f.drive,
+        AppendAuthority::Session {
+            snapshot: &snapshot,
+            closeout: None,
+        },
+        context(UUID, BLOCK, 0, 2),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.kind,
+        AdmissionErrorKind::SessionSuffixContradiction { .. }
+    ));
+    assert_eq!(
+        remanence_library::outcome::census::total() - before.0,
+        (f.commands.lock().unwrap().len() - before.1) as u64 + 1,
+        "one classification per CDB plus the final scoped contradiction"
+    );
+    let before = (
+        remanence_library::outcome::census::total(),
+        remanence_library::outcome::census::normalizations(),
+    );
+    assert!(matches!(
+        admission_error_outcome(&error).effect,
+        remanence_library::outcome::Effect::WriteFence(
+            remanence_library::outcome::FenceCause::SessionSuffixContradiction
+        )
+    ));
+    assert_eq!(
+        (
+            remanence_library::outcome::census::total(),
+            remanence_library::outcome::census::normalizations()
+        ),
+        before
+    );
+}
+
+/// A production batch READ crossing 1 GiB remains transient at the suffix renderer.
+/// The current suffix scanner uses single-block READs; the batch result is passed
+/// through its production SuffixIo carrier to pin the renderer independently.
+#[test]
+fn b3b_fix1_admission_suffix_position_drift_is_transient() {
+    let mut f = fixture();
+    f.world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("TAIL")
+        .unwrap()
+        .records
+        .extend(std::iter::repeat_n(
+            Record::ZeroBlock(SIZE),
+            (1usize << 30) / SIZE as usize + 64,
+        ));
+    *f.position_fault.lock().unwrap() = Some((999, 0));
+    *f.position_fault_min_lba.lock().unwrap() = (1u64 << 30) / u64::from(SIZE);
+    assert_eq!(f.drive.position_check_bytes(), 1 << 30);
+    let _scope = f
+        .drive
+        .scoped_outcome_context(remanence_library::outcome::OperationContext {
+            phase: remanence_library::outcome::Phase::Admission,
+            region: remanence_library::outcome::Region::Unknown,
+            ..Default::default()
+        });
+    f.drive.locate(2).unwrap();
+    let mut buffer = vec![0; SIZE as usize * 32];
+    let mut read_bytes = 0u64;
+    let source = loop {
+        assert!(read_bytes < 1 << 30, "tripwire must fire at 1 GiB");
+        match f.drive.read_block_batch(&mut buffer, SIZE, 32, 32) {
+            Ok(read) => read_bytes += u64::from(read.bytes_read),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            source.kind,
+            remanence_library::TapeIoErrorKind::PositionDrift { .. }
+        ),
+        "{source:?}"
+    );
+    eprintln!("1 GiB admission drift: {:?}", source.outcome());
+    let error = AdmissionError::new(AdmissionErrorKind::SuffixIo {
+        start_lba: 2,
+        source,
+    });
+    let outcome = admission_error_outcome(&error);
+    assert_eq!(
+        outcome.retry,
+        remanence_library::outcome::RetryCause::Transient
+    );
+    let root = tempfile::tempdir().unwrap();
+    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    index
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: UUID,
+            voltag: "TAIL".into(),
+            block_size: SIZE,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    let cfg = crate::write_owner::TerminalWriteConfig {
+        io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
+        mounted_endpoint: None,
+        checkpoint_journal_dir: root.path().join("tapes"),
+        audit_dir: root.path().join("audit"),
+        audit_fsync: true,
+        audit_append_lock: Arc::new(Mutex::new(())),
+    };
+    let status = daemon_admission_error(
+        remanence_state::AuditActor::System,
+        &mut index,
+        &cfg,
+        UUID,
+        error,
+        &outcome,
+    );
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        status.metadata().get("remanence-retry").unwrap(),
+        "transient"
+    );
+    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+    assert_eq!(index.get_tape(&UUID).unwrap().unwrap().state, "ready");
+    assert!(!cfg.audit_dir.exists());
+    assert_eq!(f.drive.media_write_dispatch_count(), 0);
+}
+
+/// Produce a scoped contradiction by changing a recorded torn prefix on the model tape.
+fn golden_suffix_contradiction() -> AdmissionError {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    use sha2::{Digest, Sha256};
+    const BLOCK: u32 = 262144;
+    let observed = vec![0x53; BLOCK as usize];
+    let mutation = "mutated";
+    let mut f = fixture_with_size(BLOCK);
+    let root = tempfile::tempdir().unwrap();
+    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    index
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: UUID,
+            voltag: "TAIL".into(),
+            block_size: BLOCK,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    std::fs::create_dir(root.path().join("tapes")).unwrap();
+    std::fs::create_dir(root.path().join("audit")).unwrap();
+    let authority =
+        remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
+            .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    lease
+        .publish_initialized(
+            BLOCK,
+            None,
+            remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    lease
+        .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
+    lease
+        .end_session(
+            [0x61; 16],
+            "2026-11-02T00:00:01Z".into(),
+            SessionEndReason::CrashRecovered,
+            None,
+            [Ok(TailFile {
+                tape_file_number: 1,
+                identity: TailIdentity::TornPrefix(Sha256::digest(&observed).into()),
+                known_blocks: 1,
+                synchronized_blocks: 1,
+                unknown_blocks: 0,
+                filemark: TailFilemark::Absent,
+                synchronized_filemark: false,
+            })],
+        )
+        .unwrap();
+    let snapshot = lease.freeze().unwrap();
+    let mut block = observed.clone();
+    if mutation == "mutated" {
+        block[100] ^= 1;
+    }
+    {
+        let mut world = f.world.lock().unwrap();
+        let tape = world.tapes.get_mut("TAIL").unwrap();
+        if mutation != "early_eod" {
+            tape.records.push(Record::Block(block));
+        }
+        if mutation == "extra" {
+            tape.records.push(Record::Block(observed.clone()));
+        }
+        if mutation == "filemark" {
+            tape.records.push(Record::Filemark);
+        }
+    }
+
+    admit_append_boundary(
+        &mut f.drive,
+        AppendAuthority::Session {
+            snapshot: &snapshot,
+            closeout: None,
+        },
+        context(UUID, BLOCK, 0, 2),
+    )
+    .unwrap_err()
+}
+
+/// Real admission producers and the base daemon destination, independent of S15.
+pub(crate) fn golden_production_admission_rows() {
+    for name in [
+        "TailBeyondKnownState",
+        "Unproved",
+        "MissingBootstrapFilemark",
+        "SessionSuffixContradiction",
+        "Io",
+        "SuffixIo",
+    ] {
+        let mut f = fixture();
+        let error = match name {
+            "TailBeyondKnownState" => {
+                f.world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut("TAIL")
+                    .unwrap()
+                    .records
+                    .extend(plain_blocks().into_iter().map(Record::Block));
+                f.world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut("TAIL")
+                    .unwrap()
+                    .records
+                    .push(Record::Filemark);
+                checkpoint(&mut f.drive).unwrap_err()
+            }
+            "Unproved" => {
+                admit_append_boundary(&mut f.drive, AppendAuthority::Fresh, context(UUID, 0, 0, 0))
+                    .unwrap_err()
+            }
+            "MissingBootstrapFilemark" => {
+                f.world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut("TAIL")
+                    .unwrap()
+                    .records
+                    .truncate(1);
+                admit_append_boundary(
+                    &mut f.drive,
+                    AppendAuthority::Fresh,
+                    context(UUID, SIZE, 0, 0),
+                )
+                .unwrap_err()
+            }
+            "SessionSuffixContradiction" => golden_suffix_contradiction(),
+            "Io" | "SuffixIo" => {
+                *f.fail_read_after.lock().unwrap() = Some(if name == "Io" { 0 } else { 2 });
+                admit_append_boundary(
+                    &mut f.drive,
+                    AppendAuthority::Fresh,
+                    context(UUID, SIZE, 0, 0),
+                )
+                .unwrap_err()
+            }
+            _ => unreachable!(),
+        };
+        let actual_kind = match error.kind {
+            AdmissionErrorKind::TailBeyondKnownState { .. } => "TailBeyondKnownState",
+            AdmissionErrorKind::Unproved(_) => "Unproved",
+            AdmissionErrorKind::MissingBootstrapFilemark => "MissingBootstrapFilemark",
+            AdmissionErrorKind::SessionSuffixContradiction { .. } => "SessionSuffixContradiction",
+            AdmissionErrorKind::Io(_) => "Io",
+            AdmissionErrorKind::SuffixIo { .. } => "SuffixIo",
+        };
+        assert_eq!(actual_kind, name);
+        let root = tempfile::tempdir().unwrap();
+        let mut index =
+            remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        index
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: UUID,
+                voltag: "TAIL".into(),
+                block_size: SIZE,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let cfg = crate::write_owner::TerminalWriteConfig {
+            io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: root.path().join("tapes"),
+            audit_dir: root.path().join("audit"),
+            audit_fsync: true,
+            audit_append_lock: Arc::new(Mutex::new(())),
+        };
+        let outcome = admission_error_outcome(&error);
+        daemon_admission_error(
+            remanence_state::AuditActor::System,
+            &mut index,
+            &cfg,
+            UUID,
+            error,
+            &outcome,
+        );
+        let fences = index.list_active_tape_io_fences().unwrap();
+        if name == "SessionSuffixContradiction" {
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].reason, "SessionSuffixContradiction");
+        } else {
+            assert!(fences.is_empty(), "{name}: {fences:?}");
+        }
+        assert_eq!(
+            index.get_tape(&UUID).unwrap().unwrap().state == "recovery_required",
+            matches!(
+                name,
+                "TailBeyondKnownState" | "Unproved" | "MissingBootstrapFilemark"
+            )
+        );
+        eprintln!("golden admission: {name}: base destination preserved");
     }
 }

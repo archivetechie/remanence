@@ -1,0 +1,86 @@
+# Final-result classification and raw-evidence normalization census.
+# Application consumers must not appear; named composite facts are finishing sites.
+# finish_admission_refusal: Finishes one new non-device admission/refusal fact; device errors retain their own outcome.
+crates/remanence-api/src/append_admission.rs::finish_admission_refusal::classify	1
+# ambiguous_authority_outcome: Finishes the distinct unknown-authority-append fact.
+crates/remanence-api/src/write_owner/checkpoint.rs::ambiguous_authority_outcome::classify	1
+# checked_epoch_rebuild: Finishes a new second-check mismatch or proved committed contradiction.
+crates/remanence-api/src/write_owner/checkpoint.rs::checked_epoch_rebuild::classify	2
+# fence_admission_contradiction: Finishes the new scoped append-authority contradiction; an already scoped suffix error retains its outcome.
+crates/remanence-api/src/write_owner/checkpoint.rs::fence_admission_contradiction::classify	1
+# execute_in: RES readiness transport captures one completion per physical CDB.
+crates/remanence-library/src/handle/changer_ready.rs::execute_in::from_scsi	1
+# finish: RES readiness finalizer classifies each probe/payload after its result is final.
+crates/remanence-library/src/handle/changer_ready.rs::finish::classify	1
+# rescan: Normalizes INITIALIZE ELEMENT STATUS failure at its existing completion/dirty boundary.
+crates/remanence-library/src/handle/mod.rs::rescan::from_scsi	1
+# record_command: Captures raw completion once; the owning final-result boundary subsequently classifies it.
+crates/remanence-library/src/handle/tape_io/media_gate.rs::record_command::from_scsi	1
+# decode_sense_key_asc: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::decode_sense_key_asc::decode_usable_sense	1
+# ili_signed_information: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::ili_signed_information::decode_usable_sense	1
+# is_reset_unit_attention: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::is_reset_unit_attention::decode_usable_sense	1
+# map_scsi: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::map_scsi::decode_sense_key_asc	1
+# map_scsi: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::map_scsi::decode_usable_sense	1
+# read_block: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::read_block::decode_sense_key_asc	1
+# read_block_batch: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::read_block_batch::decode_sense_key_asc	1
+# read_filemark_signal: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::read_filemark_signal::decode_usable_sense	1
+# require_single_partition: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::require_single_partition::decode_sense_key_asc	1
+# sense_has_current_ili: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::sense_has_current_ili::decode_usable_sense	1
+# sense_is_current_recovered: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::sense_is_current_recovered::decode_usable_sense	1
+# sense_is_current_recovered_without_terminal_flags: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::sense_is_current_recovered_without_terminal_flags::decode_usable_sense	1
+# sense_is_deferred: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::sense_is_deferred::decode_usable_sense	1
+# space_residual_if_early_stop: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::space_residual_if_early_stop::decode_usable_sense	1
+# valid_fixed_residual_from_sense: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::valid_fixed_residual_from_sense::decode_usable_sense	1
+# write_block: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::write_block::decode_sense_key_asc	1
+# write_block_unpositioned: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::write_block_unpositioned::decode_sense_key_asc	1
+# write_eom_signal: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::write_eom_signal::decode_usable_sense	1
+# new: Finishes an initial host readiness observation with NotIssued evidence.
+crates/remanence-library/src/handle/tape_io/readiness.rs::new::classify	1
+# transfer_bytes_from_sense: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/transfer.rs::transfer_bytes_from_sense::decode_usable_sense	1
+# publish: Classifies a captured command after final arbitration, transfer accounting and position proof.
+crates/remanence-library/src/outcome/dispatch.rs::publish::classify	1
+# finish_abandoned_write: Finishes a distinct abandoned-operation fact only when no command outcome was returned.
+crates/remanence-library/src/outcome/mod.rs::finish_abandoned_write::classify	1
+# finish_control: Finishes a raw control result at its owner.
+crates/remanence-library/src/outcome/mod.rs::finish_control::classify	1
+# finish_control: Finishes a raw control result at its owner.
+crates/remanence-library/src/outcome/mod.rs::finish_control::from_scsi	1
+# finish_driveoperror: Finishes directly constructed control errors; carried inventory errors are forwarded.
+crates/remanence-library/src/outcome/mod.rs::finish_driveoperror::classify	1
+# finish_driveoperror: Finishes directly constructed control errors; carried inventory errors are forwarded.
+crates/remanence-library/src/outcome/mod.rs::finish_driveoperror::from_scsi	1
+# finish_moveerror: Finishes directly constructed changer errors and local refusals.
+crates/remanence-library/src/outcome/mod.rs::finish_moveerror::classify	1
+# finish_moveerror: Finishes directly constructed changer errors and local refusals.
+crates/remanence-library/src/outcome/mod.rs::finish_moveerror::from_scsi	1
+# finish_tapeioerror: Finishes a new synthetic adapter error; wrappers forward an existing outcome.
+crates/remanence-library/src/outcome/mod.rs::finish_tapeioerror::classify	1
+# normalize: Normalizes raw synthetic error construction only; command consumers borrow stored evidence.
+crates/remanence-library/src/outcome/mod.rs::normalize::from_scsi	2
+# normalize: Normalizes raw synthetic error construction only; command consumers borrow stored evidence.
+crates/remanence-library/src/outcome/mod.rs::normalize::from_sense	2
+# set_sense: The common strict normalized-evidence producer.
+crates/remanence-library/src/outcome/mod.rs::set_sense::decode_usable_sense	1
+# decode_usable_sense: The SCSI decoder primitive; callers receive only validated sense.
+crates/remanence-scsi/src/sense.rs::decode_usable_sense::decode_sense	1
+# finish_abandoned_write_with_retry: Finishes S15's abandoned-operation fact while retaining the independently typed retry.
+crates/remanence-library/src/outcome/mod.rs::finish_abandoned_write_with_retry::classify	1

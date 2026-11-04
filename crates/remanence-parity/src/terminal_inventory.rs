@@ -47,8 +47,6 @@ use crate::terminal_tail::{
 use crate::verify_protected::{
     bootstrap_fill_finding, Forward, ProtectedContentVerification, ProtectedPass,
 };
-#[cfg(test)]
-use remanence_library::TapeIoError;
 use std::cell::RefCell;
 
 /// Typed stage at which one terminal member failed validation.
@@ -1474,9 +1472,10 @@ fn scan_verification_prefix(
         Ok(crate::scan::ControlledScanWalkOutcome::Aborted(_)) => {
             unreachable!("an unconditional scan controller cannot abort")
         }
-        Err(ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)) => {
-            Err(TerminalIndexVerificationError::Cancelled)
-        }
+        Err(ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        })) => Err(TerminalIndexVerificationError::Cancelled),
         Err(error) => Err(attach_prefix_findings(
             TerminalIndexVerificationError::PrefixWalk {
                 message: error.to_string(),
@@ -2757,7 +2756,10 @@ fn member_error_to_separation(
 fn source_error(operation: &'static str, error: ParityError) -> TerminalInventoryReadError {
     if matches!(
         error,
-        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        })
     ) {
         return TerminalInventoryReadError::Cancelled;
     }
@@ -2773,7 +2775,10 @@ fn verification_source_error(
 ) -> TerminalIndexVerificationError {
     if matches!(
         error,
-        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        })
     ) {
         return TerminalIndexVerificationError::Cancelled;
     }
@@ -2942,40 +2947,52 @@ mod tests {
     impl TestReadFault {
         fn error(self) -> ParityError {
             ParityError::TapeIo(match self {
-                Self::Cancelled => TapeIoError::Cancelled,
-                Self::Medium => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x72, 0x03, 0x11, 0x00],
-                        bytes_transferred: 0,
-                    },
+                Self::Cancelled => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::Cancelled,
                 ),
-                Self::DeferredFixedMedium => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0],
-                        bytes_transferred: 0,
-                    },
+                Self::Medium => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x72, 0x03, 0x11, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::DeferredDescriptorMedium => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x73, 0x03, 0x11, 0x00],
-                        bytes_transferred: 0,
-                    },
+                Self::DeferredFixedMedium => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::Hardware => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x72, 0x04, 0x44, 0x00],
-                        bytes_transferred: 0,
-                    },
+                Self::DeferredDescriptorMedium => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x73, 0x03, 0x11, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::Transport => {
-                    TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
-                        status: 0,
-                        host_status: 0,
-                        driver_status: 0x06,
-                        info: 1,
-                        sense: Vec::new(),
-                    })
-                }
+                Self::Hardware => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x72, 0x04, 0x44, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
+                ),
+                Self::Transport => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::Transport(
+                        remanence_library::scsi::ScsiError::TransportError {
+                            status: 0,
+                            host_status: 0,
+                            driver_status: 0x06,
+                            info: 1,
+                            sense: Vec::new(),
+                        },
+                    ),
+                ),
             })
         }
     }
@@ -3108,10 +3125,12 @@ mod tests {
                 // A longer record is consumed and reported as a drive reports
                 // it; a shorter one delivers its measured length.
                 Record::Block(block) if block.len() > buf.len() => {
-                    Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-                        actual: block.len() as u32,
-                        provided: buf.len() as u32,
-                    }))
+                    Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: block.len() as u32,
+                            provided: buf.len() as u32,
+                        },
+                    )))
                 }
                 Record::Block(block) => {
                     buf[..block.len()].copy_from_slice(block);

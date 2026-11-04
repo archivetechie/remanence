@@ -81,15 +81,21 @@ pub fn apply_move(library: &mut Library, src: u16, dst: u16) -> Result<MovePatch
 pub(crate) fn plan_move(library: &Library, src: u16, dst: u16) -> Result<MovePlan, MoveError> {
     // -- Preflight ---------------------------------------------------
     if src == dst {
-        return Err(MoveError::SameElement { addr: src });
+        return Err(crate::MoveError::new(crate::MoveErrorKind::SameElement {
+            addr: src,
+        }));
     }
-    let src_idx = find_element(library, src).ok_or_else(|| MoveError::AddressUnknown {
-        library: library.serial.clone(),
-        addr: src,
+    let src_idx = find_element(library, src).ok_or_else(|| {
+        crate::MoveError::new(crate::MoveErrorKind::AddressUnknown {
+            library: library.serial.clone(),
+            addr: src,
+        })
     })?;
-    let dst_idx = find_element(library, dst).ok_or_else(|| MoveError::AddressUnknown {
-        library: library.serial.clone(),
-        addr: dst,
+    let dst_idx = find_element(library, dst).ok_or_else(|| {
+        crate::MoveError::new(crate::MoveErrorKind::AddressUnknown {
+            library: library.serial.clone(),
+            addr: dst,
+        })
     })?;
 
     // DriveBayUnresolved before SourceEmpty / DestinationFull, per
@@ -97,12 +103,16 @@ pub(crate) fn plan_move(library: &Library, src: u16, dst: u16) -> Result<MovePla
     // regardless of what loaded says.
     if let ElementIdx::Drive(i) = src_idx {
         if library.drive_bays[i].installed.is_none() {
-            return Err(MoveError::DriveBayUnresolved { addr: src });
+            return Err(crate::MoveError::new(
+                crate::MoveErrorKind::DriveBayUnresolved { addr: src },
+            ));
         }
     }
     if let ElementIdx::Drive(i) = dst_idx {
         if library.drive_bays[i].installed.is_none() {
-            return Err(MoveError::DriveBayUnresolved { addr: dst });
+            return Err(crate::MoveError::new(
+                crate::MoveErrorKind::DriveBayUnresolved { addr: dst },
+            ));
         }
     }
 
@@ -114,21 +124,27 @@ pub(crate) fn plan_move(library: &Library, src: u16, dst: u16) -> Result<MovePla
         ElementIdx::Drive(i) => {
             let b = &library.drive_bays[i];
             if !b.loaded {
-                return Err(MoveError::SourceEmpty { addr: src });
+                return Err(crate::MoveError::new(crate::MoveErrorKind::SourceEmpty {
+                    addr: src,
+                }));
             }
             (b.loaded_tape.clone(), false)
         }
         ElementIdx::Slot(i) => {
             let s = &library.slots[i];
             if !s.full {
-                return Err(MoveError::SourceEmpty { addr: src });
+                return Err(crate::MoveError::new(crate::MoveErrorKind::SourceEmpty {
+                    addr: src,
+                }));
             }
             (s.cartridge.clone(), true)
         }
         ElementIdx::Ie(i) => {
             let p = &library.ie_ports[i];
             if !p.full {
-                return Err(MoveError::SourceEmpty { addr: src });
+                return Err(crate::MoveError::new(crate::MoveErrorKind::SourceEmpty {
+                    addr: src,
+                }));
             }
             (p.cartridge.clone(), false)
         }
@@ -140,7 +156,9 @@ pub(crate) fn plan_move(library: &Library, src: u16, dst: u16) -> Result<MovePla
         ElementIdx::Ie(i) => library.ie_ports[i].full,
     };
     if dst_full {
-        return Err(MoveError::DestinationFull { addr: dst });
+        return Err(crate::MoveError::new(
+            crate::MoveErrorKind::DestinationFull { addr: dst },
+        ));
     }
 
     Ok(MovePlan {
@@ -685,7 +703,13 @@ mod tests {
     fn same_element_refused() {
         let mut lib = fake_library();
         let e = apply_move(&mut lib, 0x0400, 0x0400).unwrap_err();
-        assert!(matches!(e, MoveError::SameElement { addr: 0x0400 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::SameElement { addr: 0x0400 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -693,7 +717,10 @@ mod tests {
         let mut lib = fake_library();
         let e = apply_move(&mut lib, 0x9999, 0x0100).unwrap_err();
         match e {
-            MoveError::AddressUnknown { library, addr } => {
+            crate::MoveError {
+                kind: crate::MoveErrorKind::AddressUnknown { library, addr },
+                ..
+            } => {
                 assert_eq!(library, "LIB001");
                 assert_eq!(addr, 0x9999);
             }
@@ -706,7 +733,13 @@ mod tests {
         let mut lib = fake_library();
         // Slot 0x0401 starts empty.
         let e = apply_move(&mut lib, 0x0401, 0x0100).unwrap_err();
-        assert!(matches!(e, MoveError::SourceEmpty { addr: 0x0401 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::SourceEmpty { addr: 0x0401 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -714,14 +747,26 @@ mod tests {
         let mut lib = fake_library();
         // Bay 0x0100 starts empty.
         let e = apply_move(&mut lib, 0x0100, 0x0401).unwrap_err();
-        assert!(matches!(e, MoveError::SourceEmpty { addr: 0x0100 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::SourceEmpty { addr: 0x0100 },
+                ..
+            }
+        ));
     }
 
     #[test]
     fn source_empty_refused_for_ie_port() {
         let mut lib = fake_library();
         let e = apply_move(&mut lib, 0x0300, 0x0100).unwrap_err();
-        assert!(matches!(e, MoveError::SourceEmpty { addr: 0x0300 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::SourceEmpty { addr: 0x0300 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -731,7 +776,13 @@ mod tests {
         lib.slots[1].full = true;
         lib.slots[1].cartridge = Some("BLOCK".into());
         let e = apply_move(&mut lib, 0x0400, 0x0401).unwrap_err();
-        assert!(matches!(e, MoveError::DestinationFull { addr: 0x0401 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::DestinationFull { addr: 0x0401 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -740,7 +791,13 @@ mod tests {
         lib.drive_bays[0].loaded = true;
         lib.drive_bays[0].loaded_tape = Some("ALREADY".into());
         let e = apply_move(&mut lib, 0x0400, 0x0100).unwrap_err();
-        assert!(matches!(e, MoveError::DestinationFull { addr: 0x0100 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::DestinationFull { addr: 0x0100 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -749,7 +806,13 @@ mod tests {
         lib.ie_ports[0].full = true;
         lib.ie_ports[0].cartridge = Some("BLOCK".into());
         let e = apply_move(&mut lib, 0x0400, 0x0300).unwrap_err();
-        assert!(matches!(e, MoveError::DestinationFull { addr: 0x0300 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::DestinationFull { addr: 0x0300 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -762,7 +825,13 @@ mod tests {
         let e = apply_move(&mut lib, 0x0100, 0x0401).unwrap_err();
         // DriveBayUnresolved must win over SourceEmpty/DestinationFull
         // even when the bay is loaded.
-        assert!(matches!(e, MoveError::DriveBayUnresolved { addr: 0x0100 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::DriveBayUnresolved { addr: 0x0100 },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -770,7 +839,13 @@ mod tests {
         let mut lib = fake_library();
         lib.drive_bays[0].installed = None;
         let e = apply_move(&mut lib, 0x0400, 0x0100).unwrap_err();
-        assert!(matches!(e, MoveError::DriveBayUnresolved { addr: 0x0100 }));
+        assert!(matches!(
+            e,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::DriveBayUnresolved { addr: 0x0100 },
+                ..
+            }
+        ));
     }
 
     // -- No-mutation-on-failure pin ----------------------------------

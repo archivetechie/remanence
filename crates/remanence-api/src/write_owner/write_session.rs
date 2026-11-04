@@ -1,5 +1,6 @@
 //! Write-session state, append handling, close, and media preparation.
 
+use crate::closeout_obligation::RetryCauseExt as _;
 use ciborium::Value as CborValue;
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::SourceLayer;
@@ -432,12 +433,16 @@ impl WriteSessionState<'_> {
         self.begin_closing_work();
         if let Err(error) = self.finish_session() {
             if !self.ended_durably {
+                let outcome = super::checkpoint::ambiguous_authority_outcome();
+                let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect else {
+                    unreachable!("ambiguous publication is fenced")
+                };
                 // Even a host failure before append leaves the ending unproved.
                 super::checkpoint::record_closeout_fence(
                     self.index,
                     self.cfg,
                     self.tape_uuid,
-                    "AuthorityAmbiguous",
+                    cause.reason(),
                     serde_json::json!({"session_id":self.session_id,"error":error.to_string()})
                         .to_string(),
                 );
@@ -767,9 +772,12 @@ impl WriteSessionState<'_> {
                 .ok_or_else(|| Status::internal("finalization lacks committed boundary"))?;
             let spec =
                 TerminalFinalizeSpec::automatic(&self.selected, &self.pool_cfg, intent.trigger);
-            self.drive
-                .test_unit_ready()
-                .map_err(|e| Status::unavailable(format!("terminal readiness: {e}")))?;
+            self.drive.test_unit_ready().map_err(|e| {
+                super::restore::attach_outcome_retry(
+                    e.outcome(),
+                    Status::unavailable(format!("terminal readiness: {e}")),
+                )
+            })?;
             prepare_drive_for_write(
                 self.drive,
                 &self.tape_uuid,
@@ -777,10 +785,12 @@ impl WriteSessionState<'_> {
                 self.session_id,
                 WriteMediaPolicy::RewritableObject,
             )?;
-            let config = self
-                .drive
-                .read_config()
-                .map_err(|e| Status::unavailable(e.to_string()))?;
+            let config = self.drive.read_config().map_err(|e| {
+                super::restore::attach_outcome_retry(
+                    e.outcome(),
+                    Status::unavailable(e.to_string()),
+                )
+            })?;
             let rewritable = matches!(config.worm, remanence_library::WormMediaState::NotWorm);
             self.checkpoint_lease.finish_structural_scope();
             let result = match self.selected.parity_config {
@@ -1977,6 +1987,13 @@ pub(super) fn handle_drive_open_write(
     admission_work: Option<crate::drive_pool::ClosingGuard>,
     request: OpenWriteActorRequest,
 ) -> Option<super::actor_runtime::MountedFinish> {
+    let _outcome_context =
+        drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+            phase: remanence_library::outcome::Phase::Append,
+            region: remanence_library::outcome::Region::Unknown,
+            mounted: cfg.mounted().is_some(),
+            ..Default::default()
+        });
     // Direct session fixtures use this entry without the actor dispatch loop.
     // Both entries bind the same shared cutoff; setting it is idempotent.
     drive.set_command_deadline(cfg.lifecycle.as_ref().map(|l| l.shutdown_deadline.clone()));
@@ -2480,8 +2497,13 @@ pub(super) fn handle_drive_open_write(
         Err(error) => {
             if matches!(
                 error,
-                crate::append_admission::AdmissionError::Io(_)
-                    | crate::append_admission::AdmissionError::Unproved(_)
+                crate::append_admission::AdmissionError {
+                    kind: crate::append_admission::AdmissionErrorKind::Io(_),
+                    ..
+                } | crate::append_admission::AdmissionError {
+                    kind: crate::append_admission::AdmissionErrorKind::Unproved(_),
+                    ..
+                }
             ) {
                 let range = index.get_tape(&tape_uuid).ok().flatten().map(|tape| {
                     (
@@ -2497,17 +2519,24 @@ pub(super) fn handle_drive_open_write(
                     range,
                     &error,
                 ) {
-                    let _ = reply.send(Err(Status::failed_precondition(error.to_string())));
+                    let _ = reply.send(Err(super::restore::attach_outcome_retry(
+                        &crate::append_admission::admission_error_outcome(&error),
+                        Status::failed_precondition(error.to_string()),
+                    )));
                     return None;
                 }
             }
-            let status = crate::append_admission::daemon_admission_error(
-                actor.clone(),
-                index,
-                &super::terminal_types::TerminalConfig::terminal_config(cfg),
-                tape_uuid,
-                error,
-            );
+            let status = {
+                let outcome = crate::append_admission::admission_error_outcome(&error);
+                crate::append_admission::daemon_admission_error(
+                    actor.clone(),
+                    index,
+                    &super::terminal_types::TerminalConfig::terminal_config(cfg),
+                    tape_uuid,
+                    error,
+                    &outcome,
+                )
+            };
             if closeout_due {
                 let _ = closeout_progress.audit(
                     index,
@@ -2568,9 +2597,12 @@ pub(super) fn handle_drive_open_write(
     if durable_checkpoint_records.is_empty() {
         let bootstrap = (|| -> Result<(), Status> {
             if parity_session.is_none() {
-                drive
-                    .locate_admitted_append(0)
-                    .map_err(|e| Status::unavailable(format!("locate fresh BOT: {e}")))?;
+                drive.locate_admitted_append(0).map_err(|e| {
+                    super::restore::attach_outcome_retry(
+                        e.outcome(),
+                        Status::unavailable(format!("locate fresh BOT: {e}")),
+                    )
+                })?;
                 let identity = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"));
                 crate::pool_write::write_no_parity_bootstrap(
                     &mut DriveHandleSink(drive),
@@ -2580,17 +2612,23 @@ pub(super) fn handle_drive_open_write(
                 )
                 .map_err(|e| status_from_selected_write_error(&selected, e))?;
             }
-            let barrier = drive
-                .write_filemarks(0)
-                .map_err(|e| Status::unavailable(format!("bootstrap barrier failed: {e}")))?;
+            let barrier = drive.write_filemarks(0).map_err(|e| {
+                super::restore::attach_outcome_retry(
+                    e.outcome(),
+                    Status::unavailable(format!("bootstrap barrier failed: {e}")),
+                )
+            })?;
             if barrier.end_of_medium {
                 return Err(Status::failed_precondition(
                     "bootstrap barrier reached end of medium",
                 ));
             }
-            let position = drive
-                .position()
-                .map_err(|e| Status::unavailable(format!("bootstrap barrier position: {e}")))?;
+            let position = drive.position().map_err(|e| {
+                super::restore::attach_outcome_retry(
+                    e.outcome(),
+                    Status::unavailable(format!("bootstrap barrier position: {e}")),
+                )
+            })?;
             let cursor = remanence_parity::CommitCursor {
                 partition: position.partition,
                 lba: position.lba,
@@ -2627,8 +2665,6 @@ pub(super) fn handle_drive_open_write(
         if let Err(status) = bootstrap {
             let status = if drive.media_write_dispatch_count() == bootstrap_dispatch_before {
                 status
-            } else if cfg.mounted().is_some() {
-                super::mounted_commands::fence_failed_write(index, cfg, status)
             } else {
                 let error = status.to_string();
                 fence_failed_parity_raw_write(
@@ -2638,11 +2674,17 @@ pub(super) fn handle_drive_open_write(
                     "fresh_bootstrap",
                     None,
                     None,
+                    &super::checkpoint::write_failure_outcome(
+                        drive,
+                        bootstrap_dispatch_before,
+                        None,
+                    ),
                     &error,
                     status,
                 )
                 .0
             };
+            drive.mark_media_failure_outcome_applied();
             let _ = reply.send(Err(status));
             return None;
         }
@@ -2840,11 +2882,15 @@ pub(super) fn handle_drive_open_write(
         session_state.begin_closing_work();
         if let Err(error) = session_state.finish_session() {
             if !session_state.ended_durably {
+                let outcome = super::checkpoint::ambiguous_authority_outcome();
+                let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect else {
+                    unreachable!("ambiguous publication is fenced")
+                };
                 super::checkpoint::record_closeout_fence(
                     session_state.index,
                     cfg,
                     tape_uuid,
-                    "AuthorityAmbiguous",
+                    cause.reason(),
                     serde_json::json!({"session_id": session_id, "error": error.to_string()})
                         .to_string(),
                 );
@@ -3060,7 +3106,10 @@ pub(super) fn prepare_drive_for_write_observing_identity(
     let (target_cfg, verified_cfg) =
         crate::drive_mode::configure_fixed_uncompressed_write(drive, current_cfg, block_size)
             .map_err(|err| {
-                Status::failed_precondition(format!("verify fixed-block write config: {err}"))
+                super::restore::attach_outcome_retry(
+                    err.outcome(),
+                    Status::failed_precondition(format!("verify fixed-block write config: {err}")),
+                )
             })?;
     drive
         .bind_identity_generation(identity_generation)

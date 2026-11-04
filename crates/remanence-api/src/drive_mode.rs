@@ -43,10 +43,10 @@ fn verify_fixed_uncompressed_write(
     observed: TapeConfig,
 ) -> Result<(), TapeIoError> {
     if observed.block_size != target.block_size || observed.compression {
-        return Err(TapeIoError::OperationFailed(format!(
+        return Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
             "fixed uncompressed write-mode verification mismatch: expected block_size={:?} compression=false, got block_size={:?} compression={}",
             target.block_size, observed.block_size, observed.compression
-        )));
+        ))));
     }
     Ok(())
 }

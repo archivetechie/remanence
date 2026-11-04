@@ -1062,7 +1062,10 @@ fn move_check_condition_reports_failure_without_moving_cartridges() {
     assert!(
         matches!(
             error,
-            remanence_library::MoveError::DestinationFull { addr: 0x401 }
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::DestinationFull { addr: 0x401 },
+                ..
+            }
         ),
         "{error}"
     );
@@ -1119,7 +1122,13 @@ fn move_to_full_slot_preserves_both_cartridges() {
             .move_medium(0x400, 0x401, &StaticAllowlist::new([LIBRARY]))
             .unwrap_err();
         assert!(
-            matches!(error, remanence_library::MoveError::DestinationFull { .. }),
+            matches!(
+                error,
+                remanence_library::MoveError {
+                    kind: remanence_library::MoveErrorKind::DestinationFull { .. },
+                    ..
+                }
+            ),
             "{error}"
         );
         let world = fixture.world.lock().unwrap();
@@ -1154,9 +1163,10 @@ fn full_destination_refusal_leaves_source_cartridge_threaded() {
     assert!(
         matches!(
             error,
-            remanence_library::UnloadError::Move(
-                remanence_library::MoveError::DestinationFull { .. }
-            )
+            remanence_library::UnloadError::Move(remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::DestinationFull { .. },
+                ..
+            })
         ),
         "{error}"
     );

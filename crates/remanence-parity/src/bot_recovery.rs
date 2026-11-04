@@ -353,9 +353,10 @@ where
         |progress| visit_control(&BotStructuralRecoveryEvent::Progress(*progress)),
     )
     .map_err(|error| match error {
-        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled) => {
-            BotStructuralRecoveryError::Cancelled
-        }
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        }) => BotStructuralRecoveryError::Cancelled,
         ParityError::BootstrapRefused {
             field: BootstrapRefusedField::TapeUuid,
             ..
@@ -797,7 +798,10 @@ fn bot_bootstrap_source_error(
 ) -> BotStructuralRecoveryError {
     if matches!(
         error,
-        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        })
     ) {
         return BotStructuralRecoveryError::Cancelled;
     }

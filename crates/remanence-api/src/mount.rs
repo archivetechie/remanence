@@ -1,5 +1,6 @@
 //! Hardware mount bridge shared by CLI and Layer 5 actor orchestration.
 
+use crate::closeout_obligation::RetryCauseExt as _;
 use remanence_library::{
     resolve_load_target, AccessPolicy, DriveHandle, Library, LibraryHandle, LoadError, LoadPlan,
 };
@@ -5357,10 +5358,12 @@ mod tests {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     operation_id,
-                    &remanence_library::MediaReadiness::BecomingReady {
-                        ascq: 0x02,
-                        media_initializing: true,
-                    },
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::BecomingReady {
+                            ascq: 0x02,
+                            media_initializing: true,
+                        },
+                    ),
                 ),
             )
             .expect("record the fence's last sense");
@@ -7213,7 +7216,9 @@ mod tests {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     readiness_id,
-                    &remanence_library::MediaReadiness::Ready,
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::Ready,
+                    ),
                 ),
             )
             .unwrap();
@@ -7370,10 +7375,12 @@ mod tests {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     readiness_id,
-                    &remanence_library::MediaReadiness::BecomingReady {
-                        ascq: 1,
-                        media_initializing: false,
-                    },
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::BecomingReady {
+                            ascq: 1,
+                            media_initializing: false,
+                        },
+                    ),
                 ),
             )
             .unwrap();
@@ -7448,7 +7455,9 @@ mod tests {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     readiness_id,
-                    &remanence_library::MediaReadiness::Ready,
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::Ready,
+                    ),
                 ),
             )
             .unwrap();
@@ -8113,7 +8122,9 @@ mod tests {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     readiness_id,
-                    &remanence_library::MediaReadiness::Ready,
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::Ready,
+                    ),
                 ),
             )
             .unwrap();

@@ -288,8 +288,70 @@ pub enum OpenError {
 
 /// Errors from `LibraryHandle::move_medium` and other single-CDB
 /// changer operations.
+/// An error kind together with the immutable outcome of its final public result.
+pub struct MoveError {
+    /// Original error detail; exposed for mechanical, behavior-preserving matching.
+    pub kind: MoveErrorKind,
+    classification: Option<Box<crate::outcome::ClassifiedOutcome>>,
+}
+impl std::fmt::Debug for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.kind, f)
+    }
+}
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+impl std::error::Error for MoveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.kind)
+    }
+}
+impl MoveError {
+    /// Preserve the completed MOVE when its final public kind names an element refusal.
+    pub(crate) fn with_kind(mut self, kind: MoveErrorKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Finish a synthetic error without borrowing a handle's last command.
+    pub fn new(kind: MoveErrorKind) -> Self {
+        let mut error = Self::pending(kind);
+        error.finish_synthetic();
+        error
+    }
+    /// Construct an intermediate error while its command is still being arbitrated.
+    pub(crate) fn pending(kind: MoveErrorKind) -> Self {
+        Self {
+            kind,
+            classification: None,
+        }
+    }
+    /// The outcome belonging to this error, independent of later handle activity.
+    pub fn outcome(&self) -> &crate::outcome::ClassifiedOutcome {
+        self.classification
+            .as_deref()
+            .expect("error returned before final classification")
+    }
+    /// Already-normalized evidence; this accessor never decodes or classifies.
+    pub fn completion_evidence(&self) -> crate::outcome::CompletionEvidence {
+        self.outcome().evidence.clone()
+    }
+    pub(crate) fn set_outcome(&mut self, outcome: crate::outcome::ClassifiedOutcome) {
+        self.classification = Some(Box::new(outcome));
+    }
+    pub(crate) fn finish_synthetic(&mut self) {
+        if self.classification.is_none() {
+            self.set_outcome(crate::outcome::finish_moveerror(&self.kind));
+        }
+    }
+}
+
+/// Original error detail, retained without a policy decision.
 #[derive(Debug, Error)]
-pub enum MoveError {
+pub enum MoveErrorKind {
     /// The owner refused new motion immediately before dispatch.
     #[error("motion admission refused: {0}")]
     Admission(String),
@@ -396,8 +458,64 @@ pub enum MoveError {
 /// Errors from `DriveHandle::unload` / `load`. Thin wrapper today;
 /// distinct from [`MoveError`] so composed operations can carry both
 /// without conflation.
+/// An error kind together with the immutable outcome of its final public result.
+pub struct DriveOpError {
+    /// Original error detail; exposed for mechanical, behavior-preserving matching.
+    pub kind: DriveOpErrorKind,
+    classification: Option<Box<crate::outcome::ClassifiedOutcome>>,
+}
+impl std::fmt::Debug for DriveOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.kind, f)
+    }
+}
+impl std::fmt::Display for DriveOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+impl std::error::Error for DriveOpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.kind)
+    }
+}
+impl DriveOpError {
+    /// Finish a synthetic error without borrowing a handle's last command.
+    pub fn new(kind: DriveOpErrorKind) -> Self {
+        let mut error = Self::pending(kind);
+        error.finish_synthetic();
+        error
+    }
+    /// Construct an intermediate error while its command is still being arbitrated.
+    pub(crate) fn pending(kind: DriveOpErrorKind) -> Self {
+        Self {
+            kind,
+            classification: None,
+        }
+    }
+    /// The outcome belonging to this error, independent of later handle activity.
+    pub fn outcome(&self) -> &crate::outcome::ClassifiedOutcome {
+        self.classification
+            .as_deref()
+            .expect("error returned before final classification")
+    }
+    /// Already-normalized evidence; this accessor never decodes or classifies.
+    pub fn completion_evidence(&self) -> crate::outcome::CompletionEvidence {
+        self.outcome().evidence.clone()
+    }
+    pub(crate) fn set_outcome(&mut self, outcome: crate::outcome::ClassifiedOutcome) {
+        self.classification = Some(Box::new(outcome));
+    }
+    pub(crate) fn finish_synthetic(&mut self) {
+        if self.classification.is_none() {
+            self.set_outcome(crate::outcome::finish_driveoperror(&self.kind));
+        }
+    }
+}
+
+/// Original error detail, retained without a policy decision.
 #[derive(Debug, Error)]
-pub enum DriveOpError {
+pub enum DriveOpErrorKind {
     /// The owner stopped a fresh LOAD after preparation, before dispatch.
     #[error("load admission refused: {0}")]
     LoadAdmission(String),
@@ -416,14 +534,14 @@ impl DriveOpError {
     /// Only a current MEDIUM REMOVAL PREVENTED refusal authorizes recovery.
     /// Other CHECK CONDITIONs, deferred sense and transport errors do not.
     pub fn is_medium_removal_prevented(&self) -> bool {
-        match self {
-            Self::ScsiError(remanence_scsi::ScsiError::CheckCondition { sense, .. }) => {
-                remanence_scsi::sense::decode_sense(sense).is_some_and(|sense| {
-                    !sense.is_deferred() && (sense.key, sense.asc, sense.ascq) == (5, 0x53, 2)
-                })
-            }
-            _ => false,
-        }
+        matches!(
+            &self.kind,
+            DriveOpErrorKind::ScsiError(remanence_scsi::ScsiError::CheckCondition { .. })
+        ) && self
+            .outcome()
+            .evidence
+            .current_sense()
+            .is_some_and(|sense| (sense.key, sense.asc, sense.ascq) == (5, 0x53, 2))
     }
 }
 
@@ -967,7 +1085,26 @@ impl<'a> AuditSubject<'a> {
 
 #[cfg(test)]
 mod recovery_tests {
-    use super::DriveOpError;
+
+    /// P24 removal recovery rejects missing ASCQ and a three-byte key alone.
+    #[test]
+    fn b3b_removal_recovery_requires_usable_sense() {
+        let mut advertised = [0; 14];
+        advertised[0] = 0x70;
+        advertised[2] = 5;
+        advertised[7] = 10;
+        advertised[12] = 0x53;
+        advertised[13] = 2;
+        for sense in [vec![0x70, 0, 5], advertised[..13].to_vec()] {
+            let error = crate::DriveOpError::new(crate::DriveOpErrorKind::ScsiError(
+                remanence_scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ));
+            assert!(!error.is_medium_removal_prevented());
+        }
+    }
 
     /// Recovery must be exact, including current versus deferred sense format.
     #[test]
@@ -983,10 +1120,12 @@ mod recovery_tests {
                 } else {
                     sense[1..4].copy_from_slice(&[key, asc, ascq]);
                 }
-                let error = DriveOpError::ScsiError(remanence_scsi::ScsiError::CheckCondition {
-                    sense,
-                    bytes_transferred: 0,
-                });
+                let error = crate::DriveOpError::new(crate::DriveOpErrorKind::ScsiError(
+                    remanence_scsi::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    },
+                ));
                 assert_eq!(
                     error.is_medium_removal_prevented(),
                     matches!(response, 0x70 | 0x72) && (key, asc, ascq) == (5, 0x53, 2)
@@ -1000,10 +1139,12 @@ mod recovery_tests {
             vec![0x7f, 5, 0x53, 2],
         ] {
             assert!(
-                !DriveOpError::ScsiError(remanence_scsi::ScsiError::CheckCondition {
-                    sense,
-                    bytes_transferred: 0
-                })
+                !crate::DriveOpError::new(crate::DriveOpErrorKind::ScsiError(
+                    remanence_scsi::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0
+                    }
+                ))
                 .is_medium_removal_prevented()
             );
         }

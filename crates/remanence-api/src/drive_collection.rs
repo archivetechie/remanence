@@ -401,7 +401,13 @@ pub(crate) fn read_tape_alert_flags_from_transport<T: remanence_library::SgTrans
 
 #[cfg(target_os = "linux")]
 pub(crate) fn foreign_poll_error_from_scsi(err: remanence_library::ScsiError) -> ForeignPollError {
-    if is_retryable_foreign_scsi_error(&err) {
+    let outcome = remanence_library::outcome::finish_control(
+        remanence_library::outcome::CommandClass::SenseStatus,
+        Default::default(),
+        0,
+        Some(&err),
+    );
+    if is_retryable_foreign_scsi_error(&outcome) {
         ForeignPollError::Retryable(err.to_string())
     } else {
         ForeignPollError::Permanent(err.to_string())
@@ -409,22 +415,24 @@ pub(crate) fn foreign_poll_error_from_scsi(err: remanence_library::ScsiError) ->
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn is_retryable_foreign_scsi_error(err: &remanence_library::ScsiError) -> bool {
-    match err {
-        remanence_library::ScsiError::UnexpectedStatus { status } => {
-            matches!(*status, 0x08 | 0x18)
-        }
-        remanence_library::ScsiError::CheckCondition { sense, .. }
-        | remanence_library::ScsiError::TransportError { sense, .. } => {
-            remanence_scsi_unit_attention(sense)
-        }
-        _ => false,
-    }
+pub(crate) fn is_retryable_foreign_scsi_error(
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
+) -> bool {
+    (outcome.evidence.host_status.is_none()
+        && matches!(outcome.evidence.scsi_status, Some(0x08 | 0x18)))
+        || remanence_scsi_unit_attention(outcome)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn remanence_scsi_unit_attention(sense: &[u8]) -> bool {
-    remanence_library::decode_scsi_sense(sense).is_some_and(|sense| sense.key == 0x06)
+pub(crate) fn remanence_scsi_unit_attention(
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
+) -> bool {
+    outcome
+        .evidence
+        .decoded
+        // Foreign polling historically retries usable UA, including deferred sense and host failure.
+        // This retry permission does not establish completion or media authority.
+        .is_some_and(|sense| sense.key == 0x06)
 }
 
 pub(crate) fn next_backoff(current: Duration, max: Duration) -> Duration {
@@ -526,4 +534,59 @@ pub(crate) fn observe_drive_catalog_from_libraries<'a>(
         .observe_drive_inventory_snapshot(observations)
         .map(|_| ())
         .map_err(status_from_state_error)
+}
+
+#[cfg(test)]
+mod b3b_strict_tests {
+    use super::*;
+    /// Unusable autosense cannot authorize a foreign-drive unit-attention retry.
+    #[test]
+    fn b3b_foreign_unit_attention_requires_usable_sense() {
+        let error =
+            remanence_library::DriveOpError::from(remanence_library::ScsiError::CheckCondition {
+                sense: vec![0x70, 0, 6],
+                bytes_transferred: 0,
+            });
+        assert!(!remanence_scsi_unit_attention(error.outcome()));
+    }
+    /// Preserve the foreign poll retry policy while consuming normalized evidence once.
+    #[test]
+    fn b3b_foreign_retry_carrier_census() {
+        use remanence_library::{outcome::census, DriveOpError, ScsiError};
+        for (sense, status, expected) in [
+            (vec![0x72, 6, 0x29, 0], 2, true),
+            (vec![0x70, 0, 6], 2, false),
+            (vec![], 8, false),
+        ] {
+            let error = DriveOpError::from(ScsiError::TransportError {
+                status,
+                host_status: 1,
+                driver_status: 0,
+                info: 1,
+                sense,
+            });
+            let before = (census::total(), census::normalizations());
+            assert_eq!(is_retryable_foreign_scsi_error(error.outcome()), expected);
+            assert_eq!((census::total(), census::normalizations()), before);
+        }
+    }
+}
+
+/// Foreign polling accepts usable deferred UA, as it did before consolidation.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn b3b_fix1_deferred_foreign_unit_attention() {
+    for raw in [
+        vec![0x71, 0, 6, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x29, 0, 0, 0, 0, 0],
+        vec![0x73, 6, 0x29, 0, 0, 0, 0, 0],
+    ] {
+        let error =
+            remanence_library::DriveOpError::new(remanence_library::DriveOpErrorKind::ScsiError(
+                remanence_library::ScsiError::CheckCondition {
+                    sense: raw,
+                    bytes_transferred: 0,
+                },
+            ));
+        assert!(remanence_scsi_unit_attention(error.outcome()));
+    }
 }

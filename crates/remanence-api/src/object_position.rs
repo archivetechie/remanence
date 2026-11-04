@@ -39,8 +39,8 @@ pub fn position_to_object<'a>(
     origin: BotRelativeTapeFile,
 ) -> Result<TapePosition, TapeIoError> {
     let count = i64::try_from(origin.0).map_err(|_| {
-        TapeIoError::InvalidRequest(remanence_library::ScsiError::InvalidInput(
-            "tape-file number exceeds SPACE range",
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::InvalidRequest(
+            remanence_library::ScsiError::InvalidInput("tape-file number exceeds SPACE range"),
         ))
     })?;
     let source = source.into();

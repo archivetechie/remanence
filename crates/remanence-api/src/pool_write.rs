@@ -84,3 +84,8 @@ fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWrit
 pub(crate) use no_parity::requested_copy_identity;
 
 pub(crate) use prepare::write_no_parity_bootstrap;
+
+#[cfg(test)]
+mod b3b_fix2_tests;
+#[cfg(test)]
+pub(crate) use b3b_fix2_tests::post_write_adapter_error;

@@ -47,6 +47,7 @@ crates/remanence-api/src/drive_collection.rs::parse_simple_duration::text-match	
 crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_with_reader::text-equality	3
 crates/remanence-api/src/drive_collection.rs::touch_managed_drive_heartbeats::text-equality	2
 crates/remanence-api/src/drive_pool.rs::held_by_readiness_wait::text-matches	1
+crates/remanence-api/src/drive_pool.rs::is_status::text-equality	1
 crates/remanence-api/src/library.rs::clean_drive::text-equality	2
 crates/remanence-api/src/library.rs::ensure_mutable_drive::text-equality	2
 crates/remanence-api/src/library.rs::poll_drive::text-equality	2
@@ -108,7 +109,6 @@ crates/remanence-api/src/terminal_fault.rs::parse::text-matches	1
 crates/remanence-api/src/terminal_fault.rs::record_prefix_if_matches::text-equality	1
 crates/remanence-api/src/terminal_fault.rs::require_confined_path::text-equality	1
 crates/remanence-api/src/terminal_fault.rs::validate_component_cut::text-match	4
-crates/remanence-api/src/write_owner/checkpoint.rs::parity_raw_write_fence_reason::text-contains	6
 crates/remanence-api/src/write_owner/cleaning.rs::cleaning_too_soon::text-equality	1
 crates/remanence-api/src/write_owner/cleaning.rs::parse_simple_duration::text-match	4
 crates/remanence-api/src/write_owner/cleaning.rs::run_cleaning_sequence::text-equality	6
@@ -211,7 +211,6 @@ crates/remanence-cli/src/lib.rs::development_replacement::text-match	3
 crates/remanence-cli/src/lib.rs::development_replacement::text-matches	2
 crates/remanence-cli/src/lib.rs::development_replacement::text-starts_with	5
 crates/remanence-cli/src/lib.rs::finish_top_client_result::text-starts_with	1
-crates/remanence-cli/src/lib.rs::media_readiness_command_failure_state::text-contains	8
 crates/remanence-cli/src/lib.rs::media_readiness_error_is_signal_abort::text-contains	2
 crates/remanence-cli/src/lib.rs::media_readiness_failure_exit_code::text-find	1
 crates/remanence-cli/src/lib.rs::media_readiness_mechanical_transition::text-equality	1

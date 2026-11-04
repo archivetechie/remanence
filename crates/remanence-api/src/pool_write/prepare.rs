@@ -463,15 +463,21 @@ impl CanonicalDigestSink {
 impl BlockSink for CanonicalDigestSink {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         if buf.len() != self.block_size {
-            return Err(TapeIoError::OperationFailed(format!(
-                "canonical regeneration emitted {} bytes, expected one {}-byte block",
-                buf.len(),
-                self.block_size
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "canonical regeneration emitted {} bytes, expected one {}-byte block",
+                    buf.len(),
+                    self.block_size
+                )),
+            ));
         }
         self.hasher.update(buf);
         self.next_lba = self.next_lba.checked_add(1).ok_or_else(|| {
-            TapeIoError::OperationFailed("canonical regeneration LBA overflow".to_string())
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "canonical regeneration LBA overflow".to_string(),
+                ),
+            )
         })?;
         Ok(WriteOutcome::from_device_position(
             buf.len() as u32,
@@ -483,8 +489,10 @@ impl BlockSink for CanonicalDigestSink {
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
         if count != 0 {
-            return Err(TapeIoError::OperationFailed(
-                "canonical regeneration does not accept filemarks".to_string(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "canonical regeneration does not accept filemarks".to_string(),
+                ),
             ));
         }
         Ok(WriteFilemarksOutcome::from_device_position(
@@ -943,16 +951,16 @@ pub(crate) fn write_fixed_blocks(
         })?;
         let written_bytes = u64::from(outcome.bytes_written);
         if written_bytes != expected_bytes || outcome.end_of_medium {
-            return Err(PoolWriteError::TapeIo(
-                TapeIoError::PartialBatchUncommittable {
-                    requested_records: 1,
-                    written_records: u32::from(written_bytes >= expected_bytes),
-                    requested_bytes: expected_bytes,
-                    written_bytes,
-                    end_of_medium: outcome.end_of_medium,
-                    sense: None,
-                },
-            ));
+            let kind = remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+                requested_records: 1,
+                written_records: u32::from(written_bytes >= expected_bytes),
+                requested_bytes: expected_bytes,
+                written_bytes,
+                end_of_medium: outcome.end_of_medium,
+                sense: None,
+            };
+            let error = sink.finish_adapter_error(kind);
+            return Err(PoolWriteError::TapeIo(error));
         }
         blocks = blocks
             .checked_add(1)
@@ -974,12 +982,12 @@ pub(crate) fn position_no_parity_append_at_checkpoint(
 ) -> Result<(), PoolWriteError> {
     let located = sink.locate(journal_eod_lba)?;
     if located.partition != 0 || located.lba != journal_eod_lba {
-        return Err(PoolWriteError::TapeIo(TapeIoError::OperationFailed(
+        return Err(PoolWriteError::TapeIo(sink.finish_adapter_error(remanence_library::TapeIoErrorKind::OperationFailed(
             format!(
                 "checkpoint recovery LOCATE mismatch: expected partition 0 lba {journal_eod_lba}, observed partition {} lba {}",
                 located.partition, located.lba
             ),
-        )));
+        ))));
     }
     prove_no_parity_append_boundary(sink, journal_eod_lba)
 }
@@ -990,12 +998,12 @@ pub(crate) fn prove_no_parity_append_boundary(
 ) -> Result<(), PoolWriteError> {
     let observed = sink.position()?;
     if observed.partition != 0 || observed.lba != expected_lba {
-        return Err(PoolWriteError::TapeIo(TapeIoError::OperationFailed(
+        return Err(PoolWriteError::TapeIo(sink.finish_adapter_error(remanence_library::TapeIoErrorKind::OperationFailed(
             format!(
                 "checkpoint append position drift: expected partition 0 lba {expected_lba}, observed partition {} lba {}",
                 observed.partition, observed.lba
             ),
-        )));
+        ))));
     }
     Ok(())
 }

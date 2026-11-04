@@ -56,7 +56,7 @@ test-support = []
 [dev-dependencies]
 remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
 remanence-state = { path = "../remanence-state", features = ["fixtures"] }
-remanence-library = { path = "../remanence-library", features = ["test-support"] }
+remanence-library = { path = "../remanence-library", features = ["test-support", "outcome-census"] }
 tokio = { workspace = true, features = ["test-util"] }
 remanence-chaos = { path = "../remanence-chaos" }
 rusqlite = { workspace = true }

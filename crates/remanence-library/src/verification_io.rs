@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::transport::TransferOutcome;
-use remanence_scsi::{decode_sense, ScsiError};
+use remanence_scsi::ScsiError;
 
 /// Existing verification boundaries; nested scopes restore their enclosing phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,12 +271,13 @@ impl VerificationContext {
                 1;
         }
     }
-    pub(crate) fn dispatch(
+    pub(crate) fn dispatch_completed(
         &self,
         cdb: &[u8],
         buf: &[u8],
         result: &Result<TransferOutcome, ScsiError>,
         duration: Duration,
+        evidence: &crate::outcome::CompletionEvidence,
     ) {
         let command_ms = milliseconds(duration);
         let bucket = [5, 20, 100, 1_000, 10_000].partition_point(|&bound| command_ms >= bound);
@@ -311,12 +312,11 @@ impl VerificationContext {
         let bytes = match result {
             Ok(o) => u64::from(o.bytes_transferred),
             Err(ScsiError::CheckCondition {
-                sense,
-                bytes_transferred,
+                bytes_transferred, ..
             }) if opcode == 8 => {
                 let block_size = fixed.then(|| (buf.len() as u64 / requested.max(1)) as u32);
-                u64::from(crate::handle::tape_io::transfer_bytes_from_sense(
-                    sense,
+                u64::from(crate::handle::tape_io::transfer_bytes_from_evidence(
+                    evidence,
                     *bytes_transferred,
                     buf.len() as u32,
                     block_size,
@@ -333,7 +333,7 @@ impl VerificationContext {
         let recovered = opcode == 8
             && !fixed
             && state.verification_depth > 0
-            && exact_recovered(result, buf.len());
+            && exact_recovered_evidence(result, buf.len(), evidence);
         let clean = matches!(result, Ok(o) if o.sense.is_none()) && bytes == buf.len() as u64;
         let confirmed = if clean || recovered { requested } else { 0 };
         let phase = state.phase;
@@ -481,15 +481,19 @@ impl VerificationContext {
 
 /// Accept only current recovered sense with exact bytes and no residual or
 /// stream-boundary anomaly. Malformed or deferred sense retains prior handling.
-pub(crate) fn exact_recovered(result: &Result<TransferOutcome, ScsiError>, size: usize) -> bool {
+pub(crate) fn exact_recovered_evidence(
+    result: &Result<TransferOutcome, ScsiError>,
+    size: usize,
+    evidence: &crate::outcome::CompletionEvidence,
+) -> bool {
     let (sense, bytes) = match result {
         Err(ScsiError::CheckCondition {
             sense,
             bytes_transferred,
         }) => (
             sense.as_slice(),
-            crate::handle::tape_io::transfer_bytes_from_sense(
-                sense,
+            crate::handle::tape_io::transfer_bytes_from_evidence(
+                evidence,
                 *bytes_transferred,
                 size as u32,
                 None,
@@ -508,7 +512,7 @@ pub(crate) fn exact_recovered(result: &Result<TransferOutcome, ScsiError>, size:
         }
         _ => return false,
     };
-    let Some(decoded) = decode_sense(sense) else {
+    let Some(decoded) = evidence.current_sense() else {
         return false;
     };
     if size == 0
@@ -560,8 +564,46 @@ pub(crate) fn exact_recovered(result: &Result<TransferOutcome, ScsiError>, size:
 }
 
 #[cfg(test)]
+impl VerificationContext {
+    /// Test fixture boundary supplying the same normalized evidence as the transport.
+    fn dispatch(
+        &self,
+        cdb: &[u8],
+        buf: &[u8],
+        result: &Result<TransferOutcome, ScsiError>,
+        duration: Duration,
+    ) {
+        let evidence = result.as_ref().err().map_or_else(
+            crate::outcome::CompletionEvidence::success,
+            crate::outcome::CompletionEvidence::from_scsi,
+        );
+        self.dispatch_completed(cdb, buf, result, duration, &evidence);
+    }
+}
+#[cfg(test)]
+fn exact_recovered(result: &Result<TransferOutcome, ScsiError>, size: usize) -> bool {
+    let evidence = result.as_ref().err().map_or_else(
+        crate::outcome::CompletionEvidence::success,
+        crate::outcome::CompletionEvidence::from_scsi,
+    );
+    exact_recovered_evidence(result, size, &evidence)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    /// P24 exact-recovered accounting never accepts a truncated RECOVERED ERROR solely from its key.
+    #[test]
+    fn b3b_exact_recovered_requires_usable_sense() {
+        for sense in [vec![0x70, 0, 1], vec![0xf0, 0, 1, 0, 0, 0, 0]] {
+            let result = Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 512,
+            });
+            assert!(!exact_recovered(&result, 512));
+        }
+    }
+
     #[test]
     fn phase_time_covers_repeated_entries_and_leaves_unused_phases_empty() {
         let context = VerificationContext::default();
@@ -803,5 +845,23 @@ mod tests {
             vec![0x72, 1, 0, 0, 0, 0, 0, 12, 0, 10, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             4
         ));
+    }
+}
+
+/// Directly constructed completion injection for downstream policy-site regressions.
+/// This bypasses map_scsi deliberately: transport-level malformed sense is
+/// already converted to Transport by B3a and cannot exercise the P24 consumers.
+#[cfg(any(test, feature = "outcome-census"))]
+#[doc(hidden)]
+pub mod b3b_test_support {
+    thread_local! {
+        static FAILURE: std::cell::RefCell<Option<crate::TapeIoError>> = const { std::cell::RefCell::new(None) };
+    }
+    /// Fail the next verification batch on this thread before dispatch.
+    pub fn fail_next_verification(error: crate::TapeIoError) {
+        FAILURE.with(|slot| assert!(slot.borrow_mut().replace(error).is_none()));
+    }
+    pub(crate) fn take() -> Option<crate::TapeIoError> {
+        FAILURE.with(|slot| slot.borrow_mut().take())
     }
 }

@@ -443,13 +443,15 @@ impl RawTapeSource for InjectReadFaultOnce<'_> {
 }
 
 fn synthetic_transport_read_error() -> TapeIoError {
-    TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
-        status: 0,
-        host_status: 0,
-        driver_status: 0,
-        info: 0,
-        sense: Vec::new(),
-    })
+    remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::Transport(
+        remanence_library::scsi::ScsiError::TransportError {
+            status: 0,
+            host_status: 0,
+            driver_status: 0,
+            info: 0,
+            sense: Vec::new(),
+        },
+    ))
 }
 
 #[test]

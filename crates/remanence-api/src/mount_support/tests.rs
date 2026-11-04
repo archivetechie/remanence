@@ -62,6 +62,31 @@ impl Transport {
                 .put_tape_in_drive(BAY, "SWAPPED", None, media([0x82; 16]));
         }
         let mut fault = self.fault.lock().unwrap();
+        // R6: the transport reports a definite WRITE rejection and zero transferred bytes.
+        if *fault == Some(0xfe) && cdb[0] == 0x0a {
+            *fault = None;
+            return Err(ScsiError::CheckCondition {
+                sense: vec![0x72, 5, 0x24, 0],
+                bytes_transferred: 0,
+            });
+        }
+
+        // 0xff is a test-only arm for a validated partial fixed WRITE, with
+        // no modeled media mutation so later positioning has an independent oracle.
+        if *fault == Some(0xff) && cdb[0] == 0x0a {
+            *fault = None;
+            assert_eq!(cdb[1] & 1, 1);
+            let mut sense = vec![0; 18];
+            sense[0] = 0xf0;
+            sense[2] = 3;
+            sense[3..7].copy_from_slice(&2u32.to_be_bytes());
+            sense[7] = 10;
+            sense[12] = 0x0c;
+            return Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 4 * BLOCK,
+            });
+        }
         if *fault == Some(cdb[0]) {
             *fault = None;
             if let Some(path) = self.audit_cut.take() {
@@ -2004,14 +2029,19 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
         audit_fsync: true,
         audit_append_lock: Arc::new(Mutex::new(())),
     };
+    let error = crate::append_admission::AdmissionError::new(
+        crate::append_admission::AdmissionErrorKind::Io(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed("transient read failure".into()),
+        )),
+    );
+    let outcome = crate::append_admission::admission_error_outcome(&error);
     let status = crate::append_admission::daemon_admission_error(
         remanence_state::AuditActor::System,
         state.catalog_index(),
         &cfg,
         UUID,
-        crate::append_admission::AdmissionError::Io(
-            remanence_library::TapeIoError::OperationFailed("transient read failure".into()),
-        ),
+        error,
+        &outcome,
     );
     assert_eq!(status.code(), tonic::Code::Unavailable);
     assert_eq!(
@@ -2038,9 +2068,13 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
 #[test]
 fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
     for error in [
-        crate::append_admission::AdmissionError::MissingBootstrapFilemark,
-        crate::append_admission::AdmissionError::Unproved(
-            "control suffix position mismatch".into(),
+        crate::append_admission::AdmissionError::new(
+            crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
+        ),
+        crate::append_admission::AdmissionError::new(
+            crate::append_admission::AdmissionErrorKind::Unproved(
+                "control suffix position mismatch".into(),
+            ),
         ),
     ] {
         let root = tempfile::tempdir().unwrap();
@@ -2054,13 +2088,17 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
             audit_append_lock: Arc::new(Mutex::new(())),
         };
         let actor = remanence_state::AuditActor::User("authenticated-test".into());
-        let status = crate::append_admission::daemon_admission_error(
-            actor.clone(),
-            state.catalog_index(),
-            &cfg,
-            UUID,
-            error,
-        );
+        let status = {
+            let outcome = crate::append_admission::admission_error_outcome(&error);
+            crate::append_admission::daemon_admission_error(
+                actor.clone(),
+                state.catalog_index(),
+                &cfg,
+                UUID,
+                error,
+                &outcome,
+            )
+        };
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
             state
@@ -2361,4 +2399,335 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "supersede_tail_failed");
     crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
+}
+
+/// Standalone initialization fences a failed WRITE from its stored outcome; cleanup adds only its CDB.
+#[test]
+fn b3b_standalone_init_failure_one_fence_by_cause() {
+    use remanence_library::outcome::census;
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state_with_audit(root.path(), false);
+    let world = world();
+    let injected = fault();
+    let mut mount = backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        injected.clone(),
+    )
+    .unwrap();
+    let finished = std::cell::Cell::new((0, 0));
+    let result: Result<(), _> = mount.initialize(
+        false,
+        |_, _| Ok((UUID, ())),
+        |drive, _, ()| {
+            *injected.lock().unwrap() = Some(10);
+            let before = census::count();
+            let error = drive.write_block_unpositioned(&[0; 512]).unwrap_err();
+            assert_eq!(census::count() - before, 1);
+            finished.set((census::total(), census::normalizations()));
+            Err(error.to_string())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        census::total(),
+        finished.get().0 + 1,
+        "only ALLOW removal follows the failure"
+    );
+    assert_eq!(census::normalizations(), finished.get().1);
+    assert!(mount.unusable);
+    let fences = mount
+        .state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].reason, "transfer_error");
+    let records = remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir).unwrap();
+    let endings: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.event,
+                AuditEvent::SessionOpened
+                    | AuditEvent::TapeIoFenceRaised
+                    | AuditEvent::SessionOrphaned
+                    | AuditEvent::SessionClosed
+            )
+        })
+        .map(|r| r.event.clone())
+        .collect();
+    assert_eq!(
+        endings,
+        vec![
+            AuditEvent::SessionOpened,
+            AuditEvent::TapeIoFenceRaised,
+            AuditEvent::SessionOrphaned
+        ]
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.event == AuditEvent::TapeIoFenceRaised)
+            .count(),
+        1
+    );
+    let commands = world.lock().unwrap().command_log.len();
+    let again: Result<(), _> = mount.initialize(
+        false,
+        |_, _| panic!("spent invocation cannot prepare"),
+        |_, _, (): ()| panic!("spent invocation cannot write"),
+    );
+    assert!(again.is_err());
+    assert_eq!(world.lock().unwrap().command_log.len(), commands);
+}
+
+/// Mounted origin conversion discards the bootstrap shortcut after a failed pipeline.
+#[test]
+fn b3b_mounted_object_origin_after_pipeline_failure() {
+    b3b_pipeline_position_consumer("origin");
+}
+
+/// Catalogless candidate listing positions from BOT after a failed pipeline, then reads the correct object.
+#[test]
+fn b3b_catalogless_listing_after_pipeline_failure() {
+    b3b_pipeline_position_consumer("listing");
+}
+
+/// A candidate cache miss LOCATEs after a failed pipeline before reading the saved block.
+#[test]
+fn b3b_tape_candidate_after_pipeline_failure() {
+    b3b_pipeline_position_consumer("candidate");
+}
+
+/// Build real object bytes, inject a partial pipeline at the consumer's cached cursor, and inspect subsequent CDBs.
+fn b3b_pipeline_position_consumer(consumer: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let world = world();
+    let lock = root.path().join("locks");
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "position-object"))
+        .unwrap();
+    actor.finish().unwrap();
+    let mut state = reopen_state();
+    let armed = fault();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut mount = OperatorMount::with_transport_for_test(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(world.clone(), DeviceRole::Drive { bay: BAY }),
+            fault: armed.clone(),
+            audit_cut: None,
+            hide_serial: false,
+            boundary: None,
+            commands: Some(commands.clone()),
+            cut_after_prevent: false,
+        }),
+        &mut state,
+        &lock,
+    )
+    .unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    let fail = |drive: &mut DriveHandle| {
+        *armed.lock().unwrap() = Some(0xff);
+        let error = drive
+            .write_block_batch_pipelined(
+                &vec![0; (4 * BLOCK) as usize],
+                BLOCK,
+                &remanence_scsi::read_write::build_write_fixed_cdb(4),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.kind,
+            remanence_library::TapeIoErrorKind::PartialBatchUncommittable { .. }
+        ));
+        assert!(armed.lock().unwrap().is_none());
+        assert!(drive.known_position().is_none());
+        commands.lock().unwrap().clear();
+    };
+    match consumer {
+        "origin" => {
+            assert_eq!(mounted.drive.known_position().unwrap().lba, 1);
+            fail(&mut mounted.drive);
+            let position =
+                crate::position_to_object(&mut mounted, crate::BotRelativeTapeFile(1)).unwrap();
+            assert_eq!(position.lba, 2);
+            let commands = commands.lock().unwrap().clone();
+            assert_eq!(commands.first().unwrap()[0], 1, "must rewind before SPACE");
+            assert!(commands.iter().any(|c| c[0] == 0x11));
+        }
+        "listing" => {
+            fail(&mut mounted.drive);
+            let report = crate::restore_catalogless_selected(
+                &mut mounted.drive,
+                None,
+                None,
+                true,
+                true,
+                &[],
+            )
+            .unwrap();
+            let candidates = report["candidates"].as_array().unwrap();
+            assert_eq!(candidates.len(), 1, "{report}");
+            assert!(candidates[0]["manifest"]["rows"].is_array(), "{report}");
+            assert!(report.to_string().contains("position-object"), "{report}");
+            let commands = commands.lock().unwrap().clone();
+            let rewind = commands.iter().position(|c| c[0] == 1).unwrap();
+            let read = commands.iter().position(|c| c[0] == 8).unwrap();
+            let positioning = commands
+                .iter()
+                .position(|c| matches!(c[0], 1 | 0x2b | 0x92))
+                .unwrap();
+            assert!(
+                positioning < read,
+                "bootstrap discovery establishes a fresh position before reading"
+            );
+            let space = commands.iter().rposition(|c| c[0] == 0x11).unwrap();
+            let candidate_read = commands.iter().rposition(|c| c[0] == 8).unwrap();
+            assert!(
+                rewind < space && space < candidate_read,
+                "candidate listing proves its own origin"
+            );
+            assert!(
+                commands.iter().any(|c| c[0] == 0x11),
+                "candidate positioning uses SPACE"
+            );
+        }
+        "candidate" => {
+            let expected = match &world.lock().unwrap().tapes["HAND"].records[2] {
+                Record::Block(block) => block[..16].to_vec(),
+                other => panic!("{other:?}"),
+            };
+            crate::catalogless_restore::b3b_check_candidate_after_failure(
+                &mut mounted.drive,
+                BLOCK,
+                fail,
+                &expected,
+            );
+            let commands = commands.lock().unwrap().clone();
+            assert!(matches!(commands.first().unwrap()[0], 0x2b | 0x92));
+            let locate = commands
+                .iter()
+                .position(|c| matches!(c[0], 0x2b | 0x92))
+                .unwrap();
+            let read = commands.iter().position(|c| c[0] == 8).unwrap();
+            assert!(locate < read);
+        }
+        _ => unreachable!(),
+    }
+    mount.release(mounted);
+}
+
+/// Standalone initialization must replace a post-write local adapter result with the host fact.
+fn fix2_init_adapter(scenario: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state_with_audit(root.path(), false);
+    let world = world();
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let result: Result<(), _> = mount.initialize(
+        false,
+        |_, _| Ok((UUID, ())),
+        |drive, _, ()| {
+            let before = drive.media_write_dispatch_count();
+            let error = crate::pool_write::post_write_adapter_error(drive, scenario);
+            assert!(drive.media_write_dispatch_count() > before);
+            assert!(error.outcome().write_context);
+            assert_eq!(
+                error.outcome().evidence.dispatch,
+                remanence_library::outcome::Dispatch::NotIssued
+            );
+            Err(error.to_string())
+        },
+    );
+    assert!(result.is_err());
+    let fences = mount
+        .state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap();
+    assert_eq!(fences.len(), 1, "{scenario}: {result:?}");
+    assert_eq!(fences[0].reason, "transfer_error");
+    let events = remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event == AuditEvent::TapeIoFenceRaised)
+            .count(),
+        1
+    );
+    assert!(events
+        .iter()
+        .any(|e| e.event == AuditEvent::SessionOrphaned));
+}
+
+/// Initialization keeps its base fence after the production overlap completion check fails.
+#[test]
+fn b3b_fix2_init_overlap_post_write() {
+    fix2_init_adapter("overlap");
+}
+
+/// Initialization keeps its base fence after a parity block-size refusal following a WRITE.
+#[test]
+fn b3b_fix2_init_parity_size_post_write() {
+    fix2_init_adapter("parity-size");
+}
+
+/// Initialization keeps its base fence after a poisoned parity sink refuses further work.
+#[test]
+fn b3b_fix2_init_parity_poisoned_post_write() {
+    fix2_init_adapter("parity-poisoned");
+}
+
+/// R6 still removes the initialization blanket fence for a dispatched zero-byte definite rejection.
+#[test]
+fn b3b_fix2_init_r6_definite_rejection() {
+    use remanence_library::outcome::{Dispatch, Effect};
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state_with_audit(root.path(), false);
+    let world = world();
+    let injected = fault();
+    let mut mount = backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        injected.clone(),
+    )
+    .unwrap();
+    let result: Result<(), _> = mount.initialize(
+        false,
+        |_, _| Ok((UUID, ())),
+        |drive, _, ()| {
+            drive
+                .write_block_unpositioned(&vec![0; BLOCK as usize])
+                .unwrap();
+            *injected.lock().unwrap() = Some(0xfe);
+            let error = drive
+                .write_block_unpositioned(&vec![0; BLOCK as usize])
+                .unwrap_err();
+            assert_eq!(error.outcome().evidence.dispatch, Dispatch::Issued);
+            assert!(error.outcome().write_context);
+            assert_eq!(error.outcome().effect, Effect::NoFence);
+            Err(error.to_string())
+        },
+    );
+    assert!(result.is_err());
+    assert!(injected.lock().unwrap().is_none());
+    assert!(mount
+        .state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(
+        !remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir)
+            .unwrap()
+            .iter()
+            .any(|e| e.event == AuditEvent::TapeIoFenceRaised)
+    );
 }

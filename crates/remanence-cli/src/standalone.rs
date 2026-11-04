@@ -2117,7 +2117,9 @@ fn prepare_init(
         || None,
         |_| Ok(()),
     )?;
-    if ready.readiness != remanence_library::MediaReadiness::Ready {
+    if ready.readiness
+        != remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready)
+    {
         return Err(format!("{}", ready.readiness));
     }
     drive.prevent_medium_removal().map_err(err)?;

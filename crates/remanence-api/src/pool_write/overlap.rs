@@ -49,14 +49,14 @@ pub(crate) struct OverlapBlockSink<'a> {
 }
 
 impl OverlapBlockSink<'_> {
-    pub(crate) fn ensure_prefill(&self) -> Result<(), TapeIoError> {
+    pub(crate) fn ensure_prefill(&mut self) -> Result<(), TapeIoError> {
         if self.control.prefill_satisfied() {
             Ok(())
         } else {
-            Err(TapeIoError::OperationFailed(
+            Err(self.inner.finish_adapter_error(remanence_library::TapeIoErrorKind::OperationFailed(
                 "overlap first-block gate reached before high-water prefill and live-source validation"
                     .to_string(),
-            ))
+            )))
         }
     }
 
@@ -64,16 +64,16 @@ impl OverlapBlockSink<'_> {
     // data. Append/recovery LOCATE below delegates to the drive sink's shared
     // cursor proof; pauses do not move the head or issue another admission.
     pub(crate) fn prove_position(
-        &self,
+        &mut self,
         observed: TapePosition,
         expected_lba: u64,
         context: &str,
     ) -> Result<(), TapeIoError> {
         if observed.partition != 0 || observed.lba != expected_lba {
-            return Err(TapeIoError::OperationFailed(format!(
+            return Err(self.inner.finish_adapter_error(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                 "overlap write position drift during {context}: expected partition 0 lba {expected_lba}, observed partition {} lba {}",
                 observed.partition, observed.lba
-            )));
+            ))));
         }
         Ok(())
     }
@@ -106,9 +106,12 @@ impl OverlapBlockSink<'_> {
             expected_next_lba = expected,
             "remanence_write_diag",
         );
-        self.control
-            .wait_for_resume()
-            .map_err(|err| TapeIoError::OperationFailed(format!("overlap refill failed: {err}")))?;
+        self.control.wait_for_resume().map_err(|err| {
+            self.inner
+                .finish_adapter_error(remanence_library::TapeIoErrorKind::OperationFailed(
+                    format!("overlap refill failed: {err}"),
+                ))
+        })?;
         let observed = self.inner.position()?;
         let proof = self.prove_position(observed, expected, "low-water resume");
         tracing::info!(
@@ -128,18 +131,27 @@ impl OverlapBlockSink<'_> {
 }
 
 impl BlockSink for OverlapBlockSink<'_> {
+    fn finish_adapter_error(&mut self, kind: remanence_library::TapeIoErrorKind) -> TapeIoError {
+        self.inner.finish_adapter_error(kind)
+    }
+
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         self.prove_initial_position()?;
         if let Some(message) = self.control.failure_message() {
-            return Err(TapeIoError::OperationFailed(format!(
-                "overlap source failed before WRITE submission: {message}"
-            )));
+            return Err(self.inner.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "overlap source failed before WRITE submission: {message}"
+                )),
+            ));
         }
         self.pause_if_low()?;
         self.write_started = true;
         let outcome = self.inner.write_block(buf)?;
         let expected = self.expected_next_lba.checked_add(1).ok_or_else(|| {
-            TapeIoError::OperationFailed("overlap expected next LBA overflow".to_string())
+            self.inner
+                .finish_adapter_error(remanence_library::TapeIoErrorKind::OperationFailed(
+                    "overlap expected next LBA overflow".to_string(),
+                ))
         })?;
         self.prove_position(outcome.position_after, expected, "WRITE completion")?;
         self.expected_next_lba = expected;
@@ -152,7 +164,11 @@ impl BlockSink for OverlapBlockSink<'_> {
             .expected_next_lba
             .checked_add(u64::from(count))
             .ok_or_else(|| {
-                TapeIoError::OperationFailed("overlap expected next LBA overflow".to_string())
+                self.inner.finish_adapter_error(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "overlap expected next LBA overflow".to_string(),
+                    ),
+                )
             })?;
         let outcome = self.inner.write_filemarks(count)?;
         self.prove_position(
@@ -170,7 +186,11 @@ impl BlockSink for OverlapBlockSink<'_> {
             .expected_next_lba
             .checked_add(u64::from(count))
             .ok_or_else(|| {
-                TapeIoError::OperationFailed("overlap expected next LBA overflow".to_string())
+                self.inner.finish_adapter_error(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "overlap expected next LBA overflow".to_string(),
+                    ),
+                )
             })?;
         self.inner.write_filemarks_immediate(count)?;
         // IMMED is submission, not completion. The next position proof checks

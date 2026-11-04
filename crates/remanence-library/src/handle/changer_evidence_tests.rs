@@ -14,6 +14,31 @@ const SLOT: u16 = 0x400;
 const BAY: u16 = 0x100;
 type Outcomes = Arc<Mutex<Vec<AuditOutcome>>>;
 
+/// A final MOVE refusal classifies only its host fact; inventory commands keep
+/// their own classifications and no MOVE, dirty state, or snapshot patch occurs.
+#[test]
+fn b3b_shutdown_move_admission_census() {
+    use crate::outcome::{census, Dispatch, Effect, OutcomeReason, PositionEffect};
+    let (mut handle, log, _) = open(None, None);
+    let before = (census::count(), census::total(), log.borrow().len());
+    let error = handle
+        .changer_mut()
+        .move_medium_with_admission(SLOT, BAY, &policy(), &mut || Err("shutdown".into()))
+        .unwrap_err();
+    assert!(matches!(error.kind, crate::MoveErrorKind::Admission(_)));
+    assert_eq!(error.outcome().evidence.dispatch, Dispatch::NotIssued);
+    assert_eq!(error.outcome().reason, OutcomeReason::NotIssued);
+    assert_eq!(error.outcome().effect, Effect::NoFence);
+    assert_eq!(error.outcome().evidence.position, PositionEffect::Unchanged);
+    let commands = (log.borrow().len() - before.2) as u64;
+    assert_eq!(census::count() - before.0, commands);
+    assert_eq!(census::total() - before.1, commands + 1);
+    assert!(!log.borrow().iter().any(|cdb| cdb[0] == 0xa5));
+    assert!(!handle.is_dirty());
+    assert!(element_state(handle.library(), SLOT).unwrap().0);
+    assert!(!element_state(handle.library(), BAY).unwrap().0);
+}
+
 /// Inject one failure before the fixture applies its successful command.
 struct FailOpcode {
     inner: FixtureTransport,
@@ -125,7 +150,16 @@ fn unknown_move(raw: Vec<u8>) {
         })),
     );
     let error = handle.move_medium(SLOT, BAY, &policy()).unwrap_err();
-    assert!(matches!(error, MoveError::ScsiError(_)), "{error:?}");
+    assert!(
+        matches!(
+            error,
+            crate::MoveError {
+                kind: crate::MoveErrorKind::ScsiError(_),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
     assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
     assert!(outcomes.lock().unwrap().iter().any(
         |o| matches!(o, AuditOutcome::ScsiError { dirty: true, sense: Some(s), .. } if s == &raw)
@@ -158,7 +192,10 @@ fn b3a_composed_load_empty_sense_is_completion_unknown() {
     let (mut handle, log, _) = open(None, Some(check(vec![])));
     assert!(matches!(
         handle.load(SLOT, BAY, &policy()),
-        Err(LoadError::DriveLoad(DriveOpError::ScsiError(_)))
+        Err(LoadError::DriveLoad(crate::DriveOpError {
+            kind: crate::DriveOpErrorKind::ScsiError(_),
+            ..
+        }))
     ));
     assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
     let log = log.borrow();
@@ -175,7 +212,16 @@ fn b3a_unload_empty_sense_invalidates_parent_and_position() {
     drive.position().unwrap();
     assert_eq!(drive.known_position().map(|p| p.lba), Some(10));
     let error = drive.unload().unwrap_err();
-    assert!(matches!(error, DriveOpError::ScsiError(_)), "{error:?}");
+    assert!(
+        matches!(
+            error,
+            crate::DriveOpError {
+                kind: crate::DriveOpErrorKind::ScsiError(_),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
     assert_eq!(drive.known_position(), None);
     assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
     assert!(matches!(
@@ -189,7 +235,10 @@ fn b3a_unload_empty_sense_invalidates_parent_and_position() {
 fn b3a_truncated_ready_transition_is_not_retryable() {
     let mut raw = sense(6, 0x29, 0);
     raw.truncate(13);
-    assert_eq!(classify_changer_ready_transition(&check(raw)), None);
+    assert_eq!(
+        classify_changer_ready_transition(&crate::MoveError::from(check(raw))),
+        None
+    );
 }
 
 /// A transport failure carrying CHECK CONDITION and usable sense remains unknown and unretried.
@@ -209,7 +258,10 @@ fn b3a_move_host_failure_is_unknown() {
     handle.set_changer_ready_wait(ChangerReadyWait::bounded(Duration::from_secs(2)));
     assert!(matches!(
         handle.move_medium(SLOT, BAY, &policy()),
-        Err(MoveError::ScsiError(ScsiError::TransportError { .. }))
+        Err(crate::MoveError {
+            kind: crate::MoveErrorKind::ScsiError(ScsiError::TransportError { .. }),
+            ..
+        })
     ));
     assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
     assert_refreshed_once(&log);
@@ -224,7 +276,10 @@ fn b3a_move_source_empty_mapping_refreshes() {
     let (mut handle, log, _) = open(Some(check(sense(5, 0x3b, 0x0e))), None);
     assert!(matches!(
         handle.move_medium(SLOT, BAY, &policy()),
-        Err(MoveError::SourceEmpty { addr: SLOT })
+        Err(crate::MoveError {
+            kind: crate::MoveErrorKind::SourceEmpty { addr: SLOT },
+            ..
+        })
     ));
     assert!(!handle.is_dirty());
     assert_refreshed_once(&log);
@@ -236,7 +291,10 @@ fn b3a_move_destination_full_mapping_refreshes() {
     let (mut handle, log, _) = open(Some(check(sense(5, 0x3b, 0x0d))), None);
     assert!(matches!(
         handle.move_medium(SLOT, BAY, &policy()),
-        Err(MoveError::DestinationFull { addr: BAY })
+        Err(crate::MoveError {
+            kind: crate::MoveErrorKind::DestinationFull { addr: BAY },
+            ..
+        })
     ));
     assert!(!handle.is_dirty());
     assert_refreshed_once(&log);
@@ -259,4 +317,101 @@ fn b3a_move_usable_not_ready_still_retries() {
     assert!(*waits.lock().unwrap() > 0);
     assert_eq!(log.borrow().iter().filter(|c| c[0] == 0xa5).count(), 2);
     assert!(!handle.is_dirty());
+}
+
+/// Composed UNLOAD preserves unknown completion after its fixture MOVE.
+#[test]
+fn b3b_composed_unload_empty_sense_is_completion_unknown() {
+    let (mut handle, log, _) = open(None, Some(check(vec![])));
+    handle.move_medium(SLOT, BAY, &policy()).unwrap();
+    let error = handle.unload(BAY, Some(SLOT), &policy()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            UnloadError::DriveUnload(crate::DriveOpError {
+                kind: crate::DriveOpErrorKind::ScsiError(_),
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(handle.dirty_cause(), Some(DirtyCause::CompletionUnknown));
+    assert_eq!(log.borrow().iter().filter(|c| c[0] == 0x1b).count(), 1);
+}
+
+/// The MOVE result survives the mandatory inventory refresh and both readiness consumers.
+#[test]
+fn b3b_move_carrier_consumer_census() {
+    use crate::outcome::census;
+    let (mut handle, log, _) = open(Some(check(sense(5, 0x3b, 0x0d))), None);
+    let before = (
+        census::count(),
+        census::normalizations(),
+        log.borrow().len(),
+    );
+    let error = handle.load(SLOT, BAY, &policy()).unwrap_err();
+    let LoadError::Move(error) = error else {
+        panic!("expected MOVE failure: {error:?}");
+    };
+    assert!(matches!(
+        error.kind,
+        crate::MoveErrorKind::DestinationFull { addr: BAY }
+    ));
+    assert_refreshed_once(&log);
+    assert_eq!(
+        census::count() - before.0,
+        (log.borrow().len() - before.2) as u64
+    );
+    assert_eq!(census::normalizations() - before.1, 1);
+    assert_eq!(error.outcome().evidence.opcode, Some(0xa5));
+    let before = (census::total(), census::normalizations());
+    assert!(crate::classify_changer_not_ready(&error).is_none());
+    assert!(crate::classify_changer_ready_transition(&error).is_none());
+    assert_eq!(error.completion_evidence(), error.outcome().evidence);
+    assert_eq!((census::total(), census::normalizations()), before);
+}
+
+/// Captured host-error sense cannot enter the legacy CHECK CONDITION-only 3B remapping.
+#[test]
+fn b3b_move_carrier_preserves_host_error_kind() {
+    let (mut handle, _, _) = open(
+        Some(ScsiError::TransportError {
+            status: 2,
+            host_status: 3,
+            driver_status: 0,
+            info: 1,
+            sense: sense(5, 0x3b, 0x0d),
+        }),
+        None,
+    );
+    let error = handle.load(SLOT, BAY, &policy()).unwrap_err();
+    let LoadError::Move(error) = error else {
+        panic!("expected MOVE failure")
+    };
+    assert!(matches!(
+        error.kind,
+        crate::MoveErrorKind::ScsiError(ScsiError::TransportError { .. })
+    ));
+    assert!(matches!(
+        error.outcome().effect,
+        crate::outcome::Effect::InventoryUnknown(_)
+    ));
+}
+
+/// Inventory failures cannot authorize a drive-side removal-lock recovery.
+#[test]
+fn b3b_removal_predicate_preserves_drive_error_scope() {
+    let error = crate::DriveOpError::from(crate::MoveError::from(check(sense(5, 0x53, 2))));
+    let before = (
+        crate::outcome::census::total(),
+        crate::outcome::census::normalizations(),
+    );
+    assert!(!error.is_medium_removal_prevented());
+    assert_eq!(
+        (
+            crate::outcome::census::total(),
+            crate::outcome::census::normalizations()
+        ),
+        before
+    );
 }

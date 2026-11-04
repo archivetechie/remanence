@@ -48,11 +48,13 @@ impl RawTapeSource for Tape {
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         self.locates.push(hint.lba);
         if self.medium_locate == Some(hint.lba) {
-            return Err(remanence_library::TapeIoError::CheckCondition(
-                remanence_library::scsi::ScsiError::CheckCondition {
-                    sense: vec![0x72, 3, 0x11, 0],
-                    bytes_transferred: 0,
-                },
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 3, 0x11, 0],
+                        bytes_transferred: 0,
+                    },
+                ),
             )
             .into());
         }
@@ -104,24 +106,26 @@ impl RawTapeSource for Tape {
             Record::Eod => Ok(RawReadOutcome::EndOfData { position_after }),
             Record::Fatal => Err(ParityError::Invariant("injected non-medium read fault")),
             Record::Medium | Record::Deferred | Record::Hardware => {
-                Err(remanence_library::TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![
-                            if !matches!(record, Record::Deferred) {
-                                0x72
-                            } else {
-                                0x73
-                            },
-                            if matches!(record, Record::Hardware) {
-                                4
-                            } else {
-                                3
-                            },
-                            0x11,
-                            0,
-                        ],
-                        bytes_transferred: 0,
-                    },
+                Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![
+                                if !matches!(record, Record::Deferred) {
+                                    0x72
+                                } else {
+                                    0x73
+                                },
+                                if matches!(record, Record::Hardware) {
+                                    4
+                                } else {
+                                    3
+                                },
+                                0x11,
+                                0,
+                            ],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 )
                 .into())
             }
@@ -987,10 +991,13 @@ fn cancelled_protected_pass_has_no_verdict_and_can_restart() {
     assert!(flag.load(Ordering::SeqCst));
     assert!(matches!(
         error,
-        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        })
     ));
     assert!(!crate::raw::tape_error_is_current_medium_damage(
-        &remanence_library::TapeIoError::Cancelled
+        &remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::Cancelled)
     ));
     let commands = source.0.reads.len() + source.0.locates.len();
     assert!(source.position().is_err());

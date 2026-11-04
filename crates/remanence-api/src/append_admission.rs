@@ -2,6 +2,7 @@
 //! journal import. Local state supplies a boundary; only tape evidence can
 //! authorize superseding an incomplete suffix at that boundary.
 use crate::catalogless_restore::{scan_append_suffix_observed, AppendSuffix};
+use crate::closeout_obligation::RetryCauseExt as _;
 mod session_suffix;
 use remanence_library::{AppendSession, DriveHandle, DriveHandleSource, TapeIoError, TapePosition};
 use remanence_parity::TerminalTripleWritePlan;
@@ -51,8 +52,61 @@ pub(crate) struct AppendContext {
     pub terminal_prefix: Option<remanence_parity::TerminalPrefixPlan>,
 }
 
+/// Admission failures retain the failed probe even after restoration issues other commands.
+pub(crate) struct AdmissionError {
+    pub(crate) kind: AdmissionErrorKind,
+    outcome: Option<Box<remanence_library::outcome::ClassifiedOutcome>>,
+}
+impl std::fmt::Debug for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.kind, f)
+    }
+}
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+impl std::error::Error for AdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.kind)
+    }
+}
+impl AdmissionError {
+    /// Keep a private intermediate suffix fact pending until admission supplies its authority scope.
+    pub(super) fn pending(kind: AdmissionErrorKind) -> Self {
+        Self {
+            kind,
+            outcome: None,
+        }
+    }
+    /// Finish the final public admission error, never an intermediate diagnostic.
+    fn finish(&mut self) {
+        if self.outcome.is_none() {
+            self.outcome = Some(Box::new(finish_admission_refusal(&self.kind)));
+        }
+    }
+    pub(crate) fn new(kind: AdmissionErrorKind) -> Self {
+        let outcome = match &kind {
+            AdmissionErrorKind::Io(error) | AdmissionErrorKind::SuffixIo { source: error, .. } => {
+                error.outcome().clone()
+            }
+            _ => finish_admission_refusal(&kind),
+        };
+        Self {
+            kind,
+            outcome: Some(Box::new(outcome)),
+        }
+    }
+}
+impl From<TapeIoError> for AdmissionError {
+    fn from(error: TapeIoError) -> Self {
+        Self::new(AdmissionErrorKind::Io(error))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AdmissionError {
+pub(crate) enum AdmissionErrorKind {
     #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {found:?}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`).")]
     TailBeyondKnownState {
         tape_uuid: uuid::Uuid,
@@ -81,12 +135,16 @@ pub(crate) enum AdmissionError {
 
 impl From<String> for AdmissionError {
     fn from(detail: String) -> Self {
-        Self::Unproved(detail)
+        crate::append_admission::AdmissionError::new(
+            crate::append_admission::AdmissionErrorKind::Unproved(detail),
+        )
     }
 }
 impl From<&str> for AdmissionError {
     fn from(detail: &str) -> Self {
-        Self::Unproved(detail.into())
+        crate::append_admission::AdmissionError::new(
+            crate::append_admission::AdmissionErrorKind::Unproved(detail.into()),
+        )
     }
 }
 
@@ -98,270 +156,375 @@ pub(crate) fn admit_append_boundary(
     authority: AppendAuthority<'_>,
     ctx: AppendContext,
 ) -> Result<AppendAdmission, AdmissionError> {
-    drive.clear_append_admission();
-    if ctx.block_size == 0 || ctx.block_size > remanence_scsi::read_write::MAX_TRANSFER_LEN {
-        return Err(AdmissionError::Unproved("invalid append block size".into()));
+    #[cfg(test)]
+    {
+        if let Some(error) = b3b_caller_injection::take() {
+            return Err(error);
+        }
     }
-
-    let generation = drive.identity_generation();
-    let recovered_tail = match &authority {
-        AppendAuthority::Session { snapshot, .. }
-            if snapshot.tape_summary().open_session.is_some() =>
-        {
-            Some(
-                crate::write_owner::session_tail::SessionTail::new(
-                    ctx.tape_uuid,
-                    ctx.block_size,
-                    snapshot.tape_summary().next_file,
-                )
-                .map_err(|e| AdmissionError::Unproved(e.to_string()))?,
-            )
-        }
-        _ => None,
-    };
-    let mut ended_tail_eod = None;
-    let probe = (|| {
-        let boundary = match &authority {
-            AppendAuthority::Fresh => {
-                drive.rewind()?;
-                crate::verify_tape_identity(&mut DriveHandleSource(drive), &ctx.tape_uuid)
-                    .map_err(|e| match e {
-                        crate::pool_write::TapeIdentityError::Io(e) => AdmissionError::Io(e),
-                        e => AdmissionError::Unproved(e.to_string()),
-                    })?;
-                let mut block = vec![0; ctx.block_size as usize];
-                match drive.read_block(&mut block) {
-                    Err(TapeIoError::FilemarkEncountered) => {}
-                    Err(e) if e.is_physical_eod() => {
-                        if ctx.allow_missing_bootstrap_filemark {
-                            return Ok(AppendSuffix::default());
-                        }
-                        return Err(AdmissionError::MissingBootstrapFilemark);
-                    }
-                    Err(e) => return Err(AdmissionError::Io(e)),
-                    Ok(_) => {
-                        return Err(AdmissionError::Unproved(
-                            "data where bootstrap filemark was expected".into(),
-                        ))
-                    }
-                }
-                let position = drive.position()?;
-                if position.partition != 0 {
-                    return Err(AdmissionError::Unproved(
-                        "bootstrap filemark position mismatch".into(),
-                    ));
-                }
-                position
-            }
-            AppendAuthority::Checkpoint { eod } => {
-                prove_position(drive, *eod, ctx.block_size, generation)?;
-                *eod
-            }
-            AppendAuthority::Terminal { .. } | AppendAuthority::Session { .. } => {
-                prove_position(drive, ctx.boundary, ctx.block_size, generation)?;
-                ctx.boundary
-            }
-        };
-        if let AppendAuthority::Session { snapshot, closeout } = &authority {
-            let summary = snapshot.tape_summary();
-            // Deterministic own-closeout prefix has priority over the old named
-            // tail. Every attempted proof restores C before trying another row.
-            if let Some(encoded) = closeout {
-                match session_suffix::own_closeout(drive, &encoded.blocks, ctx.block_size) {
-                    Ok((count, mark, digest)) if count > 0 => {
-                        if let Some(tail) = &recovered_tail {
-                            use remanence_state::tape_log::{TailFilemark, TailIdentity};
-                            let identity = if mark {
-                                TailIdentity::Sidecar(encoded.header.canonical_metadata_hash)
-                            } else {
-                                TailIdentity::TornPrefix(digest)
-                            };
-                            tail.observe(
-                                identity,
-                                count,
-                                if mark {
-                                    TailFilemark::Present
-                                } else {
-                                    TailFilemark::Absent
-                                },
-                            )
-                            .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
-                        }
-                        return Ok(AppendSuffix::default());
-                    }
-                    Ok(_) | Err(AdmissionError::Unproved(_)) => {
-                        prove_position(drive, boundary, ctx.block_size, generation)?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if summary.open_session.is_none() {
-                let mut failure = None;
-                let mut reached_eod = false;
-                snapshot
-                    .visit_session_tail(&mut |file| {
-                        if reached_eod {
-                            return Ok(());
-                        }
-                        session_suffix::named_file(drive, &ctx.tape_uuid, ctx.block_size, file)
-                            .map(|mark| reached_eod = !mark)
-                            .map_err(|e| {
-                                failure = Some(e);
-                                remanence_state::StateError::JournalReplayFailed(
-                                    "session suffix proof failed".into(),
-                                )
-                            })
-                    })
-                    .map_err(|e| {
-                        failure
-                            .take()
-                            .unwrap_or_else(|| AdmissionError::Unproved(e.to_string()))
-                    })?;
-                if !reached_eod {
-                    session_suffix::eod(drive, ctx.block_size)?;
-                }
-                let eod = drive.position()?.lba;
-                if let Some(end) = &summary.last_session_end {
-                    if eod < end.cursor.lba.saturating_add(end.synchronized_tail_blocks)
-                        || eod > end.cursor.lba.saturating_add(end.possible_tail_blocks)
-                        || end.proved_eod.is_some_and(|old| old != eod)
-                    {
-                        return Err(AdmissionError::Unproved(
-                            "SessionSuffixContradiction: EOD outside recorded tail bounds".into(),
-                        ));
-                    }
-                    if end.possible_tail_blocks > end.synchronized_tail_blocks {
-                        ended_tail_eod = Some(eod);
-                    }
-                }
-                return Ok(AppendSuffix::default());
-            }
-        }
-        let mut block = vec![0; ctx.block_size as usize];
-        match drive.read_block(&mut block) {
-            Err(e) if e.is_physical_eod() => return Ok(AppendSuffix::default()),
-            Ok(_) | Err(TapeIoError::FilemarkEncountered) => {}
-            Err(source) => {
-                return Err(AdmissionError::SuffixIo {
-                    start_lba: boundary.lba,
-                    source,
-                })
-            }
-        };
-        prove_position(drive, boundary, ctx.block_size, generation)?;
-        let plan = match &authority {
-            AppendAuthority::Terminal { plan } => Some(*plan),
-            _ => None,
-        };
-        let suffix = scan_append_suffix_observed(
-            drive,
-            &ctx.tape_uuid,
-            ctx.block_size,
-            boundary.lba,
-            plan,
-            ctx.terminal_prefix.as_ref(),
-            ctx.inspect_all || recovered_tail.is_some(),
-            recovered_tail.as_ref(),
-        )
-        .map_err(|error| match error {
-            AdmissionError::Io(source) => AdmissionError::SuffixIo {
-                start_lba: boundary.lba,
-                source,
-            },
-            other => other,
-        })?;
-        if recovered_tail.is_some() && suffix.unnameable {
-            return Err(AdmissionError::Unproved(
-                "crash suffix contains a delimited file without a session-tail identity; restore consistent tape state".into(),
+    let result = (|| {
+        let _context = drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+            phase: remanence_library::outcome::Phase::Admission,
+            region: remanence_library::outcome::Region::Unknown,
+            ..Default::default()
+        });
+        drive.clear_append_admission();
+        if ctx.block_size == 0 || ctx.block_size > remanence_scsi::read_write::MAX_TRANSFER_LEN {
+            return Err(crate::append_admission::AdmissionError::new(
+                crate::append_admission::AdmissionErrorKind::Unproved(
+                    "invalid append block size".into(),
+                ),
             ));
         }
-        let mut found = suffix.objects.clone();
-        found.extend(suffix.foreign_components.clone());
-        if ctx
-            .confirmed_discard
-            .as_ref()
-            .is_some_and(|confirmed| confirmed != &found)
-            || (!found.is_empty() && ctx.confirmed_discard.is_none())
+
+        let generation = drive.identity_generation();
+        let recovered_tail = match &authority {
+            AppendAuthority::Session { snapshot, .. }
+                if snapshot.tape_summary().open_session.is_some() =>
+            {
+                Some(
+                    crate::write_owner::session_tail::SessionTail::new(
+                        ctx.tape_uuid,
+                        ctx.block_size,
+                        snapshot.tape_summary().next_file,
+                    )
+                    .map_err(|e| {
+                        crate::append_admission::AdmissionError::new(
+                            crate::append_admission::AdmissionErrorKind::Unproved(e.to_string()),
+                        )
+                    })?,
+                )
+            }
+            _ => None,
+        };
+        let mut ended_tail_eod = None;
+        let probe = (|| {
+            let boundary = match &authority {
+                AppendAuthority::Fresh => {
+                    drive.rewind()?;
+                    crate::verify_tape_identity(&mut DriveHandleSource(drive), &ctx.tape_uuid)
+                        .map_err(|e| match e {
+                            crate::pool_write::TapeIdentityError::Io(e) => {
+                                crate::append_admission::AdmissionError::new(
+                                    crate::append_admission::AdmissionErrorKind::Io(e),
+                                )
+                            }
+                            e => crate::append_admission::AdmissionError::new(
+                                crate::append_admission::AdmissionErrorKind::Unproved(
+                                    e.to_string(),
+                                ),
+                            ),
+                        })?;
+                    let mut block = vec![0; ctx.block_size as usize];
+                    match drive.read_block(&mut block) {
+                        Err(remanence_library::TapeIoError {
+                            kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                            ..
+                        }) => {}
+                        Err(e) if e.is_physical_eod() => {
+                            if ctx.allow_missing_bootstrap_filemark {
+                                return Ok(AppendSuffix::default());
+                            }
+                            return Err(crate::append_admission::AdmissionError::new(
+                            crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
+                        ));
+                        }
+                        Err(e) => {
+                            return Err(crate::append_admission::AdmissionError::new(
+                                crate::append_admission::AdmissionErrorKind::Io(e),
+                            ))
+                        }
+                        Ok(_) => {
+                            return Err(crate::append_admission::AdmissionError::new(
+                                crate::append_admission::AdmissionErrorKind::Unproved(
+                                    "data where bootstrap filemark was expected".into(),
+                                ),
+                            ))
+                        }
+                    }
+                    let position = drive.position()?;
+                    if position.partition != 0 {
+                        return Err(crate::append_admission::AdmissionError::new(
+                            crate::append_admission::AdmissionErrorKind::Unproved(
+                                "bootstrap filemark position mismatch".into(),
+                            ),
+                        ));
+                    }
+                    position
+                }
+                AppendAuthority::Checkpoint { eod } => {
+                    prove_position(drive, *eod, ctx.block_size, generation)?;
+                    *eod
+                }
+                AppendAuthority::Terminal { .. } | AppendAuthority::Session { .. } => {
+                    prove_position(drive, ctx.boundary, ctx.block_size, generation)?;
+                    ctx.boundary
+                }
+            };
+            if let AppendAuthority::Session { snapshot, closeout } = &authority {
+                let summary = snapshot.tape_summary();
+                // Deterministic own-closeout prefix has priority over the old named
+                // tail. Every attempted proof restores C before trying another row.
+                if let Some(encoded) = closeout {
+                    match session_suffix::own_closeout(drive, &encoded.blocks, ctx.block_size) {
+                        Ok((count, mark, digest)) if count > 0 => {
+                            if let Some(tail) = &recovered_tail {
+                                use remanence_state::tape_log::{TailFilemark, TailIdentity};
+                                let identity = if mark {
+                                    TailIdentity::Sidecar(encoded.header.canonical_metadata_hash)
+                                } else {
+                                    TailIdentity::TornPrefix(digest)
+                                };
+                                tail.observe(
+                                    identity,
+                                    count,
+                                    if mark {
+                                        TailFilemark::Present
+                                    } else {
+                                        TailFilemark::Absent
+                                    },
+                                )
+                                .map_err(|e| {
+                                    crate::append_admission::AdmissionError::new(
+                                        crate::append_admission::AdmissionErrorKind::Unproved(
+                                            e.to_string(),
+                                        ),
+                                    )
+                                })?;
+                            }
+                            return Ok(AppendSuffix::default());
+                        }
+                        Ok(_)
+                        | Err(crate::append_admission::AdmissionError {
+                            kind: crate::append_admission::AdmissionErrorKind::Unproved(_),
+                            ..
+                        }) => {
+                            prove_position(drive, boundary, ctx.block_size, generation)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                if summary.open_session.is_none() {
+                    let mut failure = None;
+                    let mut reached_eod = false;
+                    snapshot
+                        .visit_session_tail(&mut |file| {
+                            if reached_eod {
+                                return Ok(());
+                            }
+                            session_suffix::named_file(drive, &ctx.tape_uuid, ctx.block_size, file)
+                                .map(|mark| reached_eod = !mark)
+                                .map_err(|e| {
+                                    failure = Some(e);
+                                    remanence_state::StateError::JournalReplayFailed(
+                                        "session suffix proof failed".into(),
+                                    )
+                                })
+                        })
+                        .map_err(|e| {
+                            failure.take().unwrap_or_else(|| {
+                                crate::append_admission::AdmissionError::new(
+                                    crate::append_admission::AdmissionErrorKind::Unproved(
+                                        e.to_string(),
+                                    ),
+                                )
+                            })
+                        })?;
+                    if !reached_eod {
+                        session_suffix::eod(drive, ctx.block_size)?;
+                    }
+                    let eod = drive.position()?.lba;
+                    if let Some(end) = &summary.last_session_end {
+                        if eod < end.cursor.lba.saturating_add(end.synchronized_tail_blocks)
+                            || eod > end.cursor.lba.saturating_add(end.possible_tail_blocks)
+                            || end.proved_eod.is_some_and(|old| old != eod)
+                        {
+                            return Err(crate::append_admission::AdmissionError::pending(
+                                crate::append_admission::AdmissionErrorKind::Unproved(
+                                    "SessionSuffixContradiction: EOD outside recorded tail bounds"
+                                        .into(),
+                                ),
+                            ));
+                        }
+                        if end.possible_tail_blocks > end.synchronized_tail_blocks {
+                            ended_tail_eod = Some(eod);
+                        }
+                    }
+                    return Ok(AppendSuffix::default());
+                }
+            }
+            let mut block = vec![0; ctx.block_size as usize];
+            match drive.read_block(&mut block) {
+                Err(e) if e.is_physical_eod() => return Ok(AppendSuffix::default()),
+                Ok(_)
+                | Err(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                    ..
+                }) => {}
+                Err(source) => {
+                    return Err(crate::append_admission::AdmissionError::new(
+                        crate::append_admission::AdmissionErrorKind::SuffixIo {
+                            start_lba: boundary.lba,
+                            source,
+                        },
+                    ))
+                }
+            };
+            prove_position(drive, boundary, ctx.block_size, generation)?;
+            let plan = match &authority {
+                AppendAuthority::Terminal { plan } => Some(*plan),
+                _ => None,
+            };
+            let suffix = scan_append_suffix_observed(
+                drive,
+                &ctx.tape_uuid,
+                ctx.block_size,
+                boundary.lba,
+                plan,
+                ctx.terminal_prefix.as_ref(),
+                ctx.inspect_all || recovered_tail.is_some(),
+                recovered_tail.as_ref(),
+            )
+            .map_err(|error| match error {
+                crate::append_admission::AdmissionError {
+                    kind: crate::append_admission::AdmissionErrorKind::Io(source),
+                    ..
+                } => crate::append_admission::AdmissionError::new(
+                    crate::append_admission::AdmissionErrorKind::SuffixIo {
+                        start_lba: boundary.lba,
+                        source,
+                    },
+                ),
+                other => other,
+            })?;
+            if recovered_tail.is_some() && suffix.unnameable {
+                return Err(crate::append_admission::AdmissionError::new(crate::append_admission::AdmissionErrorKind::Unproved(
+                "crash suffix contains a delimited file without a session-tail identity; restore consistent tape state".into(),
+            )));
+            }
+            let mut found = suffix.objects.clone();
+            found.extend(suffix.foreign_components.clone());
+            if ctx
+                .confirmed_discard
+                .as_ref()
+                .is_some_and(|confirmed| confirmed != &found)
+                || (!found.is_empty() && ctx.confirmed_discard.is_none())
+            {
+                return Err(crate::append_admission::AdmissionError::new(
+                    crate::append_admission::AdmissionErrorKind::TailBeyondKnownState {
+                        tape_uuid: uuid::Uuid::from_bytes(ctx.tape_uuid),
+                        expected_eod_lba: boundary.lba,
+                        found,
+                        object_ids: suffix.objects.clone(),
+                    },
+                ));
+            }
+            Ok(suffix)
+        })();
+        let probe = probe.map_err(|error| match (&authority, error) {
+            (
+                AppendAuthority::Session { snapshot, .. },
+                crate::append_admission::AdmissionError {
+                    kind: crate::append_admission::AdmissionErrorKind::Unproved(detail),
+                    ..
+                },
+            ) if detail.starts_with("SessionSuffixContradiction:") => {
+                crate::append_admission::AdmissionError::new(
+                    crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction {
+                        tape_uuid: uuid::Uuid::from_bytes(ctx.tape_uuid),
+                        partition: ctx.boundary.partition,
+                        lba: ctx.boundary.lba,
+                        sequence: snapshot.log_reference().0,
+                        incarnation: snapshot.tape_summary().incarnation,
+                        detail,
+                    },
+                )
+            }
+            (_, error) => error,
+        });
+        let restored = if matches!(authority, AppendAuthority::Fresh) && ctx.write_position.lba == 0
         {
-            return Err(AdmissionError::TailBeyondKnownState {
-                tape_uuid: uuid::Uuid::from_bytes(ctx.tape_uuid),
-                expected_eod_lba: boundary.lba,
-                found,
-                object_ids: suffix.objects.clone(),
-            });
+            drive
+                .locate(0)
+                .and_then(|actual| {
+                    if actual.partition != ctx.write_position.partition || actual.lba != 0 {
+                        return Err(remanence_library::TapeIoError::new(
+                            remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                                "position mismatch: expected {:?}, got {actual:?}",
+                                ctx.write_position
+                            )),
+                        ));
+                    }
+                    Ok(None)
+                })
+                .map_err(|value| {
+                    crate::append_admission::AdmissionError::new(
+                        crate::append_admission::AdmissionErrorKind::Io(value),
+                    )
+                })
+        } else {
+            prove_position(drive, ctx.write_position, ctx.block_size, generation).map(Some)
+        };
+        // A suffix read failure refuses admission even when it also invalidates the
+        // handle. Preserve its location after attempting cursor restoration.
+        if let Err(
+            error @ crate::append_admission::AdmissionError {
+                kind: crate::append_admission::AdmissionErrorKind::SuffixIo { .. },
+                ..
+            },
+        ) = probe
+        {
+            return Err(error);
         }
-        Ok(suffix)
-    })();
-    let probe = probe.map_err(|error| match (&authority, error) {
-        (AppendAuthority::Session { snapshot, .. }, AdmissionError::Unproved(detail))
-            if detail.starts_with("SessionSuffixContradiction:") =>
-        {
-            AdmissionError::SessionSuffixContradiction {
-                tape_uuid: uuid::Uuid::from_bytes(ctx.tape_uuid),
-                partition: ctx.boundary.partition,
-                lba: ctx.boundary.lba,
-                sequence: snapshot.log_reference().0,
-                incarnation: snapshot.tape_summary().incarnation,
-                detail,
+        if drive.identity_generation() != generation {
+            return Err(crate::append_admission::AdmissionError::new(
+                crate::append_admission::AdmissionErrorKind::Io(
+                    remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::IdentityInvalidated {
+                            proved: generation,
+                            current: drive.identity_generation(),
+                        },
+                    ),
+                ),
+            ));
+        }
+        let cursor_proof = restored?;
+        probe?;
+        let (position, generation) = cursor_proof.map_or(
+            (ctx.write_position, generation),
+            remanence_library::cursor::CursorProof::into_position,
+        );
+        // SAFETY: this private, non-cloneable type can only be constructed here,
+        // after successful classification, cursor restoration and generation proof.
+        // Installation immediately consumes it on the same exclusively held drive.
+        struct ProvedBoundary([u8; 16], u32, u64, u64);
+        unsafe impl remanence_library::AppendBoundaryProof for ProvedBoundary {
+            fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
+                (self.0, self.1, self.2, self.3)
             }
         }
-        (_, error) => error,
-    });
-    let restored = if matches!(authority, AppendAuthority::Fresh) && ctx.write_position.lba == 0 {
         drive
-            .locate(0)
-            .and_then(|actual| {
-                if actual.partition != ctx.write_position.partition || actual.lba != 0 {
-                    return Err(TapeIoError::OperationFailed(format!(
-                        "position mismatch: expected {:?}, got {actual:?}",
-                        ctx.write_position
-                    )));
-                }
-                Ok(None)
+            .install_append_admission(ProvedBoundary(
+                ctx.tape_uuid,
+                position.partition,
+                position.lba,
+                generation,
+            ))
+            .map(|session| AppendAdmission {
+                session,
+                recovered_tail,
+                ended_tail_eod,
             })
-            .map_err(AdmissionError::Io)
-    } else {
-        prove_position(drive, ctx.write_position, ctx.block_size, generation).map(Some)
-    };
-    // A suffix read failure refuses admission even when it also invalidates the
-    // handle. Preserve its location after attempting cursor restoration.
-    if let Err(error @ AdmissionError::SuffixIo { .. }) = probe {
-        return Err(error);
-    }
-    if drive.identity_generation() != generation {
-        return Err(AdmissionError::Io(TapeIoError::IdentityInvalidated {
-            proved: generation,
-            current: drive.identity_generation(),
-        }));
-    }
-    let cursor_proof = restored?;
-    probe?;
-    let (position, generation) = cursor_proof.map_or(
-        (ctx.write_position, generation),
-        remanence_library::cursor::CursorProof::into_position,
-    );
-    // SAFETY: this private, non-cloneable type can only be constructed here,
-    // after successful classification, cursor restoration and generation proof.
-    // Installation immediately consumes it on the same exclusively held drive.
-    struct ProvedBoundary([u8; 16], u32, u64, u64);
-    unsafe impl remanence_library::AppendBoundaryProof for ProvedBoundary {
-        fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
-            (self.0, self.1, self.2, self.3)
-        }
-    }
-    drive
-        .install_append_admission(ProvedBoundary(
-            ctx.tape_uuid,
-            position.partition,
-            position.lba,
-            generation,
-        ))
-        .map(|session| AppendAdmission {
-            session,
-            recovered_tail,
-            ended_tail_eod,
-        })
-        .map_err(AdmissionError::Io)
+            .map_err(|value| {
+                crate::append_admission::AdmissionError::new(
+                    crate::append_admission::AdmissionErrorKind::Io(value),
+                )
+            })
+    })();
+    result.map_err(|mut error: AdmissionError| {
+        error.finish();
+        error
+    })
 }
 
 fn prove_position(
@@ -372,7 +535,11 @@ fn prove_position(
 ) -> Result<remanence_library::cursor::CursorProof, AdmissionError> {
     drive
         .prove_cursor(expected, block_size, generation)
-        .map_err(AdmissionError::Io)
+        .map_err(|value| {
+            crate::append_admission::AdmissionError::new(
+                crate::append_admission::AdmissionErrorKind::Io(value),
+            )
+        })
 }
 
 pub(crate) fn context(
@@ -416,7 +583,7 @@ pub fn admit_initialized_tape(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Admit a durable checkpoint boundary for low-level recovery tools.
 pub fn admit_checkpointed_tape(
@@ -448,6 +615,40 @@ pub(crate) fn discard_reconciled_parity_suffix(
         .map_err(|e| e.to_string())
 }
 
+/// Read the outcome retained before any restoration or status rendering.
+pub(crate) fn admission_error_outcome(
+    error: &AdmissionError,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    error
+        .outcome
+        .as_deref()
+        .expect("unfinished admission error")
+        .clone()
+}
+
+/// Finish a new structural admission fact; device failures already carry their outcome.
+fn finish_admission_refusal(
+    error: &AdmissionErrorKind,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    use remanence_library::outcome::*;
+    let mut evidence = CompletionEvidence::success();
+    evidence.failed = true;
+    evidence.fact = if matches!(error, AdmissionErrorKind::SessionSuffixContradiction { .. }) {
+        CompletionFact::SuffixContradiction
+    } else {
+        CompletionFact::AdmissionRecovery
+    };
+    classify(OutcomeInput {
+        class: CommandClass::Read,
+        context: OperationContext {
+            phase: Phase::Admission,
+            region: Region::Unknown,
+            ..Default::default()
+        },
+        evidence,
+    })
+}
+
 /// A stale physical tail disables this tape alone. Probe failures without writes
 /// remain retryable and do not create durable quarantine or recovery state.
 pub(crate) fn daemon_admission_error(
@@ -456,30 +657,30 @@ pub(crate) fn daemon_admission_error(
     cfg: &crate::write_owner::TerminalWriteConfig,
     tape_uuid: [u8; 16],
     error: AdmissionError,
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
 ) -> tonic::Status {
-    if let AdmissionError::SessionSuffixContradiction {
-        detail,
-        partition,
-        lba,
-        sequence,
-        incarnation,
-        ..
-    } = &error
-    {
-        crate::write_owner::record_closeout_fence(
-            index,
-            cfg,
-            tape_uuid,
-            "SessionSuffixContradiction",
-            serde_json::json!({"error": error.to_string(), "detail": detail, "partition":partition, "lba":lba, "tape_log_sequence":sequence, "tape_incarnation":incarnation}).to_string(),
-        );
-        return crate::closeout_obligation::RetryCause::Operator
+    if matches!(
+        error.kind,
+        AdmissionErrorKind::Io(_) | AdmissionErrorKind::SuffixIo { .. }
+    ) {
+        return outcome
+            .retry
+            .attach(tonic::Status::unavailable(error.to_string()));
+    }
+    if let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect {
+        let evidence = match &error {
+            crate::append_admission::AdmissionError { kind: crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { detail, partition, lba, sequence, incarnation, .. }, .. } =>
+                serde_json::json!({"error": error.to_string(), "detail": detail, "partition":partition, "lba":lba, "tape_log_sequence":sequence, "tape_incarnation":incarnation}).to_string(),
+            _ => serde_json::json!({"error": error.to_string()}).to_string(),
+        };
+        crate::write_owner::record_closeout_fence(index, cfg, tape_uuid, cause.reason(), evidence);
+        return outcome
+            .retry
             .attach(tonic::Status::failed_precondition(error.to_string()));
     }
     let detail = error.to_string();
-    if let AdmissionError::Io(cause) | AdmissionError::SuffixIo { source: cause, .. } = &error {
-        return crate::closeout_obligation::RetryCause::tape_io(cause)
-            .attach(tonic::Status::unavailable(detail));
+    if !outcome.recovery_required {
+        return outcome.retry.attach(tonic::Status::unavailable(detail));
     }
     if let Err(e) = index.set_append_recovery_required(tape_uuid, true) {
         return crate::status_from_state_error(e);
@@ -508,8 +709,29 @@ pub(crate) fn daemon_admission_error(
         },
     );
     match audit {
-        Ok(_) => crate::closeout_obligation::RetryCause::Operator
+        Ok(_) => outcome
+            .retry
             .attach(tonic::Status::failed_precondition(detail)),
         Err(e) => e,
+    }
+}
+
+/// Thread-scoped admission-boundary injection for production-caller persistence regressions.
+#[cfg(test)]
+pub(crate) mod b3b_caller_injection {
+    use super::AdmissionError;
+    thread_local! {
+        static FAILURE: std::cell::RefCell<Option<Box<dyn FnOnce() -> AdmissionError>>> = Default::default();
+    }
+    pub(crate) fn set(make: impl FnOnce() -> AdmissionError + 'static) {
+        FAILURE.with(|slot| assert!(slot.borrow_mut().replace(Box::new(make)).is_none()));
+    }
+    pub(super) fn take() -> Option<AdmissionError> {
+        FAILURE
+            .with(|slot| slot.borrow_mut().take())
+            .map(|make| make())
+    }
+    pub(crate) fn pending() -> bool {
+        FAILURE.with(|slot| slot.borrow().is_some())
     }
 }

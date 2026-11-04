@@ -234,8 +234,10 @@ fn reader_failures_preserve_their_class_and_do_not_retry() {
     let range = range(11, 256);
     for error in [
         CloseoutError::Boundary { lba: 33 },
-        CloseoutError::TapeIo(remanence_library::TapeIoError::Transport(
-            remanence_library::ScsiError::Truncated { got: 0, need: 256 },
+        CloseoutError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::Transport(
+                remanence_library::ScsiError::Truncated { got: 0, need: 256 },
+            ),
         )),
     ] {
         let boundary = matches!(error, CloseoutError::Boundary { .. });
@@ -246,9 +248,10 @@ fn reader_failures_preserve_their_class_and_do_not_retry() {
         } else {
             assert!(matches!(
                 result,
-                Err(CloseoutError::TapeIo(
-                    remanence_library::TapeIoError::Transport(_)
-                ))
+                Err(CloseoutError::TapeIo(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::Transport(_),
+                    ..
+                }))
             ));
         }
     }

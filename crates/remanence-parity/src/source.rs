@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use remanence_library::scsi::decode_sense;
 #[cfg(test)]
 use remanence_library::scsi::ScsiError;
 use remanence_library::{BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePosition};
@@ -771,7 +770,10 @@ impl<'a> ObjectParitySource<'a> {
     ) -> Result<FixedRecordRead, TapeIoError> {
         let block_len = self.block_size as usize;
         let read = match self.inner.read_record(buf) {
-            Err(ParityError::TapeIo(TapeIoError::Transport(_))) => {
+            Err(ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::Transport(_),
+                ..
+            })) => {
                 self.locate_body_lba(body_lba)
                     .map_err(parity_error_to_tape_io_error)?;
                 self.inner.read_record(buf)
@@ -949,14 +951,20 @@ impl<'a> ObjectParitySource<'a> {
         recovered: &[u8],
     ) -> Result<usize, TapeIoError> {
         if buf.len() < recovered.len() {
-            return Err(TapeIoError::ReadBufferTooSmall {
-                actual: recovered.len() as u32,
-                provided: buf.len() as u32,
-            });
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: recovered.len() as u32,
+                    provided: buf.len() as u32,
+                },
+            ));
         }
         buf[..recovered.len()].copy_from_slice(recovered);
         self.cursor_body_lba = body_lba.checked_add(1).ok_or_else(|| {
-            TapeIoError::OperationFailed("object source cursor overflow".to_string())
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "object source cursor overflow".to_string(),
+                ),
+            )
         })?;
         Ok(recovered.len())
     }
@@ -970,10 +978,12 @@ impl<'a> remanence_library::BlockRead for ObjectParitySource<'a> {
 
         if let Some(buffered) = self.auto_read_blocks.get(&body_lba) {
             if buf.len() < buffered.data.len() {
-                return Err(TapeIoError::ReadBufferTooSmall {
-                    actual: buffered.data.len() as u32,
-                    provided: buf.len() as u32,
-                });
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                        actual: buffered.data.len() as u32,
+                        provided: buf.len() as u32,
+                    },
+                ));
             }
         }
         if let Some(buffered) = self.auto_read_blocks.remove(&body_lba) {
@@ -984,16 +994,18 @@ impl<'a> remanence_library::BlockRead for ObjectParitySource<'a> {
         // record of the wrong length: refuse it before touching tape, so it can
         // never start a parity recovery.
         if buf.len() < self.block_size as usize {
-            return Err(TapeIoError::ReadBufferTooSmall {
-                actual: self.block_size,
-                provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
-            });
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: self.block_size,
+                    provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                },
+            ));
         }
 
         match self.read_record_with_transport_retry(buf, body_lba) {
             Ok(FixedRecordRead::Block { .. }) => {
                 self.cursor_body_lba = self.cursor_body_lba.checked_add(1).ok_or_else(|| {
-                    TapeIoError::OperationFailed("object source cursor overflow".to_string())
+                    remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed("object source cursor overflow".to_string()))
                 })?;
                 self.last_read_erasure_body_lba = None;
                 Ok(self.block_size as usize)
@@ -1011,19 +1023,19 @@ impl<'a> remanence_library::BlockRead for ObjectParitySource<'a> {
             // `BlockRead` can only return a `TapeIoError`; the label says what
             // the failure is: invalid content, not a device fault.
             Ok(FixedRecordRead::WrongLength { measured_bytes }) => {
-                Err(TapeIoError::OperationFailed(format!(
+                Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                     "invalid object content: the record at body LBA {body_lba} is {measured_bytes} bytes, not one {}-byte block (REM-PARITY 3.5), and recovery is disabled outside the validated prefix",
                     self.block_size
-                )))
+                ))))
             }
-            Ok(FixedRecordRead::Filemark { .. }) => Err(TapeIoError::OperationFailed(format!(
+            Ok(FixedRecordRead::Filemark { .. }) => Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                 "unexpected filemark inside object tape file {} at body LBA {body_lba}",
                 self.tape_file_number
-            ))),
-            Ok(FixedRecordRead::EndOfData { .. }) => Err(TapeIoError::OperationFailed(format!(
+            )))),
+            Ok(FixedRecordRead::EndOfData { .. }) => Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                 "unexpected EOD inside object tape file {} at body LBA {body_lba}",
                 self.tape_file_number
-            ))),
+            )))),
             Err(err) if !self.tar_only_unverified && is_erasure(&err) => {
                 let recovered = self
                     .recover_read_erasure(body_lba)
@@ -1046,26 +1058,40 @@ impl<'a> BlockSource for ObjectParitySource<'a> {
 
     fn space(&mut self, count: i64, kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
         if kind != SpaceKind::Blocks {
-            return Err(TapeIoError::OperationFailed(
-                "ObjectParitySource supports only object-local block spacing".to_string(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "ObjectParitySource supports only object-local block spacing".to_string(),
+                ),
             ));
         }
         let target = if count >= 0 {
             self.cursor_body_lba
                 .checked_add(count as u64)
-                .ok_or_else(|| TapeIoError::OperationFailed("object space overflow".to_string()))?
+                .ok_or_else(|| {
+                    remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::OperationFailed(
+                            "object space overflow".to_string(),
+                        ),
+                    )
+                })?
         } else {
             self.cursor_body_lba
                 .checked_sub(count.unsigned_abs())
                 .ok_or_else(|| {
-                    TapeIoError::OperationFailed("object space before BOF".to_string())
+                    remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::OperationFailed(
+                            "object space before BOF".to_string(),
+                        ),
+                    )
                 })?
         };
         if target > self.object_block_count {
-            return Err(TapeIoError::OperationFailed(format!(
-                "object space target {target} exceeds block_count {}",
-                self.object_block_count
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "object space target {target} exceeds block_count {}",
+                    self.object_block_count
+                )),
+            ));
         }
         self.auto_read_blocks.clear();
         self.last_read_erasure_body_lba = None;
@@ -1143,7 +1169,9 @@ fn validated_prefix_ordinals(scoped_map: &ScopedFilemarkMap) -> u64 {
 fn parity_error_to_tape_io_error(err: ParityError) -> TapeIoError {
     match err {
         ParityError::TapeIo(err) => err,
-        other => TapeIoError::OperationFailed(other.to_string()),
+        other => remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(other.to_string()),
+        ),
     }
 }
 
@@ -1171,10 +1199,19 @@ fn parity_error_to_tape_io_error(err: ParityError) -> TapeIoError {
 /// Same reasoning applies to NOT_READY: Annex B Table B.3
 /// entries are drive-state codes, not per-block faults.
 fn is_erasure(err: &TapeIoError) -> bool {
-    if let Some((sense, _)) = err.check_condition_transfer() {
-        return decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03);
+    if err.check_condition_transfer().is_some() {
+        return err
+            .completion_evidence()
+            .decoded
+            .is_some_and(|sense| sense.key == 3);
     }
-    matches!(err, TapeIoError::Transport(_))
+    matches!(
+        err,
+        remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Transport(_),
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -1187,10 +1224,12 @@ mod erasure_tests {
         sense[2] = key;
         sense[7] = 24;
         sense[12] = asc;
-        TapeIoError::CheckCondition(ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        })
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+            ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            },
+        ))
     }
 
     /// A corrected MEDIUM ERROR completion remains eligible for reconstruction.
@@ -1202,13 +1241,15 @@ mod erasure_tests {
         sense[3..7].copy_from_slice(&262_144u32.to_be_bytes());
         sense[7] = 24;
         sense[12] = 0x11;
-        let error = TapeIoError::CheckConditionWithResidue {
-            source: ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: 262_144,
+        let error = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckConditionWithResidue {
+                source: ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 262_144,
+                },
+                bytes_transferred: 0,
             },
-            bytes_transferred: 0,
-        };
+        );
         assert!(is_erasure(&error));
     }
 
@@ -1239,20 +1280,20 @@ mod erasure_tests {
         for asc in [0x00u8, 0x11, 0x14] {
             assert!(is_erasure(&cc(0x03, asc)));
         }
-        assert!(is_erasure(&TapeIoError::CheckCondition(
-            ScsiError::CheckCondition {
+        assert!(is_erasure(&remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::CheckCondition {
                 sense: vec![0x72, 0x03, 0x11, 0x00],
                 bytes_transferred: 0,
-            },
+            },)
         )));
-        assert!(is_erasure(&TapeIoError::Transport(
-            ScsiError::TransportError {
+        assert!(is_erasure(&remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::Transport(ScsiError::TransportError {
                 status: 0,
                 host_status: 0,
                 driver_status: 0,
                 info: 0,
                 sense: Vec::new(),
-            },
+            },)
         )));
     }
 }
@@ -1368,10 +1409,12 @@ mod object_source_tests {
                 // a drive reports it (ILI with a negative residual).
                 Record::Block(block) if block.len() > buf.len() => {
                     self.cursor += 1;
-                    Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-                        actual: block.len() as u32,
-                        provided: buf.len() as u32,
-                    }))
+                    Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: block.len() as u32,
+                            provided: buf.len() as u32,
+                        },
+                    )))
                 }
                 Record::Block(block) => {
                     let bytes = block.len();
@@ -1516,13 +1559,15 @@ mod object_source_tests {
     }
 
     fn transport_error() -> TapeIoError {
-        TapeIoError::Transport(ScsiError::TransportError {
-            status: 0,
-            host_status: 0,
-            driver_status: 0,
-            info: 0,
-            sense: Vec::new(),
-        })
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::Transport(
+            ScsiError::TransportError {
+                status: 0,
+                host_status: 0,
+                driver_status: 0,
+                info: 0,
+                sense: Vec::new(),
+            },
+        ))
     }
 
     fn check_condition(key: u8, asc: u8, ascq: u8) -> TapeIoError {
@@ -1532,10 +1577,12 @@ mod object_source_tests {
         sense[7] = 24;
         sense[12] = asc;
         sense[13] = ascq;
-        TapeIoError::CheckCondition(ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        })
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+            ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            },
+        ))
     }
 
     fn scheme() -> ParityScheme {
@@ -1979,7 +2026,7 @@ mod object_source_tests {
             .read_block(&mut vec![0u8; BLOCK_SIZE as usize])
             .expect_err("no recovery outside the validated prefix");
         assert!(
-            matches!(&error, TapeIoError::OperationFailed(m)
+            matches!(&error, remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::OperationFailed(m), .. }
                 if m.starts_with("invalid object content") && !m.contains("device-reported position")),
             "{error:?}"
         );
@@ -2017,7 +2064,13 @@ mod object_source_tests {
             .read_block(&mut vec![0u8; BLOCK_SIZE as usize - 1])
             .expect_err("a buffer below one block is refused");
         assert!(
-            matches!(error, TapeIoError::ReadBufferTooSmall { .. }),
+            matches!(
+                error,
+                remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { .. },
+                    ..
+                }
+            ),
             "{error:?}"
         );
         drop(source);
@@ -2561,7 +2614,14 @@ mod object_source_tests {
                 .expect_err("non-erasure sense key must propagate");
 
             match err {
-                TapeIoError::CheckCondition(ScsiError::CheckCondition { sense, .. }) => {
+                remanence_library::TapeIoError {
+                    kind:
+                        remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::CheckCondition {
+                            sense,
+                            ..
+                        }),
+                    ..
+                } => {
                     assert_eq!(sense[2] & 0x0F, key, "{label}: sense key");
                     assert_eq!(sense[12], asc, "{label}: ASC");
                     assert_eq!(sense[13], ascq, "{label}: ASCQ");
@@ -3238,5 +3298,41 @@ mod object_source_tests {
                 prefix_ordinals: 2
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod b3b_strict_tests {
+    use super::*;
+    /// Three-byte sense is unknown completion, not a per-block media erasure.
+    #[test]
+    fn b3b_erasure_rejects_truncated_medium() {
+        let error = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 3],
+                    bytes_transferred: 0,
+                },
+            ),
+        );
+        assert!(!is_erasure(&error));
+    }
+}
+
+/// Deferred usable MEDIUM ERROR remains an erasure under the base RS policy.
+#[cfg(test)]
+#[test]
+fn b3b_fix1_deferred_medium_is_erasure() {
+    for raw in [
+        vec![0x71, 0, 3, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0, 0, 0, 0, 0],
+        vec![0x73, 3, 0x11, 0, 0, 0, 0, 0],
+    ] {
+        let error = TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+            remanence_library::ScsiError::CheckCondition {
+                sense: raw,
+                bytes_transferred: 0,
+            },
+        ));
+        assert!(is_erasure(&error));
     }
 }

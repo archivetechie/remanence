@@ -21,7 +21,8 @@
 //!   (WRITE block, MODE SELECT).
 //!
 //! All three share the same error vocabulary on [`ScsiError`]:
-//! `InvalidInput` for caller-side limits and pre-dispatch ENOMEM/EINVAL, `Io` for other ioctl
+//! `InvalidInput` for caller-side limits, `HostCapacityRefused` for pre-dispatch
+//! ENOMEM/EINVAL, `Io` for other ioctl
 //! failures, `CheckCondition` for target-reported CHECK CONDITION
 //! (with sense bytes and bytes_transferred derived from `resid`), and
 //! `TransportError` for host/driver/transport-level faults that the
@@ -131,10 +132,10 @@ const MAX_CDB_LEN: usize = 16;
 /// This is a kernel-source premise, not a runtime proof for vendor backports.
 pub fn classify_ioctl_error(error: nix::errno::Errno) -> ScsiError {
     match error {
-        nix::errno::Errno::ENOMEM => ScsiError::InvalidInput(
+        nix::errno::Errno::ENOMEM => ScsiError::HostCapacityRefused(
             "host capacity refusal: SG_IO allocation failed (ENOMEM); no command issued; raise sg scatter_elem_sz or use a host with a larger per-command limit",
         ),
-        nix::errno::Errno::EINVAL => ScsiError::InvalidInput(
+        nix::errno::Errno::EINVAL => ScsiError::HostCapacityRefused(
             "host capacity/input refusal: SG_IO rejected the request (EINVAL); no command issued; for size limits raise sg scatter_elem_sz or use a host with a larger per-command limit",
         ),
         other => ScsiError::Io(other.into()),
@@ -241,7 +242,8 @@ mod ioctl {
 /// Error variants:
 /// - [`ScsiError::InvalidInput`] — the caller's `cdb` or `data_in` violated
 ///   a documented limit of the sg v3 interface (1..=16-byte CDB, transfer
-///   length must fit in a `u32`), or the kernel refused allocation/input
+///   length must fit in a `u32`).
+/// - [`ScsiError::HostCapacityRefused`] — the kernel refused allocation/input
 ///   before dispatch (ENOMEM/EINVAL).
 /// - [`ScsiError::Io`] — other ioctl failures, conservatively completion unknown.
 /// - [`ScsiError::CheckCondition`] — the target replied CHECK CONDITION;
@@ -715,7 +717,7 @@ mod tests {
     fn ioctl_capacity_errors_are_not_issued() {
         for errno in [nix::errno::Errno::ENOMEM, nix::errno::Errno::EINVAL] {
             let error = classify_ioctl_error(errno);
-            assert!(matches!(error, ScsiError::InvalidInput(_)));
+            assert!(matches!(error, ScsiError::HostCapacityRefused(_)));
             assert!(error.to_string().contains("no command issued"));
             assert!(error.to_string().contains("scatter_elem_sz"));
         }

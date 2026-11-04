@@ -309,14 +309,22 @@ impl<'a, S: BlockSink + ?Sized> ObjectFaultSink<'a, S> {
         position_after: TapePosition,
     ) -> Result<(), TapeIoError> {
         self.completed_records = self.completed_records.checked_add(records).ok_or_else(|| {
-            TapeIoError::OperationFailed("WOR object fault record counter overflow".into())
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "WOR object fault record counter overflow".into(),
+                ),
+            )
         })?;
         let Some(fault) = self.fault else {
             return Ok(());
         };
         let triggered = fault
             .record_after_write(self.completed_records, position_after)
-            .map_err(TapeIoError::OperationFailed)?;
+            .map_err(|value| {
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(value),
+                )
+            })?;
         if triggered {
             match self.abort_behavior {
                 AbortBehavior::AbortProcess => std::process::abort(),
@@ -334,14 +342,17 @@ impl<'a, S: BlockSink + ?Sized> ObjectFaultSink<'a, S> {
         let Some(fault) = self.fault else {
             return Ok(());
         };
-        if fault
-            .cut_is_pending()
-            .map_err(TapeIoError::OperationFailed)?
-        {
-            return Err(TapeIoError::OperationFailed(format!(
-                "WOR object filemark reached after {} completed records before planned cut {}",
-                self.completed_records, fault.after_completed_records
-            )));
+        if fault.cut_is_pending().map_err(|value| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(value),
+            )
+        })? {
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "WOR object filemark reached after {} completed records before planned cut {}",
+                    self.completed_records, fault.after_completed_records
+                )),
+            ));
         }
         Ok(())
     }
@@ -764,8 +775,10 @@ mod tests {
     impl BlockSink for MockSink {
         fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
             if self.fail_write {
-                return Err(TapeIoError::OperationFailed(
-                    "injected write failure".into(),
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "injected write failure".into(),
+                    ),
                 ));
             }
             self.writes += 1;
@@ -1112,7 +1125,9 @@ mod tests {
             8,
             1,
             1,
-            &TapeIoError::OperationFailed("test".into()),
+            &remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed("test".into()),
+            ),
         );
         assert_eq!(sink.space_to_end_of_data().unwrap().lba, 50);
         assert_eq!(sink.space_to_end_of_data_pipelined().unwrap().lba, 51);

@@ -311,7 +311,10 @@ fn load_unload_boundary_rearms_the_fence() {
 
     assert!(matches!(
         drive.write_block(&[0u8; 64]),
-        Err(TapeIoError::IdentityInvalidated { .. })
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+            ..
+        })
     ));
     // Fixture models the caller completing media re-proof for the new load.
     drive
@@ -354,7 +357,10 @@ fn failed_durable_transaction_means_the_cdb_is_not_dispatched() {
         .write_block(&[0u8; 64])
         .expect_err("write must be refused while the fence cannot be made durable");
     match &err {
-        TapeIoError::WriteFenceNotDurable(inner) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::WriteFenceNotDurable(inner),
+            ..
+        } => {
             assert!(inner.reason().contains("wal sync failed"));
         }
         other => panic!("expected WriteFenceNotDurable, got {other:?}"),
@@ -382,7 +388,13 @@ fn failed_durable_transaction_refuses_the_pipelined_path_too() {
     let err = drive
         .write_block_batch_pipelined(&buf, 512, &cdb)
         .expect_err("pipelined write must be refused");
-    assert!(matches!(err, TapeIoError::WriteFenceNotDurable(_)));
+    assert!(matches!(
+        err,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::WriteFenceNotDurable(_),
+            ..
+        }
+    ));
     assert_eq!(
         opcode_count(&log, 0x0A),
         0,
@@ -415,13 +427,15 @@ fn write_whose_cdb_fails_still_leaves_the_epoch_advanced() {
     assert_eq!(control.write_epoch(), 1);
     assert_eq!(opcode_count(&log, 0x0A), 1, "the WRITE was dispatched");
     assert!(
-        drive.media_write_fenced_this_load(),
-        "the load stays fenced — the epoch is already advanced"
+        !drive.media_write_fenced_this_load(),
+        "unproved variable WRITE invalidates the load's identity trust"
     );
-
-    // A subsequent successful write in the same load does not
-    // advance the epoch again.
-    drive.write_block(&[0u8; 64]).expect("clean retry");
+    assert_eq!(drive.known_position(), None);
+    // The advanced durable epoch stays advanced, but a new write needs reproof.
+    drive
+        .write_block(&[0u8; 64])
+        .expect_err("retry needs fresh identity proof");
+    assert_eq!(opcode_count(&log, 0x0A), 1);
     assert_eq!(control.fence_transactions(), 1);
 }
 
@@ -451,7 +465,10 @@ fn reset_unit_attention_rearms_the_fence() {
     drive.position().expect("re-establish position after reset");
     assert!(matches!(
         drive.write_block(&[0u8; 64]),
-        Err(TapeIoError::IdentityInvalidated { .. })
+        Err(crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::IdentityInvalidated { .. },
+            ..
+        })
     ));
     // Position recovery alone cannot authorize writes after an identity change.
     drive
@@ -473,7 +490,13 @@ fn allocator_exhaustion_fails_closed_at_the_drive_handle_surface() {
     let err = drive
         .write_block(&[0u8; 64])
         .expect_err("exhausted allocator must refuse the write");
-    assert!(matches!(err, TapeIoError::WriteFenceNotDurable(_)));
+    assert!(matches!(
+        err,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::WriteFenceNotDurable(_),
+            ..
+        }
+    ));
     assert_eq!(opcode_count(&log, 0x0A), 0);
     assert_eq!(control.write_epoch(), u64::MAX, "no wrap-around");
 }
@@ -638,6 +661,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                 execute_out: 1,
                 execute_none: 1,
                 why: "B6c deadline/settlement forwarder holds or fails in-memory ModelTransport commands; no hardware transport",
+            },
+        ),
+        (
+            "remanence-api/src/write_owner/b3b_golden_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 2,
+                execute_none: 1,
+                why: "cfg(test) golden bootstrap fault transport forwards only to in-memory ModelTransport; production bootstrap still dispatches through DriveHandle",
             },
         ),
         (
@@ -949,8 +980,8 @@ struct DispatchEvidence {
 impl super::MediaDispatchObserver for DispatchEvidence {
     fn dispatching(&mut self, cdb: &[u8], data: Option<&[u8]>) -> Result<(), TapeIoError> {
         if self.refuse {
-            return Err(TapeIoError::OperationFailed(
-                "tail evidence unavailable".into(),
+            return Err(crate::TapeIoError::new(
+                crate::TapeIoErrorKind::OperationFailed("tail evidence unavailable".into()),
             ));
         }
         self.events

@@ -558,7 +558,7 @@ fn startup_readiness_probe_transition_clears_ready_and_keeps_initializing_fenced
     let operation_id = Uuid::from_u128(0xabc);
     let ready = startup_media_readiness_probe_transition(
         operation_id,
-        &remanence_library::MediaReadiness::Ready,
+        &remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready),
     );
     assert_eq!(ready.phase.as_deref(), Some("startup_reconcile_tur"));
     assert_eq!(ready.state, "ready");
@@ -567,10 +567,12 @@ fn startup_readiness_probe_transition_clears_ready_and_keeps_initializing_fenced
 
     let initializing = startup_media_readiness_probe_transition(
         operation_id,
-        &remanence_library::MediaReadiness::BecomingReady {
-            ascq: 0x01,
-            media_initializing: true,
-        },
+        &remanence_library::MediaReadiness::new(
+            remanence_library::MediaReadinessKind::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true,
+            },
+        ),
     );
     assert_eq!(initializing.state, "media_initializing");
     assert_eq!(initializing.dirty_scope.as_deref(), Some("drive+tape"));
@@ -581,9 +583,11 @@ fn startup_readiness_probe_transition_clears_ready_and_keeps_initializing_fenced
 
     let transport = startup_media_readiness_probe_transition(
         operation_id,
-        &remanence_library::MediaReadiness::TransportUnknown {
-            detail: "DID_TIME_OUT".to_string(),
-        },
+        &remanence_library::MediaReadiness::new(
+            remanence_library::MediaReadinessKind::TransportUnknown {
+                detail: "DID_TIME_OUT".to_string(),
+            },
+        ),
     );
     assert_eq!(transport.state, "transport_unknown");
     assert_eq!(
@@ -3987,8 +3991,10 @@ impl FailAfterBlocksSink {
 impl BlockSink for FailAfterBlocksSink {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         if self.inner.blocks.len() >= self.max_successful_blocks {
-            return Err(TapeIoError::OperationFailed(
-                "injected write_block failure".to_string(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected write_block failure".to_string(),
+                ),
             ));
         }
         self.inner.write_block(buf)
@@ -4224,10 +4230,10 @@ impl BlockSink for PositionDriftBatchSink {
         let records = u32::try_from(buf.len() / block_size).expect("test record count fits");
         if !self.injected && records > 1 {
             self.injected = true;
-            return Err(TapeIoError::OperationFailed(
+            return Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(
                     "position drift: expected_partition=0 expected_lba=11 device_partition=0 device_lba=12"
                         .to_string(),
-                ));
+                )));
         }
         self.inner.write_block_batch(buf, block_size_bytes)
     }
@@ -5880,7 +5886,7 @@ fn encrypted_write_transfer_failure_leaves_no_durable_catalog_reference() {
     assert!(
         matches!(
             err,
-            PoolWriteError::TapeIo(TapeIoError::OperationFailed(ref message))
+            PoolWriteError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::OperationFailed(ref message), .. })
                 if message.contains("injected write_block failure")
         ),
         "{err}"

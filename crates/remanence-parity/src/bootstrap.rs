@@ -1930,7 +1930,7 @@ mod tests {
         BlockSourceRawTapeSource, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
         SpaceFilemarksOutcome,
     };
-    use remanence_library::{TapeIoError, VecBlockSource};
+    use remanence_library::VecBlockSource;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RecordingRawSourceCall {
@@ -2012,8 +2012,8 @@ mod tests {
                     requested: buf.len(),
                     returned: 0,
                 });
-                return Err(ParityError::TapeIo(
-                    remanence_library::TapeIoError::ReadBufferTooSmall {
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
                         actual: u32::try_from(block.len()).map_err(|_| {
                             ParityError::Invariant("test block length exceeds u32 host boundary")
                         })?,
@@ -2021,7 +2021,7 @@ mod tests {
                             ParityError::Invariant("test buffer length exceeds u32 host boundary")
                         })?,
                     },
-                ));
+                )));
             }
 
             let returned = block.len();
@@ -2054,11 +2054,21 @@ mod tests {
         }
 
         fn locate_physical(&mut self, _hint: PhysicalPositionHint) -> Result<(), ParityError> {
-            Err(TapeIoError::OperationFailed("synthetic locate failure".into()).into())
+            Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "synthetic locate failure".into(),
+                ),
+            )
+            .into())
         }
 
         fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
-            Err(TapeIoError::OperationFailed("synthetic EOD locate failure".into()).into())
+            Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "synthetic EOD locate failure".into(),
+                ),
+            )
+            .into())
         }
 
         fn space_filemarks(&mut self, _count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
@@ -2097,7 +2107,12 @@ mod tests {
         }
 
         fn read_record(&mut self, _buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-            Err(TapeIoError::OperationFailed("synthetic read failure".into()).into())
+            Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "synthetic read failure".into(),
+                ),
+            )
+            .into())
         }
 
         fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -2191,7 +2206,10 @@ mod tests {
             .expect_err("raw-source failures must not be masked as missing bootstrap");
 
         match err {
-            ParityError::TapeIo(TapeIoError::OperationFailed(message)) => {
+            ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::OperationFailed(message),
+                ..
+            }) => {
                 assert!(message.contains("synthetic locate failure"), "{message}");
             }
             other => panic!("expected raw source error, got {other:?}"),
@@ -2206,7 +2224,10 @@ mod tests {
             .expect_err("non-medium read failures must not be masked as missing bootstrap");
 
         match err {
-            ParityError::TapeIo(TapeIoError::OperationFailed(message)) => {
+            ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::OperationFailed(message),
+                ..
+            }) => {
                 assert!(message.contains("synthetic read failure"), "{message}");
             }
             other => panic!("expected raw read error, got {other:?}"),
@@ -2216,10 +2237,12 @@ mod tests {
     #[test]
     fn candidate_fallback_rejects_deferred_medium_errors() {
         let check_condition = |sense| {
-            TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: 0,
-            })
+            remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ))
         };
         assert!(bootstrap_read_error_can_continue(&check_condition(vec![
             0x70, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0,

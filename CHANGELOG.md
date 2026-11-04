@@ -7,6 +7,13 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Unreleased
 
+- Device failures are judged in one place from the drive's own completion,
+  never from message text. A mounted or standalone write with an uncertain
+  outcome after reaching the tape gets one fence, named for its cause; a
+  durably named session tail keeps its existing recovery path. Failed pipelined
+  or variable-length writes, and fixed reads whose position cannot be advanced,
+  no longer keep their position.
+
 - Failed fixed-block write batches return an uncommittable error with their
   sense; failed fixed read batches no longer keep their cursor. CHECK CONDITION
   without usable sense, or accompanied by a host or driver failure, is treated

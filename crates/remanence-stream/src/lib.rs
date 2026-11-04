@@ -2023,7 +2023,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use remanence_format::{RemTarEntryType, RemTarObjectOptions};
-    use remanence_library::{TapeIoError, VecBlockSink, VecBlockSource, VecBlockSourceCall};
+    use remanence_library::{VecBlockSink, VecBlockSource, VecBlockSourceCall};
     use remanence_parity::{
         BlockSinkRawTapeSink, FileRowsKind, FileRowsReport, FileRowsState, FilemarkMap,
         JournalError, ObjectParitySource, OpenTrust, ParityScheme, PhysicalPositionHint,
@@ -3685,8 +3685,10 @@ mod tests {
 
         fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
             if count < 0 {
-                return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-                    "backward filemark spacing is not implemented in this fixture".to_string(),
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "backward filemark spacing is not implemented in this fixture".to_string(),
+                    ),
                 )));
             }
             let mut remaining = count;
@@ -3708,10 +3710,12 @@ mod tests {
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
             if let Some(block) = self.blocks_by_lba.get(&self.cursor_lba) {
                 if buf.len() < block.len() {
-                    return Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-                        actual: block.len() as u32,
-                        provided: buf.len() as u32,
-                    }));
+                    return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: block.len() as u32,
+                            provided: buf.len() as u32,
+                        },
+                    )));
                 }
                 buf[..block.len()].copy_from_slice(block);
                 self.cursor_lba += 1;

@@ -144,8 +144,10 @@ impl HandoffBlockSource {
         reservoir: Arc<ReservoirState>,
     ) -> Result<Self, TapeIoError> {
         if block_size == 0 {
-            return Err(TapeIoError::OperationFailed(
-                "handoff block size must be nonzero".to_string(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "handoff block size must be nonzero".to_string(),
+                ),
             ));
         }
         Ok(Self {
@@ -171,35 +173,47 @@ impl HandoffBlockSource {
         self.free_sender
             .try_send(handoff.into_reusable_buffer())
             .map_err(|_| {
-                TapeIoError::OperationFailed(
-                    "read reservoir free-buffer channel unavailable".to_string(),
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read reservoir free-buffer channel unavailable".to_string(),
+                    ),
                 )
             })
     }
 
     fn accept_handoff(&mut self, delivery: SequencedHandoff) -> Result<(), TapeIoError> {
         if delivery.seq != self.next_seq {
-            return Err(TapeIoError::OperationFailed(format!(
-                "read delivery sequence mismatch: expected {}, got {}",
-                self.next_seq, delivery.seq
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "read delivery sequence mismatch: expected {}, got {}",
+                    self.next_seq, delivery.seq
+                )),
+            ));
         }
         let expected_end = self
             .received_records
             .checked_add(u64::from(delivery.handoff.records_read))
             .ok_or_else(|| {
-                TapeIoError::OperationFailed("read handoff record frontier overflow".to_string())
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read handoff record frontier overflow".to_string(),
+                    ),
+                )
             })?;
         if delivery.plan_records_end != expected_end {
-            return Err(TapeIoError::OperationFailed(format!(
-                "read handoff plan frontier mismatch: expected {expected_end}, got {}",
-                delivery.plan_records_end
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "read handoff plan frontier mismatch: expected {expected_end}, got {}",
+                    delivery.plan_records_end
+                )),
+            ));
         }
         if let PositionAfter::Device(proof) = delivery.evidence {
             if proof.position() != delivery.position_after {
-                return Err(TapeIoError::OperationFailed(
-                    "read handoff device evidence position mismatch".to_string(),
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read handoff device evidence position mismatch".to_string(),
+                    ),
                 ));
             }
             self.proven_frontier = delivery.plan_records_end;
@@ -222,15 +236,15 @@ impl HandoffBlockSource {
             (0, None) => (0, proof.position()),
             (seq, Some(position)) if seq == last_received_seq => (self.received_records, position),
             _ => {
-                return Err(TapeIoError::OperationFailed(format!(
+                return Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                     "proof frontier credits unreceived command {through_seq}; last received is {last_received_seq}"
-                )))
+                ))))
             }
         };
         if plan_records_end != expected.0 || proof.position() != expected.1 {
-            return Err(TapeIoError::OperationFailed(format!(
+            return Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                 "proof frontier attribution mismatch through_seq={through_seq} plan_records_end={plan_records_end}"
-            )));
+            ))));
         }
         self.proven_frontier = self.proven_frontier.max(plan_records_end);
         Ok(())
@@ -241,18 +255,26 @@ impl HandoffBlockSource {
         let expected_bytes = (handoff.records_read as usize)
             .checked_mul(self.block_size)
             .ok_or_else(|| {
-                TapeIoError::OperationFailed("read handoff byte count overflow".to_string())
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read handoff byte count overflow".to_string(),
+                    ),
+                )
             })?;
         let validation_error = if handoff.terminal_flags.filemark || handoff.records_read == 0 {
-            Some(TapeIoError::OperationFailed(format!(
-                "fixed read batch stopped before object boundary: records_read={} filemark={}",
-                handoff.records_read, handoff.terminal_flags.filemark
-            )))
+            Some(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "fixed read batch stopped before object boundary: records_read={} filemark={}",
+                    handoff.records_read, handoff.terminal_flags.filemark
+                )),
+            ))
         } else if expected_bytes != handoff.valid_bytes {
-            Some(TapeIoError::OperationFailed(format!(
+            Some(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
                 "read handoff byte/record mismatch: valid_bytes={} records_read={} block_size={}",
                 handoff.valid_bytes, handoff.records_read, self.block_size
-            )))
+            )),
+            ))
         } else {
             None
         };
@@ -265,7 +287,11 @@ impl HandoffBlockSource {
             .remaining
             .checked_sub(u64::from(handoff.records_read))
             .ok_or_else(|| {
-                TapeIoError::OperationFailed("read handoff remaining underflow".to_string())
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read handoff remaining underflow".to_string(),
+                    ),
+                )
             })?;
         self.current = Some(handoff);
         Ok(())
@@ -288,7 +314,11 @@ impl HandoffBlockSource {
                 }
             }
             let delivery = self.delivery_receiver.recv().map_err(|_| {
-                TapeIoError::OperationFailed("read delivery channel closed".to_string())
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read delivery channel closed".to_string(),
+                    ),
+                )
             })??;
             match delivery {
                 ReadDelivery::Handoff(delivery) => self.accept_handoff(delivery)?,
@@ -311,10 +341,10 @@ impl HandoffBlockSource {
             self.recycle(pending.handoff)?;
         }
         if self.received_records != self.plan_total || self.remaining != 0 {
-            return Err(TapeIoError::OperationFailed(format!(
+            return Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(format!(
                 "read delivery closed before issued plan was received: received={} plan={} remaining={}",
                 self.received_records, self.plan_total, self.remaining
-            )));
+            ))));
         }
         Ok(())
     }
@@ -358,13 +388,19 @@ impl BlockRead for HandoffBlockSource {
             self.refill()?;
         }
         if buf.len() < self.block_size {
-            return Err(TapeIoError::ReadBufferTooSmall {
-                actual: u32::try_from(self.block_size).unwrap_or(u32::MAX),
-                provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
-            });
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: u32::try_from(self.block_size).unwrap_or(u32::MAX),
+                    provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                },
+            ));
         }
         let handoff = self.current.as_ref().ok_or_else(|| {
-            TapeIoError::OperationFailed("read handoff source is empty".to_string())
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "read handoff source is empty".to_string(),
+                ),
+            )
         })?;
         let start = self.next_record as usize * self.block_size;
         let end = start + self.block_size;
@@ -449,8 +485,10 @@ impl ReservoirState {
         while self.occupancy_bytes.load(Ordering::Acquire) > self.low_bytes.load(Ordering::Acquire)
         {
             if !self.consumer_alive.load(Ordering::Acquire) {
-                return Err(TapeIoError::OperationFailed(
-                    "read consumer died while reservoir was parked".to_string(),
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "read consumer died while reservoir was parked".to_string(),
+                    ),
                 ));
             }
             #[cfg(test)]
@@ -466,8 +504,10 @@ impl ReservoirState {
             guard = self.wake.wait(guard).unwrap_or_else(|err| err.into_inner());
         }
         if !self.consumer_alive.load(Ordering::Acquire) {
-            return Err(TapeIoError::OperationFailed(
-                "read consumer died while reservoir was parked".to_string(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "read consumer died while reservoir was parked".to_string(),
+                ),
             ));
         }
         Ok(())
@@ -660,13 +700,17 @@ fn send_handoff(
     delivery: ReadDelivery,
 ) -> Result<(), TapeIoError> {
     tx.try_send(Ok(delivery)).map_err(|error| match error {
-        std::sync::mpsc::TrySendError::Full(_) => TapeIoError::OperationFailed(
-            "read delivery channel construction invariant violated: handoff push would block"
-                .to_string(),
+        std::sync::mpsc::TrySendError::Full(_) => remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "read delivery channel construction invariant violated: handoff push would block"
+                    .to_string(),
+            ),
         ),
-        std::sync::mpsc::TrySendError::Disconnected(_) => {
-            TapeIoError::OperationFailed("read delivery receiver dropped".to_string())
-        }
+        std::sync::mpsc::TrySendError::Disconnected(_) => remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "read delivery receiver dropped".to_string(),
+            ),
+        ),
     })
 }
 
@@ -692,7 +736,11 @@ fn send_proof_frontier(
         plan_records_end,
         proof,
     }))
-    .map_err(|_| TapeIoError::OperationFailed("read delivery receiver dropped".to_string()))
+    .map_err(|_| {
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(
+            "read delivery receiver dropped".to_string(),
+        ))
+    })
 }
 
 fn run_read_pipeline<T: Send>(
@@ -882,8 +930,10 @@ fn run_read_pipeline<T: Send>(
                 let (buffer, waited) = match free_rx.try_recv() {
                     Ok(buffer) => (buffer, Duration::ZERO),
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return Err(TapeIoError::OperationFailed(
-                            "read reservoir free-buffer channel disconnected".to_string(),
+                        return Err(remanence_library::TapeIoError::new(
+                            remanence_library::TapeIoErrorKind::OperationFailed(
+                                "read reservoir free-buffer channel disconnected".to_string(),
+                            ),
                         ));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty)
@@ -922,8 +972,10 @@ fn run_read_pipeline<T: Send>(
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         let started = Instant::now();
                         let buffer = free_rx.recv().map_err(|_| {
-                            TapeIoError::OperationFailed(
-                                "read reservoir free-buffer channel disconnected".to_string(),
+                            remanence_library::TapeIoError::new(
+                                remanence_library::TapeIoErrorKind::OperationFailed(
+                                    "read reservoir free-buffer channel disconnected".to_string(),
+                                ),
                             )
                         })?;
                         (buffer, started.elapsed())
@@ -992,8 +1044,10 @@ fn run_read_pipeline<T: Send>(
                 submitter_remaining = submitter_remaining
                     .checked_sub(u64::from(records_read))
                     .ok_or_else(|| {
-                        TapeIoError::OperationFailed(
-                            "read submitter plan remaining underflow".to_string(),
+                        remanence_library::TapeIoError::new(
+                            remanence_library::TapeIoErrorKind::OperationFailed(
+                                "read submitter plan remaining underflow".to_string(),
+                            ),
                         )
                     })?;
                 plan_records_end += u64::from(records_read);
@@ -1933,8 +1987,10 @@ mod tests {
         ) -> Result<remanence_library::DevicePositionProof, TapeIoError> {
             let proof_number = self.proofs.fetch_add(1, Ordering::AcqRel) + 1;
             if self.fail_proof_at == Some(proof_number) {
-                return Err(TapeIoError::OperationFailed(
-                    "injected position proof failure".to_string(),
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "injected position proof failure".to_string(),
+                    ),
                 ));
             }
             self.inner.prove_read_position(expected)
@@ -2359,9 +2415,12 @@ mod tests {
             .expect_err("short GOOD aborts the restore");
             assert!(matches!(
                 error,
-                FormatError::TapeIo(TapeIoError::GoodReadLengthMismatch {
-                    requested_bytes: 64,
-                    bytes_transferred: 63,
+                FormatError::TapeIo(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::GoodReadLengthMismatch {
+                        requested_bytes: 64,
+                        bytes_transferred: 63,
+                    },
+                    ..
                 })
             ));
             assert!(!emitted.is_empty(), "failure occurs after real delivery");

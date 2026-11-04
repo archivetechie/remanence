@@ -1,7 +1,7 @@
 //! SSC READ/WRITE byte accounting at the command's transfer-unit boundary.
 
 use super::{map_scsi, ScsiError, TapeIoError};
-use remanence_scsi::decode_sense;
+use remanence_scsi::decode_usable_sense;
 
 /// Use valid current sense only when the kernel count equals the request
 /// (zero kernel residue). A unit is one byte for FIXED=0 or one block for
@@ -16,13 +16,43 @@ pub(crate) fn transfer_bytes_from_sense(
     if kernel_bytes != requested {
         return kernel_bytes;
     }
-    let Some(decoded) = decode_sense(sense) else {
+    let Some(decoded) = decode_usable_sense(sense) else {
         return kernel_bytes;
     };
     if decoded.is_deferred() || !decoded.valid {
         return kernel_bytes;
     }
     let Some(residue) = information(sense) else {
+        return kernel_bytes;
+    };
+    if block_size.is_none() && decoded.ili {
+        let negative = match decoded.response_code {
+            0x70 => residue & (1 << 31) != 0,
+            0x72 => residue & (1 << 63) != 0,
+            _ => false,
+        };
+        if negative {
+            return requested;
+        }
+    }
+    u64::from(requested).saturating_sub(residue.saturating_mul(u64::from(block_size.unwrap_or(1))))
+        as u32
+}
+
+/// Correct a transfer count from the command's already-normalized residual.
+pub(crate) fn transfer_bytes_from_evidence(
+    evidence: &crate::outcome::CompletionEvidence,
+    kernel_bytes: u32,
+    requested: u32,
+    block_size: Option<u32>,
+) -> u32 {
+    if kernel_bytes != requested {
+        return kernel_bytes;
+    }
+    let Some(decoded) = evidence.current_sense().filter(|s| s.valid) else {
+        return kernel_bytes;
+    };
+    let Some(residue) = evidence.residual else {
         return kernel_bytes;
     };
     if block_size.is_none() && decoded.ili {
@@ -75,7 +105,10 @@ pub(super) fn map_transfer_scsi(
     block_size: Option<u32>,
 ) -> TapeIoError {
     match map_scsi(err) {
-        TapeIoError::CheckCondition(source @ ScsiError::CheckCondition { .. }) => {
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::CheckCondition(source @ ScsiError::CheckCondition { .. }),
+            ..
+        } => {
             let ScsiError::CheckCondition {
                 sense,
                 bytes_transferred,
@@ -86,12 +119,12 @@ pub(super) fn map_transfer_scsi(
             let corrected =
                 transfer_bytes_from_sense(sense, *bytes_transferred, requested, block_size);
             if corrected == *bytes_transferred {
-                TapeIoError::CheckCondition(source)
+                crate::TapeIoError::pending(crate::TapeIoErrorKind::CheckCondition(source))
             } else {
-                TapeIoError::CheckConditionWithResidue {
+                crate::TapeIoError::pending(crate::TapeIoErrorKind::CheckConditionWithResidue {
                     source,
                     bytes_transferred: corrected,
-                }
+                })
             }
         }
         mapped => mapped,
@@ -146,26 +179,39 @@ pub fn verification_read_completion(
         return (0, VerificationReadCompletion::IoError);
     }
     let source = match error {
-        TapeIoError::CheckCondition(source) => source,
-        TapeIoError::CheckConditionWithResidue { source, .. } => source,
-        TapeIoError::GoodReadLengthMismatch { .. } | TapeIoError::ReadBufferTooSmall { .. } => {
-            return (0, VerificationReadCompletion::WrongLength)
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::CheckCondition(source),
+            ..
+        } => source,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::CheckConditionWithResidue { source, .. },
+            ..
+        } => source,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::GoodReadLengthMismatch { .. },
+            ..
         }
-        TapeIoError::OperationFailed(message)
-            if message.starts_with("unclean verification batch:") =>
-        {
+        | crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::ReadBufferTooSmall { .. },
+            ..
+        } => return (0, VerificationReadCompletion::WrongLength),
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::OperationFailed(message),
+            ..
+        } if message.starts_with("unclean verification batch:") => {
             return (0, VerificationReadCompletion::UncleanRead)
         }
         _ => return (0, VerificationReadCompletion::IoError),
     };
     let ScsiError::CheckCondition {
-        sense,
         bytes_transferred: kernel_bytes,
+        ..
     } = source
     else {
         return (0, VerificationReadCompletion::IoError);
     };
-    let Some(sense) = decode_sense(sense) else {
+    let evidence = error.completion_evidence();
+    let Some(sense) = evidence.decoded else {
         return (0, VerificationReadCompletion::IoError);
     };
     if sense.is_deferred() {
@@ -196,10 +242,7 @@ pub fn verification_read_completion(
     };
     // Some hosts omit the kernel residual. Otherwise both independent counts
     // must confirm the same whole-block prefix; buffer capacity is not evidence.
-    let residue = match source {
-        ScsiError::CheckCondition { sense: bytes, .. } if sense.valid => information(bytes),
-        _ => None,
-    };
+    let residue = evidence.residual;
     let records = residue
         .filter(|&r| r >= 1)
         .and_then(|r| u64::from(requested).checked_sub(r));
@@ -242,10 +285,12 @@ mod tests {
                 sense[2] = flags;
                 sense[3..7].copy_from_slice(&u32::to_be_bytes(residue));
                 sense[7] = 10;
-                let error = TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                    sense,
-                    bytes_transferred: kernel,
-                });
+                let error = crate::TapeIoError::new(crate::TapeIoErrorKind::CheckCondition(
+                    ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: kernel,
+                    },
+                ));
                 assert_eq!(
                     verification_read_completion(&error, 4, 4),
                     (
@@ -272,13 +317,14 @@ mod tests {
                 sense[2] = 0x80;
                 sense[3..7].copy_from_slice(&1u32.to_be_bytes());
                 sense[7] = 10;
-                let error = TapeIoError::CheckConditionWithResidue {
-                    source: ScsiError::CheckCondition {
-                        sense,
-                        bytes_transferred: kernel,
-                    },
-                    bytes_transferred: 12,
-                };
+                let error =
+                    crate::TapeIoError::new(crate::TapeIoErrorKind::CheckConditionWithResidue {
+                        source: ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred: kernel,
+                        },
+                        bytes_transferred: 12,
+                    });
                 let expected = if response == 0xf0 && kernel != 8 {
                     (3, VerificationReadCompletion::Filemark)
                 } else {
@@ -287,5 +333,32 @@ mod tests {
                 assert_eq!(verification_read_completion(&error, 4, 4), expected);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod b3b_strict_tests {
+    use super::*;
+    /// A truncated MEDIUM ERROR cannot become a verification damage fact.
+    #[test]
+    fn b3b_verification_completion_rejects_truncated_medium() {
+        let error = crate::TapeIoError::new(crate::TapeIoErrorKind::CheckCondition(
+            ScsiError::CheckCondition {
+                sense: vec![0x70, 0, 3],
+                bytes_transferred: 0,
+            },
+        ));
+        assert_eq!(
+            verification_read_completion(&error, 512, 4).1,
+            VerificationReadCompletion::IoError
+        );
+    }
+    /// Seven captured bytes can contain a residual but cannot prove usable sense.
+    #[test]
+    fn b3b_transfer_residual_requires_usable_sense() {
+        assert_eq!(
+            transfer_bytes_from_sense(&[0xf0, 0, 3, 0, 0, 0, 2], 2048, 2048, Some(512)),
+            2048
+        );
     }
 }

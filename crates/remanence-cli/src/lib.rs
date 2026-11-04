@@ -10218,14 +10218,19 @@ fn terminalize_repeated_unit_attention(
     seen: &mut BTreeSet<(u8, u8)>,
 ) {
     let repeated = match readiness {
-        MediaReadiness::UnitAttention { asc, ascq } => {
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { asc, ascq },
+            ..
+        } => {
             let key = (*asc, *ascq);
             (!seen.insert(key)).then_some(key)
         }
         _ => None,
     };
     if let Some((asc, ascq)) = repeated {
-        *readiness = MediaReadiness::RepeatedUnitAttention { asc, ascq };
+        *readiness = remanence_library::MediaReadiness::new(
+            remanence_library::MediaReadinessKind::RepeatedUnitAttention { asc, ascq },
+        );
     }
 }
 
@@ -10293,7 +10298,11 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
     let started = StdInstant::now();
     let mut attempts = initial_poll.attempts;
     let mut unit_attention_seen = BTreeSet::<(u8, u8)>::new();
-    if let MediaReadiness::UnitAttention { asc, ascq } = &initial_poll.readiness {
+    if let remanence_library::MediaReadiness {
+        kind: remanence_library::MediaReadinessKind::UnitAttention { asc, ascq },
+        ..
+    } = &initial_poll.readiness
+    {
         unit_attention_seen.insert((*asc, *ascq));
     }
     let mut current = Some(initial_poll);
@@ -10634,20 +10643,24 @@ fn tape_wait_ready_failure_from_poll_error(message: String) -> TapeWaitReadyFail
     TapeWaitReadyFailure { message, exit_code }
 }
 
-fn media_readiness_command_failure_state(error: &str) -> &'static str {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("transport error")
-        || lower.contains("completion unknown")
-        || lower.contains("host_status")
-        || lower.contains("did_")
-        || lower.contains("task aborted")
-        || lower.contains("resetting scsi")
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-    {
-        "transport_unknown"
-    } else {
-        "terminal_error"
+/// Preserve the failed bootstrap command independently of subsequent handle activity.
+fn tape_init_write_failure_completion(
+    error: &remanence_api::TapeInitWriteError,
+) -> remanence_library::outcome::Completion {
+    match error {
+        remanence_api::TapeInitWriteError::Write(remanence_api::PoolWriteError::TapeIo(error)) => {
+            error.outcome().completion
+        }
+        _ => remanence_library::outcome::Completion::Known,
+    }
+}
+
+fn media_readiness_command_failure_state(
+    completion: remanence_library::outcome::Completion,
+) -> &'static str {
+    match completion {
+        remanence_library::outcome::Completion::Unknown => "transport_unknown",
+        remanence_library::outcome::Completion::Known => "terminal_error",
     }
 }
 
@@ -10657,11 +10670,12 @@ fn record_media_readiness_command_failure<S: TapeInitStateOps>(
     phase: &str,
     cdb_opcode: Option<u8>,
     error: &str,
+    completion: remanence_library::outcome::Completion,
 ) -> Result<(), String> {
     state.record_media_readiness_transition(media_readiness_mechanical_transition(
         operation_id,
         phase,
-        media_readiness_command_failure_state(error),
+        media_readiness_command_failure_state(completion),
         cdb_opcode,
         Some(error.to_string()),
     ))
@@ -10696,13 +10710,21 @@ fn record_media_readiness_signal_or_command_failure<S: TapeInitStateOps>(
     phase: &str,
     cdb_opcode: Option<u8>,
     error: &str,
+    completion: remanence_library::outcome::Completion,
     signal: Option<&str>,
 ) -> Result<Option<String>, String> {
     if let Some(signal) = signal {
         record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
         return Ok(Some(media_readiness_signal_abort_message(signal)));
     }
-    record_media_readiness_command_failure(state, operation_id, phase, cdb_opcode, error)?;
+    record_media_readiness_command_failure(
+        state,
+        operation_id,
+        phase,
+        cdb_opcode,
+        error,
+        completion,
+    )?;
     Ok(None)
 }
 
@@ -10759,17 +10781,26 @@ type MediaReadinessEvidenceFields = (
 
 fn media_readiness_evidence_fields(readiness: &MediaReadiness) -> MediaReadinessEvidenceFields {
     match readiness {
-        MediaReadiness::Ready => (None, None, None, None, None, None, None),
-        MediaReadiness::BecomingReady { ascq, .. } => {
-            (Some(0x02), Some(0x04), Some(*ascq), None, None, None, None)
-        }
-        MediaReadiness::NoMedium { ascq } => {
-            (Some(0x02), Some(0x3a), Some(*ascq), None, None, None, None)
-        }
-        MediaReadiness::UnitAttention { asc, ascq } => {
-            (Some(0x06), Some(*asc), Some(*ascq), None, None, None, None)
-        }
-        MediaReadiness::RepeatedUnitAttention { asc, ascq } => (
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::Ready,
+            ..
+        } => (None, None, None, None, None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { ascq, .. },
+            ..
+        } => (Some(0x02), Some(0x04), Some(*ascq), None, None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { ascq },
+            ..
+        } => (Some(0x02), Some(0x3a), Some(*ascq), None, None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { asc, ascq },
+            ..
+        } => (Some(0x06), Some(*asc), Some(*ascq), None, None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { asc, ascq },
+            ..
+        } => (
             Some(0x06),
             Some(*asc),
             Some(*ascq),
@@ -10778,7 +10809,10 @@ fn media_readiness_evidence_fields(readiness: &MediaReadiness) -> MediaReadiness
             Some(json!({ "action": "repeated_unit_attention" }).to_string()),
             None,
         ),
-        MediaReadiness::TerminalNotReady { ascq, action } => (
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { ascq, action },
+            ..
+        } => (
             Some(0x02),
             Some(0x04),
             Some(*ascq),
@@ -10787,10 +10821,14 @@ fn media_readiness_evidence_fields(readiness: &MediaReadiness) -> MediaReadiness
             Some(json!({ "action": action }).to_string()),
             None,
         ),
-        MediaReadiness::CheckCondition { key, asc, ascq } => {
-            (Some(*key), Some(*asc), Some(*ascq), None, None, None, None)
-        }
-        MediaReadiness::UndecodedCheckCondition { sense } => (
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { key, asc, ascq },
+            ..
+        } => (Some(*key), Some(*asc), Some(*ascq), None, None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { sense },
+            ..
+        } => (
             None,
             None,
             None,
@@ -10799,12 +10837,26 @@ fn media_readiness_evidence_fields(readiness: &MediaReadiness) -> MediaReadiness
             Some(json!({ "error": "undecoded_check_condition" }).to_string()),
             Some(bytes_to_hex(sense)),
         ),
-        MediaReadiness::TargetBusy { status } | MediaReadiness::UnexpectedStatus { status } => {
-            (None, None, None, Some(*status), None, None, None)
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TargetBusy { status },
+            ..
         }
-        MediaReadiness::ReservationConflict => (None, None, None, Some(0x18), None, None, None),
-        MediaReadiness::TaskAborted => (None, None, None, Some(0x40), None, None, None),
-        MediaReadiness::TransportUnknown { detail } => (
+        | remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnexpectedStatus { status },
+            ..
+        } => (None, None, None, Some(*status), None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::ReservationConflict,
+            ..
+        } => (None, None, None, Some(0x18), None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TaskAborted,
+            ..
+        } => (None, None, None, Some(0x40), None, None, None),
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TransportUnknown { detail },
+            ..
+        } => (
             None,
             None,
             None,
@@ -10813,7 +10865,10 @@ fn media_readiness_evidence_fields(readiness: &MediaReadiness) -> MediaReadiness
             Some(json!({ "detail": detail }).to_string()),
             None,
         ),
-        MediaReadiness::InvalidRequest { detail } => (
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::InvalidRequest { detail },
+            ..
+        } => (
             None,
             None,
             None,
@@ -10830,24 +10885,70 @@ fn media_readiness_durable_state(readiness: &MediaReadiness, timed_out: bool) ->
         return "timeout_unknown";
     }
     match readiness {
-        MediaReadiness::Ready => "ready",
-        MediaReadiness::BecomingReady {
-            media_initializing: true,
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::Ready,
+            ..
+        } => "ready",
+        remanence_library::MediaReadiness {
+            kind:
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    media_initializing: true,
+                    ..
+                },
             ..
         } => "media_initializing",
-        MediaReadiness::BecomingReady { .. } => "becoming_ready",
-        MediaReadiness::NoMedium { .. } => "terminal_error",
-        MediaReadiness::UnitAttention { .. } => "unit_attention",
-        MediaReadiness::RepeatedUnitAttention { .. } => "terminal_error",
-        MediaReadiness::TerminalNotReady { .. } => "terminal_error",
-        MediaReadiness::CheckCondition { .. } => "terminal_error",
-        MediaReadiness::UndecodedCheckCondition { .. } => "terminal_error",
-        MediaReadiness::TargetBusy { .. } => "target_busy",
-        MediaReadiness::ReservationConflict => "reservation_conflict",
-        MediaReadiness::TaskAborted => "terminal_error",
-        MediaReadiness::UnexpectedStatus { .. } => "terminal_error",
-        MediaReadiness::TransportUnknown { .. } => "transport_unknown",
-        MediaReadiness::InvalidRequest { .. } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { .. },
+            ..
+        } => "becoming_ready",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { .. },
+            ..
+        } => "unit_attention",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { .. },
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { .. },
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { .. },
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { .. },
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TargetBusy { .. },
+            ..
+        } => "target_busy",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::ReservationConflict,
+            ..
+        } => "reservation_conflict",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TaskAborted,
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnexpectedStatus { .. },
+            ..
+        } => "terminal_error",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TransportUnknown { .. },
+            ..
+        } => "transport_unknown",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::InvalidRequest { .. },
+            ..
+        } => "terminal_error",
     }
 }
 
@@ -10856,7 +10957,14 @@ fn readiness_requires_conditional_load(
     conditional_load_on_no_medium: bool,
 ) -> bool {
     readiness.requires_initializing_command()
-        || (conditional_load_on_no_medium && matches!(readiness, MediaReadiness::NoMedium { .. }))
+        || (conditional_load_on_no_medium
+            && matches!(
+                readiness,
+                remanence_library::MediaReadiness {
+                    kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+                    ..
+                }
+            ))
 }
 
 fn tape_init_readiness_exit_code(poll: &MediaReadinessPoll) -> u8 {
@@ -11097,24 +11205,70 @@ fn media_readiness_state_name(readiness: &MediaReadiness, timed_out: bool) -> &'
         return "timeout_unknown";
     }
     match readiness {
-        MediaReadiness::Ready => "ready",
-        MediaReadiness::BecomingReady {
-            media_initializing: true,
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::Ready,
+            ..
+        } => "ready",
+        remanence_library::MediaReadiness {
+            kind:
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    media_initializing: true,
+                    ..
+                },
             ..
         } => "media_initializing",
-        MediaReadiness::BecomingReady { .. } => "becoming_ready",
-        MediaReadiness::NoMedium { .. } => "no_medium",
-        MediaReadiness::UnitAttention { .. } => "unit_attention",
-        MediaReadiness::RepeatedUnitAttention { .. } => "repeated_unit_attention",
-        MediaReadiness::TerminalNotReady { .. } => "terminal_not_ready",
-        MediaReadiness::CheckCondition { .. } => "check_condition",
-        MediaReadiness::UndecodedCheckCondition { .. } => "undecoded_check_condition",
-        MediaReadiness::TargetBusy { .. } => "target_busy",
-        MediaReadiness::ReservationConflict => "reservation_conflict",
-        MediaReadiness::TaskAborted => "task_aborted",
-        MediaReadiness::UnexpectedStatus { .. } => "unexpected_status",
-        MediaReadiness::TransportUnknown { .. } => "transport_unknown",
-        MediaReadiness::InvalidRequest { .. } => "invalid_request",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::BecomingReady { .. },
+            ..
+        } => "becoming_ready",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+            ..
+        } => "no_medium",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention { .. },
+            ..
+        } => "unit_attention",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { .. },
+            ..
+        } => "repeated_unit_attention",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TerminalNotReady { .. },
+            ..
+        } => "terminal_not_ready",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::CheckCondition { .. },
+            ..
+        } => "check_condition",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { .. },
+            ..
+        } => "undecoded_check_condition",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TargetBusy { .. },
+            ..
+        } => "target_busy",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::ReservationConflict,
+            ..
+        } => "reservation_conflict",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TaskAborted,
+            ..
+        } => "task_aborted",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnexpectedStatus { .. },
+            ..
+        } => "unexpected_status",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::TransportUnknown { .. },
+            ..
+        } => "transport_unknown",
+        remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::InvalidRequest { .. },
+            ..
+        } => "invalid_request",
     }
 }
 
@@ -12325,7 +12479,10 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     if let Err(error) = drive.require_single_partition() {
         if matches!(
             error,
-            remanence_library::TapeIoError::MultiPartitionMedium { .. }
+            remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::MultiPartitionMedium { .. },
+                ..
+            }
         ) {
             record_media_readiness_signal_if_requested(
                 state,
@@ -12341,6 +12498,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             "read_medium_partitions",
             None,
             &error.to_string(),
+            error.outcome().completion,
             signal_guard.requested_signal_name(),
         )? {
             return Err(signal);
@@ -12362,6 +12520,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
                 "read_drive_config",
                 None,
                 &error.to_string(),
+                error.outcome().completion,
                 signal_guard.requested_signal_name(),
             )? {
                 return Err(signal);
@@ -12386,6 +12545,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             "rewind_before_bot_read",
             Some(0x01),
             &error.to_string(),
+            error.outcome().completion,
             signal_guard.requested_signal_name(),
         )? {
             return Err(signal);
@@ -12514,6 +12674,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             "rewind_before_bootstrap_write",
             Some(0x01),
             &error.to_string(),
+            error.outcome().completion,
             signal_guard.requested_signal_name(),
         )? {
             return Err(signal);
@@ -12554,6 +12715,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
                 "apply_init_write_gate",
                 None,
                 &error.to_string(),
+                tape_init_write_failure_completion(&error),
                 signal_guard.requested_signal_name(),
             )? {
                 return Err(signal);
@@ -12666,14 +12828,14 @@ fn media_family_for_init_generation(generation: remanence_api::LtoGen) -> MediaF
 
 fn describe_media_readiness(readiness: &MediaReadiness) -> String {
     match readiness {
-        MediaReadiness::Ready => "ready".to_string(),
-        MediaReadiness::BecomingReady { ascq: 0x02, .. } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::Ready, .. } => "ready".to_string(),
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::BecomingReady { ascq: 0x02, .. }, .. } => {
             "drive asks for an initializing command (TEST UNIT READY sense 02/04/02); the cartridge sits unthreaded in the drive until an SSC LOAD arrives".to_string()
         }
-        MediaReadiness::BecomingReady {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::BecomingReady {
             ascq,
             media_initializing,
-        } => {
+        }, .. } => {
             if *media_initializing {
                 format!(
                     "media initializing/calibrating (TEST UNIT READY sense 02/04/{ascq:02x}); retry after the library UI leaves Calib/initializing"
@@ -12684,40 +12846,40 @@ fn describe_media_readiness(readiness: &MediaReadiness) -> String {
                 )
             }
         }
-        MediaReadiness::NoMedium { ascq } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::NoMedium { ascq }, .. } => {
             format!("drive reports no medium (TEST UNIT READY sense 02/3a/{ascq:02x})")
         }
-        MediaReadiness::UnitAttention { asc, ascq } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::UnitAttention { asc, ascq }, .. } => {
             format!("unit attention during readiness probe (sense 06/{asc:02x}/{ascq:02x})")
         }
-        MediaReadiness::RepeatedUnitAttention { asc, ascq } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention { asc, ascq }, .. } => {
             format!("repeated unit attention during readiness probe (sense 06/{asc:02x}/{ascq:02x}); fence for recovery")
         }
-        MediaReadiness::TerminalNotReady { ascq, action } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::TerminalNotReady { ascq, action }, .. } => {
             format!("terminal not-ready state {action} (sense 02/04/{ascq:02x})")
         }
-        MediaReadiness::CheckCondition { key, asc, ascq } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::CheckCondition { key, asc, ascq }, .. } => {
             format!("readiness probe check condition (sense {key:02x}/{asc:02x}/{ascq:02x})")
         }
-        MediaReadiness::UndecodedCheckCondition { sense } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::UndecodedCheckCondition { sense }, .. } => {
             format!("readiness probe returned undecoded check condition sense={sense:02x?}")
         }
-        MediaReadiness::TargetBusy { status } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::TargetBusy { status }, .. } => {
             format!("target busy during readiness probe (status 0x{status:02x}); retry later")
         }
-        MediaReadiness::ReservationConflict => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::ReservationConflict, .. } => {
             "reservation conflict during readiness probe; another owner holds the drive".to_string()
         }
-        MediaReadiness::TaskAborted => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::TaskAborted, .. } => {
             "task aborted during readiness probe; fence this operation for recovery".to_string()
         }
-        MediaReadiness::UnexpectedStatus { status } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::UnexpectedStatus { status }, .. } => {
             format!("unexpected target status during readiness probe: 0x{status:02x}")
         }
-        MediaReadiness::TransportUnknown { detail } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::TransportUnknown { detail }, .. } => {
             format!("transport completion unknown during readiness probe: {detail}")
         }
-        MediaReadiness::InvalidRequest { detail } => {
+        remanence_library::MediaReadiness { kind: remanence_library::MediaReadinessKind::InvalidRequest { detail }, .. } => {
             format!("invalid readiness probe request: {detail}")
         }
     }
@@ -20604,9 +20766,11 @@ mod tests {
     fn media_readiness_unknown_states_get_quarantine_id() {
         let operation_id = Uuid::from_u128(0x123);
         let poll = MediaReadinessPoll {
-            readiness: MediaReadiness::TransportUnknown {
-                detail: "DID_TIME_OUT".to_string(),
-            },
+            readiness: remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::TransportUnknown {
+                    detail: "DID_TIME_OUT".to_string(),
+                },
+            ),
             attempts: 1,
             timed_out: false,
         };
@@ -20728,6 +20892,7 @@ mod tests {
             "rewind_before_bot_read",
             Some(0x01),
             "interrupted system call",
+            remanence_library::outcome::Completion::Unknown,
             Some("SIGINT"),
         )
         .expect("record signal")
@@ -20892,16 +21057,36 @@ mod tests {
         );
     }
 
+    /// The init renderer consumes its error's completion; diagnostic words cannot change it.
+    #[test]
+    fn b3b_cli_init_failure_uses_carried_completion() {
+        use remanence_library::outcome::Completion;
+        let error =
+            remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::Transport(
+                remanence_library::ScsiError::Io(std::io::Error::other("position drift")),
+            ));
+        let expected = error.outcome().completion;
+        let wrapped =
+            remanence_api::TapeInitWriteError::Write(remanence_api::PoolWriteError::TapeIo(error));
+        assert_eq!(tape_init_write_failure_completion(&wrapped), expected);
+        assert_eq!(expected, Completion::Unknown);
+        let local = remanence_api::TapeInitWriteError::Write(
+            remanence_api::PoolWriteError::InvalidInput("transport error timeout".into()),
+        );
+        assert_eq!(
+            tape_init_write_failure_completion(&local),
+            Completion::Known
+        );
+    }
+
     #[test]
     fn media_readiness_command_failure_state_keeps_unknown_completion_fenced() {
         assert_eq!(
-            media_readiness_command_failure_state(
-                "SG_IO transport error: host_status=0x0003 completion unknown"
-            ),
+            media_readiness_command_failure_state(remanence_library::outcome::Completion::Unknown),
             "transport_unknown"
         );
         assert_eq!(
-            media_readiness_command_failure_state("drive rejected MODE SENSE"),
+            media_readiness_command_failure_state(remanence_library::outcome::Completion::Known),
             "terminal_error"
         );
     }
@@ -20910,26 +21095,35 @@ mod tests {
     fn media_readiness_state_name_distinguishes_lto9_initializing() {
         assert_eq!(
             media_readiness_state_name(
-                &MediaReadiness::BecomingReady {
-                    ascq: 0x01,
-                    media_initializing: true,
-                },
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 0x01,
+                        media_initializing: true,
+                    }
+                ),
                 false,
             ),
             "media_initializing"
         );
         assert_eq!(
             media_readiness_state_name(
-                &MediaReadiness::BecomingReady {
-                    ascq: 0x01,
-                    media_initializing: false,
-                },
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 0x01,
+                        media_initializing: false,
+                    }
+                ),
                 false,
             ),
             "becoming_ready"
         );
         assert_eq!(
-            media_readiness_state_name(&MediaReadiness::Ready, true),
+            media_readiness_state_name(
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::Ready
+                ),
+                true
+            ),
             "timeout_unknown"
         );
     }
@@ -20997,10 +21191,12 @@ mod tests {
             operation_id,
             drive_element: 0x0001,
             barcode: Some("AOX030L9".to_string()),
-            readiness: MediaReadiness::BecomingReady {
-                ascq: 0x01,
-                media_initializing: true,
-            },
+            readiness: remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: true,
+                },
+            ),
             attempts: 1,
             timed_out: false,
         };
@@ -21031,10 +21227,12 @@ mod tests {
             operation_id,
             drive_element: 0x0001,
             barcode: Some("AOX031L9".to_string()),
-            readiness: MediaReadiness::BecomingReady {
-                ascq: 0x01,
-                media_initializing: true,
-            },
+            readiness: remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: true,
+                },
+            ),
             attempts: 2,
             timed_out: true,
         };
@@ -21080,25 +21278,33 @@ mod tests {
     #[test]
     fn tape_init_conditional_load_only_for_explicit_load_readiness() {
         assert!(!readiness_requires_conditional_load(
-            &MediaReadiness::BecomingReady {
-                ascq: 0x01,
-                media_initializing: true,
-            },
+            &remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: true,
+                }
+            ),
             true,
         ));
         assert!(readiness_requires_conditional_load(
-            &MediaReadiness::BecomingReady {
-                ascq: 0x02,
-                media_initializing: true,
-            },
+            &remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    ascq: 0x02,
+                    media_initializing: true,
+                }
+            ),
             false,
         ));
         assert!(readiness_requires_conditional_load(
-            &MediaReadiness::NoMedium { ascq: 0x00 },
+            &remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::NoMedium { ascq: 0x00 }
+            ),
             true,
         ));
         assert!(!readiness_requires_conditional_load(
-            &MediaReadiness::NoMedium { ascq: 0x00 },
+            &remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::NoMedium { ascq: 0x00 }
+            ),
             false,
         ));
     }
@@ -22429,10 +22635,12 @@ pool_id = "init-test"
     #[test]
     fn tape_init_readiness_error_carries_stable_exit_metadata() {
         let poll = MediaReadinessPoll {
-            readiness: MediaReadiness::BecomingReady {
-                ascq: 0x01,
-                media_initializing: true,
-            },
+            readiness: remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: true,
+                },
+            ),
             attempts: 1,
             timed_out: false,
         };
@@ -22524,10 +22732,12 @@ pool_id = "init-test"
         assert_eq!(result.attempts, 2);
         assert_eq!(
             result.readiness,
-            MediaReadiness::RepeatedUnitAttention {
-                asc: 0x29,
-                ascq: 0x00
-            }
+            remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::RepeatedUnitAttention {
+                    asc: 0x29,
+                    ascq: 0x00
+                }
+            )
         );
         assert_eq!(result.readiness.design_exit_code(), 30);
         assert_eq!(
@@ -22539,18 +22749,24 @@ pool_id = "init-test"
         assert!(!polls[0].1);
         assert!(matches!(
             polls[0].2,
-            MediaReadiness::UnitAttention {
-                asc: 0x29,
-                ascq: 0x00
+            remanence_library::MediaReadiness {
+                kind: remanence_library::MediaReadinessKind::UnitAttention {
+                    asc: 0x29,
+                    ascq: 0x00
+                },
+                ..
             }
         ));
         assert_eq!(polls[1].0, 2);
         assert!(!polls[1].1);
         assert!(matches!(
             polls[1].2,
-            MediaReadiness::RepeatedUnitAttention {
-                asc: 0x29,
-                ascq: 0x00
+            remanence_library::MediaReadiness {
+                kind: remanence_library::MediaReadinessKind::RepeatedUnitAttention {
+                    asc: 0x29,
+                    ascq: 0x00
+                },
+                ..
             }
         ));
         assert_eq!(tur_count, 2, "poll loop must stop at repeated identical UA");
@@ -22571,7 +22787,10 @@ pool_id = "init-test"
         );
 
         assert_eq!(result.attempts, 4);
-        assert_eq!(result.readiness, MediaReadiness::Ready);
+        assert_eq!(
+            result.readiness,
+            remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready)
+        );
         assert_eq!(result.readiness.design_exit_code(), 0);
         assert_eq!(
             media_readiness_durable_state(&result.readiness, false),
@@ -22580,26 +22799,38 @@ pool_id = "init-test"
         assert_eq!(polls.len(), 4);
         assert!(matches!(
             polls[0].2,
-            MediaReadiness::UnitAttention {
-                asc: 0x29,
-                ascq: 0x00
+            remanence_library::MediaReadiness {
+                kind: remanence_library::MediaReadinessKind::UnitAttention {
+                    asc: 0x29,
+                    ascq: 0x00
+                },
+                ..
             }
         ));
         assert!(matches!(
             polls[1].2,
-            MediaReadiness::BecomingReady {
-                ascq: 0x01,
-                media_initializing: true
+            remanence_library::MediaReadiness {
+                kind: remanence_library::MediaReadinessKind::BecomingReady {
+                    ascq: 0x01,
+                    media_initializing: true
+                },
+                ..
             }
         ));
         assert!(matches!(
             polls[2].2,
-            MediaReadiness::UnitAttention {
-                asc: 0x28,
-                ascq: 0x00
+            remanence_library::MediaReadiness {
+                kind: remanence_library::MediaReadinessKind::UnitAttention {
+                    asc: 0x28,
+                    ascq: 0x00
+                },
+                ..
             }
         ));
-        assert_eq!(polls[3].2, MediaReadiness::Ready);
+        assert_eq!(
+            polls[3].2,
+            remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready)
+        );
         assert_eq!(tur_count, 4);
         assert!(!dirty, "TUR CHECK CONDITION is classified, not dirty");
     }
@@ -22638,7 +22869,9 @@ pool_id = "init-test"
             0x0100,
             MediaReadinessInitialProbeInput {
                 initial_poll: MediaReadinessPoll {
-                    readiness: MediaReadiness::NoMedium { ascq: 0x00 },
+                    readiness: remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::NoMedium { ascq: 0x00 },
+                    ),
                     attempts: 1,
                     timed_out: false,
                 },
@@ -22651,7 +22884,12 @@ pool_id = "init-test"
         )
         .expect("already-loaded no-medium should terminalize without LOAD");
 
-        assert_eq!(result.readiness, MediaReadiness::NoMedium { ascq: 0x00 });
+        assert_eq!(
+            result.readiness,
+            remanence_library::MediaReadiness::new(
+                remanence_library::MediaReadinessKind::NoMedium { ascq: 0x00 }
+            )
+        );
         assert_eq!(
             log.borrow()
                 .iter()
@@ -22700,10 +22938,12 @@ pool_id = "init-test"
             0x0100,
             MediaReadinessInitialProbeInput {
                 initial_poll: MediaReadinessPoll {
-                    readiness: MediaReadiness::UnitAttention {
-                        asc: 0x29,
-                        ascq: 0x00,
-                    },
+                    readiness: remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::UnitAttention {
+                            asc: 0x29,
+                            ascq: 0x00,
+                        },
+                    ),
                     attempts: 1,
                     timed_out: false,
                 },
@@ -22716,7 +22956,10 @@ pool_id = "init-test"
         )
         .expect("post-load UA should start a fresh epoch and reach ready");
 
-        assert_eq!(result.readiness, MediaReadiness::Ready);
+        assert_eq!(
+            result.readiness,
+            remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready)
+        );
         assert_eq!(result.attempts, 4);
         let control_cdbs = log
             .borrow()

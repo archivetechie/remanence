@@ -332,9 +332,12 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
     state: &mut CatalogIndex,
     fence_cfg: &crate::write_owner::TerminalWriteConfig,
     selected: &SelectedTape,
-    reason: &str,
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
     error: &str,
 ) -> Result<(), PoolWriteError> {
+    let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect else {
+        return Ok(());
+    };
     let barcode = state
         .get_tape(&selected.tape_uuid)?
         .and_then(|tape| tape.voltag);
@@ -350,25 +353,12 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
         remanence_state::TapeIoFenceInput {
             tape_uuid: selected.tape_uuid,
             barcode,
-            reason: reason.to_string(),
+            reason: cause.reason().to_string(),
             evidence_json: Some(evidence),
         },
         selected.standalone_endpoint.as_ref(),
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn tape_io_fence_reason_for_transfer_error(error: &str) -> &'static str {
-    if error.contains("reset UNIT ATTENTION") {
-        "reset_unit_attention"
-    } else if error.contains("partial fixed batch uncommittable") {
-        "partial_batch"
-    } else if error.contains("position drift") {
-        "position_drift"
-    } else {
-        "transfer_error"
-    }
 }
 
 #[cfg(test)]
@@ -950,5 +940,28 @@ pub(super) fn no_parity_file_catalog_projection(
         chunk_count: file.chunk_count,
         mtime: prepared.spec.mtime.clone(),
         executable: file.executable,
+    })
+}
+
+/// Synthetic staged-sink failures carry the same typed policy as real drive outcomes.
+#[cfg(test)]
+pub(super) fn staged_failure_outcome(
+    error: &remanence_library::TapeIoError,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    use remanence_library::outcome::*;
+    let mut evidence = error.completion_evidence();
+    // This callback is reached after the staged writer reports a safety error;
+    // an untyped producer/position failure cannot prove the dispatched tail safe.
+    if evidence.dispatch == Dispatch::NotIssued {
+        evidence = CompletionEvidence::unknown();
+    }
+    classify(OutcomeInput {
+        class: CommandClass::Write,
+        context: OperationContext {
+            phase: Phase::Append,
+            region: Region::Unknown,
+            ..Default::default()
+        },
+        evidence,
     })
 }

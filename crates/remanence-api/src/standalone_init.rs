@@ -50,18 +50,49 @@ impl OperatorMount<'_> {
             let id = uuid::Uuid::new_v4();
             self.session(uuid, id, AuditEvent::SessionOpened)?;
             let before = drive.media_write_dispatch_count();
+            let _outcome_context =
+                drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Initialization,
+                    region: remanence_library::outcome::Region::Bot,
+                    mounted: true,
+                    ..Default::default()
+                });
             let result = write_and_provision(&mut drive, self.state, plan).map_err(refusal);
             self.flush_audit()?;
             let uncertain = result.is_err() && drive.media_write_dispatch_count() != before;
             if uncertain {
                 self.unusable = true;
-                raise_standalone_fence(
-                    self.state,
-                    uuid,
-                    self.context.endpoint.durable_key(),
-                    "standalone_init_failed",
-                    &result.as_ref().err().expect("failed write").to_string(),
-                )?;
+                let outcome = drive
+                    .media_failure_outcome_after(before)
+                    .filter(|outcome| {
+                        // D2 preserves issued write results, including R6's definite rejection.
+                        // A local adapter refusal cannot account for the preceding media writes.
+                        outcome.write_context
+                            && outcome.evidence.dispatch
+                                == remanence_library::outcome::Dispatch::Issued
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        remanence_library::outcome::finish_abandoned_write(
+                            remanence_library::outcome::OperationContext {
+                                phase: remanence_library::outcome::Phase::Initialization,
+                                region: remanence_library::outcome::Region::Bot,
+                                mounted: true,
+                                ..Default::default()
+                            },
+                        )
+                    });
+                drive.retain_operation_failure(before, outcome.clone());
+                if let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect {
+                    raise_standalone_fence(
+                        self.state,
+                        uuid,
+                        self.context.endpoint.durable_key(),
+                        cause.reason(),
+                        &result.as_ref().err().expect("failed write").to_string(),
+                    )?;
+                }
+                drive.mark_media_failure_outcome_applied();
             }
             self.session(
                 uuid,

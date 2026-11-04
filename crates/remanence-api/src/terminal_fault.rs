@@ -637,6 +637,14 @@ impl<'a, S: RawTapeSink + ?Sized> TerminalPrefixFaultSink<'a, S> {
 }
 
 impl<S: RawTapeSink + ?Sized> RawTapeSink for TerminalPrefixFaultSink<'_, S> {
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        self.inner.finish_adapter_error(kind, class)
+    }
+
     fn locate_for_overwrite(
         &mut self,
         hint: PhysicalPositionHint,
@@ -801,6 +809,14 @@ impl<'a, S: RawTapeSink + ?Sized> TerminalFaultSink<'a, S> {
 }
 
 impl<S: RawTapeSink + ?Sized> RawTapeSink for TerminalFaultSink<'_, S> {
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        self.inner.finish_adapter_error(kind, class)
+    }
+
     fn locate_for_overwrite(
         &mut self,
         hint: PhysicalPositionHint,
@@ -936,6 +952,22 @@ mod tests {
     }
 
     impl RawTapeSink for CountingRawSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(
             &mut self,
             buf: &[u8],

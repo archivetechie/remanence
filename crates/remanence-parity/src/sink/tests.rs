@@ -217,6 +217,22 @@ impl EwEomTripwireRawTapeSink {
 }
 
 impl RawTapeSink for EwEomTripwireRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.events.push(RawSinkEvent::WriteBlock(buf.len()));
         self.block_count += 1;
@@ -270,6 +286,22 @@ struct RecordingRawTapeSink {
 }
 
 impl RawTapeSink for RecordingRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.events.push(RawSinkEvent::WriteBlock(buf.len()));
         self.blocks.push(buf.to_vec());
@@ -344,6 +376,22 @@ impl NonExactRawTapeSink {
 }
 
 impl RawTapeSink for NonExactRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.block_calls += 1;
         match self.inner.write_fixed_block(buf)? {
@@ -383,14 +431,32 @@ struct FailingBarrierRawTapeSink {
 }
 
 impl RawTapeSink for FailingBarrierRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.inner.write_fixed_block(buf)
     }
 
     fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
         if count == 0 {
-            return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-                "injected checkpoint barrier failure".to_string(),
+            return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected checkpoint barrier failure".to_string(),
+                ),
             )));
         }
         self.inner.write_filemarks(count, immed)
@@ -464,13 +530,15 @@ impl FaultingPrefixSource {
 
 fn injected_prefix_read_error(kind: PrefixReadFaultKind, block_size: u32) -> ParityError {
     let error = match kind {
-        PrefixReadFaultKind::Transport => TapeIoError::Transport(ScsiError::TransportError {
-            status: 0,
-            host_status: 0,
-            driver_status: 0x06,
-            info: 1,
-            sense: Vec::new(),
-        }),
+        PrefixReadFaultKind::Transport => remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::Transport(ScsiError::TransportError {
+                status: 0,
+                host_status: 0,
+                driver_status: 0x06,
+                info: 1,
+                sense: Vec::new(),
+            }),
+        ),
         PrefixReadFaultKind::Medium | PrefixReadFaultKind::Hardware => {
             let mut sense = vec![0u8; 18];
             sense[0] = 0x70;
@@ -481,15 +549,19 @@ fn injected_prefix_read_error(kind: PrefixReadFaultKind, block_size: u32) -> Par
             };
             sense[7] = 10;
             sense[12] = 0x11;
-            TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: 0,
-            })
+            remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+                ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ))
         }
-        PrefixReadFaultKind::BufferTooSmall => TapeIoError::ReadBufferTooSmall {
-            actual: block_size.saturating_add(1),
-            provided: block_size,
-        },
+        PrefixReadFaultKind::BufferTooSmall => remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                actual: block_size.saturating_add(1),
+                provided: block_size,
+            },
+        ),
     };
     ParityError::TapeIo(error)
 }
@@ -528,8 +600,10 @@ impl RawTapeSource for FaultingPrefixSource {
 
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         if self.position_fails {
-            return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-                "injected terminal-prefix position failure".to_string(),
+            return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected terminal-prefix position failure".to_string(),
+                ),
             )));
         }
         self.inner.position()
@@ -734,6 +808,22 @@ impl EarlyWarningRawTapeSink {
 }
 
 impl RawTapeSink for EarlyWarningRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.block_count += 1;
         let early_warning = self.ew_on_blocks.contains(&self.block_count);
@@ -780,6 +870,22 @@ struct FailingRawTapeSink {
 }
 
 impl RawTapeSink for FailingRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         if let Some(err) = self.block_error.take() {
             return Err(err);
@@ -1011,6 +1117,22 @@ fn parity_attach_reports_record_failure_before_position() {
     }
     struct NoMotion;
     impl RawTapeSink for NoMotion {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, _: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             panic!("unexpected write")
         }
@@ -1111,7 +1233,11 @@ fn wrong_length_first_object_block_does_not_pin_session_block_size() {
     start_object(&mut sink, 1, block_size);
     let err = sink.write_block(&[0xAA; 8]).expect_err("wrong block size");
     match err {
-        TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+        remanence_library::TapeIoError {
+            kind:
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message)),
+            ..
+        } => {
             assert!(message.contains("configured fixed block size"));
         }
         other => panic!("expected fixed block size rejection, got {other:?}"),
@@ -1495,7 +1621,10 @@ fn failed_checkpoint_barrier_poisons_without_committing_journal_bundle() {
             .close_open_epoch(CloseReason::Barrier)
             .expect_err("injected checkpoint barrier must fail");
         match err {
-            ParityError::TapeIo(TapeIoError::OperationFailed(message)) => {
+            ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::OperationFailed(message),
+                ..
+            }) => {
                 assert!(message.contains("injected checkpoint barrier failure"));
             }
             other => panic!("expected injected tape-I/O failure, got {other:?}"),
@@ -1544,7 +1673,10 @@ fn checkpoint_barrier_end_of_medium_is_tape_io_and_poisons_without_commit() {
         assert!(
             matches!(
                 err,
-                ParityError::TapeIo(TapeIoError::HardEndOfMedium { .. })
+                ParityError::TapeIo(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::HardEndOfMedium { .. },
+                    ..
+                })
             ),
             "barrier EOM must retain tape-I/O taxonomy: {err:?}"
         );
@@ -2138,7 +2270,10 @@ fn raw_sink_error_context_survives_block_sink_wrapper() {
         .write_bootstrap()
         .expect_err("raw fixed-block error should bubble");
     match err {
-        ParityError::TapeIo(TapeIoError::OperationFailed(message)) => {
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::OperationFailed(message),
+            ..
+        }) => {
             assert!(message.contains("RawTapeSink operation failed"));
             assert!(message.contains("resume append error"));
             assert!(message.contains("catalog commit callback failed"));
@@ -2152,14 +2287,14 @@ fn raw_sink_error_context_survives_block_sink_wrapper() {
 fn raw_sink_transport_error_remains_completion_unknown() {
     let block_size: u32 = 512;
     let mut raw = FailingRawTapeSink {
-        block_error: Some(ParityError::TapeIo(TapeIoError::Transport(
-            ScsiError::TransportError {
+        block_error: Some(ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::Transport(ScsiError::TransportError {
                 status: 0,
                 host_status: 0,
                 driver_status: 0x06,
                 info: 1,
                 sense: Vec::new(),
-            },
+            }),
         ))),
         cursor: 0,
     };
@@ -2170,8 +2305,14 @@ fn raw_sink_transport_error_remains_completion_unknown() {
         .write_bootstrap()
         .expect_err("raw transport error should bubble");
     match err {
-        ParityError::TapeIo(TapeIoError::Transport(scsi)) => {
-            assert!(TapeIoError::Transport(scsi).is_completion_unknown());
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Transport(scsi),
+            ..
+        }) => {
+            assert!(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::Transport(scsi)
+            )
+            .is_completion_unknown());
         }
         other => panic!("expected completion-unknown transport error, got {other:?}"),
     }
@@ -2190,7 +2331,13 @@ fn raw_backed_body_facing_write_filemarks_is_rejected_before_raw_barrier() {
             let err = BlockSink::write_filemarks(&mut sink, count)
                 .expect_err("body-facing filemark writes must be disabled");
             match err {
-                TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+                remanence_library::TapeIoError {
+                    kind:
+                        remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                            message,
+                        )),
+                    ..
+                } => {
                     assert!(message.contains("body-facing write_filemarks"), "{message}");
                 }
                 other => panic!("expected InvalidInput for body filemark write, got {other:?}"),
@@ -2254,6 +2401,22 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_data_eom() {
     }
 
     impl RawTapeSink for SidecarFilemarkEwThenObjectEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -2339,7 +2502,11 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_data_eom() {
             .write_block(&fixed_block(0xE3, block_size))
             .expect_err("later object data EOM must hard-abort despite prior sidecar EW");
         match err {
-            TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+            remanence_library::TapeIoError {
+                kind:
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message)),
+                ..
+            } => {
                 assert!(
                     message.contains("object data block write reached end of medium"),
                     "{message}"
@@ -2417,6 +2584,22 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_filemark_eom() {
     }
 
     impl RawTapeSink for SidecarFilemarkEwThenObjectFilemarkEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -2577,6 +2760,22 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_body_eom() {
     }
 
     impl RawTapeSink for SidecarFilemarkEwThenSidecarBodyEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -2752,6 +2951,22 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_filemark_eom() {
     }
 
     impl RawTapeSink for SidecarFilemarkEwThenSidecarFilemarkEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -2963,6 +3178,22 @@ impl SidecarBodyEwThenLaterEomRawTapeSink {
 }
 
 impl RawTapeSink for SidecarBodyEwThenLaterEomRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.events.push(RawSinkEvent::WriteBlock(buf.len()));
         self.block_count += 1;
@@ -3074,7 +3305,11 @@ fn sidecar_body_early_warning_does_not_mask_later_object_data_eom() {
             .write_block(&fixed_block(0xE5, block_size))
             .expect_err("later object data EOM must hard-abort despite prior sidecar-body EW");
         match err {
-            TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+            remanence_library::TapeIoError {
+                kind:
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message)),
+                ..
+            } => {
                 assert!(
                     message.contains("object data block write reached end of medium"),
                     "{message}"
@@ -3475,6 +3710,22 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_filemark_eom() {
     }
 
     impl RawTapeSink for SidecarBodyEwThenSidecarFilemarkEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -3811,7 +4062,10 @@ fn object_data_early_warning_uses_single_runtime_reserve_predicate() {
             .write_block(&fixed_block(1, block_size))
             .expect_err("EW with an exhausted runtime reserve must abort");
         match err {
-            TapeIoError::OperationFailed(message) => {
+            remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::OperationFailed(message),
+                ..
+            } => {
                 assert!(message.contains("required reserve"), "{message}");
                 assert!(message.contains("TapeCapacity"), "{message}");
             }
@@ -3851,7 +4105,11 @@ fn object_data_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
             .write_block(&fixed_block(0xC1, block_size))
             .expect_err("object data EW+EOM must hard-abort before reserve failure");
         match err {
-            TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+            remanence_library::TapeIoError {
+                kind:
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message)),
+                ..
+            } => {
                 assert!(
                     message.contains("object data block write reached end of medium"),
                     "{message}"
@@ -4100,6 +4358,22 @@ fn sidecar_body_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
     }
 
     impl RawTapeSink for EarlyWarningEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -4361,6 +4635,22 @@ fn sidecar_only_rejects_eom_on_object_data_before_filemark_or_map_commit() {
     }
 
     impl RawTapeSink for EomObjectDataRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
@@ -4404,7 +4694,11 @@ fn sidecar_only_rejects_eom_on_object_data_before_filemark_or_map_commit() {
             .write_block(&fixed_block(0xD0, block_size))
             .expect_err("object data EOM must hard-abort the write session");
         match err {
-            TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+            remanence_library::TapeIoError {
+                kind:
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message)),
+                ..
+            } => {
                 assert!(
                     message.contains("object data block write reached end of medium"),
                     "{message}"
@@ -4451,6 +4745,22 @@ fn sidecar_only_prior_early_warning_does_not_mask_later_object_data_eom_abort() 
     }
 
     impl RawTapeSink for EwThenEomObjectDataRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -4502,7 +4812,11 @@ fn sidecar_only_prior_early_warning_does_not_mask_later_object_data_eom_abort() 
             .write_block(&fixed_block(0xE2, block_size))
             .expect_err("later object data EOM must still hard-abort");
         match err {
-            TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
+            remanence_library::TapeIoError {
+                kind:
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message)),
+                ..
+            } => {
                 assert!(
                     message.contains("object data block write reached end of medium"),
                     "{message}"
@@ -4556,6 +4870,22 @@ fn sidecar_only_prior_early_warning_does_not_mask_object_filemark_eom_abort() {
     }
 
     impl RawTapeSink for EwTailThenFilemarkEomRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -4660,6 +4990,22 @@ fn finish_object_rejects_eom_on_object_filemark_before_map_commit() {
     }
 
     impl RawTapeSink for EomFilemarkRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
@@ -4746,6 +5092,22 @@ fn finish_object_rejects_eom_on_sidecar_filemark_before_map_commit() {
     }
 
     impl RawTapeSink for EomOnNthFilemarkRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
@@ -4847,6 +5209,22 @@ fn finish_object_rejects_sidecar_block_eom_even_when_early_warning_cofires() {
     }
 
     impl RawTapeSink for EwEomOnNthBlockRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.block_count += 1;
@@ -4951,6 +5329,22 @@ fn finish_object_rejects_sidecar_filemark_eom_even_when_early_warning_cofires() 
     }
 
     impl RawTapeSink for EwEomOnNthFilemarkRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events.push(RawSinkEvent::WriteBlock(buf.len()));
             self.cursor += 1;
@@ -5121,6 +5515,22 @@ impl BootstrapEomRawTapeSink {
 }
 
 impl RawTapeSink for BootstrapEomRawTapeSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.events.push(RawSinkEvent::WriteBlock(buf.len()));
         self.block_count += 1;

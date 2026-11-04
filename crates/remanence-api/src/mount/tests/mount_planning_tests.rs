@@ -9,6 +9,22 @@ use remanence_parity::{
 #[derive(Default)]
 struct CounterSink(u64);
 impl RawTapeSink for CounterSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn write_fixed_block(&mut self, bytes: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.0 += 1;
         Ok(RawWriteOutcome::WroteBlock {

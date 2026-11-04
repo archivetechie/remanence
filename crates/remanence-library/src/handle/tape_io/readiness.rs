@@ -11,8 +11,6 @@ use std::time::Duration;
 
 use remanence_scsi::ScsiError;
 
-use super::decode_sense_key_asc;
-
 /// Media family hint used when interpreting `NOT READY / becoming ready`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MediaFamily {
@@ -25,8 +23,56 @@ pub enum MediaFamily {
 }
 
 /// Classified outcome of a TEST UNIT READY readiness probe.
+#[derive(Clone)]
+pub struct MediaReadiness {
+    /// Original readiness state used by the existing wait machine.
+    pub kind: MediaReadinessKind,
+    outcome: Option<Box<crate::outcome::ClassifiedOutcome>>,
+}
+impl std::fmt::Debug for MediaReadiness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.kind, f)
+    }
+}
+impl PartialEq for MediaReadiness {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+impl Eq for MediaReadiness {}
+impl MediaReadiness {
+    /// Construct an initial host observation without inventing a dispatched command.
+    pub fn new(kind: MediaReadinessKind) -> Self {
+        let mut evidence = crate::outcome::CompletionEvidence::success();
+        evidence.dispatch = crate::outcome::Dispatch::NotIssued;
+        evidence.failed = !matches!(kind, MediaReadinessKind::Ready);
+        let outcome = crate::outcome::classify(crate::outcome::OutcomeInput {
+            class: crate::outcome::CommandClass::SenseStatus,
+            context: Default::default(),
+            evidence,
+        });
+        Self::pending(kind).with_outcome(outcome)
+    }
+    pub(crate) fn pending(kind: MediaReadinessKind) -> Self {
+        Self {
+            kind,
+            outcome: None,
+        }
+    }
+    pub(crate) fn with_outcome(mut self, outcome: crate::outcome::ClassifiedOutcome) -> Self {
+        self.outcome = Some(Box::new(outcome));
+        self
+    }
+    /// The command that supplied this observation, retained across later polls.
+    pub fn outcome(&self) -> &crate::outcome::ClassifiedOutcome {
+        self.outcome
+            .as_deref()
+            .expect("unfinished readiness observation")
+    }
+}
+/// Readiness vocabulary; equality of observations retains the original state semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MediaReadiness {
+pub enum MediaReadinessKind {
     /// TEST UNIT READY returned GOOD.
     Ready,
     /// The drive reports `NOT READY / LOGICAL UNIT IS IN PROCESS OF BECOMING
@@ -116,33 +162,73 @@ pub enum MediaReadiness {
 impl std::fmt::Display for MediaReadiness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ready => f.write_str("drive ready"),
-            Self::NoMedium { .. } => f.write_str("no cartridge in the drive"),
-            Self::BecomingReady { ascq: 0x02, .. } => {
-                f.write_str("drive needs an initializing command (SSC LOAD)")
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::Ready,
+                ..
+            } => f.write_str("drive ready"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::NoMedium { .. },
+                ..
+            } => f.write_str("no cartridge in the drive"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::BecomingReady { ascq: 0x02, .. },
+                ..
+            } => f.write_str("drive needs an initializing command (SSC LOAD)"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::BecomingReady { .. },
+                ..
+            } => f.write_str("drive becoming ready"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnitAttention { .. },
+                ..
             }
-            Self::BecomingReady { .. } => f.write_str("drive becoming ready"),
-            Self::UnitAttention { .. } | Self::RepeatedUnitAttention { .. } => {
-                f.write_str("drive reported a change; retry readiness checks")
-            }
-            Self::TerminalNotReady { action, .. } => write!(f, "drive not ready: {action}"),
-            Self::CheckCondition { key, asc, ascq } => write!(
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::RepeatedUnitAttention { .. },
+                ..
+            } => f.write_str("drive reported a change; retry readiness checks"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TerminalNotReady { action, .. },
+                ..
+            } => write!(f, "drive not ready: {action}"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::CheckCondition { key, asc, ascq },
+                ..
+            } => write!(
                 f,
                 "drive refused readiness check (sense {key:02x}/{asc:02x}/{ascq:02x})"
             ),
-            Self::UndecodedCheckCondition { .. } => {
-                f.write_str("drive returned unreadable sense data")
-            }
-            Self::TargetBusy { .. } => f.write_str("drive busy"),
-            Self::ReservationConflict => f.write_str("drive reserved by another host"),
-            Self::TaskAborted => f.write_str("drive aborted the readiness check"),
-            Self::UnexpectedStatus { status } => {
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UndecodedCheckCondition { .. },
+                ..
+            } => f.write_str("drive returned unreadable sense data"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TargetBusy { .. },
+                ..
+            } => f.write_str("drive busy"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::ReservationConflict,
+                ..
+            } => f.write_str("drive reserved by another host"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TaskAborted,
+                ..
+            } => f.write_str("drive aborted the readiness check"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnexpectedStatus { status },
+                ..
+            } => {
                 write!(f, "drive returned unexpected status {status:02x}")
             }
-            Self::TransportUnknown { detail } => {
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TransportUnknown { detail },
+                ..
+            } => {
                 write!(f, "drive communication uncertain: {detail}")
             }
-            Self::InvalidRequest { detail } => write!(f, "invalid readiness request: {detail}"),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::InvalidRequest { detail },
+                ..
+            } => write!(f, "invalid readiness request: {detail}"),
         }
     }
 }
@@ -216,7 +302,13 @@ pub fn media_readiness_poll_interval(elapsed: Duration, steady_poll: Duration) -
 impl MediaReadiness {
     /// True when the medium is ready for subsequent tape commands.
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(
+            self,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::Ready,
+                ..
+            }
+        )
     }
 
     /// True when the drive reports `NOT READY / LOGICAL UNIT NOT READY,
@@ -224,29 +316,75 @@ impl MediaReadiness {
     /// drive unthreaded, for example after an SSC UNLOAD that no changer move
     /// followed, and the drive stays not ready until a host sends SSC LOAD.
     pub fn requires_initializing_command(&self) -> bool {
-        matches!(self, Self::BecomingReady { ascq: 0x02, .. })
+        matches!(
+            self,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::BecomingReady { ascq: 0x02, .. },
+                ..
+            }
+        )
     }
 
     /// Sense key, ASC and ASCQ behind this classification, when the drive
     /// returned decodable sense data.
     pub fn sense(&self) -> Option<(u8, u8, u8)> {
         match self {
-            Self::BecomingReady { ascq, .. } | Self::TerminalNotReady { ascq, .. } => {
-                Some((0x02, 0x04, *ascq))
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::BecomingReady { ascq, .. },
+                ..
             }
-            Self::NoMedium { ascq } => Some((0x02, 0x3a, *ascq)),
-            Self::UnitAttention { asc, ascq } | Self::RepeatedUnitAttention { asc, ascq } => {
-                Some((0x06, *asc, *ascq))
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TerminalNotReady { ascq, .. },
+                ..
+            } => Some((0x02, 0x04, *ascq)),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::NoMedium { ascq },
+                ..
+            } => Some((0x02, 0x3a, *ascq)),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnitAttention { asc, ascq },
+                ..
             }
-            Self::CheckCondition { key, asc, ascq } => Some((*key, *asc, *ascq)),
-            Self::Ready
-            | Self::UndecodedCheckCondition { .. }
-            | Self::TargetBusy { .. }
-            | Self::ReservationConflict
-            | Self::TaskAborted
-            | Self::UnexpectedStatus { .. }
-            | Self::TransportUnknown { .. }
-            | Self::InvalidRequest { .. } => None,
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::RepeatedUnitAttention { asc, ascq },
+                ..
+            } => Some((0x06, *asc, *ascq)),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::CheckCondition { key, asc, ascq },
+                ..
+            } => Some((*key, *asc, *ascq)),
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::Ready,
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UndecodedCheckCondition { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TargetBusy { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::ReservationConflict,
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TaskAborted,
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnexpectedStatus { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TransportUnknown { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::InvalidRequest { .. },
+                ..
+            } => None,
         }
     }
 
@@ -254,25 +392,78 @@ impl MediaReadiness {
     pub fn is_retryable_wait(&self) -> bool {
         matches!(
             self,
-            Self::BecomingReady { .. } | Self::UnitAttention { .. } | Self::TargetBusy { .. }
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::BecomingReady { .. },
+                ..
+            } | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnitAttention { .. },
+                ..
+            } | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TargetBusy { .. },
+                ..
+            }
         )
     }
 
     /// Suggested CLI exit code from the v0.4 readiness design.
     pub fn design_exit_code(&self) -> i32 {
         match self {
-            Self::Ready => 0,
-            Self::BecomingReady { .. } | Self::UnitAttention { .. } | Self::TargetBusy { .. } => 10,
-            Self::TransportUnknown { .. } => 40,
-            Self::ReservationConflict => 50,
-            Self::TerminalNotReady { .. }
-            | Self::NoMedium { .. }
-            | Self::RepeatedUnitAttention { .. }
-            | Self::CheckCondition { .. }
-            | Self::UndecodedCheckCondition { .. }
-            | Self::TaskAborted
-            | Self::UnexpectedStatus { .. }
-            | Self::InvalidRequest { .. } => 30,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::Ready,
+                ..
+            } => 0,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::BecomingReady { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnitAttention { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TargetBusy { .. },
+                ..
+            } => 10,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TransportUnknown { .. },
+                ..
+            } => 40,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::ReservationConflict,
+                ..
+            } => 50,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TerminalNotReady { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::NoMedium { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::RepeatedUnitAttention { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::CheckCondition { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UndecodedCheckCondition { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TaskAborted,
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::UnexpectedStatus { .. },
+                ..
+            }
+            | crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::InvalidRequest { .. },
+                ..
+            } => 30,
         }
     }
 }
@@ -324,7 +515,15 @@ pub fn media_readiness_sense_label(sense_key: u8, asc: u8, ascq: u8) -> String {
 
 /// Classify a failed TEST UNIT READY call.
 pub fn classify_media_readiness_error(err: ScsiError, family: MediaFamily) -> MediaReadiness {
-    classify_media_readiness_error_ref(&err, family)
+    let outcome = crate::outcome::finish_control(
+        crate::outcome::CommandClass::SenseStatus,
+        Default::default(),
+        0,
+        Some(&err),
+    );
+    let mut error = crate::DriveOpError::pending(crate::DriveOpErrorKind::ScsiError(err));
+    error.set_outcome(outcome);
+    classify_media_readiness_error_ref(&error, family)
 }
 
 /// Classify a borrowed SCSI failure for readiness-aware composed commands.
@@ -332,66 +531,108 @@ pub fn classify_media_readiness_error(err: ScsiError, family: MediaFamily) -> Me
 /// This is the same classifier as [`classify_media_readiness_error`], exposed
 /// by reference so a higher layer can decide whether a failed LOAD is safe to
 /// follow with TEST UNIT READY while retaining the original error for display.
-pub fn classify_media_readiness_error_ref(err: &ScsiError, family: MediaFamily) -> MediaReadiness {
-    match err {
+pub fn classify_media_readiness_error_ref(
+    error: &crate::DriveOpError,
+    family: MediaFamily,
+) -> MediaReadiness {
+    let crate::DriveOpErrorKind::ScsiError(err) = &error.kind else {
+        return MediaReadiness::pending(MediaReadinessKind::InvalidRequest {
+            detail: error.to_string(),
+        })
+        .with_outcome(error.outcome().clone());
+    };
+    let readiness = match err {
         #[cfg(target_os = "linux")]
-        ScsiError::CheckCondition { sense, .. } => classify_check_condition(sense.clone(), family),
+        ScsiError::CheckCondition { sense, .. } => {
+            classify_check_condition(sense.clone(), &error.completion_evidence(), family)
+        }
         #[cfg(target_os = "linux")]
         ScsiError::UnexpectedStatus { status } => classify_target_status(*status),
         #[cfg(target_os = "linux")]
-        ScsiError::TransportError { .. } | ScsiError::Io(_) => MediaReadiness::TransportUnknown {
-            detail: err.to_string(),
-        },
-        ScsiError::Cancelled | ScsiError::InvalidInput(_) => MediaReadiness::InvalidRequest {
-            detail: err.to_string(),
-        },
-        ScsiError::Truncated { .. } | ScsiError::InvalidResponse { .. } => {
-            MediaReadiness::InvalidRequest {
+        ScsiError::TransportError { .. } | ScsiError::Io(_) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::TransportUnknown {
                 detail: err.to_string(),
-            }
+            })
         }
-    }
+        ScsiError::Cancelled | ScsiError::InvalidInput(_) | ScsiError::HostCapacityRefused(_) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::InvalidRequest {
+                detail: err.to_string(),
+            })
+        }
+        ScsiError::Truncated { .. } | ScsiError::InvalidResponse { .. } => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::InvalidRequest {
+                detail: err.to_string(),
+            })
+        }
+    };
+    readiness.with_outcome(error.outcome().clone())
 }
 
 #[cfg(target_os = "linux")]
-fn classify_check_condition(sense: Vec<u8>, family: MediaFamily) -> MediaReadiness {
-    let Some((key, asc, ascq)) = decode_sense_key_asc(&sense) else {
-        return MediaReadiness::UndecodedCheckCondition { sense };
+fn classify_check_condition(
+    sense: Vec<u8>,
+    evidence: &crate::outcome::CompletionEvidence,
+    family: MediaFamily,
+) -> MediaReadiness {
+    let Some((key, asc, ascq)) = evidence.decoded.map(|s| (s.key, s.asc, s.ascq)) else {
+        return crate::MediaReadiness::pending(
+            crate::MediaReadinessKind::UndecodedCheckCondition { sense },
+        );
     };
     match (key, asc, ascq) {
-        (0x02, 0x04, 0x03) => MediaReadiness::TerminalNotReady {
+        (0x02, 0x04, 0x03) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::TerminalNotReady {
+                ascq,
+                action: "manual_intervention_required",
+            })
+        }
+        (0x02, 0x04, 0x20) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::TerminalNotReady {
+                ascq,
+                action: "logical_unit_reset_required",
+            })
+        }
+        (0x02, 0x04, 0x21) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::TerminalNotReady {
+                ascq,
+                action: "hard_reset_required",
+            })
+        }
+        (0x02, 0x04, 0x22) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::TerminalNotReady {
+                ascq,
+                action: "power_cycle_required",
+            })
+        }
+        (0x02, 0x04, _) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::BecomingReady {
+                ascq,
+                media_initializing: family == MediaFamily::Lto9OrLater,
+            })
+        }
+        (0x02, 0x3a, _) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::NoMedium { ascq })
+        }
+        (0x06, _, _) => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::UnitAttention { asc, ascq })
+        }
+        _ => crate::MediaReadiness::pending(crate::MediaReadinessKind::CheckCondition {
+            key,
+            asc,
             ascq,
-            action: "manual_intervention_required",
-        },
-        (0x02, 0x04, 0x20) => MediaReadiness::TerminalNotReady {
-            ascq,
-            action: "logical_unit_reset_required",
-        },
-        (0x02, 0x04, 0x21) => MediaReadiness::TerminalNotReady {
-            ascq,
-            action: "hard_reset_required",
-        },
-        (0x02, 0x04, 0x22) => MediaReadiness::TerminalNotReady {
-            ascq,
-            action: "power_cycle_required",
-        },
-        (0x02, 0x04, _) => MediaReadiness::BecomingReady {
-            ascq,
-            media_initializing: family == MediaFamily::Lto9OrLater,
-        },
-        (0x02, 0x3a, _) => MediaReadiness::NoMedium { ascq },
-        (0x06, _, _) => MediaReadiness::UnitAttention { asc, ascq },
-        _ => MediaReadiness::CheckCondition { key, asc, ascq },
+        }),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn classify_target_status(status: u8) -> MediaReadiness {
     match status {
-        0x08 | 0x28 => MediaReadiness::TargetBusy { status },
-        0x18 => MediaReadiness::ReservationConflict,
-        0x40 => MediaReadiness::TaskAborted,
-        _ => MediaReadiness::UnexpectedStatus { status },
+        0x08 | 0x28 => {
+            crate::MediaReadiness::pending(crate::MediaReadinessKind::TargetBusy { status })
+        }
+        0x18 => crate::MediaReadiness::pending(crate::MediaReadinessKind::ReservationConflict),
+        0x40 => crate::MediaReadiness::pending(crate::MediaReadinessKind::TaskAborted),
+        _ => crate::MediaReadiness::pending(crate::MediaReadinessKind::UnexpectedStatus { status }),
     }
 }
 
@@ -428,10 +669,10 @@ mod tests {
 
         assert_eq!(
             readiness,
-            MediaReadiness::BecomingReady {
+            crate::MediaReadiness::new(crate::MediaReadinessKind::BecomingReady {
                 ascq: 0x01,
                 media_initializing: true
-            }
+            })
         );
         assert!(readiness.is_retryable_wait());
         assert_eq!(readiness.design_exit_code(), 10);
@@ -447,10 +688,10 @@ mod tests {
 
         assert_eq!(
             readiness,
-            MediaReadiness::TerminalNotReady {
+            crate::MediaReadiness::new(crate::MediaReadinessKind::TerminalNotReady {
                 ascq: 0x03,
                 action: "manual_intervention_required"
-            }
+            })
         );
         assert!(!readiness.is_retryable_wait());
         assert_eq!(readiness.design_exit_code(), 30);
@@ -464,14 +705,14 @@ mod tests {
                 ScsiError::UnexpectedStatus { status: 0x08 },
                 MediaFamily::Unknown
             ),
-            MediaReadiness::TargetBusy { status: 0x08 }
+            crate::MediaReadiness::new(crate::MediaReadinessKind::TargetBusy { status: 0x08 })
         );
         assert_eq!(
             classify_media_readiness_error(
                 ScsiError::UnexpectedStatus { status: 0x28 },
                 MediaFamily::Unknown
             ),
-            MediaReadiness::TargetBusy { status: 0x28 }
+            crate::MediaReadiness::new(crate::MediaReadinessKind::TargetBusy { status: 0x28 })
         );
     }
 
@@ -483,7 +724,10 @@ mod tests {
             MediaFamily::Unknown,
         );
 
-        assert_eq!(readiness, MediaReadiness::ReservationConflict);
+        assert_eq!(
+            readiness,
+            crate::MediaReadiness::new(crate::MediaReadinessKind::ReservationConflict)
+        );
         assert_eq!(readiness.design_exit_code(), 50);
     }
 
@@ -507,19 +751,22 @@ mod tests {
             "02/04/02 (initializing command required)"
         );
         assert_eq!(media_readiness_sense_label(0x03, 0x11, 0x00), "03/11/00");
-        assert!(!MediaReadiness::BecomingReady {
-            ascq: 0x01,
-            media_initializing: true
-        }
-        .requires_initializing_command());
+        assert!(
+            !crate::MediaReadiness::new(crate::MediaReadinessKind::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true
+            })
+            .requires_initializing_command()
+        );
     }
 
     #[test]
     fn repeated_unit_attention_is_terminal_for_readiness_epoch() {
-        let readiness = MediaReadiness::RepeatedUnitAttention {
-            asc: 0x29,
-            ascq: 0x00,
-        };
+        let readiness =
+            crate::MediaReadiness::new(crate::MediaReadinessKind::RepeatedUnitAttention {
+                asc: 0x29,
+                ascq: 0x00,
+            });
 
         assert!(!readiness.is_retryable_wait());
         assert_eq!(readiness.design_exit_code(), 30);
@@ -539,7 +786,13 @@ mod tests {
             MediaFamily::Lto9OrLater,
         );
 
-        assert!(matches!(readiness, MediaReadiness::TransportUnknown { .. }));
+        assert!(matches!(
+            readiness,
+            crate::MediaReadiness {
+                kind: crate::MediaReadinessKind::TransportUnknown { .. },
+                ..
+            }
+        ));
         assert_eq!(readiness.design_exit_code(), 40);
     }
 }

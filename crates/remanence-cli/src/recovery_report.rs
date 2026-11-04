@@ -1865,10 +1865,12 @@ mod tests {
                 return self.inner.read_record(buf);
             }
             if self.record_len > buf.len() {
-                return Err(remanence_library::TapeIoError::ReadBufferTooSmall {
-                    actual: self.record_len as u32,
-                    provided: buf.len() as u32,
-                }
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                        actual: self.record_len as u32,
+                        provided: buf.len() as u32,
+                    },
+                )
                 .into());
             }
             Ok(RawReadOutcome::Block {

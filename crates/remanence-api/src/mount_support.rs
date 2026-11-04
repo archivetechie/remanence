@@ -4,7 +4,7 @@ use crate::{LtoGen, TapeUuid};
 pub use remanence_library::MountEndpoint;
 use remanence_library::{
     AccessPolicy, DriveHandle, DriveHandleSource, DriveKey, LibraryHandle, MediaFamily,
-    MediaReadiness, MediaReadinessWaitOptions, SgTransport, StaticAllowlist,
+    MediaReadinessWaitOptions, SgTransport, StaticAllowlist,
 };
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{CatalogIndex, GenerationSource, LabelProvenance, StateHandle};
@@ -863,7 +863,9 @@ fn prove_mount(
             |_| Ok(()),
         )
         .map_err(refusal)?;
-    if poll.readiness != MediaReadiness::Ready {
+    if poll.readiness
+        != remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready)
+    {
         return Err(refusal(format!(
             "{}; insert the cartridge and retry",
             poll.readiness

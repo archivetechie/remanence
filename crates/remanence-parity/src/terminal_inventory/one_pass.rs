@@ -99,9 +99,10 @@ impl From<TerminalIndexVerificationError> for AttemptError {
 
 fn prefix_error(error: ParityError) -> AttemptError {
     match error {
-        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled) => {
-            AttemptError::Fatal(TerminalIndexVerificationError::Cancelled)
-        }
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::Cancelled,
+            ..
+        }) => AttemptError::Fatal(TerminalIndexVerificationError::Cancelled),
         ParityError::TapeIo(_) => AttemptError::Rejected("tape_io"),
         ParityError::FilemarkMapReconstruct(_) => AttemptError::Rejected("prefix_map"),
         _ => AttemptError::Rejected("prefix_check"),

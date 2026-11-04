@@ -17,9 +17,7 @@ pub(crate) fn supersede_mounted_tail(
     actor: AuditActor,
     confirm: impl FnOnce(&str, &[String], u64) -> Result<(), String>,
 ) -> Result<Vec<String>, tonic::Status> {
-    use crate::append_admission::{
-        admit_append_boundary, context, AdmissionError, AppendAuthority,
-    };
+    use crate::append_admission::{admit_append_boundary, context, AppendAuthority};
     use tonic::Status;
     let failure = |e: String| Status::failed_precondition(e);
     let tape = index
@@ -152,10 +150,19 @@ pub(crate) fn supersede_mounted_tail(
         .map_err(|e| failure(e.to_string()))?;
     let (found, object_ids, missing_filemark) =
         match admit_append_boundary(drive, authority(), make_context()) {
-            Err(AdmissionError::TailBeyondKnownState {
-                found, object_ids, ..
+            Err(crate::append_admission::AdmissionError {
+                kind:
+                    crate::append_admission::AdmissionErrorKind::TailBeyondKnownState {
+                        found,
+                        object_ids,
+                        ..
+                    },
+                ..
             }) => (found, object_ids, false),
-            Err(AdmissionError::MissingBootstrapFilemark) => (Vec::new(), Vec::new(), true),
+            Err(crate::append_admission::AdmissionError {
+                kind: crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
+                ..
+            }) => (Vec::new(), Vec::new(), true),
             Err(e) => return Err(failure(e.to_string())),
             Ok(_) if repaired_tail => (Vec::new(), Vec::new(), false),
             Ok(_) => return Err(failure("no foreign tail requires superseding".into())),

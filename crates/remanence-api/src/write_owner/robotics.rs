@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use ciborium::value::Value as CborValue;
 use remanence_library::{
-    classify_media_readiness_error_ref, DriveOpError, LoadError, MediaFamily, MediaReadiness,
+    classify_media_readiness_error_ref, LoadError, MediaFamily, MediaReadiness,
     MediaReadinessWaitOptions,
 };
 use remanence_state::{AuditActor, AuditEvent, CatalogIndex};
@@ -436,7 +436,13 @@ pub(crate) fn retryable_readiness_from_load_error(
     error: &LoadError,
     family: MediaFamily,
 ) -> Option<MediaReadiness> {
-    let LoadError::DriveLoad(DriveOpError::ScsiError(error)) = error else {
+    let LoadError::DriveLoad(
+        error @ remanence_library::DriveOpError {
+            kind: remanence_library::DriveOpErrorKind::ScsiError(_),
+            ..
+        },
+    ) = error
+    else {
         return None;
     };
     let readiness = classify_media_readiness_error_ref(error, family);

@@ -834,10 +834,12 @@ fn shutdown_round2_dispatched_and_unknown_loads_still_count_after_restart() {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::media_readiness_initializing_load_transition(
                     id,
-                    &MediaReadiness::BecomingReady {
-                        ascq: 2,
-                        media_initializing: true,
-                    },
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::BecomingReady {
+                            ascq: 2,
+                            media_initializing: true,
+                        },
+                    ),
                 ),
             )
             .unwrap();

@@ -642,9 +642,9 @@ fn identity_read_buffer(
     let requested = wanted.min(drive_limit.unwrap_or(wanted));
     let granted = source.configure_read_buffer(requested)?.min(requested);
     if granted == 0 {
-        return Err(remanence_library::TapeIoError::InvalidRequest(
-            remanence_library::scsi::ScsiError::InvalidInput("host capacity refusal: reserved buffer grant is zero; raise sg scatter_elem_sz or use a host with a larger per-command limit"),
-        ));
+        return Err(remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::InvalidRequest(
+            remanence_library::scsi::ScsiError::HostCapacityRefused("host capacity refusal: reserved buffer grant is zero; raise sg scatter_elem_sz or use a host with a larger per-command limit"),
+        )));
     }
     let limit = if granted < requested {
         IdentityReadLimit::Host
@@ -661,9 +661,12 @@ fn identity_capacity_refusal(
     error: &remanence_library::TapeIoError,
     limit: Option<IdentityReadLimit>,
 ) -> Option<String> {
-    use remanence_library::{scsi::ScsiError, TapeIoError};
+    use remanence_library::{scsi::ScsiError, TapeIoError, TapeIoErrorKind};
     match error {
-        TapeIoError::ReadBufferTooSmall { actual, provided } => {
+        TapeIoError {
+            kind: TapeIoErrorKind::ReadBufferTooSmall { actual, provided },
+            ..
+        } => {
             let reason = match limit {
                 Some(IdentityReadLimit::Host) => "host-granted identity READ buffer; raise the sg driver's scatter_elem_sz, or read on a host with a larger per-command limit",
                 Some(IdentityReadLimit::Drive) => "drive's reported READ BLOCK LIMITS maximum; this drive does not report support for a record this large",
@@ -671,11 +674,10 @@ fn identity_capacity_refusal(
             };
             Some(format!("record is {actual} bytes, but the identity READ is limited to {provided} bytes by the {reason}"))
         }
-        TapeIoError::InvalidRequest(ScsiError::InvalidInput(detail))
-            if detail.starts_with("host capacity") =>
-        {
-            Some(detail.to_string())
-        }
+        TapeIoError {
+            kind: TapeIoErrorKind::InvalidRequest(ScsiError::HostCapacityRefused(detail)),
+            ..
+        } => Some(detail.to_string()),
         _ => None,
     }
 }
@@ -756,18 +758,20 @@ pub fn classify_bootstrap_adoption_from_source(
     };
     let tail = match source.read_block(&mut next) {
         Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
-        Err(remanence_library::TapeIoError::FilemarkEncountered) => {
-            match source.read_block(&mut next) {
-                Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
-                Err(remanence_library::TapeIoError::FilemarkEncountered) => {
-                    BootstrapTailClassification::ExtraFilemark
-                }
-                Err(error) if is_blank_check_eod(&error) => {
-                    BootstrapTailClassification::ExactBootstrapFilemarkEod
-                }
-                Err(error) => identity_tail_error(error, Some(limit)),
+        Err(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+            ..
+        }) => match source.read_block(&mut next) {
+            Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
+            Err(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                ..
+            }) => BootstrapTailClassification::ExtraFilemark,
+            Err(error) if is_blank_check_eod(&error) => {
+                BootstrapTailClassification::ExactBootstrapFilemarkEod
             }
-        }
+            Err(error) => identity_tail_error(error, Some(limit)),
+        },
         Err(error) if is_blank_check_eod(&error) => BootstrapTailClassification::MissingFilemark,
         Err(error) => identity_tail_error(error, Some(limit)),
     };
@@ -1576,32 +1580,40 @@ mod tests {
                     buf[..data.len()].copy_from_slice(&data);
                     Ok(data.len())
                 }
-                ScriptRead::Filemark => Err(TapeIoError::FilemarkEncountered),
+                ScriptRead::Filemark => Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::FilemarkEncountered,
+                )),
                 ScriptRead::Eod => {
                     let mut sense = vec![0u8; 14];
                     sense[0] = 0x70;
                     sense[2] = 0x08;
                     sense[12] = 0x00;
                     sense[13] = 0x05;
-                    Err(TapeIoError::CheckCondition(
-                        remanence_library::scsi::ScsiError::CheckCondition {
-                            sense,
-                            bytes_transferred: 0,
-                        },
+                    Err(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::CheckCondition(
+                            remanence_library::scsi::ScsiError::CheckCondition {
+                                sense,
+                                bytes_transferred: 0,
+                            },
+                        ),
                     ))
                 }
-                ScriptRead::EodWithResidue => Err(TapeIoError::CheckConditionWithResidue {
-                    source: remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![
-                            0xf0, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x00,
-                            0x00, 0x05, 0x30, 0x00, 0x64, 0x02, 0x20, 0x00, 0x06, 0x01, 0x41, 0x4f,
-                            0x58, 0x30, 0x33, 0x32, 0x4c, 0x00, 0x00, 0x00,
-                        ],
-                        bytes_transferred: 262_144,
+                ScriptRead::EodWithResidue => Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckConditionWithResidue {
+                        source: remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![
+                                0xf0, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x05, 0x30, 0x00, 0x64, 0x02, 0x20, 0x00, 0x06, 0x01,
+                                0x41, 0x4f, 0x58, 0x30, 0x33, 0x32, 0x4c, 0x00, 0x00, 0x00,
+                            ],
+                            bytes_transferred: 262_144,
+                        },
+                        bytes_transferred: 0,
                     },
-                    bytes_transferred: 0,
-                }),
-                ScriptRead::Error(detail) => Err(TapeIoError::OperationFailed(detail)),
+                )),
+                ScriptRead::Error(detail) => Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(detail),
+                )),
             }
         }
     }

@@ -2063,12 +2063,14 @@ mod tests {
             let position_after = crate::raw::PhysicalPositionHint::new(self.cursor as u64);
             match record {
                 None => Ok(crate::raw::RawReadOutcome::Filemark { position_after }),
-                Some(block) if block.len() > buf.len() => Err(ParityError::TapeIo(
-                    remanence_library::TapeIoError::ReadBufferTooSmall {
-                        actual: block.len() as u32,
-                        provided: buf.len() as u32,
-                    },
-                )),
+                Some(block) if block.len() > buf.len() => {
+                    Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: block.len() as u32,
+                            provided: buf.len() as u32,
+                        },
+                    )))
+                }
                 Some(block) => {
                     buf[..block.len()].copy_from_slice(&block);
                     Ok(crate::raw::RawReadOutcome::Block {

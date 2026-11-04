@@ -1460,10 +1460,16 @@ pub(crate) fn unload_actor_drive(
             let message = format!("unload drive bay {bay}: {error}");
             match error {
                 crate::mount_support::DriveUnloadError::Drive(
-                    remanence_library::DriveOpError::UnloadAdmission(_),
+                    remanence_library::DriveOpError {
+                        kind: remanence_library::DriveOpErrorKind::UnloadAdmission(_),
+                        ..
+                    },
                 ) => Status::unavailable(message),
                 crate::mount_support::DriveUnloadError::Drive(
-                    remanence_library::DriveOpError::Inventory(_),
+                    remanence_library::DriveOpError {
+                        kind: remanence_library::DriveOpErrorKind::Inventory(_),
+                        ..
+                    },
                 )
                 | crate::mount_support::DriveUnloadError::Recovery(_) => {
                     Status::failed_precondition(message)

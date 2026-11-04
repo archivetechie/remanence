@@ -11,8 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
-use remanence_library::scsi::decode_sense;
 use remanence_library::{
     BlockSink, BlockSize, BlockSource, DriveHandle, SpaceKind, TapeConfig, TapeIoError,
     TapePosition, WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
@@ -29,7 +27,10 @@ use crate::error::ParityError;
 pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
     matches!(
         error,
-        ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { .. })
+        ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { .. },
+            ..
+        })
     ) || matches!(
         error,
         ParityError::TapeIo(error) if tape_error_is_current_medium_damage(error)
@@ -40,9 +41,7 @@ pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
 pub fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
     #[cfg(target_os = "linux")]
     {
-        error.check_condition_transfer().is_some_and(|(sense, _)| {
-            decode_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x03)
-        })
+        error.completion_evidence().current_medium_damage()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -56,9 +55,11 @@ pub fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
 /// error is `TapeIo` (REM-PARITY 2.4). Every device-derived position and count
 /// that Layer 3c computes reports through this one constructor.
 pub(crate) fn device_position_error(detail: impl std::fmt::Display) -> ParityError {
-    ParityError::TapeIo(TapeIoError::OperationFailed(format!(
-        "device-reported position {detail}"
-    )))
+    ParityError::TapeIo(remanence_library::TapeIoError::new(
+        remanence_library::TapeIoErrorKind::OperationFailed(format!(
+            "device-reported position {detail}"
+        )),
+    ))
 }
 
 /// The position `records` records after a device-reported position. A sum that
@@ -138,11 +139,10 @@ pub fn wrong_record_length(
         // usize is at most 64 bits on every supported target, so the delivered
         // length converts exactly.
         Ok(RawReadOutcome::Block { bytes, .. }) if *bytes != block_len => Some(*bytes as u64),
-        Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { actual, .. }))
-            if *actual as usize != block_len =>
-        {
-            Some(u64::from(*actual))
-        }
+        Err(ParityError::TapeIo(remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { actual, .. },
+            ..
+        })) if *actual as usize != block_len => Some(u64::from(*actual)),
         _ => None,
     }
 }
@@ -1114,11 +1114,13 @@ impl RawTapeSource for ImageDirectoryRawSource {
             // A drive that is asked to LOCATE past its last record reports
             // end-of-data (BLANK CHECK, 08/00/05) and stays at end-of-data.
             self.cursor = self.records.len();
-            return Err(TapeIoError::CheckCondition(
-                remanence_library::scsi::ScsiError::CheckCondition {
-                    sense: vec![0x72, 0x08, 0x00, 0x05],
-                    bytes_transferred: 0,
-                },
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x08, 0x00, 0x05],
+                        bytes_transferred: 0,
+                    },
+                ),
             )
             .into());
         }
@@ -1196,19 +1198,23 @@ impl RawTapeSource for ImageDirectoryRawSource {
                     .unreadable_blocks
                     .contains(&(tape_file_index, block_within_file))
                 {
-                    return Err(TapeIoError::CheckCondition(
-                        remanence_library::scsi::ScsiError::CheckCondition {
-                            sense: vec![0x72, 0x03, 0x11, 0x00],
-                            bytes_transferred: 0,
-                        },
+                    return Err(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::CheckCondition(
+                            remanence_library::scsi::ScsiError::CheckCondition {
+                                sense: vec![0x72, 0x03, 0x11, 0x00],
+                                bytes_transferred: 0,
+                            },
+                        ),
                     )
                     .into());
                 }
                 if buf.len() < block_size {
-                    return Err(TapeIoError::ReadBufferTooSmall {
-                        actual: u32::try_from(block_size).unwrap_or(u32::MAX),
-                        provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
-                    }
+                    return Err(remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                            actual: u32::try_from(block_size).unwrap_or(u32::MAX),
+                            provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                        },
+                    )
                     .into());
                 }
                 let end = byte_offset
@@ -1260,6 +1266,15 @@ fn image_source_error(message: impl Into<String>) -> ParityError {
 /// string-only `ParityError` variants; Layer 5 relies on the transport variant
 /// to observe the dirty-bit / rescan-required signal.
 pub trait RawTapeSink {
+    /// Finish a new adapter fact with the owning drive's operation authority.
+    /// Implementors must use their caller's operation context; decorators forward
+    /// to the inner sink so the owning drive also retains the failure.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> TapeIoError;
+
     /// Locate to a proved component start before overwriting a torn terminal
     /// control tail.
     ///
@@ -1309,6 +1324,18 @@ impl<'a> BlockSinkRawTapeSink<'a> {
 }
 
 impl RawTapeSink for BlockSinkRawTapeSink<'_> {
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> TapeIoError {
+        if let Some(drive) = self.inner.append_admission_drive() {
+            drive.finish_adapter_error(kind, class)
+        } else {
+            self.inner.finish_adapter_error(kind)
+        }
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         Ok(raw_block_outcome(self.inner.write_block(buf)?))
     }
@@ -1481,6 +1508,29 @@ pub struct DriveHandleRawSink<'a> {
 }
 
 impl<'a> DriveHandleRawSink<'a> {
+    /// Post-dispatch arithmetic failure belongs to this drive's write operation.
+    fn position_after_write(
+        &mut self,
+        position: PhysicalPositionHint,
+        records: u64,
+        context: &'static str,
+        class: remanence_library::outcome::CommandClass,
+    ) -> Result<PhysicalPositionHint, ParityError> {
+        let lba = position.lba.checked_add(records).ok_or_else(|| {
+            ParityError::TapeIo(self.drive.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "device-reported position {} + {records} does not fit in u64 ({context})",
+                    position.lba
+                )),
+                class,
+            ))
+        })?;
+        Ok(PhysicalPositionHint {
+            lba,
+            partition: position.partition,
+        })
+    }
+
     /// Wrap a drive handle for raw Layer 3c writes.
     pub fn new(drive: &'a mut DriveHandle) -> Self {
         Self {
@@ -1543,6 +1593,14 @@ impl<'a> DriveHandleRawSink<'a> {
 }
 
 impl RawTapeSink for DriveHandleRawSink<'_> {
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> TapeIoError {
+        self.drive.finish_adapter_error(kind, class)
+    }
+
     fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         let observed: PhysicalPositionHint = self.drive.locate_admitted_append(hint.lba)?.into();
         if observed.partition != hint.partition || observed.lba != hint.lba {
@@ -1571,8 +1629,8 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
             .map_err(|_| ParityError::Invariant("raw fixed-block write length exceeds u32"))?;
         if outcome.bytes_written != requested_bytes {
             self.cursor_hint = None;
-            return Err(ParityError::TapeIo(
-                TapeIoError::PartialBatchUncommittable {
+            return Err(ParityError::TapeIo(self.drive.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
                     requested_records: 1,
                     written_records: u32::from(outcome.bytes_written >= requested_bytes),
                     requested_bytes: u64::from(requested_bytes),
@@ -1580,10 +1638,15 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
                     end_of_medium: outcome.end_of_medium,
                     sense: None,
                 },
-            ));
+                remanence_library::outcome::CommandClass::Write,
+            )));
         }
-        let position_after =
-            device_position_after(position_before, 1, "drive raw sink after a block write")?;
+        let position_after = self.position_after_write(
+            position_before,
+            1,
+            "drive raw sink after a block write",
+            remanence_library::outcome::CommandClass::Write,
+        )?;
         self.cursor_hint = Some(position_after);
         Ok(raw_unpositioned_block_outcome(outcome, position_after))
     }
@@ -1595,10 +1658,14 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
             self.drive.check_append_admission()?;
             self.drive.write_filemarks_immediate(count)?;
             RawWriteOutcome::WroteFilemark {
-                position_after: device_position_after(
+                position_after: self.position_after_write(
                     position_before,
                     u64::from(count),
                     "drive raw sink after immediate filemarks",
+                    remanence_library::outcome::CommandClass::WriteFilemarks {
+                        count,
+                        immediate: immed,
+                    },
                 )?,
                 early_warning: false,
                 end_of_medium: false,
@@ -1852,11 +1919,12 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
                         == remanence_library::VerificationReadCompletion::UnconfirmedBoundary
                     {
                         unconfirmed_boundary = true;
-                        let filemark =
-                            error.check_condition_transfer().is_some_and(|(sense, _)| {
-                                remanence_library::decode_scsi_sense(sense)
-                                    .is_some_and(|s| s.key == 0 && s.filemark)
-                            });
+                        let filemark = error.check_condition_transfer().is_some_and(|_| {
+                            error
+                                .completion_evidence()
+                                .decoded
+                                .is_some_and(|s| s.key == 0 && s.filemark)
+                        });
                         (
                             0,
                             Some(if filemark {
@@ -1956,14 +2024,20 @@ pub(crate) fn tape_error_is_end_of_data(err: &TapeIoError) -> bool {
 }
 
 fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
-    if matches!(err, TapeIoError::FilemarkEncountered) {
+    if matches!(
+        err,
+        remanence_library::TapeIoError {
+            kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
+            ..
+        }
+    ) {
         return Some(RawReadBoundary::Filemark);
     }
 
     #[cfg(target_os = "linux")]
     {
-        let (sense, bytes) = err.check_condition_transfer()?;
-        let decoded = decode_sense(sense)?;
+        let (_, bytes) = err.check_condition_transfer()?;
+        let decoded = err.completion_evidence().current_sense()?;
 
         // A zero-transfer filemark needs no residual. Preserve the library's
         // refusal of deferred sense, ILI and any accompanying data transfer.
@@ -2004,13 +2078,15 @@ mod compat_tests {
             sense[0] = 0xf0;
             sense[2] = key;
             sense[13] = 5;
-            let error = TapeIoError::CheckConditionWithResidue {
-                source: remanence_library::ScsiError::CheckCondition {
-                    sense,
-                    bytes_transferred: 262_144,
+            let error = remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckConditionWithResidue {
+                    source: remanence_library::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 262_144,
+                    },
+                    bytes_transferred: bytes,
                 },
-                bytes_transferred: bytes,
-            };
+            );
             assert_eq!(
                 classify_read_boundary(&error) == Some(RawReadBoundary::EndOfData),
                 eod
@@ -2033,10 +2109,14 @@ mod compat_tests {
             sense[2] = key;
             sense[7] = 10;
             sense[13] = ascq;
-            let error = TapeIoError::CheckCondition(remanence_library::ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: bytes,
-            });
+            let error = remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckCondition(
+                    remanence_library::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: bytes,
+                    },
+                ),
+            );
             assert_eq!(
                 matches!(
                     classify_read_boundary(&error),
@@ -2141,12 +2221,12 @@ mod compat_tests {
             .expect_err("marked block returns a medium error");
         assert!(matches!(
             error,
-            ParityError::TapeIo(TapeIoError::CheckCondition(
+            ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::CheckCondition(
                 remanence_library::scsi::ScsiError::CheckCondition {
                     sense,
                     bytes_transferred: 0,
                 }
-            )) if sense == [0x72, 0x03, 0x11, 0x00]
+            ), .. }) if sense == [0x72, 0x03, 0x11, 0x00]
         ));
     }
 
@@ -2804,11 +2884,14 @@ mod compat_tests {
                 .expect_err("short physical completion must fail");
             assert!(matches!(
                 err,
-                ParityError::TapeIo(TapeIoError::PartialBatchUncommittable {
-                    requested_records: 1,
-                    written_records: 0,
-                    requested_bytes: 1024,
-                    written_bytes: 1023,
+                ParityError::TapeIo(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+                        requested_records: 1,
+                        written_records: 0,
+                        requested_bytes: 1024,
+                        written_bytes: 1023,
+                        ..
+                    },
                     ..
                 })
             ));
@@ -3057,6 +3140,40 @@ mod compat_tests {
                 .logical_object_number_unknown
         );
         assert!(source.cursor_hint.is_none());
+    }
+
+    /// A directly constructed truncated filemark reaches forward reading, but proves no boundary or credit.
+    #[test]
+    fn b3b_forward_read_rejects_truncated_filemark() {
+        let (mut drive, log) =
+            scripted_read_drive(vec![(0x34, Ok(read_position_long_response(0, 0, 10)))], 0);
+        let error = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 0x80],
+                    bytes_transferred: 0,
+                },
+            ),
+        );
+        remanence_library::verification_io::b3b_test_support::fail_next_verification(error);
+        let mut source = DriveHandleRawSource::new(&mut drive);
+        let result = source.read_forward_records(&mut [0; 8], 4, 2);
+        assert!(
+            !result.unconfirmed_boundary,
+            "truncated flag is not a filemark fact"
+        );
+        assert_eq!(result.batch.records_read, 0);
+        assert!(
+            matches!(result.batch.end, RawReadEnd::Error(_)),
+            "{:?}",
+            result.batch.end
+        );
+        assert!(source.cursor_hint.is_none());
+        assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x34).count(), 1);
+        assert!(
+            !log.borrow().iter().any(|cdb| cdb[0] == 8),
+            "direct error injection precedes transport mapping"
+        );
     }
 
     /// Boundary credit uses the library's issued count after its batch limit applies.
@@ -3323,9 +3440,9 @@ mod compat_tests {
         }
         let error = run.read_record(&mut [0; 4]).unwrap_err();
         assert!(
-            matches!(error, ParityError::TapeIo(TapeIoError::CheckCondition(
+            matches!(error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::CheckCondition(
             remanence_library::ScsiError::CheckCondition { sense, .. }
-        )) if sense == [0x72, 0x04, 0x44, 0])
+        ), .. }) if sense == [0x72, 0x04, 0x44, 0])
         );
         let log = log.borrow();
         let locates: Vec<_> = log
@@ -3358,9 +3475,9 @@ mod compat_tests {
             .read_record(&mut [0; 4])
             .unwrap_err();
         assert!(
-            matches!(single_error, ParityError::TapeIo(TapeIoError::CheckCondition(
+            matches!(single_error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::CheckCondition(
             remanence_library::ScsiError::CheckCondition { sense, .. }
-        )) if sense == [0x72, 0x04, 0x44, 0])
+        ), .. }) if sense == [0x72, 0x04, 0x44, 0])
         );
     }
 
@@ -3392,9 +3509,12 @@ mod compat_tests {
         }
         assert!(matches!(
             run.read_record(&mut [0; 4]).unwrap_err(),
-            ParityError::TapeIo(TapeIoError::InvalidRequest(
-                remanence_library::ScsiError::InvalidInput("fallback LOCATE failed")
-            ))
+            ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::InvalidRequest(
+                    remanence_library::ScsiError::InvalidInput("fallback LOCATE failed")
+                ),
+                ..
+            })
         ));
         let log = log.borrow();
         assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x92).count(), 2);
@@ -3458,9 +3578,9 @@ mod compat_tests {
                             raw.read_record(&mut [0; 4]).unwrap_err()
                         };
                         assert!(
-                            matches!(&error, ParityError::TapeIo(TapeIoError::StateInvalidatingReset(
+                            matches!(&error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::StateInvalidatingReset(
                             remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: 0 }
-                        )) if actual == &sense),
+                        ), .. }) if actual == &sense),
                             "{error:?}"
                         );
                         assert_eq!(
@@ -3497,10 +3617,19 @@ mod compat_tests {
         drive.read_config().unwrap();
         assert!(matches!(
             drive.read_block(&mut [0; 4]),
-            Err(TapeIoError::StateInvalidatingReset(_))
+            Err(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::StateInvalidatingReset(_),
+                ..
+            })
         ));
         let expected = drive.read_block(&mut [0; 4]).unwrap_err();
-        assert!(matches!(expected, TapeIoError::InvalidRequest(_)));
+        assert!(matches!(
+            expected,
+            remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::InvalidRequest(_),
+                ..
+            }
+        ));
         let mut raw = DriveHandleRawSource::new(&mut drive);
         let mut run = ReadRun::new(&mut raw, 4, 2);
         run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
@@ -3522,6 +3651,18 @@ mod compat_tests {
             sense[0] = 0xf0;
             sense[2] = 0x20;
             assert_stable_batch_fault_matches_single(sense, 0, None, true);
+        }
+    }
+
+    /// Truncated RECOVERED is unknown on both the batch and the single reread.
+    #[test]
+    fn b3b_truncated_recovered_batch_and_single_are_unknown() {
+        for sense in [
+            vec![0x70, 0, 1],
+            vec![0xf0, 0, 1, 0, 0, 0, 0],
+            vec![0xf0, 0, 1, 0, 0, 0, 1],
+        ] {
+            assert_stable_batch_fault_matches_single(sense, 4, None, true);
         }
     }
 
@@ -3777,13 +3918,17 @@ mod compat_tests {
             };
             match (&error, corrected_bytes, completion_unknown) {
                 (
-                    ParityError::TapeIo(TapeIoError::CheckConditionWithResidue {
-                        source:
-                            remanence_library::ScsiError::CheckCondition {
-                                sense: actual,
-                                bytes_transferred: kernel,
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind:
+                            remanence_library::TapeIoErrorKind::CheckConditionWithResidue {
+                                source:
+                                    remanence_library::ScsiError::CheckCondition {
+                                        sense: actual,
+                                        bytes_transferred: kernel,
+                                    },
+                                bytes_transferred: corrected,
                             },
-                        bytes_transferred: corrected,
+                        ..
                     }),
                     Some(expected),
                     false,
@@ -3793,12 +3938,16 @@ mod compat_tests {
                     assert_eq!(*corrected, expected);
                 }
                 (
-                    ParityError::TapeIo(TapeIoError::CheckCondition(
-                        remanence_library::ScsiError::CheckCondition {
-                            sense: actual,
-                            bytes_transferred: kernel,
-                        },
-                    )),
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind:
+                            remanence_library::TapeIoErrorKind::CheckCondition(
+                                remanence_library::ScsiError::CheckCondition {
+                                    sense: actual,
+                                    bytes_transferred: kernel,
+                                },
+                            ),
+                        ..
+                    }),
                     None,
                     false,
                 ) => {
@@ -3806,12 +3955,16 @@ mod compat_tests {
                     assert_eq!(*kernel, bytes_transferred);
                 }
                 (
-                    ParityError::TapeIo(TapeIoError::Transport(
-                        remanence_library::ScsiError::CheckCondition {
-                            sense: actual,
-                            bytes_transferred: kernel,
-                        },
-                    )),
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind:
+                            remanence_library::TapeIoErrorKind::Transport(
+                                remanence_library::ScsiError::CheckCondition {
+                                    sense: actual,
+                                    bytes_transferred: kernel,
+                                },
+                            ),
+                        ..
+                    }),
                     None,
                     true,
                 ) => {
@@ -3860,13 +4013,17 @@ mod compat_tests {
                 drive.read_block(&mut [0; 8]).unwrap_err()
             };
             match error {
-                TapeIoError::CheckConditionWithResidue {
-                    source:
-                        remanence_library::ScsiError::CheckCondition {
-                            sense: actual,
-                            bytes_transferred: kernel,
+                remanence_library::TapeIoError {
+                    kind:
+                        remanence_library::TapeIoErrorKind::CheckConditionWithResidue {
+                            source:
+                                remanence_library::ScsiError::CheckCondition {
+                                    sense: actual,
+                                    bytes_transferred: kernel,
+                                },
+                            bytes_transferred: corrected,
                         },
-                    bytes_transferred: corrected,
+                    ..
                 } => {
                     assert_eq!(actual, sense);
                     assert_eq!(kernel, 8);
@@ -3982,6 +4139,22 @@ mod compat_tests {
     }
 
     impl RawTapeSink for DurabilityMockRawTapeSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.position += 1;
             self.pending_file_started = true;
@@ -4087,11 +4260,13 @@ mod tests {
                         sense[2] = 0x80 | key | if ili { 0x20 } else { 0 };
                         sense[7] = 10;
                         sense[13] = 1;
-                        let error = TapeIoError::CheckCondition(
-                            remanence_library::ScsiError::CheckCondition {
-                                sense,
-                                bytes_transferred: bytes,
-                            },
+                        let error = remanence_library::TapeIoError::new(
+                            remanence_library::TapeIoErrorKind::CheckCondition(
+                                remanence_library::ScsiError::CheckCondition {
+                                    sense,
+                                    bytes_transferred: bytes,
+                                },
+                            ),
                         );
                         assert_eq!(
                             classify_read_boundary(&error),
@@ -4372,10 +4547,12 @@ mod tests {
     }
 
     fn check_condition(sense: Vec<u8>) -> TapeIoError {
-        TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        })
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+            remanence_library::scsi::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            },
+        ))
     }
 
     fn read_error(error: TapeIoError) -> ParityError {
@@ -4395,25 +4572,33 @@ mod tests {
             current_descriptor_medium,
         ))));
         assert!(raw_read_error_proves_damage(&read_error(
-            TapeIoError::ReadBufferTooSmall {
-                actual: 4097,
-                provided: 4096,
-            },
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: 4097,
+                    provided: 4096,
+                }
+            ),
         )));
 
         for error in [
-            TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
-                status: 0,
-                host_status: 0,
-                driver_status: 0x06,
-                info: 1,
-                sense: Vec::new(),
-            }),
+            remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::Transport(
+                remanence_library::scsi::ScsiError::TransportError {
+                    status: 0,
+                    host_status: 0,
+                    driver_status: 0x06,
+                    info: 1,
+                    sense: Vec::new(),
+                },
+            )),
             check_condition(fixed_sense(0x04, 0x44, 0x00)),
             check_condition(deferred_medium),
             check_condition(deferred_descriptor_medium),
-            TapeIoError::OperationFailed("adapter failure".to_string()),
-            TapeIoError::FilemarkEncountered,
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed("adapter failure".to_string()),
+            ),
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::FilemarkEncountered,
+            ),
         ] {
             assert!(
                 !raw_read_error_proves_damage(&read_error(error)),
@@ -4434,7 +4619,9 @@ mod tests {
     #[test]
     fn classify_structured_filemark_boundary() {
         assert_eq!(
-            classify_read_boundary(&TapeIoError::FilemarkEncountered),
+            classify_read_boundary(&remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::FilemarkEncountered
+            )),
             Some(RawReadBoundary::Filemark)
         );
     }
@@ -4499,10 +4686,12 @@ mod record_length_tests {
             classify_fixed_record(block(40), 512).unwrap(),
             FixedRecordRead::WrongLength { measured_bytes: 40 }
         );
-        let longer = Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-            actual: 1024,
-            provided: 512,
-        }));
+        let longer = Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                actual: 1024,
+                provided: 512,
+            },
+        )));
         assert_eq!(
             classify_fixed_record(longer, 512).unwrap(),
             FixedRecordRead::WrongLength {
@@ -4534,20 +4723,28 @@ mod record_length_tests {
             }
         );
         // A buffer smaller than the one-block record is the caller's error.
-        let small_buffer = Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-            actual: 512,
-            provided: 256,
-        }));
+        let small_buffer = Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                actual: 512,
+                provided: 256,
+            },
+        )));
         assert!(matches!(
             classify_fixed_record(small_buffer, 512),
-            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { .. }))
+            Err(ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { .. },
+                ..
+            }))
         ));
-        let transport = Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-            "transport".into(),
+        let transport = Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed("transport".into()),
         )));
         assert!(matches!(
             classify_fixed_record(transport, 512),
-            Err(ParityError::TapeIo(TapeIoError::OperationFailed(_)))
+            Err(ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::OperationFailed(_),
+                ..
+            }))
         ));
     }
 
@@ -4558,7 +4755,7 @@ mod record_length_tests {
         let near_end = PhysicalPositionHint::new(u64::MAX);
         let error = device_position_after(near_end, 1, "test").unwrap_err();
         assert!(
-            matches!(error, ParityError::TapeIo(TapeIoError::OperationFailed(ref m)) if m.starts_with("device-reported position"))
+            matches!(error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::OperationFailed(ref m), .. }) if m.starts_with("device-reported position"))
         );
         assert_eq!(
             device_position_after(PhysicalPositionHint::new(u64::MAX - 1), 1, "test").unwrap(),
@@ -4589,7 +4786,9 @@ mod record_length_tests {
             _count: i64,
             _kind: SpaceKind,
         ) -> Result<remanence_library::SpaceResult, TapeIoError> {
-            Err(TapeIoError::OperationFailed("not used".into()))
+            Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed("not used".into()),
+            ))
         }
         fn position(&mut self) -> Result<TapePosition, TapeIoError> {
             self.locate(u64::MAX)
@@ -4711,6 +4910,13 @@ impl<S: crate::RawTapeSource> CancellableRawSource<S> {
         self.0
             .verification_context()
             .check_cancelled()
-            .map_err(|_| remanence_library::TapeIoError::Cancelled.into())
+            .map_err(|_| {
+                remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::Cancelled)
+                    .into()
+            })
     }
 }
+
+#[cfg(test)]
+#[path = "b3b_raw_tests.rs"]
+mod b3b_strict_tests;

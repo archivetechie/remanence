@@ -355,10 +355,12 @@ impl BlockSink for StagedTestSink {
             return Err(error);
         }
         if self.fail_on_batch_call == Some(self.batch_calls) {
-            return Err(TapeIoError::OperationFailed(format!(
-                "injected sink failure on batch {}",
-                self.batch_calls
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "injected sink failure on batch {}",
+                    self.batch_calls
+                )),
+            ));
         }
         let outcome = self.inner.write_block_batch(buf, block_size_bytes)?;
         if self.early_warning_on_batch_call == Some(self.batch_calls) {
@@ -454,7 +456,13 @@ impl BlockSink for StagedTestSink {
     ) {
         self.audited_partial_sense = matches!(
             error,
-            TapeIoError::PartialBatchUncommittable { sense: Some(_), .. }
+            remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+                    sense: Some(_),
+                    ..
+                },
+                ..
+            }
         );
         self.ordered_events
             .lock()
@@ -489,8 +497,10 @@ impl BlockSink for StagedTestSink {
     ) -> Result<WriteFilemarksOutcome, TapeIoError> {
         if self.fail_filemark {
             self.pending_deferred_audit = true;
-            return Err(TapeIoError::OperationFailed(
-                "injected WRITE FILEMARKS failure".into(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected WRITE FILEMARKS failure".into(),
+                ),
             ));
         }
         self.write_filemarks(count)
@@ -499,8 +509,10 @@ impl BlockSink for StagedTestSink {
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
         self.events.push("space_eod".to_string());
         if self.fail_space_to_eod {
-            return Err(TapeIoError::OperationFailed(
-                "injected space-to-EOD failure".into(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected space-to-EOD failure".into(),
+                ),
             ));
         }
         self.inner.space_to_end_of_data()
@@ -522,8 +534,10 @@ impl BlockSink for StagedTestSink {
             let _ = notify.send(calls);
         }
         if self.fail_position {
-            return Err(TapeIoError::OperationFailed(
-                "injected READ POSITION failure".into(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected READ POSITION failure".into(),
+                ),
             ));
         }
         match self.position_overrides.pop_front() {
@@ -569,8 +583,10 @@ impl BlockSink for SingleBlockOutcomeSink {
     }
 
     fn write_filemarks(&mut self, _count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
-        Err(TapeIoError::OperationFailed(
-            "single-block test sink does not write filemarks".to_string(),
+        Err(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "single-block test sink does not write filemarks".to_string(),
+            ),
         ))
     }
 
@@ -607,13 +623,13 @@ fn bootstrap_rejects_incomplete_block_before_filemark() {
         assert!(
             matches!(
                 error,
-                PoolWriteError::TapeIo(TapeIoError::PartialBatchUncommittable {
+                PoolWriteError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
                     requested_records: 1,
                     requested_bytes: 4096,
                     written_bytes,
                     end_of_medium: reported_eom,
                     ..
-                }) if written_bytes == u64::from(bytes_written) && reported_eom == end_of_medium
+                }, .. }) if written_bytes == u64::from(bytes_written) && reported_eom == end_of_medium
             ),
             "{error:?}"
         );
@@ -2015,6 +2031,15 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         delay: &'a std::cell::Cell<bool>,
     }
     impl RawTapeSink for HostDelayRaw<'_> {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            self.inner.finish_adapter_error(kind, class)
+        }
+
         fn write_fixed_block(
             &mut self,
             bytes: &[u8],
@@ -2724,14 +2749,16 @@ fn position_error_records_tape_io_fence() {
 #[test]
 fn disconnected_free_ring_cannot_mask_inflight_tape_failure() {
     let mut sink = StagedTestSink::with_ring(2, 2);
-    sink.batch_error = Some(TapeIoError::PartialBatchUncommittable {
-        requested_records: 2,
-        written_records: 1,
-        requested_bytes: 8,
-        written_bytes: 4,
-        end_of_medium: false,
-        sense: Some(vec![0x70, 0, 0x40]),
-    });
+    sink.batch_error = Some(remanence_library::TapeIoError::new(
+        remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+            requested_records: 2,
+            written_records: 1,
+            requested_bytes: 8,
+            written_bytes: 4,
+            end_of_medium: false,
+            sense: Some(vec![0x70, 0, 0x40]),
+        },
+    ));
     let ordered = Arc::clone(&sink.ordered_events);
     let accounting = Arc::new(RingAccounting::default());
     let mut buffer = PageAlignedBuffer::try_new(8, accounting).expect("test ring buffer");
@@ -2982,23 +3009,31 @@ fn block_sink_stats_latches_hardware_early_warning() {
 
 #[test]
 fn write_failure_with_position_secondary_keeps_partial_batch_fence_reason() {
-    let error = TapeIoError::WriteFailureWithPositionError {
-        write_error: Box::new(TapeIoError::PartialBatchUncommittable {
-            requested_records: 4,
-            written_records: 2,
-            requested_bytes: 16,
-            written_bytes: 8,
-            end_of_medium: true,
-            sense: Some(vec![0x70, 0, 0x40]),
-        }),
-        position_error: Box::new(TapeIoError::OperationFailed(
-            "injected arbitration READ POSITION failure".into(),
-        )),
-    };
+    let error = remanence_library::TapeIoError::new(
+        remanence_library::TapeIoErrorKind::WriteFailureWithPositionError {
+            write_error: Box::new(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+                    requested_records: 4,
+                    written_records: 2,
+                    requested_bytes: 16,
+                    written_bytes: 8,
+                    end_of_medium: true,
+                    sense: Some(vec![0x70, 0, 0x40]),
+                },
+            )),
+            position_error: Box::new(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "injected arbitration READ POSITION failure".into(),
+                ),
+            )),
+        },
+    );
     let message = error.to_string();
     assert_eq!(
-        tape_io_fence_reason_for_transfer_error(&message),
-        "partial_batch"
+        super::no_parity::staged_failure_outcome(&error).effect,
+        remanence_library::outcome::Effect::WriteFence(
+            remanence_library::outcome::FenceCause::PartialBatch
+        )
     );
     assert!(message.contains("arbitration READ POSITION failure"));
 }
@@ -3769,6 +3804,22 @@ fn parity_raw_timing_separates_commands_from_host_gaps() {
         calls: Vec<String>,
     }
     impl RawTapeSink for Raw {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
             self.calls.push(format!("locate:{}", hint.lba));
             Ok(())
@@ -3777,8 +3828,8 @@ fn parity_raw_timing_separates_commands_from_host_gaps() {
             self.calls.push(format!("block:{bytes:?}"));
             std::thread::sleep(Duration::from_millis(3));
             if bytes == b"fail" {
-                return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-                    "injected".into(),
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed("injected".into()),
                 )));
             }
             Ok(RawWriteOutcome::WroteBlock {

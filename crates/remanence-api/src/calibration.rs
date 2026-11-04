@@ -22,7 +22,7 @@
 //! dependency on the SCSI crate (and vice versa). [`descriptor_from_wire`]
 //! is that single mapping.
 
-use remanence_library::{DriveHandle, TapeIoError};
+use remanence_library::DriveHandle;
 use remanence_order::{lookup_media_code, GeometryLookup, ReowpDescriptor, WrapMap};
 use remanence_scsi::read_end_of_wrap_position::WrapDescriptor;
 use remanence_state::{
@@ -199,7 +199,12 @@ pub(crate) fn harvest_and_install_calibration(
     // (5) The harvest read.
     let positions = match drive.read_end_of_wrap_position() {
         Ok(positions) => positions,
-        Err(err @ TapeIoError::CheckCondition(_)) => {
+        Err(
+            err @ remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::CheckCondition(_),
+                ..
+            },
+        ) => {
             // Runtime rejection of a nominally supported format —
             // defensive handling, recorded as unsupported for this
             // load with the command failure in the detail.

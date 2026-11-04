@@ -306,18 +306,43 @@ pub struct TerminalTripleCapacityRuntimeState {
 struct ParitySinkBackend<'a>(&'a mut dyn RawTapeSink);
 
 impl ParitySinkBackend<'_> {
-    fn locate_for_overwrite(&mut self, position: PhysicalPositionHint) -> Result<(), TapeIoError> {
+    /// Keep adapter-created facts attached to the raw sink's owning operation.
+    fn finish_adapter_error(&mut self, kind: remanence_library::TapeIoErrorKind) -> TapeIoError {
         self.0
-            .locate_for_overwrite(position)
-            .map_err(parity_error_to_tape_io)
+            .finish_adapter_error(kind, remanence_library::outcome::CommandClass::Write)
+    }
+    fn invalid_input(&mut self, message: &'static str) -> TapeIoError {
+        self.finish_adapter_error(remanence_library::TapeIoErrorKind::CheckCondition(
+            ScsiError::InvalidInput(message),
+        ))
+    }
+    fn finish_parity_error(
+        &mut self,
+        error: ParityError,
+        class: remanence_library::outcome::CommandClass,
+    ) -> TapeIoError {
+        let kind = match error {
+            ParityError::TapeIo(error) => return error,
+            ParityError::Invariant(message) => {
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(message))
+            }
+            other => remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                "RawTapeSink operation failed: {other}"
+            )),
+        };
+        self.0.finish_adapter_error(kind, class)
+    }
+
+    fn locate_for_overwrite(&mut self, position: PhysicalPositionHint) -> Result<(), TapeIoError> {
+        self.0.locate_for_overwrite(position).map_err(|error| {
+            self.finish_parity_error(error, remanence_library::outcome::CommandClass::Position)
+        })
     }
 
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
-        match self
-            .0
-            .write_fixed_block(buf)
-            .map_err(parity_error_to_tape_io)?
-        {
+        match self.0.write_fixed_block(buf).map_err(|error| {
+            self.finish_parity_error(error, remanence_library::outcome::CommandClass::Write)
+        })? {
             RawWriteOutcome::WroteBlock {
                 bytes_written,
                 position_after,
@@ -329,9 +354,10 @@ impl ParitySinkBackend<'_> {
                 end_of_medium,
                 physical_to_tape_position(position_after),
             )),
-            RawWriteOutcome::WroteFilemark { .. } => Err(invalid_input(
-                "RawTapeSink::write_fixed_block returned a filemark outcome",
-            )),
+            RawWriteOutcome::WroteFilemark { .. } => {
+                Err(self
+                    .invalid_input("RawTapeSink::write_fixed_block returned a filemark outcome"))
+            }
         }
     }
 
@@ -340,11 +366,15 @@ impl ParitySinkBackend<'_> {
         count: u32,
         immed: bool,
     ) -> Result<WriteFilemarksOutcome, TapeIoError> {
-        match self
-            .0
-            .write_filemarks(count, immed)
-            .map_err(parity_error_to_tape_io)?
-        {
+        match self.0.write_filemarks(count, immed).map_err(|error| {
+            self.finish_parity_error(
+                error,
+                remanence_library::outcome::CommandClass::WriteFilemarks {
+                    count,
+                    immediate: immed,
+                },
+            )
+        })? {
             RawWriteOutcome::WroteFilemark {
                 position_after,
                 early_warning,
@@ -354,35 +384,31 @@ impl ParitySinkBackend<'_> {
                 end_of_medium,
                 physical_to_tape_position(position_after),
             )),
-            RawWriteOutcome::WroteBlock { .. } => Err(invalid_input(
-                "RawTapeSink::write_filemarks returned a block outcome",
+            RawWriteOutcome::WroteBlock { .. } => Err(self.0.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                    "RawTapeSink::write_filemarks returned a block outcome",
+                )),
+                remanence_library::outcome::CommandClass::WriteFilemarks {
+                    count,
+                    immediate: immed,
+                },
             )),
         }
     }
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
-        Ok(physical_to_tape_position(
-            self.0.position().map_err(parity_error_to_tape_io)?,
-        ))
+        Ok(physical_to_tape_position(self.0.position().map_err(
+            |error| {
+                self.finish_parity_error(error, remanence_library::outcome::CommandClass::Position)
+            },
+        )?))
     }
 }
 
 fn invalid_input(message: &'static str) -> TapeIoError {
-    TapeIoError::CheckCondition(ScsiError::InvalidInput(message))
-}
-
-/// Convert raw-adapter parity errors back into the body-facing tape-I/O shape.
-///
-/// RawTapeSink implementations must return `ParityError::TapeIo` with
-/// `TapeIoError::Transport` for completion-unknown SG_IO / driver failures.
-/// String-only wrapper variants are preserved as diagnostics but cannot carry
-/// the Layer 3a dirty-bit signal.
-fn parity_error_to_tape_io(err: ParityError) -> TapeIoError {
-    match err {
-        ParityError::TapeIo(err) => err,
-        ParityError::Invariant(message) => invalid_input(message),
-        other => TapeIoError::OperationFailed(format!("RawTapeSink operation failed: {other}")),
-    }
+    remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+        ScsiError::InvalidInput(message),
+    ))
 }
 
 fn physical_to_tape_position(position: PhysicalPositionHint) -> TapePosition {
@@ -2768,9 +2794,13 @@ impl<'a> ParitySink<'a> {
         self.record_physical_position(barrier_outcome.position_after.lba);
         if barrier_outcome.end_of_medium {
             self.poisoned = true;
-            return Err(ParityError::TapeIo(TapeIoError::HardEndOfMedium {
-                sense: Vec::new(),
-            }));
+            return Err(ParityError::TapeIo(self.backend.0.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::HardEndOfMedium { sense: Vec::new() },
+                remanence_library::outcome::CommandClass::WriteFilemarks {
+                    count: 0,
+                    immediate: false,
+                },
+            )));
         }
         let observed = match self.backend.position() {
             Ok(observed) => observed,
@@ -2877,9 +2907,13 @@ impl<'a> ParitySink<'a> {
         self.record_physical_position(barrier_outcome.position_after.lba);
         if barrier_outcome.end_of_medium {
             self.poisoned = true;
-            return Err(ParityError::TapeIo(TapeIoError::HardEndOfMedium {
-                sense: Vec::new(),
-            }));
+            return Err(ParityError::TapeIo(self.backend.0.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::HardEndOfMedium { sense: Vec::new() },
+                remanence_library::outcome::CommandClass::WriteFilemarks {
+                    count: 0,
+                    immediate: false,
+                },
+            )));
         }
         let kind = FileRowsKind::CheckpointSidecars;
         let mut publication = PublicationReceipt::default();
@@ -3604,32 +3638,47 @@ impl<'a> ParitySink<'a> {
     fn abandon_active_object_boundary_or_tape_io(&mut self, err: TapeIoError) -> TapeIoError {
         match self.abandon_active_object_boundary() {
             Ok(()) => err,
-            Err(boundary_err) => parity_error_to_tape_io(boundary_err),
+            Err(boundary_err) => self.backend.finish_parity_error(
+                boundary_err,
+                remanence_library::outcome::CommandClass::Write,
+            ),
         }
     }
 }
 
 impl<'a> BlockSink for ParitySink<'a> {
+    fn finish_adapter_error(&mut self, kind: remanence_library::TapeIoErrorKind) -> TapeIoError {
+        self.backend.finish_adapter_error(kind)
+    }
+
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         if self.poisoned {
-            return Err(TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                "ParitySink poisoned after prior transport error; abandon session",
-            )));
+            return Err(self.backend.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                    "ParitySink poisoned after prior transport error; abandon session",
+                )),
+            ));
         }
         let Some(object) = self.active_object else {
-            return Err(TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                "ParitySink: write_block outside active object",
-            )));
+            return Err(self.backend.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                    "ParitySink: write_block outside active object",
+                )),
+            ));
         };
         if object.written_blocks >= object.projected_size_blocks {
-            return Err(TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                "ParitySink: object exceeded projected_size_blocks",
-            )));
+            return Err(self.backend.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                    "ParitySink: object exceeded projected_size_blocks",
+                )),
+            ));
         }
         if buf.len() != self.block_size_bytes as usize {
-            return Err(TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                "ParitySink: sidecar-only object blocks must match configured fixed block size",
-            )));
+            return Err(self.backend.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                    "ParitySink: sidecar-only object blocks must match configured fixed block size",
+                )),
+            ));
         }
         // Pin the block size only after validating it against the configured
         // fixed tape block size, so one malformed first write cannot poison
@@ -3637,9 +3686,11 @@ impl<'a> BlockSink for ParitySink<'a> {
         match self.block_size {
             None => self.block_size = Some(buf.len()),
             Some(expected) if expected != buf.len() => {
-                return Err(TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                    "ParitySink: heterogeneous block sizes within a parity session",
-                )));
+                return Err(self.backend.finish_adapter_error(
+                    remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                        "ParitySink: heterogeneous block sizes within a parity session",
+                    )),
+                ));
             }
             Some(_) => {}
         }
@@ -3653,7 +3704,13 @@ impl<'a> BlockSink for ParitySink<'a> {
             Ok(o) => o,
             Err(e) => {
                 if e.is_completion_unknown()
-                    || matches!(e, TapeIoError::PartialBatchUncommittable { .. })
+                    || matches!(
+                        e,
+                        remanence_library::TapeIoError {
+                            kind: remanence_library::TapeIoErrorKind::PartialBatchUncommittable { .. },
+                            ..
+                        }
+                    )
                 {
                     self.poisoned = true;
                     return Err(self.abandon_active_object_boundary_or_tape_io(e));
@@ -3663,18 +3720,14 @@ impl<'a> BlockSink for ParitySink<'a> {
         };
         if data_outcome.bytes_written as usize != buf.len() {
             self.poisoned = true;
-            return Err(
-                self.abandon_active_object_boundary_or_tape_io(invalid_input(
-                    "ParitySink: object data block write completed with a nonexact byte count before trailing filemark",
-                )),
-            );
+            let error = self.backend.invalid_input("ParitySink: object data block write completed with a nonexact byte count before trailing filemark");
+            return Err(self.abandon_active_object_boundary_or_tape_io(error));
         }
         self.record_physical_position(data_outcome.position_after.lba);
         if data_outcome.end_of_medium {
             self.poisoned = true;
-            return Err(self.abandon_active_object_boundary_or_tape_io(invalid_input(
-                "ParitySink: object data block write reached end of medium before trailing filemark",
-            )));
+            let error = self.backend.invalid_input("ParitySink: object data block write reached end of medium before trailing filemark");
+            return Err(self.abandon_active_object_boundary_or_tape_io(error));
         }
         // Track the logical end-of-user-data LBA. The inner
         // sink's reported position_after is the post-write
@@ -3691,21 +3744,26 @@ impl<'a> BlockSink for ParitySink<'a> {
             data_outcome.end_of_medium,
         ) {
             self.poisoned = true;
-            return Err(
-                self.abandon_active_object_boundary_or_tape_io(parity_error_to_tape_io(err))
-            );
+            return Err({
+                let error = self
+                    .backend
+                    .finish_parity_error(err, remanence_library::outcome::CommandClass::Write);
+                self.abandon_active_object_boundary_or_tape_io(error)
+            });
         }
 
         // Record the block for parity computation.
         if let Err(invariant) = self.record_data_block(buf) {
             self.poisoned = true;
             let _ = self.abandon_active_object_boundary();
-            return Err(TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                match invariant {
-                    ParityError::Invariant(s) => s,
-                    _ => "ParitySink stripe accounting failure",
-                },
-            )));
+            return Err(self.backend.finish_adapter_error(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::InvalidInput(
+                    match invariant {
+                        ParityError::Invariant(s) => s,
+                        _ => "ParitySink stripe accounting failure",
+                    },
+                )),
+            ));
         }
 
         // If we've just filled every data row in the neighborhood,
@@ -3722,12 +3780,16 @@ impl<'a> BlockSink for ParitySink<'a> {
                     let _ = self.abandon_active_object_boundary();
                     Err(match parity_err {
                         ParityError::TapeIo(inner) => inner,
-                        ParityError::Invariant(msg) => {
-                            TapeIoError::CheckCondition(ScsiError::InvalidInput(msg))
-                        }
-                        _ => TapeIoError::CheckCondition(ScsiError::InvalidInput(
-                            "parity emission failed",
-                        )),
+                        ParityError::Invariant(msg) => self.backend.finish_adapter_error(
+                            remanence_library::TapeIoErrorKind::CheckCondition(
+                                ScsiError::InvalidInput(msg),
+                            ),
+                        ),
+                        _ => self.backend.finish_adapter_error(
+                            remanence_library::TapeIoErrorKind::CheckCondition(
+                                ScsiError::InvalidInput("parity emission failed"),
+                            ),
+                        ),
                     })
                 }
             }

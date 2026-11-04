@@ -34,8 +34,7 @@ use remanence_format::{
     RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
 };
 use remanence_library::{
-    DiscoveryReport, DriveHandle, DriveOpError, LoadError, MediaFamily, MediaReadiness, SpaceKind,
-    TapeConfig, TapeIoError,
+    DiscoveryReport, DriveHandle, LoadError, MediaFamily, SpaceKind, TapeConfig,
 };
 use remanence_library::{
     DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library,
@@ -1715,20 +1714,25 @@ fn load_wait_absorbs_only_retryable_drive_completions() {
         sense[7] = 24;
         sense[12] = asc;
         sense[13] = ascq;
-        LoadError::DriveLoad(DriveOpError::ScsiError(
-            remanence_library::ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: 0,
-            },
+        LoadError::DriveLoad(remanence_library::DriveOpError::new(
+            remanence_library::DriveOpErrorKind::ScsiError(
+                remanence_library::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ),
         ))
     }
 
     let first_mount_attention = load_check_condition(0x06, 0x28, 0x00);
     assert!(matches!(
         retryable_readiness_from_load_error(&first_mount_attention, MediaFamily::Lto9OrLater),
-        Some(MediaReadiness::UnitAttention {
-            asc: 0x28,
-            ascq: 0x00
+        Some(remanence_library::MediaReadiness {
+            kind: remanence_library::MediaReadinessKind::UnitAttention {
+                asc: 0x28,
+                ascq: 0x00
+            },
+            ..
         })
     ));
 
@@ -1836,10 +1840,12 @@ fn session_open_readiness_fence_records_operation_and_guidance() {
         &mut index,
         &ctx,
         "session_open_short_probe",
-        &MediaReadiness::BecomingReady {
-            ascq: 0x01,
-            media_initializing: true,
-        },
+        &remanence_library::MediaReadiness::new(
+            remanence_library::MediaReadinessKind::BecomingReady {
+                ascq: 0x01,
+                media_initializing: true,
+            },
+        ),
     );
 
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -1911,6 +1917,22 @@ fn parity_raw_activity_tracks_write_entry_but_not_position_queries() {
     struct FailingRawSink;
 
     impl RawTapeSink for FailingRawSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             Err(ParityError::Invariant("injected raw block failure"))
         }
@@ -1956,6 +1978,22 @@ fn parity_raw_activity_tracks_write_entry_but_not_position_queries() {
     struct PositionFailingRawSink;
 
     impl RawTapeSink for PositionFailingRawSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             panic!("a failed pre-write position check must prevent the block write")
         }
@@ -2629,15 +2667,18 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
         block_size: 4096,
         parity_config: ParityConfig::None,
     };
-    let error = TapeIoError::PartialBatchUncommittable {
-        requested_records: 1,
-        written_records: 0,
-        requested_bytes: 4096,
-        written_bytes: 4095,
-        end_of_medium: false,
-        sense: None,
-    }
-    .to_string();
+    let error = remanence_library::TapeIoError::new(
+        remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+            requested_records: 1,
+            written_records: 0,
+            requested_bytes: 4096,
+            written_bytes: 4095,
+            end_of_medium: false,
+            sense: None,
+        },
+    );
+    let outcome = b3b_test_write_outcome(error.completion_evidence());
+    let error = error.to_string();
 
     let (status, audited) = fence_failed_parity_raw_write(
         &mut index,
@@ -2646,6 +2687,7 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
         "append",
         Some("caller-first-after-checkpoint"),
         None,
+        &outcome,
         error.as_str(),
         Status::internal(error.clone()),
     );
@@ -3475,10 +3517,12 @@ fn drive_wait_ready_never_repeats_a_load_or_loads_without_inventory_evidence() {
                 .record_media_readiness_transition(
                     crate::startup_media_readiness::media_readiness_initializing_load_transition(
                         operation_id,
-                        &MediaReadiness::BecomingReady {
-                            ascq: 0x02,
-                            media_initializing: true,
-                        },
+                        &remanence_library::MediaReadiness::new(
+                            remanence_library::MediaReadinessKind::BecomingReady {
+                                ascq: 0x02,
+                                media_initializing: true,
+                            },
+                        ),
                     ),
                 )
                 .expect("record earlier LOAD attempt");
@@ -3590,10 +3634,12 @@ fn startup_reconcile_never_repeats_recorded_load_across_restart() {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::media_readiness_initializing_load_transition(
                     operation_id,
-                    &MediaReadiness::BecomingReady {
-                        ascq: 2,
-                        media_initializing: true,
-                    },
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::BecomingReady {
+                            ascq: 2,
+                            media_initializing: true,
+                        },
+                    ),
                 ),
             )
             .expect("record LOAD attempt");
@@ -10674,10 +10720,12 @@ async fn detached_verification_waits_for_another_drive_fence() {
         readiness_id,
         &ctx,
         "session_open_short_probe",
-        &MediaReadiness::BecomingReady {
-            ascq: 1,
-            media_initializing: false,
-        },
+        &remanence_library::MediaReadiness::new(
+            remanence_library::MediaReadinessKind::BecomingReady {
+                ascq: 1,
+                media_initializing: false,
+            },
+        ),
     );
     drop(index);
     let (op, result) = crate::tape_verification::start(
@@ -10707,7 +10755,7 @@ async fn detached_verification_waits_for_another_drive_fence() {
         &mut harness.state.index_write().unwrap(),
         readiness_id,
         "ready",
-        &MediaReadiness::Ready,
+        &remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready),
     )
     .unwrap();
     let pool = harness.state.drive_pool().unwrap();
@@ -10782,10 +10830,12 @@ async fn startup_resumable_fence_gets_an_automatic_wait() {
         .record_media_readiness_transition(
             crate::startup_media_readiness::media_readiness_initializing_load_transition(
                 id,
-                &MediaReadiness::BecomingReady {
-                    ascq: 2,
-                    media_initializing: true,
-                },
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 2,
+                        media_initializing: true,
+                    },
+                ),
             ),
         )
         .unwrap();
@@ -11256,10 +11306,12 @@ fn startup_release_transition_keeps_reconcile_cancel_source() {
             let mut transition =
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     id,
-                    &remanence_library::MediaReadiness::BecomingReady {
-                        ascq: 1,
-                        media_initializing: false,
-                    },
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::BecomingReady {
+                            ascq: 1,
+                            media_initializing: false,
+                        },
+                    ),
                 );
             transition.cancel_source = source.map(str::to_string);
             if release_only {
@@ -11341,7 +11393,9 @@ async fn detached_verification_waits_for_load_drive_release() {
             .record_media_readiness_transition(
                 crate::startup_media_readiness::startup_media_readiness_probe_transition(
                     id,
-                    &remanence_library::MediaReadiness::Ready,
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::Ready,
+                    ),
                 ),
             )
             .unwrap();
@@ -11602,10 +11656,12 @@ fn load_drive_terminal_progress_uses_durable_readiness() {
         let mut transition =
             crate::startup_media_readiness::startup_media_readiness_probe_transition(
                 id,
-                &MediaReadiness::BecomingReady {
-                    ascq: 1,
-                    media_initializing: false,
-                },
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 1,
+                        media_initializing: false,
+                    },
+                ),
             );
         transition.state = state.into();
         index.record_media_readiness_transition(transition).unwrap();
@@ -12977,7 +13033,13 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
             )
             .unwrap_err();
         if length.is_some() {
-            assert!(matches!(error, TapeIoError::CursorPredecessorNotFilemark));
+            assert!(matches!(
+                error,
+                remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::CursorPredecessorNotFilemark,
+                    ..
+                }
+            ));
         }
         assert!(super::checkpoint::fence_admission_contradiction(
             &mut index,
@@ -12985,7 +13047,9 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
             uuid,
             size as u32,
             Some((1, 2)),
-            &crate::append_admission::AdmissionError::Io(error),
+            &crate::append_admission::AdmissionError::new(
+                crate::append_admission::AdmissionErrorKind::Io(error)
+            ),
         ));
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1, "predecessor length={length:?}");
@@ -13030,7 +13094,13 @@ fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
             uuid,
             262144,
             range,
-            &crate::append_admission::AdmissionError::Io(TapeIoError::FilemarkEncountered),
+            &crate::append_admission::AdmissionError::new(
+                crate::append_admission::AdmissionErrorKind::Io(
+                    remanence_library::TapeIoError::new(
+                        remanence_library::TapeIoErrorKind::FilemarkEncountered
+                    )
+                )
+            ),
         ));
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
@@ -13136,6 +13206,7 @@ fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
             &remanence_parity::TerminalTailWriteError::Media(ParityError::Invariant(
                 "terminal write fails",
             )),
+            &b3b_test_write_outcome(remanence_library::outcome::CompletionEvidence::unknown()),
         )
     } else {
         super::terminal_finalize::terminal_prefix_write_failure(
@@ -13146,6 +13217,7 @@ fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
             &selected,
             reached_drive,
             &ParityError::Invariant("terminal write fails"),
+            &b3b_test_write_outcome(remanence_library::outcome::CompletionEvidence::unknown()),
         )
     };
     assert!(
@@ -13464,6 +13536,7 @@ fn catalog_lock_refusal_logs_write_session_context() {
 /// Refused WRITE/WRITE FILEMARKS must not create a catalog tape-I/O fence.
 #[test]
 fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
+    use remanence_library::outcome::{census, Dispatch, Effect, OutcomeReason};
     struct RefusingTransport {
         inner: FixtureTransport,
         errno: nix::errno::Errno,
@@ -13544,6 +13617,7 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
             let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
             let before = drive.media_write_dispatch_count();
             let mut attempted = false;
+            let counts = (census::total(), census::normalizations());
             let refusal =
                 super::mounted_commands::with_evidence(&mut index, &cfg, &mut drive, |_, drive| {
                     attempted = true;
@@ -13552,8 +13626,17 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
                     } else {
                         drive.write_filemarks(1).unwrap_err()
                     };
-                    assert!(matches!(error, TapeIoError::InvalidRequest(_)));
+                    assert!(matches!(
+                        error,
+                        remanence_library::TapeIoError {
+                            kind: remanence_library::TapeIoErrorKind::InvalidRequest(_),
+                            ..
+                        }
+                    ));
                     assert!(!error.is_completion_unknown());
+                    assert_eq!(error.outcome().evidence.dispatch, Dispatch::NotIssued);
+                    assert_eq!(error.outcome().effect, Effect::NoFence);
+                    assert_eq!(error.outcome().reason, OutcomeReason::NotIssued);
                     Err::<(), _>(Status::invalid_argument(error.to_string()))
                 })
                 .unwrap_err();
@@ -13561,6 +13644,8 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
                 attempted,
                 "the write must reach the injected transport error"
             );
+            assert_eq!(census::total() - counts.0, 1);
+            assert_eq!(census::normalizations() - counts.1, 1);
             assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
             assert!(refusal.message().contains("no command issued"));
             assert_eq!(drive.known_position().map(|p| p.lba), Some(10));
@@ -13581,3 +13666,24 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
         }
     }
 }
+/// Construct synthetic failure evidence for persistence-helper tests without a transport.
+fn b3b_test_write_outcome(
+    evidence: remanence_library::outcome::CompletionEvidence,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    use remanence_library::outcome::*;
+    classify(OutcomeInput {
+        class: CommandClass::Write,
+        context: OperationContext {
+            phase: Phase::Append,
+            region: Region::Unknown,
+            ..Default::default()
+        },
+        evidence,
+    })
+}
+
+#[path = "b3b_carrier_tests.rs"]
+pub(crate) mod b3b_carrier_tests;
+
+#[path = "b3b_golden_tests.rs"]
+mod b3b_golden_tests;

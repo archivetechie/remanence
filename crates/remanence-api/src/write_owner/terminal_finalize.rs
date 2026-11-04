@@ -261,9 +261,12 @@ pub(crate) fn finalize_mounted_tape(
         None
     };
     prepare(index, drive)?;
-    let drive_config = drive
-        .read_config()
-        .map_err(|error| Status::unavailable(format!("read finalization drive config: {error}")))?;
+    let drive_config = drive.read_config().map_err(|error| {
+        super::restore::attach_outcome_retry(
+            error.outcome(),
+            Status::unavailable(format!("read finalization drive config: {error}")),
+        )
+    })?;
     if drive_config.write_protected {
         return Err(Status::failed_precondition(
             "tape is write-protected and cannot be finalized",
@@ -474,9 +477,9 @@ pub(super) fn plan_terminal_prefix_without_motion(
 
 #[derive(Clone, Copy)]
 pub(super) struct TerminalPlanPosition<'a> {
-    first_tape_file_number: u64,
-    first_start_lba: u64,
-    terminal_prefix: Option<&'a TerminalPrefixPlan>,
+    pub(super) first_tape_file_number: u64,
+    pub(super) first_start_lba: u64,
+    pub(super) terminal_prefix: Option<&'a TerminalPrefixPlan>,
 }
 
 pub(super) fn build_new_terminal_plan(
@@ -1561,7 +1564,12 @@ pub(super) fn finalize_terminal_no_parity(
             previous.block_size,
             drive.identity_generation(),
         )
-        .map_err(|error| Status::unavailable(format!("prove checkpoint EOD: {error}")))?;
+        .map_err(|error| {
+            super::restore::attach_outcome_retry(
+                error.outcome(),
+                Status::unavailable(format!("prove checkpoint EOD: {error}")),
+            )
+        })?;
     finish_terminal_tail(
         index,
         cfg,
@@ -1971,6 +1979,13 @@ pub(super) fn finalize_terminal_with_parity_journal(
             end_recovered_finalizing_session(checkpoint)?;
         }
         let dispatches_before = drive.media_write_dispatch_count();
+        let _outcome_context =
+            drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                region: remanence_library::outcome::Region::Unknown,
+                mounted: cfg.terminal_config().mounted_endpoint.is_some(),
+                ..Default::default()
+            });
         let mut raw_write_attempted = false;
         let close_result = {
             let mut raw = DriveHandleRawSink::new(drive);
@@ -2024,6 +2039,12 @@ pub(super) fn finalize_terminal_with_parity_journal(
                     selected,
                     raw_write_attempted,
                     &error,
+                    &super::checkpoint::write_failure_outcome_with_attempt(
+                        drive,
+                        dispatches_before,
+                        Some(&error),
+                        raw_write_attempted,
+                    ),
                 ));
             }
         };
@@ -2039,6 +2060,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
                         "terminal prefix is durable; retry after tape-log replay: {error}"
                     ));
                 }
+                let error = error.into();
                 terminal_prefix_write_failure(
                     index,
                     cfg,
@@ -2046,7 +2068,13 @@ pub(super) fn finalize_terminal_with_parity_journal(
                     spec,
                     selected,
                     true,
-                    &error.into(),
+                    &error,
+                    &super::checkpoint::write_failure_outcome_with_attempt(
+                        drive,
+                        dispatches_before,
+                        Some(&error),
+                        true,
+                    ),
                 )
             })?;
         index
@@ -2326,9 +2354,12 @@ pub(super) fn finish_terminal_tail(
             )
             .boundary;
             if evidence == remanence_parity::TerminalComponentReconcileEvidence::Complete {
-                drive
-                    .advance_append_commit(cursor)
-                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                drive.advance_append_commit(cursor).map_err(|e| {
+                    super::restore::attach_outcome_retry(
+                        e.outcome(),
+                        Status::unavailable(e.to_string()),
+                    )
+                })?;
             }
             drive
                 .prove_cursor(cursor, selected.block_size, drive.identity_generation())
@@ -2338,6 +2369,13 @@ pub(super) fn finish_terminal_tail(
         }
         authority.set_reconciliation(progress, component, evidence);
         let dispatches_before = drive.media_write_dispatch_count();
+        let _outcome_context =
+            drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                region: remanence_library::outcome::Region::Unknown,
+                mounted: cfg.terminal_config().mounted_endpoint.is_some(),
+                ..Default::default()
+            });
         let step_result = {
             let mut raw = DriveHandleRawSink::new(drive);
             let mut faulting = crate::terminal_fault::TerminalFaultSink::new(
@@ -2368,7 +2406,12 @@ pub(super) fn finish_terminal_tail(
                             )
                             .boundary,
                         )
-                        .map_err(|e| Status::unavailable(e.to_string()))?;
+                        .map_err(|e| {
+                            super::restore::attach_outcome_retry(
+                                e.outcome(),
+                                Status::unavailable(e.to_string()),
+                            )
+                        })?;
                     return Err(Status::internal(format!(
                         "terminal component is durable; retry after tape-log replay: {error}"
                     )));
@@ -2384,6 +2427,15 @@ pub(super) fn finish_terminal_tail(
                     manual_request,
                     raw_write_reached_drive,
                     &error,
+                    &super::checkpoint::write_failure_outcome_with_attempt(
+                        drive,
+                        dispatches_before,
+                        match &error {
+                            TerminalTailWriteError::Media(error) => Some(error),
+                            _ => None,
+                        },
+                        raw_write_reached_drive,
+                    ),
                 ));
             }
         };
@@ -2399,7 +2451,12 @@ pub(super) fn finish_terminal_tail(
                         )
                         .boundary,
                     )
-                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                    .map_err(|e| {
+                        super::restore::attach_outcome_retry(
+                            e.outcome(),
+                            Status::unavailable(e.to_string()),
+                        )
+                    })?;
             }
             TerminalTailStepOutcome::AlreadyComplete => break,
             TerminalTailStepOutcome::RecoveryRequired {
@@ -2845,15 +2902,21 @@ fn admit_ended_tail_for_terminal(
             }
             Ok(Some(admission))
         }
-        Err(crate::append_admission::AdmissionError::SessionSuffixContradiction { .. }) => Ok(None),
-        Err(error) => Err(Status::failed_precondition(error.to_string())),
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. },
+            ..
+        }) => Ok(None),
+        Err(error) => Err(super::restore::attach_outcome_retry(
+            &crate::append_admission::admission_error_outcome(&error),
+            Status::failed_precondition(error.to_string()),
+        )),
     }
 }
 
 /// Preserve the terminal reconciler's position while checking the entire suffix
 /// for complete foreign objects before its first destructive operation.
 #[allow(clippy::too_many_arguments)]
-fn admit_terminal_write(
+pub(super) fn admit_terminal_write(
     actor: &AuditActor,
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
@@ -2870,21 +2933,23 @@ fn admit_terminal_write(
         previous.cursor.lba,
     );
     ctx.terminal_prefix = prefix.cloned();
-    ctx.write_position = drive
-        .position()
-        .map_err(|e| Status::unavailable(e.to_string()))?;
+    ctx.write_position = drive.position().map_err(|e| {
+        super::restore::attach_outcome_retry(e.outcome(), Status::unavailable(e.to_string()))
+    })?;
     crate::append_admission::admit_append_boundary(
         drive,
         crate::append_admission::AppendAuthority::Terminal { plan },
         ctx,
     )
     .map_err(|error| {
+        let outcome = crate::append_admission::admission_error_outcome(&error);
         crate::append_admission::daemon_admission_error(
             actor.clone(),
             index,
             &cfg.terminal_config(),
             selected.tape_uuid,
             error,
+            &outcome,
         )
     })
 }
@@ -2969,6 +3034,7 @@ pub(super) fn terminal_epoch_state(
 }
 
 /// Fence a dirty terminal prefix before attempting fallible recovery persistence.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn terminal_prefix_write_failure(
     index: &mut CatalogIndex,
     cfg: &impl TerminalConfig,
@@ -2977,6 +3043,7 @@ pub(super) fn terminal_prefix_write_failure(
     selected: &SelectedTape,
     raw_write_attempted: bool,
     error: &remanence_parity::ParityError,
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
 ) -> Status {
     let status = status_from_parity_error(error, error.to_string());
     let status = if raw_write_attempted {
@@ -2987,6 +3054,7 @@ pub(super) fn terminal_prefix_write_failure(
             "terminal_prefix",
             None,
             None,
+            outcome,
             &error.to_string(),
             status,
         )
@@ -3017,6 +3085,7 @@ pub(super) fn terminal_tail_write_failure(
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
     raw_write_reached_drive: bool,
     error: &TerminalTailWriteError,
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
 ) -> Status {
     let detail = error.to_string();
     let status = status_from_terminal_tail_error(error);
@@ -3028,6 +3097,7 @@ pub(super) fn terminal_tail_write_failure(
             "terminal_tail",
             None,
             None,
+            outcome,
             &detail,
             status,
         )

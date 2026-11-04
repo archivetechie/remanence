@@ -1,5 +1,6 @@
 //! Read-session opening and tape-I/O admission checks.
 
+use crate::closeout_obligation::RetryCauseExt as _;
 use remanence_library::DriveHandle;
 use remanence_state::{AuditEvent, CatalogIndex};
 use tokio::sync::mpsc;

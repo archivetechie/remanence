@@ -18,9 +18,7 @@ use super::model::PoolWriteError;
 #[cfg(test)]
 use super::model::SelectedTape;
 #[cfg(test)]
-use super::no_parity::{
-    record_tape_io_fence_for_transfer_error, tape_io_fence_reason_for_transfer_error,
-};
+use super::no_parity::{record_tape_io_fence_for_transfer_error, staged_failure_outcome};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BlockSinkStats {
@@ -251,14 +249,20 @@ impl PageAlignedBuffer {
         accounting: Arc<RingAccounting>,
     ) -> Result<Self, TapeIoError> {
         let page_alignment = system_page_size();
-        let allocation_bytes = capacity
-            .checked_add(page_alignment - 1)
-            .ok_or_else(|| TapeIoError::OperationFailed("staging buffer size overflow".into()))?;
+        let allocation_bytes = capacity.checked_add(page_alignment - 1).ok_or_else(|| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "staging buffer size overflow".into(),
+                ),
+            )
+        })?;
         let mut storage = Vec::new();
         storage.try_reserve_exact(allocation_bytes).map_err(|err| {
-            TapeIoError::OperationFailed(format!(
-                "failed to allocate page-aligned staging buffer: {err}"
-            ))
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "failed to allocate page-aligned staging buffer: {err}"
+                )),
+            )
         })?;
         storage.resize(allocation_bytes, 0);
         let address = storage.as_ptr() as usize;
@@ -277,13 +281,18 @@ impl PageAlignedBuffer {
     }
 
     pub(crate) fn append(&mut self, bytes: &[u8]) -> Result<(), TapeIoError> {
-        let end = self
-            .used
-            .checked_add(bytes.len())
-            .ok_or_else(|| TapeIoError::OperationFailed("staging buffer cursor overflow".into()))?;
+        let end = self.used.checked_add(bytes.len()).ok_or_else(|| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "staging buffer cursor overflow".into(),
+                ),
+            )
+        })?;
         if end > self.capacity {
-            return Err(TapeIoError::OperationFailed(
-                "staging buffer exceeded fixed batch capacity".into(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "staging buffer exceeded fixed batch capacity".into(),
+                ),
             ));
         }
         let destination = self.start + self.used..self.start + end;
@@ -346,12 +355,22 @@ impl PipelinedWindow {
 
     pub(crate) fn push(&mut self, batch: PipelinedBatch) -> Result<(), TapeIoError> {
         let slot = self.batches.get_mut(self.len).ok_or_else(|| {
-            TapeIoError::OperationFailed("pipelined window exceeded ring depth".into())
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "pipelined window exceeded ring depth".into(),
+                ),
+            )
         })?;
         self.bytes = self
             .bytes
             .checked_add(batch.buffer.used as u64)
-            .ok_or_else(|| TapeIoError::OperationFailed("pipelined window byte overflow".into()))?;
+            .ok_or_else(|| {
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "pipelined window byte overflow".into(),
+                    ),
+                )
+            })?;
         *slot = Some(batch);
         self.len += 1;
         Ok(())
@@ -430,6 +449,10 @@ impl<'a, S: BlockSink + ?Sized> ObjectDigestBlockSink<'a, S> {
 }
 
 impl<S: BlockSink + ?Sized> BlockSink for ObjectDigestBlockSink<'_, S> {
+    fn finish_adapter_error(&mut self, kind: remanence_library::TapeIoErrorKind) -> TapeIoError {
+        self.inner.finish_adapter_error(kind)
+    }
+
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         let outcome = self.inner.write_block(buf)?;
         self.hasher.update(buf);
@@ -504,9 +527,11 @@ impl StagedBlockSink {
 
     pub(crate) fn check_poison(&self) -> Result<(), TapeIoError> {
         if let Some(message) = staged_poison_message(&self.poison) {
-            Err(TapeIoError::OperationFailed(format!(
-                "pipelined transfer poisoned after sink error: {message}"
-            )))
+            Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "pipelined transfer poisoned after sink error: {message}"
+                )),
+            ))
         } else {
             Ok(())
         }
@@ -521,7 +546,11 @@ impl StagedBlockSink {
         let received = self.free_rx.recv();
         self.diagnostics.wait_us.record(wait_started.elapsed());
         let buffer = received.map_err(|_| {
-            TapeIoError::OperationFailed("pipelined staging ring was closed".into())
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "pipelined staging ring was closed".into(),
+                ),
+            )
         })?;
         self.current = Some(buffer);
         Ok(())
@@ -536,8 +565,13 @@ impl StagedBlockSink {
             return Ok(());
         }
         self.diagnostics.refill_us.record(buffer.refill_elapsed);
-        let block_size_bytes = u32::try_from(self.caps.block_size)
-            .map_err(|_| TapeIoError::OperationFailed("batch block size exceeds u32".into()))?;
+        let block_size_bytes = u32::try_from(self.caps.block_size).map_err(|_| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "batch block size exceeds u32".into(),
+                ),
+            )
+        })?;
         let records = records_in_staged_batch(buffer.bytes(), block_size_bytes)?;
         let cdb = remanence_scsi::read_write::build_write_fixed_cdb(records);
         self.window.push(PipelinedBatch {
@@ -560,7 +594,13 @@ impl StagedBlockSink {
         let window = std::mem::replace(&mut self.window, PipelinedWindow::new());
         self.tx
             .send(PipelinedSinkCommand::WriteWindow(window))
-            .map_err(|_| TapeIoError::OperationFailed("pipelined submitter stopped".into()))?;
+            .map_err(|_| {
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "pipelined submitter stopped".into(),
+                    ),
+                )
+            })?;
         self.check_poison()
     }
 
@@ -575,16 +615,24 @@ impl StagedBlockSink {
     ) -> Result<T, TapeIoError> {
         self.check_poison()?;
         let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.tx
-            .send(build(reply_tx))
-            .map_err(|_| TapeIoError::OperationFailed("pipelined submitter stopped".into()))?;
+        self.tx.send(build(reply_tx)).map_err(|_| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "pipelined submitter stopped".into(),
+                ),
+            )
+        })?;
         match reply_rx.recv() {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => Err(TapeIoError::OperationFailed(format!(
-                "pipelined submitter error: {message}"
-            ))),
-            Err(_) => Err(TapeIoError::OperationFailed(
-                "pipelined submitter dropped reply".into(),
+            Ok(Err(message)) => Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "pipelined submitter error: {message}"
+                )),
+            )),
+            Err(_) => Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "pipelined submitter dropped reply".into(),
+                ),
             )),
         }
     }
@@ -600,10 +648,13 @@ impl StagedBlockSink {
 
     pub(crate) fn advance_cursor(&mut self, records: u32) -> Result<TapePosition, TapeIoError> {
         let before = self.seed_cursor()?;
-        let lba = before
-            .lba
-            .checked_add(u64::from(records))
-            .ok_or_else(|| TapeIoError::OperationFailed("batch position overflow".into()))?;
+        let lba = before.lba.checked_add(u64::from(records)).ok_or_else(|| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "batch position overflow".into(),
+                ),
+            )
+        })?;
         let position = TapePosition {
             lba,
             partition: before.partition,
@@ -642,11 +693,13 @@ impl StagedBlockSink {
 impl BlockSink for StagedBlockSink {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         if buf.len() != self.caps.block_size {
-            return Err(TapeIoError::OperationFailed(format!(
-                "pipelined fixed write requires {}-byte records, got {}",
-                self.caps.block_size,
-                buf.len()
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "pipelined fixed write requires {}-byte records, got {}",
+                    self.caps.block_size,
+                    buf.len()
+                )),
+            ));
         }
         self.acquire_buffer()?;
         let refill_started = Instant::now();
@@ -682,15 +735,22 @@ impl BlockSink for StagedBlockSink {
             || buf.is_empty()
             || !buf.len().is_multiple_of(self.caps.block_size)
         {
-            return Err(TapeIoError::OperationFailed(
-                "pipelined batch must contain whole configured records".into(),
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "pipelined batch must contain whole configured records".into(),
+                ),
             ));
         }
         self.flush_pending()?;
         let _: Option<WriteBatchOutcome> =
             self.request(|reply| PipelinedSinkCommand::Barrier { reply })?;
-        let records = u32::try_from(buf.len() / self.caps.block_size)
-            .map_err(|_| TapeIoError::OperationFailed("batch record count overflow".into()))?;
+        let records = u32::try_from(buf.len() / self.caps.block_size).map_err(|_| {
+            remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "batch record count overflow".into(),
+                ),
+            )
+        })?;
         for block in buf.chunks_exact(self.caps.block_size) {
             self.write_block(block)?;
         }
@@ -698,13 +758,19 @@ impl BlockSink for StagedBlockSink {
         let outcome = self
             .request(|reply| PipelinedSinkCommand::Barrier { reply })?
             .ok_or_else(|| {
-                TapeIoError::OperationFailed("pipelined batch barrier lost its outcome".into())
+                remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "pipelined batch barrier lost its outcome".into(),
+                    ),
+                )
             })?;
         if outcome.records_written != records {
-            return Err(TapeIoError::OperationFailed(format!(
-                "pipelined batch outcome mismatch: requested={records} written={}",
-                outcome.records_written
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "pipelined batch outcome mismatch: requested={records} written={}",
+                    outcome.records_written
+                )),
+            ));
         }
         self.cursor = Some(outcome.position_after);
         Ok(outcome)
@@ -806,14 +872,9 @@ where
 {
     let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
     run_ring_staged_transfer(inner, block_size, producer, None, |error| {
+        let outcome = staged_failure_outcome(error);
         let error = error.to_string();
-        record_tape_io_fence_for_transfer_error(
-            state,
-            fence_cfg,
-            selected,
-            tape_io_fence_reason_for_transfer_error(&error),
-            &error,
-        )
+        record_tape_io_fence_for_transfer_error(state, fence_cfg, selected, &outcome, &error)
     })?
     .result
 }
@@ -841,14 +902,9 @@ where
             {
                 return Ok(());
             }
+            let outcome = staged_failure_outcome(error);
             let error = error.to_string();
-            record_tape_io_fence_for_transfer_error(
-                state,
-                fence_cfg,
-                selected,
-                tape_io_fence_reason_for_transfer_error(&error),
-                &error,
-            )
+            record_tape_io_fence_for_transfer_error(state, fence_cfg, selected, &outcome, &error)
         })?;
     inner.stats.record_staging(&outcome.staging_diagnostics);
     outcome.result
@@ -989,7 +1045,9 @@ where
             Ok(()) => match producer_result {
                 Ok(value) => Ok(value),
                 Err(primary) => {
-                    let safety_error = TapeIoError::OperationFailed(primary.to_string());
+                    let safety_error = inner.finish_adapter_error(
+                        remanence_library::TapeIoErrorKind::OperationFailed(primary.to_string()),
+                    );
                     match on_safety_error(&safety_error) {
                         Ok(()) => Err(primary),
                         Err(secondary) => Err(attach_secondary(
@@ -1014,7 +1072,9 @@ where
         ));
         result = match result {
             Ok(_) => {
-                let safety_error = TapeIoError::OperationFailed(imbalance.to_string());
+                let safety_error = inner.finish_adapter_error(
+                    remanence_library::TapeIoErrorKind::OperationFailed(imbalance.to_string()),
+                );
                 let fence_result = on_safety_error(&safety_error);
                 inner.flush_pending_pipeline_audit();
                 match fence_result {
@@ -1232,6 +1292,9 @@ pub(crate) fn execute_pipelined_window<S: BlockSink + ?Sized>(
                     && !outcome.end_of_medium =>
             {
                 if let Some(error) = buffer_return_error {
+                    let failure = inner.finish_adapter_error(
+                        remanence_library::TapeIoErrorKind::OperationFailed(error.to_string()),
+                    );
                     return finish_pipelined_window_failure(
                         inner,
                         &mut window,
@@ -1241,21 +1304,23 @@ pub(crate) fn execute_pipelined_window<S: BlockSink + ?Sized>(
                         bytes,
                         first_records,
                         last_records,
-                        TapeIoError::OperationFailed(error.to_string()),
+                        failure,
                         None,
                     );
                 }
                 outcome
             }
             Ok(outcome) => {
-                let err = TapeIoError::PartialBatchUncommittable {
-                    requested_records: requested,
-                    written_records: outcome.records_written,
-                    requested_bytes,
-                    written_bytes: u64::from(outcome.bytes_written),
-                    end_of_medium: outcome.end_of_medium,
-                    sense: None,
-                };
+                let err = inner.finish_adapter_error(
+                    remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+                        requested_records: requested,
+                        written_records: outcome.records_written,
+                        requested_bytes,
+                        written_bytes: u64::from(outcome.bytes_written),
+                        end_of_medium: outcome.end_of_medium,
+                        sense: None,
+                    },
+                );
                 return finish_pipelined_window_failure(
                     inner,
                     &mut window,
@@ -1398,18 +1463,24 @@ pub(crate) fn records_in_staged_batch(
     block_size_bytes: u32,
 ) -> Result<u32, TapeIoError> {
     if block_size_bytes == 0 {
-        return Err(TapeIoError::OperationFailed(
-            "staged write batch block size must be nonzero".to_string(),
+        return Err(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "staged write batch block size must be nonzero".to_string(),
+            ),
         ));
     }
     let block_size = block_size_bytes as usize;
     if data.is_empty() || !data.len().is_multiple_of(block_size) {
-        return Err(TapeIoError::OperationFailed(
-            "staged write batch must contain whole records".to_string(),
+        return Err(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "staged write batch must contain whole records".to_string(),
+            ),
         ));
     }
     u32::try_from(data.len() / block_size).map_err(|_| {
-        TapeIoError::OperationFailed("staged write batch record count overflow".to_string())
+        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(
+            "staged write batch record count overflow".to_string(),
+        ))
     })
 }
 
@@ -1504,6 +1575,10 @@ impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
 }
 
 impl<'a> BlockSink for LiveCounterBlockSink<'a> {
+    fn finish_adapter_error(&mut self, kind: remanence_library::TapeIoErrorKind) -> TapeIoError {
+        self.inner.finish_adapter_error(kind)
+    }
+
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         let outcome = self.inner.write_block(buf)?;
         self.live_write_counter
@@ -1535,7 +1610,10 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
             Ok(outcome) => self
                 .live_write_counter
                 .record_write_bytes(u64::from(outcome.bytes_written)),
-            Err(TapeIoError::GoodWriteTripwire { outcome, .. }) => self
+            Err(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::GoodWriteTripwire { outcome, .. },
+                ..
+            }) => self
                 .live_write_counter
                 .record_write_bytes(u64::from(outcome.bytes_written)),
             Err(_) => {}
@@ -1660,6 +1738,10 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
 }
 
 impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
+    fn finish_adapter_error(&mut self, kind: remanence_library::TapeIoErrorKind) -> TapeIoError {
+        self.inner.finish_adapter_error(kind)
+    }
+
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
         let started = Instant::now();
         let result = self.inner.write_block(buf);
@@ -1699,7 +1781,10 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
             Ok(outcome) => self
                 .stats
                 .record_block(u64::from(outcome.bytes_written), outcome.early_warning),
-            Err(TapeIoError::GoodWriteTripwire { outcome, .. }) => self
+            Err(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::GoodWriteTripwire { outcome, .. },
+                ..
+            }) => self
                 .stats
                 .record_block(u64::from(outcome.bytes_written), outcome.early_warning),
             Err(_) => {}
@@ -1849,6 +1934,15 @@ pub(crate) struct TimedRawTapeSink<'a> {
 }
 
 impl remanence_parity::RawTapeSink for TimedRawTapeSink<'_> {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        self.inner.finish_adapter_error(kind, class)
+    }
+
     fn locate_for_overwrite(
         &mut self,
         hint: remanence_parity::PhysicalPositionHint,

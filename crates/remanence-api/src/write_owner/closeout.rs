@@ -106,12 +106,14 @@ pub(super) fn handle(
         ctx,
     )
     .map_err(|error| {
+        let outcome = crate::append_admission::admission_error_outcome(&error);
         crate::append_admission::daemon_admission_error(
             remanence_state::AuditActor::System,
             index,
             &super::terminal_types::TerminalConfig::terminal_config(cfg),
             tape_uuid,
             error,
+            &outcome,
         )
     })?;
     if let Some(eod) = admission.ended_tail_eod {

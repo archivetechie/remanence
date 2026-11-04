@@ -1,5 +1,6 @@
 //! Behavior-preserving operational cluster extracted from the parent module.
 
+use crate::closeout_obligation::RetryCauseExt as _;
 use std::io::Write;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
@@ -307,7 +308,12 @@ pub(crate) fn stream_one_object(
         &mut *drive,
         crate::BotRelativeTapeFile(copy.tape_file_number),
     )
-    .map_err(|err| Status::internal(format!("position before object read: {err}")))?;
+    .map_err(|err| {
+        attach_outcome_retry(
+            err.outcome(),
+            Status::internal(format!("position before object read: {err}")),
+        )
+    })?;
 
     drive.reset_pipelined_diagnostics();
     let wall_started = Instant::now();
@@ -339,7 +345,7 @@ pub(crate) fn stream_one_object(
                     },
                     Arc::clone(&cfg.io_memory),
                 )
-                .map_err(|err| Status::internal(format!("read object: {err}")))?;
+                .map_err(|err| status_from_format_error(&err, format!("read object: {err}")))?;
                 let (_payload_bytes, _digest) = sink
                     .finish()
                     .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
@@ -783,6 +789,9 @@ pub(crate) fn requested_file_range(
 }
 
 pub(crate) fn status_from_file_range_error(err: FormatError) -> Status {
+    if let FormatError::TapeIo(error) = &err {
+        return status_from_tape_io_error(error, format!("read object range: {err}"));
+    }
     match err {
         FormatError::InvalidInput(message) => Status::invalid_argument(message),
         other => Status::internal(format!("read object range: {other}")),
@@ -793,12 +802,17 @@ pub(crate) fn verify_loaded_tape_identity(
     drive: &mut DriveHandle,
     tape_uuid: &[u8; 16],
 ) -> Result<(), Status> {
-    drive
-        .rewind()
-        .map_err(|err| Status::internal(format!("rewind before read: {err}")))?;
+    drive.rewind().map_err(|err| {
+        attach_outcome_retry(
+            err.outcome(),
+            Status::internal(format!("rewind before read: {err}")),
+        )
+    })?;
     let mut source = DriveHandleSource(drive);
-    verify_tape_identity(&mut source, tape_uuid)
-        .map_err(|err| Status::failed_precondition(format!("tape identity: {err}")))?;
+    verify_tape_identity(&mut source, tape_uuid).map_err(|err| {
+        crate::closeout_obligation::RetryCause::identity(&err)
+            .attach(Status::failed_precondition(format!("tape identity: {err}")))
+    })?;
     Ok(())
 }
 
@@ -815,9 +829,12 @@ pub(crate) fn position_read_resume(
         0,
         0,
     )?;
-    drive
-        .rewind()
-        .map_err(|err| Status::internal(format!("rewind before resume position: {err}")))?;
+    drive.rewind().map_err(|err| {
+        attach_outcome_retry(
+            err.outcome(),
+            Status::internal(format!("rewind before resume position: {err}")),
+        )
+    })?;
     let mut source = DriveHandleSource(drive);
     verify_and_position_read_resume_from_source(&mut source, request, target)
 }
@@ -827,11 +844,16 @@ pub(crate) fn verify_and_position_read_resume_from_source(
     request: crate::read_core::PlaintextFileRangeReadRequest,
     target: &ReadResumeTarget,
 ) -> Result<u64, Status> {
-    verify_tape_identity(source, &target.tape_uuid)
-        .map_err(|err| Status::failed_precondition(format!("tape identity: {err}")))?;
-    source
-        .locate(0)
-        .map_err(|err| Status::internal(format!("return to BOT after identity proof: {err}")))?;
+    verify_tape_identity(source, &target.tape_uuid).map_err(|err| {
+        crate::closeout_obligation::RetryCause::identity(&err)
+            .attach(Status::failed_precondition(format!("tape identity: {err}")))
+    })?;
+    source.locate(0).map_err(|err| {
+        attach_outcome_retry(
+            err.outcome(),
+            Status::internal(format!("return to BOT after identity proof: {err}")),
+        )
+    })?;
     position_read_resume_from_source(source, request, target)
 }
 
@@ -860,19 +882,32 @@ pub(crate) fn position_read_resume_from_source(
         .map_err(|_| Status::invalid_argument("tape file number exceeds SPACE range"))?;
     let mut positioned = source
         .space(tape_file_spacing, SpaceKind::Filemarks)
-        .map_err(|err| Status::internal(format!("space to resume object: {err}")))?
+        .map_err(|err| {
+            attach_outcome_retry(
+                err.outcome(),
+                Status::internal(format!("space to resume object: {err}")),
+            )
+        })?
         .position_after;
     let skip_blocks = i64::try_from(first_chunk_lba.0)
         .map_err(|_| Status::invalid_argument("resume file boundary exceeds SPACE range"))?;
     if skip_blocks != 0 {
         positioned = source
             .space(skip_blocks, SpaceKind::Blocks)
-            .map_err(|err| Status::internal(format!("space to resume file boundary: {err}")))?
+            .map_err(|err| {
+                attach_outcome_retry(
+                    err.outcome(),
+                    Status::internal(format!("space to resume file boundary: {err}")),
+                )
+            })?
             .position_after;
     }
-    let proof = source
-        .prove_read_position(positioned)
-        .map_err(|err| Status::failed_precondition(format!("resume position proof: {err}")))?;
+    let proof = source.prove_read_position(positioned).map_err(|err| {
+        attach_outcome_retry(
+            err.outcome(),
+            Status::failed_precondition(format!("resume position proof: {err}")),
+        )
+    })?;
     if let Some(expected) = target.expected_position_lba {
         if proof.lba() != expected {
             return Err(Status::failed_precondition(format!(
@@ -1031,6 +1066,7 @@ pub(crate) fn status_from_streaming_error(err: &StreamingError, message: String)
 
 pub(crate) fn status_from_format_error(err: &FormatError, message: String) -> Status {
     match err {
+        FormatError::TapeIo(error) => status_from_tape_io_error(error, message),
         FormatError::InvalidInput(_) => Status::invalid_argument(message),
         _ => Status::internal(message),
     }
@@ -1089,4 +1125,23 @@ pub(crate) fn status_from_select_tape_error(
 
 pub(crate) fn now_rfc3339() -> Result<String, time::error::Format> {
     OffsetDateTime::now_utc().format(&Rfc3339)
+}
+
+/// Render retry metadata from the command's existing decision, preserving its cause.
+pub(super) fn attach_outcome_retry(
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
+    mut status: Status,
+) -> Status {
+    use remanence_library::outcome::RetryCause;
+    status.metadata_mut().insert(
+        "remanence-retry",
+        match outcome.retry {
+            RetryCause::Transient => "transient",
+            RetryCause::Operator => "operator",
+            RetryCause::Media => "media",
+        }
+        .parse()
+        .expect("fixed retry metadata"),
+    );
+    status
 }

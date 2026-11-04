@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
-use remanence_library::{scsi::ScsiError, DriveHandle, LinuxSgTransport, TapeIoError};
+use remanence_library::{scsi::ScsiError, DriveHandle, LinuxSgTransport};
 use remanence_parity::{
     encode_tape_index_bootstrap_footer, encode_tape_index_replica_header,
     read_terminal_index_inventory, reconcile_terminal_tail_next,
@@ -521,13 +521,15 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
         };
         self.read_lbas.push(position.lba);
         if self.unreadable_lbas.contains(&position.lba) {
-            return Err(TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                // Descriptor-format MEDIUM ERROR / UNRECOVERED READ ERROR.
-                // The production terminal reader may fall back only for this
-                // typed damage class; generic/transport failures must abort.
-                sense: vec![0x72, 0x03, 0x11, 0x00],
-                bytes_transferred: 0,
-            })
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::CheckCondition {
+                    // Descriptor-format MEDIUM ERROR / UNRECOVERED READ ERROR.
+                    // The production terminal reader may fall back only for this
+                    // typed damage class; generic/transport failures must abort.
+                    sense: vec![0x72, 0x03, 0x11, 0x00],
+                    bytes_transferred: 0,
+                }),
+            )
             .into());
         }
         let outcome = self.inner.read_record(buf)?;
@@ -677,6 +679,22 @@ impl MotionRefusingSink {
 }
 
 impl RawTapeSink for MotionRefusingSink {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        remanence_library::TapeIoError::new_with_context(
+            kind,
+            class,
+            remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Finalization,
+                ..Default::default()
+            },
+        )
+    }
+
     fn locate_for_overwrite(&mut self, _hint: PhysicalPositionHint) -> Result<(), ParityError> {
         self.reject_motion().map(|_| ())
     }

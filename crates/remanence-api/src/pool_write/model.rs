@@ -74,6 +74,15 @@ impl<'a> CapacityTrackingRawTapeSink<'a> {
 }
 
 impl RawTapeSink for CapacityTrackingRawTapeSink<'_> {
+    /// Finish adapter facts in this sink's explicit operation authority.
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        self.inner.finish_adapter_error(kind, class)
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.ensure_position_ready()?;
         self.write_attempted.set(true);

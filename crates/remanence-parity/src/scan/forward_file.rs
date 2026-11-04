@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::raw::{device_position_after, RawPositionReport, RawReadEnd};
-use remanence_library::TapeIoError;
 
 /// Evidence that establishes the head before any read of this file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,9 +112,10 @@ impl FileObservation {
             Ok(RawReadOutcome::Filemark { .. }) => HeadOutcome::Filemark,
             Ok(RawReadOutcome::EndOfData { .. }) => HeadOutcome::EndOfData,
             Err(e) if scan_read_error_is_medium_damage(e) => HeadOutcome::Unreadable,
-            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { .. })) => {
-                HeadOutcome::WrongLength
-            }
+            Err(ParityError::TapeIo(remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { .. },
+                ..
+            })) => HeadOutcome::WrongLength,
             Err(_) => return Err(read.unwrap_err()),
         };
         if self.head_outcome == HeadOutcome::Block {
@@ -378,7 +378,7 @@ impl ForwardFileReader {
                     if observation.head_read.is_none()
                         && (reason == SpacingReason::Unreadable
                             || matches!(
-                                &error, ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { actual, .. }) if *actual as usize != size
+                                &error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { actual, .. }, .. }) if *actual as usize != size
                             ))
                     {
                         observation.head_outcome = if reason == SpacingReason::Unreadable {

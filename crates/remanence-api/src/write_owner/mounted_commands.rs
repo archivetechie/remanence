@@ -69,7 +69,7 @@ fn event(
 pub(super) fn settle_audit(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
-    drive: &DriveHandle,
+    drive: &mut DriveHandle,
     before: u64,
 ) -> Result<(), Status> {
     let Some(mounted) = cfg.mounted() else {
@@ -84,28 +84,50 @@ pub(super) fn settle_audit(
     };
     let uncertain = before != drive.media_write_dispatch_count();
     // Explicit tail recovery already records its own durable invocation fence.
-    // Preserve its single-fence contract; append failures retain both layers.
+    // Preserve its single-fence contract until B5 removes the reason comparison.
     let supersede_fenced = index
         .tape_io_admission_conflicts(&mounted.tape_uuid, mounted.barcode.as_deref())
         .map_err(crate::status_from_state_error)?
         .iter()
         .any(|fence| fence.reason == "supersede_tail_failed");
-    if uncertain && !supersede_fenced {
-        remanence_state::fence::raise(
-            index,
-            &cfg.audit_dir,
-            remanence_state::TapeIoFenceInput {
-                tape_uuid: mounted.tape_uuid,
-                barcode: mounted.barcode.clone(),
-                reason: "standalone_write_failed".into(),
-                evidence_json: Some(
-                    "{\"reason\":\"mounted operation ended without durable close\"}".into(),
-                ),
-            },
-            Some(&mounted.endpoint),
-            mounted.actor.clone(),
-        )
-        .map_err(crate::status_from_state_error)?;
+    let applied_this_invocation = drive.media_failure_outcome_after(before).is_some()
+        && drive.media_failure_outcome_applied();
+    if uncertain && !supersede_fenced && !applied_this_invocation {
+        let outcome = match drive.media_failure_outcome_after(before).filter(|outcome| {
+            // D2 preserves issued write results, including R6's definite rejection.
+            // A local adapter refusal cannot account for the preceding media writes.
+            outcome.write_context
+                && outcome.evidence.dispatch == remanence_library::outcome::Dispatch::Issued
+        }) {
+            Some(outcome) => outcome.clone(),
+            None => remanence_library::outcome::finish_abandoned_write(
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Append,
+                    region: remanence_library::outcome::Region::Unknown,
+                    mounted: true,
+                    ..Default::default()
+                },
+            ),
+        };
+        drive.retain_operation_failure(before, outcome.clone());
+        if let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect {
+            remanence_state::fence::raise(
+                index,
+                &cfg.audit_dir,
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: mounted.tape_uuid,
+                    barcode: mounted.barcode.clone(),
+                    reason: cause.reason().into(),
+                    evidence_json: Some(
+                        "{\"reason\":\"mounted operation ended without durable close\"}".into(),
+                    ),
+                },
+                Some(&mounted.endpoint),
+                mounted.actor.clone(),
+            )
+            .map_err(crate::status_from_state_error)?;
+        }
+        drive.mark_media_failure_outcome_applied();
     }
     event(
         index,
@@ -336,35 +358,4 @@ pub(super) fn supersede(
             _ => Err(Status::internal("supersede did not produce a preview")),
         }
     })
-}
-
-/// Keep the standalone invocation fence alongside the writer's specific fence.
-/// Called only when this command failed after dispatching modifying media I/O.
-pub(super) fn fence_failed_write(
-    index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
-    status: Status,
-) -> Status {
-    let mounted = cfg.mounted().expect("mounted failure evidence");
-    match remanence_state::fence::raise(
-        index,
-        &cfg.audit_dir,
-        remanence_state::TapeIoFenceInput {
-            tape_uuid: mounted.tape_uuid,
-            barcode: mounted.barcode.clone(),
-            reason: "standalone_write_failed".into(),
-            evidence_json: Some(serde_json::json!({"error": status.message()}).to_string()),
-        },
-        Some(&mounted.endpoint),
-        mounted.actor.clone(),
-    ) {
-        Ok(_) => status,
-        Err(error) => super::ActorFailure::preserve(
-            &status,
-            Status::internal(format!(
-                "{}; additionally failed to persist standalone fence: {error}",
-                status.message()
-            )),
-        ),
-    }
 }

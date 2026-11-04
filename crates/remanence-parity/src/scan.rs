@@ -46,8 +46,6 @@ use crate::tape_index_replica::{
     derive_tape_index_replica_footer_magic, derive_tape_index_replica_header_magic,
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
 };
-#[cfg(test)]
-use remanence_library::TapeIoError;
 use std::time::{Duration, Instant};
 
 /// Catalog-supplied filemark map and protection watermark for a loaded tape.
@@ -2367,39 +2365,49 @@ mod tests {
     impl TestReadFault {
         fn error(self) -> ParityError {
             ParityError::TapeIo(match self {
-                Self::Medium => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x72, 0x03, 0x11, 0x00],
-                        bytes_transferred: 0,
-                    },
+                Self::Medium => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x72, 0x03, 0x11, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::DeferredFixedMedium => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0],
-                        bytes_transferred: 0,
-                    },
+                Self::DeferredFixedMedium => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::DeferredDescriptorMedium => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x73, 0x03, 0x11, 0x00],
-                        bytes_transferred: 0,
-                    },
+                Self::DeferredDescriptorMedium => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x73, 0x03, 0x11, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::Hardware => TapeIoError::CheckCondition(
-                    remanence_library::scsi::ScsiError::CheckCondition {
-                        sense: vec![0x72, 0x04, 0x44, 0x00],
-                        bytes_transferred: 0,
-                    },
+                Self::Hardware => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x72, 0x04, 0x44, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ),
-                Self::Transport => {
-                    TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
-                        status: 0,
-                        host_status: 0,
-                        driver_status: 0x06,
-                        info: 1,
-                        sense: Vec::new(),
-                    })
-                }
+                Self::Transport => remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::Transport(
+                        remanence_library::scsi::ScsiError::TransportError {
+                            status: 0,
+                            host_status: 0,
+                            driver_status: 0x06,
+                            info: 1,
+                            sense: Vec::new(),
+                        },
+                    ),
+                ),
             })
         }
     }
@@ -2516,10 +2524,12 @@ mod tests {
                 Record::Block(block) => {
                     if block.len() > buf.len() {
                         self.cursor += 1;
-                        return Err(remanence_library::TapeIoError::ReadBufferTooSmall {
-                            actual: block.len() as u32,
-                            provided: buf.len() as u32,
-                        }
+                        return Err(remanence_library::TapeIoError::new(
+                            remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                                actual: block.len() as u32,
+                                provided: buf.len() as u32,
+                            },
+                        )
                         .into());
                     }
                     let bytes = block.len();
@@ -3737,7 +3747,7 @@ mod tests {
             let error = measure_current_file(&mut source, PhysicalPositionHint::new(start))
                 .expect_err("a delta that does not fit is refused");
             assert!(
-                matches!(error, ParityError::TapeIo(TapeIoError::OperationFailed(ref m)) if m.starts_with("device-reported position")),
+                matches!(error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::OperationFailed(ref m), .. }) if m.starts_with("device-reported position")),
                 "start {start}: {error:?}"
             );
         }
@@ -3860,11 +3870,17 @@ mod tests {
                 | TestReadFault::DeferredDescriptorMedium
                 | TestReadFault::Hardware => assert!(matches!(
                     error,
-                    ParityError::TapeIo(TapeIoError::CheckCondition(_))
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::CheckCondition(_),
+                        ..
+                    })
                 )),
                 TestReadFault::Transport => assert!(matches!(
                     error,
-                    ParityError::TapeIo(TapeIoError::Transport(_))
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::Transport(_),
+                        ..
+                    })
                 )),
                 TestReadFault::Medium => unreachable!("current-medium case was tested separately"),
             }
@@ -3910,11 +3926,17 @@ mod tests {
                 | TestReadFault::DeferredDescriptorMedium
                 | TestReadFault::Hardware => assert!(matches!(
                     error,
-                    ParityError::TapeIo(TapeIoError::CheckCondition(_))
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::CheckCondition(_),
+                        ..
+                    })
                 )),
                 TestReadFault::Transport => assert!(matches!(
                     error,
-                    ParityError::TapeIo(TapeIoError::Transport(_))
+                    ParityError::TapeIo(remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::Transport(_),
+                        ..
+                    })
                 )),
                 TestReadFault::Medium => unreachable!("current-medium case was tested separately"),
             }
@@ -4481,10 +4503,12 @@ mod tests {
             })
         };
         let longer = |actual: usize, provided: usize| {
-            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-                actual: actual as u32,
-                provided: provided as u32,
-            }))
+            Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                    actual: actual as u32,
+                    provided: provided as u32,
+                },
+            )))
         };
         // At the supplied size, any other measured length is refused.
         hints

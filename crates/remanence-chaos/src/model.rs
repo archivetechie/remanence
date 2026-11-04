@@ -2659,7 +2659,7 @@ mod l1b_tests {
     };
     use remanence_library::{
         AuditEvent, AuditOutcome, BlockRead, DriveHandle, IoErrorKind, LibraryHandle, MoveError,
-        StaticAllowlist, TapeIoError,
+        StaticAllowlist,
     };
     use remanence_parity::{
         scan_reconstruct_filemark_map, DriveHandleRawSink, DriveHandleRawSource, FileRowsKind,
@@ -3343,7 +3343,10 @@ mod l1b_tests {
             }
             assert!(matches!(
                 handle.move_medium(SLOT, BAY, &policy()),
-                Err(MoveError::InventoryChanged { .. })
+                Err(remanence_library::MoveError {
+                    kind: remanence_library::MoveErrorKind::InventoryChanged { .. },
+                    ..
+                })
             ));
             assert_eq!(handle.library(), &world.lock().unwrap().library_snapshot());
             assert!(world
@@ -3387,7 +3390,10 @@ mod l1b_tests {
         }
         assert!(matches!(
             drive.unload(),
-            Err(remanence_library::DriveOpError::Inventory(_))
+            Err(remanence_library::DriveOpError {
+                kind: remanence_library::DriveOpErrorKind::Inventory(_),
+                ..
+            })
         ));
         assert!(!drive.observed_library().unwrap().drive_bays[0].loaded);
         assert!(world
@@ -3450,7 +3456,10 @@ mod l1b_tests {
             .expect_err("LIB-01 fails move");
 
         match err {
-            MoveError::SourceEmpty { addr } => assert_eq!(addr, SLOT),
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::SourceEmpty { addr },
+                ..
+            } => assert_eq!(addr, SLOT),
             other => panic!("expected SourceEmpty, got {other:?}"),
         }
         assert!(!handle.is_dirty());
@@ -3481,7 +3490,10 @@ mod l1b_tests {
             .expect_err("LIB-08 fails move");
 
         match err {
-            MoveError::ScsiError(err) => assert_eq!(scsi_error_tuple(&err), (0x02, 0x04, 0x18)),
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::ScsiError(err),
+                ..
+            } => assert_eq!(scsi_error_tuple(&err), (0x02, 0x04, 0x18)),
             other => panic!("expected ScsiError, got {other:?}"),
         }
         assert_eq!(
@@ -3618,7 +3630,13 @@ mod l1b_tests {
 
         let err = drive.read_block(&mut buf).expect_err("LIB-11 read fails");
 
-        assert!(matches!(err, TapeIoError::NoMedium));
+        assert!(matches!(
+            err,
+            remanence_library::TapeIoError {
+                kind: remanence_library::TapeIoErrorKind::NoMedium,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4146,7 +4164,10 @@ mod l1b_tests {
             .expect_err("the magazine never returns");
 
         match err {
-            MoveError::NotReady { src, dst, detail } => {
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::NotReady { src, dst, detail },
+                ..
+            } => {
                 assert_eq!((src, dst), (BAY, HOME_SLOT));
                 assert!(detail.contains("medium magazine removed"), "{detail}");
             }
@@ -4212,7 +4233,10 @@ mod l1b_tests {
             .expect_err("a changed destination is never retried");
 
         match err {
-            MoveError::InventoryChanged { addr, found, .. } => {
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::InventoryChanged { addr, found, .. },
+                ..
+            } => {
                 assert_eq!(addr, HOME_SLOT);
                 assert!(found.contains("OTHER01"), "{found}");
             }
@@ -4322,9 +4346,27 @@ mod l1b_tests {
                 .expect_err("non-transient sense fails");
 
             match (catalogue_id, err) {
-                ("LIB-01", MoveError::SourceEmpty { addr }) => assert_eq!(addr, SLOT),
-                ("LIB-02", MoveError::DestinationFull { addr }) => assert_eq!(addr, BAY),
-                ("LIB-07", MoveError::ScsiError(err)) => {
+                (
+                    "LIB-01",
+                    remanence_library::MoveError {
+                        kind: remanence_library::MoveErrorKind::SourceEmpty { addr },
+                        ..
+                    },
+                ) => assert_eq!(addr, SLOT),
+                (
+                    "LIB-02",
+                    remanence_library::MoveError {
+                        kind: remanence_library::MoveErrorKind::DestinationFull { addr },
+                        ..
+                    },
+                ) => assert_eq!(addr, BAY),
+                (
+                    "LIB-07",
+                    remanence_library::MoveError {
+                        kind: remanence_library::MoveErrorKind::ScsiError(err),
+                        ..
+                    },
+                ) => {
                     assert_eq!(scsi_error_tuple(&err), expected)
                 }
                 (_, other) => panic!("{catalogue_id}: unexpected {other:?}"),
@@ -4412,7 +4454,10 @@ mod l1b_tests {
 
     fn move_error_tuple(err: MoveError) -> (u8, u8, u8) {
         match err {
-            MoveError::ScsiError(err) => scsi_error_tuple(&err),
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::ScsiError(err),
+                ..
+            } => scsi_error_tuple(&err),
             other => panic!("expected the original sense, got {other:?}"),
         }
     }
@@ -4448,10 +4493,14 @@ mod l1b_tests {
             .expect_err("a swapped source is never moved");
 
         match err {
-            MoveError::InventoryChanged {
-                addr,
-                expected,
-                found,
+            remanence_library::MoveError {
+                kind:
+                    remanence_library::MoveErrorKind::InventoryChanged {
+                        addr,
+                        expected,
+                        found,
+                    },
+                ..
             } => {
                 assert_eq!(addr, SLOT);
                 assert!(expected.contains(BARCODE), "{expected}");
@@ -4684,7 +4733,16 @@ mod l1b_tests {
             .expect_err("a stopped pre-move wait refuses");
 
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(matches!(err, MoveError::NotReady { .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                remanence_library::MoveError {
+                    kind: remanence_library::MoveErrorKind::NotReady { .. },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert_eq!(strings(&audit), ["refused NotReady"]);
         assert_eq!(count(&changer_opcodes(&world), 0xa5), 0);
         assert_eq!(
@@ -4729,7 +4787,10 @@ mod l1b_tests {
             .expect_err("a swapped source is never moved");
 
         match err {
-            MoveError::InventoryChanged { addr, found, .. } => {
+            remanence_library::MoveError {
+                kind: remanence_library::MoveErrorKind::InventoryChanged { addr, found, .. },
+                ..
+            } => {
                 assert_eq!(addr, BAY);
                 assert!(found.contains("SWAP02"), "{found}");
             }

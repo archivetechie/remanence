@@ -1,5 +1,6 @@
 //! Parity-session authority and durable checkpoint barriers.
 
+use crate::closeout_obligation::RetryCauseExt as _;
 use remanence_state::authority::TapeAuthorityView;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -127,6 +128,21 @@ pub(super) fn checked_epoch_rebuild(
     result.map_err(|error| {
         let mut status = status_from_parity_error(&error, error.to_string());
         if let ParityError::CloseoutCheckMismatch { expected, found } = error {
+            use remanence_library::outcome::*;
+            let mut evidence = CompletionEvidence::success();
+            evidence.failed = true;
+            evidence.fact = CompletionFact::CloseoutMismatch;
+            let outcome = classify(OutcomeInput {
+                class: CommandClass::OtherControl,
+                context: OperationContext {
+                    phase: Phase::Closeout,
+                    region: Region::Committed(previous.protected..previous.total),
+                    durability: DurabilityEvidence { checksum_attempts: 2, ..Default::default() },
+                    ..Default::default()
+                },
+                evidence,
+            });
+            let Effect::WriteFence(cause) = outcome.effect else { return status; };
             status = Status::failed_precondition(format!("CloseoutCheckMismatch: tape {} range [{},{}) differs from commit check {} after two reads (found {}); writes are fenced.", Uuid::from_bytes(selected.tape_uuid), previous.protected, previous.total, expected.0, found.0));
             let barcode = match index.get_tape(&selected.tape_uuid) {
                 Ok(tape) => tape.and_then(|t| t.voltag),
@@ -148,7 +164,7 @@ pub(super) fn checked_epoch_rebuild(
                 remanence_state::TapeIoFenceInput {
                     tape_uuid: selected.tape_uuid,
                     barcode,
-                    reason: "CloseoutCheckMismatch".into(),
+                    reason: cause.reason().into(),
                     evidence_json: Some(evidence.to_string()),
                 },
                 cfg.terminal_config().mounted_endpoint.as_ref(),
@@ -164,12 +180,26 @@ pub(super) fn checked_epoch_rebuild(
                 );
             }
         } else if contradiction {
+            use remanence_library::outcome::*;
+            let mut evidence = CompletionEvidence::success();
+            evidence.failed = true;
+            evidence.fact = CompletionFact::CursorContradiction;
+            let outcome = classify(OutcomeInput {
+                class: CommandClass::OtherControl,
+                context: OperationContext {
+                    phase: Phase::Closeout,
+                    region: Region::Committed(previous.protected..previous.total),
+                    ..Default::default()
+                },
+                evidence,
+            });
+            let Effect::WriteFence(cause) = outcome.effect else { return status; };
             status = Status::failed_precondition(format!("CloseoutReadContradiction: tape {} committed range [{},{}) contradicts its recorded extents; writes are fenced.", Uuid::from_bytes(selected.tape_uuid), previous.protected, previous.total));
             record_closeout_fence(
                 index,
                 cfg,
                 selected.tape_uuid,
-                "CloseoutReadContradiction",
+                cause.reason(),
                 serde_json::json!({
                     "open_epoch_start": previous.protected,
                     "open_epoch_end": previous.total,
@@ -215,6 +245,14 @@ impl<'a> ActivityTrackingRawTapeSink<'a> {
 }
 
 impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
+    fn finish_adapter_error(
+        &mut self,
+        kind: remanence_library::TapeIoErrorKind,
+        class: remanence_library::outcome::CommandClass,
+    ) -> remanence_library::TapeIoError {
+        self.inner.finish_adapter_error(kind, class)
+    }
+
     fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         self.position_ready = false;
         self.inner.locate_for_overwrite(hint)
@@ -396,10 +434,21 @@ pub(super) fn open_parity_actor_session_with_rows(
             })()
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?
         };
-        drive
-            .locate_admitted_append(0)
-            .map_err(|err| Status::unavailable(format!("locate fresh parity BOT: {err}")))?;
+        drive.locate_admitted_append(0).map_err(|err| {
+            super::restore::attach_outcome_retry(
+                err.outcome(),
+                Status::unavailable(format!("locate fresh parity BOT: {err}")),
+            )
+        })?;
         let mut write_attempted = false;
+        let dispatch_before = drive.media_write_dispatch_count();
+        let _outcome_context =
+            drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+                phase: remanence_library::outcome::Phase::Initialization,
+                region: remanence_library::outcome::Region::Bot,
+                mounted: cfg.mounted().is_some(),
+                ..Default::default()
+            });
         let opened = {
             let mut raw = DriveHandleRawSink::new(drive);
             let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut write_attempted);
@@ -423,6 +472,12 @@ pub(super) fn open_parity_actor_session_with_rows(
                         "fresh_bootstrap",
                         None,
                         None,
+                        &write_failure_outcome_with_attempt(
+                            drive,
+                            dispatch_before,
+                            Some(&err),
+                            write_attempted,
+                        ),
                         error.as_str(),
                         status,
                     )
@@ -449,7 +504,12 @@ pub(super) fn open_parity_actor_session_with_rows(
                 selected.block_size,
                 drive.identity_generation(),
             )
-            .map_err(|err| Status::unavailable(format!("locate parity checkpoint EOD: {err}")))?;
+            .map_err(|err| {
+                super::restore::attach_outcome_retry(
+                    err.outcome(),
+                    Status::unavailable(format!("locate parity checkpoint EOD: {err}")),
+                )
+            })?;
         let plan = summary
             .append_plan(&scheme)
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
@@ -472,7 +532,12 @@ pub(super) fn open_parity_actor_session_with_rows(
                 selected.block_size,
                 drive.identity_generation(),
             )
-            .map_err(|err| Status::unavailable(format!("restore parity append position: {err}")))?;
+            .map_err(|err| {
+                super::restore::attach_outcome_retry(
+                    err.outcome(),
+                    Status::unavailable(format!("restore parity append position: {err}")),
+                )
+            })?;
         let resume_result = plan
             .complete(Vec::new())
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
@@ -1203,18 +1268,68 @@ fn perform_checkpoint_barrier_with_rows(
     }
 }
 
-pub(super) fn parity_raw_write_fence_reason(error: &str) -> &'static str {
-    if error.contains("TailBeyondKnownState") || error.contains("append admission") {
-        "append_admission_refused"
-    } else if error.contains("partial fixed batch uncommittable") {
-        "partial_batch"
-    } else if error.contains("reset UNIT ATTENTION") {
-        "reset_unit_attention"
-    } else if error.contains("position drift") || error.contains("position mismatch") {
-        "position_drift"
-    } else {
-        "transfer_error"
-    }
+/// Resolve a dispatch-guarded failure, preserving a pre-dispatch carried result.
+pub(super) fn write_failure_outcome(
+    drive: &mut DriveHandle,
+    before: u64,
+    error: Option<&ParityError>,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    write_failure_outcome_with_attempt(drive, before, error, false)
+}
+
+/// An attempt-guarded caller counts an attempted write even when the media gate
+/// refuses it. Preserve an issued write fence or contribute the abandoned host fact.
+pub(super) fn write_failure_outcome_with_attempt(
+    drive: &mut DriveHandle,
+    before: u64,
+    error: Option<&ParityError>,
+    write_attempted: bool,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    // S15 callers retain their base write-attempt/dispatch guards. A local refusal,
+    // read failure, or diagnostic result cannot account for those writes. Even a
+    // valid non-fencing command result cannot erase the base operation fence here;
+    // D2's non-fencing endings are handled by the mounted/init consumers instead.
+    let usable = |outcome: &&remanence_library::outcome::ClassifiedOutcome| {
+        outcome.write_context
+            && outcome.evidence.dispatch == remanence_library::outcome::Dispatch::Issued
+            && matches!(
+                outcome.effect,
+                remanence_library::outcome::Effect::WriteFence(_)
+            )
+    };
+    let carried = match error {
+        Some(ParityError::TapeIo(error)) => Some(error.outcome()),
+        _ => None,
+    };
+    let outcome = carried
+        .filter(|outcome| {
+            // A captured command that the host explicitly refused is stronger
+            // evidence than the adapter's write-attempt flag. With no earlier
+            // media dispatch in this invocation, retain that one outcome.
+            // Synthetic gate refusals have no opcode and keep the S15 contract.
+            (drive.media_write_dispatch_count() <= before
+                && (!write_attempted
+                    || (outcome.evidence.dispatch
+                        == remanence_library::outcome::Dispatch::NotIssued
+                        && matches!(outcome.evidence.opcode, Some(0x0a | 0x10)))))
+                || usable(outcome)
+        })
+        .or_else(|| drive.media_failure_outcome_after(before).filter(usable))
+        .cloned()
+        .unwrap_or_else(|| {
+            remanence_library::outcome::finish_abandoned_write_with_retry(
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Append,
+                    region: remanence_library::outcome::Region::Unknown,
+                    ..Default::default()
+                },
+                carried.map_or(remanence_library::outcome::RetryCause::Transient, |o| {
+                    o.retry
+                }),
+            )
+        });
+    drive.retain_operation_failure(before, outcome.clone());
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1225,9 +1340,14 @@ pub(super) fn fence_failed_parity_raw_write(
     phase: &'static str,
     current_caller_object_id: Option<&str>,
     batch: Option<&PendingCheckpointBatch>,
+    classified: &remanence_library::outcome::ClassifiedOutcome,
     error: &str,
     status: Status,
 ) -> (Status, bool) {
+    let status = super::restore::attach_outcome_retry(classified, status);
+    let remanence_library::outcome::Effect::WriteFence(cause) = classified.effect else {
+        return (status, false);
+    };
     let original = status.clone();
     let cfg = &cfg.terminal_config();
     let barcode = index
@@ -1259,7 +1379,7 @@ pub(super) fn fence_failed_parity_raw_write(
         remanence_state::TapeIoFenceInput {
             tape_uuid: selected.tape_uuid,
             barcode,
-            reason: parity_raw_write_fence_reason(error).to_string(),
+            reason: cause.reason().to_string(),
             evidence_json: Some(evidence),
         },
         selected.standalone_endpoint.as_ref(),
@@ -1724,6 +1844,24 @@ pub(super) fn write_closeout(
     result
 }
 
+/// Classify the new host publication fact without re-reading device evidence.
+pub(super) fn ambiguous_authority_outcome() -> remanence_library::outcome::ClassifiedOutcome {
+    use remanence_library::outcome::*;
+    classify(OutcomeInput {
+        class: CommandClass::OtherControl,
+        context: OperationContext {
+            phase: Phase::LogAppend,
+            region: Region::Unknown,
+            durability: DurabilityEvidence {
+                authority_append: AuthorityAppend::Ambiguous,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        evidence: CompletionEvidence::success(),
+    })
+}
+
 /// Surface an unknown native publication as a fence, without fencing ordinary
 /// media failures whose live ending can still name its exact dispatched tail.
 pub(super) fn fence_ambiguous_authority(
@@ -1735,11 +1873,15 @@ pub(super) fn fence_ambiguous_authority(
     error: &Status,
 ) {
     if lease.ensure_abandonment_allowed().is_err() {
+        let outcome = ambiguous_authority_outcome();
+        let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect else {
+            return;
+        };
         record_closeout_fence(
             index,
             cfg,
             tape_uuid,
-            "AuthorityAmbiguous",
+            cause.reason(),
             serde_json::json!({"phase": phase, "error": error.to_string()}).to_string(),
         );
     }
@@ -1754,42 +1896,78 @@ pub(super) fn fence_admission_contradiction(
     range: Option<(u64, u64)>,
     error: &crate::append_admission::AdmissionError,
 ) -> bool {
-    use crate::append_admission::AdmissionError;
     let mut evidence = match error {
-        AdmissionError::TailBeyondKnownState {
-            expected_eod_lba, ..
+        crate::append_admission::AdmissionError {
+            kind:
+                crate::append_admission::AdmissionErrorKind::TailBeyondKnownState {
+                    expected_eod_lba,
+                    ..
+                },
+            ..
         } => serde_json::json!({
             "phase": "append_suffix", "suffix_start_lba": expected_eod_lba,
             "error": error.to_string()
         }),
-        AdmissionError::Io(cause) if committed_io_contradiction(cause, block_size, 1) => {
+        crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::Io(cause),
+            ..
+        } if committed_io_contradiction(cause, block_size, 1) => {
             serde_json::json!({ "phase": "append_admission", "error": error.to_string() })
         }
-        AdmissionError::SessionSuffixContradiction {
-            detail,
-            partition,
-            lba,
-            sequence,
-            incarnation,
+        crate::append_admission::AdmissionError {
+            kind:
+                crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction {
+                    detail,
+                    partition,
+                    lba,
+                    sequence,
+                    incarnation,
+                    ..
+                },
             ..
         } => {
             serde_json::json!({"phase":"session_suffix","error":detail,"partition":partition,"lba":lba,"tape_log_sequence":sequence,"tape_incarnation":incarnation})
         }
         _ => return false,
     };
-    if matches!(error, AdmissionError::Io(_)) {
+    if matches!(
+        error,
+        crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::Io(_),
+            ..
+        }
+    ) {
         if let Some((w, t)) = range.filter(|(w, t)| w < t) {
             evidence["open_epoch_start"] = w.into();
             evidence["open_epoch_end"] = t.into();
         }
     }
-    record_closeout_fence(
-        index,
-        cfg,
-        tape_uuid,
-        "SessionSuffixContradiction",
-        evidence.to_string(),
-    );
+    // A scoped suffix error already owns this consequence. The other arms
+    // establish a new contradiction between device evidence and append authority.
+    let outcome = if matches!(
+        error.kind,
+        crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. }
+    ) {
+        crate::append_admission::admission_error_outcome(error)
+    } else {
+        use remanence_library::outcome::*;
+        let mut evidence = CompletionEvidence::success();
+        evidence.failed = true;
+        evidence.fact = CompletionFact::SuffixContradiction;
+        classify(OutcomeInput {
+            class: CommandClass::Read,
+            context: OperationContext {
+                phase: Phase::Admission,
+                region: Region::Unknown,
+                ..Default::default()
+            },
+            evidence,
+        })
+    };
+    let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect else {
+        return false;
+    };
+    record_closeout_fence(index, cfg, tape_uuid, cause.reason(), evidence.to_string());
     true
 }
 
@@ -1842,31 +2020,7 @@ fn committed_read_contradiction(error: &ParityError, size: u32, count: u32) -> b
 
 /// Classify tape contradictions shared by identity, append admission and rebuild.
 fn committed_io_contradiction(error: &TapeIoError, size: u32, count: u32) -> bool {
-    if matches!(error, TapeIoError::GoodReadLengthMismatch { .. }) {
-        return false;
-    }
-    if matches!(
-        error,
-        TapeIoError::FilemarkEncountered | TapeIoError::CursorPredecessorNotFilemark
-    ) {
-        return true;
-    }
-    use remanence_library::VerificationReadCompletion as Completion;
-    matches!(
-        remanence_library::verification_read_completion(error, size, count).1,
-        Completion::MediumError
-            | Completion::WrongLength
-            | Completion::Filemark
-            | Completion::EndOfData
-    ) || error.check_condition_transfer().is_some_and(|(sense, _)| {
-        remanence_library::decode_scsi_sense(sense).is_some_and(|s| {
-            !s.is_deferred()
-                && (s.key == 8
-                    || (s.key == 0 && s.filemark)
-                    // Hardware errors qualify only for unrecovered reads or missing records.
-                    || (s.key == 4 && matches!(s.asc, 0x11 | 0x14)))
-        })
-    })
+    size != 0 && count != 0 && error.completion_evidence().committed_contradiction()
 }
 
 /// Track media contradictions without turning transient drive errors into fences.
@@ -1945,10 +2099,12 @@ impl remanence_parity::RawTapeSource for EpochRebuildSource<'_> {
 /// A GOOD completion with an inconsistent host count never proves a media contradiction.
 #[test]
 fn good_read_length_mismatch_stays_transient() {
-    let error = remanence_library::TapeIoError::GoodReadLengthMismatch {
-        requested_bytes: 4096,
-        bytes_transferred: 2048,
-    };
+    let error = remanence_library::TapeIoError::new(
+        remanence_library::TapeIoErrorKind::GoodReadLengthMismatch {
+            requested_bytes: 4096,
+            bytes_transferred: 2048,
+        },
+    );
     assert!(error.is_completion_unknown());
     assert!(!committed_read_contradiction(
         &ParityError::TapeIo(error),
@@ -1965,5 +2121,23 @@ pub(crate) struct SessionSealed;
 impl From<SessionSealed> for Status {
     fn from(error: SessionSealed) -> Self {
         Status::failed_precondition(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod b3b_strict_tests {
+    use super::*;
+    /// Truncated MEDIUM ERROR cannot contradict the committed physical prefix.
+    #[test]
+    fn b3b_committed_contradiction_requires_usable_sense() {
+        let error = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 3],
+                    bytes_transferred: 0,
+                },
+            ),
+        );
+        assert!(!committed_io_contradiction(&error, 512, 4));
     }
 }

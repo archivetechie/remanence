@@ -21,8 +21,7 @@ use remanence_chaos::model::{
 use remanence_library::transport::TransferOutcome;
 use remanence_library::{
     DriveHandle, DriveHandleSource, FixtureTransport, MountEndpoint, RecordingLog,
-    RecordingTransport, ScsiError, SgTransport, StaticAllowlist, TapeIoError, TimeoutClass,
-    VecBlockSink,
+    RecordingTransport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass, VecBlockSink,
 };
 use remanence_parity::{bootstrap::write_bootstrap_block, ParityConfig};
 use remanence_state::{
@@ -60,6 +59,7 @@ fn transport(world: &SharedVirtualWorld) -> FaultTransport {
         hide_serial: false,
         fence_observer: None,
         session_observer: None,
+        short_write: None,
     }
 }
 
@@ -166,6 +166,7 @@ struct FaultTransport {
     hide_serial: bool,
     fence_observer: Option<(PathBuf, u64, Arc<Mutex<usize>>)>,
     session_observer: Option<PathBuf>,
+    short_write: Option<Arc<Mutex<bool>>>,
 }
 
 fn modifies_media(opcode: u8) -> bool {
@@ -264,6 +265,16 @@ impl SgTransport for FaultTransport {
     }
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
         self.check(cdb)?;
+        if cdb[0] == 0x0a {
+            if let Some(fired) = &self.short_write {
+                assert!(
+                    !*fired.lock().unwrap(),
+                    "failed bootstrap cannot retry WRITE"
+                );
+                *fired.lock().unwrap() = true;
+                return Ok(TransferOutcome::clean((buf.len() - 1) as u32));
+            }
+        }
         self.inner.execute_out(cdb, buf)
     }
     fn set_timeout_for(&mut self, class: TimeoutClass) {
@@ -391,7 +402,13 @@ fn c3_identity_generation_invalidates_old_proof_and_allows_reproof() {
         let block = vec![0xa5; BLOCK as usize];
         let result = drive.write_block_with_identity_generation(&block, old);
         assert!(
-            matches!(result, Err(TapeIoError::IdentityInvalidated { .. })),
+            matches!(
+                result,
+                Err(remanence_library::TapeIoError {
+                    kind: remanence_library::TapeIoErrorKind::IdentityInvalidated { .. },
+                    ..
+                })
+            ),
             "{result:?}"
         );
         assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
@@ -1318,4 +1335,265 @@ fn c5_scan_restore_contains_hostile_members_and_destination_symlinks() {
         );
         assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
     }
+}
+
+/// Unknown mounted WRITE leaves one cause-keyed fence after reopen.
+#[test]
+fn b3b_mounted_bootstrap_unknown_write_raises_one_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(&root.path().join("state"));
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let world = world(tape(UUID));
+    let transport = transport(&world);
+    let armed = transport.armed.clone();
+    let before = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(transport),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    *armed.lock().unwrap() = Some(Fault {
+        opcode: 0x0a,
+        key: 0,
+        asc: 0,
+        ascq: 0,
+        completion_unknown: true,
+    });
+    assert!(actor.write_checkpointed(request(root.path())).is_err());
+    assert!(armed.lock().unwrap().is_none(), "WRITE fault was reached");
+    let commands = world.lock().unwrap().command_log.len();
+    assert!(actor.write_checkpointed(request(root.path())).is_err());
+    assert_eq!(world.lock().unwrap().command_log.len(), commands);
+    let _ = actor.finish();
+    drop(actor);
+    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = reopened
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap();
+    assert_eq!(fences.len(), 1, "{fences:?}");
+    assert_eq!(fences[0].reason, "transfer_error");
+    assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
+}
+
+/// A later failed WRITE with a durable live tail preserves the base no-fence result.
+#[test]
+fn b3b_mounted_named_tail_preserves_no_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(&root.path().join("state"));
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let world = world(tape(UUID));
+    let transport = transport(&world);
+    let armed = transport.armed.clone();
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(transport),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    actor.write_checkpointed(request(root.path())).unwrap();
+    let before = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
+    *armed.lock().unwrap() = Some(Fault {
+        opcode: 0x0a,
+        key: 0,
+        asc: 0,
+        ascq: 0,
+        completion_unknown: true,
+    });
+    let mut next = request(root.path());
+    next.caller_object_id = "b3b-later-write".into();
+    assert!(actor.write_checkpointed(next).is_err());
+    assert!(armed.lock().unwrap().is_none(), "WRITE fault was reached");
+    let commands = world.lock().unwrap().command_log.len();
+    let mut retry = request(root.path());
+    retry.caller_object_id = "b3b-later-write".into();
+    assert!(actor.write_checkpointed(retry).is_err());
+    assert_eq!(world.lock().unwrap().command_log.len(), commands);
+    let _ = actor.finish();
+    drop(actor);
+    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = reopened
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap();
+    assert!(fences.is_empty(), "durable live ending: {fences:?}");
+    assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
+}
+
+/// The real mounted bootstrap branch persists one partial_batch fence for a short WRITE.
+#[test]
+fn b3b_mounted_bootstrap_failure_one_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(&root.path().join("state"));
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let world = world(tape(UUID));
+    let fired = Arc::new(Mutex::new(false));
+    let mut injected = transport(&world);
+    injected.short_write = Some(fired.clone());
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(injected),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    let error = actor.write_checkpointed(request(root.path())).unwrap_err();
+    assert!(*fired.lock().unwrap());
+    assert!(error.to_string().contains("partial"), "{error}");
+    let _ = actor.finish();
+    drop(actor);
+    let mut state = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1, "{fences:?}");
+    assert_eq!(fences[0].reason, "partial_batch");
+    let records = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r.event == remanence_state::AuditEvent::TapeIoFenceRaised)
+            .count(),
+        1
+    );
+}
+
+/// A later 05/24/00 WRITE has no fence; a new mounted invocation proves C before its next WRITE.
+#[test]
+fn b3b_mounted_named_tail_rejection_reproves_on_reopen() {
+    // R6 assumes sg data-out reports zero host-transferred bytes for a rejected
+    // WRITE. Capture this on kernel 5.14 in the next field window; a nonzero
+    // report must fail closed, never grant refusal-based position authority.
+    let root = tempfile::tempdir().unwrap();
+    let state = state(&root.path().join("state"));
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let world = world(tape(UUID));
+    let injected = transport(&world);
+    let armed = injected.armed.clone();
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(injected),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    actor.write_checkpointed(request(root.path())).unwrap();
+    let prefix = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
+    *armed.lock().unwrap() = Some(Fault {
+        opcode: 10,
+        key: 5,
+        asc: 0x24,
+        ascq: 0,
+        completion_unknown: false,
+    });
+    let mut next = request(root.path());
+    next.caller_object_id = "b3b-rejected".into();
+    assert!(actor.write_checkpointed(next).is_err());
+    assert!(
+        armed.lock().unwrap().is_none(),
+        "later WRITE reached rejection"
+    );
+    assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, prefix);
+    let _ = actor.finish();
+    drop(actor);
+    let mut state = StateHandle::open_with_config(paths, config).unwrap();
+    assert!(state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    let (recording, log) = RecordingTransport::new(transport(&world));
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(recording),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    let mut retry = request(root.path());
+    retry.caller_object_id = "b3b-after-rejection".into();
+    actor.write_checkpointed(retry).unwrap();
+    let commands = log.borrow();
+    let first_write = commands
+        .iter()
+        .position(|cdb| cdb[0] == 10)
+        .expect("retry reached WRITE");
+    let proof = &commands[..first_write];
+    assert!(
+        proof.iter().any(|cdb| cdb[0] == 8),
+        "re-read identity and suffix"
+    );
+    assert!(
+        proof.iter().any(|cdb| cdb[0] == 0x34),
+        "fresh position proof"
+    );
+    assert!(
+        proof.iter().any(|cdb| matches!(cdb[0], 0x2b | 0x92)),
+        "restore C before write"
+    );
+    drop(commands);
+    actor.finish().unwrap();
+}
+
+/// A later reset-UA WRITE keeps the base durable-ending no-fence behavior.
+#[test]
+fn b3b_fix1_mounted_later_reset_has_no_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(&root.path().join("state"));
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let world = world(tape(UUID));
+    let transport = transport(&world);
+    let armed = transport.armed.clone();
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(transport),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    actor.write_checkpointed(request(root.path())).unwrap();
+    let before = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
+    *armed.lock().unwrap() = Some(Fault {
+        opcode: 0x0a,
+        key: 6,
+        asc: 0x29,
+        ascq: 0,
+        completion_unknown: false,
+    });
+    let mut next = request(root.path());
+    next.caller_object_id = "b3b-later-write".into();
+    assert!(actor.write_checkpointed(next).is_err());
+    assert!(armed.lock().unwrap().is_none(), "WRITE fault was reached");
+    let commands = world.lock().unwrap().command_log.len();
+    let mut retry = request(root.path());
+    retry.caller_object_id = "b3b-later-write".into();
+    assert!(actor.write_checkpointed(retry).is_err());
+    assert_eq!(world.lock().unwrap().command_log.len(), commands);
+    let _ = actor.finish();
+    drop(actor);
+    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = reopened
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap();
+    assert!(fences.is_empty(), "durable live ending: {fences:?}");
+    assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
 }

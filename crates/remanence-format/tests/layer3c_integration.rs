@@ -649,8 +649,10 @@ impl RawTapeSource for PhysicalVecTapeSource {
 
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
         if count < 0 {
-            return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
-                "backward filemark spacing is not implemented in this fixture".to_string(),
+            return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "backward filemark spacing is not implemented in this fixture".to_string(),
+                ),
             )));
         }
         let mut remaining = count;
@@ -675,10 +677,12 @@ impl RawTapeSource for PhysicalVecTapeSource {
         }
         if let Some(block) = self.blocks_by_lba.get(&self.cursor_lba) {
             if buf.len() < block.len() {
-                return Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-                    actual: block.len() as u32,
-                    provided: buf.len() as u32,
-                }));
+                return Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                        actual: block.len() as u32,
+                        provided: buf.len() as u32,
+                    },
+                )));
             }
             buf[..block.len()].copy_from_slice(block);
             self.cursor_lba += 1;
@@ -709,8 +713,10 @@ fn medium_error() -> TapeIoError {
     sense[2] = 0x03;
     sense[7] = 24;
     sense[12] = 0x11;
-    TapeIoError::CheckCondition(ScsiError::CheckCondition {
-        sense,
-        bytes_transferred: 0,
-    })
+    remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::CheckCondition(
+        ScsiError::CheckCondition {
+            sense,
+            bytes_transferred: 0,
+        },
+    ))
 }

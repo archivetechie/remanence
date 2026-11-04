@@ -9,7 +9,7 @@
 use crate::authority::TapeReportPublisher;
 
 use ciborium::value::Value as CborValue;
-use remanence_library::{TapeIoError, TapePosition, WriteFilemarksOutcome};
+use remanence_library::{TapePosition, WriteFilemarksOutcome};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
@@ -855,7 +855,13 @@ pub fn close_checkpointed_terminal_index_prefix(
         ));
     };
     if end_of_medium {
-        return Err(hard_end_of_medium());
+        return Err(hard_end_of_medium(
+            raw,
+            remanence_library::outcome::CommandClass::WriteFilemarks {
+                count: 0,
+                immediate: false,
+            },
+        ));
     }
     let observed = raw.position()?;
     if observed != position_after || observed.lba != expected_plan.tail_start_lba {
@@ -1124,7 +1130,10 @@ fn write_planned_terminal_parity_map(
             ));
         };
         if end_of_medium {
-            return Err(hard_end_of_medium());
+            return Err(hard_end_of_medium(
+                raw,
+                remanence_library::outcome::CommandClass::Write,
+            ));
         }
         // Bounded by the plan's tail start, which was checked to fit.
         expected_lba = expected_lba
@@ -1152,7 +1161,13 @@ fn write_planned_terminal_parity_map(
         ));
     };
     if end_of_medium {
-        return Err(hard_end_of_medium());
+        return Err(hard_end_of_medium(
+            raw,
+            remanence_library::outcome::CommandClass::WriteFilemarks {
+                count: 1,
+                immediate: true,
+            },
+        ));
     }
     // Bounded by the plan's tail start, which was checked to fit.
     expected_lba = expected_lba.checked_add(1).ok_or(ParityError::Invariant(
@@ -1184,8 +1199,14 @@ fn ensure_raw_position(
     Ok(())
 }
 
-fn hard_end_of_medium() -> ParityError {
-    ParityError::TapeIo(TapeIoError::HardEndOfMedium { sense: Vec::new() })
+fn hard_end_of_medium(
+    raw: &mut dyn RawTapeSink,
+    class: remanence_library::outcome::CommandClass,
+) -> ParityError {
+    ParityError::TapeIo(raw.finish_adapter_error(
+        remanence_library::TapeIoErrorKind::HardEndOfMedium { sense: Vec::new() },
+        class,
+    ))
 }
 
 fn hash_filemark_map_entry(
@@ -1492,15 +1513,20 @@ fn accumulate_extent(
         if let crate::raw::RawReadEnd::Error(error) = batch.end {
             let length_refusal = match &error {
                 ParityError::TapeIo(
-                    remanence_library::TapeIoError::InvalidRequest(_)
-                    | remanence_library::TapeIoError::ReadBufferTooSmall { .. },
+                    remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::InvalidRequest(_),
+                        ..
+                    }
+                    | remanence_library::TapeIoError {
+                        kind: remanence_library::TapeIoErrorKind::ReadBufferTooSmall { .. },
+                        ..
+                    },
                 ) => true,
-                ParityError::TapeIo(io) => {
-                    io.check_condition_transfer().is_some_and(|(sense, _)| {
-                        remanence_library::decode_scsi_sense(sense)
-                            .is_some_and(|s| !s.is_deferred() && s.key == 0 && s.ili)
-                    })
-                }
+                ParityError::TapeIo(io) => io.check_condition_transfer().is_some_and(|_| {
+                    io.completion_evidence()
+                        .current_sense()
+                        .is_some_and(|s| !s.is_deferred() && s.key == 0 && s.ili)
+                }),
                 _ => false,
             };
             if length_refusal {
@@ -2547,6 +2573,47 @@ mod tests {
         }
     }
 
+    /// P24 extent recovery must not reinterpret truncated ILI as permission for a single-record re-read.
+    #[test]
+    fn b3b_resume_extent_rejects_truncated_ili() {
+        let error = ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 0x20],
+                    bytes_transferred: 0,
+                },
+            ),
+        ));
+        let diagnostic = error.to_string();
+        let mut source = ScriptedReads(vec![
+            Err(error),
+            Ok(RawReadOutcome::Block {
+                bytes: 512,
+                position_after: PhysicalPositionHint::new(1),
+            }),
+        ]);
+        let scheme = crate::default_scheme_for_block_size(512);
+        let mut accumulator =
+            crate::closeout::EpochAccumulator::new([7; 16], &scheme, 512, 0, 0).unwrap();
+        let error = accumulate_extent(
+            &mut source,
+            &mut [0; 512],
+            512,
+            0,
+            0,
+            0,
+            1,
+            &mut accumulator,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), diagnostic);
+        assert_eq!(
+            source.0.len(),
+            1,
+            "unusable ILI must not trigger the fallback read"
+        );
+    }
+
     /// The image raw source reports a LOCATE past its last record as a drive
     /// does, end-of-data, so the Resumer gives `ResumeAppend` there, as it
     /// would on a real drive, rather than a device fault from a clamped and
@@ -2596,16 +2663,20 @@ mod tests {
             })
         };
         let medium = || {
-            Err(ParityError::TapeIo(TapeIoError::CheckCondition(
-                remanence_library::scsi::ScsiError::CheckCondition {
-                    sense: vec![0x72, 0x03, 0x11, 0x00],
-                    bytes_transferred: 0,
-                },
+            Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x03, 0x11, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
             )))
         };
         let transport = || {
-            Err(ParityError::TapeIo(TapeIoError::Transport(
-                remanence_library::scsi::ScsiError::InvalidInput("timeout"),
+            Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::Transport(
+                    remanence_library::scsi::ScsiError::InvalidInput("timeout"),
+                ),
             )))
         };
         let mut good = ScriptedReads(vec![block(256)]);
@@ -2617,10 +2688,12 @@ mod tests {
             ("short record", block(100)),
             (
                 "long record",
-                Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
-                    actual: 512,
-                    provided: 256,
-                })),
+                Err(ParityError::TapeIo(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::ReadBufferTooSmall {
+                        actual: 512,
+                        provided: 256,
+                    },
+                ))),
             ),
             (
                 "filemark",
@@ -2705,17 +2778,21 @@ mod tests {
         sense[7] = 10;
         sense[12] = asc;
         sense[13] = ascq;
-        ParityError::TapeIo(TapeIoError::CheckCondition(
-            remanence_library::scsi::ScsiError::CheckCondition {
-                sense,
-                bytes_transferred: 0,
-            },
+        ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                },
+            ),
         ))
     }
 
     fn transport() -> ParityError {
-        ParityError::TapeIo(TapeIoError::Transport(
-            remanence_library::scsi::ScsiError::InvalidInput("timeout"),
+        ParityError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::Transport(
+                remanence_library::scsi::ScsiError::InvalidInput("timeout"),
+            ),
         ))
     }
 
@@ -3130,6 +3207,22 @@ mod tests {
     }
 
     impl RawTapeSink for RecordingResumeRawSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
             self.events
                 .borrow_mut()
@@ -4892,6 +4985,22 @@ mod tests {
     }
 
     impl RawTapeSink for ExactTerminalRawSink {
+        /// Finish adapter facts in this sink's explicit operation authority.
+        fn finish_adapter_error(
+            &mut self,
+            kind: remanence_library::TapeIoErrorKind,
+            class: remanence_library::outcome::CommandClass,
+        ) -> remanence_library::TapeIoError {
+            remanence_library::TapeIoError::new_with_context(
+                kind,
+                class,
+                remanence_library::outcome::OperationContext {
+                    phase: remanence_library::outcome::Phase::Finalization,
+                    ..Default::default()
+                },
+            )
+        }
+
         fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
             self.cursor = hint.lba;
             self.blocks.clear();

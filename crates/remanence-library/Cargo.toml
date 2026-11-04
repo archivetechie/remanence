@@ -28,6 +28,8 @@ futures-util = { version = "0.3", optional = true }
 # (event types, trait, coalescer, mock) builds and tests everywhere.
 default = []
 field-kit = []
+# Per-thread classification accounting, enabled only by tests.
+outcome-census = []
 # Path-scoped file durability substitution for hermetic tests.
 test-support = []
 

@@ -91,9 +91,12 @@ fn sense_residue_variable_read_proves_physical_eod_and_preserves_kernel_count() 
     assert_eq!(error.check_condition_transfer(), Some((EOD.as_slice(), 0)));
     assert!(matches!(
         error,
-        TapeIoError::CheckConditionWithResidue {
-            source: ScsiError::CheckCondition {
-                bytes_transferred: REQUESTED,
+        crate::TapeIoError {
+            kind: crate::TapeIoErrorKind::CheckConditionWithResidue {
+                source: ScsiError::CheckCondition {
+                    bytes_transferred: REQUESTED,
+                    ..
+                },
                 ..
             },
             ..
@@ -114,7 +117,13 @@ fn sense_residue_nonzero_kernel_residual_is_authoritative() {
         let error = read_error(EOD.to_vec(), 128, fixed);
         assert_eq!(error.check_condition_transfer().unwrap().1, 128);
         assert!(!error.is_physical_eod());
-        assert!(matches!(error, TapeIoError::CheckCondition(_)));
+        assert!(matches!(
+            error,
+            crate::TapeIoError {
+                kind: crate::TapeIoErrorKind::CheckCondition(_),
+                ..
+            }
+        ));
     }
 }
 
@@ -195,9 +204,11 @@ fn sense_residue_variable_writes_credit_only_transferred_bytes() {
         let error = drive(sense, REQUESTED, false)
             .write_block_unpositioned(&payload)
             .unwrap_err();
-        assert!(matches!(error, TapeIoError::PartialBatchUncommittable {
+        assert!(
+            matches!(error, crate::TapeIoError { kind: crate::TapeIoErrorKind::PartialBatchUncommittable {
             written_bytes, end_of_medium, ..
-        } if written_bytes == u64::from(REQUESTED - 1024) && end_of_medium == (key == 0x4d)));
+        }, .. } if written_bytes == u64::from(REQUESTED - 1024) && end_of_medium == (key == 0x4d))
+        );
     }
 }
 

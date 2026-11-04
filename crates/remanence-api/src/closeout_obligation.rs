@@ -370,54 +370,20 @@ impl WorkList {
     }
 }
 
-/// Preserve retry semantics when typed lower-layer causes become actor Status.
-/// Metadata survives holder diagnostics and RPC forwarding; text is fallback only.
-#[derive(Clone, Copy)]
-pub(crate) enum RetryCause {
-    Transient,
-    Operator,
-    Media,
+/// The policy enum lives below API; tonic rendering and identity adaptation stay here.
+pub(crate) use remanence_library::outcome::RetryCause;
+pub(crate) trait RetryCauseExt {
+    fn identity(error: &crate::TapeIdentityError) -> Self;
+    fn attach(self, status: Status) -> Status;
 }
-impl RetryCause {
-    pub(crate) fn tape_io(error: &remanence_library::TapeIoError) -> Self {
-        use remanence_library::TapeIoError;
-        match error {
-            TapeIoError::CheckCondition(remanence_library::ScsiError::CheckCondition {
-                sense,
-                ..
-            })
-            | TapeIoError::CheckConditionWithResidue {
-                source: remanence_library::ScsiError::CheckCondition { sense, .. },
-                ..
-            } if remanence_scsi::sense::decode_sense(sense)
-                .is_some_and(|s| matches!(s.key, 3 | 4)) =>
-            {
-                Self::Media
-            }
-            TapeIoError::PartialBatchUncommittable {
-                sense: Some(sense), ..
-            } if remanence_scsi::sense::decode_sense(sense)
-                .is_some_and(|s| matches!(s.key, 3 | 4)) =>
-            {
-                Self::Media
-            }
-            TapeIoError::GoodWriteTripwire { cause, .. } => Self::tape_io(cause),
-            TapeIoError::WriteFailureWithPositionError { write_error, .. } => {
-                Self::tape_io(write_error)
-            }
-            TapeIoError::WriteProtected
-            | TapeIoError::DataProtect(_)
-            | TapeIoError::MultiPartitionMedium { .. } => Self::Operator,
-            _ => Self::Transient,
-        }
-    }
-    pub(crate) fn identity(error: &crate::TapeIdentityError) -> Self {
+impl RetryCauseExt for RetryCause {
+    fn identity(error: &crate::TapeIdentityError) -> Self {
         match error {
             crate::TapeIdentityError::Io(error) => Self::tape_io(error),
             _ => Self::Operator,
         }
     }
-    pub(crate) fn attach(self, mut status: Status) -> Status {
+    fn attach(self, mut status: Status) -> Status {
         status.metadata_mut().insert(
             "remanence-retry",
             match self {
@@ -1064,7 +1030,7 @@ mod fix_tests {
     /// Typed medium/hardware causes share a budget; text and contention cannot reset it.
     #[test]
     fn b9_media_faults_park_after_three_attempts_and_wake() {
-        use remanence_library::{ScsiError, TapeIoError};
+        use remanence_library::ScsiError;
         let work = WorkList::default();
         let key = ([0xb9; 16], 1);
         work.observe(key, true);
@@ -1077,11 +1043,12 @@ mod fix_tests {
             sense[0] = 0x70;
             sense[2] = sense_key;
             sense[7] = 10;
-            let cause =
-                RetryCause::tape_io(&TapeIoError::CheckCondition(ScsiError::CheckCondition {
+            let cause = RetryCause::tape_io(&remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::CheckCondition(ScsiError::CheckCondition {
                     sense,
                     bytes_transferred: 0,
-                }));
+                }),
+            ));
             work.failed(
                 key,
                 &cause.attach(Status::unavailable(format!("different diagnostic {n}"))),
@@ -1162,17 +1129,21 @@ mod fix_tests {
     #[test]
     fn b7_fix2_retry_causes_and_unknown_backoff() {
         use crate::write_owner::status_from_pool_write_error;
-        use remanence_library::TapeIoError;
+
         for error in [
-            crate::PoolWriteError::TapeIo(TapeIoError::WriteProtected),
+            crate::PoolWriteError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::WriteProtected,
+            )),
             crate::PoolWriteError::TapeIdentity(crate::TapeIdentityError::Mismatch {
                 expected: "a".into(),
                 actual: "b".into(),
             }),
-            crate::PoolWriteError::TapeIo(TapeIoError::MultiPartitionMedium {
-                count: 2,
-                device: "model".into(),
-            }),
+            crate::PoolWriteError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::MultiPartitionMedium {
+                    count: 2,
+                    device: "model".into(),
+                },
+            )),
         ] {
             let mut status = status_from_pool_write_error(error);
             // Retain only typed metadata, with text that cannot classify it.
@@ -1185,15 +1156,19 @@ mod fix_tests {
             assert!(!transient(&status));
         }
         assert!(transient(&status_from_pool_write_error(
-            crate::PoolWriteError::TapeIo(TapeIoError::IdentityInvalidated {
-                proved: 1,
-                current: 2
-            })
+            crate::PoolWriteError::TapeIo(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::IdentityInvalidated {
+                    proved: 1,
+                    current: 2
+                }
+            ))
         )));
-        let untyped = TapeIoError::IdentityInvalidated {
-            proved: 1,
-            current: 2,
-        };
+        let untyped = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::IdentityInvalidated {
+                proved: 1,
+                current: 2,
+            },
+        );
         assert!(transient(&Status::internal(untyped.to_string())));
         let fence = crate::status_from_state_error(remanence_state::StateError::from(
             remanence_state::tape_log::store::StoreError::Fenced,
@@ -1203,8 +1178,10 @@ mod fix_tests {
             &crate::readiness_wait::ReadinessFence(Uuid::new_v4())
                 .status("identity mismatch; fence")
         ));
-        let transport = crate::PoolWriteError::TapeIo(TapeIoError::OperationFailed(
-            "identity mismatch in transport diagnostic".into(),
+        let transport = crate::PoolWriteError::TapeIo(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "identity mismatch in transport diagnostic".into(),
+            ),
         ));
         assert!(transient(&status_from_pool_write_error(transport)));
         assert!(transient(&Status::unavailable(
@@ -1334,5 +1311,46 @@ mod fix_tests {
         state.closeout_work.finish(key);
         assert_eq!(state.closeout_work.claim(Instant::now(), false), vec![key]);
         assert!(state.closeout_work.entries.lock().unwrap()[&other].parked);
+    }
+}
+
+#[cfg(test)]
+mod b3b_strict_tests {
+    use super::*;
+    /// Truncated MEDIUM ERROR consumes transient retry, never the media budget.
+    #[test]
+    fn b3b_retry_metadata_rejects_truncated_medium() {
+        let error = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::CheckCondition(
+                remanence_library::ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 3],
+                    bytes_transferred: 0,
+                },
+            ),
+        );
+        let status = RetryCause::tape_io(&error).attach(Status::unavailable("position drift"));
+        assert_eq!(
+            status.metadata().get("remanence-retry").unwrap(),
+            "transient"
+        );
+    }
+    /// A partial batch with unusable sense cannot claim a medium retry cause.
+    #[test]
+    fn b3b_partial_retry_metadata_rejects_truncated_medium() {
+        let error = remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::PartialBatchUncommittable {
+                requested_records: 4,
+                written_records: 2,
+                requested_bytes: 2048,
+                written_bytes: 1024,
+                end_of_medium: false,
+                sense: Some(vec![0x70, 0, 3]),
+            },
+        );
+        let status = RetryCause::tape_io(&error).attach(Status::unavailable("medium"));
+        assert_eq!(
+            status.metadata().get("remanence-retry").unwrap(),
+            "transient"
+        );
     }
 }

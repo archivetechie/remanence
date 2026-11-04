@@ -36,7 +36,9 @@ struct Evidence {
 }
 
 fn invalid() -> TapeIoError {
-    TapeIoError::InvalidRequest(ScsiError::InvalidInput("session tail evidence unavailable"))
+    remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::InvalidRequest(
+        ScsiError::InvalidInput("session tail evidence unavailable"),
+    ))
 }
 
 impl SessionTail {
@@ -252,9 +254,11 @@ impl MediaDispatchObserver for SessionTail {
             .and_then(std::sync::Weak::upgrade)
             .and_then(|c| c.failure_message())
         {
-            return Err(TapeIoError::OperationFailed(format!(
-                "append source failed before media dispatch: {message}"
-            )));
+            return Err(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(format!(
+                    "append source failed before media dispatch: {message}"
+                )),
+            ));
         }
         if cdb[0] == 0x0a {
             let bytes = data.ok_or_else(invalid)?;
