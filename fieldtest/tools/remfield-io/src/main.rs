@@ -700,10 +700,23 @@ async fn open_write_session(
         idempotency_key: None,
         recover_session_id: None,
     };
+    open_write_session_with(channel, client, request, no_wait)
+        .await
+        .map(|response| response.session_id)
+}
+
+/// The one open path: a media-readiness fence or a busy bay is waited on and
+/// the same request is retried, unless `no_wait` asks for the refusal itself.
+async fn open_write_session_with(
+    channel: Channel,
+    client: &mut pb::write_session_service_client::WriteSessionServiceClient<Channel>,
+    request: impl Fn() -> pb::OpenWriteSessionRequest,
+    no_wait: bool,
+) -> AppResult<pb::WriteSession> {
     let mut retry = OpenRetry::from_env()?;
     loop {
         match client.open_write_session(request()).await {
-            Ok(response) => return Ok(response.into_inner().session_id),
+            Ok(response) => return Ok(response.into_inner()),
             Err(status) if !no_wait => {
                 wait_before_open_retry(channel.clone(), &status, &mut retry).await?
             }
