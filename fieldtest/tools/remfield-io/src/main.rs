@@ -725,6 +725,34 @@ async fn open_write_session_with(
     }
 }
 
+/// Retry one daemon call through the shared media-readiness and busy-bay wait.
+/// A tape the daemon must load (re-)enters "becoming ready" for a few seconds
+/// after every load; any call that needs it mounted is fenced until then.
+/// Other refusals come back unchanged so the caller can match on them.
+async fn call_with_readiness_retry<T, F, Fut>(
+    channel: Channel,
+    mut call: F,
+) -> AppResult<Result<T, tonic::Status>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let mut retry = OpenRetry::from_env()?;
+    loop {
+        match call().await {
+            Ok(response) => return Ok(Ok(response.into_inner())),
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && (media_readiness_operation_id(status.message()).is_some()
+                        || drive_bay_busy(status.message())) =>
+            {
+                wait_before_open_retry(channel.clone(), &status, &mut retry).await?
+            }
+            Err(status) => return Ok(Err(status)),
+        }
+    }
+}
+
 async fn close_write_session(
     client: &mut pb::write_session_service_client::WriteSessionServiceClient<Channel>,
     session_id: &[u8],
