@@ -552,11 +552,11 @@ impl ApiState {
 
     /// Stop drive admission, new idle dismounts, and readiness polling before gRPC drains.
     pub fn begin_shutdown(&self) {
-        let _guard = self
-            .operations
-            .readiness_start
-            .lock()
-            .expect("readiness start lock");
+        // Never wait for catalog/audit work under readiness_start before
+        // closing motion admission. Already-admitted work keeps its ownership.
+        if let Some(pool) = &self.drive_pool {
+            pool.begin_shutdown();
+        }
         self.readiness_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(pool) = &self.drive_pool {
@@ -565,7 +565,6 @@ impl ApiState {
                     + std::time::Duration::from_secs(self.shutdown_close_deadline_secs)
             });
             pool.shutdown_notify.notify_waiters();
-            pool.begin_shutdown();
             pool.readiness_wake.notify.notify_one();
         }
     }

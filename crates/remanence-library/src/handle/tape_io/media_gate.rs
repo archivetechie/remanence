@@ -515,15 +515,27 @@ impl MediaFencedTransport {
     /// CDB routed around the gate fails closed instead of reaching
     /// the medium unfenced.
     pub(in crate::handle) fn execute_none_nonmedia(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.execute_none_nonmedia_with_admission(cdb, &mut || Ok(()))
+    }
+
+    /// Commit motion only after verification callbacks and deadline checks,
+    /// directly before handing the CDB to the underlying transport.
+    pub(in crate::handle) fn execute_none_nonmedia_with_admission<E: From<ScsiError>>(
+        &mut self,
+        cdb: &[u8],
+        admit: &mut dyn FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
         if cdb.first().copied().is_some_and(opcode_requires_media_gate) {
             return Err(ScsiError::InvalidInput(
                 "media-modifying CDB refused on the non-media dispatch path; \
                  route it through the media-dispatch gate",
-            ));
+            )
+            .into());
         }
         let started = Instant::now();
         self.verification.check_cancelled()?;
         self.check_command_deadline()?;
+        admit()?;
         let result = self.inner.execute_none(cdb);
         #[cfg(feature = "field-kit")]
         crate::field_trace::record(
@@ -538,7 +550,7 @@ impl MediaFencedTransport {
         if let Err(error) = &result {
             self.note_error(error, cdb.first() == Some(&0x00));
         }
-        result
+        result.map_err(E::from)
     }
 
     /// Host allocation only: no media command or write-fence transition.

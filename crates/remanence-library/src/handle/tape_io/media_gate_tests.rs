@@ -597,6 +597,15 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/shutdown_round1_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 2,
+                execute_none: 2,
+                why: "cfg(test) StopAtUnloadInventory and ShutdownOnLoad forwarders \
+                      to in-memory ModelTransport only; production uses DriveHandle",
+            },
+        ),
+        (
             "remanence-api/src/write_owner/closeout_tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,

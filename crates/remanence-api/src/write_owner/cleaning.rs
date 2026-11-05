@@ -22,6 +22,9 @@ pub(crate) fn run_cleaning_sequence(
     drive_uuid: &[u8],
     trigger: &str,
 ) -> Result<(), Status> {
+    if let Some(lifecycle) = &cfg.lifecycle {
+        lifecycle.check_admission()?;
+    }
     let clean_cfg = &cfg.cleaning;
     if !clean_cfg.auto {
         return Err(Status::failed_precondition(
@@ -260,12 +263,43 @@ pub(crate) fn run_cleaning_sequence(
         .last_element_address
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
-    retry_cleaning_move(index, cfg, run_id.as_str(), drive_uuid, "moving-in", || {
+    let mut motion =
+        crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(drive_bay));
+    let loaded = retry_cleaning_move(index, cfg, run_id.as_str(), drive_uuid, "moving-in", || {
         library
-            .load(slot_address, drive_bay, &cfg.policy)
-            .map_err(|err| format!("load cleaning cartridge: {err}"))?;
-        Ok(())
-    })?;
+            .load_with_admission(slot_address, drive_bay, &cfg.policy, &mut || motion.admit())
+            .map_err(|err| {
+                motion
+                    .refusal
+                    .take()
+                    .unwrap_or_else(|| Status::internal(format!("load cleaning cartridge: {err}")))
+            })
+    });
+    if let Err(error) = loaded {
+        if crate::drive_pool::DaemonShuttingDown::is_status(&error) && !motion.dispatched {
+            // This run owns this unique alarm and raised the fence only after
+            // rejecting a pre-existing fence. No physical command was sent.
+            index
+                .terminalize_clean_run(
+                    run_id.as_str(),
+                    "failed",
+                    Some("{\"outcome\":\"cancelled\",\"reason\":\"daemon shutting down\"}"),
+                )
+                .map_err(status_from_state_error)?;
+            if !drive.fenced {
+                index
+                    .set_drive_fenced(drive_uuid, false)
+                    .map_err(status_from_state_error)?;
+            }
+            clear_alarm_with_evidence(
+                index,
+                cfg,
+                format!("cleaning-needs-operator:{run_id}").as_str(),
+            )?;
+        }
+        return Err(error);
+    }
+    drop(motion);
     let load_completed = std::time::Instant::now();
     let _ = index
         .advance_clean_run(
@@ -400,6 +434,7 @@ pub(crate) fn run_cleaning_sequence(
     // Admission happens at physical UNLOAD dispatch. Retain it across both
     // retries and MOVE so shutdown cannot strand the unthreaded cartridge.
     let mut dismount = None;
+    let shutdown_refusal = std::cell::RefCell::new(None);
     let mut admit = || {
         if dismount.is_none() {
             dismount = cfg
@@ -407,7 +442,11 @@ pub(crate) fn run_cleaning_sequence(
                 .as_ref()
                 .map(|l| l.begin_dismount(&cfg.endpoint(drive_bay)))
                 .transpose()
-                .map_err(|error| error.message().to_string())?;
+                .map_err(|error| {
+                    let message = error.message().to_string();
+                    *shutdown_refusal.borrow_mut() = Some(error);
+                    message
+                })?;
         }
         Ok(())
     };
@@ -428,7 +467,11 @@ pub(crate) fn run_cleaning_sequence(
                 std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
                 &mut admit,
             )
-            .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
+            .map_err(|err| {
+                shutdown_refusal.borrow_mut().take().unwrap_or_else(|| {
+                    Status::internal(format!("unload cleaning cartridge: {err}"))
+                })
+            })?;
             Ok(())
         },
     )?;
@@ -637,14 +680,15 @@ pub(crate) fn retry_cleaning_move(
     run_id: &str,
     drive_uuid: &[u8],
     label: &str,
-    mut op: impl FnMut() -> Result<(), String>,
+    mut op: impl FnMut() -> Result<(), Status>,
 ) -> Result<(), Status> {
     let mut last_err = None;
     for attempt in 0..2 {
         match op() {
             Ok(()) => return Ok(()),
+            Err(err) if crate::drive_pool::DaemonShuttingDown::is_status(&err) => return Err(err),
             Err(err) => {
-                last_err = Some(err);
+                last_err = Some(err.message().to_string());
                 if attempt == 0 {
                     tracing::warn!("{label} failed once during cleaning; retrying");
                 }

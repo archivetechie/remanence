@@ -94,9 +94,7 @@ impl ApiState {
             .readiness_shutdown
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(Status::unavailable(
-                "daemon shutdown stops readiness admission",
-            ));
+            return Err(crate::drive_pool::DaemonShuttingDown::status());
         }
         if let Some(status) = self.operations.latest(&operation_id) {
             if matches!(
@@ -233,7 +231,8 @@ impl ApiState {
         let handle = self
             .operations
             .register(operation_id, "media_readiness_wait")
-            .with_readiness_lifetime(self.readiness_shutdown.clone(), pool.readiness_wake.clone());
+            .with_readiness_lifetime(self.readiness_shutdown.clone(), pool.readiness_wake.clone())
+            .with_readiness_motion(pool.clone(), drive_key.clone());
         handle.publish_state(
             pb::OperationState::Running,
             &[("started_by", started_by), ("state", &record.state)],
@@ -399,6 +398,11 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
                                     retry.live = true;
                                     retry.fast_until = None;
                                 }
+                                Err(error)
+                                    if crate::drive_pool::DaemonShuttingDown::is_status(&error) =>
+                                {
+                                    return
+                                }
                                 Err(error) => {
                                     // Only reservation/dispatch congestion merits a fast retry.
                                     let busy = error.code() == tonic::Code::FailedPrecondition
@@ -503,10 +507,9 @@ pub(crate) async fn wait_after_refusal(
             .readiness_shutdown
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(Status::unavailable(format!(
-                "{original_refusal}; {}",
-                SHUTDOWN_REASON
-            )));
+            return Err(crate::drive_pool::DaemonShuttingDown::with_message(
+                format!("{original_refusal}; {}", SHUTDOWN_REASON),
+            ));
         }
         if handle.is_cancelled() {
             return Err(Status::cancelled(

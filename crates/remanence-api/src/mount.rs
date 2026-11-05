@@ -101,6 +101,17 @@ pub fn load_tape_by_uuid(
     policy: &dyn AccessPolicy,
     tape_uuid: &TapeUuid,
 ) -> Result<DriveHandle, LoadByUuidError> {
+    load_tape_by_uuid_with_admission(state, library, policy, tape_uuid, &mut || Ok(()))
+}
+
+/// Daemon composed load: resolve first, then admit at the library CDB boundary.
+pub(crate) fn load_tape_by_uuid_with_admission(
+    state: &CatalogIndex,
+    library: &mut LibraryHandle,
+    policy: &dyn AccessPolicy,
+    tape_uuid: &TapeUuid,
+    admit: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<DriveHandle, LoadByUuidError> {
     let tape = state
         .get_tape(tape_uuid)
         .map_err(LoadByUuidError::State)?
@@ -135,7 +146,7 @@ pub fn load_tape_by_uuid(
         LoadPlan::AlreadyLoaded { bay } => bay,
         LoadPlan::Load { slot, bay } => {
             library
-                .load(slot, bay, policy)
+                .load_with_admission(slot, bay, policy, admit)
                 .map_err(|err| LoadByUuidError::LoadFailed {
                     voltag: voltag.clone(),
                     cause: err,
@@ -1049,9 +1060,7 @@ async fn manual_finalize_tape_critical(
             .readiness_shutdown
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(Status::unavailable(
-                "daemon shutdown; maintenance admission closed",
-            ));
+            return Err(crate::drive_pool::DaemonShuttingDown::status());
         }
         let mut index = CatalogIndex::open(state.index_path.as_ref())
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1205,9 +1214,7 @@ fn start_finalize_attempt(
         .readiness_shutdown
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        return Err(Status::unavailable(
-            "daemon shutdown; maintenance admission closed",
-        ));
+        return Err(crate::drive_pool::DaemonShuttingDown::status());
     }
     publish_finalize_attempt(state, request)
 }
@@ -1435,8 +1442,10 @@ pub(crate) async fn service_closeout_obligation(
         let pool = state.drive_pool()?.clone();
         let (_closing, tape_reservation) =
             pool.reserve_worker_tape(tape_uuid).inspect_err(|error| {
-                tracing::warn!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error,
-                "closeout worker reservation refused; skipping attempt");
+                if !crate::drive_pool::DaemonShuttingDown::is_status(error) {
+                    tracing::warn!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error,
+                    "closeout worker reservation refused; skipping attempt");
+                }
             })?;
         let mut index = state.index_write()?;
         if index
@@ -1503,9 +1512,7 @@ pub(crate) async fn service_closeout_obligation(
             .readiness_shutdown
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(Status::unavailable(
-                "daemon shutdown; maintenance admission closed",
-            ));
+            return Err(crate::drive_pool::DaemonShuttingDown::status());
         }
         let mut _finalization_operation = None;
         let terminal_handle = if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
@@ -1610,9 +1617,7 @@ pub(crate) async fn closeout_worker_attempt(
             .readiness_shutdown
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(Status::unavailable(
-                "daemon shutdown; maintenance admission closed",
-            ));
+            return Err(crate::drive_pool::DaemonShuttingDown::status());
         }
         let progress =
             crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?;
@@ -2469,23 +2474,35 @@ async fn changer_move_guarded(
     caller_gone: Option<Arc<AtomicBool>>,
 ) -> Result<(), Status> {
     let after_unload = unloaded.is_some();
-    let (recovery_guard, dismount_guard) = unloaded
+    let (recovery_guard, mut dismount_guard) = unloaded
         .map(|u| (u.recovery_guard, u.dismount_guard))
         .unwrap_or_default();
     let changer = pool.changer_tx(library_serial)?;
+    #[cfg(test)]
+    {
+        let hook = pool.motion_admission_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     let (reply_tx, reply_rx) = oneshot::channel();
-    changer
-        .send(crate::write_owner::ChangerCommand::Move {
-            src,
-            dst,
-            recovery_guard,
-            dismount_guard,
-            after_unload,
-            caller_gone,
-            reply: reply_tx,
-        })
+    let channel = changer
+        .reserve()
         .await
         .map_err(|_| Status::internal("changer actor unavailable"))?;
+    if !after_unload {
+        dismount_guard =
+            Some(pool.begin_motion(&crate::drive_pool::DriveKey::new(library_serial, dst))?);
+    }
+    channel.send(crate::write_owner::ChangerCommand::Move {
+        src,
+        dst,
+        recovery_guard,
+        dismount_guard,
+        after_unload,
+        caller_gone,
+        reply: reply_tx,
+    });
     reply_rx
         .await
         .map_err(|_| Status::internal("changer actor dropped reply"))?
@@ -2510,7 +2527,7 @@ async fn drive_unload(
     drive_key: &crate::drive_pool::DriveKey,
 ) -> Result<crate::write_owner::DriveUnloadOutcome, Status> {
     if pool.is_shutting_down() {
-        return Err(Status::unavailable(
+        return Err(crate::drive_pool::DaemonShuttingDown::with_message(
             "daemon shutdown before UNLOAD; cartridge stays seated",
         ));
     }
@@ -2599,7 +2616,7 @@ async fn dismount_pair(
     reason: DismountReason,
 ) -> Result<(), Status> {
     if pool.is_shutting_down() {
-        return Err(Status::unavailable(format!(
+        return Err(crate::drive_pool::DaemonShuttingDown::with_message(format!(
             "daemon shutdown began before the {} dismount of drive bay 0x{:04x} started its unload; the cartridge stays seated",
             reason.as_str(),
             seated.bay
@@ -2765,6 +2782,7 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
             }
             let reservation = match pool.reserve_drive(&parked.seated.drive_key()) {
                 Ok(reservation) => reservation,
+                Err(error) if crate::drive_pool::DaemonShuttingDown::is_status(&error) => return,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -4423,6 +4441,73 @@ mod tests {
     const POOL_B: &str = "fieldtest-b";
     const POOL_TAPE_A: TapeUuid = [0xA1; 16];
     const POOL_TAPE_B: TapeUuid = [0xB1; 16];
+
+    /// Motion committed before shutdown completes, but the same reserved bay
+    /// cannot be used to start another mount after the cutoff.
+    #[tokio::test]
+    async fn shutdown_gate_finishes_admitted_mount_and_refuses_new_motion() {
+        let mut harness = three_bay_two_pool_harness(
+            vec![drive_bay(0x0101, false, None)],
+            vec![slot(0x0401, "FTA001L9")],
+        );
+        let state = harness.state.clone();
+        let task =
+            tokio::spawn(async move { test_mount_for_write(&state, "LIB001", &POOL_TAPE_A).await });
+        let command = tokio::time::timeout(Duration::from_secs(5), harness.changer_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        harness.state.begin_shutdown();
+        let crate::write_owner::ChangerCommand::Move {
+            reply,
+            dismount_guard,
+            ..
+        } = command
+        else {
+            panic!("expected mount MOVE");
+        };
+        drop(dismount_guard);
+        reply.send(Ok(())).unwrap();
+        assert!(task.await.unwrap().is_ok(), "admitted mount completes");
+        let error = test_mount_for_write(&harness.state, "LIB001", &POOL_TAPE_A)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        // A caller retaining a previous reservation must also pass motion admission.
+        let next = changer_move(&harness.pool, "LIB001", 0x0401, 0x0101);
+        tokio::pin!(next);
+        tokio::select! {
+            result = &mut next => {
+                let error = result.unwrap_err();
+                assert_eq!(error.metadata().get("remanence-shutdown").unwrap(), "true");
+            }
+            command = harness.changer_rx.recv() => panic!("new MOVE after shutdown: {}", command.is_some()),
+        }
+        assert!(harness.changer_rx.try_recv().is_err());
+    }
+
+    /// Shutdown must publish its cutoff even while a readiness caller owns the
+    /// old admission mutex; that caller may be waiting on catalog or audit I/O.
+    #[test]
+    fn shutdown_gate_does_not_wait_for_readiness_admission() {
+        let harness = dismount_harness(0);
+        let guard = harness.state.operations.readiness_start.lock().unwrap();
+        let (done, received) = std::sync::mpsc::channel();
+        let state = harness.state.clone();
+        let thread = std::thread::spawn(move || {
+            state.begin_shutdown();
+            done.send(()).unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_secs(2));
+        // Always release/join even on the base revision, so failure cannot leak a thread.
+        drop(guard);
+        thread.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "shutdown cutoff was delayed by readiness admission"
+        );
+        assert!(harness.pool.is_shutting_down());
+    }
 
     struct ThreeBayHarness {
         _temp: tempfile::TempDir,
@@ -7311,10 +7396,9 @@ mod tests {
         .await
         .expect("shutdown ends the finalize attempt")
         .unwrap_err();
-        assert!(shutdown_error.message().contains("shutdown"));
-        assert!(shutdown_error
-            .message()
-            .contains("maintenance admission closed"));
+        assert!(crate::drive_pool::DaemonShuttingDown::is_status(
+            &shutdown_error
+        ));
         assert_eq!(
             state
                 .operations

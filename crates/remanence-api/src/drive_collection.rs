@@ -94,6 +94,9 @@ pub(crate) fn touch_managed_drive_heartbeats(
             };
             let drive_key = crate::drive_pool::DriveKey::new(library_serial.to_string(), bay);
             if let Err(err) = drive_pool.heartbeat_drive(&drive_key, drive.drive_uuid.clone()) {
+                if crate::drive_pool::DaemonShuttingDown::is_status(&err) {
+                    return Ok(());
+                }
                 tracing::warn!(
                     "managed drive heartbeat skipped for {}: {err}",
                     drive.serial.as_deref().unwrap_or("<no serial>")

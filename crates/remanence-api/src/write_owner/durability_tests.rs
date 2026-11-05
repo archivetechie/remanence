@@ -1316,3 +1316,6 @@ async fn acknowledged_prefix_property_detects_missing_barriers() {
     );
     eprintln!("negative control: {failure}; elapsed {:?}", start.elapsed());
 }
+
+#[path = "shutdown_round1_tests.rs"]
+mod shutdown_round1_tests;

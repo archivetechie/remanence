@@ -1331,8 +1331,32 @@ impl super::DriveHandle {
         initial: Option<MediaReadiness>,
         options: MediaReadinessWaitOptions,
         load_budget: u32,
+        cancellation: impl FnMut() -> Option<String>,
+        event: impl for<'a> FnMut(MediaReadinessWaitEvent<'a>) -> Result<(), String>,
+    ) -> Result<MediaReadinessPoll, String> {
+        self.wait_for_media_readiness_with_load_admission(
+            family,
+            initial,
+            options,
+            load_budget,
+            cancellation,
+            event,
+            &mut || Ok(()),
+        )
+    }
+
+    /// Like the initializing-load wait, with final admission after the event
+    /// callback and drive audit. Refusal sends no LOAD.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wait_for_media_readiness_with_load_admission(
+        &mut self,
+        family: MediaFamily,
+        initial: Option<MediaReadiness>,
+        options: MediaReadinessWaitOptions,
+        load_budget: u32,
         mut cancellation: impl FnMut() -> Option<String>,
         mut event: impl for<'a> FnMut(MediaReadinessWaitEvent<'a>) -> Result<(), String>,
+        admit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<MediaReadinessPoll, String> {
         const CANCEL_SLEEP_SLICE: Duration = Duration::from_millis(250);
 
@@ -1383,7 +1407,7 @@ impl super::DriveHandle {
                 // same unit attention it reported before the cartridge was
                 // threaded, which is not a repeat within this epoch.
                 unit_attention_seen.clear();
-                if let Err(error) = self.load_immediate() {
+                if let Err(error) = self.load_immediate_with_admission(admit) {
                     let DriveOpError::ScsiError(scsi) = &error else {
                         return Err(error.to_string());
                     };

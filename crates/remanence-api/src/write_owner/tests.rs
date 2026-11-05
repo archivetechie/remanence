@@ -1828,6 +1828,8 @@ fn session_open_readiness_fence_records_operation_and_guidance() {
         source_slot: Some(0x03eb),
         drive_serial: Some("8031BDC7D1"),
         needs_drive_load: true,
+        load_continues_move: true,
+        lifecycle: None,
     };
 
     let status = record_session_open_readiness_fence(
@@ -3155,6 +3157,8 @@ fn session_open_refuses_active_media_readiness_fence_before_drive_probe() {
         source_slot: Some(0x03eb),
         drive_serial: Some("DRV_MOVE_OBS"),
         needs_drive_load: true,
+        load_continues_move: true,
+        lifecycle: None,
     };
 
     let status = session_open_short_probe_or_load(&mut index, &mut drive, ctx)
@@ -3199,6 +3203,8 @@ fn session_open_loads_immediate_after_unit_attention_then_load_required() {
         source_slot: Some(0x03eb),
         drive_serial: Some("DRV_MOVE_OBS"),
         needs_drive_load: true,
+        load_continues_move: true,
+        lifecycle: None,
     };
 
     session_open_short_probe_or_load(&mut index, &mut drive, ctx)
@@ -3249,6 +3255,8 @@ fn session_open_loads_immediate_for_already_loaded_initialization_required() {
         source_slot: None,
         drive_serial: Some("DRV_MOVE_OBS"),
         needs_drive_load: false,
+        load_continues_move: false,
+        lifecycle: None,
     };
 
     session_open_short_probe_or_load(&mut index, &mut drive, ctx)
@@ -10657,6 +10665,8 @@ async fn detached_verification_waits_for_another_drive_fence() {
         source_slot: None,
         drive_serial: Some("OTHERDRIVE"),
         needs_drive_load: false,
+        load_continues_move: false,
+        lifecycle: None,
     };
     record_session_open_readiness_operation(&mut index, readiness_id, &ctx).unwrap();
     status(
@@ -11154,6 +11164,8 @@ fn readiness_admission_reports_invalid_stored_id() {
             source_slot: None,
             drive_serial: None,
             needs_drive_load: false,
+            load_continues_move: false,
+            lifecycle: None,
         },
     )
     .unwrap_err();

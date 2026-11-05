@@ -1751,7 +1751,10 @@ impl CatalogIndex {
     ///
     /// Every path that sends LOAD on behalf of an operation first records a
     /// `pre_ready_loading` transition carrying opcode `1Bh`; this counts those
-    /// write-ahead rows. Readiness waits use it to bound the LOADs one
+    /// write-ahead rows except those immediately followed by a conclusive
+    /// `initializing_load_refused` outcome. An absent outcome (including a
+    /// crash), dispatch failure, or unknown completion still counts.
+    /// Readiness waits use it to bound the LOADs one
     /// operation sends, so a resumed or restarted wait does not repeat one.
     pub fn media_readiness_load_attempts_since_ready(
         &self,
@@ -1760,10 +1763,20 @@ impl CatalogIndex {
         let count: i64 = self
             .conn
             .query_row(
-                "select count(*) from media_readiness_transitions
+                "select count(*) from media_readiness_transitions as attempt
                  where operation_id = ?1
                    and last_cdb_opcode = 27
                    and state = 'pre_ready_loading'
+                   and not exists (
+                       select 1 from media_readiness_transitions as outcome
+                       where outcome.operation_id = attempt.operation_id
+                         and outcome.transition_id = (
+                             select min(next.transition_id) from media_readiness_transitions as next
+                             where next.operation_id = attempt.operation_id
+                               and next.transition_id > attempt.transition_id)
+                         and outcome.phase = 'initializing_load_refused'
+                         and outcome.last_cdb_opcode is null
+                         and outcome.cancel_source = 'shutdown')
                    and transition_id > coalesce(
                        (select max(transition_id) from media_readiness_transitions
                          where operation_id = ?1 and state = 'ready'),

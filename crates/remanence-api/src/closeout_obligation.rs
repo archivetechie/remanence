@@ -41,10 +41,17 @@ struct Retry {
 struct Attempt {
     work: std::sync::Arc<WorkList>,
     key: Key,
+    shutdown: bool,
 }
 impl Drop for Attempt {
     fn drop(&mut self) {
-        self.work.finish(self.key);
+        if self.shutdown {
+            if let Some(entry) = self.work.entries.lock().unwrap().get_mut(&self.key) {
+                entry.running = false;
+            }
+        } else {
+            self.work.finish(self.key);
+        }
     }
 }
 
@@ -108,6 +115,22 @@ impl WorkList {
     fn claim_unheld(&self, now: Instant, held: &HashSet<[u8; 16]>) -> Vec<Key> {
         self.claim_filtered(now, false, held)
     }
+    /// Seed and inspect prior evidence without changing eligibility in barrier tests.
+    #[cfg(test)]
+    pub(crate) fn seed_retry_reason_for_test(&self, key: ([u8; 16], u64), reason: &str) {
+        self.entries.lock().unwrap().get_mut(&key).unwrap().reason = Some(reason.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_evidence_for_test(
+        &self,
+        key: ([u8; 16], u64),
+    ) -> (usize, Option<String>, bool) {
+        let entries = self.entries.lock().unwrap();
+        let retry = entries.get(&key).unwrap();
+        (retry.attempt, retry.reason.clone(), retry.running)
+    }
+
     /// Assert live ownership caused no work-list attempts or retry diagnostics.
     #[cfg(test)]
     pub(crate) fn assert_unattempted_for_test(&self, tape: [u8; 16]) {
@@ -858,6 +881,7 @@ pub(crate) fn spawn(state: ApiState) {
                 let attempt = Attempt {
                     work: state.closeout_work.clone(),
                     key,
+                    shutdown: false,
                 };
                 tokio::spawn(service_claimed(state, key, attempt));
             }
@@ -870,8 +894,14 @@ pub(crate) fn spawn(state: ApiState) {
 }
 
 /// Service one claimed entry and refresh its debt after releasing attempt ownership.
-async fn service_claimed(state: ApiState, key: Key, attempt: Attempt) {
+async fn service_claimed(state: ApiState, key: Key, mut attempt: Attempt) {
     if let Err(error) = crate::mount::service_closeout_obligation(&state, key.0, key.1).await {
+        if crate::drive_pool::DaemonShuttingDown::is_status(&error) {
+            // Release ownership without scheduling backoff or changing the
+            // existing debt/retry evidence needed by the next daemon start.
+            attempt.shutdown = true;
+            return;
+        }
         state.closeout_work.failed(key, &error);
         tracing::debug!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout obligation remains queued");
     } else {
@@ -907,6 +937,7 @@ pub(crate) async fn service_unheld_for_test(state: &ApiState) -> Vec<Key> {
         let attempt = Attempt {
             work: state.closeout_work.clone(),
             key: *key,
+            shutdown: false,
         };
         service_claimed(state.clone(), *key, attempt).await;
     }

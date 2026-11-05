@@ -206,6 +206,8 @@ pub(crate) fn handle_drive_tape_inventory(
             source_slot,
             drive_serial,
             needs_drive_load,
+            load_continues_move: needs_drive_load,
+            lifecycle: cfg.lifecycle.as_ref(),
         },
     )?;
     session_open_reject_tape_io_fences(index, &tape_uuid, barcode, "read terminal tape inventory")?;
@@ -606,6 +608,8 @@ pub(crate) fn handle_drive_verify_tape_index(
                 source_slot,
                 drive_serial,
                 needs_drive_load,
+                load_continues_move: needs_drive_load,
+                lifecycle: cfg.lifecycle.as_ref(),
             },
         )?;
         if let Some((handle, _)) = &operation {

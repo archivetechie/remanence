@@ -546,6 +546,12 @@ impl LibraryServiceApi {
                 self.state.readiness_shutdown.clone(),
                 pool.readiness_wake.clone(),
             );
+            if let crate::write_owner::RoboticsAction::Load { bay, .. } = &action {
+                handle = handle.with_readiness_motion(
+                    pool.clone(),
+                    crate::drive_pool::DriveKey::new(&library_serial, *bay),
+                );
+            }
         }
         match changer.try_reserve_owned() {
             Ok(permit) => {

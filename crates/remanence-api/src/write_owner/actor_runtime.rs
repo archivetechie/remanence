@@ -204,9 +204,23 @@ pub(super) fn changer_loop(
                 let result =
                     super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
                         .and_then(|()| {
-                            changer.move_medium(src, dst, &cfg.policy).map_err(|err| {
-                                Status::failed_precondition(format!("move medium: {err}"))
-                            })
+                            let mut motion = crate::drive_pool::MotionAdmission::new(
+                                cfg.lifecycle.clone(),
+                                cfg.endpoint(dst),
+                            );
+                            changer
+                                .move_medium_with_admission(src, dst, &cfg.policy, &mut || {
+                                    if after_unload {
+                                        Ok(())
+                                    } else {
+                                        motion.admit()
+                                    }
+                                })
+                                .map_err(|err| {
+                                    motion.refusal.take().unwrap_or_else(|| {
+                                        Status::failed_precondition(format!("move medium: {err}"))
+                                    })
+                                })
                         });
                 changer.set_ready_wait(cfg.changer_ready_wait.clone());
                 {
@@ -646,6 +660,8 @@ pub(super) fn drive_loop(
                                 source_slot,
                                 drive_serial: drive_serial.as_deref(),
                                 needs_drive_load,
+                                load_continues_move: needs_drive_load,
+                                lifecycle: cfg.lifecycle.as_ref(),
                             },
                         )
                     },
@@ -678,6 +694,8 @@ pub(super) fn drive_loop(
                             source_slot,
                             drive_serial: drive_serial.as_deref(),
                             needs_drive_load,
+                            load_continues_move: needs_drive_load,
+                            lifecycle: cfg.lifecycle.as_ref(),
                         },
                     )?;
                     let tape = index
@@ -1420,17 +1438,25 @@ pub(crate) fn unload_actor_drive(
         .map_or_else(|| "unplaced".to_string(), |bay| format!("0x{bay:04x}"));
     let key = drive.endpoint().durable_key().cloned();
     let mut dismount_guard = None;
+    let refusal = std::cell::RefCell::new(None);
     let mut admit = || {
         if dismount_guard.is_none() {
             dismount_guard = lifecycle
                 .map(|l| l.begin_dismount(key.as_ref().expect("daemon drive has a durable key")))
                 .transpose()
-                .map_err(|error| error.message().to_string())?;
+                .map_err(|error| {
+                    let message = error.message().to_string();
+                    *refusal.borrow_mut() = Some(error);
+                    message
+                })?;
         }
         Ok(())
     };
     let guard =
         crate::mount_support::unload_drive(drive, lock_root, &mut admit).map_err(|error| {
+            if let Some(status) = refusal.borrow_mut().take() {
+                return status;
+            }
             let message = format!("unload drive bay {bay}: {error}");
             match error {
                 crate::mount_support::DriveUnloadError::Drive(

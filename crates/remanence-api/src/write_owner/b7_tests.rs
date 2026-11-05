@@ -1859,3 +1859,162 @@ async fn b10_pool_joins_worker_closeout_but_not_its_finalization() {
         }
     }
 }
+
+/// A durable debt attempt crosses its early checks, then is paused immediately
+/// before motion admission. The queue variant also waits for changer capacity.
+async fn shutdown_debt_at_motion_admission(queued: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let world = due_tape(root.path()).await;
+    {
+        let mut world = world.lock().unwrap();
+        let barcode = world.drive_bays.get_mut(&BAY).unwrap().take().unwrap();
+        world.drive_source_slots.insert(BAY, None);
+        world.slots[0].full = true;
+        world.slots[0].barcode = Some(barcode);
+    }
+    let mut state = state(root.path());
+    let mut library = open_model_library(world.clone());
+    state.library_snapshot = Some(library_snapshot_cell(library.library().clone()));
+    let (changer, mut changer_rx) = mpsc::channel(1);
+    let (drive, mut drive_rx) = mpsc::channel(1);
+    let pool = DrivePool::new_for_library(
+        LIBRARY,
+        changer.clone(),
+        HashMap::from([(BAY, drive)]),
+        Arc::new(HashMap::from([(BAY, AtomicBool::new(false))])),
+    );
+    state.drive_pool = Some(pool.clone());
+    scan(&state).unwrap();
+    assert!(state.closeout_work.contains((TAPE, 1)));
+    let before = world.lock().unwrap().command_log.len();
+    let (entered, reached) = oneshot::channel();
+    if queued {
+        changer
+            .send(ChangerCommand::Reconcile {
+                tape_uuid: TAPE,
+                handle: state
+                    .operations
+                    .register(Uuid::new_v4(), "test_queue_barrier"),
+            })
+            .await
+            .unwrap();
+        *pool.motion_admission_hook.lock().unwrap() = Some(Box::new(move || {
+            entered.send(()).unwrap();
+        }));
+    } else {
+        let stopping = state.clone();
+        *pool.motion_admission_hook.lock().unwrap() = Some(Box::new(move || {
+            stopping.begin_shutdown();
+            entered.send(()).unwrap();
+        }));
+    }
+    let worker_state = state.clone();
+    let mut worker = tokio::spawn(async move {
+        crate::closeout_obligation::service_unheld_for_test(&worker_state).await
+    });
+    tokio::time::timeout(StdDuration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    if queued {
+        // Consume the real signal synchronously: Tokio's signal self-pipe uses
+        // send(), which the offline test sandbox denies even for socketpair.
+        // SAFETY: this isolated child blocks/restores only its calling thread's
+        // mask; raise targets that thread and sigwait consumes the pending signal.
+        unsafe {
+            let mut signals = std::mem::zeroed();
+            let mut previous = std::mem::zeroed();
+            assert_eq!(libc::sigemptyset(&mut signals), 0);
+            assert_eq!(libc::sigaddset(&mut signals, libc::SIGTERM), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &signals, &mut previous),
+                0
+            );
+            assert_eq!(libc::raise(libc::SIGTERM), 0);
+            let mut received = 0;
+            assert_eq!(libc::sigwait(&signals, &mut received), 0);
+            assert_eq!(received, libc::SIGTERM);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()),
+                0
+            );
+        }
+        state.begin_shutdown();
+        assert!(matches!(
+            changer_rx.recv().await,
+            Some(ChangerCommand::Reconcile { .. })
+        ));
+    }
+    // Drive real model I/O if a regression admits a command. This both avoids
+    // hanging on the base and makes the failure evidence a physical CDB trace.
+    let policy = remanence_library::StaticAllowlist::new([LIBRARY]);
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut worker => { result.unwrap(); break; }
+                command = changer_rx.recv() => {
+                    let Some(ChangerCommand::Move { src, dst, reply, dismount_guard, .. }) = command else {
+                        panic!("unexpected changer command");
+                    };
+                    library.move_medium(src, dst, &policy).unwrap();
+                    drop(dismount_guard);
+                    reply.send(Ok(())).unwrap();
+                }
+                command = drive_rx.recv() => {
+                    let Some(DriveCommand::CloseoutTape { reply, needs_drive_load, .. }) = command else {
+                        panic!("unexpected drive command");
+                    };
+                    if needs_drive_load { library.open_drive(BAY, &policy).unwrap().load().unwrap(); }
+                    reply.send(Err(Status::unavailable("model attempt settled"))).unwrap();
+                }
+            }
+        }
+    }).await.unwrap();
+    state.shutdown_drive_pool().await.unwrap();
+    let world = world.lock().unwrap();
+    assert!(
+        world.command_log[before..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0xa5 | 0x1b)),
+        "debt worker issued MOVE/LOAD after shutdown: {:?}",
+        &world.command_log[before..]
+    );
+    assert!(
+        world.loaded_barcode(BAY).is_none(),
+        "shutdown leaves drive empty"
+    );
+    drop(world);
+    assert!(summary(&state, TAPE).unwrap().closeout_due());
+    assert!(state.closeout_work.contains((TAPE, 1)));
+    state.closeout_work.assert_unattempted_for_test(TAPE);
+    assert!(!state
+        .index()
+        .unwrap()
+        .tape_io_is_fenced(Some(&TAPE), None, None)
+        .unwrap());
+}
+
+/// An attempt already waiting for channel capacity must recheck at commitment.
+#[test]
+fn shutdown_gate_pending_closeout_debt_does_not_move_or_load() {
+    const CHILD: &str = "REM_TEST_SHUTDOWN_DEBT_SIGNAL";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(shutdown_debt_at_motion_admission(true));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "write_owner::tests::durability_tests::b7_tests::shutdown_gate_pending_closeout_debt_does_not_move_or_load", "--nocapture"])
+        .env(CHILD, "1").output().unwrap();
+    assert!(output.status.success(), "SIGTERM debt child: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+/// Set shutdown at an exact hook after the worker's early checks, without sleeps.
+#[tokio::test]
+async fn shutdown_gate_debt_race_after_early_check_does_not_move() {
+    shutdown_debt_at_motion_admission(false).await;
+}

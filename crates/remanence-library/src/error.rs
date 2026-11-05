@@ -290,6 +290,9 @@ pub enum OpenError {
 /// changer operations.
 #[derive(Debug, Error)]
 pub enum MoveError {
+    /// The owner refused new motion immediately before dispatch.
+    #[error("motion admission refused: {0}")]
+    Admission(String),
     /// Live element status differs from the inventory used to plan the command.
     #[error("element 0x{addr:04x} changes: expected {expected}, found {found}; command refused")]
     InventoryChanged {
@@ -395,6 +398,9 @@ pub enum MoveError {
 /// without conflation.
 #[derive(Debug, Error)]
 pub enum DriveOpError {
+    /// The owner stopped a fresh LOAD after preparation, before dispatch.
+    #[error("load admission refused: {0}")]
+    LoadAdmission(String),
     /// The owner stopped removal after inventory checks, before physical UNLOAD.
     #[error("unload admission refused: {0}")]
     UnloadAdmission(String),
