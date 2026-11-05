@@ -165,9 +165,14 @@ pub(crate) fn handle_robotics(
     publish_running(handle, &[("phase", "execute")]);
     let action = match &action {
         RoboticsAction::Refresh => library.refresh().map_err(|err| err.to_string()),
-        RoboticsAction::Move { src, dst } => library
-            .move_medium(*src, *dst, &cfg.policy)
-            .map_err(|err| err.to_string()),
+        RoboticsAction::Move { src, dst } => {
+            let mut motion =
+                crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(*dst));
+            library
+                .changer_mut()
+                .move_medium_with_admission(*src, *dst, &cfg.policy, &mut || motion.admit())
+                .map_err(|err| err.to_string())
+        }
         RoboticsAction::Load {
             slot,
             bay,
@@ -204,15 +209,22 @@ pub(crate) fn handle_robotics(
         RoboticsAction::Clean {
             drive_uuid,
             trigger,
-        } => run_cleaning_sequence(
+        } => match run_cleaning_sequence(
             index,
             cfg,
             handle,
             &mut library,
             drive_uuid.as_slice(),
             trigger.as_str(),
-        )
-        .map_err(|err| err.to_string()),
+        ) {
+            Err(error) if crate::drive_pool::DaemonShuttingDown::is_status(&error) => {
+                return RoboticsOutcome::Failed {
+                    message: error.message().into(),
+                    phase: "shutdown",
+                };
+            }
+            result => result.map_err(|error| error.to_string()),
+        },
     };
 
     let observation = observe_refreshed_library(index, cfg, library.library())
@@ -304,9 +316,11 @@ pub(crate) fn run_load_sequence(
     bay: u16,
     wait_ready: bool,
 ) -> Result<(), String> {
+    let mut motion =
+        crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(bay));
     if !wait_ready {
         return library
-            .load(slot, bay, &cfg.policy)
+            .load_with_admission(slot, bay, &cfg.policy, &mut || motion.admit())
             .map_err(|error| error.to_string());
     }
 
@@ -332,13 +346,14 @@ pub(crate) fn run_load_sequence(
         .readiness_media_observation(barcode.as_deref())
         .map_err(|e| e.to_string())?;
     let family = session_open_media_family(observation);
-    let retryable_load_completion = match library.load(slot, bay, &cfg.policy) {
-        Ok(()) => None,
-        Err(error) => match retryable_readiness_from_load_error(&error, family) {
-            Some(readiness) => Some(readiness),
-            None => return Err(error.to_string()),
-        },
-    };
+    let retryable_load_completion =
+        match library.load_with_admission(slot, bay, &cfg.policy, &mut || motion.admit()) {
+            Ok(()) => None,
+            Err(error) => match retryable_readiness_from_load_error(&error, family) {
+                Some(readiness) => Some(readiness),
+                None => return Err(error.to_string()),
+            },
+        };
 
     let operation_id = handle.op_id_uuid();
     index

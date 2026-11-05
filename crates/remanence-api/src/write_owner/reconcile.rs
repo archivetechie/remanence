@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::actor_runtime::WriteOwnerConfig;
 use super::terminal_inventory::prepare_catalog_recovery_read;
 use crate::audit_projection::{append_operation_audit, OperationAuditInput};
-use crate::{load_tape_by_uuid, pb};
+use crate::pb;
 
 pub(crate) fn handle_reconcile(
     index: &mut CatalogIndex,
@@ -75,10 +75,34 @@ pub(crate) fn handle_reconcile(
             return;
         }
     };
-    cfg.configure_operation_library(&mut library, &handle);
-    let mut drive = match load_tape_by_uuid(index, &mut library, &cfg.policy, &tape_uuid) {
+    reconcile_with_library(index, cfg, tape_uuid, handle, &mut library);
+}
+
+/// Reconcile using an opened library; the same boundary accepts model transports
+/// in regression tests without changing the daemon's device opener.
+pub(crate) fn reconcile_with_library(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: [u8; 16],
+    handle: crate::operations::OperationHandle,
+    library: &mut remanence_library::LibraryHandle,
+) {
+    cfg.configure_operation_library(library, &handle);
+    let mut motion =
+        crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(0));
+    let mut drive = match crate::mount::load_tape_by_uuid_with_admission(
+        index,
+        library,
+        &cfg.policy,
+        &tape_uuid,
+        &mut || motion.admit(),
+    ) {
         Ok(drive) => drive,
         Err(err) => {
+            if let Some(refusal) = motion.refusal.take() {
+                cancel_operation(index, cfg, &handle, &tape_uuid, refusal.message());
+                return;
+            }
             fail_operation(
                 index,
                 cfg,
@@ -90,6 +114,7 @@ pub(crate) fn handle_reconcile(
             return;
         }
     };
+    drop(motion);
     reconcile_loaded_tape(index, cfg, &mut drive, tape_uuid, handle);
 }
 

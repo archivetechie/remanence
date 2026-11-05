@@ -721,6 +721,29 @@ impl ChangerHandle {
         policy: &dyn AccessPolicy,
         op: AuditOp,
     ) -> Result<(), MoveError> {
+        self.move_medium_as_with_admission(src, dst, policy, op, &mut || Ok(()))
+    }
+
+    /// Admit MOVE after inventory, readiness, audit and transport-lock waits.
+    /// The caller retains ownership through any composed LOAD or return MOVE.
+    pub fn move_medium_with_admission(
+        &mut self,
+        src: u16,
+        dst: u16,
+        policy: &dyn AccessPolicy,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), MoveError> {
+        self.move_medium_as_with_admission(src, dst, policy, AuditOp::Move { src, dst }, admit)
+    }
+
+    fn move_medium_as_with_admission(
+        &mut self,
+        src: u16,
+        dst: u16,
+        policy: &dyn AccessPolicy,
+        op: AuditOp,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), MoveError> {
         // Snapshot-level preflight.
         let plan = match ops::plan_move(&self.library, src, dst) {
             Ok(p) => p,
@@ -831,9 +854,10 @@ impl ChangerHandle {
             }
         }
         loop {
-            match self.issue_planned_move(src, dst, &plan, op) {
+            match self.issue_planned_move(src, dst, &plan, op, admit) {
                 Ok(()) => return Ok(()),
-                Err(e) => {
+                Err(MoveError::Admission(message)) => return Err(MoveError::Admission(message)),
+                Err(MoveError::ScsiError(e)) => {
                     let transient = if wait_spent {
                         None
                     } else {
@@ -896,6 +920,7 @@ impl ChangerHandle {
                     refresh?;
                     return Err(MoveError::ScsiError(e));
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -952,7 +977,8 @@ impl ChangerHandle {
         dst: u16,
         plan: &ops::MovePlan,
         op: AuditOp,
-    ) -> Result<(), ScsiError> {
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), MoveError> {
         // Build CDB + Started event.
         let cdb = move_medium_cdb::build_cdb(
             self.library.layout.robot_address,
@@ -979,6 +1005,17 @@ impl ChangerHandle {
         let result = {
             let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
             transport.set_timeout_for(TimeoutClass::Move);
+            if let Err(message) = admit() {
+                drop(transport);
+                let error = MoveError::Admission(message);
+                fire_refused(
+                    &mut lock_drive_shared(&self.shared).audit_hook,
+                    &self.library.serial,
+                    op,
+                    &error,
+                );
+                return Err(error);
+            }
             transport.execute_none(&cdb)
         };
         match result {
@@ -1039,7 +1076,7 @@ impl ChangerHandle {
                         at: SystemTime::now(),
                     },
                 );
-                Err(e)
+                Err(MoveError::ScsiError(e))
             }
         }
     }
@@ -1369,10 +1406,23 @@ impl LibraryHandle {
         bay: u16,
         policy: &dyn AccessPolicy,
     ) -> Result<(), LoadError> {
+        self.load_with_admission(slot, bay, policy, &mut || Ok(()))
+    }
+
+    /// Complete MOVE then LOAD under the caller's admission, checked at the
+    /// first MOVE dispatch after all blocking preparation. Once admitted, LOAD
+    /// completes even if the caller's shutdown signal changes between phases.
+    pub fn load_with_admission(
+        &mut self,
+        slot: u16,
+        bay: u16,
+        policy: &dyn AccessPolicy,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), LoadError> {
         let op = AuditOp::Load { slot, bay };
         // Phase 1: changer MOVE
         self.changer
-            .move_medium_as(slot, bay, policy, op)
+            .move_medium_as_with_admission(slot, bay, policy, op, admit)
             .map_err(LoadError::Move)?;
         // MOVE succeeded — snapshot patched (cartridge in bay). If
         // anything below fails, mark the snapshot dirty. Two
@@ -2300,13 +2350,21 @@ impl DriveHandle {
     /// after a changer MOVE and then poll TEST UNIT READY, instead of blocking
     /// inside the drive LOAD while LTO-9 media calibrates.
     pub fn load_immediate(&mut self) -> Result<(), DriveOpError> {
+        self.load_immediate_with_admission(&mut || Ok(()))
+    }
+
+    /// Admit a readiness LOAD after the drive audit callback has completed.
+    pub fn load_immediate_with_admission(
+        &mut self,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), DriveOpError> {
         self.issue_load_unload(
             /* load */ true,
             /* immed */ true,
             AuditOp::DriveLoad {
                 bay: self.bay_address(),
             },
-            &mut || Ok(()),
+            admit,
         )
     }
 
@@ -2359,15 +2417,20 @@ impl DriveHandle {
                 }
             }
         }
-        if !load {
-            admit().map_err(DriveOpError::UnloadAdmission)?;
-        }
         let cdb = lu::build_cdb_with_immed(load, immed);
 
         // Invalidate before dispatch: even a failed LOAD/UNLOAD may have
         // changed the cartridge. Keep the long mechanical-command timeout.
         self.transport.reset_media_write_fence_for_load_boundary();
-        self.issue_drive_control(&cdb, op, TimeoutClass::LoadUnload)
+        self.issue_drive_control_with_admission(&cdb, op, TimeoutClass::LoadUnload, &mut || {
+            admit().map_err(|error| {
+                if load {
+                    DriveOpError::LoadAdmission(error)
+                } else {
+                    DriveOpError::UnloadAdmission(error)
+                }
+            })
+        })
     }
 
     fn issue_drive_control(
@@ -2375,6 +2438,16 @@ impl DriveHandle {
         cdb: &[u8],
         op: AuditOp,
         timeout: TimeoutClass,
+    ) -> Result<(), DriveOpError> {
+        self.issue_drive_control_with_admission(cdb, op, timeout, &mut || Ok(()))
+    }
+
+    fn issue_drive_control_with_admission(
+        &mut self,
+        cdb: &[u8],
+        op: AuditOp,
+        timeout: TimeoutClass,
+        admit: &mut dyn FnMut() -> Result<(), DriveOpError>,
     ) -> Result<(), DriveOpError> {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
@@ -2387,7 +2460,25 @@ impl DriveHandle {
         );
         self.transport.set_timeout_for(timeout);
         let started = Instant::now();
-        let result = self.transport.execute_none_nonmedia(cdb);
+        let result = self
+            .transport
+            .execute_none_nonmedia_with_admission(cdb, admit);
+        let result = match result {
+            Err(DriveOpError::ScsiError(error)) => Err(error),
+            Err(error) => {
+                fire_audit(
+                    &mut lock_drive_shared(&self.shared).audit_hook,
+                    &AuditEvent::Refused {
+                        subject: self.audit_subject(),
+                        operation: op,
+                        reason: "MotionAdmission",
+                        at: SystemTime::now(),
+                    },
+                );
+                return Err(error);
+            }
+            Ok(()) => Ok(()),
+        };
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
@@ -2541,6 +2632,7 @@ fn completion_unknown(err: &ScsiError) -> bool {
 /// of the [`MoveError`] that caused the refusal.
 fn fire_refused(hook: &mut Option<AuditHook>, library_serial: &str, op: AuditOp, err: &MoveError) {
     let reason: &'static str = match err {
+        MoveError::Admission(_) => "Admission",
         MoveError::AddressUnknown { .. } => "AddressUnknown",
         MoveError::SourceEmpty { .. } => "SourceEmpty",
         MoveError::DestinationFull { .. } => "DestinationFull",

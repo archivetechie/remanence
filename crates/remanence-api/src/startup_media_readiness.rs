@@ -119,7 +119,8 @@ pub(crate) fn media_readiness_sense_progress(
 
 /// LOADs the operation may still send for an initializing-command request:
 /// [`MEDIA_READINESS_MAX_INITIALIZING_LOADS`] minus the LOAD attempts it
-/// recorded since it last reported ready.
+/// recorded since it last reported ready, excluding conclusive pre-dispatch
+/// shutdown refusals. Unknown outcomes continue to consume the allowance.
 pub(crate) fn media_readiness_initializing_load_budget(
     index: &CatalogIndex,
     operation_id: Uuid,

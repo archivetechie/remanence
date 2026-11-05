@@ -78,6 +78,8 @@ pub(super) fn handle_drive_open_read(
             source_slot,
             drive_serial: drive_serial.as_deref(),
             needs_drive_load,
+            load_continues_move: needs_drive_load,
+            lifecycle: cfg.lifecycle.as_ref(),
         },
     ) {
         let _ = reply.send(Err(status));

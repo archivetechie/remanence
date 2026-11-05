@@ -164,6 +164,10 @@ pub(crate) struct SessionOpenReadinessContext<'a> {
     source_slot: Option<u16>,
     drive_serial: Option<&'a str>,
     needs_drive_load: bool,
+    /// The caller completed MOVE in this admitted sequence; its initial LOAD
+    /// must finish even if shutdown has since closed fresh motion admission.
+    load_continues_move: bool,
+    lifecycle: Option<&'a crate::drive_pool::DrivePoolLifecycle>,
 }
 
 mod write_session;

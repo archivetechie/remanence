@@ -57,24 +57,33 @@ struct Args {
 /// The service manager's stop timeout must cover in-flight work and checkpointing
 /// and closing every open session, plus a margin. SIGKILL or a failed changer
 /// move can still leave a cartridge unthreaded.
-fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
+fn shutdown_signal(
+    state: remanence_api::ApiState,
+) -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
-    Ok(report_shutdown_signal(async move {
-        tokio::select! {
-            _ = interrupt.recv() => "SIGINT",
-            _ = terminate.recv() => "SIGTERM",
-            _ = hangup.recv() => "SIGHUP",
-        }
-    }))
+    Ok(report_shutdown_signal(
+        async move {
+            tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+                _ = hangup.recv() => "SIGHUP",
+            }
+        },
+        state,
+    ))
 }
 
 /// Complete the shutdown notification even when its diagnostic cannot be written.
-async fn report_shutdown_signal(signal: impl std::future::Future<Output = &'static str>) {
+async fn report_shutdown_signal(
+    signal: impl std::future::Future<Output = &'static str>,
+    state: remanence_api::ApiState,
+) {
     let name = signal.await;
+    state.begin_shutdown();
     stderr_message!(
         "rem-daemon: {name} received; closing sessions and finishing in-flight motion; cartridges stay seated"
     );
@@ -259,7 +268,7 @@ pub async fn main_entry_with_registry(
         "rem-daemon: serving local Layer 5 API on unix:{}",
         socket_path.display()
     );
-    let shutdown = match shutdown_signal() {
+    let shutdown = match shutdown_signal(state.clone()) {
         Ok(shutdown) => shutdown,
         Err(error) => {
             stderr_message!("error: install shutdown signal handlers: {error}");
@@ -290,6 +299,14 @@ fn init_tracing() {
 mod signal_tests {
     use super::*;
 
+    fn signal_state() -> (tempfile::TempDir, remanence_api::ApiState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = remanence_api::ApiState::new(
+            remanence_state::CatalogIndex::open(dir.path().join("state.sqlite")).unwrap(),
+        );
+        (dir, state)
+    }
+
     /// Complete the shutdown notification with a closed pty master in a child process.
     #[test]
     fn closed_stderr_does_not_panic_shutdown() {
@@ -298,7 +315,8 @@ mod signal_tests {
             let runtime = tokio::runtime::Runtime::new().expect("runtime");
             runtime.block_on(async {
                 // Supply the notification directly; signal delivery has separate coverage.
-                let shutdown = report_shutdown_signal(std::future::ready("SIGHUP"));
+                let (_dir, state) = signal_state();
+                let shutdown = report_shutdown_signal(std::future::ready("SIGHUP"), state);
                 let (mut master, mut slave) = (-1, -1);
                 // SAFETY: both output pointers are valid; null selects default pty settings.
                 assert_eq!(
@@ -350,6 +368,86 @@ mod signal_tests {
         );
     }
 
+    /// Exercise each real termination signal in an isolated daemon test process.
+    /// Admission must already be closed when notification returns, before
+    /// serve() starts session closing or transport draining.
+    #[test]
+    fn shutdown_gate_sigterm_and_sigint_close_admission() {
+        const CHILD: &str = "REM_TEST_SHUTDOWN_ADMISSION_SIGNAL";
+        if let Ok(signal) = std::env::var(CHILD) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                use remanence_api::pb::library_service_server::LibraryService;
+                let (_dir, state) = signal_state();
+                let signal: i32 = signal.parse().unwrap();
+                // Exercise the production notification callback with an actual
+                // received signal. sigwait avoids the sandbox's denied Unix
+                // socket send in Tokio's notifier; SIGHUP tests that notifier.
+                // SAFETY: only this isolated child's calling thread is masked;
+                // raise targets it, sigwait consumes it, and its mask is restored.
+                unsafe {
+                    let mut signals = std::mem::zeroed();
+                    let mut previous = std::mem::zeroed();
+                    assert_eq!(libc::sigemptyset(&mut signals), 0);
+                    assert_eq!(libc::sigaddset(&mut signals, signal), 0);
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_BLOCK, &signals, &mut previous),
+                        0
+                    );
+                    assert_eq!(libc::raise(signal), 0);
+                    let mut received = 0;
+                    assert_eq!(libc::sigwait(&signals, &mut received), 0);
+                    assert_eq!(received, signal);
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()),
+                        0
+                    );
+                }
+                report_shutdown_signal(
+                    std::future::ready(if signal == libc::SIGTERM {
+                        "SIGTERM"
+                    } else {
+                        "SIGINT"
+                    }),
+                    state.clone(),
+                )
+                .await;
+                let error = state
+                    .library_service()
+                    .resume_media_readiness(tonic::Request::new(
+                        remanence_api::pb::ResumeMediaReadinessRequest {
+                            operation_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                            timeout_seconds: 1,
+                            poll_interval_seconds: 1,
+                        },
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code(),
+                    tonic::Code::Unavailable,
+                    "signal must close admission before returning"
+                );
+                assert_eq!(error.metadata().get("remanence-shutdown").unwrap(), "true");
+                state.shutdown_drive_pool().await.unwrap();
+            });
+            return;
+        }
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "entry::signal_tests::shutdown_gate_sigterm_and_sigint_close_admission",
+                    "--nocapture",
+                ])
+                .env(CHILD, signal.to_string())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "signal {signal}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
     /// A hung-up pty reports EIO rather than a short successful write.
     #[test]
     fn tracing_writer_tolerates_terminal_eio() {
@@ -375,7 +473,8 @@ mod signal_tests {
 
     #[tokio::test]
     async fn sighup_requests_the_graceful_shutdown() {
-        let shutdown = shutdown_signal().expect("install shutdown signal handlers");
+        let (_dir, state) = signal_state();
+        let shutdown = shutdown_signal(state).expect("install shutdown signal handlers");
         // SAFETY: raise has no memory-safety preconditions. The handlers
         // installed above replace the default SIGHUP action for the rest of
         // the process, so the signal reaches the shutdown future instead of

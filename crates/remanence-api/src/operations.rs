@@ -41,6 +41,8 @@ pub(crate) struct OperationRegistry {
     #[cfg(test)]
     after_terminal: TerminalPublicationHook,
     #[cfg(test)]
+    before_publish: PublicationHook,
+    #[cfg(test)]
     running_publications: Arc<Mutex<HashMap<Uuid, usize>>>,
 }
 
@@ -48,12 +50,15 @@ pub(crate) struct OperationRegistry {
 pub(crate) struct OperationHandle {
     readiness_shutdown: Option<Arc<AtomicBool>>,
     readiness_wake: Option<Arc<crate::drive_pool::ReadinessWake>>,
+    readiness_motion: Option<(crate::drive_pool::DrivePool, crate::drive_pool::DriveKey)>,
     op_id: Uuid,
     operation_kind: String,
     cancel: Arc<AtomicBool>,
     ops: Arc<Mutex<HashMap<Uuid, OpEntry>>>,
     #[cfg(test)]
     after_terminal: TerminalPublicationHook,
+    #[cfg(test)]
+    before_publish: PublicationHook,
     #[cfg(test)]
     running_publications: Arc<Mutex<HashMap<Uuid, usize>>>,
 }
@@ -62,7 +67,19 @@ pub(crate) struct OperationHandle {
 #[cfg(test)]
 type TerminalPublicationHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
+/// Observation barrier while publication holds the real operation-registry lock.
+#[cfg(test)]
+type PublicationHook = Arc<Mutex<Option<Box<dyn FnMut(&pb::OperationStatus) + Send>>>>;
+
 impl OperationRegistry {
+    #[cfg(test)]
+    pub(crate) fn before_publish_for_test(
+        &self,
+        hook: impl FnMut(&pb::OperationStatus) + Send + 'static,
+    ) {
+        *self.before_publish.lock().unwrap() = Some(Box::new(hook));
+    }
+
     #[cfg(test)]
     pub(crate) fn after_terminal_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.after_terminal.lock().unwrap() = Some(Box::new(hook));
@@ -104,12 +121,15 @@ impl OperationRegistry {
         OperationHandle {
             readiness_shutdown: None,
             readiness_wake: None,
+            readiness_motion: None,
             op_id,
             operation_kind,
             cancel,
             ops: self.ops.clone(),
             #[cfg(test)]
             after_terminal: self.after_terminal.clone(),
+            #[cfg(test)]
+            before_publish: self.before_publish.clone(),
             #[cfg(test)]
             running_publications: self.running_publications.clone(),
         }
@@ -199,6 +219,26 @@ impl OperationHandle {
         self
     }
 
+    /// A readiness retry is a new mechanical purpose even when its wait has
+    /// owned the drive for a long time. Reuse the physical admission gate.
+    pub(crate) fn with_readiness_motion(
+        mut self,
+        pool: crate::drive_pool::DrivePool,
+        drive: crate::drive_pool::DriveKey,
+    ) -> Self {
+        self.readiness_motion = Some((pool, drive));
+        self
+    }
+
+    pub(crate) fn admit_readiness_load(
+        &self,
+    ) -> Result<Option<crate::drive_pool::DismountGuard>, tonic::Status> {
+        self.readiness_motion
+            .as_ref()
+            .map(|(pool, drive)| pool.begin_motion(drive))
+            .transpose()
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.readiness_shutdown
             .as_ref()
@@ -265,6 +305,10 @@ impl OperationHandle {
                 .or_default() += 1;
         }
         if let Ok(mut ops) = self.ops.lock() {
+            #[cfg(test)]
+            if let Some(hook) = self.before_publish.lock().unwrap().as_mut() {
+                hook(&status);
+            }
             if let Some(entry) = ops.get_mut(&self.op_id) {
                 push_locked(entry, status);
             }

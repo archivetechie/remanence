@@ -15,6 +15,57 @@ use crate::pool_write::TapeUuid;
 
 pub(crate) use remanence_state::DriveKey;
 
+/// Typed lifecycle refusal, preserved across tonic and holder decoration.
+/// This is cancellation of new work, never a media fault or retry cause.
+pub(crate) struct DaemonShuttingDown;
+impl DaemonShuttingDown {
+    pub(crate) fn status() -> Status {
+        Self::with_message("daemon shutting down; new mount and motion admission closed")
+    }
+
+    pub(crate) fn with_message(message: impl Into<String>) -> Status {
+        let mut status = Status::unavailable(message);
+        status
+            .metadata_mut()
+            .insert("remanence-shutdown", "true".parse().unwrap());
+        status
+    }
+
+    pub(crate) fn is_status(status: &Status) -> bool {
+        status
+            .metadata()
+            .get("remanence-shutdown")
+            .is_some_and(|value| value == "true")
+    }
+}
+
+/// One admission boundary for reservations and new physical motion. The same
+/// mutex closes admission on shutdown; callers acquire it after queue/drive waits.
+fn admit_new_work<'a>(
+    active: &'a Mutex<HashMap<DriveKey, usize>>,
+    shutdown: &AtomicBool,
+) -> Result<std::sync::MutexGuard<'a, HashMap<DriveKey, usize>>, Status> {
+    let guard = active.lock().unwrap();
+    if shutdown.load(Ordering::SeqCst) {
+        return Err(DaemonShuttingDown::status());
+    }
+    Ok(guard)
+}
+
+/// Retain committed motion until its complete physical sequence has replied.
+fn begin_motion(
+    active: &Arc<Mutex<HashMap<DriveKey, usize>>>,
+    shutdown: &AtomicBool,
+    key: &DriveKey,
+) -> Result<DismountGuard, Status> {
+    let mut admitted = admit_new_work(active, shutdown)?;
+    *admitted.entry(key.clone()).or_default() += 1;
+    Ok(DismountGuard {
+        active: active.clone(),
+        key: key.clone(),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MountedSession {
     pub(crate) bay: u16,
@@ -239,6 +290,45 @@ pub(crate) struct DismountGuard {
     key: DriveKey,
 }
 
+/// Own a composed motion from its first physical dispatch through completion.
+/// Keeps the typed refusal across the library's string callback boundary.
+pub(crate) struct MotionAdmission {
+    lifecycle: Option<DrivePoolLifecycle>,
+    key: DriveKey,
+    guard: Option<DismountGuard>,
+    pub(crate) refusal: Option<Status>,
+    pub(crate) dispatched: bool,
+}
+
+impl MotionAdmission {
+    pub(crate) fn new(lifecycle: Option<DrivePoolLifecycle>, key: DriveKey) -> Self {
+        Self {
+            lifecycle,
+            key,
+            guard: None,
+            refusal: None,
+            dispatched: false,
+        }
+    }
+
+    pub(crate) fn admit(&mut self) -> Result<(), String> {
+        if !self.dispatched {
+            self.guard = self
+                .lifecycle
+                .as_ref()
+                .map(|l| l.begin_motion(&self.key))
+                .transpose()
+                .map_err(|error| {
+                    let message = error.message().to_string();
+                    self.refusal = Some(error);
+                    message
+                })?;
+            self.dispatched = true;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for DismountGuard {
     fn drop(&mut self) {
         let mut active = self.active.lock().unwrap();
@@ -251,6 +341,13 @@ impl Drop for DismountGuard {
 }
 
 impl DrivePoolLifecycle {
+    /// Refuse preparation side effects once shutdown is known. Physical motion
+    /// still needs fresh admission after its blocking preparation.
+    pub(crate) fn check_admission(&self) -> Result<(), Status> {
+        drop(admit_new_work(&self.dismounts, &self.shutting_down)?);
+        Ok(())
+    }
+
     /// Register seated media even when no caller received its new session.
     pub(crate) fn park_cartridge(&self, seated: SeatedCartridge) -> ParkedCartridge {
         park_cartridge(&self.parked, seated)
@@ -258,17 +355,19 @@ impl DrivePoolLifecycle {
 
     /// Serialize the final pre-UNLOAD decision with shutdown admission.
     pub(crate) fn begin_dismount(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
-        let mut active = self.dismounts.lock().unwrap();
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return Err(Status::unavailable(
+        begin_motion(&self.dismounts, &self.shutting_down, key).map_err(|error| {
+            Status::with_details_and_metadata(
+                error.code(),
                 "daemon shutdown before UNLOAD; cartridge stays seated",
-            ));
-        }
-        *active.entry(key.clone()).or_default() += 1;
-        Ok(DismountGuard {
-            active: self.dismounts.clone(),
-            key: key.clone(),
+                error.details().to_vec().into(),
+                error.metadata().clone(),
+            )
         })
+    }
+
+    /// Admit the start of a new composed motion using the pool's common gate.
+    pub(crate) fn begin_motion(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
+        begin_motion(&self.dismounts, &self.shutting_down, key)
     }
 
     pub(crate) fn clear_holder(&self, drive: &DriveKey) {
@@ -340,9 +439,14 @@ fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
 
 #[cfg(test)]
 type ReservationHook = Box<dyn FnOnce(&DrivePool) + Send>;
+#[cfg(test)]
+type MotionAdmissionHook = Box<dyn FnOnce() + Send>;
 
 #[derive(Clone)]
 pub(crate) struct DrivePool {
+    #[cfg(test)]
+    pub(crate) motion_admission_hook: Arc<Mutex<Option<MotionAdmissionHook>>>,
+
     #[cfg(test)]
     pub(crate) mount_busy_snapshot_hook: Arc<Mutex<Option<ReservationHook>>>,
     #[cfg(test)]
@@ -500,6 +604,8 @@ impl DrivePool {
     ) -> Self {
         Self {
             #[cfg(test)]
+            motion_admission_hook: Arc::default(),
+            #[cfg(test)]
             mount_busy_snapshot_hook: Arc::default(),
             #[cfg(test)]
             post_wait_reservation_hook: Arc::default(),
@@ -618,9 +724,7 @@ impl DrivePool {
     }
 
     pub(crate) fn reserve_drive(&self, drive: &DriveKey) -> Result<DriveReservation, Status> {
-        if self.is_shutting_down() {
-            return Err(Status::unavailable("drive pool is shutting down"));
-        }
+        let _admission = admit_new_work(&self.dismounts, &self.shutting_down)?;
         self.reserve_drive_inner(drive)
     }
 
@@ -674,9 +778,7 @@ impl DrivePool {
         &self,
         include: impl Fn(&DriveKey) -> bool,
     ) -> Result<(), Status> {
-        if self.is_shutting_down() {
-            return Err(Status::unavailable("drive pool is shutting down"));
-        }
+        let _admission = admit_new_work(&self.dismounts, &self.shutting_down)?;
         let mut acquired = Vec::new();
         let mut drives = self
             .reservations
@@ -814,12 +916,7 @@ impl DrivePool {
         &self,
         tape: TapeUuid,
     ) -> Result<(ClosingGuard, TapeReservation), Status> {
-        let _admission = self.dismounts.lock().unwrap();
-        if self.is_shutting_down() {
-            return Err(Status::unavailable(
-                "daemon shutdown; maintenance admission closed",
-            ));
-        }
+        let _admission = admit_new_work(&self.dismounts, &self.shutting_down)?;
         let mut closing = None;
         let reservation = self.reserve_tape_with_after_insert(tape, |_| {
             closing = Some(
@@ -1010,6 +1107,12 @@ impl DrivePool {
         }
     }
 
+    /// Commit a new MOVE only after obtaining channel capacity. A return MOVE
+    /// already owns the guard from UNLOAD and must not seek new admission.
+    pub(crate) fn begin_motion(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
+        begin_motion(&self.dismounts, &self.shutting_down, key)
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         let _motion = self.dismounts.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
@@ -1037,12 +1140,7 @@ impl DrivePool {
             return Err(Status::unavailable("drive is completing session closeout"));
         }
         let work = {
-            let _admission = self.dismounts.lock().unwrap();
-            if self.is_shutting_down() {
-                return Err(Status::unavailable(
-                    "daemon shutdown; maintenance admission closed",
-                ));
-            }
+            let _admission = admit_new_work(&self.dismounts, &self.shutting_down)?;
             self.actor_work.begin([0; 16], drive.clone()).0
         };
         let tx = self.drive_tx(drive)?;
@@ -1070,12 +1168,7 @@ impl DrivePool {
             return Ok(());
         }
         let work = {
-            let _admission = self.dismounts.lock().unwrap();
-            if self.is_shutting_down() {
-                return Err(Status::unavailable(
-                    "daemon shutdown; maintenance admission closed",
-                ));
-            }
+            let _admission = admit_new_work(&self.dismounts, &self.shutting_down)?;
             self.actor_work.begin([0; 16], drive.clone()).0
         };
         let tx = self.drive_tx(drive)?;

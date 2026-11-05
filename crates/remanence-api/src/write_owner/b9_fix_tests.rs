@@ -227,10 +227,7 @@ async fn b9_fix_cold_preparation_leaves_other_rpc_and_shutdown_admissible() {
     release.send(()).unwrap();
     observer.await.unwrap().unwrap();
     let error = preparation.await.unwrap().unwrap_err();
-    assert_eq!(
-        error.message(),
-        "daemon shutdown; maintenance admission closed"
-    );
+    assert!(crate::drive_pool::DaemonShuttingDown::is_status(&error));
     assert_eq!(
         state.index().unwrap().list_operations().unwrap().len(),
         before

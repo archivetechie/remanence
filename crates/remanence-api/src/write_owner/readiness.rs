@@ -40,6 +40,7 @@ pub(crate) fn session_open_short_probe_or_load(
             ctx,
             family,
             "drive LOAD IMMED",
+            &first,
         );
     }
     if session_open_readiness_should_retry_once(&first) {
@@ -54,6 +55,7 @@ pub(crate) fn session_open_short_probe_or_load(
                 ctx,
                 family,
                 "drive LOAD IMMED after retry",
+                &second,
             );
         }
         return Err(record_session_open_readiness_fence(
@@ -258,7 +260,10 @@ pub(crate) fn poll_drive_media_readiness(
         .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
     let mut last_logged: Option<LoggedReadiness> = None;
     let mut interruption = None;
-    drive.wait_for_media_readiness_with_initializing_load(
+    let mut load_admission = None;
+    let refused = std::cell::Cell::new(false);
+    let mut attempted_readiness = None;
+    let result = drive.wait_for_media_readiness_with_load_admission(
         family,
         None,
         options,
@@ -312,6 +317,7 @@ pub(crate) fn poll_drive_media_readiness(
                 Ok(())
             }
             MediaReadinessWaitEvent::InitializingLoad(poll) => {
+                attempted_readiness = Some(poll.readiness.clone());
                 index
                     .record_media_readiness_transition(
                         crate::startup_media_readiness::media_readiness_initializing_load_transition(
@@ -373,7 +379,49 @@ pub(crate) fn poll_drive_media_readiness(
                 Ok(())
             },
         },
-    ).map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
+        &mut || {
+            load_admission = handle.admit_readiness_load().map_err(|error| {
+                refused.set(crate::drive_pool::DaemonShuttingDown::is_status(&error));
+                error.message().to_string()
+            })?;
+            Ok(())
+        },
+    );
+    if refused.get() {
+        record_refused_load(
+            index,
+            operation_id,
+            attempted_readiness
+                .as_ref()
+                .expect("LOAD write-ahead precedes admission"),
+        )?;
+        return Err(DriveReadinessError::Shutdown);
+    }
+    result.map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
+}
+
+/// Append proof that the immediately preceding LOAD write-ahead sent no command.
+/// A crash or persistence failure leaves the write-ahead counted conservatively.
+fn record_refused_load(
+    index: &mut CatalogIndex,
+    operation_id: Uuid,
+    observed: &MediaReadiness,
+) -> Result<(), String> {
+    let mut transition = crate::startup_media_readiness::startup_media_readiness_probe_transition(
+        operation_id,
+        observed,
+    );
+    transition.phase = Some("initializing_load_refused".into());
+    transition.last_cdb_opcode = None;
+    transition.cancel_source = Some("shutdown".into());
+    transition.last_error_json = Some(session_open_json_detail(
+        "load_refused_before_dispatch",
+        crate::readiness_wait::SHUTDOWN_REASON,
+    ));
+    index
+        .record_media_readiness_transition(transition)
+        .map(|_| ())
+        .map_err(|error| format!("record media readiness LOAD refusal: {error}"))
 }
 
 pub(crate) fn session_open_reject_admission_conflicts(
@@ -440,12 +488,15 @@ pub(crate) fn session_open_admission_error_message(
     )
 }
 
+/// Finish an admitted MOVE, or admit a fresh conditional LOAD at physical dispatch.
+/// Keep write-ahead evidence and record a conclusive refusal without a media error.
 pub(crate) fn session_open_immediate_load_then_probe(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
     family: MediaFamily,
     detail_prefix: &str,
+    observed: &MediaReadiness,
 ) -> Result<(), Status> {
     let operation_id = Uuid::new_v4();
     if let Err(err) = record_session_open_readiness_operation(index, operation_id, &ctx) {
@@ -472,7 +523,34 @@ pub(crate) fn session_open_immediate_load_then_probe(
         ));
     }
     std::thread::sleep(SESSION_OPEN_CONDITIONAL_LOAD_SETTLE);
-    if let Err(err) = drive.load_immediate() {
+    let mut admission = None;
+    let mut refusal = None;
+    let result = drive.load_immediate_with_admission(&mut || {
+        if !ctx.load_continues_move {
+            admission = ctx
+                .lifecycle
+                .map(|lifecycle| {
+                    lifecycle.begin_motion(&crate::drive_pool::DriveKey::new(
+                        ctx.library_serial,
+                        ctx.bay,
+                    ))
+                })
+                .transpose()
+                .map_err(|status| {
+                    let detail = status.message().to_string();
+                    if crate::drive_pool::DaemonShuttingDown::is_status(&status) {
+                        refusal = Some(status);
+                    }
+                    detail
+                })?;
+        }
+        Ok(())
+    });
+    if let Some(status) = refusal {
+        record_refused_load(index, operation_id, observed).map_err(Status::internal)?;
+        return Err(status);
+    }
+    if let Err(err) = result {
         return Err(record_session_open_command_fence_on_operation(
             index,
             operation_id,
