@@ -59,7 +59,9 @@ fn shutdown_round1_reconcile_reserved_load_and_admitted_completion() {
                     released.recv_timeout(StdDuration::from_secs(10)).unwrap();
                 }
             });
-            let mut index = CatalogIndex::open(root_path.join("state.sqlite")).unwrap();
+            let mut index = remanence_state::projector::open(root_path.join("state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             let registry = crate::operations::OperationRegistry::default();
             let handle = registry.register(Uuid::new_v4(), "reconcile");
             super::super::super::reconcile::reconcile_with_library(
@@ -124,7 +126,9 @@ fn shutdown_round1_readiness_registry_barrier_refuses_load() {
     let index_path = root.path().join("state.sqlite");
     let worker = std::thread::spawn(move || {
         let (world, mut library) = unthreaded_cartridge_world(LIBRARY);
-        let mut index = CatalogIndex::open(&index_path).unwrap();
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         record_unthreaded_readiness_operation(&mut index, LIBRARY, id);
         let mut drive = library
             .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
@@ -182,7 +186,9 @@ fn shutdown_round1_cleaning_refusal_restores_durable_state() {
         let lifecycle = DrivePoolLifecycle::default();
         let pool = motion_pool(lifecycle.clone());
         cfg.lifecycle = Some(lifecycle);
-        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        let mut index = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let uuid = index
             .observe_drive(DriveObservationInput {
                 serial: DRIVE.into(),
@@ -406,7 +412,9 @@ fn shutdown_round1_operator_load_rechecks_after_library_preparation() {
             pool.begin_shutdown();
         }
     });
-    let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+    let mut index = remanence_state::projector::open(&cfg.index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry.register(Uuid::new_v4(), "load");
     let result = run_load_sequence(&mut index, &cfg, &handle, &mut library, 0x400, BAY, false);
@@ -572,7 +580,9 @@ fn readiness_dispatched_load_finishes() {
         })
         .unwrap();
     let mut drive = library.open_drive(BAY, &policy).unwrap();
-    let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = Uuid::new_v4();
     record_unthreaded_readiness_operation(&mut index, LIBRARY, id);
     let registry = crate::operations::OperationRegistry::default();
@@ -757,7 +767,9 @@ fn regate1_refused_readiness_load_can_resume_after_restart() {
         .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
         .unwrap();
     let id = Uuid::new_v4();
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     record_unthreaded_readiness_operation(&mut index, LIBRARY, id);
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry
@@ -781,7 +793,9 @@ fn regate1_refused_readiness_load_can_resume_after_restart() {
     drop(index);
     drop(drive);
     drop(library);
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let rows = readiness_transition_rows(&path, id);
     assert!(
         rows.iter()
@@ -828,7 +842,9 @@ fn shutdown_round2_dispatched_and_unknown_loads_still_count_after_restart() {
             .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
             .unwrap();
         let id = Uuid::new_v4();
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         record_unthreaded_readiness_operation(&mut index, LIBRARY, id);
         index
             .record_media_readiness_transition(
@@ -849,7 +865,9 @@ fn shutdown_round2_dispatched_and_unknown_loads_still_count_after_restart() {
             world.lock().unwrap().leave_cartridge_unthreaded(BAY);
         }
         drop(index);
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert_eq!(
             crate::startup_media_readiness::media_readiness_initializing_load_budget(&index, id)
                 .unwrap(),

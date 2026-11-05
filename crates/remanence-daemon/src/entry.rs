@@ -302,7 +302,7 @@ mod signal_tests {
     fn signal_state() -> (tempfile::TempDir, remanence_api::ApiState) {
         let dir = tempfile::tempdir().unwrap();
         let state = remanence_api::ApiState::new(
-            remanence_state::CatalogIndex::open(dir.path().join("state.sqlite")).unwrap(),
+            remanence_state::projector::open(dir.path().join("state.sqlite")).unwrap(),
         );
         (dir, state)
     }
