@@ -22,11 +22,6 @@ use std::sync::RwLock;
 use std::time::Instant;
 
 #[cfg(test)]
-use remanence_format_driver::{
-    ArchiveGapCause, ArchiveGapRange, EntryCatalogSink, EntryKind, ForeignFormatRegistry,
-    FormatError, NormalizedEntry, ScanIntegrityBasis, SourceRequirement,
-};
-#[cfg(test)]
 use remanence_state::{
     AuditEventRecord, CatalogIndex, FileAuditLog, MediaReadinessOperationRecord,
     NativeObjectFileRecord, NativeObjectInstanceRecord, NativeObjectRecord, StateError,

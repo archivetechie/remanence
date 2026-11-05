@@ -10,7 +10,7 @@ use remanence_state::{CalibrationControlStore, CatalogIndex, RemConfig, StateHan
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::audit_projection::{ensure_manual_finalize_finished_audit, ensure_tape_sealed_audit};
+use crate::audit_projection::ensure_manual_finalize_finished_audit;
 use crate::drive_collection::parse_simple_duration;
 use crate::startup_media_readiness::status_from_state_error;
 
@@ -288,7 +288,6 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
                 .map_err(status_from_state_error)?;
         }
         if let Some(completion) = sealed_completion.as_ref() {
-            ensure_tape_sealed_audit(index, audit_dir, audit_append_lock, tape_uuid)?;
             ensure_manual_finalize_finished_audit(
                 index,
                 audit_dir,

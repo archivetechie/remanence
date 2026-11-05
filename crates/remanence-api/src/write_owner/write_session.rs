@@ -40,7 +40,6 @@ use super::{
     AppendFinishOutcome, CheckpointTrigger, CloseWriteActorDiagnostics, CloseWriteActorReply,
     SelectedTape, SessionOpenReadinessContext, TapeUuid,
 };
-use crate::audit_projection::ensure_tape_sealed_audit;
 use crate::{
     pb, status_from_state_error, verify_tape_identity, PoolWriteError, WriteObjectToPoolRequest,
 };
@@ -793,7 +792,7 @@ impl WriteSessionState<'_> {
             })?;
             let rewritable = matches!(config.worm, remanence_library::WormMediaState::NotWorm);
             self.checkpoint_lease.finish_structural_scope();
-            let result = match self.selected.parity_config {
+            match self.selected.parity_config {
                 remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
                     self.index,
                     self.cfg,
@@ -821,9 +820,6 @@ impl WriteSessionState<'_> {
                     permit,
                 ),
             }?;
-            if result.final_record.is_some() {
-                append_tape_sealed_evidence(self.index, self.cfg, self.tape_uuid)?;
-            }
             return audit_result.map(|_| ());
         }
         drop(parity);
@@ -2326,9 +2322,6 @@ pub(super) fn handle_drive_open_write(
         };
         match result {
             Ok(result) if result.final_record.is_some() => {
-                if let Err(error) = append_tape_sealed_evidence(index, cfg, tape_uuid) {
-                    tracing::warn!(error = %error, "failed to append recovered tape sealing evidence");
-                }
                 if cfg.mounted().is_some() {
                     if let Err(error) = super::mounted_commands::close_audit(index, cfg, session_id)
                     {
@@ -2917,19 +2910,6 @@ pub(super) fn handle_drive_open_write(
             .map_err(|_| Status::internal("session close reply lost"))
             .and_then(|result| result.map(|_| ())),
     })
-}
-
-pub(super) fn append_tape_sealed_evidence(
-    index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
-    tape_uuid: [u8; 16],
-) -> Result<(), Status> {
-    ensure_tape_sealed_audit(
-        index,
-        cfg.audit_dir.as_path(),
-        &cfg.audit_append_lock,
-        tape_uuid,
-    )
 }
 
 /// Raise a fence under the same append lock as the other daemon audit writers.

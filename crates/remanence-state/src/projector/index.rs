@@ -36,7 +36,6 @@ use remanence_parity::{
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -1232,36 +1231,6 @@ pub struct NativeObjectFileProjectionInput {
     pub mtime: Option<String>,
     /// Optional executable flag.
     pub executable: Option<bool>,
-}
-
-/// Foreign archive scan summary supplied by a registered read-only driver.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForeignArchiveProjectionInput {
-    /// Optional tape UUID when the source is a physical cartridge.
-    pub tape_uuid: Vec<u8>,
-    /// Stable foreign-format adapter identifier.
-    pub format_id: String,
-    /// Stable scan id assigned by the caller/daemon.
-    pub scan_id: String,
-    /// Source kind, such as `byte_stream_dump` or `physical_tape_records`.
-    pub source_kind: String,
-    /// Trusted daemon-local source id or path token.
-    ///
-    /// This must come from daemon configuration or another privileged local
-    /// source. It is not safe to accept arbitrary client-submitted paths here.
-    pub source_id: String,
-    /// Scan confidence: `low`, `medium`, or `high`.
-    pub confidence: String,
-    /// Number of normalized entries seen during scan.
-    pub entry_count: u64,
-    /// Number of non-fatal damage events seen during scan.
-    pub damage_event_count: u64,
-    /// Driver-private state needed to resume or refresh this scan.
-    pub adapter_state: Vec<u8>,
-    /// Scan timestamp. Uses current UTC when omitted.
-    pub last_scan_at_utc: Option<String>,
-    /// Row creation timestamp. Uses current UTC when omitted.
-    pub created_at_utc: Option<String>,
 }
 
 /// One tape row from the rebuildable catalog projection.
@@ -4955,61 +4924,6 @@ impl CatalogCore {
         Ok(())
     }
 
-    /// Project a foreign archive scan unit without exposing driver-private locators.
-    pub fn upsert_foreign_archive_projection(
-        &mut self,
-        input: ForeignArchiveProjectionInput,
-    ) -> Result<String, StateError> {
-        let unit_id = foreign_catalog_unit_id(
-            input.source_kind.as_str(),
-            input.source_id.as_str(),
-            input.scan_id.as_str(),
-        );
-        let entry_count = u64_to_i64(input.entry_count, "entry_count")?;
-        let damage_event_count = u64_to_i64(input.damage_event_count, "damage_event_count")?;
-        let now = now_utc()?;
-        let last_scan_at_utc = input.last_scan_at_utc.unwrap_or_else(|| now.clone());
-        let created_at_utc = input.created_at_utc.unwrap_or(now);
-
-        self.conn
-            .execute(
-                "insert into catalog_units(
-                   unit_id, tape_uuid, origin_kind, format_id, native_object_id,
-                   scan_id, source_kind, source_id, confidence, entry_count,
-                   damage_event_count, last_scan_at_utc, adapter_state, created_at_utc
-                 )
-                 values(?1, ?2, 'foreign_archive', ?3, null, ?4, ?5, ?6, ?7,
-                        ?8, ?9, ?10, ?11, ?12)
-                 on conflict(unit_id) do update set
-                   tape_uuid = excluded.tape_uuid,
-                   format_id = excluded.format_id,
-                   scan_id = excluded.scan_id,
-                   source_kind = excluded.source_kind,
-                   source_id = excluded.source_id,
-                   confidence = excluded.confidence,
-                   entry_count = excluded.entry_count,
-                   damage_event_count = excluded.damage_event_count,
-                   last_scan_at_utc = excluded.last_scan_at_utc,
-                   adapter_state = excluded.adapter_state",
-                params![
-                    unit_id.as_str(),
-                    input.tape_uuid,
-                    input.format_id.as_str(),
-                    input.scan_id.as_str(),
-                    input.source_kind.as_str(),
-                    input.source_id.as_str(),
-                    input.confidence.as_str(),
-                    entry_count,
-                    damage_event_count,
-                    last_scan_at_utc.as_str(),
-                    input.adapter_state,
-                    created_at_utc.as_str(),
-                ],
-            )
-            .map_err(|err| sqlite_error("upsert foreign archive projection", err))?;
-        Ok(unit_id)
-    }
-
     /// List source-neutral catalog units for operator/discovery surfaces.
     pub fn list_catalog_units(
         &self,
@@ -6584,7 +6498,6 @@ impl PreservedEvidenceKeys {
                 AuditEvent::TapeProvisioned
                 | AuditEvent::TapeIdentityAdopted
                 | AuditEvent::TapeRetired
-                | AuditEvent::TapeSealed
                 | AuditEvent::CleaningCartridgeExpired
                 | AuditEvent::CleaningCartridgeRegistered => {
                     if let Some(id) = audit_tape_identity(record) {
@@ -9355,7 +9268,7 @@ fn project_catalog_evidence_record(
                 .map_err(|_| StateError::IndexCorrupt("invalid assignment UUID".into()))?;
             replay_assignment(tx, uuid, record)?;
         }
-        AuditEvent::TapeSealed | AuditEvent::TapeRetired => {
+        AuditEvent::TapeRetired => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
                 divergences.push(format!(
                     "record {} {:?} has no valid tape identity",
@@ -9363,12 +9276,7 @@ fn project_catalog_evidence_record(
                 ));
                 return Ok(());
             };
-            let state = if matches!(record.event, AuditEvent::TapeRetired) {
-                "retired"
-            } else {
-                "sealed"
-            };
-            project_tape_lifecycle_core(tx, &tape_uuid, state, &record.timestamp_utc)?;
+            project_tape_lifecycle_core(tx, &tape_uuid, "retired", &record.timestamp_utc)?;
         }
         AuditEvent::CleaningCartridgeRegistered | AuditEvent::CleaningCartridgeExpired => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
@@ -11651,15 +11559,6 @@ fn native_catalog_unit_id(object_id: &str, tape_uuid: [u8; 16], tape_file_number
         "native:{}:{tape_file_number}:{object_id}",
         hex_uuid(tape_uuid)
     )
-}
-
-fn foreign_catalog_unit_id(source_kind: &str, source_id: &str, scan_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(source_kind.as_bytes());
-    hasher.update([0]);
-    hasher.update(source_id.as_bytes());
-    let digest = hasher.finalize();
-    format!("foreign:{source_kind}:{}:{scan_id}", hex_bytes(&digest))
 }
 
 fn tape_file_kind(kind: TapeFileKind) -> &'static str {
@@ -14725,7 +14624,8 @@ mod tests {
             index.project_checkpoint_record(&record).unwrap();
             index.project_checkpoint_record(&terminal).unwrap();
             assert!(index.get_tape(&uuid).unwrap().unwrap().seal_due.is_none());
-            for event in [AuditEvent::TapeSealed, AuditEvent::TapeRetired] {
+            {
+                let event = AuditEvent::TapeRetired;
                 let mut other =
                     crate::projector::open(root.path().join(format!("{event:?}.sqlite")))
                         .map(|catalog| catalog.write_handle())
@@ -19425,55 +19325,38 @@ mod tests {
         assert_eq!(voltag, None);
     }
 
+    /// Native seal replay cannot revive a retired identity or restore its label.
     #[test]
-    fn tape_sealed_audit_cannot_resurrect_a_retired_identity() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-retired-seal-audit")
-            .tempdir()
-            .expect("temp dir");
-        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .expect("open");
-        let tape_uuid = [0x73; 16];
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: "RMN009L9".to_string(),
-                block_size: 1024 * 1024,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .expect("provision tape");
+    fn tape_log_seal_cannot_resurrect_a_retired_identity() {
+        use crate::authority::TapeAuthorityView;
+        let root = tempfile::tempdir().unwrap();
+        let uuid = [0xa3; 16];
+        let logs = root.path().join("tapes");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join(format!("{}.remtape", Uuid::from_bytes(uuid).simple())),
+            include_bytes!("../../../../fixtures/tape-log/sealed-terminal.remtape"),
+        )
+        .unwrap();
+        let mut index = crate::projector::open(root.path().join("catalog.sqlite"))
+            .unwrap()
+            .write_handle();
+        let authority = crate::TapeAuthority::open(&logs, uuid, index.path()).unwrap();
+        let snapshot = authority.freeze().unwrap();
+        index.project_tape_log(&snapshot).unwrap();
+        assert_eq!(index.get_tape(&uuid).unwrap().unwrap().state, "sealed");
         index
             .retire_tape(RetireTapeInput {
-                tape_uuid,
-                reason: "scratch-media recycle".to_string(),
+                tape_uuid: uuid,
+                reason: "recycle".into(),
             })
-            .expect("retire tape");
-        let retired_at = index
-            .get_tape(&tape_uuid)
-            .expect("read retired tape")
-            .expect("retired tape exists")
-            .updated_at_utc;
-
-        let sealed = catalog_evidence_record(
-            1,
-            AuditEvent::TapeSealed,
-            "tape",
-            hex_uuid_from_slice(&tape_uuid).as_str(),
-            BTreeMap::new(),
-        );
-        index
-            .project_audit_record(&sealed)
-            .expect("replay older durable seal fact");
-
-        let tape = index
-            .get_tape(&tape_uuid)
-            .expect("read tape")
-            .expect("tape exists");
-        assert_eq!(tape.state, "retired");
-        assert_eq!(tape.voltag, None);
-        assert_eq!(tape.updated_at_utc, retired_at);
+            .unwrap();
+        let retired = index.get_tape(&uuid).unwrap().unwrap();
+        index.project_tape_log(&snapshot).unwrap();
+        let replayed = index.get_tape(&uuid).unwrap().unwrap();
+        assert_eq!(replayed.state, "retired");
+        assert_eq!(replayed.voltag, None);
+        assert_eq!(replayed.updated_at_utc, retired.updated_at_utc);
     }
 
     #[test]
@@ -21982,52 +21865,6 @@ mod tests {
     }
 
     #[test]
-    fn foreign_archive_projection_populates_catalog_units() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-index")
-            .tempdir()
-            .expect("temp dir");
-        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .expect("open");
-
-        let unit_id = index
-            .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
-                tape_uuid: Vec::new(),
-                format_id: "legacy-example-v1".to_string(),
-                scan_id: "scan-1".to_string(),
-                source_kind: "byte_stream_dump".to_string(),
-                source_id: "dump:/tmp/archive.bin".to_string(),
-                confidence: "high".to_string(),
-                entry_count: 3,
-                damage_event_count: 1,
-                adapter_state: vec![0xab, 0xcd],
-                last_scan_at_utc: Some("2026-05-28T13:00:00Z".to_string()),
-                created_at_utc: Some("2026-05-28T13:00:01Z".to_string()),
-            })
-            .expect("project foreign archive");
-
-        let units = index
-            .list_catalog_units(CatalogUnitFilter::ForeignArchives)
-            .expect("list foreign units");
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].unit_id, unit_id);
-        assert_eq!(units[0].origin_kind, "foreign_archive");
-        assert_eq!(units[0].format_id, "legacy-example-v1");
-        assert_eq!(units[0].scan_id.as_deref(), Some("scan-1"));
-        assert_eq!(units[0].source_kind.as_deref(), Some("byte_stream_dump"));
-        assert_eq!(units[0].source_id.as_deref(), Some("dump:/tmp/archive.bin"));
-        assert_eq!(units[0].confidence.as_deref(), Some("high"));
-        assert_eq!(units[0].entry_count, Some(3));
-        assert_eq!(units[0].damage_event_count, Some(1));
-        assert_eq!(units[0].adapter_state, vec![0xab, 0xcd]);
-        assert_eq!(
-            index.get_catalog_unit(&unit_id).expect("get foreign unit"),
-            Some(units[0].clone())
-        );
-    }
-
-    #[test]
     fn marks_tape_journal_ingestion_pending() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
@@ -22222,9 +22059,6 @@ mod tests {
             .project_tape_pool_membership(tape_uuid, "camera.copy-a")
             .expect("seed tape pool membership cache");
         index
-            .seal_tape(tape_uuid)
-            .expect("seed tape lifecycle cache");
-        index
             .raise_alarm(
                 "snapshot-persist-failing:mainlib",
                 "snapshot-persist-failing",
@@ -22374,13 +22208,6 @@ mod tests {
                     ("release_ack", CborValue::Text("verified".to_string())),
                 ]),
             ),
-            catalog_evidence_record(
-                10,
-                AuditEvent::TapeSealed,
-                "tape",
-                tape_id.as_str(),
-                BTreeMap::new(),
-            ),
         ];
 
         let first = index
@@ -22457,7 +22284,7 @@ mod tests {
         );
         assert_eq!(actual, expected);
         let tape = actual.0.expect("tape row");
-        assert_eq!(tape.state, "sealed");
+        assert_eq!(tape.state, "ready");
         assert_eq!(tape.voltag.as_deref(), Some("RMN042L9"));
         assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
         assert_eq!(actual.1.expect("alarm row").state, "acked");

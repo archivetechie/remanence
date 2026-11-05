@@ -32,13 +32,9 @@ crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_au
 crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_audit::AuditEvent::OperationFinished	2
 crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_audit::append_and_project_audit_locked	1
 crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_audit::audit-hub	1
-crates/remanence-api/src/audit_projection.rs::ensure_tape_sealed_audit::AuditEvent::TapeSealed	2
-crates/remanence-api/src/audit_projection.rs::ensure_tape_sealed_audit::append_and_project_audit_locked	1
-crates/remanence-api/src/audit_projection.rs::ensure_tape_sealed_audit::audit-hub	1
 crates/remanence-api/src/audit_projection.rs::manual_finalize_audit_identity_matches::audit-hub	1
 crates/remanence-api/src/audit_projection.rs::manual_finalize_completion_unknown_audit_matches::audit-hub	1
 crates/remanence-api/src/audit_projection.rs::manual_finalize_finished_audit_matches::audit-hub	1
-crates/remanence-api/src/audit_projection.rs::tape_sealed_audit_matches::audit-hub	1
 crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::AlarmAcked	1
 crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::AlarmCleared	1
 crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::AlarmRaised	1
@@ -315,7 +311,6 @@ crates/remanence-state/src/index.rs::fallbacks::AuditEvent::TapeIoFenceRaised	1
 crates/remanence-state/src/index.rs::fallbacks::AuditEvent::TapePoolAssigned	1
 crates/remanence-state/src/index.rs::fallbacks::AuditEvent::TapeProvisioned	2
 crates/remanence-state/src/index.rs::fallbacks::AuditEvent::TapeRetired	1
-crates/remanence-state/src/index.rs::fallbacks::AuditEvent::TapeSealed	1
 crates/remanence-state/src/index.rs::operation_state_for_event::AuditEvent::CancelRequested	1
 crates/remanence-state/src/index.rs::operation_state_for_event::AuditEvent::CancellationRejected	1
 crates/remanence-state/src/index.rs::operation_state_for_event::AuditEvent::CancelledBeforeDispatch	1
@@ -346,8 +341,7 @@ crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent
 crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent::TapeLabelRebound	1
 crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent::TapePoolAssigned	1
 crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent::TapeProvisioned	1
-crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent::TapeRetired	2
-crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent::TapeSealed	1
+crates/remanence-state/src/index.rs::project_catalog_evidence_record::AuditEvent::TapeRetired	1
 crates/remanence-state/src/index.rs::project_drive_lifecycle_record::AuditEvent::DriveAnnotated	1
 crates/remanence-state/src/index.rs::project_drive_lifecycle_record::AuditEvent::DriveCleaned	1
 crates/remanence-state/src/index.rs::project_drive_lifecycle_record::AuditEvent::DriveFenced	2

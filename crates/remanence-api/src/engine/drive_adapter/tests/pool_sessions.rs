@@ -548,6 +548,7 @@ fn watermark_seal_journals_exact_terminal_authority_and_host_suffix() {
                 )]),
             })
             .unwrap();
+        crate::tests::assert_one_native_seal(&f.config.journal.dir.join("tapes"), UUID);
         let audit = FileAuditLog::replay(&f.config.audit.dir).unwrap();
         assert_eq!(
             audit
@@ -555,7 +556,7 @@ fn watermark_seal_journals_exact_terminal_authority_and_host_suffix() {
                 .filter(|r| r.event == AuditEvent::TapeSealed
                     && crate::audit_projection::audit_subject_matches_tape(r, UUID))
                 .count(),
-            1
+            0
         );
         assert!(audit.windows(2).all(|p| p[1].sequence == p[0].sequence + 1));
         assert_eq!(

@@ -42,8 +42,7 @@ use super::write_session::{
 };
 use super::{SelectedTape, SessionOpenReadinessContext};
 use crate::audit_projection::{
-    append_operation_audit, ensure_manual_finalize_finished_audit, ensure_tape_sealed_audit,
-    OperationAuditInput,
+    append_operation_audit, ensure_manual_finalize_finished_audit, OperationAuditInput,
 };
 use crate::FINALIZE_TAPE_OPERATION_KIND;
 
@@ -167,12 +166,7 @@ pub(crate) fn finalize_mounted_tape(
                 "sealed checkpoint authority has no terminal-finalization completion",
             )
         })?;
-        ensure_tape_sealed_audit(
-            index,
-            cfg.audit_dir.as_path(),
-            &cfg.audit_append_lock,
-            request.tape_uuid,
-        )?;
+
         ensure_manual_finalize_finished_audit(
             index,
             cfg.audit_dir.as_path(),
@@ -945,12 +939,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                 "sealed checkpoint authority has no terminal-finalization completion",
             )
         })?;
-        ensure_tape_sealed_audit(
-            index,
-            cfg.audit_dir,
-            cfg.audit_append_lock,
-            request.tape_uuid,
-        )?;
+
         ensure_manual_finalize_finished_audit(
             index,
             cfg.audit_dir,
@@ -1317,12 +1306,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 )
                 .map_err(crate::status_from_state_error)?;
         }
-        ensure_tape_sealed_audit(
-            index,
-            cfg.audit_dir,
-            cfg.audit_append_lock,
-            selected.tape_uuid,
-        )?;
+
         ensure_manual_finalize_finished_audit(
             index,
             cfg.audit_dir,
@@ -2216,12 +2200,7 @@ pub(super) fn complete_terminal_finalization_host_only(
                 Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
             })?;
     }
-    ensure_tape_sealed_audit(
-        index,
-        audit.audit_dir,
-        audit.audit_append_lock,
-        spec.tape_uuid,
-    )?;
+
     let completion = final_record.finalization.as_ref().ok_or_else(|| {
         Status::internal("sealed terminal checkpoint omitted its completion authority")
     })?;

@@ -1688,3 +1688,64 @@ fn prepared_skip_and_command_reconciliation_are_independent_of_file_count() {
 }
 
 mod pool_sessions;
+
+/// A real tail beyond restored host state must exclude the tape from production pool selection.
+#[test]
+fn gate2b_rejected_tail_remains_ineligible() {
+    for parity in [false, true] {
+        let (fixture, state) = Fixture::new(parity);
+        drop(state);
+        let backup = fixture.root.path().join("initial.sqlite");
+        std::fs::copy(&fixture.config.index.sqlite_path, &backup).unwrap();
+        let mut owner = fixture.owner(fixture.reopen().unwrap());
+        owner.open_session("default").unwrap();
+        owner.append(fixture.request("foreign")).unwrap();
+        owner.finish().unwrap();
+        drop(owner);
+        std::fs::copy(&backup, &fixture.config.index.sqlite_path).unwrap();
+        std::fs::remove_dir_all(&fixture.config.journal.dir).unwrap();
+        std::fs::create_dir_all(&fixture.config.journal.dir).unwrap();
+        let mut owner = fixture.owner(fixture.reopen().unwrap());
+        fixture.commands.lock().unwrap().clear();
+        let before = fixture.world.lock().unwrap().tapes["HAND"].records.clone();
+        let error = owner.open_session("default").unwrap_err();
+        assert!(
+            error.to_string().contains("TailBeyondKnownState"),
+            "{error:?}"
+        );
+        assert!(!fixture.commands.lock().unwrap().is_empty());
+        assert!(!fixture
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+        assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
+        assert_eq!(
+            fixture.index().get_tape(&UUID).unwrap().unwrap().state,
+            "recovery_required"
+        );
+        owner.finish().unwrap();
+        let selected = crate::pool_write::select_tape_in_pool_for_write_session(
+            &fixture.index(),
+            &fixture.config.tape_pools[0],
+            1,
+            &std::collections::HashSet::new(),
+            &fixture.config.journal.dir.join("tapes"),
+        );
+        match selected {
+            Err(crate::pool_write::SelectTapeError::NoWritableTapes { pool_id, reasons }) => {
+                assert_eq!(pool_id, "default");
+                assert_eq!(
+                    reasons,
+                    vec![crate::pool_write::WritabilityError::NotReady {
+                        state: "recovery_required".to_string(),
+                    }]
+                );
+            }
+            other => {
+                panic!("refused physical tail must remain excluded from pool selection: {other:?}")
+            }
+        }
+    }
+}

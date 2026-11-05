@@ -5745,9 +5745,10 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
                         == Some(crate::bytes_to_hex(tape_uuid.as_slice()).as_str())
             })
             .count(),
-        1,
-        "manual finalization and every sealed retry share one TapeSealed event"
+        0,
+        "manual finalization and sealed retries must not emit an audit seal"
     );
+    crate::tests::assert_one_native_seal(&checkpoint_dir, tape_uuid);
 }
 
 /// Mount-dispatched explicit checkpoints must return catalog-projected copies after reopening

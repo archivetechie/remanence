@@ -12,8 +12,10 @@ use remanence_chaos::model::{
 };
 use remanence_format::{read_encrypted_rem_object, read_rem_tar_object};
 use remanence_format_driver::{
-    ArchiveEventSink, ArchiveReader, FileDataSink, FileId, FileStreamReport, ForeignFormatAdapter,
-    FormatCapabilities, FormatDescriptor, ScanReport, StreamReport,
+    ArchiveEventSink, ArchiveGapCause, ArchiveGapRange, ArchiveReader, EntryCatalogSink, EntryKind,
+    FileDataSink, FileId, FileStreamReport, ForeignFormatAdapter, ForeignFormatRegistry,
+    FormatCapabilities, FormatDescriptor, FormatError, NormalizedEntry, ScanIntegrityBasis,
+    ScanReport, SourceRequirement, StreamReport,
 };
 use remanence_library::scsi::{DeviceType, Inquiry};
 use remanence_library::{
@@ -28,11 +30,10 @@ use remanence_parity::{
 };
 use remanence_state::{
     watermark_floor_bytes, AuditActor, AuditEvent, AuditRecord, AuditSubject,
-    ForeignArchiveProjectionInput, NativeObjectFileProjectionInput,
-    NativeObjectInstanceProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
-    ProvisionTapeInput, RetireTapeInput, SourceLayer, TapeJournalIndexInput,
-    TapePoolProjectionInput, OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED,
-    OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
+    NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectProjectionInput, PoolSelectionPolicyName, ProvisionTapeInput, RetireTapeInput,
+    SourceLayer, TapeJournalIndexInput, TapePoolProjectionInput,
+    OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED, OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
 use sha2::{Digest, Sha256};
@@ -1988,8 +1989,6 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
     let lock = Arc::new(std::sync::Mutex::new(()));
 
     for _ in 0..2 {
-        ensure_tape_sealed_audit(&mut index, &audit_dir, &lock, tape_uuid)
-            .expect("ensure exact tape-sealed evidence");
         ensure_manual_finalize_finished_audit(
             &mut index,
             &audit_dir,
@@ -2009,7 +2008,7 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
                     && audit_subject_matches_tape(record, tape_uuid)
             })
             .count(),
-        1
+        0
     );
     assert_eq!(
         records
@@ -2034,29 +2033,6 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
             .as_deref(),
         Some("finished")
     );
-
-    append_and_project_audit(
-        &mut index,
-        &audit_dir,
-        false,
-        &lock,
-        ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::TapeSealed,
-            subject_kind: "tape",
-            subject_id: Some(crate::bytes_to_hex(tape_uuid.as_slice())),
-            detail: BTreeMap::new(),
-        },
-    )
-    .expect("append hostile duplicate tape-sealed evidence");
-    let duplicate_seal = ensure_tape_sealed_audit(&mut index, &audit_dir, &lock, tape_uuid)
-        .expect_err("duplicate tape-sealed evidence must fail closed");
-    assert_eq!(duplicate_seal.code(), tonic::Code::FailedPrecondition);
-    assert!(duplicate_seal.message().contains("2 durable TapeSealed"));
 
     append_and_project_audit(
         &mut index,
@@ -3005,9 +2981,10 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
                     && audit_subject_matches_tape(record, tape_uuid)
             })
             .count(),
-        1,
-        "startup recovery must repair one durable TapeSealed event without duplication"
+        0,
+        "startup recovery must not duplicate the native seal in the audit"
     );
+    assert_one_native_seal(&checkpoint_dir, tape_uuid);
 }
 
 fn project_no_parity_tape_with_block_size(
@@ -3994,39 +3971,24 @@ impl ArchiveReader for TestForeignReader {
     }
 }
 
-fn foreign_test_state() -> (tempfile::TempDir, ApiState, String) {
-    let temp = tempfile::tempdir().expect("create foreign fixture directory");
-    let source = temp.path().join("fixture.bin");
-    std::fs::write(&source, b"test").expect("write foreign fixture");
-    let mut index = test_index();
-    let unit_id = index
-        .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
-            tape_uuid: Vec::new(),
-            format_id: "test-foreign-v1".to_string(),
-            scan_id: "scan-test-1".to_string(),
-            source_kind: "byte_stream_dump".to_string(),
-            source_id: source.to_string_lossy().into_owned(),
-            confidence: "high".to_string(),
-            entry_count: 1,
-            damage_event_count: 1,
-            adapter_state: b"test-resume-state".to_vec(),
-            last_scan_at_utc: Some("2026-05-28T13:15:00Z".to_string()),
-            created_at_utc: Some("2026-05-28T13:15:01Z".to_string()),
-        })
-        .expect("project foreign unit");
-    let mut registry = ForeignFormatRegistry::new();
-    registry.register(Arc::new(TestForeignAdapter)).unwrap();
-    (
-        temp,
-        ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .with_foreign_formats(registry),
-        unit_id,
-    )
+/// Construct the reader-facing catalog row without the removed foreign SQL writer.
+fn foreign_test_unit(format_id: &str, source_id: String) -> remanence_state::CatalogUnitRecord {
+    remanence_state::CatalogUnitRecord {
+        unit_id: "foreign:test-unit".to_string(),
+        tape_uuid: Vec::new(),
+        origin_kind: "foreign_archive".to_string(),
+        format_id: format_id.to_string(),
+        native_object_id: None,
+        scan_id: Some("scan-test-1".to_string()),
+        source_kind: Some("byte_stream_dump".to_string()),
+        source_id: Some(source_id),
+        confidence: Some("high".to_string()),
+        entry_count: Some(1),
+        damage_event_count: Some(1),
+        last_scan_at_utc: Some("2026-05-28T13:15:00Z".to_string()),
+        adapter_state: b"test-resume-state".to_vec(),
+        created_at_utc: "2026-05-28T13:15:01Z".to_string(),
+    }
 }
 
 fn audit_record(
@@ -9385,23 +9347,18 @@ async fn catalog_units_are_exposed_as_parallel_surface() {
     assert_eq!(err.code(), tonic::Code::Unimplemented);
 }
 
-#[tokio::test]
-async fn foreign_unit_uses_registered_adapter_for_normalized_entries() {
-    let (_temp, state, unit_id) = foreign_test_state();
-    let service = state.catalog_service();
-
-    let entries = pb::catalog_server::Catalog::list_entries_in_unit(
-        &service,
-        Request::new(pb::ListEntriesInUnitRequest {
-            unit_id: unit_id.as_bytes().to_vec(),
-            page_token: None,
-            page_size: 0,
-            refresh_from_source: false,
-        }),
-    )
-    .await
-    .expect("list foreign unit entries")
-    .into_inner();
+/// Retain adapter dispatch, saved state delivery and API conversion coverage.
+#[test]
+fn foreign_unit_uses_registered_adapter_for_normalized_entries() {
+    let temp = tempfile::tempdir().expect("create foreign fixture directory");
+    let source = temp.path().join("fixture.bin");
+    std::fs::write(&source, b"test").expect("write foreign fixture");
+    let unit = foreign_test_unit("test-foreign-v1", source.to_string_lossy().into_owned());
+    let mut registry = ForeignFormatRegistry::new();
+    registry.register(Arc::new(TestForeignAdapter)).unwrap();
+    let entries = crate::catalog_conversion::list_entries_for_unit(unit, &registry)
+        .expect("list foreign unit entries")
+        .into_inner();
 
     assert_eq!(entries.entries.len(), 1);
     assert_eq!(entries.entries[0].path, "camera/a.txt");
@@ -9419,43 +9376,16 @@ async fn foreign_unit_uses_registered_adapter_for_normalized_entries() {
     assert_eq!(entries.archive_gaps[0].source_end, 16);
 }
 
-#[tokio::test]
-async fn foreign_unit_reports_unregistered_format_in_core_distribution() {
-    let mut index = test_index();
-    let unit_id = index
-        .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
-            tape_uuid: Vec::new(),
-            format_id: "legacy-example-v1".to_string(),
-            scan_id: "scan-example-1".to_string(),
-            source_kind: "byte_stream_dump".to_string(),
-            source_id: "/nonexistent/fixture.archive".to_string(),
-            confidence: "high".to_string(),
-            entry_count: 0,
-            damage_event_count: 0,
-            adapter_state: vec![],
-            last_scan_at_utc: Some("2026-05-28T13:15:00Z".to_string()),
-            created_at_utc: Some("2026-05-28T13:15:01Z".to_string()),
-        })
-        .expect("project foreign unit");
-    let service = ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
-    .catalog_service();
-
-    let error = pb::catalog_server::Catalog::list_entries_in_unit(
-        &service,
-        Request::new(pb::ListEntriesInUnitRequest {
-            unit_id: unit_id.as_bytes().to_vec(),
-            page_token: None,
-            page_size: 0,
-            refresh_from_source: false,
-        }),
-    )
-    .await
-    .expect_err("core distribution has an empty foreign-format registry");
+/// The core distribution reports an absent adapter before trying to open its source.
+#[test]
+fn foreign_unit_reports_unregistered_format_in_core_distribution() {
+    let unit = foreign_test_unit(
+        "legacy-example-v1",
+        "/nonexistent/fixture.archive".to_string(),
+    );
+    let error =
+        crate::catalog_conversion::list_entries_for_unit(unit, &ForeignFormatRegistry::new())
+            .expect_err("core distribution has an empty foreign-format registry");
 
     assert_eq!(error.code(), tonic::Code::Unimplemented);
     assert!(error
@@ -10871,4 +10801,28 @@ fn empty_actor_native_record() -> crate::PoolWriteObjectRecord {
         created_at_utc: String::new(),
         copies: Vec::new(),
     }
+}
+
+/// Count the durable native seal itself, independently of catalog and audit rows.
+pub(crate) fn assert_one_native_seal(directory: &Path, tape_uuid: [u8; 16]) {
+    use remanence_state::tape_log::{codec::Decoder, store::Header, Record};
+    let path = remanence_state::TapeAuthority::list_entries(directory)
+        .unwrap()
+        .into_iter()
+        .find(|path| remanence_state::TapeAuthority::entry_tape_uuid(path).unwrap() == tape_uuid)
+        .expect("native tape log");
+    let mut file = std::fs::File::open(path).unwrap();
+    Header::decode(&mut file, tape_uuid).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = Decoder::at(file, 1, offset);
+    let mut seals = 0;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        if matches!(frame.record, Record::Sealed { .. }) {
+            seals += 1;
+        }
+    }
+    assert_eq!(
+        seals, 1,
+        "one native seal across retries and startup replay"
+    );
 }

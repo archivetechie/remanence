@@ -896,13 +896,6 @@ impl CatalogIndex {
     ) -> Result<(), StateError> {
         self.with_core(|core| core.upsert_native_object_projection(object, instances))
     }
-    /// Project a foreign archive scan unit without exposing driver-private locators.
-    pub fn upsert_foreign_archive_projection(
-        &mut self,
-        input: ForeignArchiveProjectionInput,
-    ) -> Result<String, StateError> {
-        self.with_core(|core| core.upsert_foreign_archive_projection(input))
-    }
     /// List source-neutral catalog units for operator/discovery surfaces.
     pub fn list_catalog_units(
         &self,

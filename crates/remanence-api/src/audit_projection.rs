@@ -14,7 +14,6 @@ use remanence_state::{
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::hex_encoding::bytes_to_hex;
 use crate::startup_media_readiness::status_from_state_error;
 
 pub(crate) const FINALIZE_TAPE_OPERATION_KIND: &str = "finalize_tape";
@@ -359,92 +358,11 @@ pub(crate) fn manual_finalize_audit_identity_matches(
         )
 }
 
-/// Ensure the catalog-evidence audit contains one fsynced tape-sealed fact.
-pub(crate) fn ensure_tape_sealed_audit(
-    index: &mut CatalogIndex,
-    audit_dir: &Path,
-    audit_append_lock: &Arc<std::sync::Mutex<()>>,
-    tape_uuid: [u8; 16],
-) -> Result<(), Status> {
-    let _guard = audit_append_lock
-        .lock()
-        .map_err(|_| Status::internal("audit append lock poisoned"))?;
-    fs::create_dir_all(audit_dir).map_err(|error| {
-        Status::internal(format!(
-            "create audit directory {}: {error}",
-            audit_dir.display()
-        ))
-    })?;
-    let mut durable = None;
-    let mut durable_count = 0usize;
-    let mut conflict = None;
-    FileAuditLog::replay_incremental(audit_dir, |record| {
-        if record.event != AuditEvent::TapeSealed || !audit_subject_matches_tape(&record, tape_uuid)
-        {
-            return ControlFlow::Continue(());
-        }
-        if tape_sealed_audit_matches(&record, tape_uuid) {
-            durable_count += 1;
-            durable.get_or_insert(record);
-        } else {
-            conflict.get_or_insert(record);
-        }
-        ControlFlow::Continue(())
-    })
-    .map_err(status_from_state_error)?;
-    if let Some(record) = conflict {
-        return Err(Status::failed_precondition(format!(
-            "tape {} has conflicting durable TapeSealed audit record {}",
-            Uuid::from_bytes(tape_uuid),
-            record.record_uuid
-        )));
-    }
-    if durable_count > 1 {
-        return Err(Status::failed_precondition(format!(
-            "tape {} has {durable_count} durable TapeSealed audit records",
-            Uuid::from_bytes(tape_uuid)
-        )));
-    }
-    if let Some(record) = durable {
-        index
-            .project_audit_record(&record)
-            .map_err(status_from_state_error)?;
-        return Ok(());
-    }
-    append_and_project_audit_locked(
-        index,
-        audit_dir,
-        true,
-        ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::TapeSealed,
-            subject_kind: "tape",
-            subject_id: Some(bytes_to_hex(tape_uuid.as_slice())),
-            detail: BTreeMap::new(),
-        },
-    )?;
-    Ok(())
-}
-
 pub(crate) fn audit_subject_matches_tape(record: &AuditRecord, tape_uuid: [u8; 16]) -> bool {
     record.subject.kind == "tape"
         && record.subject.id.as_deref().is_some_and(|value| {
             Uuid::parse_str(value).is_ok_and(|parsed| parsed.as_bytes() == &tape_uuid)
         })
-}
-
-pub(crate) fn tape_sealed_audit_matches(record: &AuditRecord, tape_uuid: [u8; 16]) -> bool {
-    record.actor == AuditActor::System
-        && record.source_layer == SourceLayer::Layer4
-        && record.operation_id.is_none()
-        && record.session_id.is_none()
-        && record.idempotency_key.is_none()
-        && record.detail.is_empty()
-        && audit_subject_matches_tape(record, tape_uuid)
 }
 
 pub(crate) fn drive_health_audit_detail(
