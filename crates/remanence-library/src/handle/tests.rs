@@ -2604,6 +2604,7 @@ fn drive_handle_read_block_filemark_is_structured_boundary() {
     let mut sense = vec![0u8; 32];
     sense[0] = 0x80 | 0x70; // VALID + fixed-format current
     sense[2] = 0x80; // FILEMARK + NO SENSE
+    sense[3..7].copy_from_slice(&1024u32.to_be_bytes()); // full residual at filemark
     sense[7] = 24;
     sense[12] = 0x00;
     sense[13] = 0x01;
@@ -3765,7 +3766,7 @@ fn deferred_recovered_fixed_read_is_always_completion_unknown() {
 }
 
 #[test]
-fn fixed_read_filemark_residual_cannot_claim_bytes_transport_did_not_move() {
+fn fixed_read_filemark_valid_residual_overrides_transport_count() {
     let config = TapeIoRuntimeConfig {
         read_batch_blocks: 4,
         position_check_bytes: 0,
@@ -3782,13 +3783,11 @@ fn fixed_read_filemark_residual_cannot_claim_bytes_transport_did_not_move() {
     );
     let mut buffer = [0xa5; 16];
 
-    assert!(matches!(
-        drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(crate::TapeIoError {
-            kind: crate::TapeIoErrorKind::Transport(_),
-            ..
-        })
-    ));
+    let outcome = drive.read_block_batch(&mut buffer, 4, 4, 4).unwrap();
+    assert_eq!(outcome.bytes_read, 8);
+    assert_eq!(outcome.records_read, 2);
+    assert!(outcome.filemark);
+    assert_eq!(drive.known_position().unwrap().lba, 13);
 }
 
 #[test]
@@ -3868,21 +3867,59 @@ fn both_write_funnels_reject_recovered_full_residual_claim_mismatch() {
     }
 }
 
+/// Synthetic CHECK CONDITION: SG disagreement cannot replace valid sense;
+/// partial writes still fail closed and report the sense-proved prefix.
 #[test]
-fn both_write_funnels_reject_partial_and_garbage_residual_claims() {
-    for (serial, pipelined) in [
-        ("LIB_WRITE_PARTIAL_ORD", false),
-        ("LIB_WRITE_PARTIAL_PIPE", true),
-        ("LIB_WRITE_GARBAGE_ORD", false),
-        ("LIB_WRITE_GARBAGE_PIPE", true),
-    ] {
-        let garbage = serial.contains("GARBAGE");
-        assert!(write_residual_claim_is_completion_unknown(
-            serial,
-            pipelined,
-            fixed_residual_sense(1),
-            if garbage { 0 } else { 8 },
-        ));
+fn both_write_funnels_prefer_valid_sense_to_conflicting_host_counts() {
+    for pipelined in [false, true] {
+        for host_bytes in [0, 8] {
+            let config = TapeIoRuntimeConfig {
+                write_batch_blocks: 4,
+                position_check_bytes: 0,
+                ..TapeIoRuntimeConfig::default()
+            };
+            let (mut drive, _, _) = open_hot_script_drive(
+                "LIB_WRITE_SENSE_PRIORITY",
+                [10],
+                [HotWriteScript::CheckConditionWithBytes(
+                    fixed_residual_sense(1),
+                    host_bytes,
+                )],
+                config,
+            );
+            let _context = drive.scoped_outcome_context(crate::outcome::OperationContext {
+                phase: crate::outcome::Phase::Append,
+                region: crate::outcome::Region::AtOrAfterCursor(10),
+                ..Default::default()
+            });
+            let result = if pipelined {
+                drive.write_block_batch_pipelined(
+                    &[0x5a; 16],
+                    4,
+                    &remanence_scsi::read_write::build_write_fixed_cdb(4),
+                )
+            } else {
+                drive.write_block_batch(&[0x5a; 16], 4)
+            };
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.kind,
+                crate::TapeIoErrorKind::PartialBatchUncommittable {
+                    written_records: 3,
+                    written_bytes: 12,
+                    ..
+                }
+            ));
+            assert_eq!(
+                error.outcome().evidence.host_transferred_bytes,
+                Some(u64::from(host_bytes))
+            );
+            assert_eq!(error.outcome().evidence.transferred_bytes, Some(12));
+            assert_eq!(
+                error.outcome().effect,
+                crate::outcome::Effect::WriteFence(crate::outcome::FenceCause::PartialBatch)
+            );
+        }
     }
 }
 
@@ -3974,6 +4011,10 @@ fn write_eom_position_arbitration_ignores_helper_mismatch_and_records_diagnostic
         };
         assert_eq!(outcome.records_written, 4);
         assert!(outcome.early_warning);
+        let evidence = &drive.last_command_outcome().unwrap().evidence;
+        assert_eq!(evidence.host_transferred_bytes, Some(0));
+        assert_eq!(evidence.transferred_bytes, Some(16));
+        assert_eq!(evidence.records_transferred, Some(4));
         assert_eq!(
             drive
                 .pipelined_write_diagnostics()

@@ -579,6 +579,33 @@ impl CompletionEvidence {
         self.decoded
             .filter(|s| self.completion == Completion::Known && !s.is_deferred())
     }
+    /// CHECK CONDITION data counts prefer valid current sense over SG's count.
+    /// Fixed commands express residuals in blocks; variable commands use bytes.
+    /// A negative variable ILI describes a record larger than the supplied buffer.
+    pub(crate) fn data_transfer_bytes(
+        &self,
+        host_bytes: u64,
+        requested: u64,
+        block_size: Option<u32>,
+    ) -> u64 {
+        let Some(sense) = self.current_sense().filter(|_| self.residual_valid) else {
+            return host_bytes;
+        };
+        let Some(residual) = self.residual else {
+            return host_bytes;
+        };
+        if block_size.is_none()
+            && sense.ili
+            && match sense.response_code {
+                0x70 => residual & (1 << 31) != 0,
+                0x72 => residual & (1 << 63) != 0,
+                _ => false,
+            }
+        {
+            return requested;
+        }
+        requested.saturating_sub(residual.saturating_mul(u64::from(block_size.unwrap_or(1))))
+    }
     /// A current MEDIUM ERROR, not malformed autosense or a transport failure.
     pub fn current_medium_damage(&self) -> bool {
         self.current_sense().is_some_and(|s| s.key == 3)
@@ -610,6 +637,18 @@ impl CompletionEvidence {
                 s.key == 3 || s.key == 8 || (s.key == 4 && matches!(s.asc, 0x11 | 0x14))
             })
     }
+}
+/// Apply the classifier's transfer rule to legacy raw-sense consumers. This
+/// adapter adds no classification or census event for the same command.
+pub(crate) fn data_transfer_bytes_from_sense(
+    sense: &[u8],
+    host_bytes: u32,
+    requested: u32,
+    block_size: Option<u32>,
+) -> u32 {
+    let mut evidence = CompletionEvidence::success();
+    evidence.set_sense(sense);
+    evidence.data_transfer_bytes(u64::from(host_bytes), u64::from(requested), block_size) as u32
 }
 /// Read a complete information field, preserving absent versus valid zero.
 fn sense_information(sense: &[u8]) -> Option<u64> {
@@ -837,8 +876,29 @@ pub fn classify(input: OutcomeInput) -> ClassifiedOutcome {
     let OutcomeInput {
         class,
         context,
-        evidence,
+        mut evidence,
     } = input;
+    // Owners can already have supplied validated record/byte counts, including
+    // an independent post-EOM position proof. Resolve raw completion counts
+    // here without replacing that final arbitration with transport evidence.
+    if matches!(class, CommandClass::Read | CommandClass::Write)
+        && evidence.scsi_status == Some(2)
+        && evidence.records_transferred.is_none()
+    {
+        if let (Some(host), Some(requested)) =
+            (evidence.host_transferred_bytes, evidence.requested_bytes)
+        {
+            evidence.transferred_bytes =
+                Some(evidence.data_transfer_bytes(host, requested, evidence.block_size));
+            evidence.boundary.physical_eod = evidence.current_sense().is_some_and(|s| {
+                s.key == 8
+                    && s.asc == 0
+                    && s.ascq == 5
+                    && !s.filemark
+                    && evidence.transferred_bytes == Some(0)
+            });
+        }
+    }
     let writing = matches!(
         class,
         CommandClass::Write | CommandClass::WriteFilemarks { .. }

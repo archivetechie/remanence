@@ -111,19 +111,19 @@ fn sense_residue_fixed_read_converts_one_block_to_bytes_at_eod() {
     assert!(read_error(sense, REQUESTED, true).is_physical_eod());
 }
 
+/// Synthetic conflicts: a valid sense residual wins even when SG reports residue.
 #[test]
-fn sense_residue_nonzero_kernel_residual_is_authoritative() {
+fn sense_residue_overrides_nonzero_kernel_residual() {
     for fixed in [false, true] {
-        let error = read_error(EOD.to_vec(), 128, fixed);
-        assert_eq!(error.check_condition_transfer().unwrap().1, 128);
-        assert!(!error.is_physical_eod());
-        assert!(matches!(
-            error,
-            crate::TapeIoError {
-                kind: crate::TapeIoErrorKind::CheckCondition(_),
-                ..
-            }
-        ));
+        let mut sense = EOD.to_vec();
+        if fixed {
+            sense[3..7].copy_from_slice(&1u32.to_be_bytes());
+        }
+        let error = read_error(sense, 128, fixed);
+        assert_eq!(error.check_condition_transfer().unwrap().1, 0);
+        assert!(error.is_physical_eod());
+        assert_eq!(error.outcome().evidence.host_transferred_bytes, Some(128));
+        assert_eq!(error.outcome().evidence.transferred_bytes, Some(0));
     }
 }
 
@@ -241,4 +241,115 @@ fn sense_residue_verification_batch_carries_corrected_eod() {
         .read_block_batch_for_verification(&mut vec![0; REQUESTED as usize], REQUESTED, 1, 1)
         .unwrap_err();
     assert!(error.is_physical_eod());
+}
+
+/// Synthetic WRITE model only: field leg A has no captured WRITE. Model the
+/// same valid full residual with VOLUME OVERFLOW/EOM instead of a READ boundary.
+#[test]
+fn b4b2c_synthetic_write_full_residual_credits_zero_in_all_funnels() {
+    for host in [128, REQUESTED] {
+        for mode in 0..3 {
+            let fixed = mode != 0;
+            let mut sense =
+                include_bytes!("../../../../../fixtures/sense/datamover-leg-a-20261105/eod.bin")
+                    .to_vec();
+            sense[2] = 0x4d;
+            sense[12..14].fill(0);
+            if fixed {
+                sense[3..7].copy_from_slice(&1u32.to_be_bytes());
+            }
+            let mut drive = drive(sense, host, fixed);
+            let _context = drive.scoped_outcome_context(crate::outcome::OperationContext {
+                phase: crate::outcome::Phase::Append,
+                region: crate::outcome::Region::AtOrAfterCursor(10),
+                ..Default::default()
+            });
+            let payload = vec![0; REQUESTED as usize];
+            let error = match mode {
+                0 => drive.write_block_unpositioned(&payload).unwrap_err(),
+                1 => {
+                    // Ordinary positioned WRITE exposes its established EOM
+                    // outcome; it still credits neither bytes nor records.
+                    let outcome = drive.write_block_batch(&payload, REQUESTED).unwrap();
+                    assert_eq!(outcome.bytes_written, 0);
+                    assert_eq!(outcome.records_written, 0);
+                    assert!(outcome.end_of_medium);
+                    let evidence = &drive.last_command_outcome().unwrap().evidence;
+                    assert_eq!(evidence.transferred_bytes, Some(0));
+                    assert_eq!(evidence.host_transferred_bytes, Some(u64::from(host)));
+                    continue;
+                }
+                _ => drive
+                    .write_block_batch_pipelined(
+                        &payload,
+                        REQUESTED,
+                        &remanence_scsi::read_write::build_write_fixed_cdb(1),
+                    )
+                    .unwrap_err(),
+            };
+            assert!(matches!(
+                error.kind,
+                crate::TapeIoErrorKind::PartialBatchUncommittable {
+                    written_bytes: 0,
+                    written_records: 0,
+                    end_of_medium: true,
+                    ..
+                }
+            ));
+            assert_eq!(error.outcome().evidence.transferred_bytes, Some(0));
+            assert_eq!(
+                error.outcome().evidence.host_transferred_bytes,
+                Some(u64::from(host))
+            );
+            assert_eq!(
+                error.outcome().effect,
+                crate::outcome::Effect::WriteFence(crate::outcome::FenceCause::PartialBatch)
+            );
+        }
+    }
+}
+
+/// Synthetic fixed-block variants of the field READs exercise the owned-buffer
+/// handoff used by pipelined reads. Residual units are blocks, not captured bytes.
+#[test]
+fn b4b2c_synthetic_fixed_read_pipeline_delivers_no_boundary_data() {
+    use crate::{BlockSource, DriveHandleSource, ReadBuffer};
+    for filemark in [false, true] {
+        for host in [128, REQUESTED] {
+            let mut sense = if filemark {
+                include_bytes!(
+                    "../../../../../fixtures/sense/datamover-leg-a-20261105/filemark.bin"
+                )
+                .to_vec()
+            } else {
+                include_bytes!("../../../../../fixtures/sense/datamover-leg-a-20261105/eod.bin")
+                    .to_vec()
+            };
+            sense[3..7].copy_from_slice(&1u32.to_be_bytes());
+            let mut drive = drive(sense, host, true);
+            let buffer = ReadBuffer::try_new_page_aligned(REQUESTED as usize).unwrap();
+            let result = DriveHandleSource(&mut drive).read_buffer_handoff(buffer, REQUESTED, 1, 1);
+            if filemark {
+                let outcome = result.unwrap();
+                assert!(outcome.handoff.valid_data().is_empty());
+                assert_eq!(outcome.handoff.records_read, 0);
+                assert!(outcome.handoff.terminal_flags.filemark);
+                assert_eq!(outcome.position_after.lba, 1);
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is_physical_eod());
+                assert_eq!(error.check_condition_transfer().unwrap().1, 0);
+            }
+            let outcome = drive.last_command_outcome().unwrap();
+            assert_eq!(outcome.evidence.transferred_bytes, Some(0));
+            assert_eq!(
+                outcome.evidence.host_transferred_bytes,
+                Some(u64::from(host))
+            );
+            assert!(matches!(
+                outcome.effect,
+                crate::outcome::Effect::NoFence | crate::outcome::Effect::Transient
+            ));
+        }
+    }
 }

@@ -3265,10 +3265,10 @@ mod compat_tests {
                 (0x08, Err(read_filemark_error(1, 4))), // partial batch: data -> 26, FM -> 27
                 (0x34, Ok(read_position_long_response(0, 0, 25))), // redo LOCATE
                 (0x08, Ok(vec![4; 4])), // redo data -> 26
-                (0x08, Err(read_filemark_error(0, 0))), // single FM -> 27
+                (0x08, Err(read_filemark_error(4, 0))), // variable READ: full byte residual, FM -> 27
                 (0x34, Ok(read_position_long_response(0, 0, 27))), // boundary resync
-                (0x08, Ok(vec![5; 4])), // single -> 28
-                (0x08, Ok(vec![6; 8])), // prefix -> 30
+                (0x08, Ok(vec![5; 4])),                 // single -> 28
+                (0x08, Ok(vec![6; 8])),                 // prefix -> 30
                 (0x34, Ok(read_position_long_response(0, 0, 30))),
                 (0x08, Err(eod())), // EOD during the next partial command
                 (0x34, Ok(read_position_long_response(0, 0, 30))), // redo LOCATE
@@ -3765,18 +3765,19 @@ mod compat_tests {
 
     #[test]
     fn descriptor_filemark_batch_redoes_singly_and_reports_boundary() {
-        let fault = || remanence_library::ScsiError::CheckCondition {
+        let fault = |residual: u8| remanence_library::ScsiError::CheckCondition {
             sense: vec![
-                0x72, 0, 0, 1, 0, 0, 0, 16, 0, 10, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 0, 0x80,
+                0x72, 0, 0, 1, 0, 0, 0, 16, 0, 10, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, residual, 4, 2, 0,
+                0x80,
             ],
             bytes_transferred: 0,
         };
         let (mut drive, log) = scripted_read_drive(
             vec![
                 (0x34, Ok(read_position_long_response(0, 0, 0))),
-                (0x08, Err(fault())),
+                (0x08, Err(fault(1))),
                 (0x34, Ok(read_position_long_response(0, 0, 0))),
-                (0x08, Err(fault())),
+                (0x08, Err(fault(4))),
                 (0x34, Ok(read_position_long_response(0, 0, 1))),
             ],
             0,
@@ -3793,7 +3794,7 @@ mod compat_tests {
     }
 
     /// Verification accepts exact recovered singles; unrelated callers retain
-    /// their existing CHECK CONDITION result. Inconsistent recovery is unchanged.
+    /// their existing CHECK CONDITION result. Valid sense overrides SG counts.
     #[test]
     fn verification_recovered_single_policy_is_scoped_and_exact() {
         for bytes in [3, 4, 5] {
@@ -3825,7 +3826,7 @@ mod compat_tests {
                 let (plain, _) = observe(false);
                 let (verified, io) = observe(true);
                 assert!(plain.is_err());
-                if bytes == 4 && residual == 0 {
+                if residual == 0 {
                     assert!(matches!(
                         verified,
                         Ok(RawReadOutcome::Block { bytes: 4, .. })

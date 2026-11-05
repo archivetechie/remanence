@@ -3231,6 +3231,8 @@ mod tests {
                     );
                     let mut sense = vec![0; 18];
                     sense[0] = 0xf0;
+                    // Synthetic zero-data boundaries have a full byte residual.
+                    sense[3..7].copy_from_slice(&(buf.len() as u32).to_be_bytes());
                     sense[7] = 10;
                     match self.records.pop_front() {
                         None => {

@@ -1513,6 +1513,14 @@ pub(crate) async fn service_closeout_obligation(
         if summary.sealed {
             return Ok(None);
         }
+        // Cold replay may have overlapped shutdown. Reconciliation can retire or
+        // accept a native preparation even before any motion or attempt.
+        if state
+            .readiness_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::drive_pool::DaemonShuttingDown::status());
+        }
         if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
             if !crate::write_owner::reconcile_manual_terminal_acceptance(
                 &index, &mut lease, intent,

@@ -709,10 +709,13 @@ fn b3b_mounted_definite_rejection_no_fence() {
         (0x34, Ok(reply))
     };
     let filemark = || {
+        // The synthetic zero-byte READ carries a full valid byte residual.
+        let mut sense = vec![0xf0, 0, 0x80, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 1];
+        sense[3..7].copy_from_slice(&BLOCK.to_be_bytes());
         (
             8,
             Err(ScsiError::CheckCondition {
-                sense: vec![0xf0, 0, 0x80, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 1],
+                sense,
                 bytes_transferred: 0,
             }),
         )

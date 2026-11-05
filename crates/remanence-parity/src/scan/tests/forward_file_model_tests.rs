@@ -19,7 +19,8 @@ enum Fault {
         jump: i64,
         wrong_file: bool,
     },
-    Disagree,
+    InvalidResidual,
+    HostDisagree,
     UnconfirmedHead,
     UnconfirmedBody,
 }
@@ -164,11 +165,28 @@ impl SgTransport for WireFault {
                 self.boundary = remanence_library::decode_scsi_sense(&sense)
                     .unwrap()
                     .filemark;
-                // The model filled two slots, but sense falsely claims three.
-                if fixed && self.boundary && matches!(self.fault, Fault::Disagree) && count == 4 {
+                // An invalid residual cannot authorize the stale third slot.
+                if fixed
+                    && self.boundary
+                    && matches!(self.fault, Fault::InvalidResidual)
+                    && count == 4
+                {
                     assert_eq!(bytes_transferred, 2 * BLOCK_SIZE);
                     sense[3..7].copy_from_slice(&1u32.to_be_bytes());
+                    sense[0] &= 0x7f;
                 }
+                // Model the field trust rule: valid sense is correct while SG
+                // overstates the delivered prefix. Stale slots remain hidden.
+                let bytes_transferred = if fixed
+                    && self.boundary
+                    && matches!(self.fault, Fault::HostDisagree)
+                    && count == 4
+                {
+                    assert_eq!(bytes_transferred, 2 * BLOCK_SIZE);
+                    3 * BLOCK_SIZE
+                } else {
+                    bytes_transferred
+                };
                 Err(ScsiError::CheckCondition {
                     sense,
                     bytes_transferred,
@@ -310,6 +328,42 @@ fn fixed_batch_chaos_damage_vectors_match_single_record_walk() {
     }
 }
 
+/// Valid sense limits the callback and retained block even when SG claims a
+/// stale third slot was transferred. This is a synthetic fixed READ conflict.
+#[test]
+fn valid_residual_keeps_stale_batch_slots_hidden_when_host_overstates() {
+    let records: Vec<_> = (0..7)
+        .map(|i| Record::Block(block(i)))
+        .chain([Record::Filemark])
+        .collect();
+    let (mut drive, _) = drive(&records, Fault::HostDisagree);
+    let mut source = DriveHandleRawSource::new(&mut drive);
+    source.configure_fixed_block_size(BLOCK_SIZE).unwrap();
+    source
+        .locate_physical(PhysicalPositionHint::new(0))
+        .unwrap();
+    let mut seen = Vec::new();
+    let observation = ForwardFileReader::new(BLOCK_SIZE, 4)
+        .unwrap()
+        .read_file(
+            &mut source,
+            0,
+            PhysicalPositionHint::new(0),
+            HeadProvenance::Locate,
+            8,
+            8,
+            &mut |_, bytes| {
+                seen.push(bytes[0]);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(seen, [0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(observation.whole_blocks, 7);
+    assert_eq!(observation.last_block, block(6));
+    assert!(observation.requires_spacing.is_none());
+}
+
 /// A prior full batch leaves recognizable bytes in the untouched buffer slots.
 #[test]
 fn stale_batch_bytes_never_reach_callback_or_retained_blocks() {
@@ -317,7 +371,7 @@ fn stale_batch_bytes_never_reach_callback_or_retained_blocks() {
         .map(|i| Record::Block(block(i)))
         .chain([Record::Filemark])
         .collect();
-    let (mut drive, _) = drive(&records, Fault::Disagree);
+    let (mut drive, _) = drive(&records, Fault::InvalidResidual);
     let mut source = DriveHandleRawSource::new(&mut drive);
     source.configure_fixed_block_size(BLOCK_SIZE).unwrap();
     source

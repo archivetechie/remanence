@@ -817,7 +817,7 @@ mod tests {
         assert!(!context.is_verifying());
     }
     #[test]
-    fn recovered_requires_exact_current_consistent_sense() {
+    fn recovered_requires_exact_current_sense_with_host_fallback() {
         let mut sense = vec![0; 18];
         sense[0] = 0xf0;
         sense[2] = 1;
@@ -832,8 +832,13 @@ mod tests {
             )
         };
         assert!(check(sense.clone(), 4));
-        assert!(!check(sense.clone(), 3));
-        assert!(!check(sense.clone(), 5));
+        // Valid zero residual proves the full transfer despite a conflicting SG count.
+        assert!(check(sense.clone(), 3));
+        assert!(check(sense.clone(), 5));
+        let mut no_residual = sense.clone();
+        no_residual[0] = 0x70;
+        assert!(!check(no_residual.clone(), 3));
+        assert!(!check(no_residual, 5));
         for (offset, value) in [(0, 0xf1), (2, 0x21), (2, 0x41), (2, 0x81), (6, 1)] {
             let mut bad = sense.clone();
             bad[offset] = value;

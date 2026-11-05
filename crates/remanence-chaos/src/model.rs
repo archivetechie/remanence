@@ -1240,7 +1240,10 @@ impl ModelTransport {
                 Ok(TransferOutcome::clean(bytes_read as u32))
             } else {
                 let Some(record) = tape.records.get(position).cloned() else {
-                    return Err(check_condition(blank_check_eod_sense(), 0));
+                    return Err(check_condition(
+                        blank_check_eod_sense_with_residual(transfer_len as usize),
+                        0,
+                    ));
                 };
                 match record {
                     Record::Block(block) => {
@@ -1261,7 +1264,10 @@ impl ModelTransport {
                     }
                     Record::Filemark => {
                         error_advance = 1;
-                        Err(check_condition(filemark_sense(), 0))
+                        Err(check_condition(
+                            filemark_sense_with_residual(transfer_len as usize),
+                            0,
+                        ))
                     }
                 }
             }
@@ -2040,16 +2046,8 @@ fn fixed_sense(key: u8, asc: u8, ascq: u8, information: Option<i64>, flags: u8) 
     sense
 }
 
-fn filemark_sense() -> Vec<u8> {
-    fixed_sense(0x00, 0x00, 0x01, Some(0), 0x80)
-}
-
 fn filemark_sense_with_residual(residual: usize) -> Vec<u8> {
     fixed_sense(0x00, 0x00, 0x01, Some(residual as i64), 0x80)
-}
-
-fn blank_check_eod_sense() -> Vec<u8> {
-    fixed_sense(0x08, 0x00, 0x05, Some(0), 0x00)
 }
 
 fn blank_check_eod_sense_with_residual(residual: usize) -> Vec<u8> {
@@ -2326,6 +2324,31 @@ mod tests {
             )
             .expect_err("filemark sense");
         assert!(is_filemark_check_condition(&err));
+        // Synthetic variable READ boundaries carry residual bytes, just as
+        // fixed READ boundaries carry residual blocks. Neither transfers data.
+        for error in [
+            err,
+            drive
+                .execute_in(
+                    &read_write::build_read_variable_cdb(buf.len() as u32),
+                    &mut buf,
+                )
+                .expect_err("EOD after the filemark"),
+        ] {
+            let ScsiError::CheckCondition {
+                sense,
+                bytes_transferred,
+            } = error
+            else {
+                panic!("boundary completion");
+            };
+            assert_eq!(bytes_transferred, 0);
+            assert_ne!(sense[0] & 0x80, 0);
+            assert_eq!(
+                u32::from_be_bytes(sense[3..7].try_into().unwrap()),
+                buf.len() as u32
+            );
+        }
     }
 
     #[test]

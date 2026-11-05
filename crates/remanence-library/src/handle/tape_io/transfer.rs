@@ -1,100 +1,24 @@
 //! SSC READ/WRITE byte accounting at the command's transfer-unit boundary.
 
 use super::{map_scsi, ScsiError, TapeIoError};
-use remanence_scsi::decode_usable_sense;
-
-/// Use valid current sense only when the kernel count equals the request
-/// (zero kernel residue). A unit is one byte for FIXED=0 or one block for
-/// FIXED=1. Saturation bounds oversized residues; negative variable ILI
-/// residues describe oversized records and leave the full buffer count intact.
+/// Delegate raw completions to the outcome classifier's sense-residual rule.
 pub(crate) fn transfer_bytes_from_sense(
     sense: &[u8],
     kernel_bytes: u32,
     requested: u32,
     block_size: Option<u32>,
 ) -> u32 {
-    if kernel_bytes != requested {
-        return kernel_bytes;
-    }
-    let Some(decoded) = decode_usable_sense(sense) else {
-        return kernel_bytes;
-    };
-    if decoded.is_deferred() || !decoded.valid {
-        return kernel_bytes;
-    }
-    let Some(residue) = information(sense) else {
-        return kernel_bytes;
-    };
-    if block_size.is_none() && decoded.ili {
-        let negative = match decoded.response_code {
-            0x70 => residue & (1 << 31) != 0,
-            0x72 => residue & (1 << 63) != 0,
-            _ => false,
-        };
-        if negative {
-            return requested;
-        }
-    }
-    u64::from(requested).saturating_sub(residue.saturating_mul(u64::from(block_size.unwrap_or(1))))
-        as u32
+    crate::outcome::data_transfer_bytes_from_sense(sense, kernel_bytes, requested, block_size)
 }
 
-/// Correct a transfer count from the command's already-normalized residual.
+/// Use the same rule with already-normalized command evidence.
 pub(crate) fn transfer_bytes_from_evidence(
     evidence: &crate::outcome::CompletionEvidence,
     kernel_bytes: u32,
     requested: u32,
     block_size: Option<u32>,
 ) -> u32 {
-    if kernel_bytes != requested {
-        return kernel_bytes;
-    }
-    let Some(decoded) = evidence.current_sense().filter(|s| s.valid) else {
-        return kernel_bytes;
-    };
-    let Some(residue) = evidence.residual else {
-        return kernel_bytes;
-    };
-    if block_size.is_none() && decoded.ili {
-        let negative = match decoded.response_code {
-            0x70 => residue & (1 << 31) != 0,
-            0x72 => residue & (1 << 63) != 0,
-            _ => false,
-        };
-        if negative {
-            return requested;
-        }
-    }
-    u64::from(requested).saturating_sub(residue.saturating_mul(u64::from(block_size.unwrap_or(1))))
-        as u32
-}
-
-/// Read a complete, valid information field within the received sense bytes.
-/// Fixed-format information precedes the additional-sense-length boundary.
-fn information(sense: &[u8]) -> Option<u64> {
-    match sense.first()? & 0x7f {
-        0x70 if sense[0] & 0x80 != 0 => Some(u64::from(u32::from_be_bytes(
-            sense.get(3..7)?.try_into().ok()?,
-        ))),
-        0x72 => {
-            let end = (8 + usize::from(*sense.get(7)?)).min(sense.len());
-            let mut offset = 8;
-            while offset + 2 <= end {
-                let next = offset + 2 + usize::from(sense[offset + 1]);
-                if next > end {
-                    return None;
-                }
-                if sense[offset] == 0 && next - offset >= 12 && sense[offset + 2] & 0x80 != 0 {
-                    return Some(u64::from_be_bytes(
-                        sense[offset + 4..offset + 12].try_into().ok()?,
-                    ));
-                }
-                offset = next;
-            }
-            None
-        }
-        _ => None,
-    }
+    evidence.data_transfer_bytes(u64::from(kernel_bytes), u64::from(requested), block_size) as u32
 }
 
 /// Preserve transport diagnostics while carrying corrected physical bytes in
@@ -240,18 +164,19 @@ pub fn verification_read_completion(
     } else {
         return (0, VerificationReadCompletion::IoError);
     };
-    // Some hosts omit the kernel residual. Otherwise both independent counts
-    // must confirm the same whole-block prefix; buffer capacity is not evidence.
-    let residue = evidence.residual;
-    let records = residue
+    // A valid residual proves the whole-record prefix. Resolve host disagreement
+    // with the same classifier rule used by ordinary and pipelined transfers.
+    let records = evidence
+        .residual
         .filter(|&r| r >= 1)
         .and_then(|r| u64::from(requested).checked_sub(r));
     if let Some(records) = records {
-        let full_bytes = u64::from(size) * u64::from(requested);
-        let kernel_bytes = u64::from(*kernel_bytes);
-        if kernel_bytes == full_bytes
-            || (kernel_bytes % u64::from(size) == 0 && kernel_bytes / u64::from(size) == records)
-        {
+        let bytes = evidence.data_transfer_bytes(
+            u64::from(*kernel_bytes),
+            u64::from(size) * u64::from(requested),
+            Some(size),
+        );
+        if bytes == records * u64::from(size) {
             return (records as u32, boundary);
         }
     }
@@ -262,22 +187,22 @@ pub fn verification_read_completion(
 mod tests {
     use super::*;
 
-    /// Confirm only aligned, agreeing counts or the host's omitted residual.
+    /// Confirm valid whole-block sense counts even when SG disagrees.
     #[test]
     fn boundary_credit_requires_confirmed_whole_blocks() {
         for flags in [0x80, 8] {
             for (kernel, residue, valid, expected) in [
                 (8, 2, true, Some(2)),
                 (16, 2, true, Some(2)), // field host omits kernel residual
-                (8, 1, true, None),     // kernel 2, sense 3
-                (9, 2, true, None),     // non-whole kernel count
+                (8, 1, true, Some(3)),  // sense wins over kernel 2
+                (9, 2, true, Some(2)),  // sense wins over non-whole kernel count
                 (16, 5, true, None),    // residue exceeds request
                 (16, 2, false, None),
                 (8, 2, false, None),
                 (0, 4, true, Some(0)),
-                (4, 2, true, None),
-                (12, 2, true, None),
-                (20, 2, true, None),
+                (4, 2, true, Some(2)),
+                (12, 2, true, Some(2)),
+                (20, 2, true, Some(2)),
                 (16, 0, true, None),
             ] {
                 let mut sense = vec![0; 18];
@@ -309,7 +234,7 @@ mod tests {
         }
     }
     #[test]
-    fn boundary_credit_rejects_deferred_sense_and_uses_original_kernel_count() {
+    fn boundary_credit_rejects_deferred_sense_and_uses_valid_residual() {
         for response in [0xf0, 0xf1] {
             for kernel in [8, 12, 16] {
                 let mut sense = vec![0; 18];
@@ -325,7 +250,7 @@ mod tests {
                         },
                         bytes_transferred: 12,
                     });
-                let expected = if response == 0xf0 && kernel != 8 {
+                let expected = if response == 0xf0 {
                     (3, VerificationReadCompletion::Filemark)
                 } else {
                     (0, VerificationReadCompletion::UnconfirmedBoundary)

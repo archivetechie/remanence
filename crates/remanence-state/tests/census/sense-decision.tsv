@@ -55,7 +55,6 @@ crates/remanence-library/src/handle/tape_io/mod.rs::write_eom_signal::decode_usa
 # new: Finishes an initial host readiness observation with NotIssued evidence.
 crates/remanence-library/src/handle/tape_io/readiness.rs::new::classify	1
 # transfer_bytes_from_sense: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
-crates/remanence-library/src/handle/tape_io/transfer.rs::transfer_bytes_from_sense::decode_usable_sense	1
 # publish: Classifies a captured command after final arbitration, transfer accounting and position proof.
 crates/remanence-library/src/outcome/dispatch.rs::publish::classify	1
 # finish_abandoned_write: Finishes a distinct abandoned-operation fact only when no command outcome was returned.

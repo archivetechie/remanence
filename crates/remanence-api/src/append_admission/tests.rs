@@ -1285,6 +1285,9 @@ fn filemark_read_sense_and_transfer_matrix() {
                     let mut sense = vec![0; 18];
                     sense[0] = 0x70 | if valid { 0x80 } else { 0 };
                     sense[2] = 0x80 | key | if ili { 0x20 } else { 0 };
+                    // Keep the synthetic valid residual consistent with the
+                    // intended data transfer; invalid sense uses SG's count.
+                    sense[3..7].copy_from_slice(&(SIZE - bytes).to_be_bytes());
                     sense[7] = 10;
                     sense[13] = 1;
                     *f.response.lock().unwrap() = Some((sense, bytes));

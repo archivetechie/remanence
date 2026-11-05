@@ -1,0 +1,333 @@
+{
+  "source": "/home/remfield/remfield/evidence/41-session-closeout/session-epoch-a-20261105T072837Z/20261105T075259Z-kill-mid-write-AOX032L9.fizuaY/commands.jsonl",
+  "identity": {
+    "drive_catalog": {
+      "data": {
+        "drives": [
+          {
+            "actionable": true,
+            "cleaning_due": "none",
+            "correlation_rollups": [],
+            "cost": null,
+            "drive_uuid": "95f849e7-3070-4536-a623-1e6a70359dba",
+            "fenced": false,
+            "firmware_rev": "S2SD",
+            "first_seen_utc": "2026-11-05T07:28:58.915974268Z",
+            "identity_source": "DvcidAndInquiry",
+            "last_element_address": 1,
+            "last_library_serial": "DEC418146K_LL01",
+            "last_seen_utc": "2026-11-05T07:52:58.188532976Z",
+            "managed": "rem",
+            "notes": null,
+            "product": "Ultrium 9-SCSI",
+            "purchase_date": null,
+            "retire_reason": null,
+            "retired_at_utc": null,
+            "serial": "8031BDC7F9",
+            "state": "active",
+            "vendor": "HPE",
+            "warranty_until": null
+          }
+        ]
+      },
+      "kind": "list",
+      "observed_endpoints": [
+        {
+          "bay": null,
+          "kind": "library",
+          "library_serial": null,
+          "ownership": "library",
+          "path": "/dev/sg8",
+          "serial": "DEC418146K_LL01"
+        },
+        {
+          "bay": 1,
+          "kind": "library",
+          "library_serial": "DEC418146K_LL01",
+          "ownership": "library",
+          "path": "/dev/sg7",
+          "serial": "8031BDC7F9"
+        }
+      ],
+      "operation": null,
+      "schema": "rem.drive.list.v1",
+      "supported_endpoint_kinds": [
+        "library",
+        "standalone"
+      ]
+    },
+    "library_and_drives": [
+      {
+        "drives": [
+          {
+            "active_alert_names": [],
+            "catalog_state": "cataloged",
+            "cleaning_due": "none",
+            "closeout_authority_error": null,
+            "closeout_due": null,
+            "closeout_overdue": null,
+            "closeout_retry_reason": null,
+            "counter_epoch": 8011783823948749378,
+            "drive_serial": "8031BDC7F9",
+            "drive_uuid": "95f849e7-3070-4536-a623-1e6a70359dba",
+            "element_address": 1,
+            "fenced": false,
+            "host_device_path": "/dev/sg7",
+            "lifetime_read_bytes": null,
+            "lifetime_write_bytes": null,
+            "loaded_tape_barcode": null,
+            "loaded_tape_uuid": null,
+            "mount_age_seconds": null,
+            "open_epoch_end": null,
+            "open_epoch_start": null,
+            "product": "Ultrium 9-SCSI",
+            "session_id": null,
+            "status": "idle",
+            "tape_io": {
+              "cadence_us": null,
+              "effective_batch_blocks": null,
+              "gap_max_us": null,
+              "gap_p50_us": null,
+              "gap_p95_us": null,
+              "ioctl_max_us": null,
+              "ioctl_p50_us": null,
+              "ioctl_p95_us": null,
+              "session_average_feed_bytes_per_second": null,
+              "staging_ring_buffers": null,
+              "window_feed_bytes_per_second": null
+            },
+            "unprotected_bytes": null,
+            "unprotected_since": null,
+            "vendor": "HPE"
+          }
+        ],
+        "import_export_ports": [],
+        "last_inventory_at": "2026-11-05T07:52:58.165536215Z",
+        "library": {
+          "library_serial": "DEC418146K_LL01",
+          "library_uuid": "1b3c866c-d3f8-5cf1-b050-5f2269f282a5",
+          "product": "MSL3040",
+          "product_revision": "3370",
+          "vendor": "HPE"
+        },
+        "managed": "rem",
+        "slots": [
+          {
+            "element_address": 1001,
+            "tape_uuid": null,
+            "voltag": null
+          },
+          {
+            "element_address": 1002,
+            "tape_uuid": "b9ae9d1e-681b-4e6c-8784-8164192e5aa5",
+            "voltag": "AOX058L9"
+          },
+          {
+            "element_address": 1003,
+            "tape_uuid": "100f90a5-c7ec-4d62-85c9-0b9dcf5001c6",
+            "voltag": "AOX032L9"
+          },
+          {
+            "element_address": 1004,
+            "tape_uuid": "7c590331-c40e-4775-b69b-69a240272ead",
+            "voltag": "AOX036L9"
+          },
+          {
+            "element_address": 1005,
+            "tape_uuid": "2dcf287a-029e-49c1-bb1c-c272d6fca61e",
+            "voltag": "AOX038L9"
+          }
+        ]
+      }
+    ],
+    "library_inventory": {
+      "changer_sg": "/dev/sg8",
+      "changer_sysfs": "/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/host2/scsi_host/host2/port-2:2/end_device-2:2/target2:0:1/2:0:1:0",
+      "chassis": "5001438031bdc7fc",
+      "drive_count": 1,
+      "drives": [
+        {
+          "accessible": true,
+          "element_address": "0x0001",
+          "element_address_raw": 1,
+          "exception": null,
+          "installed": {
+            "identity_source": "DvcidAndInquiry",
+            "product": "Ultrium 9-SCSI",
+            "revision": "S2SD",
+            "serial": "8031BDC7F9",
+            "sg_path": "/dev/sg7",
+            "sysfs_path": "/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/host2/scsi_host/host2/port-2:1/end_device-2:1/target2:0:0/2:0:0:0",
+            "vendor": "HPE"
+          },
+          "loaded": false,
+          "loaded_tape": null,
+          "source_slot": null,
+          "source_slot_raw": null
+        }
+      ],
+      "ie_port_count": 0,
+      "ie_ports": [],
+      "loaded_slot_count": 4,
+      "observed_endpoints": [
+        {
+          "kind": "library",
+          "path": "/dev/sg8",
+          "serial": "DEC418146K_LL01"
+        },
+        {
+          "bay": 1,
+          "drive_serial": "8031BDC7F9",
+          "kind": "library",
+          "library_serial": "DEC418146K_LL01",
+          "ownership": "library",
+          "path": "/dev/sg7"
+        }
+      ],
+      "product": "MSL3040",
+      "revision": "3370",
+      "serial": "DEC418146K_LL01",
+      "slot_count": 5,
+      "slots": [
+        {
+          "accessible": true,
+          "cartridge": null,
+          "cleaning": false,
+          "element_address": "0x03e9",
+          "element_address_raw": 1001,
+          "exception": null,
+          "full": false
+        },
+        {
+          "accessible": true,
+          "cartridge": "AOX058L9",
+          "cleaning": false,
+          "element_address": "0x03ea",
+          "element_address_raw": 1002,
+          "exception": null,
+          "full": true
+        },
+        {
+          "accessible": true,
+          "cartridge": "AOX032L9",
+          "cleaning": false,
+          "element_address": "0x03eb",
+          "element_address_raw": 1003,
+          "exception": null,
+          "full": true
+        },
+        {
+          "accessible": true,
+          "cartridge": "AOX036L9",
+          "cleaning": false,
+          "element_address": "0x03ec",
+          "element_address_raw": 1004,
+          "exception": null,
+          "full": true
+        },
+        {
+          "accessible": true,
+          "cartridge": "AOX038L9",
+          "cleaning": false,
+          "element_address": "0x03ed",
+          "element_address_raw": 1005,
+          "exception": null,
+          "full": true
+        }
+      ],
+      "supported_endpoint_kinds": [
+        "library",
+        "standalone"
+      ],
+      "vendor": "HPE"
+    },
+    "reservation_ceiling_bytes": 103079215104,
+    "tape": {
+      "assignment_generation": 1,
+      "block_size_bytes": 262144,
+      "body_format": null,
+      "closeout_authority_error": null,
+      "closeout_due": false,
+      "closeout_overdue": false,
+      "closeout_retry_reason": null,
+      "correlation_rollups": [],
+      "data_blocks_per_stripe": 128,
+      "kind": "data",
+      "last_committed_tape_file": null,
+      "last_verification_state": null,
+      "last_verified_at": null,
+      "last_verified_edition_digest": null,
+      "open_epoch_end": null,
+      "open_epoch_start": null,
+      "parity_blocks_per_stripe": 4,
+      "pool_id": "fieldtest-a",
+      "scheme_id": "rs-cauchy-gf256-v1",
+      "seal_due": null,
+      "state": "ready",
+      "stripes_per_neighborhood": 512,
+      "tape_uuid": "100f90a5-c7ec-4d62-85c9-0b9dcf5001c6",
+      "unprotected_bytes": "0",
+      "unprotected_since": null,
+      "updated_at": "2026-11-05T07:31:40.245215245Z",
+      "voltag": "AOX032L9",
+      "written_extent_lba": null
+    }
+  },
+  "completion": {
+    "bytes_transferred": 262144,
+    "cdb": [
+      8,
+      0,
+      4,
+      0,
+      0,
+      0
+    ],
+    "drive": {
+      "bay": 1,
+      "firmware": "S2SD",
+      "library_serial": "DEC418146K_LL01",
+      "serial": "8031BDC7F9"
+    },
+    "duration_ns": "1846495",
+    "monotonic_ns": "8249022667",
+    "pid": 616011,
+    "requested_bytes": 262144,
+    "result": "Err(CheckCondition { sense: [240, 0, 8, 0, 4, 0, 0, 88, 0, 0, 0, 0, 0, 5, 48, 0, 100, 2, 32, 0, 6, 1, 65, 79, 88, 48, 51, 50, 76, 0, 0, 0], bytes_transferred: 262144 })",
+    "sense_raw": [
+      240,
+      0,
+      8,
+      0,
+      4,
+      0,
+      0,
+      88,
+      0,
+      0,
+      0,
+      0,
+      0,
+      5,
+      48,
+      0,
+      100,
+      2,
+      32,
+      0,
+      6,
+      1,
+      65,
+      79,
+      88,
+      48,
+      51,
+      50,
+      76,
+      0,
+      0,
+      0
+    ],
+    "wall_ns": "1793865223057712935"
+  }
+}

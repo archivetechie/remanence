@@ -240,6 +240,190 @@ async fn b9_fix_cold_preparation_leaves_other_rpc_and_shutdown_admissible() {
     pool.wait_closeouts().await;
 }
 
+/// Shutdown during cold replay must preserve both provisional and accepted
+/// manual preparations byte-for-byte, before either reconciliation append.
+#[tokio::test]
+async fn b4b2c_shutdown_before_manual_reconciliation_preserves_native_log() {
+    for accepted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let world = setup(root.path());
+        let selected = selection(root.path(), &world, false);
+        let mut state = super::b7_tests::state(root.path());
+        state.library_snapshot = Some(library_snapshot_cell(
+            world.lock().unwrap().library_snapshot(),
+        ));
+        let (changer, mut changer_rx) = mpsc::channel(1);
+        let (drive, mut drive_rx) = mpsc::channel(1);
+        let pool = DrivePool::new_for_library(
+            LIBRARY,
+            changer,
+            HashMap::from([(BAY, drive)]),
+            Arc::new(HashMap::from([(BAY, AtomicBool::new(false))])),
+        );
+        state.drive_pool = Some(pool.clone());
+        std::fs::create_dir_all(state.checkpoint_journal_dir.as_ref()).unwrap();
+        let mut index = state.catalog.write_handle();
+        let request = ManualFinalizeTapeActorRequest {
+            candidate_operation_id: Uuid::from_u128(0xb4b2c1),
+            actor: AuditActor::System,
+            actor_fingerprint: "b4b2c".into(),
+            idempotency_key: Uuid::from_u128(0xb4b2c2),
+            request_fingerprint: [0x2c; 32],
+            tape_uuid: TAPE,
+            expected_pool_id: Some(POOL.into()),
+            assignment_generation: index
+                .get_tape_assignment_snapshot(&TAPE)
+                .unwrap()
+                .unwrap()
+                .assignment_generation,
+            reason: "shutdown reconciliation regression".into(),
+            block_size: BLOCK,
+            parity_config: ParityConfig::None,
+            pool_config: Some(TapePoolConfig {
+                scheme: None,
+                ..super::pool()
+            }),
+        };
+        let authority =
+            TapeAuthority::open(state.checkpoint_journal_dir.as_ref(), TAPE, index.path()).unwrap();
+        let mut writer = authority.acquire_exclusive().unwrap();
+        writer
+            .publish_initialized(
+                BLOCK,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        let previous = writer.latest_commit().unwrap().unwrap();
+        let spec = TerminalFinalizeSpec::operator(&request);
+        let mut source =
+            remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&writer).unwrap();
+        let (intent, _) = build_new_terminal_plan(
+            &index,
+            &selected,
+            &spec,
+            &previous,
+            &mut source,
+            TerminalPlanPosition {
+                first_tape_file_number: previous.next_file,
+                first_start_lba: previous.cursor.lba,
+                terminal_prefix: None,
+            },
+        )
+        .unwrap();
+        drop(source);
+        writer.begin_finalization(&intent).unwrap();
+        if accepted {
+            // Crash cut: the DB transaction committed; the native preparation
+            // still needs its acceptance append on the next recovery attempt.
+            index
+                .accept_manual_terminal_finalization_with(
+                    remanence_state::ManualTerminalFinalizationAcceptanceInput {
+                        tape_uuid: TAPE,
+                        expected_pool_id: request.expected_pool_id.clone(),
+                        expected_assignment_generation: request.assignment_generation,
+                        actor_fingerprint: request.actor_fingerprint.clone(),
+                        operation_kind: FINALIZE_TAPE_OPERATION_KIND.into(),
+                        idempotency_key: request.idempotency_key,
+                        request_fingerprint: request.request_fingerprint,
+                        operation_id: request.candidate_operation_id,
+                        projection: remanence_state::TerminalFinalizationProjectionInput {
+                            tape_uuid: TAPE,
+                            trigger: intent.trigger,
+                            operation_id: Some(request.candidate_operation_id),
+                            progress: intent.progress,
+                            edition_digest: intent.edition_digest,
+                            layout_digest: intent.layout.layout_digest,
+                            outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+                            updated_at_utc: None,
+                        },
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+        }
+        drop(writer);
+        drop(index);
+        let cold = root.path().join("cold");
+        std::fs::create_dir(&cold).unwrap();
+        let name = format!("{}.remtape", Uuid::from_bytes(TAPE).simple());
+        std::fs::copy(state.checkpoint_journal_dir.join(&name), cold.join(&name)).unwrap();
+        state.checkpoint_journal_dir = Arc::new(cold);
+        let path = state.checkpoint_journal_dir.join(&name);
+        let before = std::fs::read(&path).unwrap();
+        let authority = TapeAuthority::open(
+            state.checkpoint_journal_dir.as_ref(),
+            TAPE,
+            state.index_path.as_ref(),
+        )
+        .unwrap();
+        let (entered, reached) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        authority.before_next_observation_replay(move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(StdDuration::from_secs(10)).unwrap();
+        });
+        let observer = tokio::task::spawn_blocking(move || authority.observe_summary());
+        tokio::time::timeout(StdDuration::from_secs(2), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        let preparing = state.clone();
+        let preparation = tokio::spawn(async move {
+            crate::mount::service_closeout_obligation(&preparing, TAPE, 1).await
+        });
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                match pool.reserve_tape(TAPE) {
+                    Ok(probe) => drop(probe),
+                    Err(_) => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let operations = state.index().unwrap().list_operations().unwrap().len();
+        state.begin_shutdown();
+        release.send(()).unwrap();
+        observer.await.unwrap().unwrap();
+        let result = preparation.await.unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "accepted={accepted}: reconciliation wrote after shutdown"
+        );
+        let error = result.unwrap_err();
+        assert!(crate::drive_pool::DaemonShuttingDown::is_status(&error));
+        assert_eq!(
+            state.index().unwrap().list_operations().unwrap().len(),
+            operations
+        );
+        assert!(drive_rx.try_recv().is_err());
+        assert!(changer_rx.try_recv().is_err());
+        pool.wait_closeouts().await;
+
+        // Positive control: the preserved preparation still takes the intended
+        // reconciliation branch once recovery runs without shutdown.
+        let authority = TapeAuthority::open(
+            state.checkpoint_journal_dir.as_ref(),
+            TAPE,
+            state.index_path.as_ref(),
+        )
+        .unwrap();
+        let mut writer = authority.acquire_exclusive_for_terminal_recovery().unwrap();
+        let index = state.catalog.write_handle();
+        assert_eq!(
+            reconcile_manual_terminal_acceptance(&index, &mut writer, &intent).unwrap(),
+            accepted
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
 /// Reopening an exact clean ending adds only SessionOpened, never a redundant refinement.
 #[tokio::test]
 async fn b9_fix_clean_reopen_does_not_refine_session_ended() {

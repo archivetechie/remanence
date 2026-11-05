@@ -2,6 +2,53 @@
 use super::*;
 use crate::ScsiError;
 
+/// Synthetic count conflicts exercise the one rule before any consumer refines
+/// the evidence: valid current sense wins, absent/deferred sense falls back.
+#[test]
+fn b4b2c_classifier_residual_precedence_and_fallback() {
+    for class in [CommandClass::Read, CommandClass::Write] {
+        for block_size in [None, Some(512)] {
+            for host in [0, 128, 1024, 2048] {
+                for (response, residual, expected) in [
+                    (0xf0, 0, 1024),
+                    (0xf0, if block_size.is_some() { 1 } else { 512 }, 512),
+                    (0xf0, if block_size.is_some() { 2 } else { 1024 }, 0),
+                    (0x70, 1, host),
+                    (0xf1, 1, host),
+                ] {
+                    let mut raw = sense(8, 0, 5);
+                    raw[0] = response;
+                    raw[3..7].copy_from_slice(&u32::to_be_bytes(residual));
+                    let mut evidence = CompletionEvidence::from_scsi(&ScsiError::CheckCondition {
+                        sense: raw,
+                        bytes_transferred: host,
+                    });
+                    evidence.requested_bytes = Some(1024);
+                    evidence.block_size = block_size;
+                    let outcome = classify(input(
+                        class,
+                        Phase::Read,
+                        Region::AtOrAfterCursor(10),
+                        evidence,
+                    ));
+                    assert_eq!(
+                        outcome.evidence.transferred_bytes,
+                        Some(u64::from(expected))
+                    );
+                    assert_eq!(
+                        outcome.evidence.host_transferred_bytes,
+                        Some(u64::from(host))
+                    );
+                    assert_eq!(
+                        outcome.evidence.boundary.physical_eod,
+                        response != 0xf1 && expected == 0
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn sense(key: u8, asc: u8, ascq: u8) -> Vec<u8> {
     let mut sense = vec![0; 18];
     sense[0] = 0x70;

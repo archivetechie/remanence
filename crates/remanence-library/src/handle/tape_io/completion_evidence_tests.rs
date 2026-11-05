@@ -60,6 +60,79 @@ fn b3b_shutdown_drive_admission_census() {
 type CdbLog = Arc<Mutex<Vec<Vec<u8>>>>;
 type Outcomes = Arc<Mutex<Vec<AuditOutcome>>>;
 
+/// Replay the complete field completion through variable READ and its one B3b
+/// classification. Boundary knowledge does not invent an absolute numeric LBA.
+fn datamover_variable_read(raw: &[u8], json: &str, filemark: bool) {
+    use crate::outcome::{census, Completion, Effect, PositionEffect};
+    let capture: serde_json::Value = serde_json::from_str(json).unwrap();
+    let completion = &capture["completion"];
+    let recorded_sense: Vec<u8> = serde_json::from_value(completion["sense_raw"].clone()).unwrap();
+    assert_eq!(raw, recorded_sense);
+    let cdb: Vec<u8> = serde_json::from_value(completion["cdb"].clone()).unwrap();
+    let requested = completion["requested_bytes"].as_u64().unwrap() as usize;
+    let host_bytes = completion["bytes_transferred"].as_u64().unwrap() as u32;
+    let (mut drive, log, _) = open(8, check(raw.to_vec(), host_bytes), vec![]);
+    let _context = drive.scoped_outcome_context(crate::outcome::OperationContext {
+        phase: crate::outcome::Phase::Read,
+        region: crate::outcome::Region::AtOrAfterCursor(10),
+        ..Default::default()
+    });
+    let generation = drive.identity_generation();
+    let before = census::count();
+    let error = drive.read_block(&mut vec![0; requested]).unwrap_err();
+    assert_eq!(census::count() - before, 1);
+    assert_eq!(log.lock().unwrap().last(), Some(&cdb));
+    let outcome = error.outcome();
+    assert_eq!(outcome.evidence.sense.as_deref(), Some(raw));
+    assert_eq!(
+        outcome.evidence.host_transferred_bytes,
+        Some(u64::from(host_bytes))
+    );
+    assert_eq!(outcome.evidence.residual, Some(requested as u64));
+    assert!(outcome.evidence.residual_valid);
+    assert_eq!(outcome.evidence.transferred_bytes, Some(0));
+    assert_eq!(outcome.completion, Completion::Known);
+    assert!(matches!(
+        outcome.effect,
+        Effect::NoFence | Effect::Transient
+    ));
+    assert_eq!(outcome.evidence.boundary.filemark, filemark);
+    assert_eq!(outcome.evidence.boundary.physical_eod, !filemark);
+    assert_eq!(outcome.evidence.position, PositionEffect::Forgotten);
+    assert_eq!(drive.identity_generation(), generation);
+    assert!(!drive.media_write_fenced_this_load());
+    if filemark {
+        // READ consumed the filemark; the next READ starts in the next file.
+        assert!(matches!(
+            error.kind,
+            crate::TapeIoErrorKind::FilemarkEncountered
+        ));
+    } else {
+        assert!(error.is_physical_eod());
+        assert_eq!(error.check_condition_transfer(), Some((raw, 0)));
+    }
+}
+
+/// Real EOD completion: no bytes, known EOD, and no fence.
+#[test]
+fn b4b2c_datamover_eod_variable_read() {
+    datamover_variable_read(
+        include_bytes!("../../../../../fixtures/sense/datamover-leg-a-20261105/eod.bin"),
+        include_str!("../../../../../fixtures/sense/datamover-leg-a-20261105/eod.json"),
+        false,
+    );
+}
+
+/// Real filemark completion: no bytes, past the filemark, and no fence.
+#[test]
+fn b4b2c_datamover_filemark_variable_read() {
+    datamover_variable_read(
+        include_bytes!("../../../../../fixtures/sense/datamover-leg-a-20261105/filemark.bin"),
+        include_str!("../../../../../fixtures/sense/datamover-leg-a-20261105/filemark.json"),
+        true,
+    );
+}
+
 /// One injected error for a selected opcode, with all CDBs recorded.
 struct Scripted {
     inner: Box<dyn SgTransport>,

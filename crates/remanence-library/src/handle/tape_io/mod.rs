@@ -3215,8 +3215,8 @@ impl super::DriveHandle {
                         }
                         if let Some(signed_info) = ili_signed_information(sense) {
                             if signed_info >= 0 {
-                                // A short record uses the kernel count when it
-                                // reports residue, otherwise the sense residue.
+                                // A short record uses the valid sense residual;
+                                // SG's count remains diagnostic evidence.
                                 let actual_usize = (transfer_bytes_from_sense(
                                     sense,
                                     bytes_transferred,
