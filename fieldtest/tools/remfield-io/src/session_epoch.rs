@@ -476,7 +476,10 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
         &args.evidence.join("closeout-key.json"),
         &json!({"tape_uuid":args.tape.to_string(),"idempotency_key":key.to_string()}),
     )?;
-    // The same idempotency key on every retry: a fenced attempt started nothing.
+    // The same idempotency key on every retry. The daemon accepts the closeout
+    // and raises a readiness fence inside the operation (a reloaded cartridge is
+    // becoming ready), so a fenced attempt ends Failed naming the fence. Wait on
+    // that fence and re-issue; the daemon re-runs a failed keyed closeout.
     let closeout_request = pb::CloseoutTapeRequest {
         tape_uuid: args.tape.as_bytes().to_vec(),
         expected_pool_id: Some(args.pool.clone()),
@@ -484,35 +487,58 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
             value: key.as_bytes().to_vec(),
         }),
     };
-    let operation = call_with_readiness_retry(channel.clone(), || {
-        let mut client = catalog.clone();
-        let request = closeout_request.clone();
-        async move { client.closeout_tape(request).await }
-    })
-    .await??;
-    let mut watch = pb::daemon_client::DaemonClient::new(channel)
-        .watch_operation(pb::GetOperationRequest {
-            operation_id: operation.operation_id,
-        })
-        .await?
-        .into_inner();
     let mut updates = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+        .append(true)
+        .create(true)
         .open(args.evidence.join("closeout.jsonl"))?;
+    let mut fence_retry = OpenRetry::from_env()?;
     let mut succeeded = false;
-    while let Some(status) = watch.message().await? {
-        writeln!(
-            updates,
-            "{}",
-            json!({"operation_id":uuid_bytes_to_text(&status.operation_id)?,"state":status.state,"progress":status.progress,"error":status.error_summary})
-        )?;
-        updates.sync_data()?;
-        if status.state == pb::OperationState::Succeeded as i32 {
-            succeeded = true;
+    while !succeeded {
+        let operation = call_with_readiness_retry(channel.clone(), || {
+            let mut client = catalog.clone();
+            let request = closeout_request.clone();
+            async move { client.closeout_tape(request).await }
+        })
+        .await??;
+        let mut watch = pb::daemon_client::DaemonClient::new(channel.clone())
+            .watch_operation(pb::GetOperationRequest {
+                operation_id: operation.operation_id,
+            })
+            .await?
+            .into_inner();
+        let mut fenced: Option<tonic::Status> = None;
+        let mut ended = false;
+        while let Some(status) = watch.message().await? {
+            writeln!(
+                updates,
+                "{}",
+                json!({"operation_id":uuid_bytes_to_text(&status.operation_id)?,"state":status.state,"progress":status.progress,"error":status.error_summary})
+            )?;
+            updates.sync_data()?;
+            if status.state == pb::OperationState::Succeeded as i32 {
+                succeeded = true;
+                ended = true;
+            }
+            if status.state == pb::OperationState::Failed as i32 {
+                if media_readiness_operation_id(&status.error_summary).is_some() {
+                    fenced = Some(tonic::Status::failed_precondition(
+                        status.error_summary.clone(),
+                    ));
+                    ended = true;
+                    break;
+                }
+                return Err(AppError::new("closeout failed; see watch"));
+            }
         }
-        if status.state == pb::OperationState::Failed as i32 {
-            return Err(AppError::new("closeout failed; see watch"));
+        if succeeded {
+            break;
+        }
+        match fenced {
+            Some(status) => {
+                wait_before_open_retry(channel.clone(), &status, &mut fence_retry).await?
+            }
+            None if ended => break,
+            None => return Err(AppError::new("closeout watch ended without success")),
         }
     }
     if !succeeded {
