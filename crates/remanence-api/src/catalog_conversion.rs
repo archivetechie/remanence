@@ -10,7 +10,7 @@ use remanence_format_driver::{
 };
 use remanence_state::{
     AuditActor, CatalogUnitFilter, CatalogUnitRecord, DriveCorrelationRollupRecord,
-    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord,
+    NativeObjectFileRecord, NativeObjectInstanceRecord, NativeObjectRecord, OperationRecord,
     StateError, TapeFileRecord, TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
@@ -450,7 +450,7 @@ pub(crate) fn object_record_to_proto(
     record: NativeObjectRecord,
 ) -> Result<pb::ObjectRecord, Status> {
     let append_commit_info = record
-        .copies
+        .instances
         .first()
         .map(append_commit_info_from_native_copy);
     let content_digest = catalog_digest_to_proto(
@@ -472,14 +472,15 @@ pub(crate) fn object_record_to_proto(
         body_format: Some(record.body_format),
         caller_metadata: std::collections::HashMap::new(),
         created_at: timestamp_from_rfc3339(record.created_at_utc.as_str()),
-        copies: record.copies.iter().map(object_copy_to_proto).collect(),
+        copies: record.instances.iter().map(object_copy_to_proto).collect(),
         append_commit_info,
         content_digest,
         metadata_digest,
     })
 }
 
-pub(crate) fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectCopy {
+// B6 retains ObjectCopy and copies on the public wire; projection rows are instances.
+pub(crate) fn object_copy_to_proto(copy: &NativeObjectInstanceRecord) -> pb::ObjectCopy {
     let health = if copy.status == "committed" {
         pb::object_copy::Health::ObjectCopyHealthOk
     } else {
@@ -500,8 +501,8 @@ pub(crate) fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectC
             copy.stored_digest_algorithm.clone(),
             copy.stored_digest.clone(),
         ),
-        // The span through the copy→tape-file join. Absent stays absent on
-        // the wire (proto3 optional): a copy whose tape file predates span
+        // The span through the instance→tape-file join. Absent stays absent on
+        // the wire (proto3 optional): an instance whose tape file predates span
         // capture is unknown, never zero.
         global_start_block: copy.global_start_block,
         global_end_block: copy.global_end_block,
@@ -526,7 +527,7 @@ pub(crate) fn append_mode_for_tape_file_number(tape_file_number: u64) -> pb::App
 }
 
 pub(crate) fn append_commit_info_from_native_copy(
-    copy: &NativeObjectCopyRecord,
+    copy: &NativeObjectInstanceRecord,
 ) -> pb::AppendCommitInfo {
     let tape_file_number = copy.tape_file_number;
     pb::AppendCommitInfo {

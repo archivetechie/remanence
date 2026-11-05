@@ -853,7 +853,7 @@ fn perform_checkpoint_barrier_with_rows(
         .last()
         .and_then(|b| b.files.last())
         .map(|r| r.tape_file_number)
-        .or_else(|| objects.last().map(|o| o.copy.tape_file_number))
+        .or_else(|| objects.last().map(|o| o.instance.tape_file_number))
         .map(|file| {
             file.checked_add(1).ok_or_else(|| {
                 CheckpointBarrierFailure::before_journal(Status::internal(
@@ -973,11 +973,15 @@ fn perform_checkpoint_barrier_with_rows(
                 "parity-off checkpoint batch has no Object projection",
             ))
         })?;
-        let next_tape_file_number = last.copy.tape_file_number.checked_add(1).ok_or_else(|| {
-            CheckpointBarrierFailure::before_journal(Status::internal(
-                "checkpoint next tape-file number overflows u64",
-            ))
-        })?;
+        let next_tape_file_number =
+            last.instance
+                .tape_file_number
+                .checked_add(1)
+                .ok_or_else(|| {
+                    CheckpointBarrierFailure::before_journal(Status::internal(
+                        "checkpoint next tape-file number overflows u64",
+                    ))
+                })?;
         (
             next_tape_file_number,
             last.block_size,

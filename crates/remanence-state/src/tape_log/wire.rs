@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::{
-    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
+    NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectProjectionInput,
 };
 use remanence_parity::authority::ManualTerminalFinalizationIdentity;
 use remanence_parity::{
@@ -153,9 +154,10 @@ fields!(TerminalTailLayout; partition,block_size,components,expected_eod_lba);
 fields!(ManualTerminalFinalizationIdentity; operation_id,operation_kind,actor_fingerprint,idempotency_key,request_fingerprint,assigned_pool_id,expected_pool_id,assignment_generation,reason);
 fields!(FinalizationPlan; group,trigger,manual,edition_id,edition_sequence,edition_digest,writer_version,write_timestamp,layout,prefix_end);
 fields!(NativeObjectProjectionInput; object_id,caller_object_id,body_format,logical_size_bytes,content_hash,metadata_hash,created_at_utc);
-fields!(NativeObjectCopyProjectionInput; object_id,tape_uuid,tape_file_number,first_body_lba,first_parity_data_ordinal,protected_until_ordinal,status,representation,recipient_epoch_ids,metadata_frame_len,plaintext_digest,stored_digest);
+fields!(NativeObjectInstanceProjectionInput; object_id,tape_uuid,tape_file_number,first_body_lba,first_parity_data_ordinal,protected_until_ordinal,status,representation,recipient_epoch_ids,metadata_frame_len,plaintext_digest,stored_digest);
 fields!(NativeObjectFileProjectionInput; object_id,file_id,path,size_bytes,file_sha256,first_chunk_lba,chunk_count,mtime,executable);
-fields!(payload::CommittedObjectProjection; object,copy,block_size,block_count,fresh_tape,total_committed_ordinals,object_recovery_row);
+// Field names are Rust-only; numeric wire keys and field order stay unchanged.
+fields!(payload::CommittedObjectProjection; object,instance,block_size,block_count,fresh_tape,total_committed_ordinals,object_recovery_row);
 impl Wire for [TerminalTailComponentPlan; 5] {
     fn put(&self, w: &mut dyn Write) -> io::Result<()> {
         head(w, 4, 5)?;

@@ -48,10 +48,10 @@ use remanence_parity::{
 };
 use remanence_state::*;
 use remanence_state::{
-    CatalogIndex, DriveObservationInput, NativeObjectCopyProjectionInput,
-    NativeObjectFileProjectionInput, NativeObjectProjectionInput, ProvisionTapeInput,
+    CatalogIndex, DriveObservationInput, NativeObjectFileProjectionInput,
+    NativeObjectInstanceProjectionInput, NativeObjectProjectionInput, ProvisionTapeInput,
     TapeFileRecord, TapeJournalIndexInput, TapePoolProjectionInput,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::StreamingError;
 use sha2::{Digest, Sha256};
@@ -620,7 +620,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
                     created_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
                 },
                 files: Vec::new(),
-                copy: NativeObjectCopyProjectionInput {
+                instance: NativeObjectInstanceProjectionInput {
                     object_id: object_uuid.to_string(),
                     tape_uuid: TAPE_UUID,
                     tape_file_number: 1,
@@ -6139,7 +6139,7 @@ fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
                 mtime: Some("0".to_string()),
                 executable: Some(false),
             }],
-            &[NativeObjectCopyProjectionInput {
+            &[NativeObjectInstanceProjectionInput {
                 object_id: RANGE_OBJECT_ID.to_string(),
                 tape_uuid: RANGE_TAPE_UUID,
                 tape_file_number: 0,
@@ -6147,7 +6147,7 @@ fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
                 first_parity_data_ordinal: None,
                 protected_until_ordinal: None,
                 status: "committed".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: None,
@@ -9460,7 +9460,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
                 created_at_utc: Some(source_object.options.write_timestamp.clone()),
             },
             files: vec![],
-            copy: NativeObjectCopyProjectionInput {
+            instance: NativeObjectInstanceProjectionInput {
                 object_id,
                 tape_uuid: selected.tape_uuid,
                 tape_file_number: 1,
@@ -9511,8 +9511,8 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         checkpoint_record.next_tape_file_number = 2;
         checkpoint_record.eod_lba = 7;
         for object in &mut checkpoint_record.objects {
-            object.copy.first_parity_data_ordinal = None;
-            object.copy.protected_until_ordinal = None;
+            object.instance.first_parity_data_ordinal = None;
+            object.instance.protected_until_ordinal = None;
         }
     }
     if refusal != Some("empty") {
@@ -12610,7 +12610,10 @@ pub(crate) async fn check_context_failure_receipts(
             .get_native_object(&Uuid::from_slice(&record.object_id).unwrap().to_string())
             .unwrap()
             .unwrap();
-        assert!(stored.copies.iter().any(|copy| copy.status == "committed"));
+        assert!(stored
+            .instances
+            .iter()
+            .any(|copy| copy.status == "committed"));
     }
     let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
         state.paths().journal_dir.join("tapes"),

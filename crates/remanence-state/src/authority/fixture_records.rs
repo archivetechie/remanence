@@ -1,8 +1,8 @@
 //! Semantic compatibility inputs for fixtures, with no legacy host storage.
 use crate::authority::{TerminalFinalizationLayout, TerminalFinalizationProgress};
 use crate::{
-    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
-    StateError,
+    NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectProjectionInput, StateError,
 };
 use remanence_parity::authority::{
     ManualTerminalFinalizationIdentity, TerminalFinalizationTrigger,
@@ -179,9 +179,9 @@ impl TerminalFinalizationIntent {
 /// Fixture input for one REM-OBJECT terminal recovery row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectRecoveryFixture {
-    /// Filemark-delimited tape-file number of the object copy.
+    /// Filemark-delimited tape-file number of the object instance.
     pub tape_file_number: u64,
-    /// Number of fixed-size records occupied by the stored copy.
+    /// Number of fixed-size records occupied by the stored instance.
     pub stored_block_count: u64,
     /// Verbatim 1–64-byte REM-OBJECT object identifier.
     pub object_id: Vec<u8>,
@@ -255,8 +255,8 @@ pub struct ObjectProjectionFixture {
     pub object: NativeObjectProjectionInput,
     /// Catalog member-file rows.
     pub files: Vec<NativeObjectFileProjectionInput>,
-    /// The single committed copy on this tape.
-    pub copy: NativeObjectCopyProjectionInput,
+    /// The single committed instance on this tape.
+    pub instance: NativeObjectInstanceProjectionInput,
     /// Fixed tape block size.
     pub block_size: u32,
     /// Stored object block count before its delimiter.
@@ -397,7 +397,7 @@ impl From<&super::AuthorityCommit> for CommitFixture {
                 .map(|payload| crate::ObjectProjectionFixture {
                     object: payload.projection.object.clone(),
                     files: payload.files.clone(),
-                    copy: payload.projection.copy.clone(),
+                    instance: payload.projection.instance.clone(),
                     block_size: payload.projection.block_size,
                     block_count: payload.projection.block_count,
                     fresh_tape: payload.projection.fresh_tape,
@@ -538,7 +538,7 @@ impl From<&crate::ObjectProjectionFixture> for crate::tape_log::payload::Committ
     fn from(v: &crate::ObjectProjectionFixture) -> Self {
         Self {
             object: v.object.clone(),
-            copy: v.copy.clone(),
+            instance: v.instance.clone(),
             block_size: v.block_size,
             block_count: v.block_count,
             fresh_tape: v.fresh_tape,

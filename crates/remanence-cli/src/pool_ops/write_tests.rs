@@ -168,10 +168,14 @@ fn selected_library_actor_preserves_encryption_locators_and_replay_before_load()
             .get_native_object_by_pool_and_caller_object_id("default", name)
             .unwrap()
             .unwrap();
-        assert_eq!(native.copies[0].representation, name);
+        assert_eq!(native.instances[0].representation, name);
         if encrypted {
             assert_eq!(
-                native.copies[0].recipient_epoch_ids.as_ref().unwrap().len(),
+                native.instances[0]
+                    .recipient_epoch_ids
+                    .as_ref()
+                    .unwrap()
+                    .len(),
                 2
             );
             assert_eq!(locator["recipient_epochs"][0]["label"], "primary");
@@ -416,7 +420,7 @@ fn archive_write_prints_committed_locator_when_allow_fails() {
         .get_native_object(locator["object_id"].as_str().unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(object.copies[0].status, "committed");
+    assert_eq!(object.instances[0].status, "committed");
     assert_eq!(
         locator["caller_object_id"],
         object.caller_object_id.unwrap()

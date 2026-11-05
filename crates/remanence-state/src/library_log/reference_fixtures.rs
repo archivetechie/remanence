@@ -3911,7 +3911,7 @@ fn authority_every_typed_method_uses_corpus_rules() {
     use std::sync::Arc;
     struct Free;
     impl FinalizationView for Free {
-        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+        fn committed_instance_count(&self, _: TapeRef) -> u64 {
             0
         }
         fn finalization_blocks_change(&self, _: TapeRef) -> bool {
@@ -4239,7 +4239,7 @@ fn authority_real_tape_and_library_200_interleavings() {
     use std::sync::Arc;
     struct Free;
     impl FinalizationView for Free {
-        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+        fn committed_instance_count(&self, _: TapeRef) -> u64 {
             0
         }
         fn finalization_blocks_change(&self, _: TapeRef) -> bool {
@@ -4347,7 +4347,7 @@ fn authority_real_tape_and_library_200_interleavings() {
         let mut cursor = 0;
         let mut tape_pending = true;
         let mut objects = 0;
-        let mut writer = crate::projector::memory_projection_without_copy_pool_fixture();
+        let mut writer = crate::projector::memory_projection_without_instance_pool_fixture();
         while cursor < library.len() || tape_pending || objects < object_prefixes.len() {
             random ^= random << 13;
             random ^= random >> 7;
@@ -4509,9 +4509,12 @@ fn authority_object_pool_both_orders_and_retries() {
             for i in order {
                 writer.apply(&sources[i], ApplyPath::Live).unwrap();
             }
-            let copies = writer.list_native_objects().unwrap();
-            assert_eq!(copies.len(), 1);
-            assert_eq!(copies[0].copies[0].pool_id.as_deref(), Some("archive"));
+            let instances = writer.list_native_objects().unwrap();
+            assert_eq!(instances.len(), 1);
+            assert_eq!(
+                instances[0].instances[0].pool_id.as_deref(),
+                Some("archive")
+            );
             let dump = writer.normalized_authority_dump();
             if let Some(expected) = &baseline {
                 assert_eq!(&dump, expected);

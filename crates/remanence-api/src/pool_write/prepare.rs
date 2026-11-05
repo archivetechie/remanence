@@ -22,7 +22,9 @@ use remanence_parity::{
     ObjectWriteSummary, ParityConfig, ParitySink, TapeFileEntry, TapeFileKind,
     TerminalTripleObjectReservation,
 };
-use remanence_state::{OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT};
+use remanence_state::{
+    OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED, OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
+};
 use remanence_stream::{
     plan_prepared_object, prepare_regular_file, ObjectCatalogProjection, ObjectCopyProjection,
     PreparedFile, StreamingAuditEvent, StreamingCatalogProjection, StreamingError,
@@ -99,8 +101,8 @@ impl PreparedStoredObject {
 
     pub(crate) fn representation_label(&self) -> &'static str {
         match self {
-            Self::Plaintext | Self::CanonicalPlaintext => OBJECT_COPY_REPRESENTATION_PLAINTEXT,
-            Self::Encrypted(_) => OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+            Self::Plaintext | Self::CanonicalPlaintext => OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
+            Self::Encrypted(_) => OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED,
         }
     }
 
@@ -141,7 +143,7 @@ pub(crate) struct CopyRepresentation {
 impl CopyRepresentation {
     pub(crate) fn plaintext() -> Self {
         Self {
-            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+            representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
             recipient_epoch_ids: None,
             recovery_recipient_epoch_ids: None,
             metadata_frame_len: None,
@@ -158,7 +160,7 @@ impl CopyRepresentation {
             .collect();
         let recovery_recipient_epoch_ids = envelope_recipient_epoch_ids(envelope);
         Self {
-            representation: OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+            representation: OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED,
             recipient_epoch_ids: Some(recipient_epoch_ids),
             recovery_recipient_epoch_ids: Some(recovery_recipient_epoch_ids),
             metadata_frame_len: Some(envelope.metadata_frame_len),

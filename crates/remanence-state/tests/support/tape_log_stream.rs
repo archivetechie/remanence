@@ -5,7 +5,8 @@ use remanence_state::tape_log::fold::GroupDigest;
 use remanence_state::tape_log::payload::{encode_header, encode_member, CommittedObjectProjection};
 use remanence_state::tape_log::*;
 use remanence_state::{
-    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
+    NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectProjectionInput,
 };
 use std::io::{self, Read};
 const UUID: [u8; 16] = [7; 16];
@@ -63,7 +64,7 @@ fn header(row: &TapeFileEntry, total: u64) -> CommittedObjectProjection {
             metadata_hash: Some(vec![4; 32]),
             created_at_utc: Some("2026-10-31T00:00:00Z".into()),
         },
-        copy: NativeObjectCopyProjectionInput {
+        instance: NativeObjectInstanceProjectionInput {
             object_id: "o".into(),
             tape_uuid: UUID,
             tape_file_number: row.tape_file_number,

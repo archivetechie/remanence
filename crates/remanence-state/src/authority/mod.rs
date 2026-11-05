@@ -24,7 +24,7 @@ pub use terminal::TerminalIndexSource;
 /// Member rows are separate so a new backend need not materialize an Object's catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CatalogPayload {
-    /// Complete Object and copy metadata before its member rows.
+    /// Complete Object and instance metadata before its member rows.
     Object(Box<crate::tape_log::payload::CommittedObjectProjection>),
     /// One member of the current Object, in source order.
     Member(crate::NativeObjectFileProjectionInput),
@@ -36,7 +36,7 @@ pub enum CatalogPayload {
 /// retain this by reference and stream its members through the frozen cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectPayload {
-    /// Format-neutral Object and copy metadata.
+    /// Format-neutral Object and instance metadata.
     pub projection: crate::tape_log::payload::CommittedObjectProjection,
     /// Catalog members in source order.
     pub files: Vec<crate::NativeObjectFileProjectionInput>,

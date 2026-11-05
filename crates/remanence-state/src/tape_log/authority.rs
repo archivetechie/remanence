@@ -1266,7 +1266,10 @@ fn visit_reports(
                         files.push(rows[position].clone());
                         position += 1;
                     }
-                    let bound = payload.copy.protected_until_ordinal.unwrap_or(protected);
+                    let bound = payload
+                        .instance
+                        .protected_until_ordinal
+                        .unwrap_or(protected);
                     while position < rows.len()
                         && rows[position].kind == TapeFileKind::ParitySidecar
                         && rows[position]
@@ -1643,7 +1646,7 @@ fn prepare_report(
             .payloads
             .iter()
             .zip(&report.object_files)
-            .any(|(object, files)| object.copy.protected_until_ordinal != Some(files.protected))
+            .any(|(object, files)| object.instance.protected_until_ordinal != Some(files.protected))
     {
         return Err(unsupported(
             "legacy Object bundle boundary not retained by its catalog projection",
@@ -1718,7 +1721,7 @@ fn prepare_report(
                 .clone()
         } else {
             let mut row = plain(
-                payload.copy.tape_file_number,
+                payload.instance.tape_file_number,
                 TapeFileKind::Object,
                 payload.block_count,
                 lba,
@@ -1738,7 +1741,7 @@ fn prepare_report(
         push(&mut group, Chunk::FileRow(row), &[])?;
         let mut stream = CatalogWriter {
             group: &mut group,
-            file: payload.copy.tape_file_number,
+            file: payload.instance.tape_file_number,
             ordinal: 0,
             bytes: Vec::with_capacity(65536),
         };

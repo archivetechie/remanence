@@ -138,9 +138,9 @@ fn planning_harness(
     let mut checkpoint = manual_finalize_checkpoint(uuid, block_size);
     checkpoint.scheme = Some(scheme.clone());
     checkpoint.eod_lba = raw.0;
-    checkpoint.objects[0].copy.first_body_lba = summary.physical_start_lba.unwrap();
-    checkpoint.objects[0].copy.first_parity_data_ordinal = Some(0);
-    checkpoint.objects[0].copy.protected_until_ordinal = Some(
+    checkpoint.objects[0].instance.first_body_lba = summary.physical_start_lba.unwrap();
+    checkpoint.objects[0].instance.first_parity_data_ordinal = Some(0);
+    checkpoint.objects[0].instance.protected_until_ordinal = Some(
         summary
             .committed_bundle()
             .unwrap()

@@ -78,8 +78,8 @@ pub use index::{
     DriveHealthSnapshotRecord, DriveObservationInput, DriveObservationOutcome, DriveRecord,
     ForeignArchiveProjectionInput, IdempotencyRegistration, IdempotencyScopeRecord,
     ManualTerminalFinalizationAcceptanceInput, MediaReadinessOperationInput,
-    MediaReadinessOperationRecord, MediaReadinessTransitionInput, NativeObjectCopyProjectionInput,
-    NativeObjectCopyRecord, NativeObjectFileProjectionInput, NativeObjectFileRecord,
+    MediaReadinessOperationRecord, MediaReadinessTransitionInput, NativeObjectFileProjectionInput,
+    NativeObjectFileRecord, NativeObjectInstanceProjectionInput, NativeObjectInstanceRecord,
     NativeObjectProjectionInput, NativeObjectRecord, OperationRecord, ProvisionTapeInput,
     RebuildReport, RebuildTapeJournalInput, RestartOperation, RestartSession, RetireDriveOutcome,
     RetireTapeInput, RetireTapeOutcome, StoredWrapDescriptor, TapeAssignmentSnapshot,
@@ -87,8 +87,8 @@ pub use index::{
     TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
     TerminalFinalizationOutcome, TerminalFinalizationProjection,
     TerminalFinalizationProjectionInput, VersionRow, WrapMapCacheRecord, DIGEST_ALGORITHM_SHA256,
-    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
-    OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
+    OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED, OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
+    OBJECT_INSTANCE_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;

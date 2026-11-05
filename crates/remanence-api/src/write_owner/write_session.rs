@@ -926,7 +926,7 @@ impl WriteSessionState<'_> {
             let (batch_id, pending) = pending;
             let (label, recipients) = crate::pool_write::requested_copy_identity(&representation);
             if pending.checkpoint_projection().is_none_or(|p| {
-                p.copy.representation != label || p.copy.recipient_epoch_ids != recipients
+                p.instance.representation != label || p.instance.recipient_epoch_ids != recipients
             }) {
                 source.remove_completed_path();
                 let _ = reply.send(Err(status_from_selected_write_error(
@@ -939,7 +939,7 @@ impl WriteSessionState<'_> {
                             .map(|p| {
                                 vec![format!(
                                     "{} {:?}",
-                                    p.copy.representation, p.copy.recipient_epoch_ids
+                                    p.instance.representation, p.instance.recipient_epoch_ids
                                 )]
                             })
                             .unwrap_or_default(),

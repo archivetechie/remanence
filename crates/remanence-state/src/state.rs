@@ -1392,8 +1392,8 @@ impl StateHandle {
             );
             detail.insert("reason".to_string(), CborValue::Text(reason));
             detail.insert(
-                "copies_marked_missing".to_string(),
-                CborValue::Integer(outcome.copies_marked_missing.into()),
+                "instances_marked_missing".to_string(),
+                CborValue::Integer(outcome.instances_marked_missing.into()),
             );
             self.audit.append(AuditEventRecord {
                 actor: AuditActor::local_user(),
@@ -1466,7 +1466,7 @@ impl StateHandle {
             TapeJournalIndexReport {
                 ingestion_pending: false,
                 tape_files_rebuilt: snapshot.summary().next_file,
-                object_copies_rebuilt: snapshot.summary().object_count,
+                object_instances_rebuilt: snapshot.summary().object_count,
             },
         ))
     }
@@ -4528,7 +4528,7 @@ pool_id = "camera.copy-a"
             .expect("open reset sqlite");
         for table in [
             "tape_files",
-            "object_copies",
+            "object_instances",
             "catalog_units",
             "operations",
             "sessions",
@@ -5747,7 +5747,7 @@ pool_id = "camera.copy-a"
 
         assert_eq!(report.tapes_rebuilt, 0);
         assert_eq!(report.tape_files_rebuilt, 0);
-        assert_eq!(report.object_copies_rebuilt, 0);
+        assert_eq!(report.object_instances_rebuilt, 0);
         assert_eq!(report.audit_records_replayed, 0);
         assert_eq!(report.journal_records_replayed, 0);
     }
@@ -5833,7 +5833,7 @@ pool_id = "camera.copy-a"
 
         assert!(outcome.newly_retired);
         assert_eq!(outcome.released_voltag.as_deref(), Some("ACM001L9"));
-        assert_eq!(outcome.copies_marked_missing, 0);
+        assert_eq!(outcome.instances_marked_missing, 0);
         let records = FileAuditLog::replay(handle.paths().audit_dir.clone()).expect("replay audit");
         let retired = records
             .iter()
@@ -5857,7 +5857,7 @@ pool_id = "camera.copy-a"
             Some(&CborValue::Text("recycled".to_string()))
         );
         assert_eq!(
-            record.detail.get("copies_marked_missing"),
+            record.detail.get("instances_marked_missing"),
             Some(&CborValue::Integer(0.into()))
         );
 
@@ -7076,6 +7076,9 @@ mod cutover_tests {
             }
             if layout == "schema23" {
                 let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+                // A predecessor fixture must use its historical table shape,
+                // not just relabel the current schema version.
+                conn.execute_batch("alter table object_instances rename to object_copies; alter table object_copies add column pool_id text;").unwrap();
                 conn.pragma_update(None, "user_version", 23).unwrap();
             }
             let relative = if layout == "two-journal" {

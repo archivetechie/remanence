@@ -69,8 +69,8 @@ fn third_record(uuid: [u8; 16]) -> crate::CommitFixture {
     let projection = &mut record.objects[0];
     projection.object.object_id = object.clone();
     projection.object.caller_object_id = Some("checkpoint-test-3".into());
-    projection.copy.object_id = object.clone();
-    projection.copy.tape_file_number = 3;
+    projection.instance.object_id = object.clone();
+    projection.instance.tape_file_number = 3;
     projection.total_committed_ordinals = 9;
     projection.object_recovery_row.tape_file_number = 3;
     projection.object_recovery_row.object_id = object.into_bytes();

@@ -393,9 +393,9 @@ fn encrypted_append_carries_recipients_and_replay_guard_without_deleting_source(
         .get_native_object(&Uuid::from_slice(&receipt.object_id).unwrap().to_string())
         .unwrap()
         .unwrap();
-    assert_eq!(native.copies[0].representation, "encrypted");
+    assert_eq!(native.instances[0].representation, "encrypted");
     assert_eq!(
-        native.copies[0].recipient_epoch_ids,
+        native.instances[0].recipient_epoch_ids,
         Some(vec!["09".repeat(16), "0a".repeat(16)])
     );
     let error = owner.append(fixture.request("secret")).unwrap_err();

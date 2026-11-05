@@ -12,7 +12,7 @@ use std::time::Instant;
 use remanence_parity::TapeIndexReplicaRecordSource;
 use remanence_state::authority::TapeAuthorityWriter;
 use remanence_state::{
-    NativeObjectCopyProjectionInput, NativeObjectProjectionInput, TerminalIndexSource,
+    NativeObjectInstanceProjectionInput, NativeObjectProjectionInput, TerminalIndexSource,
 };
 use serde_json::json;
 
@@ -78,7 +78,7 @@ fn checkpoint_record(
                         metadata_hash: Some(vec![0x22; 32]),
                         created_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
                     },
-                    copy: NativeObjectCopyProjectionInput {
+                    instance: NativeObjectInstanceProjectionInput {
                         object_id: object_id.clone(),
                         tape_uuid,
                         tape_file_number: object_tape_file_number,

@@ -372,7 +372,7 @@ impl RowAuthority {
                         metadata_hash: None,
                         created_at_utc: None,
                     },
-                    copy: crate::NativeObjectCopyProjectionInput {
+                    instance: crate::NativeObjectInstanceProjectionInput {
                         object_id,
                         tape_uuid: summary.tape_uuid,
                         tape_file_number: row.tape_file_number,

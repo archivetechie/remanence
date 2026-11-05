@@ -11,7 +11,8 @@ use super::{
     Fault, ObjectRecoveryRow,
 };
 use crate::{
-    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
+    NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectProjectionInput,
 };
 use std::io::{self, Write};
 
@@ -21,8 +22,8 @@ use std::io::{self, Write};
 pub struct CommittedObjectProjection {
     /// Object identity, caller, body format, sizes, hashes and timestamp.
     pub object: NativeObjectProjectionInput,
-    /// Copy identity, encryption, protection and digest metadata.
-    pub copy: NativeObjectCopyProjectionInput,
+    /// Instance identity, encryption, protection and digest metadata.
+    pub instance: NativeObjectInstanceProjectionInput,
     /// Fixed record size.
     pub block_size: u32,
     /// Stored object blocks.
@@ -43,17 +44,17 @@ pub fn encode_header(
     for digest in [
         &header.object.content_hash,
         &header.object.metadata_hash,
-        &header.copy.plaintext_digest,
-        &header.copy.stored_digest,
+        &header.instance.plaintext_digest,
+        &header.instance.stored_digest,
     ] {
         if digest.as_ref().is_some_and(|value| value.len() != 32) {
             return Err(bad("catalog digest length"));
         }
     }
-    if header.object.object_id != header.copy.object_id
+    if header.object.object_id != header.instance.object_id
         || header.object_recovery_row.object_id.as_deref()
             != Some(header.object.object_id.as_bytes())
-        || header.object_recovery_row.tape_file_number != header.copy.tape_file_number
+        || header.object_recovery_row.tape_file_number != header.instance.tape_file_number
         || header.object_recovery_row.stored_block_count != header.block_count
     {
         return Err(bad("catalog header identity"));
@@ -61,9 +62,13 @@ pub fn encode_header(
     if !remanence_parity::DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES.contains(&header.block_size) {
         return Err(bad("catalog block size"));
     }
-    if header.copy.first_parity_data_ordinal.is_some_and(|first| {
-        first.checked_add(header.block_count) != Some(header.total_committed_ordinals)
-    }) {
+    if header
+        .instance
+        .first_parity_data_ordinal
+        .is_some_and(|first| {
+            first.checked_add(header.block_count) != Some(header.total_committed_ordinals)
+        })
+    {
         return Err(bad("catalog data ordinals"));
     }
     remanence_parity::object_recovery::validate_object_recovery_row_fields(

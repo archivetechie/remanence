@@ -55,7 +55,7 @@ pub(crate) fn validate_parity_barrier_bundles(
         first_tape_file.get_or_insert(object_entry);
 
         if object_entry.object_id.as_deref() != Some(projection.object.object_id.as_str())
-            || object_entry.tape_file_number != projection.copy.tape_file_number
+            || object_entry.tape_file_number != projection.instance.tape_file_number
             || object_entry.block_count != projection.block_count
         {
             return Err(barrier_bundle_shape_error(format!(

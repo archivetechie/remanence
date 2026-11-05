@@ -35,7 +35,7 @@ impl TapeView for View {
 }
 struct Free;
 impl FinalizationView for Free {
-    fn committed_copy_count(&self, _: TapeRef) -> u64 {
+    fn committed_instance_count(&self, _: TapeRef) -> u64 {
         0
     }
     fn finalization_blocks_change(&self, _: TapeRef) -> bool {
@@ -832,7 +832,7 @@ fn authority_empty_rebuild_retired_sealed_identity_kept() {
 fn authority_finalization_view_refuses_assignment_label_and_retirement() {
     struct Blocked;
     impl FinalizationView for Blocked {
-        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+        fn committed_instance_count(&self, _: TapeRef) -> u64 {
             0
         }
         fn finalization_blocks_change(&self, _: TapeRef) -> bool {
@@ -1524,7 +1524,7 @@ fn authority_prepared_and_automatic_seal_interleavings() {
     use std::sync::Mutex;
     struct Summary(bool);
     impl FinalizationView for Summary {
-        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+        fn committed_instance_count(&self, _: TapeRef) -> u64 {
             0
         }
         fn finalization_blocks_change(&self, _: TapeRef) -> bool {
@@ -1827,7 +1827,7 @@ fn authority_readiness_completion_evidence_kept() {
 }
 
 /// The writer consults real native occupancy even before SQL has received the
-/// copies. Refusals append nothing; retirement remains an independent duty.
+/// instances. Refusals append nothing; retirement remains an independent duty.
 #[test]
 fn authority_occupied_tape_refuses_pool_changes_but_allows_retirement() {
     use remanence_state::{authority::TapeAuthorityView, TapeAuthority};
@@ -1836,7 +1836,7 @@ fn authority_occupied_tape_refuses_pool_changes_but_allows_retirement() {
         bool,
     );
     impl FinalizationView for Summary<'_> {
-        fn committed_copy_count(&self, tape: TapeRef) -> u64 {
+        fn committed_instance_count(&self, tape: TapeRef) -> u64 {
             assert_eq!(tape.uuid, [0xa1; 16]);
             self.0.tape_summary().object_count
         }
@@ -1895,7 +1895,7 @@ fn authority_occupied_tape_refuses_pool_changes_but_allows_retirement() {
             )
             .unwrap_err();
         assert!(
-            matches!(error, AuthorityError::TapeHoldsCommittedCopies { tape_uuid, copy_count: 2 }
+            matches!(error, AuthorityError::TapeHoldsCommittedInstances { tape_uuid, instance_count: 2 }
             if tape_uuid == Uuid::from_bytes([0xa1;16]))
         );
         assert_eq!(error.to_string(), format!("tape {} holds 2 committed instances; a tape holding data cannot change pool; it can only be retired", Uuid::from_bytes([0xa1;16])));

@@ -119,7 +119,7 @@ pub(super) fn dispatch(
                         }
                         Err(version) => {
                             let (copy, label) = version
-                                .copies
+                                .instances
                                 .first()
                                 .ok_or("committed version has no copy")?;
                             output.receipt(json!({"event":"already_stored","path":archive_path.to_string_lossy(),"object_id":version.object_id,"tape_uuid":Uuid::from_slice(copy).map_err(err)?,"label":label}))?;

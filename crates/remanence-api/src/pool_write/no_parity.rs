@@ -9,9 +9,9 @@ use remanence_format::{
 use remanence_library::BlockSink;
 use remanence_parity::TapeFileKind;
 use remanence_state::{
-    CatalogIndex, NativeObjectCopyProjectionInput, NativeObjectCopyRecord,
-    NativeObjectFileProjectionInput, NativeObjectProjectionInput, NativeObjectRecord,
-    TapePoolConfig, OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    CatalogIndex, NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectInstanceRecord, NativeObjectProjectionInput, NativeObjectRecord, TapePoolConfig,
+    OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED, OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
     normalize_archive_path, FileCatalogProjection, PreparedFile, StreamingError,
@@ -390,12 +390,13 @@ pub(super) fn commit_pool_write(
     hardware_early_warning: bool,
 ) -> Result<bool, PoolWriteError> {
     let first_body_lba = first_payload_body_lba(write_report);
-    let metadata_hash =
-        if projection.copy_representation.representation == OBJECT_COPY_REPRESENTATION_PLAINTEXT {
-            Some(write_report.catalog.object.manifest_sha256.to_vec())
-        } else {
-            None
-        };
+    let metadata_hash = if projection.copy_representation.representation
+        == OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT
+    {
+        Some(write_report.catalog.object.manifest_sha256.to_vec())
+    } else {
+        None
+    };
     let file_projections = write_report
         .catalog
         .files
@@ -411,7 +412,7 @@ pub(super) fn commit_pool_write(
         metadata_hash,
         created_at_utc: Some(prepared.write_timestamp.clone()),
     };
-    let copy_projection = NativeObjectCopyProjectionInput {
+    let copy_projection = NativeObjectInstanceProjectionInput {
         object_id: write_report.catalog.object_copy.object_id.clone(),
         tape_uuid: selected.tape_uuid,
         tape_file_number: write_report.catalog.object_copy.tape_file_number,
@@ -464,7 +465,7 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
         .map(native_object_file_projection)
         .collect();
     let representation = match copy_representation.representation {
-        OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
+        OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT => {
             let manifest_first_chunk_lba = prepared
                 .plan
                 .layout
@@ -482,7 +483,7 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
                 manifest_sha256: prepared.plan.layout.manifest_sha256,
             }
         }
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
+        OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED => {
             remanence_parity::ObjectRecoveryRepresentation::Encrypted {
                 recipient_epoch_ids: copy_representation
                     .recovery_recipient_epoch_ids
@@ -520,11 +521,11 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
                 logical_size_bytes: Some(write_report.catalog.object.logical_size_bytes),
                 content_hash: Some(prepared.content_sha256.to_vec()),
                 metadata_hash: (copy_representation.representation
-                    == OBJECT_COPY_REPRESENTATION_PLAINTEXT)
+                    == OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT)
                     .then(|| write_report.catalog.object.manifest_sha256.to_vec()),
                 created_at_utc: Some(prepared.write_timestamp.clone()),
             },
-            copy: NativeObjectCopyProjectionInput {
+            instance: NativeObjectInstanceProjectionInput {
                 object_id: write_report.catalog.object_copy.object_id.clone(),
                 tape_uuid: selected.tape_uuid,
                 tape_file_number: write_report.catalog.object_copy.tape_file_number,
@@ -715,20 +716,20 @@ pub(crate) fn maybe_replay_pool_write(
     let (requested_representation, requested_recipient_epoch_ids) =
         requested_copy_identity(&request.representation);
     let existing_representations = existing
-        .copies
+        .instances
         .iter()
         .filter(|copy| {
             copy.pool_id.as_deref() == Some(pool_cfg.id.as_str()) && copy.status == "committed"
         })
         .map(committed_copy_identity_summary)
         .collect::<Vec<_>>();
-    existing.copies.retain(|copy| {
+    existing.instances.retain(|copy| {
         copy.pool_id.as_deref() == Some(pool_cfg.id.as_str())
             && copy.status == "committed"
             && copy.representation == requested_representation
             && copy.recipient_epoch_ids == requested_recipient_epoch_ids
     });
-    if existing.copies.is_empty() {
+    if existing.instances.is_empty() {
         return Err(PoolWriteError::CallerObjectIdRepresentationConflict {
             pool_id: pool_cfg.id.clone(),
             caller_object_id: request.caller_object_id.clone(),
@@ -797,9 +798,9 @@ pub(crate) fn requested_copy_identity(
     representation: &PoolWriteRepresentation,
 ) -> (&'static str, Option<Vec<String>>) {
     match representation {
-        PoolWriteRepresentation::Plaintext => (OBJECT_COPY_REPRESENTATION_PLAINTEXT, None),
+        PoolWriteRepresentation::Plaintext => (OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT, None),
         PoolWriteRepresentation::Encrypted { recipients } => (
-            OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+            OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED,
             Some(
                 recipients
                     .iter()
@@ -810,7 +811,7 @@ pub(crate) fn requested_copy_identity(
     }
 }
 
-pub(super) fn committed_copy_identity_summary(copy: &NativeObjectCopyRecord) -> String {
+pub(super) fn committed_copy_identity_summary(copy: &NativeObjectInstanceRecord) -> String {
     match copy.recipient_epoch_ids.as_deref() {
         Some(recipient_epoch_ids) => {
             format!("{}:{recipient_epoch_ids:?}", copy.representation)
@@ -831,7 +832,7 @@ pub(crate) fn pool_write_object_record_from_native(
         .logical_size_bytes
         .ok_or_else(|| replay_object_invalid(&object.object_id, "logical_size_bytes is missing"))?;
     let copies = object
-        .copies
+        .instances
         .iter()
         .filter(|copy| copy.pool_id.as_deref() == Some(pool_id) && copy.status == "committed")
         .map(|copy| pool_write_copy_record_from_native(copy, pool_id))
@@ -854,7 +855,7 @@ pub(crate) fn pool_write_object_record_from_native(
 }
 
 pub(super) fn pool_write_copy_record_from_native(
-    copy: &NativeObjectCopyRecord,
+    copy: &NativeObjectInstanceRecord,
     pool_id: &str,
 ) -> Result<PoolWriteObjectCopyRecord, PoolWriteError> {
     let tape_uuid =

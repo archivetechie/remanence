@@ -19,7 +19,7 @@ use remanence_parity::{
 };
 use remanence_state::{
     watermark_floor_bytes, CatalogIndex, TapePoolConfig, TapeRecord,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -3094,7 +3094,7 @@ fn pool_write_record_to_proto_carries_append_commit_info() {
             tape_file_number: 3,
             first_body_lba: 9,
             pool_id: "camera.copy-a".to_string(),
-            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some([0x33; 32]),
@@ -3145,7 +3145,7 @@ fn written_ack_never_exposes_provisional_tape_locators() {
             tape_file_number: 37,
             first_body_lba: 9,
             pool_id: "camera.copy-a".to_string(),
-            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some([0x33; 32]),

@@ -28,8 +28,8 @@ use remanence_format::{
 };
 use remanence_library::{BlockSize, BlockSource, DriveHandleSource, StaticAllowlist, TapeConfig};
 use remanence_state::{
-    CatalogIndex, NativeObjectCopyRecord, StateHandle, TapeFileRecord,
-    OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    CatalogIndex, NativeObjectInstanceRecord, StateHandle, TapeFileRecord,
+    OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED, OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
 };
 use sha2::Digest;
 use uuid::Uuid;
@@ -462,7 +462,7 @@ pub(crate) fn print_locator_json_with_recipients(
     let tape_uuid_hex = bytes_to_hex(&copy.tape_uuid);
     let object_id = Uuid::from_bytes(object.object_id).to_string();
     let content_sha256_hex = bytes_to_hex(&object.content_sha256);
-    let encryption = if copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED {
+    let encryption = if copy.representation == OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED {
         "REMO"
     } else {
         "none"
@@ -481,7 +481,7 @@ pub(crate) fn print_locator_json_with_recipients(
         "body_format": "rem-object-v1",
         "representation": copy.representation.as_str(),
         "encryption": encryption,
-        "format_version": (copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED)
+        "format_version": (copy.representation == OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED)
             .then_some(2),
         "recipient_epochs": recipient_epochs,
         "metadata_frame_len": copy.metadata_frame_len.map(|value| value.to_string()),
@@ -521,7 +521,7 @@ fn print_locator_human(object: &PoolWriteObjectRecord, pool_id: &str, out: &mut 
     let tape_uuid_hex = bytes_to_hex(&copy.tape_uuid);
     let object_id = Uuid::from_bytes(object.object_id).to_string();
     let content_sha256_hex = bytes_to_hex(&object.content_sha256);
-    let encryption = if copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED {
+    let encryption = if copy.representation == OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED {
         "REMO"
     } else {
         "none"
@@ -754,7 +754,7 @@ pub(crate) fn decode_locator(raw: &str) -> Result<DecodedLocator, String> {
 /// Pure: derive the read plan from already-fetched catalog records,
 /// validating the copy location against the locator.
 fn plan_from_records(
-    copies: &[NativeObjectCopyRecord],
+    copies: &[NativeObjectInstanceRecord],
     tape_files: &[TapeFileRecord],
     block_size: Option<u64>,
     manifest_sha256: Option<[u8; 32]>,
@@ -776,12 +776,12 @@ fn plan_from_records(
         })?;
     let recipient_epoch_ids = copy.recipient_epoch_ids.clone();
     match copy.representation.as_str() {
-        OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
+        OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT => {
             if recipient_epoch_ids.is_some() || copy.metadata_frame_len.is_some() {
                 return Err("plaintext catalog copy carries encrypted envelope fields".to_string());
             }
         }
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
+        OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED => {
             if recipient_epoch_ids.as_ref().is_none_or(Vec::is_empty) {
                 return Err("encrypted catalog copy is missing recipient_epoch_ids".to_string());
             }
@@ -852,7 +852,7 @@ fn resolve_object_read_plan(
         .map_err(|e| format!("catalog: {e}"))?
         .and_then(|t| t.block_size);
     plan_from_records(
-        &object.copies,
+        &object.instances,
         &tape_files,
         block_size,
         manifest_sha256,
@@ -1017,7 +1017,7 @@ fn stream_mounted_payload<W: Write + Send>(
     err: &mut dyn Write,
 ) -> Result<TapeStreamOutcome, ExitCode> {
     let (payload_bytes, actual_sha256) = match mounted.plan.representation.as_str() {
-        OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
+        OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT => {
             if private_key.is_some() {
                 let _ = writeln!(
                     err,
@@ -1047,7 +1047,7 @@ fn stream_mounted_payload<W: Write + Send>(
                 ExitCode::from(1)
             })?
         }
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
+        OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED => {
             let private_key = private_key.ok_or_else(|| {
                 let _ = writeln!(err, "error: encrypted copy requires --private-key");
                 ExitCode::from(1)
@@ -1618,7 +1618,7 @@ pub fn run_archive_list(
                 continue;
             }
         };
-        for copy in &obj.copies {
+        for copy in &obj.instances {
             let record = CatalogObjectRecord {
                 tape_uuid: bytes_to_hex(&copy.tape_uuid),
                 tape_file_number: copy.tape_file_number,
@@ -1661,8 +1661,8 @@ mod tests {
     use remanence_library::model::{DriveBay, ElementLayout, IdentitySource, InstalledDrive};
     use remanence_library::{LoadError, LoadPlan, VecBlockSource};
     use remanence_state::{
-        NativeObjectCopyRecord, TapeFileRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-        OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+        NativeObjectInstanceRecord, TapeFileRecord, OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED,
+        OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
     };
     use sha2::Digest;
     use uuid::Uuid;
@@ -1824,8 +1824,12 @@ mod tests {
         }
     }
 
-    fn copy(object_id: &str, tape_file_number: u64, first_body_lba: u64) -> NativeObjectCopyRecord {
-        NativeObjectCopyRecord {
+    fn copy(
+        object_id: &str,
+        tape_file_number: u64,
+        first_body_lba: u64,
+    ) -> NativeObjectInstanceRecord {
+        NativeObjectInstanceRecord {
             tape_log_sequence: None,
             tape_incarnation: None,
             object_id: object_id.to_string(),
@@ -1836,7 +1840,7 @@ mod tests {
             protected_until_ordinal: None,
             status: "committed".to_string(),
             pool_id: Some("scenario-a".to_string()),
-            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some(vec![0x51; 32]),
@@ -2066,7 +2070,7 @@ mod tests {
                 tape_file_number: 1,
                 first_body_lba: 2,
                 pool_id: "scenario-a".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some([0x31; 32]),
@@ -2163,7 +2167,7 @@ mod tests {
                 tape_file_number: 2,
                 first_body_lba: 3,
                 pool_id: "scenario-a".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_ENCRYPTED.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED.to_string(),
                 recipient_epoch_ids: Some(committed_ids.clone()),
                 metadata_frame_len: Some(4096),
                 plaintext_digest: Some([0x43; 32]),
@@ -2209,7 +2213,7 @@ mod tests {
                 tape_file_number: structural_max,
                 first_body_lba: structural_max,
                 pool_id: "scenario-a".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some([0x31; 32]),

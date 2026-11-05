@@ -47,7 +47,7 @@ pub(crate) fn status_from_state_error(err: impl std::borrow::Borrow<StateError>)
         StateError::ConfigInvalid(_) => Status::invalid_argument(err.to_string()),
         StateError::IdempotencyConflict(_) => Status::already_exists(err.to_string()),
         StateError::TapePoolAssignmentConflict(_)
-        | StateError::TapeHoldsCommittedCopies { .. }
+        | StateError::TapeHoldsCommittedInstances { .. }
         | StateError::TapeProvisionConflict(_)
         | StateError::AppendRecoveryPrecondition(_)
         | StateError::JournalReplayFailed(_) => Status::failed_precondition(err.to_string()),

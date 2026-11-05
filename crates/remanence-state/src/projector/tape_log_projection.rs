@@ -56,10 +56,10 @@ impl CatalogCore {
     }
     pub(super) fn join_object_log_reference(
         &self,
-        copy: &mut NativeObjectCopyRecord,
+        instance: &mut NativeObjectInstanceRecord,
     ) -> Result<(), StateError> {
-        copy.tape_log_sequence = self.conn.query_row("select tape_log_sequence from tape_log_object_commits where tape_uuid = ?1 and tape_file_number = ?2", params![&copy.tape_uuid, SqliteU64::new(copy.tape_file_number)], |row| row.get::<_, SqliteU64>(0)).optional().map_err(|e| sqlite_error("join object log reference", e))?.map(SqliteU64::get);
-        copy.tape_incarnation = copy.tape_log_sequence.map(|_| 1);
+        instance.tape_log_sequence = self.conn.query_row("select tape_log_sequence from tape_log_object_commits where tape_uuid = ?1 and tape_file_number = ?2", params![&instance.tape_uuid, SqliteU64::new(instance.tape_file_number)], |row| row.get::<_, SqliteU64>(0)).optional().map_err(|e| sqlite_error("join object log reference", e))?.map(SqliteU64::get);
+        instance.tape_incarnation = instance.tape_log_sequence.map(|_| 1);
         Ok(())
     }
     /// Project all new closed groups from one immutable, validated snapshot.
@@ -120,11 +120,11 @@ impl CatalogCore {
         for record in audit {
             project_catalog_evidence_record(&tx, record, &mut warnings)?;
         }
-        tx.execute("update object_copies set status = 'missing' where tape_uuid in (select tape_uuid from tapes where state = 'retired')", []).map_err(|e| sqlite_error("rebuild retired copies", e))?;
+        tx.execute("update object_instances set status = 'missing' where tape_uuid in (select tape_uuid from tapes where state = 'retired')", []).map_err(|e| sqlite_error("rebuild retired copies", e))?;
         let report = RebuildReport {
             tapes_rebuilt: snapshots.len() as u64,
             tape_files_rebuilt: table_count(&tx, "tape_files")?,
-            object_copies_rebuilt: table_count(&tx, "object_copies")?,
+            object_instances_rebuilt: table_count(&tx, "object_instances")?,
             audit_records_replayed: audit.len() as u64,
             journal_records_replayed: snapshots
                 .iter()
@@ -266,17 +266,17 @@ impl CatalogCore {
         let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin repaired tape projection", e))?;
         tx.execute_batch(
-            "create temp table repaired_objects as select object_id from object_copies where 0",
+            "create temp table repaired_objects as select object_id from object_instances where 0",
         )
         .map_err(|e| sqlite_error("prepare repair object scope", e))?;
         tx.execute(
-            "insert into repaired_objects select object_id from object_copies where tape_uuid = ?1",
+            "insert into repaired_objects select object_id from object_instances where tape_uuid = ?1",
             params![uuid.as_slice()],
         )
         .map_err(|e| sqlite_error("retain repair object scope", e))?;
         for table in [
             "catalog_units",
-            "object_copies",
+            "object_instances",
             "tape_files",
             "tape_log_projection",
             "tape_log_object_commits",
@@ -292,8 +292,8 @@ impl CatalogCore {
         tx.execute("update tapes set highest_protected_ordinal = ?2, total_committed_ordinals = ?2, last_committed_tape_file = null, written_extent_lba = null, finalization_progress = null, finalization_trigger = null, finalization_operation_id = null, finalization_edition_digest = null, finalization_layout_digest = null, finalization_outcome = null, completed_replicas = null, seal_due = null where tape_uuid = ?1", params![uuid.as_slice(), SqliteU64::new(0)]).map_err(|e| sqlite_error("reset repaired tape counters", e))?;
         project_snapshot(&tx, snapshot)?;
         tx.execute("update tapes set state = case when state in ('sealed', 'retired') then state else 'recovery_required' end where tape_uuid = ?1", params![uuid.as_slice()]).map_err(|e| sqlite_error("fence repaired tape projection", e))?;
-        tx.execute("delete from object_files where object_id in (select object_id from repaired_objects) and object_id not in (select object_id from object_copies)", []).map_err(|e| sqlite_error("remove repaired orphan members", e))?;
-        tx.execute("delete from objects where object_id in (select object_id from repaired_objects) and object_id not in (select object_id from object_copies)", []).map_err(|e| sqlite_error("remove repaired orphan objects", e))?;
+        tx.execute("delete from object_files where object_id in (select object_id from repaired_objects) and object_id not in (select object_id from object_instances)", []).map_err(|e| sqlite_error("remove repaired orphan members", e))?;
+        tx.execute("delete from objects where object_id in (select object_id from repaired_objects) and object_id not in (select object_id from object_instances)", []).map_err(|e| sqlite_error("remove repaired orphan objects", e))?;
         tx.execute_batch("drop table repaired_objects")
             .map_err(|e| sqlite_error("clear repair object scope", e))?;
         tx.commit()
@@ -455,7 +455,7 @@ fn project_snapshot_rows(
                                 "insert into tape_log_object_commits values (?1, ?2, ?3, 1) on conflict(tape_uuid, tape_file_number) do nothing",
                                 params![
                                     uuid.as_slice(),
-                                    SqliteU64::new(p.copy.tape_file_number),
+                                    SqliteU64::new(p.instance.tape_file_number),
                                     SqliteU64::new(frame.sequence)
                                 ],
                             )
@@ -465,14 +465,14 @@ fn project_snapshot_rows(
                             })?;
                             let same: bool = tx.query_row(
                                 "select tape_log_sequence = ?3 and tape_incarnation = 1 from tape_log_object_commits where tape_uuid = ?1 and tape_file_number = ?2",
-                                params![uuid.as_slice(), SqliteU64::new(p.copy.tape_file_number), SqliteU64::new(frame.sequence)], |r| r.get(0)
+                                params![uuid.as_slice(), SqliteU64::new(p.instance.tape_file_number), SqliteU64::new(frame.sequence)], |r| r.get(0)
                             ).map_err(|e| { failure = Some(sqlite_error("compare object log reference", e)); StoreError::Refused("object log reference failed") })?;
                             if !same { return Err(StoreError::Refused("object log reference conflicts with existing projection")); }
                             upsert_native_object_projection_tx(
                                 tx,
                                 &p.object,
                                 Some(&[]),
-                                std::slice::from_ref(&p.copy),
+                                std::slice::from_ref(&p.instance),
                                 p.object.created_at_utc.as_deref().unwrap_or(&updated_at),
                             )
                         }
@@ -568,7 +568,7 @@ fn project_snapshot_rows(
         // reconcile only raises it, like every other extent projection.
         tx.execute("update tapes set highest_protected_ordinal = ?2, total_committed_ordinals = ?3, last_committed_tape_file = ?4, written_extent_lba = case when written_extent_lba is null or written_extent_lba < ?5 then ?5 else written_extent_lba end where tape_uuid = ?1 and (highest_protected_ordinal is not ?2 or total_committed_ordinals is not ?3 or last_committed_tape_file is not ?4 or written_extent_lba is null or written_extent_lba < ?5)", params![uuid.as_slice(), SqliteU64::new(summary.protected), SqliteU64::new(summary.total), summary.next_file.checked_sub(1).map(SqliteU64::new), SqliteU64::new(summary.cursor.lba)]).map_err(|e| sqlite_error("reconcile tape-log summary projection", e))?;
     }
-    tx.execute("update object_copies set status = 'missing' where tape_uuid = ?1 and exists(select 1 from tapes where tape_uuid = ?1 and state = 'retired')", params![uuid.as_slice()])
+    tx.execute("update object_instances set status = 'missing' where tape_uuid = ?1 and exists(select 1 from tapes where tape_uuid = ?1 and state = 'retired')", params![uuid.as_slice()])
         .map_err(|e| sqlite_error("preserve retired copy status", e))?;
     Ok(())
 }
@@ -620,12 +620,12 @@ fn validate_projected_history(
                 CatalogPayload::Object(p) => {
                     validate_object_metadata(tx, &p.object, uuid, frame.sequence, commit.batch_id)?;
                     tx.execute("insert or ignore into rebuild_objects values (?1)", params![p.object.object_id]).map_err(|e| sqlite_error("retain rebuild object key", e))?;
-                    let mut expected = checkpoint_object_copy_view(&p.copy)?;
-                    let actual = tx.query_row("select object_id, tape_uuid, tape_file_number, first_body_lba, first_parity_data_ordinal, protected_until_ordinal, status, representation, recipient_epoch_ids, metadata_frame_len, plaintext_digest, plaintext_digest_algorithm, stored_digest, stored_digest_algorithm from object_copies where tape_uuid = ?1 and tape_file_number = ?2", params![uuid.as_slice(), SqliteU64::new(p.copy.tape_file_number)], checkpoint_object_copy_view_from_row).optional().map_err(|e| sqlite_error("compare rebuild copy", e))?;
+                    let mut expected = checkpoint_object_instance_view(&p.instance)?;
+                    let actual = tx.query_row("select object_id, tape_uuid, tape_file_number, first_body_lba, first_parity_data_ordinal, protected_until_ordinal, status, representation, recipient_epoch_ids, metadata_frame_len, plaintext_digest, plaintext_digest_algorithm, stored_digest, stored_digest_algorithm from object_instances where tape_uuid = ?1 and tape_file_number = ?2", params![uuid.as_slice(), SqliteU64::new(p.instance.tape_file_number)], checkpoint_object_instance_view_from_row).optional().map_err(|e| sqlite_error("compare rebuild copy", e))?;
                     if let Some(a) = actual {
                         let retired: bool = tx.query_row("select exists(select 1 from tapes where tape_uuid = ?1 and state = 'retired')", params![uuid.as_slice()], |r| r.get(0)).map_err(|e| sqlite_error("read rebuild retired status", e))?;
                         if retired && a.status == "missing" { expected.status = a.status.clone(); }
-                        if checkpoint_object_copy_conflicts(&expected, &a) { return Err(conflict("Object copy")); }
+                        if checkpoint_object_instance_conflicts(&expected, &a) { return Err(conflict("Object copy")); }
                     }
                 }
                 CatalogPayload::Member(member) => {
@@ -821,7 +821,7 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select count(*) from object_copies", [], |r| r
+                .query_row("select count(*) from object_instances", [], |r| r
                     .get::<_, u64>(0))
                 .unwrap(),
             0
@@ -840,19 +840,19 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select count(*) from object_copies", [], |r| r
+                .query_row("select count(*) from object_instances", [], |r| r
                     .get::<_, u64>(0))
                 .unwrap(),
             2
         );
-        let copies = index
-            .find_native_object_copies(&record(id).objects[0].object.object_id)
+        let instances = index
+            .find_native_object_instances(&record(id).objects[0].object.object_id)
             .unwrap();
         assert_eq!(
-            copies[0].tape_log_sequence,
+            instances[0].tape_log_sequence,
             Some(older.raw.summary().last_closed_sequence)
         );
-        assert_eq!(copies[0].tape_incarnation, Some(1));
+        assert_eq!(instances[0].tape_incarnation, Some(1));
     }
 
     thread_local! { static SQL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
@@ -884,8 +884,8 @@ mod tests {
             r.batch_id = Uuid::from_u128(n as u128).into_bytes();
             let object = Uuid::from_u128(1000 + n as u128).to_string();
             r.objects[0].object.object_id = object.clone();
-            r.objects[0].copy.object_id = object.clone();
-            r.objects[0].copy.tape_file_number = n;
+            r.objects[0].instance.object_id = object.clone();
+            r.objects[0].instance.tape_file_number = n;
             r.objects[0].object_recovery_row.object_id = object.into_bytes();
             r.objects[0].object_recovery_row.tape_file_number = n;
             r.objects[0].fresh_tape = n == 1;
@@ -981,11 +981,11 @@ mod tests {
             .contains("object log reference conflicts"));
     }
     #[test]
-    fn full_rebuild_compares_object_file_copy_and_member_evidence() {
+    fn full_rebuild_compares_object_file_instance_and_member_evidence() {
         for update in [
             "update objects set body_format = 'contradiction'",
             "update tape_files set block_count = X'0000000000000063' where tape_file_number = X'0000000000000001'",
-            "update object_copies set first_body_lba = X'0000000000000063'",
+            "update object_instances set first_body_lba = X'0000000000000063'",
             "update object_files set path = 'contradiction'",
         ] {
             let root = tempfile::tempdir().unwrap(); let id = [0x63; 16];
@@ -1161,7 +1161,7 @@ mod tests {
         let mut other_report = record(other_id);
         let other_object = uuid::Uuid::from_bytes([0x96; 16]).to_string();
         other_report.objects[0].object.object_id = other_object.clone();
-        other_report.objects[0].copy.object_id = other_object.clone();
+        other_report.objects[0].instance.object_id = other_object.clone();
         other_report.objects[0].object_recovery_row.object_id = other_object.as_bytes().to_vec();
         let mut other_lease = other.acquire_exclusive().unwrap();
         other_lease.publish_report(&(&other_report).into()).unwrap();
@@ -1196,7 +1196,7 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select count(*) from object_copies", [], |r| r
+                .query_row("select count(*) from object_instances", [], |r| r
                     .get::<_, u64>(0))
                 .unwrap(),
             2

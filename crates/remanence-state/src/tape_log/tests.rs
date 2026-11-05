@@ -5,7 +5,8 @@ use super::payload::{encode_header, encode_member, CatalogValidator, CommittedOb
 use super::wire::Wire;
 use super::*;
 use crate::{
-    NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
+    NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
+    NativeObjectProjectionInput,
 };
 use remanence_crc::crc64_xz;
 use remanence_parity::{SchemeId, TapeFileKind, TerminalTailComponentKind};
@@ -66,7 +67,7 @@ fn header(row: &TapeFileEntry, total: u64) -> CommittedObjectProjection {
             metadata_hash: Some(vec![4; 32]),
             created_at_utc: Some("2026-10-31T00:00:00Z".into()),
         },
-        copy: NativeObjectCopyProjectionInput {
+        instance: NativeObjectInstanceProjectionInput {
             object_id: "o".into(),
             tape_uuid: UUID,
             tape_file_number: row.tape_file_number,
@@ -795,8 +796,8 @@ fn catalog_crosses_every_byte_boundary_preserves_metadata_and_rejects_bad_utf8()
         let mut h = header(&row, 3);
         match field {
             0 => h.object.object_id = "wrong".into(),
-            1 => h.copy.tape_uuid = [0; 16],
-            2 => h.copy.tape_file_number = 99,
+            1 => h.instance.tape_uuid = [0; 16],
+            2 => h.instance.tape_file_number = 99,
             3 => h.block_count = 4,
             _ => h.object_recovery_row.stored_block_count = 9,
         };
@@ -1266,16 +1267,16 @@ fn maximum_frame_bound_is_checked_before_encoder_or_decoder_allocation() {
 }
 
 #[test]
-fn encrypted_catalog_uses_binary_epoch_ids_and_preserves_every_copy_field() {
+fn encrypted_catalog_uses_binary_epoch_ids_and_preserves_every_instance_field() {
     let mut row = object(1, 2, None, 3);
     row.object_recovery_row = Some(
         ObjectRecoveryRow::encrypted(1, 3, vec![[0xab; 16]], 17, 1191)
             .with_object_id(b"o".to_vec()),
     );
     let mut h = header(&row, 0);
-    h.copy.representation = "encrypted".into();
-    h.copy.recipient_epoch_ids = Some(vec!["abababababababababababababababab".into()]);
-    h.copy.metadata_frame_len = Some(17);
+    h.instance.representation = "encrypted".into();
+    h.instance.recipient_epoch_ids = Some(vec!["abababababababababababababababab".into()]);
+    h.instance.metadata_frame_len = Some(17);
     let mut bytes = Vec::new();
     encode_header(&mut bytes, &h).unwrap();
     assert!(!bytes
@@ -1626,8 +1627,8 @@ fn encode_rejects_bad_catalog_digest_identity_and_recipient_bounds_before_writin
             let field = match slot {
                 0 => &mut h.object.content_hash,
                 1 => &mut h.object.metadata_hash,
-                2 => &mut h.copy.plaintext_digest,
-                _ => &mut h.copy.stored_digest,
+                2 => &mut h.instance.plaintext_digest,
+                _ => &mut h.instance.stored_digest,
             };
             *field = Some(vec![1; len]);
             let mut bytes = Vec::new();
@@ -1660,7 +1661,7 @@ fn encode_rejects_bad_catalog_digest_identity_and_recipient_bounds_before_writin
     ));
     assert!(bytes.is_empty());
     let mut h = good.clone();
-    h.copy.recipient_epoch_ids = Some(vec!["abababababababababababababababab".into(); 9]);
+    h.instance.recipient_epoch_ids = Some(vec!["abababababababababababababababab".into(); 9]);
     assert!(matches!(
         encode_header(&mut bytes, &h),
         Err(CodecError::EncodeSchema(Fault::Invalid(

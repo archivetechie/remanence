@@ -139,7 +139,7 @@ fn run(members: u64) {
                     CatalogPayload::Object(header) => {
                         objects += 1;
                         assert_eq!(header.object.object_id, "o");
-                        assert_eq!(header.copy.tape_uuid, [7; 16]);
+                        assert_eq!(header.instance.tape_uuid, [7; 16]);
                     }
                     CatalogPayload::Member(member) => {
                         assert_eq!(member.file_id, format!("{count:016x}"));

@@ -1,6 +1,6 @@
+# Candidate equality/match sites may include structured summaries or reason controls; review before shrinking.
 # Error/status text decisions, local aliases, and conservative lexical candidates.
 # Excluded: crates/remanence-cli/src/dev/ (vector tools comparing finding text).
-# Candidate equality/match sites may include structured summaries or reason controls; review before shrinking.
 # No function/site allowlist is used for discovery. cfg(test)-only code is excluded.
 crates/remanence-aead/src/metadata.rs::decode_metadata_map::text-equality	1
 crates/remanence-api/src/api_state.rs::enrich_live_drive::text-equality	1
@@ -388,7 +388,8 @@ crates/remanence-state/src/index.rs::upsert_idempotency_request::text-equality	1
 crates/remanence-state/src/index.rs::validate_append_bundle_extension_tx::text-equality	1
 crates/remanence-state/src/index.rs::validate_bootstrap_identity_adoption_conn::text-equality	3
 crates/remanence-state/src/index.rs::validate_catalog_digest_pair::text-match	1
-crates/remanence-state/src/index.rs::validate_unsigned_structural_schema::text-eq_ignore_ascii_case	1
+crates/remanence-state/src/index.rs::validate_unsigned_structural_schema_for_table::text-eq_ignore_ascii_case	1
+crates/remanence-state/src/index.rs::validate_unsigned_structural_schema_for_table::text-equality	1
 crates/remanence-state/src/library_log/authority.rs::write::text-equality	1
 crates/remanence-state/src/media.rs::parse_label_generation::text-match	10
 crates/remanence-state/src/media.rs::tape_generation::text-match	3

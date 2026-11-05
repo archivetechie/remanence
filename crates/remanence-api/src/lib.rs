@@ -29,8 +29,8 @@ use remanence_format_driver::{
 #[cfg(test)]
 use remanence_state::{
     AuditEventRecord, CatalogIndex, FileAuditLog, MediaReadinessOperationRecord,
-    NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, StateError, StateHandle,
-    TapePoolConfig, TapeRecord,
+    NativeObjectFileRecord, NativeObjectInstanceRecord, NativeObjectRecord, StateError,
+    StateHandle, TapePoolConfig, TapeRecord,
 };
 #[cfg(test)]
 use time::OffsetDateTime;

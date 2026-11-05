@@ -778,7 +778,7 @@ fn c4_ephemeral_mount_is_read_only_and_mints_no_write_authority() {
     assert_eq!(write_sessions, 0);
     assert_eq!(sessions_before, 0);
     let objects: i64 = db
-        .query_row("SELECT count(*) FROM object_copies", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM object_instances", [], |r| r.get(0))
         .unwrap();
     assert_eq!(objects, 0, "no durable object write authority");
     assert_eq!(

@@ -249,9 +249,9 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
         &write_report,
         stored.copy_representation(),
     )?;
-    checkpoint_projection.copy.first_parity_data_ordinal =
+    checkpoint_projection.instance.first_parity_data_ordinal =
         write_report.catalog.object_copy.first_parity_data_ordinal;
-    checkpoint_projection.copy.protected_until_ordinal =
+    checkpoint_projection.instance.protected_until_ordinal =
         write_report.catalog.object_copy.protected_until_ordinal;
     checkpoint_projection.fresh_tape = false;
     let mut result = pool_write_result(

@@ -1,9 +1,9 @@
-# Non-projector exceptions: remanence-chaos owns its separate fault database.
-# authority_layout::validate_layout reads user_version; B4b replaces that gate.
 # CLI pool_ops has two error-text false positives containing create temporary --out.
-# SQL mutation/open candidates; complete files, excluding cfg(test) items/blocks.
-# remanence-chaos uses its own fault-scenario database, not the catalog.
 # Mutating literals include TEMP/TEMPORARY, VIEW, REPLACE and CTE UPDATE forms.
+# Non-projector exceptions: remanence-chaos owns its separate fault database.
+# SQL mutation/open candidates; complete files, excluding cfg(test) items/blocks.
+# authority_layout::validate_layout reads user_version; B4b replaces that gate.
+# remanence-chaos uses its own fault-scenario database, not the catalog.
 crates/remanence-chaos/src/lib.rs::for_read_medium_errors::Connection::open	1
 crates/remanence-chaos/src/lib.rs::from_state_path::Connection::open	1
 crates/remanence-chaos/src/lib.rs::log_event::execute	1
@@ -62,8 +62,8 @@ crates/remanence-state/src/projector/index.rs::insert_native_catalog_unit_tx::ex
 crates/remanence-state/src/projector/index.rs::insert_native_catalog_unit_tx::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::insert_native_object_file_projection_tx::execute	1
 crates/remanence-state/src/projector/index.rs::insert_native_object_file_projection_tx::mutating-sql	1
-crates/remanence-state/src/projector/index.rs::insert_object_copy_projection_tx::execute	1
-crates/remanence-state/src/projector/index.rs::insert_object_copy_projection_tx::mutating-sql	1
+crates/remanence-state/src/projector/index.rs::insert_object_instance_projection_tx::execute	1
+crates/remanence-state/src/projector/index.rs::insert_object_instance_projection_tx::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::insert_provisioned_tape_tx::execute	1
 crates/remanence-state/src/projector/index.rs::insert_provisioned_tape_tx::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::insert_tape_file::execute	1
@@ -76,9 +76,11 @@ crates/remanence-state/src/projector/index.rs::migrate::execute_batch	3
 crates/remanence-state/src/projector/index.rs::migrate_idempotency_scope::execute_batch	4
 crates/remanence-state/src/projector/index.rs::migrate_idempotency_scope::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::migrate_inner::execute	8
-crates/remanence-state/src/projector/index.rs::migrate_inner::execute_batch	8
-crates/remanence-state/src/projector/index.rs::migrate_inner::mutating-sql	10
+crates/remanence-state/src/projector/index.rs::migrate_inner::execute_batch	7
+crates/remanence-state/src/projector/index.rs::migrate_inner::mutating-sql	9
 crates/remanence-state/src/projector/index.rs::migrate_inner::user_version-assignment	2
+crates/remanence-state/src/projector/index.rs::migrate_object_instances::execute_batch	1
+crates/remanence-state/src/projector/index.rs::migrate_object_instances::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::execute	3
 crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::execute_batch	8
 crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::mutating-sql	8

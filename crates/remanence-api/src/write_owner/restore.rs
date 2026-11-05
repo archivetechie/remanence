@@ -275,7 +275,7 @@ pub(crate) fn stream_one_object(
         })
         .transpose()?;
     let copy = object
-        .copies
+        .instances
         .iter()
         .find(|copy| copy.tape_uuid.as_slice() == tape_uuid)
         .ok_or_else(|| {
@@ -435,7 +435,7 @@ pub(crate) fn file_range_read_request(
     let object = object.ok_or_else(|| Status::not_found("object not found"))?;
     let file = resolve_object_file_for_range(index, object_id, file_id)?;
     let copy = object
-        .copies
+        .instances
         .iter()
         .find(|copy| copy.tape_uuid.as_slice() == tape_uuid)
         .ok_or_else(|| {

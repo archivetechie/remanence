@@ -111,12 +111,12 @@ pub enum StoreError {
     #[error("finalization protects {0:?}")]
     FinalizationInProgress(TapeRef),
     /// Writer-only occupancy refusal; never a wire or frozen-fold rule.
-    #[error("tape {tape_uuid} holds {copy_count} committed instances; a tape holding data cannot change pool; it can only be retired")]
-    TapeHoldsCommittedCopies {
+    #[error("tape {tape_uuid} holds {instance_count} committed instances; a tape holding data cannot change pool; it can only be retired")]
+    TapeHoldsCommittedInstances {
         /// Occupied tape identity.
         tape_uuid: uuid::Uuid,
-        /// Number of committed copies at the decision.
-        copy_count: u64,
+        /// Number of committed instances at the decision.
+        instance_count: u64,
     },
     /// Recovery is required before appending.
     #[error("RecoveryRequired({0:?})")]

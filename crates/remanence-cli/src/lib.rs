@@ -8048,7 +8048,7 @@ fn run_rebuild_catalog_from_journals(
             let _ = writeln!(out, "rebuild-catalog-from-journals ok");
             let _ = writeln!(out, "  tapes: {}", report.tapes_rebuilt);
             let _ = writeln!(out, "  tape files: {}", report.tape_files_rebuilt);
-            let _ = writeln!(out, "  object copies: {}", report.object_copies_rebuilt);
+            let _ = writeln!(out, "  object copies: {}", report.object_instances_rebuilt);
             let _ = writeln!(out, "  audit records: {}", report.audit_records_replayed);
             let _ = writeln!(out, "  tape logs: {}", report.tapes_rebuilt);
             for warning in &report.preserved_fallbacks {
@@ -8211,7 +8211,7 @@ struct TapeRetireReport {
     tape_uuid: Vec<u8>,
     voltag: Option<String>,
     newly_retired: bool,
-    copies_marked_missing: u64,
+    instances_marked_missing: u64,
     degraded_objects: Vec<String>,
 }
 
@@ -8269,7 +8269,7 @@ fn run_tape_retire(args: &TapeRetireArgs, out: &mut dyn Write, err: &mut dyn Wri
             "reason": args.reason,
             "dry_run": args.dry_run,
             "newly_retired": report.newly_retired,
-            "copies_marked_missing": report.copies_marked_missing,
+            "copies_marked_missing": report.instances_marked_missing,
             "degraded_objects": report.degraded_objects,
         });
         if let Err(error) = print_json_envelope("rem.tape.retire.v1", "item", data, out) {
@@ -8294,7 +8294,7 @@ fn print_tape_retire_report(
         Some(voltag) => format!("{voltag} (uuid {uuid})"),
         None => format!("uuid {uuid}"),
     };
-    let copies = count_label(report.copies_marked_missing, "copy", "copies");
+    let copies = count_label(report.instances_marked_missing, "copy", "copies");
     let objects = count_label(report.degraded_objects.len() as u64, "object", "objects");
     if !report.newly_retired {
         let _ = writeln!(
@@ -8854,19 +8854,19 @@ fn preview_tape_retire(
             tape_uuid: record.tape_uuid,
             voltag: record.voltag,
             newly_retired: false,
-            copies_marked_missing: 0,
+            instances_marked_missing: 0,
             degraded_objects: Vec::new(),
         });
     }
     let objects = catalog
         .list_native_objects()
         .map_err(|error| format!("list objects for retire preview: {error}"))?;
-    let mut copies_marked_missing = 0u64;
+    let mut instances_marked_missing = 0u64;
     let mut degraded_objects = Vec::new();
     for object in objects {
         let mut committed_on_tape = 0u64;
         let mut committed_elsewhere = false;
-        for copy in &object.copies {
+        for copy in &object.instances {
             if copy.status != "committed" {
                 continue;
             }
@@ -8876,7 +8876,7 @@ fn preview_tape_retire(
                 committed_elsewhere = true;
             }
         }
-        copies_marked_missing += committed_on_tape;
+        instances_marked_missing += committed_on_tape;
         if committed_on_tape > 0 && !committed_elsewhere {
             degraded_objects.push(object.object_id);
         }
@@ -8886,7 +8886,7 @@ fn preview_tape_retire(
         tape_uuid: record.tape_uuid,
         voltag: record.voltag,
         newly_retired: true,
-        copies_marked_missing,
+        instances_marked_missing,
         degraded_objects,
     })
 }
@@ -8904,7 +8904,7 @@ fn apply_tape_retire(
         .map_err(|_| format!("catalog tape row has {} UUID bytes", record.tape_uuid.len()))?;
     let degraded_before = state
         .catalog()
-        .list_objects_with_no_committed_copies()
+        .list_objects_with_no_committed_instances()
         .map_err(|error| format!("query degraded objects before retire: {error}"))?;
     let outcome = state
         .retire_tape(remanence_state::RetireTapeInput {
@@ -8914,7 +8914,7 @@ fn apply_tape_retire(
         .map_err(|error| format!("retire tape: {error}"))?;
     let degraded_after = state
         .catalog()
-        .list_objects_with_no_committed_copies()
+        .list_objects_with_no_committed_instances()
         .map_err(|error| format!("query degraded objects after retire: {error}"))?;
     let mut degraded_objects = degraded_after
         .into_iter()
@@ -8925,7 +8925,7 @@ fn apply_tape_retire(
         tape_uuid: record.tape_uuid,
         voltag: outcome.released_voltag,
         newly_retired: outcome.newly_retired,
-        copies_marked_missing: outcome.copies_marked_missing,
+        instances_marked_missing: outcome.instances_marked_missing,
         degraded_objects,
     })
 }
@@ -21834,7 +21834,7 @@ pool_id = "init-test"
         let conn =
             rusqlite::Connection::open(root.join("index/rem-state.sqlite")).expect("open catalog");
         conn.execute(
-            "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+            "insert into object_instances(object_id, tape_uuid, tape_file_number, status)
              values('seeded-object', ?1, ?2, 'committed')",
             rusqlite::params![
                 Uuid::parse_str(UNKNOWN_BOT_UUID)

@@ -1665,7 +1665,7 @@ where
                     let mut locations: Vec<_> = elsewhere
                         .iter()
                         .filter(|v| version.is_none_or(|id| v.object_id == id.to_string()))
-                        .flat_map(|v| &v.copies)
+                        .flat_map(|v| &v.instances)
                         .map(|(id, label)| {
                             Ok(format!(
                                 "{} ({})",
@@ -1693,12 +1693,12 @@ where
                 .map_err(err)?
                 .ok_or("object is not catalogued")?;
             let copy = record
-                .copies
+                .instances
                 .iter()
                 .find(|c| c.tape_uuid == uuid && c.status == "committed")
                 .ok_or_else(|| {
                     let locations: Vec<_> = record
-                        .copies
+                        .instances
                         .iter()
                         .filter(|c| c.status == "committed")
                         .map(|c| {

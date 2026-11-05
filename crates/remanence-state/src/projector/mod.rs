@@ -295,13 +295,13 @@ pub(crate) fn memory_projection_fixture() -> CatalogIndex {
     }
 }
 
-/// Test fixture for the future schema with no copy-level pool storage.
+/// Test fixture for the future schema with no instance-level pool storage.
 #[cfg(test)]
-pub(crate) fn memory_projection_without_copy_pool_fixture() -> CatalogIndex {
+pub(crate) fn memory_projection_without_instance_pool_fixture() -> CatalogIndex {
     let writer = memory_projection_fixture();
     writer
         .with_core(|core| {
-            core.remove_copy_pool_fixture();
+            core.remove_instance_pool_fixture();
             Ok(())
         })
         .unwrap();

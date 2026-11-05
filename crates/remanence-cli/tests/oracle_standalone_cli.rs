@@ -293,7 +293,7 @@ fn c6_put_uses_loaded_pool_and_refuses_mismatched_override() {
             .unwrap()
             .expect("this invocation's content must be cataloged");
         assert!(
-            object.copies.iter().any(|copy| {
+            object.instances.iter().any(|copy| {
                 copy.tape_uuid == tape.tape_uuid
                     && copy.status == "committed"
                     && copy.pool_id.as_deref() == Some("other")
@@ -312,7 +312,7 @@ fn c6_put_uses_loaded_pool_and_refuses_mismatched_override() {
     assert_eq!(tape.pool_id.as_deref(), Some("other"));
     assert_eq!(
         index
-            .committed_copy_pool_snapshots(&tape.tape_uuid)
+            .committed_instance_pool_snapshots(&tape.tape_uuid)
             .unwrap(),
         vec![Some("other".into())]
     );

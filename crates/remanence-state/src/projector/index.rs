@@ -48,7 +48,7 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 25;
+pub const SCHEMA_VERSION: u32 = 26;
 
 #[path = "apply.rs"]
 pub mod apply;
@@ -72,11 +72,11 @@ const STRUCTURAL_U64_COLUMNS: &[(&str, &str)] = &[
     ("tape_files", "epoch_id"),
     ("tape_files", "protected_ordinal_start"),
     ("tape_files", "protected_ordinal_end_exclusive"),
-    ("object_copies", "tape_file_number"),
-    ("object_copies", "first_body_lba"),
-    ("object_copies", "first_parity_data_ordinal"),
-    ("object_copies", "protected_until_ordinal"),
-    ("object_copies", "metadata_frame_len"),
+    ("object_instances", "tape_file_number"),
+    ("object_instances", "first_body_lba"),
+    ("object_instances", "first_parity_data_ordinal"),
+    ("object_instances", "protected_until_ordinal"),
+    ("object_instances", "metadata_frame_len"),
     ("object_files", "size_bytes"),
     ("object_files", "first_chunk_lba"),
     ("object_files", "chunk_count"),
@@ -134,12 +134,12 @@ impl FromSql for SqliteU64 {
 /// Digest algorithm emitted by the current catalog writers.
 pub const DIGEST_ALGORITHM_SHA256: &str = "sha256";
 const LEGACY_TAPE_POOL_MEMBERSHIPS_TABLE: &str = concat!("tape_pool_", "memberships");
-/// Catalog value for an unencrypted REM-OBJECT copy row.
-pub const OBJECT_COPY_REPRESENTATION_PLAINTEXT: &str = "plaintext";
-/// Catalog value for an encrypted REM-OBJECT copy row.
-pub const OBJECT_COPY_REPRESENTATION_ENCRYPTED: &str = "encrypted";
-/// Catalog value for journal-discovered object copies whose REM-OBJECT envelope row is unavailable.
-pub const OBJECT_COPY_REPRESENTATION_UNKNOWN: &str = "unknown";
+/// Catalog value for an unencrypted REM-OBJECT instance row.
+pub const OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT: &str = "plaintext";
+/// Catalog value for an encrypted REM-OBJECT instance row.
+pub const OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED: &str = "encrypted";
+/// Catalog value for journal-discovered object instances whose REM-OBJECT envelope row is unavailable.
+pub const OBJECT_INSTANCE_REPRESENTATION_UNKNOWN: &str = "unknown";
 
 /// Typed owner for the rebuildable SQLite catalog projection.
 #[derive(Debug)]
@@ -176,8 +176,8 @@ pub struct TapeJournalIndexReport {
     pub ingestion_pending: bool,
     /// Number of tape-file rows written.
     pub tape_files_rebuilt: u64,
-    /// Number of object-copy rows written.
-    pub object_copies_rebuilt: u64,
+    /// Number of object-instance rows written.
+    pub object_instances_rebuilt: u64,
 }
 
 /// Report from rebuilding audit-derived projections.
@@ -474,8 +474,8 @@ pub struct RetireTapeOutcome {
     pub newly_retired: bool,
     /// Voltag detached by this retire, when one was attached.
     pub released_voltag: Option<String>,
-    /// Number of committed object copies transitioned to `missing`.
-    pub copies_marked_missing: u64,
+    /// Number of committed object instances transitioned to `missing`.
+    pub instances_marked_missing: u64,
 }
 
 /// One authoritative tape-journal replay to include in a full index rebuild.
@@ -494,8 +494,8 @@ pub struct RebuildReport {
     pub tapes_rebuilt: u64,
     /// Number of tape-file rows rebuilt.
     pub tape_files_rebuilt: u64,
-    /// Number of object-copy rows rebuilt.
-    pub object_copies_rebuilt: u64,
+    /// Number of object-instance rows rebuilt.
+    pub object_instances_rebuilt: u64,
     /// Number of audit records replayed.
     pub audit_records_replayed: u64,
     /// Number of tape-journal files replayed.
@@ -1019,7 +1019,7 @@ pub enum CatalogUnitFilter {
 pub struct CatalogUnitRecord {
     /// Stable unit id in the local catalog projection.
     pub unit_id: String,
-    /// Tape UUID that owns this concrete unit/copy.
+    /// Tape UUID that owns this concrete unit/instance.
     pub tape_uuid: Vec<u8>,
     /// `native_object` or `foreign_archive`.
     pub origin_kind: String,
@@ -1071,20 +1071,20 @@ pub struct NativeObjectRecord {
     pub metadata_hash_algorithm: Option<String>,
     /// Creation timestamp.
     pub created_at_utc: String,
-    /// Known object copies.
-    pub copies: Vec<NativeObjectCopyRecord>,
+    /// Known object instances.
+    pub instances: Vec<NativeObjectInstanceRecord>,
 }
 
-/// Native object-copy locator and status row.
+/// Native object-instance locator and status row.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NativeObjectCopyRecord {
-    /// Closing Committed sequence, absent for a catalog-only copy without a join.
+pub struct NativeObjectInstanceRecord {
+    /// Closing Committed sequence, absent for a catalog-only instance without a join.
     pub tape_log_sequence: Option<u64>,
     /// Tape incarnation from the same authority join.
     pub tape_incarnation: Option<u64>,
     /// Remanence object UUID.
     pub object_id: String,
-    /// Tape UUID containing this copy.
+    /// Tape UUID containing this instance.
     pub tape_uuid: Vec<u8>,
     /// Filemark-delimited tape-file number.
     pub tape_file_number: u64,
@@ -1092,15 +1092,15 @@ pub struct NativeObjectCopyRecord {
     pub first_body_lba: u64,
     /// First parity data ordinal, if known.
     pub first_parity_data_ordinal: Option<u64>,
-    /// Protection watermark when the copy row was projected.
+    /// Protection watermark when the instance row was projected.
     pub protected_until_ordinal: Option<u64>,
-    /// Projected copy status.
+    /// Projected instance status.
     pub status: String,
-    /// Current pool of the tape holding this copy, if assigned.
+    /// Current pool of the tape holding this instance, if assigned.
     pub pool_id: Option<String>,
-    /// REM-OBJECT representation stored in this copy: `plaintext`, `encrypted`, or `unknown`.
+    /// REM-OBJECT representation stored in this instance: `plaintext`, `encrypted`, or `unknown`.
     pub representation: String,
-    /// Lowercase 32-hex recipient epoch ids for encrypted copies.
+    /// Lowercase 32-hex recipient epoch ids for encrypted instances.
     pub recipient_epoch_ids: Option<Vec<String>>,
     /// Encrypted REM-OBJECT metadata frame length.
     pub metadata_frame_len: Option<u64>,
@@ -1108,22 +1108,22 @@ pub struct NativeObjectCopyRecord {
     pub plaintext_digest: Option<Vec<u8>>,
     /// Algorithm naming the plaintext digest when present.
     pub plaintext_digest_algorithm: Option<String>,
-    /// SHA-256 of the stored representation bytes for this copy.
+    /// SHA-256 of the stored representation bytes for this instance.
     pub stored_digest: Option<Vec<u8>>,
     /// Algorithm naming the stored digest when present.
     pub stored_digest_algorithm: Option<String>,
-    /// Volume-global LBA of block 0 of this copy's tape file, projected
-    /// through the copy→tape-file join. The copy occupies
+    /// Volume-global LBA of block 0 of this instance's tape file, projected
+    /// through the instance→tape-file join. The instance occupies
     /// `[global_start_block, global_end_block)`, exclusive; the trailing
     /// filemark is outside the span. Absent when the tape file predates
     /// span capture — absent is never zero, and block 0 is a valid start.
     pub global_start_block: Option<u64>,
-    /// Exclusive end of the copy's span: `global_start_block + block_count`.
+    /// Exclusive end of the instance's span: `global_start_block + block_count`.
     /// Present exactly when `global_start_block` is.
     pub global_end_block: Option<u64>,
 }
 
-/// A committed version of an archive path, derived from object and copy rows.
+/// A committed version of an archive path, derived from object and instance rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionRow {
     /// Object UUID identifying this version.
@@ -1135,7 +1135,7 @@ pub struct VersionRow {
     /// Original object creation timestamp from the checkpoint projection.
     pub created_at_utc: String,
     /// Committed tape UUIDs and their optional display labels in the query scope.
-    pub copies: Vec<(Vec<u8>, Option<String>)>,
+    pub instances: Vec<(Vec<u8>, Option<String>)>,
 }
 
 /// Native object member-file row for catalog-backed partial-file restore.
@@ -1182,12 +1182,12 @@ pub struct NativeObjectProjectionInput {
     pub created_at_utc: Option<String>,
 }
 
-/// Object-copy row supplied by Layer 5 after a native object commit.
+/// Object-instance row supplied by Layer 5 after a native object commit.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct NativeObjectCopyProjectionInput {
+pub struct NativeObjectInstanceProjectionInput {
     /// Remanence object UUID.
     pub object_id: String,
-    /// Tape UUID containing this copy.
+    /// Tape UUID containing this instance.
     pub tape_uuid: [u8; 16],
     /// Filemark-delimited tape-file number.
     pub tape_file_number: u64,
@@ -1195,19 +1195,19 @@ pub struct NativeObjectCopyProjectionInput {
     pub first_body_lba: u64,
     /// First parity data ordinal, if known.
     pub first_parity_data_ordinal: Option<u64>,
-    /// Protection watermark when the copy row was projected.
+    /// Protection watermark when the instance row was projected.
     pub protected_until_ordinal: Option<u64>,
-    /// Projected copy status.
+    /// Projected instance status.
     pub status: String,
-    /// REM-OBJECT representation stored in this copy: `plaintext` or `encrypted`.
+    /// REM-OBJECT representation stored in this instance: `plaintext` or `encrypted`.
     pub representation: String,
-    /// Lowercase 32-hex recipient epoch ids for encrypted copies.
+    /// Lowercase 32-hex recipient epoch ids for encrypted instances.
     pub recipient_epoch_ids: Option<Vec<String>>,
     /// Encrypted REM-OBJECT metadata frame length.
     pub metadata_frame_len: Option<u64>,
     /// SHA-256 of the canonical plaintext REM-OBJECT object bytes.
     pub plaintext_digest: Option<Vec<u8>>,
-    /// SHA-256 of the stored representation bytes for this copy.
+    /// SHA-256 of the stored representation bytes for this instance.
     pub stored_digest: Option<Vec<u8>>,
 }
 
@@ -1390,7 +1390,7 @@ impl CatalogCore {
         })
     }
 
-    /// Read structurally compatible schema-22/23 predecessors only for declared reset admission.
+    /// Read structurally compatible schema-22–25 predecessors only for declared reset admission.
     /// This capability cannot mutate or migrate the predecessor catalog.
     pub(crate) fn open_reset_source(path: &Path) -> Result<Self, StateError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -1402,7 +1402,7 @@ impl CatalogCore {
         if !(22..SCHEMA_VERSION).contains(&version) {
             validate_schema(&conn)?;
         } else {
-            validate_unsigned_structural_schema(&conn)?;
+            validate_unsigned_structural_schema_for_table(&conn, "object_copies")?;
         }
         Ok(Self {
             conn,
@@ -2235,7 +2235,7 @@ impl CatalogCore {
     /// Physical reconciliation can recover filemark geometry without recovering
     /// native object identities. This method intentionally touches only the
     /// `tape_files` projection and tape-level structural watermarks; object and
-    /// object-copy projections remain owned by native object commit/journal
+    /// object-instance projections remain owned by native object commit/journal
     /// replay paths.
     pub fn reconcile_tape_files_projection(
         &mut self,
@@ -2286,7 +2286,7 @@ impl CatalogCore {
         Ok(TapeJournalIndexReport {
             ingestion_pending: false,
             tape_files_rebuilt: entries.len() as u64,
-            object_copies_rebuilt: 0,
+            object_instances_rebuilt: 0,
         })
     }
 
@@ -2609,7 +2609,7 @@ impl CatalogCore {
                         tapes.finalization_layout_digest, tapes.completed_replicas,
                         tapes.finalization_outcome, tapes.highest_protected_ordinal,
                         exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
-                          or exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                          or exists(select 1 from object_instances where object_instances.tape_uuid = tapes.tape_uuid)
                           or exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
                           or exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid)
                           or exists(select 1 from tape_io_fences
@@ -2889,9 +2889,9 @@ impl CatalogCore {
                      where kind = 'data'
                        and voltag glob ?1
                        and not exists (
-                         select 1 from object_copies
-                         where object_copies.tape_uuid = tapes.tape_uuid
-                           and object_copies.status = 'committed'
+                         select 1 from object_instances
+                         where object_instances.tape_uuid = tapes.tape_uuid
+                           and object_instances.status = 'committed'
                        )",
                     params![pattern],
                 )
@@ -4076,7 +4076,7 @@ impl CatalogCore {
         }))
     }
 
-    /// Permanently retire one tape identity and mark its copies missing.
+    /// Permanently retire one tape identity and mark its instances missing.
     ///
     /// `retired` is terminal: no code path leaves it, and `provision_tape`
     /// refuses to reuse the row even with `force`. The voltag is detached in
@@ -4086,10 +4086,10 @@ impl CatalogCore {
     /// `pool_id` is kept as history — selection gates on state, so a retired
     /// row in a pool is harmless and the provenance is useful.
     ///
-    /// Invariant: copy status is derived from tape state. A copy on a retired
+    /// Invariant: instance status is derived from tape state. A instance on a retired
     /// tape is `missing`, always; this method enforces it for the live
     /// catalog and rebuild re-derives it after journal replay, so no
-    /// copy-level preservation machinery is needed.
+    /// instance-level preservation machinery is needed.
     pub fn retire_tape(&mut self, input: RetireTapeInput) -> Result<RetireTapeOutcome, StateError> {
         let updated_at = now_utc()?;
         let tx = projection_transaction(&mut self.conn)
@@ -4114,13 +4114,13 @@ impl CatalogCore {
             return Ok(RetireTapeOutcome {
                 newly_retired: false,
                 released_voltag: None,
-                copies_marked_missing: 0,
+                instances_marked_missing: 0,
             });
         }
         project_tape_lifecycle_core(&tx, &input.tape_uuid, "retired", &updated_at)?;
-        let copies_marked_missing = tx
+        let instances_marked_missing = tx
             .execute(
-                "update object_copies
+                "update object_instances
                  set status = 'missing'
                  where tape_uuid = ?1 and status = 'committed'",
                 params![input.tape_uuid.to_vec()],
@@ -4131,23 +4131,23 @@ impl CatalogCore {
         Ok(RetireTapeOutcome {
             newly_retired: true,
             released_voltag: voltag,
-            copies_marked_missing: copies_marked_missing as u64,
+            instances_marked_missing: instances_marked_missing as u64,
         })
     }
 
-    /// Object ids that have copy rows but no `committed` copy anywhere.
+    /// Object ids that have instance rows but no `committed` instance anywhere.
     ///
     /// This is the degraded-objects hook for retire reporting and future
     /// self-heal: objects listed here exist in the catalog but cannot be
     /// read back from any tape.
-    pub fn list_objects_with_no_committed_copies(&self) -> Result<Vec<String>, StateError> {
+    pub fn list_objects_with_no_committed_instances(&self) -> Result<Vec<String>, StateError> {
         let mut stmt = self
             .conn
             .prepare(
                 "select distinct object_id
-                 from object_copies
+                 from object_instances
                  where object_id not in (
-                   select object_id from object_copies where status = 'committed'
+                   select object_id from object_instances where status = 'committed'
                  )
                  order by object_id",
             )
@@ -4168,14 +4168,14 @@ impl CatalogCore {
     /// Project a native object commit and its 3c tape-file bundle atomically.
     ///
     /// Live Layer 5 writes produce both projections at one commit boundary.
-    /// This method keeps the object/copy rows and tape-file bundle rows in one
+    /// This method keeps the object/instance rows and tape-file bundle rows in one
     /// SQLite transaction so a later bundle projection error cannot leave an
-    /// orphan committed object copy visible in the catalog.
+    /// orphan committed object instance visible in the catalog.
     pub fn project_native_object_and_committed_tape_file_bundle(
         &mut self,
         object: NativeObjectProjectionInput,
         files: &[NativeObjectFileProjectionInput],
-        copies: &[NativeObjectCopyProjectionInput],
+        instances: &[NativeObjectInstanceProjectionInput],
         tape_input: TapeJournalIndexInput,
         bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
@@ -4191,7 +4191,7 @@ impl CatalogCore {
             &tx,
             &object,
             Some(files),
-            copies,
+            instances,
             created_at_utc.as_str(),
         )?;
         let report =
@@ -4213,7 +4213,7 @@ impl CatalogCore {
         &mut self,
         object: NativeObjectProjectionInput,
         files: &[NativeObjectFileProjectionInput],
-        copies: &[NativeObjectCopyProjectionInput],
+        instances: &[NativeObjectInstanceProjectionInput],
         tape_input: TapeJournalIndexInput,
         bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
@@ -4225,12 +4225,12 @@ impl CatalogCore {
         let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin native object append projection", err))?;
         validate_append_bundle_extension_tx(&tx, &tape_input, bundle)?;
-        validate_append_object_conflicts_tx(&tx, &tape_input, bundle, &object, copies)?;
+        validate_append_object_conflicts_tx(&tx, &tape_input, bundle, &object, instances)?;
         upsert_native_object_projection_tx(
             &tx,
             &object,
             Some(files),
-            copies,
+            instances,
             created_at_utc.as_str(),
         )?;
         let report =
@@ -4345,7 +4345,7 @@ impl CatalogCore {
         Ok(TapeJournalIndexReport {
             ingestion_pending: true,
             tape_files_rebuilt: 0,
-            object_copies_rebuilt: 0,
+            object_instances_rebuilt: 0,
         })
     }
 
@@ -4409,7 +4409,7 @@ impl CatalogCore {
         }
 
         let mut tape_files_rebuilt = 0u64;
-        let mut object_copies_rebuilt = 0u64;
+        let mut object_instances_rebuilt = 0u64;
         for journal in tape_journals {
             let report =
                 index_committed_tape_journal_tx(&tx, &journal.input, &journal.state, &updated_at)?;
@@ -4418,10 +4418,12 @@ impl CatalogCore {
                 .ok_or_else(|| {
                     StateError::IndexMigrationFailed("tape_files_rebuilt overflow".to_string())
                 })?;
-            object_copies_rebuilt = object_copies_rebuilt
-                .checked_add(report.object_copies_rebuilt)
+            object_instances_rebuilt = object_instances_rebuilt
+                .checked_add(report.object_instances_rebuilt)
                 .ok_or_else(|| {
-                    StateError::IndexMigrationFailed("object_copies_rebuilt overflow".to_string())
+                    StateError::IndexMigrationFailed(
+                        "object_instances_rebuilt overflow".to_string(),
+                    )
                 })?;
         }
         merge_preserved_tape_operator_columns_tx(&tx, &preserved_tapes)?;
@@ -4443,12 +4445,12 @@ impl CatalogCore {
             tracing::warn!("audit-replay-divergence: {warning}; ledger value applied");
         }
 
-        // Copy status is derived from tape state (a copy on a retired tape
+        // Instance status is derived from tape state (an instance on a retired tape
         // is `missing`, always), so it is re-derived here after journal
-        // replay re-created the copies as `committed`. This keeps copy rows
+        // replay re-created the instances as `committed`. This keeps instance rows
         // out of the preservation snapshot entirely.
         tx.execute(
-            "update object_copies
+            "update object_instances
              set status = 'missing'
              where tape_uuid in (select tape_uuid from tapes where state = 'retired')
                and status = 'committed'",
@@ -4461,7 +4463,7 @@ impl CatalogCore {
         Ok(RebuildReport {
             tapes_rebuilt: tape_journals.len() as u64,
             tape_files_rebuilt,
-            object_copies_rebuilt,
+            object_instances_rebuilt,
             audit_records_replayed: audit_records.len() as u64,
             journal_records_replayed: tape_journals.len() as u64,
             preserved_fallbacks,
@@ -4935,11 +4937,11 @@ impl CatalogCore {
             .and_then(|tape| tape.terminal_finalization))
     }
 
-    /// Project a native object commit and its concrete tape copies into Layer 4.
+    /// Project a native object commit and its concrete tape instances into Layer 4.
     pub fn upsert_native_object_projection(
         &mut self,
         object: NativeObjectProjectionInput,
-        copies: &[NativeObjectCopyProjectionInput],
+        instances: &[NativeObjectInstanceProjectionInput],
     ) -> Result<(), StateError> {
         let created_at_utc = match object.created_at_utc.as_deref() {
             Some(value) => value.to_string(),
@@ -4947,7 +4949,7 @@ impl CatalogCore {
         };
         let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin native object projection", err))?;
-        upsert_native_object_projection_tx(&tx, &object, None, copies, created_at_utc.as_str())?;
+        upsert_native_object_projection_tx(&tx, &object, None, instances, created_at_utc.as_str())?;
         tx.commit()
             .map_err(|err| sqlite_error("commit native object projection", err))?;
         Ok(())
@@ -5180,20 +5182,20 @@ impl CatalogCore {
         if current.kind == kind {
             return Ok(Some(current));
         }
-        let committed_copy_exists: bool = self
+        let committed_instance_exists: bool = self
             .conn
             .query_row(
                 "select exists(
-                   select 1 from object_copies
-                   where object_copies.tape_uuid = ?1
-                     and object_copies.status = 'committed'
+                   select 1 from object_instances
+                   where object_instances.tape_uuid = ?1
+                     and object_instances.status = 'committed'
                  )",
                 params![tape_uuid],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|err| sqlite_error("check kind flip guard", err))?
             != 0;
-        if committed_copy_exists {
+        if committed_instance_exists {
             let detail = format!(
                 "{{\"tape_uuid\":\"{}\",\"from\":\"{}\",\"to\":\"{}\"}}",
                 hex_uuid_from_slice(tape_uuid),
@@ -5207,7 +5209,7 @@ impl CatalogCore {
                 Some(detail.as_str()),
             )?;
             return Err(StateError::TapeProvisionConflict(
-                "kind flip refused because the tape has committed object copies".to_string(),
+                "kind flip refused because the tape has committed object instances".to_string(),
             ));
         }
         project_tape_kind_core(&self.conn, tape_uuid, kind)?;
@@ -5333,8 +5335,8 @@ impl CatalogCore {
         }
     }
 
-    /// Current pools on committed copies for one tape (legacy method name).
-    pub fn committed_copy_pool_snapshots(
+    /// Current pools on committed instances for one tape (legacy method name).
+    pub fn committed_instance_pool_snapshots(
         &self,
         tape_uuid: &[u8],
     ) -> Result<Vec<Option<String>>, StateError> {
@@ -5342,7 +5344,7 @@ impl CatalogCore {
             .conn
             .prepare(
                 "select distinct t.pool_id
-                 from object_copies c left join tapes t on t.tape_uuid = c.tape_uuid
+                 from object_instances c left join tapes t on t.tape_uuid = c.tape_uuid
                  where c.tape_uuid = ?1
                    and c.status = 'committed'
                  order by t.pool_id is null, t.pool_id",
@@ -5441,9 +5443,9 @@ impl CatalogCore {
             .enumerate()
             .map(|(idx, object)| (object.object_id.clone(), idx))
             .collect::<HashMap<_, _>>();
-        for copy in self.list_all_native_object_copies()? {
-            if let Some(idx) = positions.get(copy.object_id.as_str()) {
-                objects[*idx].copies.push(copy);
+        for instance in self.list_all_native_object_instances()? {
+            if let Some(idx) = positions.get(instance.object_id.as_str()) {
+                objects[*idx].instances.push(instance);
             }
         }
         Ok(objects)
@@ -5462,31 +5464,31 @@ impl CatalogCore {
                         objects.content_hash, objects.content_hash_algorithm,
                         objects.metadata_hash, objects.metadata_hash_algorithm,
                         objects.created_at_utc,
-                        object_copies.object_id, object_copies.tape_uuid,
-                        object_copies.tape_file_number,
-                        object_copies.first_body_lba,
-                        object_copies.first_parity_data_ordinal,
-                        object_copies.protected_until_ordinal,
-                        object_copies.status,
+                        object_instances.object_id, object_instances.tape_uuid,
+                        object_instances.tape_file_number,
+                        object_instances.first_body_lba,
+                        object_instances.first_parity_data_ordinal,
+                        object_instances.protected_until_ordinal,
+                        object_instances.status,
                         tapes.pool_id,
-                        object_copies.representation,
-                        object_copies.recipient_epoch_ids,
-                        object_copies.metadata_frame_len,
-                        object_copies.plaintext_digest,
-                        object_copies.plaintext_digest_algorithm,
-                        object_copies.stored_digest,
-                        object_copies.stored_digest_algorithm,
+                        object_instances.representation,
+                        object_instances.recipient_epoch_ids,
+                        object_instances.metadata_frame_len,
+                        object_instances.plaintext_digest,
+                        object_instances.plaintext_digest_algorithm,
+                        object_instances.stored_digest,
+                        object_instances.stored_digest_algorithm,
                         tf.physical_start_hint, tf.block_count
                  from objects
-                 left join object_copies
-                   on object_copies.object_id = objects.object_id
-                 left join tapes on tapes.tape_uuid = object_copies.tape_uuid
+                 left join object_instances
+                   on object_instances.object_id = objects.object_id
+                 left join tapes on tapes.tape_uuid = object_instances.tape_uuid
                  left join tape_files tf
-                   on tf.tape_uuid = object_copies.tape_uuid
-                  and tf.tape_file_number = object_copies.tape_file_number
+                   on tf.tape_uuid = object_instances.tape_uuid
+                  and tf.tape_file_number = object_instances.tape_file_number
                  order by objects.created_at_utc, objects.object_id,
-                          hex(object_copies.tape_uuid),
-                          object_copies.tape_file_number",
+                          hex(object_instances.tape_uuid),
+                          object_instances.tape_file_number",
             )
             .map_err(|err| sqlite_error("prepare native object stream", err))?;
         let mut rows = stmt
@@ -5510,10 +5512,10 @@ impl CatalogCore {
                 }
                 current = Some(native_object_from_row(row)?);
             }
-            if let Some(mut copy) = native_object_copy_from_join_row(row, 9)? {
-                self.join_object_log_reference(&mut copy)?;
+            if let Some(mut instance) = native_object_instance_from_join_row(row, 9)? {
+                self.join_object_log_reference(&mut instance)?;
                 if let Some(object) = current.as_mut() {
-                    object.copies.push(copy);
+                    object.instances.push(instance);
                 }
             }
         }
@@ -5523,15 +5525,15 @@ impl CatalogCore {
         Ok(())
     }
 
-    /// Fetch a native object and its copies by object id.
+    /// Fetch a native object and its instances by object id.
     pub fn get_native_object(
         &self,
         object_id: &str,
     ) -> Result<Option<NativeObjectRecord>, StateError> {
-        let Some(object) = self.get_native_object_without_copies(object_id)? else {
+        let Some(object) = self.get_native_object_without_instances(object_id)? else {
             return Ok(None);
         };
-        self.attach_native_object_copies(object).map(Some)
+        self.attach_native_object_instances(object).map(Some)
     }
 
     /// Fetch one native object member-file row by object id and file id.
@@ -5600,7 +5602,7 @@ impl CatalogCore {
         self.committed_versions_by_path(archive_path, Some(pool_id), None)
     }
 
-    /// Newest versions with a committed copy on the specified cartridge.
+    /// Newest versions with a committed instance on the specified cartridge.
     pub fn list_committed_versions_by_path_on_tape(
         &self,
         archive_path: &str,
@@ -5635,7 +5637,7 @@ impl CatalogCore {
                 )));
             }
         }
-        let mut stmt = self.conn.prepare("select distinct t.pool_id, f.path from object_files f join object_copies c on c.object_id=f.object_id join tapes t on t.tape_uuid=c.tape_uuid where c.status='committed' order by t.pool_id, f.path")
+        let mut stmt = self.conn.prepare("select distinct t.pool_id, f.path from object_files f join object_instances c on c.object_id=f.object_id join tapes t on t.tape_uuid=c.tape_uuid where c.status='committed' order by t.pool_id, f.path")
             .map_err(|e| sqlite_error("prepare path inventory", e))?;
         let paths = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -5649,20 +5651,20 @@ impl CatalogCore {
             let mut versions = self.committed_versions_by_path(&path, Some(&pool), None)?;
             if let Some(selector) = tape {
                 for version in &mut versions {
-                    version.copies.retain(|(id, label)| {
+                    version.instances.retain(|(id, label)| {
                         label.as_deref() == Some(selector)
                             || Uuid::from_slice(id)
                                 .is_ok_and(|id| Uuid::parse_str(selector) == Ok(id))
                     });
                 }
-                versions.retain(|v| !v.copies.is_empty());
+                versions.retain(|v| !v.instances.is_empty());
             }
             let Some(newest) = versions.first() else {
                 continue;
             };
             let mut locations = std::collections::BTreeMap::new();
             for version in &versions {
-                for (id, label) in &version.copies {
+                for (id, label) in &version.instances {
                     let record = self.get_tape(id)?;
                     let finalized = record
                         .as_ref()
@@ -5694,7 +5696,7 @@ impl CatalogCore {
                 "select o.object_id, f.size_bytes, f.file_sha256, o.created_at_utc,
                     c.tape_uuid, t.voltag
              from object_files f join objects o on o.object_id = f.object_id
-             join object_copies c on c.object_id = o.object_id
+             join object_instances c on c.object_id = o.object_id
              join tapes t on t.tape_uuid = c.tape_uuid
              where f.path = ?1 and c.status = 'committed'
                and (?2 is null or t.pool_id = ?2)
@@ -5717,22 +5719,22 @@ impl CatalogCore {
                     size_bytes: row_get::<SqliteU64>(row, 1, "object_files.size_bytes")?.get(),
                     file_sha256: row_get(row, 2, "object_files.file_sha256")?,
                     created_at_utc: row_get(row, 3, "objects.created_at_utc")?,
-                    copies: Vec::new(),
+                    instances: Vec::new(),
                 });
             }
-            let copy = (
+            let instance = (
                 row_get(row, 4, "object_copies.tape_uuid")?,
                 row_get(row, 5, "tapes.voltag")?,
             );
             let version = versions.last_mut().expect("version inserted above");
-            if !version.copies.contains(&copy) {
-                version.copies.push(copy);
+            if !version.instances.contains(&instance) {
+                version.instances.push(instance);
             }
         }
         Ok(versions)
     }
 
-    /// Fetch a native object and its copies by content hash.
+    /// Fetch a native object and its instances by content hash.
     pub fn get_native_object_by_content_hash(
         &self,
         content_hash: &[u8],
@@ -5771,7 +5773,7 @@ impl CatalogCore {
         }
         drop(rows);
         drop(stmt);
-        object = self.attach_native_object_copies(object)?;
+        object = self.attach_native_object_instances(object)?;
         Ok(Some(object))
     }
 
@@ -5783,7 +5785,7 @@ impl CatalogCore {
         let mut stmt = self
             .conn
             .prepare(
-                "select distinct t.pool_id from objects o join object_copies c
+                "select distinct t.pool_id from objects o join object_instances c
              on c.object_id = o.object_id join tapes t on t.tape_uuid = c.tape_uuid where o.caller_object_id = ?1
              and c.status = 'committed' and t.pool_id is not null order by t.pool_id",
             )
@@ -5803,7 +5805,7 @@ impl CatalogCore {
         }
     }
 
-    /// Fetch a native object by caller id only when it has a committed copy in
+    /// Fetch a native object by caller id only when it has a committed instance in
     /// the requested pool.
     pub fn get_native_object_by_pool_and_caller_object_id(
         &self,
@@ -5820,10 +5822,10 @@ impl CatalogCore {
                  where caller_object_id = ?1
                    and exists (
                      select 1
-                     from object_copies join tapes on tapes.tape_uuid = object_copies.tape_uuid
-                     where object_copies.object_id = objects.object_id
+                     from object_instances join tapes on tapes.tape_uuid = object_instances.tape_uuid
+                     where object_instances.object_id = objects.object_id
                        and tapes.pool_id = ?2
-                       and object_copies.status = 'committed'
+                       and object_instances.status = 'committed'
                    )
                  order by created_at_utc, object_id
                  limit 2",
@@ -5850,18 +5852,18 @@ impl CatalogCore {
         }
         drop(rows);
         drop(stmt);
-        object = self.attach_native_object_copies(object)?;
-        object
-            .copies
-            .retain(|copy| copy.pool_id.as_deref() == Some(pool_id) && copy.status == "committed");
+        object = self.attach_native_object_instances(object)?;
+        object.instances.retain(|instance| {
+            instance.pool_id.as_deref() == Some(pool_id) && instance.status == "committed"
+        });
         Ok(Some(object))
     }
 
-    /// Return concrete tape copies for a native object.
-    pub fn find_native_object_copies(
+    /// Return concrete tape instances for a native object.
+    pub fn find_native_object_instances(
         &self,
         object_id: &str,
-    ) -> Result<Vec<NativeObjectCopyRecord>, StateError> {
+    ) -> Result<Vec<NativeObjectInstanceRecord>, StateError> {
         let mut stmt = self
             .conn
             .prepare(
@@ -5872,7 +5874,7 @@ impl CatalogCore {
                         oc.plaintext_digest, oc.plaintext_digest_algorithm,
                         oc.stored_digest, oc.stored_digest_algorithm,
                         tf.physical_start_hint, tf.block_count
-                 from object_copies oc
+                 from object_instances oc
                  left join tapes t on t.tape_uuid = oc.tape_uuid
                  left join tape_files tf
                    on tf.tape_uuid = oc.tape_uuid
@@ -5884,19 +5886,19 @@ impl CatalogCore {
         let mut rows = stmt
             .query(params![object_id])
             .map_err(|err| sqlite_error("query native object copies", err))?;
-        let mut copies = Vec::new();
+        let mut instances = Vec::new();
         while let Some(row) = rows
             .next()
             .map_err(|err| sqlite_error("iterate native object copies", err))?
         {
-            let mut copy = native_object_copy_from_row(row)?;
-            self.join_object_log_reference(&mut copy)?;
-            copies.push(copy);
+            let mut instance = native_object_instance_from_row(row)?;
+            self.join_object_log_reference(&mut instance)?;
+            instances.push(instance);
         }
-        Ok(copies)
+        Ok(instances)
     }
 
-    fn get_native_object_without_copies(
+    fn get_native_object_without_instances(
         &self,
         object_id: &str,
     ) -> Result<Option<NativeObjectRecord>, StateError> {
@@ -5922,15 +5924,17 @@ impl CatalogCore {
         Ok(Some(native_object_from_row(row)?))
     }
 
-    fn attach_native_object_copies(
+    fn attach_native_object_instances(
         &self,
         mut object: NativeObjectRecord,
     ) -> Result<NativeObjectRecord, StateError> {
-        object.copies = self.find_native_object_copies(object.object_id.as_str())?;
+        object.instances = self.find_native_object_instances(object.object_id.as_str())?;
         Ok(object)
     }
 
-    fn list_all_native_object_copies(&self) -> Result<Vec<NativeObjectCopyRecord>, StateError> {
+    fn list_all_native_object_instances(
+        &self,
+    ) -> Result<Vec<NativeObjectInstanceRecord>, StateError> {
         let mut stmt = self
             .conn
             .prepare(
@@ -5941,7 +5945,7 @@ impl CatalogCore {
                         oc.plaintext_digest, oc.plaintext_digest_algorithm,
                         oc.stored_digest, oc.stored_digest_algorithm,
                         tf.physical_start_hint, tf.block_count
-                 from object_copies oc
+                 from object_instances oc
                  left join tapes t on t.tape_uuid = oc.tape_uuid
                  left join tape_files tf
                    on tf.tape_uuid = oc.tape_uuid
@@ -5952,16 +5956,16 @@ impl CatalogCore {
         let mut rows = stmt
             .query([])
             .map_err(|err| sqlite_error("query all native object copies", err))?;
-        let mut copies = Vec::new();
+        let mut instances = Vec::new();
         while let Some(row) = rows
             .next()
             .map_err(|err| sqlite_error("iterate all native object copies", err))?
         {
-            let mut copy = native_object_copy_from_row(row)?;
-            self.join_object_log_reference(&mut copy)?;
-            copies.push(copy);
+            let mut instance = native_object_instance_from_row(row)?;
+            self.join_object_log_reference(&mut instance)?;
+            instances.push(instance);
         }
-        Ok(copies)
+        Ok(instances)
     }
 
     /// Fetch one projected operation by UUID text.
@@ -7024,7 +7028,7 @@ where
                   and tapes.completed_replicas is null
                   and tapes.finalization_outcome is null
                   and not exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
-                  and not exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from object_instances where object_instances.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from tape_io_fences
@@ -7089,7 +7093,7 @@ fn find_provisioned_tape_tx(
                   and completed_replicas is null
                   and finalization_outcome is null
                   and not exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
-                  and not exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from object_instances where object_instances.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid),
                 exists(select 1 from tape_io_fences
@@ -7124,7 +7128,7 @@ fn find_provisioned_tape_tx(
                   and completed_replicas is null
                   and finalization_outcome is null
                   and not exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
-                  and not exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from object_instances where object_instances.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
                   and not exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid),
                 exists(select 1 from tape_io_fences
@@ -7358,7 +7362,7 @@ fn reprovision_tape_tx(
     )
     .map_err(|err| sqlite_error("clear stale tape_files after re-provision", err))?;
     tx.execute(
-        "delete from object_copies where tape_uuid = ?1",
+        "delete from object_instances where tape_uuid = ?1",
         params![old_tape_uuid],
     )
     .map_err(|err| sqlite_error("clear stale object_copies after re-provision", err))?;
@@ -7385,7 +7389,7 @@ fn clear_rebuildable_tables(tx: &Connection) -> Result<(), StateError> {
     .map_err(|err| sqlite_error("clear verification replay cursor", err))?;
     for table in [
         "catalog_units",
-        "object_copies",
+        "object_instances",
         "tape_files",
         "objects",
         "tapes",
@@ -7679,7 +7683,7 @@ fn index_committed_tape_journal_tx(
     )
     .map_err(|err| sqlite_error("clear tape_files projection", err))?;
     tx.execute(
-        "delete from object_copies where tape_uuid = ?1",
+        "delete from object_instances where tape_uuid = ?1",
         params![input.tape_uuid.to_vec()],
     )
     .map_err(|err| sqlite_error("clear object_copies projection", err))?;
@@ -7689,15 +7693,15 @@ fn index_committed_tape_journal_tx(
     )
     .map_err(|err| sqlite_error("clear native catalog unit projection", err))?;
 
-    let mut object_copies = 0u64;
+    let mut object_instances = 0u64;
     for entry in &state.files {
         insert_tape_file(tx, input.tape_uuid, entry)?;
         if entry.kind == TapeFileKind::Object {
             if let Some(object_id) = entry.object_id.as_ref() {
-                let envelope = object_copy_envelope_from_tape_entry(entry)?;
-                insert_object_copy_projection_tx(
+                let envelope = object_instance_envelope_from_tape_entry(entry)?;
+                insert_object_instance_projection_tx(
                     tx,
-                    ObjectCopyProjectionRow {
+                    ObjectInstanceProjectionRow {
                         object_id,
                         tape_uuid: input.tape_uuid,
                         tape_file_number: entry.tape_file_number,
@@ -7723,7 +7727,7 @@ fn index_committed_tape_journal_tx(
                     format_id.as_str(),
                     updated_at,
                 )?;
-                object_copies += 1;
+                object_instances += 1;
             }
         }
     }
@@ -7748,7 +7752,7 @@ fn index_committed_tape_journal_tx(
     Ok(TapeJournalIndexReport {
         ingestion_pending: false,
         tape_files_rebuilt: state.files.len() as u64,
-        object_copies_rebuilt: object_copies,
+        object_instances_rebuilt: object_instances,
     })
 }
 
@@ -7756,7 +7760,7 @@ fn upsert_native_object_projection_tx(
     tx: &Connection,
     object: &NativeObjectProjectionInput,
     files: Option<&[NativeObjectFileProjectionInput]>,
-    copies: &[NativeObjectCopyProjectionInput],
+    instances: &[NativeObjectInstanceProjectionInput],
     created_at_utc: &str,
 ) -> Result<(), StateError> {
     let logical_size_bytes = opt_u64_to_i64(object.logical_size_bytes, "logical_size_bytes")?;
@@ -7803,35 +7807,35 @@ fn upsert_native_object_projection_tx(
         replace_native_object_files_tx(tx, object.object_id.as_str(), files)?;
     }
 
-    for copy in copies {
-        if copy.object_id != object.object_id {
+    for instance in instances {
+        if instance.object_id != object.object_id {
             return Err(StateError::IndexMigrationFailed(format!(
                 "object copy {} does not match projected object {}",
-                copy.object_id, object.object_id
+                instance.object_id, object.object_id
             )));
         }
-        insert_object_copy_projection_tx(
+        insert_object_instance_projection_tx(
             tx,
-            ObjectCopyProjectionRow {
-                object_id: copy.object_id.as_str(),
-                tape_uuid: copy.tape_uuid,
-                tape_file_number: copy.tape_file_number,
-                first_body_lba: copy.first_body_lba,
-                first_parity_data_ordinal: copy.first_parity_data_ordinal,
-                protected_until_ordinal: copy.protected_until_ordinal,
-                status: copy.status.as_str(),
-                representation: Some(copy.representation.as_str()),
-                recipient_epoch_ids: copy.recipient_epoch_ids.as_deref(),
-                metadata_frame_len: copy.metadata_frame_len,
-                plaintext_digest: copy.plaintext_digest.as_deref(),
-                stored_digest: copy.stored_digest.as_deref(),
+            ObjectInstanceProjectionRow {
+                object_id: instance.object_id.as_str(),
+                tape_uuid: instance.tape_uuid,
+                tape_file_number: instance.tape_file_number,
+                first_body_lba: instance.first_body_lba,
+                first_parity_data_ordinal: instance.first_parity_data_ordinal,
+                protected_until_ordinal: instance.protected_until_ordinal,
+                status: instance.status.as_str(),
+                representation: Some(instance.representation.as_str()),
+                recipient_epoch_ids: instance.recipient_epoch_ids.as_deref(),
+                metadata_frame_len: instance.metadata_frame_len,
+                plaintext_digest: instance.plaintext_digest.as_deref(),
+                stored_digest: instance.stored_digest.as_deref(),
             },
         )?;
         insert_native_catalog_unit_tx(
             tx,
-            copy.object_id.as_str(),
-            copy.tape_uuid,
-            copy.tape_file_number,
+            instance.object_id.as_str(),
+            instance.tape_uuid,
+            instance.tape_file_number,
             object.body_format.as_str(),
             created_at_utc,
         )?;
@@ -7943,7 +7947,7 @@ struct CatalogObjectFileView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CatalogObjectCopyView {
+struct CatalogObjectInstanceView {
     object_id: String,
     tape_uuid: Vec<u8>,
     tape_file_number: SqliteU64,
@@ -8036,10 +8040,10 @@ fn checkpoint_object_conflicts(expected: &CatalogObjectView, actual: &CatalogObj
         || optional_projection_conflicts(&expected.created_at_utc, &actual.created_at_utc)
 }
 
-fn checkpoint_object_copy_view(
-    copy: &NativeObjectCopyProjectionInput,
-) -> Result<CatalogObjectCopyView, StateError> {
-    let recipient_epoch_ids = copy
+fn checkpoint_object_instance_view(
+    instance: &NativeObjectInstanceProjectionInput,
+) -> Result<CatalogObjectInstanceView, StateError> {
+    let recipient_epoch_ids = instance
         .recipient_epoch_ids
         .as_ref()
         .map(serde_json::to_string)
@@ -8049,34 +8053,34 @@ fn checkpoint_object_copy_view(
                 "serialize checkpoint object-copy recipient epochs: {err}"
             ))
         })?;
-    Ok(CatalogObjectCopyView {
-        object_id: copy.object_id.clone(),
-        tape_uuid: copy.tape_uuid.to_vec(),
-        tape_file_number: SqliteU64::new(copy.tape_file_number),
-        first_body_lba: SqliteU64::new(copy.first_body_lba),
-        first_parity_data_ordinal: copy.first_parity_data_ordinal.map(SqliteU64::new),
-        protected_until_ordinal: copy.protected_until_ordinal.map(SqliteU64::new),
-        status: copy.status.clone(),
-        representation: copy.representation.clone(),
+    Ok(CatalogObjectInstanceView {
+        object_id: instance.object_id.clone(),
+        tape_uuid: instance.tape_uuid.to_vec(),
+        tape_file_number: SqliteU64::new(instance.tape_file_number),
+        first_body_lba: SqliteU64::new(instance.first_body_lba),
+        first_parity_data_ordinal: instance.first_parity_data_ordinal.map(SqliteU64::new),
+        protected_until_ordinal: instance.protected_until_ordinal.map(SqliteU64::new),
+        status: instance.status.clone(),
+        representation: instance.representation.clone(),
         recipient_epoch_ids,
-        metadata_frame_len: copy.metadata_frame_len.map(SqliteU64::new),
-        plaintext_digest: copy.plaintext_digest.clone(),
-        plaintext_digest_algorithm: copy
+        metadata_frame_len: instance.metadata_frame_len.map(SqliteU64::new),
+        plaintext_digest: instance.plaintext_digest.clone(),
+        plaintext_digest_algorithm: instance
             .plaintext_digest
             .as_ref()
             .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
-        stored_digest: copy.stored_digest.clone(),
-        stored_digest_algorithm: copy
+        stored_digest: instance.stored_digest.clone(),
+        stored_digest_algorithm: instance
             .stored_digest
             .as_ref()
             .map(|_| DIGEST_ALGORITHM_SHA256.to_string()),
     })
 }
 
-fn checkpoint_object_copy_view_from_row(
+fn checkpoint_object_instance_view_from_row(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<CatalogObjectCopyView> {
-    Ok(CatalogObjectCopyView {
+) -> rusqlite::Result<CatalogObjectInstanceView> {
+    Ok(CatalogObjectInstanceView {
         object_id: row.get(0)?,
         tape_uuid: row.get(1)?,
         tape_file_number: row.get(2)?,
@@ -8094,9 +8098,9 @@ fn checkpoint_object_copy_view_from_row(
     })
 }
 
-fn checkpoint_object_copy_conflicts(
-    expected: &CatalogObjectCopyView,
-    actual: &CatalogObjectCopyView,
+fn checkpoint_object_instance_conflicts(
+    expected: &CatalogObjectInstanceView,
+    actual: &CatalogObjectInstanceView,
 ) -> bool {
     expected.object_id != actual.object_id
         || expected.tape_uuid != actual.tape_uuid
@@ -8112,7 +8116,7 @@ fn checkpoint_object_copy_conflicts(
             &actual.protected_until_ordinal,
         )
         || expected.status != actual.status
-        || actual.representation != OBJECT_COPY_REPRESENTATION_UNKNOWN
+        || actual.representation != OBJECT_INSTANCE_REPRESENTATION_UNKNOWN
             && expected.representation != actual.representation
         || optional_projection_conflicts(&expected.recipient_epoch_ids, &actual.recipient_epoch_ids)
         || optional_projection_conflicts(&expected.metadata_frame_len, &actual.metadata_frame_len)
@@ -8287,15 +8291,15 @@ fn project_committed_tape_file_bundle_tx(
     )
     .map_err(|err| sqlite_error("upsert incremental tape projection", err))?;
 
-    let mut object_copies = 0u64;
+    let mut object_instances = 0u64;
     for entry in &bundle.files {
         insert_tape_file(tx, input.tape_uuid, entry)?;
         if entry.kind == TapeFileKind::Object {
             if let Some(object_id) = entry.object_id.as_ref() {
-                let envelope = object_copy_envelope_from_tape_entry(entry)?;
-                insert_object_copy_projection_tx(
+                let envelope = object_instance_envelope_from_tape_entry(entry)?;
+                insert_object_instance_projection_tx(
                     tx,
-                    ObjectCopyProjectionRow {
+                    ObjectInstanceProjectionRow {
                         object_id,
                         tape_uuid: input.tape_uuid,
                         tape_file_number: entry.tape_file_number,
@@ -8321,7 +8325,7 @@ fn project_committed_tape_file_bundle_tx(
                     format_id.as_str(),
                     updated_at,
                 )?;
-                object_copies += 1;
+                object_instances += 1;
             }
         }
     }
@@ -8329,7 +8333,7 @@ fn project_committed_tape_file_bundle_tx(
     Ok(TapeJournalIndexReport {
         ingestion_pending: false,
         tape_files_rebuilt: bundle.files.len() as u64,
-        object_copies_rebuilt: object_copies,
+        object_instances_rebuilt: object_instances,
     })
 }
 
@@ -8585,7 +8589,7 @@ fn validate_append_object_conflicts_tx(
     input: &TapeJournalIndexInput,
     bundle: &FilePublication,
     object: &NativeObjectProjectionInput,
-    copies: &[NativeObjectCopyProjectionInput],
+    instances: &[NativeObjectInstanceProjectionInput],
 ) -> Result<(), StateError> {
     let object_entries = bundle
         .files
@@ -8608,11 +8612,11 @@ fn validate_append_object_conflicts_tx(
             object.object_id
         )));
     }
-    if copies.len() != 1 {
+    if instances.len() != 1 {
         return Err(StateError::IndexCorrupt(format!(
             "native object append projection for tape {} requires exactly one object copy, got {}",
             hex_uuid(input.tape_uuid),
-            copies.len()
+            instances.len()
         )));
     }
     let object_exists = tx
@@ -8630,47 +8634,47 @@ fn validate_append_object_conflicts_tx(
             object.object_id
         )));
     }
-    for copy in copies {
-        if copy.object_id != object.object_id {
+    for instance in instances {
+        if instance.object_id != object.object_id {
             return Err(StateError::IndexCorrupt(format!(
                 "append projection copy object id {} does not match object {}",
-                copy.object_id, object.object_id
+                instance.object_id, object.object_id
             )));
         }
-        if copy.tape_uuid != input.tape_uuid {
+        if instance.tape_uuid != input.tape_uuid {
             return Err(StateError::IndexCorrupt(format!(
                 "append projection copy tape {} does not match commit tape {}",
-                hex_uuid(copy.tape_uuid),
+                hex_uuid(instance.tape_uuid),
                 hex_uuid(input.tape_uuid)
             )));
         }
-        if copy.tape_file_number != object_entry.tape_file_number {
+        if instance.tape_file_number != object_entry.tape_file_number {
             return Err(StateError::IndexCorrupt(format!(
                 "append projection copy tape file {} does not match object entry tape file {}",
-                copy.tape_file_number, object_entry.tape_file_number
+                instance.tape_file_number, object_entry.tape_file_number
             )));
         }
-        let copy_exists = tx
+        let instance_exists = tx
             .query_row(
                 "select 1
-                 from object_copies
+                 from object_instances
                  where object_id = ?1 and tape_uuid = ?2 and tape_file_number = ?3",
                 params![
-                    copy.object_id.as_str(),
-                    copy.tape_uuid.to_vec(),
-                    SqliteU64::new(copy.tape_file_number),
+                    instance.object_id.as_str(),
+                    instance.tape_uuid.to_vec(),
+                    SqliteU64::new(instance.tape_file_number),
                 ],
                 |_| Ok(()),
             )
             .optional()
             .map_err(|err| sqlite_error("query append object-copy conflict", err))?
             .is_some();
-        if copy_exists {
+        if instance_exists {
             return Err(StateError::IndexCorrupt(format!(
                 "append projection object copy {} on tape {} file {} already exists",
-                copy.object_id,
-                hex_uuid(copy.tape_uuid),
-                copy.tape_file_number
+                instance.object_id,
+                hex_uuid(instance.tape_uuid),
+                instance.tape_file_number
             )));
         }
     }
@@ -10848,9 +10852,9 @@ enum AssignmentWrite {
 }
 
 /// Read committed occupancy under the assignment transaction and catalog lock.
-fn committed_copy_count_tx(tx: &Connection, tape_uuid: &[u8]) -> Result<u64, StateError> {
+fn committed_instance_count_tx(tx: &Connection, tape_uuid: &[u8]) -> Result<u64, StateError> {
     tx.query_row(
-        "select count(*) from object_copies where tape_uuid = ?1 and status = 'committed'",
+        "select count(*) from object_instances where tape_uuid = ?1 and status = 'committed'",
         [tape_uuid],
         |row| row.get(0),
     )
@@ -10890,11 +10894,11 @@ fn set_tape_pool_membership_tx(
         )));
     }
     if mode == AssignmentWrite::Change && existing_pool_id.as_deref() != pool_id {
-        let copy_count = committed_copy_count_tx(tx, &tape_uuid)?;
-        if copy_count != 0 {
-            return Err(StateError::TapeHoldsCommittedCopies {
+        let instance_count = committed_instance_count_tx(tx, &tape_uuid)?;
+        if instance_count != 0 {
+            return Err(StateError::TapeHoldsCommittedInstances {
                 tape_uuid: uuid::Uuid::from_bytes(tape_uuid),
-                copy_count,
+                instance_count,
             });
         }
     }
@@ -11256,7 +11260,7 @@ fn query_mutable_memberships_tx(tx: &Connection) -> Result<Vec<(Vec<u8>, String)
              where pool_id is not null
                and coalesce((select source from tape_pool_assignments a
                  where a.tape_uuid = tapes.tape_uuid order by seq desc limit 1), 'rule') <> 'operator'
-               and not exists (select 1 from object_copies c
+               and not exists (select 1 from object_instances c
                  where c.tape_uuid = tapes.tape_uuid and c.status = 'committed')
                and finalization_progress is null
                and state not in (
@@ -11286,7 +11290,7 @@ fn query_tapes_for_pool_derivation_tx(
 ) -> Result<Vec<([u8; 16], String)>, StateError> {
     let mut stmt = tx
         .prepare("select tape_uuid, voltag from tapes where voltag is not null
-               and not exists (select 1 from object_copies c
+               and not exists (select 1 from object_instances c
                  where c.tape_uuid = tapes.tape_uuid and c.status = 'committed')
                and finalization_progress is null
                and state not in ('finalizing', 'finalized', 'sealed', 'retired', 'finalized_degraded', 'recovery_required')
@@ -11330,7 +11334,7 @@ fn query_tape_pool_ids_tx(tx: &Connection) -> Result<Vec<String>, StateError> {
     Ok(pool_ids)
 }
 
-struct ObjectCopyProjectionRow<'a> {
+struct ObjectInstanceProjectionRow<'a> {
     object_id: &'a str,
     tape_uuid: [u8; 16],
     tape_file_number: u64,
@@ -11345,18 +11349,18 @@ struct ObjectCopyProjectionRow<'a> {
     stored_digest: Option<&'a [u8]>,
 }
 
-struct ObjectCopyEnvelopeProjection {
+struct ObjectInstanceEnvelopeProjection {
     representation: Option<&'static str>,
     recipient_epoch_ids: Option<Vec<String>>,
     metadata_frame_len: Option<u64>,
 }
 
-fn object_copy_envelope_from_tape_entry(
+fn object_instance_envelope_from_tape_entry(
     entry: &TapeFileEntry,
-) -> Result<ObjectCopyEnvelopeProjection, StateError> {
+) -> Result<ObjectInstanceEnvelopeProjection, StateError> {
     let Some(row) = entry.object_recovery_row.as_ref() else {
-        return Ok(ObjectCopyEnvelopeProjection {
-            representation: Some(OBJECT_COPY_REPRESENTATION_UNKNOWN),
+        return Ok(ObjectInstanceEnvelopeProjection {
+            representation: Some(OBJECT_INSTANCE_REPRESENTATION_UNKNOWN),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
         });
@@ -11374,8 +11378,8 @@ fn object_copy_envelope_from_tape_entry(
         )));
     }
     match &row.representation {
-        ObjectRecoveryRepresentation::Plaintext { .. } => Ok(ObjectCopyEnvelopeProjection {
-            representation: Some(OBJECT_COPY_REPRESENTATION_PLAINTEXT),
+        ObjectRecoveryRepresentation::Plaintext { .. } => Ok(ObjectInstanceEnvelopeProjection {
+            representation: Some(OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
         }),
@@ -11383,8 +11387,8 @@ fn object_copy_envelope_from_tape_entry(
             recipient_epoch_ids,
             metadata_frame_len,
             ..
-        } => Ok(ObjectCopyEnvelopeProjection {
-            representation: Some(OBJECT_COPY_REPRESENTATION_ENCRYPTED),
+        } => Ok(ObjectInstanceEnvelopeProjection {
+            representation: Some(OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED),
             recipient_epoch_ids: Some(
                 recipient_epoch_ids
                     .iter()
@@ -11396,11 +11400,11 @@ fn object_copy_envelope_from_tape_entry(
     }
 }
 
-fn insert_object_copy_projection_tx(
+fn insert_object_instance_projection_tx(
     tx: &Connection,
-    row: ObjectCopyProjectionRow<'_>,
+    row: ObjectInstanceProjectionRow<'_>,
 ) -> Result<(), StateError> {
-    validate_object_copy_envelope(
+    validate_object_instance_envelope(
         row.representation,
         row.recipient_epoch_ids,
         row.metadata_frame_len,
@@ -11414,11 +11418,11 @@ fn insert_object_copy_projection_tx(
         .transpose()
         .map_err(|error| {
             StateError::IndexMigrationFailed(format!(
-                "serialize object_copies.recipient_epoch_ids: {error}"
+                "serialize object_instances.recipient_epoch_ids: {error}"
             ))
         })?;
     tx.execute(
-        "insert into object_copies(
+        "insert into object_instances(
            object_id, tape_uuid, tape_file_number,
            first_body_lba, first_parity_data_ordinal,
            protected_until_ordinal, status, representation, recipient_epoch_ids,
@@ -11436,7 +11440,7 @@ fn insert_object_copy_projection_tx(
              case
                when excluded.first_body_lba != X'0000000000000000'
                  then excluded.first_body_lba
-               else object_copies.first_body_lba
+               else object_instances.first_body_lba
              end,
            first_parity_data_ordinal = excluded.first_parity_data_ordinal,
            protected_until_ordinal = excluded.protected_until_ordinal,
@@ -11444,27 +11448,27 @@ fn insert_object_copy_projection_tx(
            representation =
              case
                when ?8 is not null and ?8 != 'unknown' then excluded.representation
-               else object_copies.representation
+               else object_instances.representation
              end,
            recipient_epoch_ids =
              case
                when ?8 is not null and ?8 != 'unknown' then excluded.recipient_epoch_ids
-               else object_copies.recipient_epoch_ids
+               else object_instances.recipient_epoch_ids
              end,
            metadata_frame_len =
              case
                when ?8 is not null and ?8 != 'unknown' then excluded.metadata_frame_len
-               else object_copies.metadata_frame_len
+               else object_instances.metadata_frame_len
              end,
-           plaintext_digest = coalesce(excluded.plaintext_digest, object_copies.plaintext_digest),
+           plaintext_digest = coalesce(excluded.plaintext_digest, object_instances.plaintext_digest),
            plaintext_digest_algorithm = coalesce(
              excluded.plaintext_digest_algorithm,
-             object_copies.plaintext_digest_algorithm
+             object_instances.plaintext_digest_algorithm
            ),
-           stored_digest = coalesce(excluded.stored_digest, object_copies.stored_digest),
+           stored_digest = coalesce(excluded.stored_digest, object_instances.stored_digest),
            stored_digest_algorithm = coalesce(
              excluded.stored_digest_algorithm,
-             object_copies.stored_digest_algorithm
+             object_instances.stored_digest_algorithm
            )",
         params![
             row.object_id,
@@ -11519,7 +11523,7 @@ fn validate_catalog_digest_pair(
     }
 }
 
-fn validate_object_copy_envelope(
+fn validate_object_instance_envelope(
     representation: Option<&str>,
     recipient_epoch_ids: Option<&[String]>,
     metadata_frame_len: Option<u64>,
@@ -11533,7 +11537,7 @@ fn validate_object_copy_envelope(
         return Ok(());
     };
     match representation {
-        OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
+        OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT => {
             if recipient_epoch_ids.is_some() || metadata_frame_len.is_some() {
                 return Err(StateError::IndexMigrationFailed(
                     "plaintext object copy rows must not carry encrypted envelope fields"
@@ -11542,7 +11546,7 @@ fn validate_object_copy_envelope(
             }
             Ok(())
         }
-        OBJECT_COPY_REPRESENTATION_UNKNOWN => {
+        OBJECT_INSTANCE_REPRESENTATION_UNKNOWN => {
             if recipient_epoch_ids.is_some() || metadata_frame_len.is_some() {
                 return Err(StateError::IndexMigrationFailed(
                     "unknown object copy rows must not carry encrypted envelope fields".to_string(),
@@ -11550,7 +11554,7 @@ fn validate_object_copy_envelope(
             }
             Ok(())
         }
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
+        OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED => {
             let Some(recipient_epoch_ids) = recipient_epoch_ids else {
                 return Err(StateError::IndexMigrationFailed(
                     "encrypted object copy rows require recipient_epoch_ids".to_string(),
@@ -11780,13 +11784,13 @@ fn native_object_from_row(row: &rusqlite::Row<'_>) -> Result<NativeObjectRecord,
         metadata_hash,
         metadata_hash_algorithm,
         created_at_utc: row_get(row, 8, "objects.created_at_utc")?,
-        copies: Vec::new(),
+        instances: Vec::new(),
     })
 }
 
-fn native_object_copy_from_row(
+fn native_object_instance_from_row(
     row: &rusqlite::Row<'_>,
-) -> Result<NativeObjectCopyRecord, StateError> {
+) -> Result<NativeObjectInstanceRecord, StateError> {
     let plaintext_digest: Option<Vec<u8>> = row_get(row, 11, "object_copies.plaintext_digest")?;
     let plaintext_digest_algorithm: Option<String> =
         row_get(row, 12, "object_copies.plaintext_digest_algorithm")?;
@@ -11803,8 +11807,8 @@ fn native_object_copy_from_row(
         stored_digest_algorithm.as_deref(),
         "object_copies.stored_digest",
     )?;
-    let envelope = object_copy_envelope_from_row(row, 8, 9, 10)?;
-    // The span, through the copy→tape-file join. Both fields are present
+    let envelope = object_instance_envelope_from_row(row, 8, 9, 10)?;
+    // The span, through the instance→tape-file join. Both fields are present
     // exactly when the joined tape file carries a captured start; an
     // absent hint stays absent — never zero, never guessed.
     let global_start_block =
@@ -11820,7 +11824,7 @@ fn native_object_copy_from_row(
         }
         _ => None,
     };
-    Ok(NativeObjectCopyRecord {
+    Ok(NativeObjectInstanceRecord {
         tape_log_sequence: None,
         tape_incarnation: None,
         object_id: row_get(row, 0, "object_copies.object_id")?,
@@ -11887,10 +11891,10 @@ fn native_object_file_from_row(
     })
 }
 
-fn native_object_copy_from_join_row(
+fn native_object_instance_from_join_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
-) -> Result<Option<NativeObjectCopyRecord>, StateError> {
+) -> Result<Option<NativeObjectInstanceRecord>, StateError> {
     let object_id: Option<String> = row_get(row, offset, "object_copies.object_id")?;
     let Some(object_id) = object_id else {
         return Ok(None);
@@ -11912,7 +11916,7 @@ fn native_object_copy_from_join_row(
         stored_digest_algorithm.as_deref(),
         "object_copies.stored_digest",
     )?;
-    let envelope = object_copy_envelope_from_row(row, offset + 8, offset + 9, offset + 10)?;
+    let envelope = object_instance_envelope_from_row(row, offset + 8, offset + 9, offset + 10)?;
     let global_start_block =
         row_get::<Option<SqliteU64>>(row, offset + 15, "tape_files.physical_start_hint")?
             .map(SqliteU64::get);
@@ -11927,7 +11931,7 @@ fn native_object_copy_from_join_row(
         }
         _ => None,
     };
-    Ok(Some(NativeObjectCopyRecord {
+    Ok(Some(NativeObjectInstanceRecord {
         tape_log_sequence: None,
         tape_incarnation: None,
         object_id,
@@ -11969,11 +11973,11 @@ fn parse_recipient_epoch_ids_json(
         .map(|json| {
             let ids: Vec<String> = serde_json::from_str(&json).map_err(|error| {
                 StateError::IndexCorrupt(format!(
-                    "object_copies.recipient_epoch_ids is invalid JSON: {error}"
+                    "object_instances.recipient_epoch_ids is invalid JSON: {error}"
                 ))
             })?;
-            validate_object_copy_envelope(
-                Some(OBJECT_COPY_REPRESENTATION_ENCRYPTED),
+            validate_object_instance_envelope(
+                Some(OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED),
                 Some(&ids),
                 Some(17),
             )?;
@@ -11982,24 +11986,24 @@ fn parse_recipient_epoch_ids_json(
         .transpose()
 }
 
-struct DecodedObjectCopyEnvelope {
+struct DecodedObjectInstanceEnvelope {
     representation: String,
     recipient_epoch_ids: Option<Vec<String>>,
     metadata_frame_len: Option<u64>,
 }
 
-fn object_copy_envelope_from_row(
+fn object_instance_envelope_from_row(
     row: &rusqlite::Row<'_>,
     representation_index: usize,
     recipient_epoch_ids_index: usize,
     metadata_frame_len_index: usize,
-) -> Result<DecodedObjectCopyEnvelope, StateError> {
+) -> Result<DecodedObjectInstanceEnvelope, StateError> {
     let representation: String =
         row_get(row, representation_index, "object_copies.representation")?;
     let recipient_epoch_ids = parse_recipient_epoch_ids_json(row_get(
         row,
         recipient_epoch_ids_index,
-        "object_copies.recipient_epoch_ids",
+        "object_instances.recipient_epoch_ids",
     )?)?;
     let metadata_frame_len = row_get::<Option<SqliteU64>>(
         row,
@@ -12007,12 +12011,12 @@ fn object_copy_envelope_from_row(
         "object_copies.metadata_frame_len",
     )?
     .map(SqliteU64::get);
-    validate_object_copy_envelope(
+    validate_object_instance_envelope(
         Some(representation.as_str()),
         recipient_epoch_ids.as_deref(),
         metadata_frame_len,
     )?;
-    Ok(DecodedObjectCopyEnvelope {
+    Ok(DecodedObjectInstanceEnvelope {
         representation,
         recipient_epoch_ids,
         metadata_frame_len,
@@ -13223,6 +13227,39 @@ fn migrate_verification_columns(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Upgrade B4b-1 projection rows transactionally, retaining every non-pool value.
+/// Pool attribution belongs exclusively to the tape joined by tape_uuid.
+fn migrate_object_instances(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(r#"drop index if exists object_copies_pool_idx;
+alter table object_copies rename to object_instances_legacy;
+create table if not exists object_instances(
+  object_id text not null,
+  tape_uuid blob not null,
+  tape_file_number blob not null
+    check(typeof(tape_file_number) = 'blob' and length(tape_file_number) = 8),
+  first_body_lba blob not null default X'0000000000000000'
+    check(typeof(first_body_lba) = 'blob' and length(first_body_lba) = 8),
+  first_parity_data_ordinal blob
+    check(first_parity_data_ordinal is null or (typeof(first_parity_data_ordinal) = 'blob' and length(first_parity_data_ordinal) = 8)),
+  protected_until_ordinal blob
+    check(protected_until_ordinal is null or (typeof(protected_until_ordinal) = 'blob' and length(protected_until_ordinal) = 8)),
+  status text not null,
+  representation text not null default 'unknown',
+  recipient_epoch_ids text,
+  metadata_frame_len blob
+    check(metadata_frame_len is null or (typeof(metadata_frame_len) = 'blob' and length(metadata_frame_len) = 8)),
+  plaintext_digest blob,
+  plaintext_digest_algorithm text,
+  stored_digest blob,
+  stored_digest_algorithm text,
+  primary key(object_id, tape_uuid, tape_file_number)
+);
+insert into object_instances (object_id, tape_uuid, tape_file_number, first_body_lba, first_parity_data_ordinal, protected_until_ordinal, status, representation, recipient_epoch_ids, metadata_frame_len, plaintext_digest, plaintext_digest_algorithm, stored_digest, stored_digest_algorithm)
+select object_id, tape_uuid, tape_file_number, first_body_lba, first_parity_data_ordinal, protected_until_ordinal, status, representation, recipient_epoch_ids, metadata_frame_len, plaintext_digest, plaintext_digest_algorithm, stored_digest, stored_digest_algorithm from object_instances_legacy;
+drop table object_instances_legacy;"#)
+        .map_err(|err| sqlite_error("migrate object instances", err))
+}
+
 fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
@@ -13237,12 +13274,6 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             "sqlite user_version {current} is newer than supported {SCHEMA_VERSION}"
         )));
     }
-    // Schema 25 keeps the dead instance pool column until B4b-2, but no index
-    // may continue reading it, including in catalogs already at version 25.
-    if current == 24 || current == SCHEMA_VERSION {
-        conn.execute_batch("drop index if exists object_copies_pool_idx")
-            .map_err(|err| sqlite_error("drop object_copies_pool_idx", err))?;
-    }
     if current == SCHEMA_VERSION {
         conn.execute_batch(tape_log_projection::SCHEMA)
             .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
@@ -13250,9 +13281,14 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             .map_err(|e| sqlite_error("install replay cursors", e))?;
         return validate_unsigned_structural_schema(conn);
     }
-    if current == 24 {
-        conn.execute_batch(super::apply::SCHEMA)
-            .map_err(|e| sqlite_error("migrate library projection bookkeeping", e))?;
+    if current == 24 || current == 25 {
+        // Only schema 24 lacks library bookkeeping. Schema 25 already holds
+        // authority projection identity, consumed decisions and source digests.
+        if current == 24 {
+            conn.execute_batch(super::apply::SCHEMA)
+                .map_err(|e| sqlite_error("migrate library projection bookkeeping", e))?;
+        }
+        migrate_object_instances(conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| sqlite_error("advance library projection schema", e))?;
         conn.execute(
@@ -13276,47 +13312,49 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
         .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
         "first_body_lba",
         "first_body_lba blob not null default X'0000000000000000' check(typeof(first_body_lba) = 'blob' and length(first_body_lba) = 8)",
     )?;
-    // Dead compatibility column in schema 25; B4b-2 removes it in its DDL.
-    // New copy rows omit pool_id; every attribution query joins the tape.
-    ensure_column(conn, "object_copies", "pool_id", "pool_id text")?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
         "representation",
         "representation text not null default 'unknown'",
     )?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
         "recipient_epoch_ids",
         "recipient_epoch_ids text",
     )?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
         "metadata_frame_len",
         "metadata_frame_len blob check(metadata_frame_len is null or (typeof(metadata_frame_len) = 'blob' and length(metadata_frame_len) = 8))",
     )?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
         "plaintext_digest",
         "plaintext_digest blob",
     )?;
-    ensure_column(conn, "object_copies", "stored_digest", "stored_digest blob")?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
+        "stored_digest",
+        "stored_digest blob",
+    )?;
+    ensure_column(
+        conn,
+        "object_instances",
         "plaintext_digest_algorithm",
         "plaintext_digest_algorithm text",
     )?;
     ensure_column(
         conn,
-        "object_copies",
+        "object_instances",
         "stored_digest_algorithm",
         "stored_digest_algorithm text",
     )?;
@@ -13351,10 +13389,10 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
          update objects
            set metadata_hash_algorithm = 'sha256'
            where metadata_hash is not null and metadata_hash_algorithm is null;
-         update object_copies
+         update object_instances
            set plaintext_digest_algorithm = 'sha256'
            where plaintext_digest is not null and plaintext_digest_algorithm is null;
-         update object_copies
+         update object_instances
            set stored_digest_algorithm = 'sha256'
            where stored_digest is not null and stored_digest_algorithm is null;
          update tape_files
@@ -13436,9 +13474,9 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
              where kind = 'data'
                and voltag glob 'CLN*'
                and not exists (
-                 select 1 from object_copies
-                 where object_copies.tape_uuid = tapes.tape_uuid
-                   and object_copies.status = 'committed'
+                 select 1 from object_instances
+                 where object_instances.tape_uuid = tapes.tape_uuid
+                   and object_instances.status = 'committed'
                )",
             [],
         )
@@ -13510,8 +13548,22 @@ fn database_has_user_tables(conn: &Connection) -> Result<bool, StateError> {
     .map_err(|err| sqlite_error("inspect pre-schema sqlite catalog", err))
 }
 
+/// Validate the current projection's structural columns.
 fn validate_unsigned_structural_schema(conn: &Connection) -> Result<(), StateError> {
+    validate_unsigned_structural_schema_for_table(conn, "object_instances")
+}
+
+/// Reset admission validates predecessor tables in place without migrating them.
+fn validate_unsigned_structural_schema_for_table(
+    conn: &Connection,
+    instance_table: &str,
+) -> Result<(), StateError> {
     for &(table, column) in STRUCTURAL_U64_COLUMNS {
+        let table = if table == "object_instances" {
+            instance_table
+        } else {
+            table
+        };
         let declared_type = conn
             .query_row(
                 "select type from pragma_table_info(?1) where name = ?2",
@@ -13768,7 +13820,7 @@ create index if not exists objects_caller_object_id_idx
   on objects(caller_object_id)
   where caller_object_id is not null;
 
-create table if not exists object_copies(
+create table if not exists object_instances(
   object_id text not null,
   tape_uuid blob not null,
   tape_file_number blob not null
@@ -13788,7 +13840,6 @@ create table if not exists object_copies(
   plaintext_digest_algorithm text,
   stored_digest blob,
   stored_digest_algorithm text,
-  pool_id text,
   primary key(object_id, tape_uuid, tape_file_number)
 );
 
@@ -14417,11 +14468,9 @@ fn project_tape_kind_core(
 
 #[cfg(test)]
 impl CatalogCore {
-    /// Prove copy pool independence before B4b-2 removes the dead schema field.
-    pub(super) fn remove_copy_pool_fixture(&self) {
-        self.conn
-            .execute_batch("alter table object_copies drop column pool_id")
-            .unwrap();
+    /// Assert that projection fixtures have no instance pool column.
+    pub(super) fn remove_instance_pool_fixture(&self) {
+        assert!(!table_column_exists(&self.conn, "object_instances", "pool_id").unwrap());
     }
 
     pub(super) fn memory_projection_fixture() -> Self {
@@ -14621,7 +14670,7 @@ mod tests {
                 objects: vec![ObjectProjectionFixture {
                     object: append_object_projection("pending-object"),
                     files: Vec::new(),
-                    copy: append_copy_projection("pending-object", uuid, 1),
+                    instance: append_instance_projection("pending-object", uuid, 1),
                     block_size: 262144,
                     block_count: 3,
                     fresh_tape: true,
@@ -14902,30 +14951,22 @@ mod tests {
         ] {
             let mut object = append_object_projection(id);
             object.caller_object_id = Some("photos/a.txt".into());
-            let mut copy = append_copy_projection(id, tape, number);
-            copy.status = status.into();
+            let mut instance = append_instance_projection(id, tape, number);
+            instance.status = status.into();
             index
-                .upsert_native_object_projection(object, &[copy])
+                .upsert_native_object_projection(object, &[instance])
                 .unwrap();
             index.conn.execute("insert into object_files (object_id,file_id,path,size_bytes,file_sha256,chunk_count) values (?1,?1,'photos/a.txt',?2,?3,?4)", params![id, SqliteU64::new(42), vec![0x41u8;32], SqliteU64::new(1)]).unwrap();
         }
-        let nonnull: u64 = index
-            .conn
-            .query_row(
-                "select count(*) from object_copies where pool_id is not null",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(nonnull, 0);
+        assert!(!table_column_exists(&index.conn, "object_instances", "pool_id").unwrap());
         assert_eq!(
-            index.committed_copy_pool_snapshots(&[1; 16]).unwrap(),
+            index.committed_instance_pool_snapshots(&[1; 16]).unwrap(),
             vec![Some("current".into())]
         );
         assert_eq!(index.list_committed_paths(None, None).unwrap().len(), 1);
-        let copies = index.list_all_native_object_copies().unwrap();
+        let instances = index.list_all_native_object_instances().unwrap();
         assert_eq!(
-            copies
+            instances
                 .iter()
                 .filter(|c| c.status == "committed" && c.pool_id.as_deref() == Some("current"))
                 .count(),
@@ -14942,7 +14983,7 @@ mod tests {
             ["a-newer", "z-older"]
         );
         assert_eq!(
-            versions[0].copies,
+            versions[0].instances,
             vec![(vec![2; 16], Some("SECOND".into()))]
         );
         assert!(index
@@ -14969,7 +15010,7 @@ mod tests {
         "tape_pools",
         "tape_files",
         "objects",
-        "object_copies",
+        "object_instances",
         "catalog_units",
         "idempotency_keys",
         "operations",
@@ -15232,12 +15273,12 @@ mod tests {
         }
     }
 
-    fn append_copy_projection(
+    fn append_instance_projection(
         object_id: &str,
         tape_uuid: [u8; 16],
         tape_file_number: u64,
-    ) -> NativeObjectCopyProjectionInput {
-        NativeObjectCopyProjectionInput {
+    ) -> NativeObjectInstanceProjectionInput {
+        NativeObjectInstanceProjectionInput {
             object_id: object_id.to_string(),
             tape_uuid,
             tape_file_number,
@@ -15245,7 +15286,7 @@ mod tests {
             first_parity_data_ordinal: None,
             protected_until_ordinal: None,
             status: "committed".to_string(),
-            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some(vec![0x43; 32]),
@@ -15376,9 +15417,9 @@ mod tests {
         ));
         rows.extend(query_strings(
             index,
-            "select 'copy|' || object_id || '|' || hex(tape_uuid) || '|' ||
-                    tape_file_number || '|' || status || '|' || coalesce(pool_id, '')
-             from object_copies order by object_id, hex(tape_uuid), tape_file_number",
+            "select 'instance|' || object_id || '|' || hex(tape_uuid) || '|' ||
+                    tape_file_number || '|' || status
+             from object_instances order by object_id, hex(tape_uuid), tape_file_number",
         ));
         rows.extend(query_strings(
             index,
@@ -15546,7 +15587,7 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select count(*) from object_copies", [], |row| {
+                .query_row("select count(*) from object_instances", [], |row| {
                     row.get::<_, u64>(0)
                 })
                 .expect("copy count"),
@@ -15840,7 +15881,7 @@ mod tests {
     }
 
     #[test]
-    fn kind_flip_guard_refuses_tapes_with_committed_object_copies() {
+    fn kind_flip_guard_refuses_tapes_with_committed_object_instances() {
         let dir = tempfile::Builder::new()
             .prefix("rem-kind-guard")
             .tempdir()
@@ -15861,7 +15902,7 @@ mod tests {
         Connection::open(index.path())
             .unwrap()
             .execute(
-                "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+                "insert into object_instances(object_id, tape_uuid, tape_file_number, status)
                  values('obj-guard', ?1, ?2, 'committed')",
                 params![tape_uuid.to_vec(), SqliteU64::new(1)],
             )
@@ -15979,7 +16020,7 @@ mod tests {
                     created_at_utc: Some("2026-05-30T10:00:00Z".to_string()),
                 },
                 &[],
-                &[NativeObjectCopyProjectionInput {
+                &[NativeObjectInstanceProjectionInput {
                     object_id: "object-foreign-pool".to_string(),
                     tape_uuid,
                     tape_file_number: 1,
@@ -15987,7 +16028,7 @@ mod tests {
                     first_parity_data_ordinal: Some(0),
                     protected_until_ordinal: Some(3),
                     status: "committed".to_string(),
-                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                     recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x31; 32]),
@@ -16261,7 +16302,10 @@ mod tests {
         assert_eq!(tape.total_committed_ordinals, 3);
         assert_eq!(highest_protected_ordinal(&index, tape_uuid), 3);
         assert_eq!(count_rows_for_tape(&index, "tape_files", tape_uuid), 4);
-        assert_eq!(count_rows_for_tape(&index, "object_copies", tape_uuid), 1);
+        assert_eq!(
+            count_rows_for_tape(&index, "object_instances", tape_uuid),
+            1
+        );
     }
 
     #[test]
@@ -16321,7 +16365,7 @@ mod tests {
             .expect("insert stale catalog unit");
         assert_eq!(count_rows_for_tape(&index, "tape_files", old_tape_uuid), 4);
         assert_eq!(
-            count_rows_for_tape(&index, "object_copies", old_tape_uuid),
+            count_rows_for_tape(&index, "object_instances", old_tape_uuid),
             1
         );
 
@@ -16356,7 +16400,7 @@ mod tests {
         assert_eq!(highest_protected_ordinal(&index, new_tape_uuid), 0);
         assert_eq!(count_rows_for_tape(&index, "tape_files", old_tape_uuid), 0);
         assert_eq!(
-            count_rows_for_tape(&index, "object_copies", old_tape_uuid),
+            count_rows_for_tape(&index, "object_instances", old_tape_uuid),
             0
         );
         assert_eq!(
@@ -17316,7 +17360,7 @@ mod tests {
     }
 
     #[test]
-    fn migrated_tables_have_pool_and_copy_envelope_columns() {
+    fn migrated_tables_have_pool_and_instance_envelope_columns() {
         let dir = tempfile::Builder::new()
             .prefix("rem-pool-col")
             .tempdir()
@@ -17345,8 +17389,8 @@ mod tests {
             "stored_digest_algorithm",
         ] {
             assert!(
-                table_column_exists(&conn, "object_copies", column).expect("table_info"),
-                "object_copies.{column} column must exist after migration"
+                table_column_exists(&conn, "object_instances", column).expect("table_info"),
+                "object_instances.{column} column must exist after migration"
             );
         }
         for (table, column) in [
@@ -19070,7 +19114,7 @@ mod tests {
 
         assert!(!report.ingestion_pending);
         assert_eq!(report.tape_files_rebuilt, 4);
-        assert_eq!(report.object_copies_rebuilt, 1);
+        assert_eq!(report.object_instances_rebuilt, 1);
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
@@ -19094,20 +19138,11 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select status from object_copies", [], |row| {
+                .query_row("select status from object_instances", [], |row| {
                     row.get::<_, String>(0)
                 })
                 .expect("object copy status"),
             "committed"
-        );
-        assert_eq!(
-            Connection::open(index.path())
-                .unwrap()
-                .query_row("select pool_id from object_copies", [], |row| {
-                    row.get::<_, Option<String>>(0)
-                })
-                .expect("dead object copy pool"),
-            None
         );
         assert_eq!(
             Connection::open(index.path())
@@ -19193,7 +19228,7 @@ mod tests {
             .project_tape_pool_membership(tape_uuid, "camera.copy-b")
             .expect_err("conflicting committed pool must fail");
         assert!(
-            matches!(err, StateError::TapeHoldsCommittedCopies { .. }),
+            matches!(err, StateError::TapeHoldsCommittedInstances { .. }),
             "{err}"
         );
     }
@@ -19239,7 +19274,7 @@ mod tests {
     }
 
     /// Provision the rebuild fixture's tape, ingest its journal so committed
-    /// copies exist, and return the (input, state) pair for further steps.
+    /// instances exist, and return the (input, state) pair for further steps.
     fn provisioned_committed_fixture(
         index: &mut CatalogIndex,
         voltag: &str,
@@ -19275,10 +19310,10 @@ mod tests {
             .expect("tape row")
     }
 
-    fn copy_statuses(index: &CatalogIndex, tape_uuid: [u8; 16]) -> Vec<String> {
+    fn instance_statuses(index: &CatalogIndex, tape_uuid: [u8; 16]) -> Vec<String> {
         let fixture_conn_stmt = Connection::open(index.path()).unwrap();
         let mut stmt = fixture_conn_stmt
-            .prepare("select status from object_copies where tape_uuid = ?1 order by status")
+            .prepare("select status from object_instances where tape_uuid = ?1 order by status")
             .expect("prepare copy status query");
         let statuses = stmt
             .query_map(params![tape_uuid.to_vec()], |row| row.get(0))
@@ -19289,7 +19324,7 @@ mod tests {
     }
 
     #[test]
-    fn retire_tape_sets_terminal_state_releases_voltag_and_marks_copies_missing() {
+    fn retire_tape_sets_terminal_state_releases_voltag_and_marks_instances_missing() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -19330,7 +19365,7 @@ mod tests {
             RetireTapeOutcome {
                 newly_retired: true,
                 released_voltag: Some("RMJ101L9".to_string()),
-                copies_marked_missing: 1,
+                instances_marked_missing: 1,
             }
         );
         let tape = index
@@ -19344,10 +19379,10 @@ mod tests {
             Some("camera.copy-a"),
             "pool membership is kept as history"
         );
-        assert_eq!(copy_statuses(&index, input.tape_uuid), vec!["missing"]);
+        assert_eq!(instance_statuses(&index, input.tape_uuid), vec!["missing"]);
         assert_eq!(
             index
-                .list_objects_with_no_committed_copies()
+                .list_objects_with_no_committed_instances()
                 .expect("degraded objects"),
             vec!["object-1".to_string()]
         );
@@ -19382,7 +19417,7 @@ mod tests {
             RetireTapeOutcome {
                 newly_retired: false,
                 released_voltag: None,
-                copies_marked_missing: 0,
+                instances_marked_missing: 0,
             }
         );
         let (state, voltag) = tape_state_and_voltag(&index, input.tape_uuid);
@@ -19522,9 +19557,9 @@ mod tests {
     /// 1. the `retired` arm of the preserve predicate,
     /// 2. the `retired` arm of the preserved-column merge,
     /// 3. the `retired` arms of both journal/bundle ingest state CASEs,
-    /// 4. the post-merge `missing` copy re-derivation.
+    /// 4. the post-merge `missing` instance re-derivation.
     #[test]
-    fn rebuild_preserves_retired_tape_and_rederives_missing_copies() {
+    fn rebuild_preserves_retired_tape_and_rederives_missing_instances() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -19545,7 +19580,7 @@ mod tests {
 
         // Changes 1 + 4: the 3c journal stays on disk as authoritative
         // history, so a full rebuild re-ingests it; the identity must stay
-        // dead and its copies must be re-derived to `missing`.
+        // dead and its instances must be re-derived to `missing`.
         index
             .rebuild_from_authoritative_sources(
                 &[],
@@ -19559,7 +19594,7 @@ mod tests {
         assert_eq!(tape_state, "retired", "rebuild resurrected the identity");
         assert_eq!(voltag, None, "rebuild re-attached the released voltag");
         assert_eq!(
-            copy_statuses(&index, input.tape_uuid),
+            instance_statuses(&index, input.tape_uuid),
             vec!["missing"],
             "rebuild did not re-derive copy statuses from the retired state"
         );
@@ -19794,7 +19829,7 @@ mod tests {
         Connection::open(index.path())
             .unwrap()
             .execute(
-                "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+                "insert into object_instances(object_id, tape_uuid, tape_file_number, status)
                  values('object-u64', ?1, ?2, 'committed')",
                 params![tape_uuid.to_vec(), SqliteU64::ZERO],
             )
@@ -19839,7 +19874,7 @@ mod tests {
         Connection::open(index.path())
             .unwrap()
             .execute(
-                "update object_copies
+                "update object_instances
                  set representation = 'encrypted',
                      recipient_epoch_ids = '[\"00000000000000000000000000000001\"]',
                      metadata_frame_len = ?1",
@@ -19847,13 +19882,13 @@ mod tests {
             )
             .expect("seed semantically invalid metadata length");
         let error = index
-            .find_native_object_copies("object-u64")
+            .find_native_object_instances("object-u64")
             .expect_err("semantic metadata cap must be checked on read");
         assert!(error.to_string().contains("must be in [17, 16 MiB]"));
     }
 
     #[test]
-    fn reconcile_tape_files_projection_preserves_object_copies() {
+    fn reconcile_tape_files_projection_preserves_object_instances() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -19900,7 +19935,7 @@ mod tests {
             .expect("reconcile structural tape files");
 
         assert_eq!(report.tape_files_rebuilt, 2);
-        assert_eq!(report.object_copies_rebuilt, 0);
+        assert_eq!(report.object_instances_rebuilt, 0);
         let files = index
             .list_tape_files(&input.tape_uuid)
             .expect("list reconciled tape files");
@@ -19910,7 +19945,7 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select count(*) from object_copies", [], |row| {
+                .query_row("select count(*) from object_instances", [], |row| {
                     row.get::<_, u64>(0)
                 })
                 .expect("object copy count"),
@@ -19942,7 +19977,7 @@ mod tests {
         index
             .upsert_native_object_projection(
                 append_object_projection("occupied"),
-                &[append_copy_projection("occupied", tape, 1)],
+                &[append_instance_projection("occupied", tape, 1)],
             )
             .unwrap();
         let before = index.normalized_authority_dump().unwrap();
@@ -19954,7 +19989,7 @@ mod tests {
                 })
                 .unwrap_err();
             assert!(
-                matches!(error, StateError::TapeHoldsCommittedCopies { tape_uuid, copy_count: 1 }
+                matches!(error, StateError::TapeHoldsCommittedInstances { tape_uuid, instance_count: 1 }
                 if tape_uuid == uuid::Uuid::from_bytes(tape))
             );
             assert_eq!(error.to_string(), format!("tape {} holds 1 committed instances; a tape holding data cannot change pool; it can only be retired", uuid::Uuid::from_bytes(tape)));
@@ -19965,13 +20000,8 @@ mod tests {
             .compare_and_set_tape_pool_assignment(tape, 2, Some("new"))
             .unwrap();
         assert_eq!(index.normalized_authority_dump().unwrap(), before);
-        let stored: Option<String> = index
-            .conn
-            .query_row("select pool_id from object_copies", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(stored, None);
         assert_eq!(
-            index.find_native_object_copies("occupied").unwrap()[0]
+            index.find_native_object_instances("occupied").unwrap()[0]
                 .pool_id
                 .as_deref(),
             Some("new")
@@ -19983,13 +20013,13 @@ mod tests {
                     reason: "test".into()
                 })
                 .unwrap()
-                .copies_marked_missing,
+                .instances_marked_missing,
             1
         );
     }
 
     #[test]
-    fn object_copy_upsert_uses_current_tape_pool() {
+    fn object_instance_upsert_uses_current_tape_pool() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -20001,10 +20031,6 @@ mod tests {
         index
             .index_committed_tape_journal(input.clone(), &state)
             .expect("seed committed projection");
-        Connection::open(index.path())
-            .unwrap()
-            .execute("update object_copies set pool_id = 'pool.at.commit'", [])
-            .expect("seed copy pool snapshot");
         Connection::open(index.path())
             .unwrap()
             .execute(
@@ -20025,12 +20051,12 @@ mod tests {
             )
             .expect("project committed bundle again");
 
-        assert_eq!(report.object_copies_rebuilt, 1);
+        assert_eq!(report.object_instances_rebuilt, 1);
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
                 .query_row(
-                    "select t.pool_id from object_copies c join tapes t on t.tape_uuid=c.tape_uuid",
+                    "select t.pool_id from object_instances c join tapes t on t.tape_uuid=c.tape_uuid",
                     [],
                     |row| { row.get::<_, String>(0) }
                 )
@@ -20064,7 +20090,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-object-1"),
                 &[],
-                &[append_copy_projection("append-object-1", tape_uuid, 1)],
+                &[append_instance_projection("append-object-1", tape_uuid, 1)],
                 input.clone(),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -20085,7 +20111,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-object-2"),
                 &[],
-                &[append_copy_projection("append-object-2", tape_uuid, 2)],
+                &[append_instance_projection("append-object-2", tape_uuid, 2)],
                 input,
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -20148,7 +20174,7 @@ mod tests {
             crate::checkpoint::ObjectProjectionFixture {
                 object: append_object_projection(&object_1_text),
                 files: Vec::new(),
-                copy: append_copy_projection(&object_1_text, tape_uuid, 1),
+                instance: append_instance_projection(&object_1_text, tape_uuid, 1),
                 block_size: 256 * 1024,
                 block_count: 3,
                 fresh_tape: true,
@@ -20169,7 +20195,7 @@ mod tests {
             crate::checkpoint::ObjectProjectionFixture {
                 object: append_object_projection(&object_2_text),
                 files: Vec::new(),
-                copy: append_copy_projection(&object_2_text, tape_uuid, 2),
+                instance: append_instance_projection(&object_2_text, tape_uuid, 2),
                 block_size: 256 * 1024,
                 block_count: 2,
                 fresh_tape: false,
@@ -20337,21 +20363,21 @@ mod tests {
             &[(0, Some(0)), (1, Some(2)), (2, Some(6))],
             "native replay preserves ordinary file positions through terminal completion"
         );
-        // The per-copy wire span, through the copy→tape-file join.
-        let copies = index
-            .find_native_object_copies(&object_1_text)
-            .expect("query object-1 copies");
-        assert_eq!(copies[0].global_start_block, Some(2));
+        // The per-instance wire span, through the instance→tape-file join.
+        let instances = index
+            .find_native_object_instances(&object_1_text)
+            .expect("query object-1 instances");
+        assert_eq!(instances[0].global_start_block, Some(2));
         assert_eq!(
-            copies[0].global_end_block,
+            instances[0].global_end_block,
             Some(5),
             "span end is exclusive: the trailing filemark at 5 is outside"
         );
-        let copies = index
-            .find_native_object_copies(&object_2_text)
-            .expect("query object-2 copies");
-        assert_eq!(copies[0].global_start_block, Some(6));
-        assert_eq!(copies[0].global_end_block, Some(8));
+        let instances = index
+            .find_native_object_instances(&object_2_text)
+            .expect("query object-2 instances");
+        assert_eq!(instances[0].global_start_block, Some(6));
+        assert_eq!(instances[0].global_end_block, Some(8));
         // The written extent is the barrier measurement itself.
         let tape = index
             .get_tape(&tape_uuid)
@@ -20409,7 +20435,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("span-object"),
                 &[],
-                &[append_copy_projection("span-object", tape_uuid, 1)],
+                &[append_instance_projection("span-object", tape_uuid, 1)],
                 TapeJournalIndexInput {
                     block_size: 256 * 1024,
                     ..no_parity_append_input(tape_uuid)
@@ -20427,11 +20453,14 @@ mod tests {
                     .unwrap(),
             )
             .expect("seed pre-hint append prefix");
-        let copies = index
-            .find_native_object_copies("span-object")
-            .expect("query pre-hint copies");
+        let instances = index
+            .find_native_object_instances("span-object")
+            .expect("query pre-hint instances");
         assert_eq!(
-            (copies[0].global_start_block, copies[0].global_end_block),
+            (
+                instances[0].global_start_block,
+                instances[0].global_end_block
+            ),
             (None, None),
             "a record journalled before the hint existed reads as absent, not zero"
         );
@@ -20451,7 +20480,7 @@ mod tests {
         let object_projection = crate::checkpoint::ObjectProjectionFixture {
             object: append_object_projection("span-object"),
             files: Vec::new(),
-            copy: append_copy_projection("span-object", tape_uuid, 1),
+            instance: append_instance_projection("span-object", tape_uuid, 1),
             block_size: 256 * 1024,
             block_count: 3,
             fresh_tape: true,
@@ -20486,7 +20515,7 @@ mod tests {
             seal_due: None,
         };
         let original = index.get_native_object("span-object").unwrap().unwrap();
-        Connection::open(index.path()).unwrap().execute_batch("delete from object_copies; delete from objects; delete from tape_files; delete from catalog_units;").unwrap();
+        Connection::open(index.path()).unwrap().execute_batch("delete from object_instances; delete from objects; delete from tape_files; delete from catalog_units;").unwrap();
         index
             .project_checkpoint_record(&record)
             .expect("replay repairs pre-hint rows without conflicting");
@@ -20511,11 +20540,11 @@ mod tests {
             )
             .unwrap();
 
-        let copies = index
-            .find_native_object_copies("span-object")
-            .expect("query repaired copies");
-        assert_eq!(copies[0].global_start_block, Some(2));
-        assert_eq!(copies[0].global_end_block, Some(5));
+        let instances = index
+            .find_native_object_instances("span-object")
+            .expect("query repaired instances");
+        assert_eq!(instances[0].global_start_block, Some(2));
+        assert_eq!(instances[0].global_end_block, Some(5));
         let checkpoint_file_count: u64 = Connection::open(index.path())
             .unwrap()
             .query_row(
@@ -20533,11 +20562,11 @@ mod tests {
         index
             .project_checkpoint_record(&record)
             .expect("hinted rows and synthesised spans agree");
-        let copies = index
-            .find_native_object_copies("span-object")
-            .expect("query stable copies");
-        assert_eq!(copies[0].global_start_block, Some(2));
-        assert_eq!(copies[0].global_end_block, Some(5));
+        let instances = index
+            .find_native_object_instances("span-object")
+            .expect("query stable instances");
+        assert_eq!(instances[0].global_start_block, Some(2));
+        assert_eq!(instances[0].global_end_block, Some(5));
     }
 
     #[test]
@@ -20665,10 +20694,10 @@ mod tests {
             objects: vec![crate::checkpoint::ObjectProjectionFixture {
                 object: append_object_projection("extent-object"),
                 files: Vec::new(),
-                copy: NativeObjectCopyProjectionInput {
+                instance: NativeObjectInstanceProjectionInput {
                     first_parity_data_ordinal: Some(0),
                     protected_until_ordinal: Some(0),
-                    ..append_copy_projection("extent-object", tape_uuid, 1)
+                    ..append_instance_projection("extent-object", tape_uuid, 1)
                 },
                 block_size: 256 * 1024,
                 block_count: 4,
@@ -20706,7 +20735,7 @@ mod tests {
                 .unwrap();
             let mut gapped = record.clone();
             gapped.next_tape_file_number = 5;
-            gapped.objects[0].copy.tape_file_number = 3;
+            gapped.objects[0].instance.tape_file_number = 3;
             gapped.objects[0].object_recovery_row.tape_file_number = 3;
             gapped.object_tape_file_bundles[0].entries[0].tape_file_number = 3;
             gapped.barrier_bundle.as_mut().unwrap().entries[0].tape_file_number = 4;
@@ -20808,7 +20837,7 @@ mod tests {
             objects: vec![crate::checkpoint::ObjectProjectionFixture {
                 object,
                 files: Vec::new(),
-                copy: append_copy_projection(&object_id, tape_uuid, 3),
+                instance: append_instance_projection(&object_id, tape_uuid, 3),
                 block_size: 256 * 1024,
                 block_count: 2,
                 fresh_tape: false,
@@ -20845,10 +20874,10 @@ mod tests {
         );
         assert!(
             index
-                .find_native_object_copies(&object_id)
-                .expect("query object copies")
+                .find_native_object_instances(&object_id)
+                .expect("query object instances")
                 .is_empty(),
-            "refused checkpoint must not publish a copy"
+            "refused checkpoint must not publish an instance"
         );
     }
 
@@ -20876,7 +20905,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-seed"),
                 &[],
-                &[append_copy_projection("append-seed", tape_uuid, 1)],
+                &[append_instance_projection("append-seed", tape_uuid, 1)],
                 input.clone(),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -20896,7 +20925,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-gap"),
                 &[],
-                &[append_copy_projection("append-gap", tape_uuid, 3)],
+                &[append_instance_projection("append-gap", tape_uuid, 3)],
                 input,
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -20953,7 +20982,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-overlap"),
                 &[],
-                &[append_copy_projection("append-overlap", tape_uuid, 1)],
+                &[append_instance_projection("append-overlap", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -21011,7 +21040,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-ingested"),
                 &[],
-                &[append_copy_projection("append-ingested", tape_uuid, 1)],
+                &[append_instance_projection("append-ingested", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -21074,7 +21103,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-duplicate"),
                 &[],
-                &[append_copy_projection("append-duplicate", tape_uuid, 1)],
+                &[append_instance_projection("append-duplicate", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -21130,7 +21159,7 @@ mod tests {
             .project_native_object_append_commit(
                 append_object_projection("append-bad-total"),
                 &[],
-                &[append_copy_projection("append-bad-total", tape_uuid, 1)],
+                &[append_instance_projection("append-bad-total", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
@@ -21163,7 +21192,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_append_projection_rejects_copy_tape_file_mismatch_before_rows() {
+    fn strict_append_projection_rejects_instance_tape_file_mismatch_before_rows() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -21184,15 +21213,19 @@ mod tests {
 
         let err = index
             .project_native_object_append_commit(
-                append_object_projection("append-copy-mismatch"),
+                append_object_projection("append-instance-mismatch"),
                 &[],
-                &[append_copy_projection("append-copy-mismatch", tape_uuid, 9)],
+                &[append_instance_projection(
+                    "append-instance-mismatch",
+                    tape_uuid,
+                    9,
+                )],
                 no_parity_append_input(tape_uuid),
                 &(&FileRowsReport {
                     kind: FileRowsKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
-                        append_object_entry("append-copy-mismatch", 1, 3),
+                        append_object_entry("append-instance-mismatch", 1, 3),
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
@@ -21200,7 +21233,7 @@ mod tests {
                     .try_into()
                     .unwrap(),
             )
-            .expect_err("append projection must reject copy/bundle mismatch");
+            .expect_err("append projection must reject instance/bundle mismatch");
 
         assert!(
             matches!(err, StateError::IndexCorrupt(ref message)
@@ -21258,7 +21291,7 @@ mod tests {
                     mtime: None,
                     executable: None,
                 }],
-                &[NativeObjectCopyProjectionInput {
+                &[NativeObjectInstanceProjectionInput {
                     object_id: object_id.to_string(),
                     tape_uuid,
                     tape_file_number: u64::MAX,
@@ -21266,7 +21299,7 @@ mod tests {
                     first_parity_data_ordinal: Some(u64::MAX),
                     protected_until_ordinal: Some(u64::MAX),
                     status: "committed".to_string(),
-                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                     recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x32; 32]),
@@ -21306,14 +21339,14 @@ mod tests {
             .get_native_object(object_id)
             .expect("query native object")
             .is_some());
-        let copies = index
-            .find_native_object_copies(object_id)
-            .expect("query native object copies");
-        assert_eq!(copies.len(), 1);
-        assert_eq!(copies[0].tape_file_number, u64::MAX);
-        assert_eq!(copies[0].first_body_lba, u64::MAX);
-        assert_eq!(copies[0].first_parity_data_ordinal, Some(u64::MAX));
-        assert_eq!(copies[0].protected_until_ordinal, Some(u64::MAX));
+        let instances = index
+            .find_native_object_instances(object_id)
+            .expect("query native object instances");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].tape_file_number, u64::MAX);
+        assert_eq!(instances[0].first_body_lba, u64::MAX);
+        assert_eq!(instances[0].first_parity_data_ordinal, Some(u64::MAX));
+        assert_eq!(instances[0].protected_until_ordinal, Some(u64::MAX));
         let files = index
             .list_native_object_files(object_id)
             .expect("list native object files");
@@ -21348,7 +21381,7 @@ mod tests {
                     metadata_hash: Some(vec![2u8; 32]),
                     created_at_utc: Some("2026-05-28T10:00:00Z".to_string()),
                 },
-                &[NativeObjectCopyProjectionInput {
+                &[NativeObjectInstanceProjectionInput {
                     object_id: "object-1".to_string(),
                     tape_uuid,
                     tape_file_number: 9,
@@ -21356,7 +21389,7 @@ mod tests {
                     first_parity_data_ordinal: Some(3),
                     protected_until_ordinal: Some(10),
                     status: "committed".to_string(),
-                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                     recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x33; 32]),
@@ -21379,16 +21412,18 @@ mod tests {
             objects[0].metadata_hash_algorithm.as_deref(),
             Some(DIGEST_ALGORITHM_SHA256)
         );
-        assert_eq!(objects[0].copies.len(), 1);
-        assert_eq!(objects[0].copies[0].tape_file_number, 9);
-        assert_eq!(objects[0].copies[0].first_parity_data_ordinal, Some(3));
-        assert_eq!(objects[0].copies[0].pool_id, None);
+        assert_eq!(objects[0].instances.len(), 1);
+        assert_eq!(objects[0].instances[0].tape_file_number, 9);
+        assert_eq!(objects[0].instances[0].first_parity_data_ordinal, Some(3));
+        assert_eq!(objects[0].instances[0].pool_id, None);
         assert_eq!(
-            objects[0].copies[0].plaintext_digest_algorithm.as_deref(),
+            objects[0].instances[0]
+                .plaintext_digest_algorithm
+                .as_deref(),
             Some(DIGEST_ALGORITHM_SHA256)
         );
         assert_eq!(
-            objects[0].copies[0].stored_digest_algorithm.as_deref(),
+            objects[0].instances[0].stored_digest_algorithm.as_deref(),
             Some(DIGEST_ALGORITHM_SHA256)
         );
 
@@ -21427,9 +21462,9 @@ mod tests {
             .is_none());
         assert_eq!(
             index
-                .find_native_object_copies("object-1")
-                .expect("find object copies"),
-            objects[0].copies
+                .find_native_object_instances("object-1")
+                .expect("find object instances"),
+            objects[0].instances
         );
         let reader = crate::CatalogReader::open(index.path()).expect("open streaming reader");
         let mut streamed_objects = Vec::new();
@@ -21476,7 +21511,7 @@ mod tests {
     }
 
     #[test]
-    fn native_object_pool_caller_lookup_scopes_to_committed_pool_copy() {
+    fn native_object_pool_caller_lookup_scopes_to_committed_pool_instance() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -21547,7 +21582,7 @@ mod tests {
                         metadata_hash: Some(vec![0x44; 32]),
                         created_at_utc: Some("2026-07-05T12:00:00Z".to_string()),
                     },
-                    &[NativeObjectCopyProjectionInput {
+                    &[NativeObjectInstanceProjectionInput {
                         object_id: object_id.to_string(),
                         tape_uuid,
                         tape_file_number: 1,
@@ -21555,7 +21590,7 @@ mod tests {
                         first_parity_data_ordinal: None,
                         protected_until_ordinal: None,
                         status: status.to_string(),
-                        representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                        representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                         recipient_epoch_ids: None,
                         metadata_frame_len: None,
                         plaintext_digest: Some(vec![0x55; 32]),
@@ -21567,7 +21602,7 @@ mod tests {
 
         index
             .with_core(|core| {
-                core.remove_copy_pool_fixture();
+                core.remove_instance_pool_fixture();
                 Ok(())
             })
             .unwrap();
@@ -21582,9 +21617,9 @@ mod tests {
             .expect("pool-a object");
         assert_eq!(pool_a.object_id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         assert_eq!(pool_a.content_hash.as_deref(), Some(&[0x11; 32][..]));
-        assert_eq!(pool_a.copies.len(), 1);
-        assert_eq!(pool_a.copies[0].pool_id.as_deref(), Some("pool-a"));
-        assert_eq!(pool_a.copies[0].status, "committed");
+        assert_eq!(pool_a.instances.len(), 1);
+        assert_eq!(pool_a.instances[0].pool_id.as_deref(), Some("pool-a"));
+        assert_eq!(pool_a.instances[0].status, "committed");
 
         let pool_b = index
             .get_native_object_by_pool_and_caller_object_id("pool-b", "shared-caller")
@@ -21592,8 +21627,8 @@ mod tests {
             .expect("pool-b object");
         assert_eq!(pool_b.object_id, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
         assert_eq!(pool_b.content_hash.as_deref(), Some(&[0x22; 32][..]));
-        assert_eq!(pool_b.copies.len(), 1);
-        assert_eq!(pool_b.copies[0].pool_id.as_deref(), Some("pool-b"));
+        assert_eq!(pool_b.instances.len(), 1);
+        assert_eq!(pool_b.instances[0].pool_id.as_deref(), Some("pool-b"));
 
         assert!(index
             .get_native_object_by_pool_and_caller_object_id("pool-missing", "shared-caller")
@@ -21602,7 +21637,7 @@ mod tests {
         Connection::open(index.path())
             .unwrap()
             .execute(
-                "update object_copies set status = 'missing' where tape_uuid in (select tape_uuid from tapes where pool_id = 'pool-b')",
+                "update object_instances set status = 'missing' where tape_uuid in (select tape_uuid from tapes where pool_id = 'pool-b')",
                 [],
             )
             .unwrap();
@@ -21616,7 +21651,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_native_object_copy_projection_persists_envelope_fields() {
+    fn encrypted_native_object_instance_projection_persists_envelope_fields() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -21644,7 +21679,7 @@ mod tests {
                     created_at_utc: Some("2026-06-11T19:00:00Z".to_string()),
                 },
                 &[],
-                &[NativeObjectCopyProjectionInput {
+                &[NativeObjectInstanceProjectionInput {
                     object_id: object_id.to_string(),
                     tape_uuid,
                     tape_file_number: 2,
@@ -21652,7 +21687,7 @@ mod tests {
                     first_parity_data_ordinal: Some(24),
                     protected_until_ordinal: Some(31),
                     status: "committed".to_string(),
-                    representation: OBJECT_COPY_REPRESENTATION_ENCRYPTED.to_string(),
+                    representation: OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED.to_string(),
                     recipient_epoch_ids: Some(recipient_epoch_ids.clone()),
                     metadata_frame_len: Some(66),
                     plaintext_digest: Some(vec![0x44; 32]),
@@ -21685,24 +21720,27 @@ mod tests {
                     .try_into()
                     .unwrap(),
             )
-            .expect("project encrypted object copy");
+            .expect("project encrypted object instance");
 
-        let copies = index
-            .find_native_object_copies(object_id)
-            .expect("find encrypted object copies");
-        assert_eq!(copies.len(), 1);
-        assert_eq!(copies[0].first_body_lba, 7);
+        let instances = index
+            .find_native_object_instances(object_id)
+            .expect("find encrypted object instances");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].first_body_lba, 7);
         assert_eq!(
-            copies[0].representation,
-            OBJECT_COPY_REPRESENTATION_ENCRYPTED
+            instances[0].representation,
+            OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED
         );
         assert_eq!(
-            copies[0].recipient_epoch_ids.as_deref(),
+            instances[0].recipient_epoch_ids.as_deref(),
             Some(recipient_epoch_ids.as_slice())
         );
-        assert_eq!(copies[0].metadata_frame_len, Some(66));
-        assert_eq!(copies[0].plaintext_digest.as_deref(), Some(&[0x44; 32][..]));
-        assert_eq!(copies[0].stored_digest.as_deref(), Some(&[0x55; 32][..]));
+        assert_eq!(instances[0].metadata_frame_len, Some(66));
+        assert_eq!(
+            instances[0].plaintext_digest.as_deref(),
+            Some(&[0x44; 32][..])
+        );
+        assert_eq!(instances[0].stored_digest.as_deref(), Some(&[0x55; 32][..]));
 
         let (
             representation,
@@ -21715,7 +21753,7 @@ mod tests {
             .query_row(
                 "select representation, recipient_epoch_ids, metadata_frame_len,
                         plaintext_digest, stored_digest
-                 from object_copies where object_id = ?1",
+                 from object_instances where object_id = ?1",
                 params![object_id],
                 |row| {
                     Ok((
@@ -21727,8 +21765,8 @@ mod tests {
                     ))
                 },
             )
-            .expect("read raw object copy row");
-        assert_eq!(representation, OBJECT_COPY_REPRESENTATION_ENCRYPTED);
+            .expect("read raw object instance row");
+        assert_eq!(representation, OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED);
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&stored_recipient_epoch_ids).unwrap(),
             recipient_epoch_ids
@@ -21739,10 +21777,10 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_object_copy_projection_rejects_metadata_frame_len_out_of_bounds() {
+    fn encrypted_object_instance_projection_rejects_metadata_frame_len_out_of_bounds() {
         for metadata_frame_len in [0, 16, 16 * 1024 * 1024 + 1] {
-            let err = validate_object_copy_envelope(
-                Some(OBJECT_COPY_REPRESENTATION_ENCRYPTED),
+            let err = validate_object_instance_envelope(
+                Some(OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED),
                 Some(&["24242424242424242424242424242424".to_string()]),
                 Some(metadata_frame_len),
             )
@@ -21796,17 +21834,20 @@ mod tests {
             )
             .expect("index journal without object recovery row");
 
-        let copies = index
-            .find_native_object_copies(object_id)
-            .expect("find object copies");
-        assert_eq!(copies.len(), 1);
-        assert_eq!(copies[0].representation, OBJECT_COPY_REPRESENTATION_UNKNOWN);
-        assert!(copies[0].recipient_epoch_ids.is_none());
-        assert!(copies[0].metadata_frame_len.is_none());
+        let instances = index
+            .find_native_object_instances(object_id)
+            .expect("find object instances");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(
+            instances[0].representation,
+            OBJECT_INSTANCE_REPRESENTATION_UNKNOWN
+        );
+        assert!(instances[0].recipient_epoch_ids.is_none());
+        assert!(instances[0].metadata_frame_len.is_none());
     }
 
     #[test]
-    fn journal_object_recovery_row_projects_encrypted_copy_fields() {
+    fn journal_object_recovery_row_projects_encrypted_instance_fields() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -21856,16 +21897,16 @@ mod tests {
             )
             .expect("index journal with encrypted object recovery row");
 
-        let copies = index
-            .find_native_object_copies(object_id)
-            .expect("find object copies");
-        assert_eq!(copies.len(), 1);
+        let instances = index
+            .find_native_object_instances(object_id)
+            .expect("find object instances");
+        assert_eq!(instances.len(), 1);
         assert_eq!(
-            copies[0].representation,
-            OBJECT_COPY_REPRESENTATION_ENCRYPTED
+            instances[0].representation,
+            OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED
         );
         assert_eq!(
-            copies[0].recipient_epoch_ids.as_deref(),
+            instances[0].recipient_epoch_ids.as_deref(),
             Some(
                 [
                     "35353535353535353535353535353535".to_string(),
@@ -21874,7 +21915,7 @@ mod tests {
                 .as_slice()
             )
         );
-        assert_eq!(copies[0].metadata_frame_len, Some(66));
+        assert_eq!(instances[0].metadata_frame_len, Some(66));
     }
 
     #[test]
@@ -21913,7 +21954,7 @@ mod tests {
                     metadata_hash: None,
                     created_at_utc: Some("2026-05-28T10:05:00Z".to_string()),
                 },
-                &[NativeObjectCopyProjectionInput {
+                &[NativeObjectInstanceProjectionInput {
                     object_id: "object-1".to_string(),
                     tape_uuid,
                     tape_file_number: 1,
@@ -21921,7 +21962,7 @@ mod tests {
                     first_parity_data_ordinal: Some(0),
                     protected_until_ordinal: Some(3),
                     status: "committed".to_string(),
-                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                    representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                     recipient_epoch_ids: None,
                     metadata_frame_len: None,
                     plaintext_digest: Some(vec![0x34; 32]),
@@ -22058,7 +22099,7 @@ mod tests {
 
         assert_eq!(report.tapes_rebuilt, 1);
         assert_eq!(report.tape_files_rebuilt, 4);
-        assert_eq!(report.object_copies_rebuilt, 1);
+        assert_eq!(report.object_instances_rebuilt, 1);
         assert_eq!(report.audit_records_replayed, 0);
         assert_eq!(report.journal_records_replayed, 1);
         assert_eq!(catalog_snapshot(&rebuilt), expected);
@@ -23495,87 +23536,141 @@ mod tests {
             .expect_err("actor/key-only compatibility lookup must fail closed");
         assert!(matches!(ambiguous, StateError::AmbiguousCatalogLookup(_)));
     }
-    /// SQLite rejects dropping a column used by an index or view. Roll back the
-    /// probe so schema-25 catalogs retain the compatibility column and its data.
-    fn assert_no_instance_pool_schema_readers(conn: &Connection) {
-        conn.execute_batch("savepoint instance_pool_schema_probe")
-            .unwrap();
-        let result = conn.execute_batch("alter table object_copies drop column pool_id");
-        conn.execute_batch(
-            "rollback to instance_pool_schema_probe; release instance_pool_schema_probe",
-        )
-        .unwrap();
-        result.expect("no index or view may read object_copies.pool_id");
+    /// Capture every SQLite value, preserving BLOB bytes, NULLs and storage types.
+    fn migration_rows(conn: &Connection, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn.prepare(query).unwrap();
+        let width = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..width)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
     }
 
-    /// Existing schema-24 catalogs take one transactional bookkeeping migration;
-    /// opening them does not rebuild or change the production authority.
-    #[test]
-    fn b4b1_schema24_migrates_through_existing_path() {
+    /// Compare all schema objects, including autoindexes and triggers. SQLite
+    /// removes IF NOT EXISTS on storage; only SQL whitespace is normalized.
+    fn migration_schema(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("select type, name, tbl_name, sql from sqlite_master order by type, name")
+            .unwrap();
+        stmt.query_map([], |row| {
+            let sql: Option<String> = row.get(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                sql.map(|sql| sql.split_whitespace().collect::<Vec<_>>().join(" ")),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// Real predecessor DDL must upgrade to the entire fresh schema without
+    /// changing any retained instance value or other projection/bookkeeping row.
+    fn assert_predecessor_instances_migrate(version: u32, fixture: &str) {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
-        {
-            let catalog = crate::projector::open(&path).unwrap();
-            let writer = catalog.write_handle();
-            writer.with_core(|core| {
-            assert_no_instance_pool_schema_readers(&core.conn);
-            core.conn.execute_batch("create index object_copies_pool_idx on object_copies(pool_id) where pool_id is not null").unwrap();
-            core.conn.execute_batch("insert into tapes(tape_uuid,pool_id,state,updated_at_utc) values(X'01','current','ready','test'); insert into objects(object_id,body_format,created_at_utc) values('migration-copy','rem-object-v1','test'); insert into object_copies(object_id,tape_uuid,tape_file_number,status,pool_id) values('migration-copy',X'01',X'0000000000000001','committed','historical')").unwrap();
-            let names:Vec<String>={let mut stmt=core.conn.prepare("select name from sqlite_master where type='table' and (name like 'library_%' or name in ('projection_sources','tape_projection_sources','tape_projection_chunks'))").unwrap();let rows=stmt.query_map([],|r|r.get(0)).unwrap();rows.collect::<Result<_,_>>().unwrap()};
-            for name in names {core.conn.execute_batch(&format!("drop table {name}")).unwrap();}
-            core.conn.execute_batch("pragma user_version=24; update schema_meta set value=X'3234' where key='schema_version'").unwrap();Ok(())
-        }).unwrap();
-        }
-        let catalog = crate::projector::open(&path).unwrap();
-        let writer = catalog.write_handle();
-        assert_eq!(writer.schema_version().unwrap(), SCHEMA_VERSION);
-        writer
-            .with_core(|core| {
-                assert_no_instance_pool_schema_readers(&core.conn);
-                let count: u64 = core
-                    .conn
-                    .query_row("select count(*) from library_projection_records", [], |r| {
-                        r.get(0)
-                    })
-                    .unwrap();
-                assert_eq!(count, 0);
-                let pool: String = core
-                    .conn
-                    .query_row(
-                        "select pool_id from object_copies where object_id='migration-copy'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(pool, "historical");
-                assert_eq!(
-                    core.find_native_object_copies("migration-copy")?
-                        .first()
-                        .unwrap()
-                        .pool_id
-                        .as_deref(),
-                    Some("current")
-                );
-                Ok(())
-            })
-            .unwrap();
-        writer.with_core(|core| {
-            core.conn.execute_batch("create index object_copies_pool_idx on object_copies(pool_id) where pool_id is not null").unwrap();
-            Ok(())
-        }).unwrap();
-        drop(writer);
-        drop(catalog);
-        let reopened = crate::projector::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(fixture).unwrap();
         assert_eq!(
-            reopened.write_handle().schema_version().unwrap(),
+            conn.query_row("pragma user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            version
+        );
+        let columns = "object_id,tape_uuid,tape_file_number,first_body_lba,first_parity_data_ordinal,protected_until_ordinal,status,representation,recipient_epoch_ids,metadata_frame_len,plaintext_digest,plaintext_digest_algorithm,stored_digest,stored_digest_algorithm";
+        let query = |table| {
+            format!("select {columns} from {table} order by object_id,tape_uuid,tape_file_number")
+        };
+        let before = migration_rows(&conn, &query("object_copies"));
+        assert_eq!(before.len(), 4);
+        let tables: Vec<String> = conn
+            .prepare("select name from sqlite_master where type='table' and name not in ('object_copies','schema_meta') order by name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let preserved: Vec<_> = tables
+            .iter()
+            .map(|table| {
+                let query = format!("select * from {table} order by rowid");
+                let rows = migration_rows(&conn, &query);
+                // Every library table introduced by schema 25 is populated, as are
+                // all tape bookkeeping tables already present in schema 24.
+                if table.starts_with("library_")
+                    || matches!(
+                        table.as_str(),
+                        "projection_sources"
+                            | "tape_projection_sources"
+                            | "tape_projection_chunks"
+                            | "tape_log_projection"
+                            | "tape_log_object_commits"
+                            | "tape_audit_cursors"
+                            | "tape_assignment_replay_baselines"
+                            | "tape_pool_assignments"
+                    )
+                {
+                    assert!(!rows.is_empty(), "empty bookkeeping fixture: {table}");
+                }
+                (query, rows)
+            })
+            .collect();
+        drop(conn);
+        let catalog = crate::projector::open(&path).unwrap();
+        assert_eq!(
+            catalog.write_handle().schema_version().unwrap(),
             SCHEMA_VERSION
         );
-        reopened
-            .write_handle()
-            .with_core(|core| {
-                assert_no_instance_pool_schema_readers(&core.conn);
-                Ok(())
-            })
-            .unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(migration_rows(&conn, &query("object_instances")), before);
+        for (query, rows) in &preserved {
+            assert_eq!(
+                &migration_rows(&conn, query),
+                rows,
+                "schema {version}: {query}"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "select value from schema_meta where key='schema_version'",
+                [],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            b"26"
+        );
+        assert!(!table_column_exists(&conn, "object_instances", "pool_id").unwrap());
+        assert!(!table_exists(&conn, "object_copies").unwrap());
+        let pool: String = conn.query_row("select t.pool_id from object_instances i join tapes t using(tape_uuid) where i.tape_file_number=X'FFFFFFFFFFFFFFFF'", [], |r| r.get(0)).unwrap();
+        assert_eq!(pool, "current");
+        let fresh_path = root.path().join("fresh.sqlite");
+        let _fresh = crate::projector::open(&fresh_path).unwrap();
+        assert_eq!(
+            migration_schema(&conn),
+            migration_schema(&Connection::open(fresh_path).unwrap())
+        );
+        // Reopening a migrated catalog must not reapply bookkeeping creation.
+        drop(catalog);
+        drop(crate::projector::open(&path).unwrap());
+        for (query, rows) in &preserved {
+            assert_eq!(&migration_rows(&conn, query), rows);
+        }
+    }
+
+    /// B4b-1 schema 25 already contains populated library projection bookkeeping.
+    #[test]
+    fn schema25_instances_migrate_without_pool_and_preserve_rows() {
+        assert_predecessor_instances_migrate(25, include_str!("../../tests/fixtures/schema25.sql"));
+    }
+
+    /// Schema 24 first adds library bookkeeping, then performs the same upgrade.
+    #[test]
+    fn schema24_instances_migrate_without_pool_and_preserve_rows() {
+        assert_predecessor_instances_migrate(24, include_str!("../../tests/fixtures/schema24.sql"));
     }
 }

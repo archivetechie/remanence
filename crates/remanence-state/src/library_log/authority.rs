@@ -12,9 +12,9 @@ use std::{
 /// Tape-summary adapter. Implementations must remain stable while the caller
 /// holds the same tape admission ownership through this library append.
 pub trait FinalizationView {
-    /// Committed copy count from the native summary or projection. The caller
+    /// Committed instance count from the native summary or projection. The caller
     /// keeps tape admission ownership stable through this append, as above.
-    fn committed_copy_count(&self, tape: TapeRef) -> u64;
+    fn committed_instance_count(&self, tape: TapeRef) -> u64;
     /// An outstanding manual Prepared, or an automatic seal, forbids changing identity or assignment.
     fn finalization_blocks_change(&self, tape: TapeRef) -> bool;
 }
@@ -38,12 +38,12 @@ pub enum AuthorityError {
     #[error("finalization protects {0:?}")]
     FinalizationInProgress(TapeRef),
     /// Pool changes are forbidden while a tape holds committed data.
-    #[error("tape {tape_uuid} holds {copy_count} committed instances; a tape holding data cannot change pool; it can only be retired")]
-    TapeHoldsCommittedCopies {
+    #[error("tape {tape_uuid} holds {instance_count} committed instances; a tape holding data cannot change pool; it can only be retired")]
+    TapeHoldsCommittedInstances {
         /// Occupied tape identity.
         tape_uuid: uuid::Uuid,
-        /// Committed copies observed under append/admission ownership.
-        copy_count: u64,
+        /// Committed instances observed under append/admission ownership.
+        instance_count: u64,
     },
     /// Do not invent caller-chosen operation identities.
     #[error("operation acceptance must mint a fresh identity")]
@@ -193,11 +193,11 @@ impl LibraryAuthority {
                             .get(&assignment.tape.uuid)
                             .is_some_and(|state| state.pool != assignment.pool)
                         {
-                            let copy_count = summary.committed_copy_count(assignment.tape);
-                            if copy_count != 0 {
-                                return Err(StoreError::TapeHoldsCommittedCopies {
+                            let instance_count = summary.committed_instance_count(assignment.tape);
+                            if instance_count != 0 {
+                                return Err(StoreError::TapeHoldsCommittedInstances {
                                     tape_uuid: uuid::Uuid::from_bytes(assignment.tape.uuid),
-                                    copy_count,
+                                    instance_count,
                                 });
                             }
                         }
@@ -230,14 +230,14 @@ impl LibraryAuthority {
                 if let StoreError::FinalizationInProgress(tape) = error {
                     return AuthorityError::FinalizationInProgress(tape);
                 }
-                if let StoreError::TapeHoldsCommittedCopies {
+                if let StoreError::TapeHoldsCommittedInstances {
                     tape_uuid,
-                    copy_count,
+                    instance_count,
                 } = error
                 {
-                    return AuthorityError::TapeHoldsCommittedCopies {
+                    return AuthorityError::TapeHoldsCommittedInstances {
                         tape_uuid,
-                        copy_count,
+                        instance_count,
                     };
                 }
                 if let StoreError::Fold(ref fold_error) = error {
@@ -778,7 +778,7 @@ mod refusal_delivery_tests {
 
     struct Free;
     impl FinalizationView for Free {
-        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+        fn committed_instance_count(&self, _: TapeRef) -> u64 {
             0
         }
         fn finalization_blocks_change(&self, _: TapeRef) -> bool {

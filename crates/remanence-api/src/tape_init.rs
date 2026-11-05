@@ -256,20 +256,20 @@ pub struct TapeInitCatalogProjection {
     pub catalog_row: Option<CatalogTapeInitRow>,
     /// Barcode lifecycle projected from current catalog rows.
     pub barcode_state: LabelLifecycleState,
-    /// Committed-copy snapshot state for the tape under consideration.
+    /// Current tape-pool attribution of committed instances for the tape under consideration.
     pub committed_copies: CommittedCopyState,
     /// Non-fatal projection notes for deferred identity features.
     pub notes: Vec<String>,
 }
 
-/// Committed-copy snapshot state for the tape under consideration.
+/// Current tape-pool attribution of committed instances for the tape under consideration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommittedCopyState {
-    /// No committed copies reference the tape.
+    /// No committed instances reference the tape.
     None,
-    /// Committed copies exist and snapshot this pool id.
+    /// Committed instances exist on a tape currently assigned to this pool.
     Pool(String),
-    /// Committed copies exist but have no pool snapshot.
+    /// Committed instances exist on a tape with no current pool.
     UnknownPool,
 }
 
@@ -326,18 +326,18 @@ pub enum TapeInitError {
     },
     /// Physical data exists after the bootstrap.
     PhysicalDataPastBootstrap,
-    /// Committed copies reference this tape.
+    /// Committed instances reference this tape.
     CommittedCopiesPresent,
-    /// Committed copy pool snapshot conflicts with the derived pool.
+    /// The current pool of a tape with committed instances conflicts with the derived pool.
     TapePoolAssignmentConflict {
-        /// Pool of the tape holding committed copies; `None` means unknown/unassigned.
+        /// Pool of the tape holding committed instances; `None` means unknown/unassigned.
         committed_pool: Option<String>,
         /// Pool derived from the physical barcode.
         derived_pool: String,
     },
     /// Bootstrap and catalog geometry differ but the tape appears unwritten.
     GeometryMismatch,
-    /// The catalog says the tape is not unwritten, even though no copy rows
+    /// The catalog says the tape is not unwritten, even though no instance rows
     /// were projected into the decision input.
     CatalogIndicatesWritten,
 }
@@ -389,10 +389,10 @@ pub struct TapeInitWriteOptions {
 }
 
 /// Proof that an operator-named BOT UUID matched an unknown-identity init
-/// decision with no committed copies referencing it.
+/// decision with no committed instances referencing it.
 ///
 /// Only [`match_unknown_tape_clobber`] constructs this, so the write gate
-/// cannot be handed a named clobber that skipped the committed-copy check.
+/// cannot be handed a named clobber that skipped the committed-instance check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnknownTapeClobber {
     bot_uuid: TapeUuid,
@@ -445,7 +445,7 @@ pub enum UnknownTapeClobberRefusal {
         /// UUID actually found at BOT.
         bot_uuid: TapeUuid,
     },
-    /// Committed copies in this catalog still reference the BOT UUID, so the
+    /// Committed instances in this catalog still reference the BOT UUID, so the
     /// identity is not unknown even though its tape row is absent.
     CommittedCopiesPresent {
         /// UUID found at BOT.
@@ -463,7 +463,7 @@ pub enum UnknownTapeClobberRefusal {
 ///
 /// Succeeds, returning the proof the write gate requires, only when the decision is
 /// `NeedsExplicitRebuild { MissingCatalogRow { bot_uuid } }`, `requested`
-/// equals `bot_uuid` exactly, and no committed copy references that UUID. The
+/// equals `bot_uuid` exactly, and no committed instance references that UUID. The
 /// caller must still obtain the ordinary typed data-clobber confirmation.
 pub fn match_unknown_tape_clobber(
     decision: &InitDecision,
@@ -496,7 +496,7 @@ pub fn match_unknown_tape_clobber(
 ///
 /// This function encodes the safety gauntlet for already-projected facts:
 /// blank is only BLANK CHECK/EOD, read errors fail closed, readable foreign or
-/// unrecognized data refuses, and committed-copy pool conflicts are anomalies.
+/// unrecognized data refuses, and committed-instance pool conflicts are anomalies.
 pub fn decide_tape_init(
     bot: &BotClassification,
     catalog_row: Option<&CatalogTapeInitRow>,
@@ -1359,7 +1359,7 @@ fn committed_copy_state_for_tape(
     tape_uuid: &[u8],
     derived_pool: &str,
 ) -> Result<CommittedCopyState, StateError> {
-    let pools = catalog.committed_copy_pool_snapshots(tape_uuid)?;
+    let pools = catalog.committed_instance_pool_snapshots(tape_uuid)?;
     if pools.is_empty() {
         return Ok(CommittedCopyState::None);
     }
@@ -2907,7 +2907,7 @@ mod tests {
                 bot_uuid: BOT_UUID,
             })
         );
-        // Copies still indexed under the BOT UUID mean the identity is known.
+        // Instances still indexed under the BOT UUID mean the identity is known.
         let copies = CommittedCopyState::Pool(POOL_A.into());
         let decision = decide(
             &ours_bot(),
@@ -2921,7 +2921,7 @@ mod tests {
             match_unknown_tape_clobber(&decision, &copies, BOT_UUID),
             Err(UnknownTapeClobberRefusal::CommittedCopiesPresent { bot_uuid: BOT_UUID })
         );
-        // Copies with no recorded pool are a pool-conflict anomaly first.
+        // Instances with no recorded pool are a pool-conflict anomaly first.
         let copies = CommittedCopyState::UnknownPool;
         let decision = decide(
             &ours_bot(),

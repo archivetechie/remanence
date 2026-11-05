@@ -1542,7 +1542,7 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
     );
     let mismatch =
         format!("--clobber-unknown-tape {wrong} does not match BOT uuid {bot}; no write attempted");
-    // An orphan copy has no tape-level pool authority.
+    // An orphan instance has no tape-level pool authority.
     let copies = "pool assignment conflict: committed=unknown derived=default";
     let named = [
         "--clobber-data",
@@ -1620,12 +1620,12 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
             .unwrap()
             .put_tape_in_drive(0x100, "STRAY", None, tape);
         if seed_copy {
-            // A committed copy on the BOT UUID with no tape row for it.
+            // A committed instance on the BOT UUID with no tape row for it.
             let config = remanence_state::load_config(f.config()).unwrap();
             rusqlite::Connection::open(config.index.sqlite_path)
                 .unwrap()
                 .execute(
-                    "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+                    "insert into object_instances(object_id, tape_uuid, tape_file_number, status)
                      values('seeded-object', ?1, ?2, 'committed')",
                     rusqlite::params![
                         uuid::Uuid::parse_str(bot).unwrap().as_bytes().to_vec(),
@@ -2075,7 +2075,7 @@ fn other_cartridge_write_depends_on_recorded_endpoint() {
     }
 }
 
-/// A confirmed overwrite reuses the catalog provisioning path and removes stale copies.
+/// A confirmed overwrite reuses the catalog provisioning path and removes stale instances.
 #[test]
 fn clobber_catalogued_tape_and_refuse_another_label_owner() {
     let f = VersionFixture::new();
@@ -2111,7 +2111,7 @@ fn clobber_catalogued_tape_and_refuse_another_label_owner() {
         .get_native_object(put["receipts"][0]["object_id"].as_str().unwrap())
         .unwrap()
         .unwrap();
-    assert!(!object.copies.iter().any(|c| c.status == "committed"));
+    assert!(!object.instances.iter().any(|c| c.status == "committed"));
     let mut foreign = remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144);
     foreign.records.push(remanence_chaos::model::Record::Block(
         b"foreign data".to_vec(),
@@ -2671,7 +2671,7 @@ fn catalogless_listing_continues_after_invalid_metadata() {
     let written = f.ok(&["put", source.to_str().unwrap()]);
     let id = written["receipts"][0]["object_id"].as_str().unwrap();
     let object = f.index().get_native_object(id).unwrap().unwrap();
-    let tape_file = object.copies[0].tape_file_number;
+    let tape_file = object.instances[0].tape_file_number;
     let good = f.root.path().join("good.txt");
     std::fs::write(&good, b"good").unwrap();
     f.ok(&["put", good.to_str().unwrap()]);
@@ -3773,7 +3773,11 @@ fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
     let config = remanence_state::load_config(f.config()).unwrap();
     std::fs::remove_file(config.daemon.state_dir.join("authority-format")).unwrap();
     let db = rusqlite::Connection::open(&config.index.sqlite_path).unwrap();
-    db.execute_batch("drop table tape_log_projection; drop table tape_log_object_commits; pragma user_version=22;").unwrap();
+    // Restore the predecessor's table shape as well as its version: reset
+    // admission validates the historical instance table without migrating it.
+    db.execute_batch("alter table object_instances rename to object_copies;
+        alter table object_copies add column pool_id text;
+        drop table tape_log_projection; drop table tape_log_object_commits; pragma user_version=22;").unwrap();
     drop(db);
     std::fs::create_dir_all(config.journal.dir.join("checkpoints")).unwrap();
     for path in [

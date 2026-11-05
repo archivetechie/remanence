@@ -461,7 +461,7 @@ impl pb::catalog_server::Catalog for CatalogService {
         let object = find_copy_object_for_key(&self.state, request.key, &request.pool_id)?
             .ok_or_else(|| Status::not_found("object not found"))?;
         let copies = object
-            .copies
+            .instances
             .iter()
             .map(object_copy_to_proto)
             .collect::<Vec<_>>();

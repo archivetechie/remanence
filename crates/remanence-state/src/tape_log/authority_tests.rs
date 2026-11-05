@@ -390,7 +390,10 @@ fn streaming_report_preserves_original_write_check() {
     report.object_files[0].files.truncate(1);
     report.barrier = None;
     report.object_files[0].protected = 0;
-    report.payloads[0].projection.copy.protected_until_ordinal = Some(0);
+    report.payloads[0]
+        .projection
+        .instance
+        .protected_until_ordinal = Some(0);
     report.protected = 0;
     report.next_file = 2;
     report.cursor.lba = 6;
@@ -615,7 +618,7 @@ fn checkpoint_carriers_preserve_tape_file_numbers_beyond_u32() {
     use crate::tape_log::wire::Wire;
     let mut source = crate::checkpoint::tests::record([0x7a; 16]);
     let number = u64::from(u32::MAX) + 17;
-    source.objects[0].copy.tape_file_number = number;
+    source.objects[0].instance.tape_file_number = number;
     source.objects[0].object_recovery_row.tape_file_number = number;
     let header = crate::tape_log::payload::CommittedObjectProjection::from(&source.objects[0]);
     let mut bytes = Vec::new();
@@ -623,7 +626,7 @@ fn checkpoint_carriers_preserve_tape_file_numbers_beyond_u32() {
     let decoded =
         crate::tape_log::payload::CommittedObjectProjection::get(&mut bytes.as_slice()).unwrap();
     assert_eq!(decoded, header);
-    assert_eq!(decoded.copy.tape_file_number, number);
+    assert_eq!(decoded.instance.tape_file_number, number);
     assert_eq!(decoded.object_recovery_row.tape_file_number, number);
 }
 
@@ -642,7 +645,10 @@ fn session_owner_fixture() -> (
     let mut sidecar = report.barrier.take().unwrap();
     report.object_files[0].files.truncate(1);
     report.object_files[0].protected = 0;
-    report.payloads[0].projection.copy.protected_until_ordinal = Some(0);
+    report.payloads[0]
+        .projection
+        .instance
+        .protected_until_ordinal = Some(0);
     report.protected = 0;
     report.next_file = 2;
     report.cursor.lba = 6;

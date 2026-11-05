@@ -685,7 +685,7 @@ fn encrypted_first_epoch_journals_parity_state_and_replays() {
             assert!(bundle.highest_protected_ordinal > 0);
         }
         assert!(records[0].objects[0]
-            .copy
+            .instance
             .first_parity_data_ordinal
             .is_some());
         assert!(records[0].scheme.is_some());

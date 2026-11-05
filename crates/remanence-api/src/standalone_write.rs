@@ -52,7 +52,7 @@ pub(crate) fn prepare_version(
                 .map_err(refusal)?
                 .ok_or_else(|| refusal("version object disappeared"))?;
             if record
-                .copies
+                .instances
                 .iter()
                 .any(|copy| copy.status == "committed" && copy.representation == "encrypted")
             {
@@ -72,7 +72,7 @@ pub(crate) fn prepare_version(
             .get_native_object(&version.object_id)
             .map_err(refusal)?
             .ok_or_else(|| refusal("version object disappeared"))?;
-        record.copies.iter().any(|copy| {
+        record.instances.iter().any(|copy| {
             copy.status == "committed"
                 && copy.pool_id.as_deref() == Some(request.pool_id.as_str())
                 && match &request.representation {

@@ -557,7 +557,7 @@ async fn trace_session(root: &Path, skip_barrier: bool) -> Vec<Cut> {
             .map(|catalog| catalog.write_handle())
             .unwrap();
         let object_id = Uuid::from_slice(&object.object_id).unwrap().to_string();
-        let copy = &index.find_native_object_copies(&object_id).unwrap()[0];
+        let copy = &index.find_native_object_instances(&object_id).unwrap()[0];
         let start = copy.global_start_block.unwrap() as usize;
         let end = copy.global_end_block.unwrap() as usize + 1;
         let records = world.lock().unwrap().tapes[BARCODE].records[start..end].to_vec();
@@ -977,7 +977,7 @@ async fn check_crash(
                 let index = remanence_state::projector::open(temp.path().join("state.sqlite"))
                     .map(|catalog| catalog.write_handle())
                     .unwrap();
-                let next = index.find_native_object_copies(&next_id).unwrap();
+                let next = index.find_native_object_instances(&next_id).unwrap();
                 assert_eq!(
                     next[0].global_start_block,
                     Some(expected_start),

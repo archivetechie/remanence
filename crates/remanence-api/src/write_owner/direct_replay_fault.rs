@@ -311,7 +311,7 @@ mod tests {
     use super::*;
     use remanence_state::CommitFixture;
     use remanence_state::{
-        NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput,
+        NativeObjectFileProjectionInput, NativeObjectInstanceProjectionInput,
         NativeObjectProjectionInput, ObjectProjectionFixture, ObjectRecoveryFixture,
         ObjectRecoveryFixtureRepresentation,
     };
@@ -361,7 +361,7 @@ mod tests {
                     mtime: None,
                     executable: Some(false),
                 }],
-                copy: NativeObjectCopyProjectionInput {
+                instance: NativeObjectInstanceProjectionInput {
                     object_id: object_id.clone(),
                     tape_uuid,
                     tape_file_number: 1,

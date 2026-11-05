@@ -4178,7 +4178,7 @@ mod tests {
         FileRowsKind, FileRowsReport, ParityConfig, TapeFileEntry, TapeFileKind,
     };
     use remanence_state::{
-        CommitFixture, NativeObjectCopyProjectionInput, NativeObjectProjectionInput,
+        CommitFixture, NativeObjectInstanceProjectionInput, NativeObjectProjectionInput,
         ObjectProjectionFixture, ObjectRecoveryFixture, ObjectRecoveryFixtureRepresentation,
         PoolSelectionPolicyName, ProvisionTapeInput, TapeJournalIndexInput, TapePoolConfig,
         TapePoolProjectionInput,
@@ -6117,7 +6117,7 @@ mod tests {
                     created_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
                 },
                 files: Vec::new(),
-                copy: NativeObjectCopyProjectionInput {
+                instance: NativeObjectInstanceProjectionInput {
                     object_id: object_id.clone(),
                     tape_uuid,
                     tape_file_number: 1,
@@ -6207,7 +6207,10 @@ mod tests {
             .object
             .object_id
             .clone_from(&object_id);
-        checkpoint.objects[0].copy.object_id.clone_from(&object_id);
+        checkpoint.objects[0]
+            .instance
+            .object_id
+            .clone_from(&object_id);
         checkpoint.objects[0].object_recovery_row.object_id = object_id.into_bytes();
         let checkpoint_dir = index_path.parent().expect("catalog parent").join("tapes");
         let journal =

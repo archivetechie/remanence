@@ -211,7 +211,7 @@ impl CatalogIndex {
     /// Physical reconciliation can recover filemark geometry without recovering
     /// native object identities. This method intentionally touches only the
     /// `tape_files` projection and tape-level structural watermarks; object and
-    /// object-copy projections remain owned by native object commit/journal
+    /// object-instance projections remain owned by native object commit/journal
     /// replay paths.
     pub fn reconcile_tape_files_projection(
         &mut self,
@@ -651,7 +651,7 @@ impl CatalogIndex {
     ) -> Result<Option<ReinstateDriveOutcome>, StateError> {
         self.with_core(|core| core.reinstate_drive(drive_uuid, reason))
     }
-    /// Permanently retire one tape identity and mark its copies missing.
+    /// Permanently retire one tape identity and mark its instances missing.
     ///
     /// `retired` is terminal: no code path leaves it, and `provision_tape`
     /// refuses to reuse the row even with `force`. The voltag is detached in
@@ -661,38 +661,38 @@ impl CatalogIndex {
     /// `pool_id` is kept as history — selection gates on state, so a retired
     /// row in a pool is harmless and the provenance is useful.
     ///
-    /// Invariant: copy status is derived from tape state. A copy on a retired
+    /// Invariant: instance status is derived from tape state. A instance on a retired
     /// tape is `missing`, always; this method enforces it for the live
     /// catalog and rebuild re-derives it after journal replay, so no
-    /// copy-level preservation machinery is needed.
+    /// instance-level preservation machinery is needed.
     pub fn retire_tape(&mut self, input: RetireTapeInput) -> Result<RetireTapeOutcome, StateError> {
         self.with_core(|core| core.retire_tape(input))
     }
-    /// Object ids that have copy rows but no `committed` copy anywhere.
+    /// Object ids that have instance rows but no `committed` instance anywhere.
     ///
     /// This is the degraded-objects hook for retire reporting and future
     /// self-heal: objects listed here exist in the catalog but cannot be
     /// read back from any tape.
-    pub fn list_objects_with_no_committed_copies(&self) -> Result<Vec<String>, StateError> {
-        self.with_core(|core| core.list_objects_with_no_committed_copies())
+    pub fn list_objects_with_no_committed_instances(&self) -> Result<Vec<String>, StateError> {
+        self.with_core(|core| core.list_objects_with_no_committed_instances())
     }
     /// Project a native object commit and its 3c tape-file bundle atomically.
     ///
     /// Live Layer 5 writes produce both projections at one commit boundary.
-    /// This method keeps the object/copy rows and tape-file bundle rows in one
+    /// This method keeps the object/instance rows and tape-file bundle rows in one
     /// SQLite transaction so a later bundle projection error cannot leave an
-    /// orphan committed object copy visible in the catalog.
+    /// orphan committed object instance visible in the catalog.
     pub fn project_native_object_and_committed_tape_file_bundle(
         &mut self,
         object: NativeObjectProjectionInput,
         files: &[NativeObjectFileProjectionInput],
-        copies: &[NativeObjectCopyProjectionInput],
+        instances: &[NativeObjectInstanceProjectionInput],
         tape_input: TapeJournalIndexInput,
         bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
         self.with_core(|core| {
             core.project_native_object_and_committed_tape_file_bundle(
-                object, files, copies, tape_input, bundle,
+                object, files, instances, tape_input, bundle,
             )
         })
     }
@@ -707,12 +707,12 @@ impl CatalogIndex {
         &mut self,
         object: NativeObjectProjectionInput,
         files: &[NativeObjectFileProjectionInput],
-        copies: &[NativeObjectCopyProjectionInput],
+        instances: &[NativeObjectInstanceProjectionInput],
         tape_input: TapeJournalIndexInput,
         bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
         self.with_core(|core| {
-            core.project_native_object_append_commit(object, files, copies, tape_input, bundle)
+            core.project_native_object_append_commit(object, files, instances, tape_input, bundle)
         })
     }
     /// Clear only append recovery after replaying the imported authority pair.
@@ -888,13 +888,13 @@ impl CatalogIndex {
     ) -> Result<Option<TerminalFinalizationProjection>, StateError> {
         self.with_core(|core| core.terminal_finalization(tape_uuid))
     }
-    /// Project a native object commit and its concrete tape copies into Layer 4.
+    /// Project a native object commit and its concrete tape instances into Layer 4.
     pub fn upsert_native_object_projection(
         &mut self,
         object: NativeObjectProjectionInput,
-        copies: &[NativeObjectCopyProjectionInput],
+        instances: &[NativeObjectInstanceProjectionInput],
     ) -> Result<(), StateError> {
-        self.with_core(|core| core.upsert_native_object_projection(object, copies))
+        self.with_core(|core| core.upsert_native_object_projection(object, instances))
     }
     /// Project a foreign archive scan unit without exposing driver-private locators.
     pub fn upsert_foreign_archive_projection(
@@ -949,12 +949,12 @@ impl CatalogIndex {
     pub fn get_tape_by_voltag(&self, voltag: &str) -> Result<Option<TapeRecord>, StateError> {
         self.with_core(|core| core.get_tape_by_voltag(voltag))
     }
-    /// Current pools on committed copies for one tape (legacy method name).
-    pub fn committed_copy_pool_snapshots(
+    /// Current pools on committed instances for one tape (legacy method name).
+    pub fn committed_instance_pool_snapshots(
         &self,
         tape_uuid: &[u8],
     ) -> Result<Vec<Option<String>>, StateError> {
-        self.with_core(|core| core.committed_copy_pool_snapshots(tape_uuid))
+        self.with_core(|core| core.committed_instance_pool_snapshots(tape_uuid))
     }
     /// List committed tape files for one tape.
     pub fn list_tape_files(&self, tape_uuid: &[u8]) -> Result<Vec<TapeFileRecord>, StateError> {
@@ -968,7 +968,7 @@ impl CatalogIndex {
     pub fn list_native_objects(&self) -> Result<Vec<NativeObjectRecord>, StateError> {
         self.with_core(|core| core.list_native_objects())
     }
-    /// Fetch a native object and its copies by object id.
+    /// Fetch a native object and its instances by object id.
     pub fn get_native_object(
         &self,
         object_id: &str,
@@ -990,7 +990,7 @@ impl CatalogIndex {
     ) -> Result<Vec<NativeObjectFileRecord>, StateError> {
         self.with_core(|core| core.list_native_object_files(object_id))
     }
-    /// Newest committed versions in the copy's pool, independent of tape assignment.
+    /// Newest committed versions in the instance's tape pool, independent of tape assignment.
     pub fn list_committed_versions_by_path(
         &self,
         pool_id: &str,
@@ -998,7 +998,7 @@ impl CatalogIndex {
     ) -> Result<Vec<VersionRow>, StateError> {
         self.with_core(|core| core.list_committed_versions_by_path(pool_id, archive_path))
     }
-    /// Newest versions with a committed copy on the specified cartridge.
+    /// Newest versions with a committed instance on the specified cartridge.
     pub fn list_committed_versions_by_path_on_tape(
         &self,
         archive_path: &str,
@@ -1013,7 +1013,7 @@ impl CatalogIndex {
     ) -> Result<Vec<VersionRow>, StateError> {
         self.with_core(|core| core.list_committed_versions_by_path_any_pool(archive_path))
     }
-    /// Read committed path inventories, grouped by copy pool, with deterministic newest versions.
+    /// Read committed path inventories, grouped by tape pool, with deterministic newest versions.
     pub fn list_committed_paths(
         &self,
         tape: Option<&str>,
@@ -1021,7 +1021,7 @@ impl CatalogIndex {
     ) -> Result<Vec<serde_json::Value>, StateError> {
         self.with_core(|core| core.list_committed_paths(tape, prefix))
     }
-    /// Fetch a native object and its copies by content hash.
+    /// Fetch a native object and its instances by content hash.
     pub fn get_native_object_by_content_hash(
         &self,
         content_hash: &[u8],
@@ -1035,7 +1035,7 @@ impl CatalogIndex {
     ) -> Result<Option<NativeObjectRecord>, StateError> {
         self.with_core(|core| core.get_native_object_by_unique_caller_object_id(caller_object_id))
     }
-    /// Fetch a native object by caller id only when it has a committed copy in
+    /// Fetch a native object by caller id only when it has a committed instance in
     /// the requested pool.
     pub fn get_native_object_by_pool_and_caller_object_id(
         &self,
@@ -1046,12 +1046,12 @@ impl CatalogIndex {
             core.get_native_object_by_pool_and_caller_object_id(pool_id, caller_object_id)
         })
     }
-    /// Return concrete tape copies for a native object.
-    pub fn find_native_object_copies(
+    /// Return concrete tape instances for a native object.
+    pub fn find_native_object_instances(
         &self,
         object_id: &str,
-    ) -> Result<Vec<NativeObjectCopyRecord>, StateError> {
-        self.with_core(|core| core.find_native_object_copies(object_id))
+    ) -> Result<Vec<NativeObjectInstanceRecord>, StateError> {
+        self.with_core(|core| core.find_native_object_instances(object_id))
     }
     /// Fetch one projected operation by UUID text.
     pub fn get_operation(&self, operation_id: &str) -> Result<Option<OperationRecord>, StateError> {

@@ -110,7 +110,7 @@ async fn check_ingress_ending(disconnect: bool) {
                 .map(|catalog| catalog.write_handle())
                 .unwrap();
             let saved = index.get_native_object(&object_id).unwrap().unwrap();
-            let copies = index.find_native_object_copies(&object_id).unwrap();
+            let copies = index.find_native_object_instances(&object_id).unwrap();
             let before = world.lock().unwrap().tapes[BARCODE].records.clone();
             let (changer_tx, _changer_rx) = mpsc::channel(1);
             let pool = DrivePool::new_for_library(
@@ -236,7 +236,10 @@ async fn check_ingress_ending(disconnect: bool) {
                 );
             }
             assert_eq!(index.get_native_object(&object_id).unwrap().unwrap(), saved);
-            assert_eq!(index.find_native_object_copies(&object_id).unwrap(), copies);
+            assert_eq!(
+                index.find_native_object_instances(&object_id).unwrap(),
+                copies
+            );
             assert_eq!(index.list_native_objects().unwrap().len(), 1);
             // A failed append definitively ends its owner; wait for its durable named end.
             thread.join().expect("failed append owner exits");

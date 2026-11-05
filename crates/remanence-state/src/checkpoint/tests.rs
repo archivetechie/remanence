@@ -39,7 +39,7 @@ pub(crate) fn terminal_prefix_plan_for_parity_record(
 
 use super::*;
 use crate::authority::TapeAuthorityWriter;
-use crate::{NativeObjectCopyProjectionInput, NativeObjectProjectionInput, StateError};
+use crate::{NativeObjectInstanceProjectionInput, NativeObjectProjectionInput, StateError};
 use remanence_parity::authority::StructuralAuthority;
 use std::fs;
 
@@ -65,7 +65,7 @@ pub(crate) fn record(tape_uuid: [u8; 16]) -> CommitFixture {
                 created_at_utc: Some("2026-07-21T00:00:00Z".to_string()),
             },
             files: Vec::new(),
-            copy: NativeObjectCopyProjectionInput {
+            instance: NativeObjectInstanceProjectionInput {
                 object_id: object_uuid.to_string(),
                 tape_uuid,
                 tape_file_number: 1,
@@ -114,8 +114,8 @@ pub(crate) fn second_record(tape_uuid: [u8; 16]) -> CommitFixture {
     record.next_tape_file_number = 3;
     record.objects[0].object.object_id = object_uuid.to_string();
     record.objects[0].object.caller_object_id = Some("checkpoint-test-2".to_string());
-    record.objects[0].copy.object_id = object_uuid.to_string();
-    record.objects[0].copy.tape_file_number = 2;
+    record.objects[0].instance.object_id = object_uuid.to_string();
+    record.objects[0].instance.tape_file_number = 2;
     record.objects[0].fresh_tape = false;
     record.objects[0].total_committed_ordinals = 6;
     record.objects[0].object_recovery_row.tape_file_number = 2;
@@ -435,8 +435,8 @@ pub(crate) fn partial_epoch_parity_record(tape_uuid: [u8; 16]) -> CommitFixture 
         stripes_per_neighborhood: 1,
     });
     record.objects[0].fresh_tape = false;
-    record.objects[0].copy.first_parity_data_ordinal = Some(0);
-    record.objects[0].copy.protected_until_ordinal = Some(0);
+    record.objects[0].instance.first_parity_data_ordinal = Some(0);
+    record.objects[0].instance.protected_until_ordinal = Some(0);
     let mut object = parity_entry(1, remanence_parity::TapeFileKind::Object);
     object.block_count = 3;
     object.physical_start_hint = Some(2);
@@ -479,10 +479,10 @@ fn second_partial_epoch_parity_record(prior: &CommitFixture) -> CommitFixture {
     record.next_tape_file_number = 5;
     record.objects[0].object.object_id = object_uuid.to_string();
     record.objects[0].object.caller_object_id = Some("checkpoint-test-2".to_string());
-    record.objects[0].copy.object_id = object_uuid.to_string();
-    record.objects[0].copy.tape_file_number = 3;
-    record.objects[0].copy.first_parity_data_ordinal = Some(3);
-    record.objects[0].copy.protected_until_ordinal = Some(3);
+    record.objects[0].instance.object_id = object_uuid.to_string();
+    record.objects[0].instance.tape_file_number = 3;
+    record.objects[0].instance.first_parity_data_ordinal = Some(3);
+    record.objects[0].instance.protected_until_ordinal = Some(3);
     record.objects[0].total_committed_ordinals = 6;
     record.objects[0].object_recovery_row.tape_file_number = 3;
     record.objects[0].object_recovery_row.object_id = object_uuid.to_string().into_bytes();
@@ -1456,8 +1456,8 @@ fn high_count_checkpoint_replay_reports_one_pass_and_bounded_live_rows() {
         next.batch_id = object_uuid.into_bytes();
         next.next_tape_file_number = ordinal + 1;
         next.objects[0].object.object_id = object_uuid.to_string();
-        next.objects[0].copy.object_id = object_uuid.to_string();
-        next.objects[0].copy.tape_file_number = ordinal;
+        next.objects[0].instance.object_id = object_uuid.to_string();
+        next.objects[0].instance.tape_file_number = ordinal;
         next.objects[0].fresh_tape = ordinal == 1;
         next.objects[0].total_committed_ordinals = ordinal * 3;
         next.objects[0].object_recovery_row.tape_file_number = ordinal;
@@ -1665,7 +1665,7 @@ fn validation_accepts_non_uuid_object_id() {
     let mut rec = record(tape_uuid);
     let opaque = "accession-2026-0007";
     rec.objects[0].object.object_id = opaque.to_string();
-    rec.objects[0].copy.object_id = opaque.to_string();
+    rec.objects[0].instance.object_id = opaque.to_string();
     rec.objects[0].object_recovery_row.object_id = opaque.as_bytes().to_vec();
 
     validate_next_record(None, &rec).expect("a non-UUID opaque object_id must validate");

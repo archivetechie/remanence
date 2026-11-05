@@ -28,11 +28,11 @@ use remanence_parity::{
 };
 use remanence_state::{
     watermark_floor_bytes, AuditActor, AuditEvent, AuditRecord, AuditSubject,
-    ForeignArchiveProjectionInput, NativeObjectCopyProjectionInput,
-    NativeObjectFileProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
+    ForeignArchiveProjectionInput, NativeObjectFileProjectionInput,
+    NativeObjectInstanceProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
     ProvisionTapeInput, RetireTapeInput, SourceLayer, TapeJournalIndexInput,
-    TapePoolProjectionInput, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
-    OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+    TapePoolProjectionInput, OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED,
+    OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
 use sha2::{Digest, Sha256};
@@ -797,7 +797,7 @@ fn object_record_to_proto_carries_append_commit_info() {
         metadata_hash: None,
         metadata_hash_algorithm: None,
         created_at_utc: "2026-07-05T00:00:00Z".to_string(),
-        copies: vec![NativeObjectCopyRecord {
+        instances: vec![NativeObjectInstanceRecord {
             tape_log_sequence: None,
             tape_incarnation: None,
             object_id: OBJECT_ID_TEXT.to_string(),
@@ -808,7 +808,7 @@ fn object_record_to_proto_carries_append_commit_info() {
             protected_until_ordinal: None,
             status: "committed".to_string(),
             pool_id: Some("camera.copy-a".to_string()),
-            representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+            representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
             plaintext_digest: Some(vec![0x33; 32]),
@@ -855,7 +855,7 @@ fn wire_span_and_extent_keep_absent_distinguishable_from_zero() {
     // Proto3 optional: absent = unknown, never guessed, never defaulted.
     // Block 0 is a valid position, so Some(0) must survive the wire as
     // present-zero — distinguishable from absent.
-    let mut copy_record = NativeObjectCopyRecord {
+    let mut copy_record = NativeObjectInstanceRecord {
         tape_log_sequence: None,
         tape_incarnation: None,
         object_id: OBJECT_ID_TEXT.to_string(),
@@ -866,7 +866,7 @@ fn wire_span_and_extent_keep_absent_distinguishable_from_zero() {
         protected_until_ordinal: None,
         status: "committed".to_string(),
         pool_id: None,
-        representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+        representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
         recipient_epoch_ids: None,
         metadata_frame_len: None,
         plaintext_digest: None,
@@ -2198,7 +2198,7 @@ fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::CommitFi
                 mtime: Some("0".to_string()),
                 executable: Some(false),
             }],
-            copy: NativeObjectCopyProjectionInput {
+            instance: NativeObjectInstanceProjectionInput {
                 object_id: object_uuid.to_string(),
                 tape_uuid,
                 tape_file_number: 1,
@@ -2206,7 +2206,7 @@ fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::CommitFi
                 first_parity_data_ordinal: None,
                 protected_until_ordinal: None,
                 status: "committed".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some(vec![0x33; 32]),
@@ -2404,7 +2404,7 @@ fn restart_cycle_checkpoint_record(
                 created_at_utc: Some(format!("2026-07-21T00:00:0{ordinal}Z")),
             },
             files: Vec::new(),
-            copy: NativeObjectCopyProjectionInput {
+            instance: NativeObjectInstanceProjectionInput {
                 object_id: object_uuid.to_string(),
                 tape_uuid,
                 tape_file_number: object_tape_file,
@@ -2412,7 +2412,7 @@ fn restart_cycle_checkpoint_record(
                 first_parity_data_ordinal: None,
                 protected_until_ordinal: None,
                 status: "committed".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some(vec![object_byte.wrapping_add(2); 32]),
@@ -2483,7 +2483,7 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
 
     // Append again, then preserve the same independently compatible views found in the
     // field evidence before killing mid-projection: object metadata is visible,
-    // while the copy, object tape-file, and catalog unit are absent.
+    // while the instance, object tape-file, and catalog unit are absent.
     let second = restart_cycle_checkpoint_record(tape_uuid, 2, 0x72, 2, 2, 5);
     journal.append(&second).expect("fsync second checkpoint");
     index
@@ -2498,7 +2498,7 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
         .expect("journal-authoritative startup repair");
     let second_object_id = second.objects[0].object.object_id.as_str();
     let copies = index
-        .find_native_object_copies(second_object_id)
+        .find_native_object_instances(second_object_id)
         .expect("query repaired copy");
     assert_eq!(copies.len(), 1);
     assert_eq!(copies[0].tape_uuid, tape_uuid);
@@ -2522,7 +2522,7 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
         .expect("retired copy status is compatible with checkpoint history");
     assert_eq!(
         index
-            .find_native_object_copies(second_object_id)
+            .find_native_object_instances(second_object_id)
             .expect("query retired checkpoint copy")[0]
             .status,
         "missing"
@@ -3390,7 +3390,7 @@ fn populated_state() -> ApiState {
                 metadata_hash: None,
                 created_at_utc: Some("2026-05-28T12:00:00Z".to_string()),
             },
-            &[NativeObjectCopyProjectionInput {
+            &[NativeObjectInstanceProjectionInput {
                 object_id: OBJECT_ID_TEXT.to_string(),
                 tape_uuid: TAPE_UUID,
                 tape_file_number: 4,
@@ -3398,7 +3398,7 @@ fn populated_state() -> ApiState {
                 first_parity_data_ordinal: Some(0),
                 protected_until_ordinal: Some(8),
                 status: "committed".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some(vec![0x51; 32]),
@@ -3447,7 +3447,7 @@ fn populated_state_with_file_catalog() -> ApiState {
                 mtime: Some("0".to_string()),
                 executable: Some(false),
             }],
-            &[NativeObjectCopyProjectionInput {
+            &[NativeObjectInstanceProjectionInput {
                 object_id: OBJECT_ID_TEXT.to_string(),
                 tape_uuid: TAPE_UUID,
                 tape_file_number: 4,
@@ -3455,7 +3455,7 @@ fn populated_state_with_file_catalog() -> ApiState {
                 first_parity_data_ordinal: Some(0),
                 protected_until_ordinal: Some(8),
                 status: "committed".to_string(),
-                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                representation: OBJECT_INSTANCE_REPRESENTATION_PLAINTEXT.to_string(),
                 recipient_epoch_ids: None,
                 metadata_frame_len: None,
                 plaintext_digest: Some(vec![0x51; 32]),
@@ -5058,12 +5058,12 @@ fn write_object_to_pool_returns_locator_commits_catalog_and_round_trips_payload(
         committed.content_hash.as_deref(),
         Some(expected_hash.as_slice())
     );
-    assert_eq!(committed.copies.len(), 1);
+    assert_eq!(committed.instances.len(), 1);
     assert_eq!(
-        committed.copies[0].pool_id.as_deref(),
+        committed.instances[0].pool_id.as_deref(),
         Some(copy.pool_id.as_str())
     );
-    assert_eq!(committed.copies[0].first_body_lba, copy.first_body_lba);
+    assert_eq!(committed.instances[0].first_body_lba, copy.first_body_lba);
     let projected_file = &result.expect_write_report().catalog.files[0];
     let committed_file = index
         .get_native_object_file(
@@ -5189,9 +5189,9 @@ fn no_parity_write_round_trips_payload_and_commits_without_parity_geometry() {
         committed.metadata_hash.as_deref(),
         Some(&result.expect_write_report().catalog.object.manifest_sha256[..])
     );
-    assert_eq!(committed.copies.len(), 1);
-    assert_eq!(committed.copies[0].first_parity_data_ordinal, None);
-    assert_eq!(committed.copies[0].protected_until_ordinal, None);
+    assert_eq!(committed.instances.len(), 1);
+    assert_eq!(committed.instances[0].first_parity_data_ordinal, None);
+    assert_eq!(committed.instances[0].protected_until_ordinal, None);
 }
 
 #[test]
@@ -5256,15 +5256,15 @@ fn fresh_tape_first_object_span_excludes_bootstrap_prefix_and_trailing_filemark(
     assert_eq!(report.object_close.physical_start_lba, Some(2));
 
     // The catalog read path serves the same span through the
-    // copy→tape-file join — the fact the wire fields project.
+    // instance→tape-file join — the fact the wire fields project.
     let committed = index
         .get_native_object(result.object.object_id_text().as_str())
         .expect("query committed object")
         .expect("committed object exists");
-    assert_eq!(committed.copies.len(), 1);
-    assert_eq!(committed.copies[0].global_start_block, Some(2));
+    assert_eq!(committed.instances.len(), 1);
+    assert_eq!(committed.instances[0].global_start_block, Some(2));
     assert_eq!(
-        committed.copies[0].global_end_block,
+        committed.instances[0].global_end_block,
         Some(span_end_exclusive)
     );
 }
@@ -5566,7 +5566,7 @@ fn encrypted_no_parity_write_round_trips_payload_and_commits_envelope_fields() {
     assert_eq!(tape_sink.filemarks, vec![1, 1]);
     assert_eq!(
         result.object.copies[0].representation,
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED
+        OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED
     );
     assert_eq!(
         result.object.copies[0].recipient_epoch_ids,
@@ -5580,17 +5580,17 @@ fn encrypted_no_parity_write_round_trips_payload_and_commits_envelope_fields() {
         .expect("query encrypted object")
         .expect("encrypted object exists");
     assert_eq!(committed.metadata_hash, None);
-    assert_eq!(committed.copies.len(), 1);
+    assert_eq!(committed.instances.len(), 1);
     assert_eq!(
-        committed.copies[0].representation,
-        OBJECT_COPY_REPRESENTATION_ENCRYPTED
+        committed.instances[0].representation,
+        OBJECT_INSTANCE_REPRESENTATION_ENCRYPTED
     );
     assert_eq!(
-        committed.copies[0].recipient_epoch_ids.as_deref(),
+        committed.instances[0].recipient_epoch_ids.as_deref(),
         Some(recipient_epoch_ids.as_slice())
     );
     assert_eq!(
-        committed.copies[0].metadata_frame_len,
+        committed.instances[0].metadata_frame_len,
         Some(metadata_frame_len)
     );
 
@@ -6064,7 +6064,7 @@ fn plaintext_write_transfer_failure_leaves_no_durable_catalog_reference() {
 /// §10.6 integration: the recycle-concern repro with **no** catalog
 /// reset anywhere. Init → write+commit → retire → re-init the same
 /// barcode under a fresh identity → write+commit; the first identity's
-/// copies read back `missing` while the second's read back `committed`.
+/// instances read back `missing` while the second's read back `committed`.
 #[test]
 fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
     const FIRST_UUID: [u8; 16] = [0xA1; 16];
@@ -6109,7 +6109,7 @@ fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
         .expect("retire first identity");
     assert!(outcome.newly_retired);
     assert_eq!(outcome.released_voltag.as_deref(), Some(VOLTAG));
-    assert_eq!(outcome.copies_marked_missing, 1);
+    assert_eq!(outcome.instances_marked_missing, 1);
 
     // Re-init the same physical medium: BOT still carries the retired
     // identity's bootstrap with object data past it.
@@ -6218,17 +6218,17 @@ fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
         .get_native_object(first.object.object_id_text().as_str())
         .expect("query first object")
         .expect("first object exists");
-    assert_eq!(first_record.copies.len(), 1);
-    assert_eq!(first_record.copies[0].status, "missing");
+    assert_eq!(first_record.instances.len(), 1);
+    assert_eq!(first_record.instances[0].status, "missing");
     let second_record = index
         .get_native_object(second.object.object_id_text().as_str())
         .expect("query second object")
         .expect("second object exists");
-    assert_eq!(second_record.copies.len(), 1);
-    assert_eq!(second_record.copies[0].status, "committed");
+    assert_eq!(second_record.instances.len(), 1);
+    assert_eq!(second_record.instances[0].status, "committed");
     assert_eq!(
         index
-            .list_objects_with_no_committed_copies()
+            .list_objects_with_no_committed_instances()
             .expect("degraded objects"),
         vec![first.object.object_id_text()]
     );
@@ -10124,8 +10124,8 @@ fn below_projection_fence_clears_with_audit_only_when_the_log_reaches_the_mark()
     projection.object.object_id = object.clone();
     projection.object.caller_object_id = Some("checkpoint-selection-test-2".into());
     projection.files[0].object_id = object.clone();
-    projection.copy.object_id = object.clone();
-    projection.copy.tape_file_number = 2;
+    projection.instance.object_id = object.clone();
+    projection.instance.tape_file_number = 2;
     projection.fresh_tape = false;
     projection.total_committed_ordinals = 6;
     projection.object_recovery_row.tape_file_number = 2;
@@ -10297,8 +10297,8 @@ fn two_group_log(
     projection.object.object_id = object.clone();
     projection.object.caller_object_id = Some(format!("two-group-log-{}", id[0]));
     projection.files[0].object_id = object.clone();
-    projection.copy.object_id = object.clone();
-    projection.copy.tape_file_number = 2;
+    projection.instance.object_id = object.clone();
+    projection.instance.tape_file_number = 2;
     projection.fresh_tape = false;
     projection.total_committed_ordinals = 6;
     projection.object_recovery_row.tape_file_number = 2;
@@ -10739,7 +10739,7 @@ async fn catalog_caller_id_requires_pool_when_two_pools_hold_it() {
                 metadata_hash: original.metadata_hash.clone(),
                 created_at_utc: None,
             },
-            &[remanence_state::NativeObjectCopyProjectionInput {
+            &[remanence_state::NativeObjectInstanceProjectionInput {
                 object_id: other.to_string(),
                 tape_uuid: [99; 16],
                 tape_file_number: 1,
