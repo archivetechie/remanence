@@ -914,6 +914,7 @@ fn generate(root: &Path) {
         );
     }
     freeze_vectors(root);
+    contradiction_vectors(root);
     extra_rejections(root);
     historical_vectors(root);
     pending_limit_case(&root.join("rejected/pending-record-limit"));
@@ -1049,12 +1050,12 @@ fn metadata(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .keys()
         .map(|p| p.parent().unwrap().to_path_buf())
         .collect();
-    let mut manifest=String::from("case\tsegments\tbytes\tsha256\tlog_uuid\tlast_sequence\tterminal_hash\ttail_or_error\tapplied_through\tpending\ttapes\topen_fences\tduplicates\tcontradictions\tpending_sequences\topen_fence_ids\tcontradicted_tapes\n");
+    let mut manifest=String::from("case\tsegments\tbytes\tsha256\tlog_uuid\tlast_sequence\tterminal_hash\ttail_or_error\tapplied_through\tpending\ttapes\topen_fences\tduplicates\tcontradictions\tpending_sequences\topen_fence_ids\tcontradicted_tapes\texcluded_diagnostics\n");
     let mut frames = String::from("case\tsequence\ttag\tsegment\toffset\tend\trecord_hash\n");
     let mut readme=String::from("# Library log v1 corpus\n\nGenerated through the real append store. Run `LIBRARY_LOG_FIXTURE_EXPORT_DIR=/empty/path cargo test --offline -p remanence-state --lib reference_library_logs_regenerate_byte_exactly`. Validated EOF-short or zero-filled final frames are absent; SCHEMA.md defines the checks that can refuse them, including an over-cap short prefix and EmptySegment for a torn first frame. Byte faults and library contradictions stop replay; native contradictions are scoped.\n\n");
     let mut views = String::from("case\ttape_uuid\tsequence\tanswer\tkind\tdigest\n");
     let mut view_prose = String::from("## Tape views\n\nNative tape views are replay inputs, not part of the library log. VIEWS.tsv has exactly one default row per MANIFEST case (`*`, `*`). `Present` with digest `echo` returns the reference's own digest and kind `FinalizationPrepared`; `NotYet` has empty kind and digest. Explicit rows override that default by tape UUID and sequence; their Present digest is literal hex. Contradiction and NotYet have empty kind and digest.\n\n");
-    readme += "FRAMES.tsv inventories complete decodable frames, including non-authoritative frames in rejected cases; authoritative records have sequence at most MANIFEST.last_sequence. MANIFEST.log_uuid is the first segment's on-disk header value (wrong-log-uuid intentionally differs from the expected identity). The appended identity columns describe the authoritative prefix: pending_sequences and open_fence_ids are ascending comma-separated sequences; contradicted_tapes is ascending UUID hex:FoldError name. Counts retain their existing meanings.\n\n";
+    readme += "FRAMES.tsv inventories complete decodable frames, including non-authoritative frames in rejected cases; authoritative records have sequence at most MANIFEST.last_sequence. MANIFEST.log_uuid is the first segment's on-disk header value (wrong-log-uuid intentionally differs from the expected identity). The appended identity columns describe the authoritative prefix: pending_sequences and open_fence_ids are ascending comma-separated sequences; contradicted_tapes is ascending UUID hex:FoldError name. Counts retain their existing meanings. excluded_diagnostics is a comma-separated UUID hex:count list; these replay diagnostics are not fold authority. The deferred-fence-unknown-at-resolution case publishes the queued prefix; its injected liveness loss is specified in FOLD-VECTORS.json.\n\n";
     for case in cases {
         let dir = root.join(&case);
         let published_view = case_view(&case);
@@ -1097,7 +1098,7 @@ fn metadata(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             .unwrap_or_else(|| format!("{:?}", r.segments.last().map(|s| s.tail)));
         let identities = fold_identities(&dir, &r);
         manifest += &format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             case.display(),
             names.join(","),
             sizes.join(","),
@@ -1111,10 +1112,22 @@ fn metadata(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             r.fold.tapes.len(),
             r.fold.open_fences(),
             r.fold.duplicates,
-            r.fold.contradictions.len(),
+            r.fold.contradicted_tapes(),
             identities.0,
             identities.1,
-            identities.2
+            identities.2,
+            r.fold
+                .contradictions
+                .iter()
+                .filter(|(_, s)| s.excluded != 0)
+                .map(|(scope, s)| {
+                    let fold::Scope::Tape(tape) = scope else {
+                        unreachable!()
+                    };
+                    format!("{}:{}", hex(tape), s.excluded)
+                })
+                .collect::<Vec<_>>()
+                .join(",")
         );
         readme+=&format!("## {}\n\nTail: `{status}`. Authoritative sequence {}; applied {}; pending {}; tapes {}; fences {}; duplicates {}.\n\n",case.display(),r.last_sequence,r.fold.applied_through,r.fold.pending.len(),r.fold.tapes.len(),r.fold.open_fences(),r.fold.duplicates);
         for ((name, b), hash) in names.iter().zip(bytes.iter()).zip(hashes) {
@@ -1190,7 +1203,7 @@ fn metadata(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     schema += "### MediumFamily\n\n| Code | Variant / payload |\n|---:|---|\n| 0 | Lto(LtoGen) |\n| 1 | Disk(null) |\n\n### FenceScope\n\n| Code | Variant / payload |\n|---:|---|\n| 0 | Tape(TapeRef) |\n| 1 | Drive(DriveKey) |\n| 2 | Model(ModelScope), reserved |\n\nMediumSpec stores capabilities, never role. rerecord implies regenerative; lifecycle_ops gates lifecycle operations independently of family. Source Measured on a revision attests a fresh measurement, not inherited provenance. Zero capacity is permitted (no usable space).\n\n";
-    schema += "## Replay and pending\n\nTags 6, 7, 13, 14, 15 and 26 depend on TapeAt; tag 15 requires native FinalizationPrepared. Present has both kind and digest. NotYet queues all touched scopes in source order, except FenceRaised always applies. Replay receives every frame once, in sequence order, and never retries a pending record. Pending records are retried (`resolve`, to a fixed point) only before a live append, under the view current at that append. If retrying a pending record returns a library FoldError (rather than remaining Unresolved or becoming a scoped tape contradiction), resolution stops at that error, retains the failing record and the unvisited remainder as pending, and keeps earlier progress from that resolution. The live append propagates that error before constructing or writing its new frame. Later appends retry the same pending record and fail again while that error persists. Byte faults and library FoldError stop at the previous authoritative prefix. TapeContradiction isolates its tape and continues. A record whose scopes meet a contradicted tape is held pending regardless of its own dependency; applied_through stops before it. A record whose own TapeAt digest contradicts records that tape's contradiction and is not held. FenceRaised is the immediate-effect exception described in tag 8. applied_through never crosses pending.\n";
+    schema += "## Replay and pending\n\nTags 6, 7, 13, 14, 15 and 26 depend on TapeAt; tag 15 requires native FinalizationPrepared. Present has both kind and digest. NotYet queues all touched scopes in source order, except FenceRaised always applies. Replay receives every frame once, in sequence order, and never retries a pending record. Pending records are retried (`resolve`, to a fixed point) only before a live append, under the view current at that append. Except for deferred-fence liveness failures described in tag 8, if retrying a pending record returns a library FoldError (rather than remaining Unresolved or becoming a scoped tape contradiction), resolution stops at that error, retains the failing record and the unvisited remainder as pending, and keeps earlier progress from that resolution. The live append propagates that error before constructing or writing its new frame. Later appends retry the same pending record and fail again while that error persists. Byte faults and library FoldError stop at the previous authoritative prefix. TapeContradiction isolates its tape and continues. Contradiction status alone never refuses, excludes or holds a record in the fold. After shape, identity, repair-floor, pending-scope and capacity admission succeed, live validation judges a dependent record on its own reference: a match proceeds to library rules, a mismatch is refused TapeContradiction without appending an exclusion, and NotYet is refused Unresolved. Refusing write, verify and finalize on a contradicted tape is D3 admission policy for B4b-2/B5, not a fold rule. During replay and resolution each dependent record is judged on its own reference, after shape and tape identity checks and before coverage, chains or uniqueness; on receipt, the RepairBelowReference floor check also precedes the own-reference check. A below-floor repair is refused before that reference is consulted: it is not received, is not excluded, and changes no summary. A replay or resolution mismatch reached after those admission checks excludes the record without applying it or retaining any scope, updates the tape's minimum contradicting sequence, and increments its excluded diagnostic count. A matching reference proceeds to library rules when its scopes are free; NotYet and earlier pending scopes still hold records. Resolution checks a scope-held dependent record's reference just as receive does. Per-tape summaries retain the minimum contradiction and highest received dependent sequence; map membership alone does not mean contradicted. FenceRaised is the immediate-effect exception described in tag 8. applied_through never crosses pending. Live/replay equivalence under growing immutable tape views requires dependent references to be present and matching at each append; FenceRaised.at is evidence and may be NotYet at its append. Excluded counters and unresolved_fence_evidence are diagnostics excluded from the equivalence comparison: unresolved fence evidence may differ between live and replay without changing fence enforcement or tape authority.\n";
     schema += "\nLibraryHistory first uses retained state; otherwise the store binary-searches existing segment headers and scans one segment. DecisionRef binds sequence and UUID; only FenceId wire references may use sequence-only lookup in the header-bound log. Replay sees only lower sequences. FOLD-VECTORS.json freezes ReleaseWithoutFence with an explicitly empty injected history: a contiguous store log cannot lack an earlier sequence, and a diagnostic at that sequence is WrongCounterpart. I/O faults are HistoryUnavailable. Memory is O(resources), plus lifetime idempotency key/value payload at 80 bytes per keyed operation (SHA-256 of length-prefixed actor_fingerprint, u16 kind, and idempotency_key maps to operation id and request_fingerprint; allocator/map overhead is measured separately), plus one entry per crash supersede or unprotected acceptance (tags 6 and 7, retained for lifetime lookup and uniqueness), plus pending up to 4096 records and 64 MiB of canonical CBOR envelopes/bodies, plus one looked-up frame. Tags 13, 14 and 26 require an OperationRecorded chain ending in a terminal record to be pruned; writers that omit that chain retain those slots indefinitely. The pending byte limit counts the canonical encoding of the whole structural map `{0: envelope, 1: body}`. Pending bytes use exact-length boxed storage. Exceeding either total refuses with PendingLimitExceeded { scope, records, bytes }, preserving every prior pending record. Append to a blocked scope at capacity returns the same typed error.\n";
     schema += "\nFRAMES.tsv lists complete decodable frames, including frames beyond the authoritative prefix and the decoded refused frame of a rejected case; authoritative records have sequence at most MANIFEST.last_sequence. Frames whose header or encoding cannot be decoded are not listed. MANIFEST.log_uuid is the first segment's on-disk header value; in wrong-log-uuid it differs from the expected identity. Tape views are external replay inputs published in VIEWS.tsv and README.md.\n";
     schema += FOLD_SCHEMA_NOTES;
@@ -1365,7 +1378,7 @@ pub(super) fn tape_reference_ahead_of_tape_log_waits() {
     let r = replay(d.path(), LOG, &real_view()).unwrap();
     assert!(r.refusal.is_none());
     assert_eq!(r.fold.pending.len(), 3);
-    assert_eq!(r.fold.contradictions.len(), 1);
+    assert_eq!(r.fold.contradicted_tapes(), 1);
     assert_eq!(r.fold.open_fences(), 1);
     assert_eq!(r.fold.tapes[&tape(2).uuid].assignment_generation, 2);
 }
@@ -1989,7 +2002,7 @@ fn extra_rejections(root: &Path) {
     }
 }
 
-const FOLD_SCHEMA_NOTES:&str="## Record tags, causal keys and scopes\n\nEvery record except FenceRaised also orders on the current label of each tape it names in its direct tape set. For this rule the direct tape set is the tape field of tags 1, 3, 5 and 25, both holders for tag 2, the TapeAt tape of tags 6, 7, 13, 14, 15 and 26, and the optional tape or cartridge of tags 10, 17, 20, 21 and 24; other tags have no direct tapes. Reprovision adds its new and predecessor Tape scopes and its explicit new Label, but does not add the predecessor current label. A DecisionRef adds only the referenced record's direct scopes, defined separately from the ordering column below. These are Tape for its direct tape set above (also the scope tape for FenceRaised, and the new and predecessor tapes for Reprovision); Operation for the operation of tags 6, 7, 13, 14, 15, 17, 23 and 26, the optional operation of tags 8 and 20, the adoption operation of tag 4, the parent operation of tag 10, and the session_id of tag 24. Additional direct scopes are: the explicit new Label of tags 2 and 4; Endpoint of a drive FenceRaised; Endpoint of a Load/Unload MotionIntent, plus Library for a bay endpoint, or Library of a Move MotionIntent; Library of tag 12; Config of tag 16; Endpoint of tag 17; Drive and optional Endpoint of tag 18; Drive of tags 19 and 20; CleaningRun and optional Drive of tag 21; Alarm of tag 22; and optional Endpoint of tag 24. Thus a reference to a fence inherits its scope Tape or drive Endpoint plus its optional Operation, independent of tag 8's deferral column. Inheritance is one level only: no current labels, no scopes the referenced record itself inherited, and no Config from a referenced Rule AssignPool. A reference to FenceReleased inherits nothing. FenceReleased's own ordering instead adds only the target Tape or Endpoint of the fence it names, and only while that fence is open (a raised fence still awaiting its queued check counts as open), as described in tag 9. A release of a fence that is no longer open orders on nothing.\n\n| Tag | Record | Scopes | Causal rule |\n|---:|---|---|---|\n| 1 | AssignPool | Tape, current Label; also Config when `source` is `Rule` with a configuration reference | `change.expected` = the tape's `assignment_generation`. The tape is provisioned and not retired. `Rule` requires `configuration` to name the latest retained `ConfigurationAccepted`; an older reference is `StaleConfiguration`, including an identical retry. History classifies a mismatching reference: only an older ConfigurationAccepted is StaleConfiguration; another kind or absent reference is WrongCounterpart. `pool`, if present, is non-empty. An Operator assignment without a configuration reference has no Config scope; if it supplies a reference, the general historical-reference rule adds that referenced record's direct scopes |\n| 2 | Label | Tape (both holders), Label (old and new) | `change` against the tape's `label_generation`. Labels are unique among live tapes. If the label is held by live tape X, `prior_holder` must name X with X's current `label_generation`. The one record moves the label, clears X's label and bumps X's generation. If the label is free, `prior_holder` is null. `observed_bot_uuid`, if present, equals `tape.uuid`. **Recovery 4** |\n| 3 | Retire | Tape, Label | `assignment_generation` equals the current one. The tape is live. Retire ends the incarnation for good and releases its label and pool. `observed_tape_sequence` is evidence, never a prerequisite. No later record except `Diagnostic` may name a retired `TapeRef` (`RetiredIdentity`) |\n| 4 | Reprovision | Tape (new and predecessor), Label, Operation (adoption) | A new UUID, never seen before. `predecessor`, if present, is retired. The label, if any, is free. `label_provenance` is null exactly when `label` is. `adoption` is present exactly for `Adopt`. Mandatory MediumSpec owns the sole fixed block size (record_size > 0, multiple of 512 for adoption). record_size, rerecord, lifecycle_ops and family kind are fixed for this incarnation; changing them requires a new incarnation. Former key 5 block_size is removed; parity_scheme is key 5, medium key 6, pool key 7, endpoint key 8 and adoption key 9. Sets assignment, label and media generations to 1 in one record; no separate `Label` or `AssignPool` for the initial state |\n| 5 | MediumSpecSet | Tape | `change` against the live tape's `media_revision`. Family kind (Lto/Disk) is fixed. Within Lto, generation may change only when the incarnation's derived ever_measured bit is false; otherwise MediumFamilyChanged. Provisioning (tag 4) initializes ever_measured from its own source, and every committed MediumSpecSet with source Measured sets it. The bit never clears within an incarnation, even if source is later revised to Label or Operator; it is derived from records, not stored on the wire. record_size, rerecord and lifecycle_ops must equal their current values, otherwise ImmutableMediumField { field }. Only usable_logical_bytes and source are generally revisable, with the stated LTO correction exception. Capacity may stay equal or decrease; an increase requires source Measured on this new revision (fresh measurement), otherwise CapacityIncreaseRequiresMeasurement. A retry is not a fresh revision. Fixed geometry and capabilities can change only through a new incarnation |\n| 6 | SupersedeTail | Tape, Operation | **Pending dependency** on `at`. At most one per (`at.tape`, `session_id`). B4b's tape fold checks the `SessionEnded.crash_ack_audit_sequence` that names it (kind, tape, session, count); B2 provides `LibraryFold::supersede(sequence)` for that lookup |\n| 7 | AcceptUnprotectedFinalization | Tape, Operation | **Pending** on `at`. `w < t`. At most one per (incarnation, operation). Codec, fold and fixtures exist now. **No production constructor**; step 6 adds the emitter |\n| 8 | FenceRaised | scope Tape only for ordering; none for DriveFault | ContainerQuarantine (cause 12) and Model (scope 2) decode but are refused before queuing or committing with ReservedNotYetUsed. `Write` requires tape scope; `DriveFault` requires drive scope (`FenceScopeMismatch`). The tape is live. A live or replay fence takes effect immediately. It defers its live-tape check only behind pending records on `Scope::Tape` of its scope tape; its queue entry contains only that scope. Label, operation and endpoint scopes neither block it nor are blocked by it while queued. A DriveFault fence has no tape-ordered check and never defers. A fence on a tape unknown while that tape has queued records is accepted; if the tape remains unknown at resolution, it becomes a scoped contradiction. The check runs in tape queue order; B4b writers check fence targets themselves. If the scope tape is already contradicted when the fence is raised, the check resolves at once: the fence opens and is never queued. If the scope tape becomes contradicted while the check is queued, the queued entry is released at the next `resolve`, which runs only before a live append; replay never runs one, so after replay that entry is still pending. In both cases the contradiction stands and the fence stays open. The fence id is this record's sequence. No deduplication: every raise is its own fence. **`at` is evidence, not a dependency:** the fence applies at once, and an unresolvable `at` is reported, never waited for |\n| 9 | FenceReleased | target Tape or Endpoint of the named fence while it is open; none otherwise | `fence` remains a u64 FenceId: the raise sequence within the header-bound log UUID. Only this reference form uses sequence-only LibraryHistory lookup; DecisionRef always matches the record UUID. An earlier raise no longer open is `FenceAlreadyReleased`, even after later fences; another tag is `WrongCounterpart`; absent history is `ReleaseWithoutFence`. Zero/forward references remain `ForwardReference`. The latest identical release retry remains a no-op. A release that differs from an earlier release of the same fence is `FenceAlreadyReleased`. While the named fence is open, the release orders on its target tape or endpoint, without inheriting the raise's operation. A release of a fence that is no longer open, including an identical retry of an earlier release, orders on nothing. `forced` changes nothing in the fold but the fence: it cannot resolve a motion, a pending record or an ambiguity |\n| 10 | MotionIntent | Tape, Endpoint, Library, Operation | `command` is unique among open intents; a `command` already open is `ConflictingDuplicate`. **The LOAD attempt count lives only here** (item 6): `attempt` is 1 plus the number of earlier `Load` intents with the same `parent_operation` and endpoint; with no parent it is 1. An intent with no outcome makes its library (a `Bay` endpoint's serial, a `Move`'s serial, or a standalone endpoint) **InventoryUnknown** |\n| 11 | MotionOutcome | intent scopes | `intent` names an open `MotionIntent` (`OutcomeWithoutOpenIntent`; `WrongCounterpart` if another tag). An intent reference naming an existing sequence with a different record UUID is `OutcomeWithoutOpenIntent`. One outcome per intent. `Done` requires a confirmation: Inventory for Move and Unload, Readiness for Load. `Unknown` leaves the library InventoryUnknown |\n| 12 | InventoryReconciled | Library, resolved intent scopes | `observation_generation` strictly increases per library. `resolves` names intents of this library whose outcome is `Unknown` or absent. A partial poll (`complete = false`) may resolve only intents whose elements it lists. It clears exactly the named uncertainty and creates no placement ownership |\n| 13 | VerificationProgress | Tape, Operation | **Pending** on `at`. Within one operation, `at`, `plan_digest` and `modes` never change (`CoverageChanged`). `parts_done` strictly increases and `next` strictly advances in lexicographic order (`ProgressRegressed`). `next.part = parts_done` (`ImpossibleCursor`). Progress is never a verdict. **No production constructor in step 4** (item 7); step 7 emits it |\n| 14 | VerificationVerdict | Tape, Operation, progress scopes | **Pending** on `at`. Healthy means `damaged` is empty and `unprotected` is null; findings may combine. Each range has `start < end`; `w < t`. If the operation has progress records, `progress` must name the last one, with the same `at` (`VerdictWithoutCoverage`). It supersedes that operation's progress only. A verdict at tape sequence N says nothing about N+1 |\n| 15 | ManualFinalizationAccepted | Tape, Operation | **Pending** on `at`, which names the tape log's `FinalizationPrepared` record; its digest binds the immutable plan, so there is no separate plan digest. `assignment_generation` equals the tape's current one (`GenerationMismatch`; item 9's \"Accepted with a stale generation\"). One per incarnation. Retired in step 6 |\n| 16 | ConfigurationAccepted | Config | `generation` is the previous one plus 1, starting at 1. `config_digest` = SHA-256 of the canonical bytes of `definitions` (`ConfigDigest`). It holds only catalog-relevant fields, never a secret or a TLS key. Assignments still need `AssignPool`; replay never reinterprets an older config |\n| 17 | ReadinessObserved | Tape, Endpoint, Operation, previous and intent scopes | `previous` names the last `ReadinessObserved` of the same operation, and is null for its first. `load_intent`, if present, names an open or resolved `Load` intent on the same endpoint; resolved records use LibraryHistory. **It carries no LOAD count** (item 6). `ready_generation` strictly increases per endpoint. A terminal `result` closes the operation. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids |\n| 18 | DriveObserved | Drive, Endpoint | The first observation creates the drive with `stewardship_generation = 1`. The observation time is the envelope's |\n| 19 | DriveDecision | Drive | The drive is known. `change` against `stewardship_generation`. Retire requires active; Reinstate requires retired. Fencing is tags 8 and 9, never this |\n| 20 | DriveHealthObserved | Drive, Tape, Operation | The drive is known. A non-null (`session_id`, `trigger`) matching the drive's latest retained snapshot is a no-op if the body is identical, otherwise `ConflictingDuplicate`. The fold makes no lifetime uniqueness claim. B4's health projector must retain the (`session_id`, `trigger`) unique key with first-wins: ignore an identical later body; report a different later body as a projection conflict and never apply it. Null-session snapshots are independent. Counters are cumulative per mount |\n| 21 | CleaningRecorded | CleaningRun, Drive, Tape | `previous` chains a run's records. At most one active run per drive and per cartridge (today's unique indexes). Register and Expire concern the cartridge, not a run. **The fold never derives a fence from cleaning** (item 11): a run that needs an operator is a separate `FenceRaised(DriveFault)` |\n| 22 | AlarmChanged | Alarm, cause scopes | `change` against the alarm generation (0 when never raised). Raise requires absent or cleared; Acknowledge requires raised and unacknowledged, with an envelope actor other than System (the acknowledger is the actor, recorded once); Clear requires raised. `cause` may name any earlier record, using LibraryHistory after replacement |\n| 23 | OperationRecorded | Operation | `previous` chains the operation's records. Accepted comes first or not at all. Started follows nothing or Accepted. Cancel records follow a non-terminal state. Finished, Failed, CancelledBeforeDispatch, CompletedAfterCancel and CompletionUnknown are terminal; nothing follows them. The idempotency scope (`actor_fingerprint`, `kind`, `idempotency_key`) is unique: a second Accepted for that scope with a different operation or fingerprint is a `ConflictingDuplicate`. An identical keyed retry yields `Duplicate(original receipt)` while Accepted is latest, `Chain` after Started or another non-terminal successor, or `ClosedOperationReplay { operation }` after the operation closes. B4b's API must answer all three from its projection, treating `Chain` for an identical keyed Accepted as already running and using the operation id for a closed retry because the fold does not retain terminal receipts. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids. **No progress variant**: progress gates nothing in step 4 and stays `Diagnostic` |\n| 24 | SessionObserved | Operation(session), Tape, Endpoint | Opened comes first; the other events are terminal. **A write session cannot be expressed**: write sessions are the tape log's (item 5b), and kind 0 is refused. It has no receipts, because durable receipts are tape-log only |\n| 25 | WrapMapCached | Tape | `digest` = SHA-256(`descriptors`), whose bytes are today's descriptor serialisation, opaque to the fold. Only digest and calibration_generation are retained per tape; the projector reads descriptor bytes from the source record. `calibration_generation` never decreases per tape. The RAO control store (the third authority) still decides servability; this rebuilds only the SQL cache |\n| 26 | RecoveryRecorded | Tape, Operation, prior scopes | **Pending** on `at`. RepairApplied requires `retained_through = at.sequence`. **`AppendRecoveryRequired` does not exist** (item 5c): action 0 is refused. Missing native proof stays pending. `prior` must name an earlier RecoveryRecorded, including one replaced in retained state |\n| 32 | Diagnostic | none | Detail keys are strictly ascending and unique (InvalidSchema); a nested value is refused at encode. **The fold validates and ignores it.** `DiagnosticEvent` is B2's own closed enum (below) |\n\nAll generation failures use GenerationMismatch. Shape violations use InvalidSchema; pair/type failures use WrongCounterpart or the named rule error. Digest mismatch is a scoped `TapeContradiction` and is checked first. A matching digest with the wrong native kind is the typed refusal `CounterpartKind`: replay stops there, and nothing is held for that record. Only tag 15 constrains the kind (`FinalizationPrepared`). Tag 3 adds mandatory key 4, detail: text <=4096 bytes or null; it is presentation only. Tag 21 is removed from production orchestration in step 5; its historical decoder remains.\n\n### Additional wire conventions\n\nId is b16; Hash is b32; Text/TextValue is UTF-8 text <=4096 bytes; LabelText is UTF-8 text <=32 bytes. Blob<N> is a CBOR byte string <=N bytes; Bounded<T,N> is a definite array <=N entries. Integer types are unsigned, except Negative, the diagnostic i64 <0. Struct names are mandatory ascending integer-keyed maps. Unit is null. DiagnosticEntry is [text,DiagnosticValue]. AuditActor is {0: kind (System=0, User=1, Service=2), 1: name (null exactly for System)}. Pool watermark fields encode the existing f64 IEEE-754 bits as u64, preserving exact configuration values without CBOR floats; they are not text.\n";
+const FOLD_SCHEMA_NOTES:&str="## Record tags, causal keys and scopes\n\nEvery record except FenceRaised also orders on the current label of each tape it names in its direct tape set. For this rule the direct tape set is the tape field of tags 1, 3, 5 and 25, both holders for tag 2, the TapeAt tape of tags 6, 7, 13, 14, 15 and 26, and the optional tape or cartridge of tags 10, 17, 20, 21 and 24; other tags have no direct tapes. Reprovision adds its new and predecessor Tape scopes and its explicit new Label, but does not add the predecessor current label. A DecisionRef adds only the referenced record's direct scopes, defined separately from the ordering column below. These are Tape for its direct tape set above (also the scope tape for FenceRaised, and the new and predecessor tapes for Reprovision); Operation for the operation of tags 6, 7, 13, 14, 15, 17, 23 and 26, the optional operation of tags 8 and 20, the adoption operation of tag 4, the parent operation of tag 10, and the session_id of tag 24. Additional direct scopes are: the explicit new Label of tags 2 and 4; Endpoint of a drive FenceRaised; Endpoint of a Load/Unload MotionIntent, plus Library for a bay endpoint, or Library of a Move MotionIntent; Library of tag 12; Config of tag 16; Endpoint of tag 17; Drive and optional Endpoint of tag 18; Drive of tags 19 and 20; CleaningRun and optional Drive of tag 21; Alarm of tag 22; and optional Endpoint of tag 24. Thus a reference to a fence inherits its scope Tape or drive Endpoint plus its optional Operation, independent of tag 8's deferral column. Inheritance is one level only: no current labels, no scopes the referenced record itself inherited, and no Config from a referenced Rule AssignPool. A reference to FenceReleased inherits nothing. FenceReleased's own ordering instead adds only the target Tape or Endpoint of the fence it names, and only while that fence is open (a raised fence still awaiting its queued check counts as open), as described in tag 9. A release of a fence that is no longer open orders on nothing.\n\n| Tag | Record | Scopes | Causal rule |\n|---:|---|---|---|\n| 1 | AssignPool | Tape, current Label; also Config when `source` is `Rule` with a configuration reference | `change.expected` = the tape's `assignment_generation`. The tape is provisioned and not retired. `Rule` requires `configuration` to name the latest retained `ConfigurationAccepted`; an older reference is `StaleConfiguration`, including an identical retry. History classifies a mismatching reference: only an older ConfigurationAccepted is StaleConfiguration; another kind or absent reference is WrongCounterpart. `pool`, if present, is non-empty. An Operator assignment without a configuration reference has no Config scope; if it supplies a reference, the general historical-reference rule adds that referenced record's direct scopes |\n| 2 | Label | Tape (both holders), Label (old and new) | `change` against the tape's `label_generation`. Labels are unique among live tapes. If the label is held by live tape X, `prior_holder` must name X with X's current `label_generation`. The one record moves the label, clears X's label and bumps X's generation. If the label is free, `prior_holder` is null. `observed_bot_uuid`, if present, equals `tape.uuid`. **Recovery 4** |\n| 3 | Retire | Tape, Label | `assignment_generation` equals the current one. The tape is live. Retire ends the incarnation for good and releases its label and pool. `observed_tape_sequence` is evidence, never a prerequisite. No later record except `Diagnostic` may name a retired `TapeRef` (`RetiredIdentity`) |\n| 4 | Reprovision | Tape (new and predecessor), Label, Operation (adoption) | A new UUID, never seen before. `predecessor`, if present, is retired. The label, if any, is free. `label_provenance` is null exactly when `label` is. `adoption` is present exactly for `Adopt`. Mandatory MediumSpec owns the sole fixed block size (record_size > 0, multiple of 512 for adoption). record_size, rerecord, lifecycle_ops and family kind are fixed for this incarnation; changing them requires a new incarnation. Former key 5 block_size is removed; parity_scheme is key 5, medium key 6, pool key 7, endpoint key 8 and adoption key 9. Sets assignment, label and media generations to 1 in one record; no separate `Label` or `AssignPool` for the initial state |\n| 5 | MediumSpecSet | Tape | `change` against the live tape's `media_revision`. Family kind (Lto/Disk) is fixed. Within Lto, generation may change only when the incarnation's derived ever_measured bit is false; otherwise MediumFamilyChanged. Provisioning (tag 4) initializes ever_measured from its own source, and every committed MediumSpecSet with source Measured sets it. The bit never clears within an incarnation, even if source is later revised to Label or Operator; it is derived from records, not stored on the wire. record_size, rerecord and lifecycle_ops must equal their current values, otherwise ImmutableMediumField { field }. Only usable_logical_bytes and source are generally revisable, with the stated LTO correction exception. Capacity may stay equal or decrease; an increase requires source Measured on this new revision (fresh measurement), otherwise CapacityIncreaseRequiresMeasurement. A retry is not a fresh revision. Fixed geometry and capabilities can change only through a new incarnation |\n| 6 | SupersedeTail | Tape, Operation | **Pending dependency** on `at`. At most one per (`at.tape`, `session_id`). B4b's tape fold checks the `SessionEnded.crash_ack_audit_sequence` that names it (kind, tape, session, count); B2 provides `LibraryFold::supersede(sequence)` for that lookup |\n| 7 | AcceptUnprotectedFinalization | Tape, Operation | **Pending** on `at`. `w < t`. At most one per (incarnation, operation). Codec, fold and fixtures exist now. **No production constructor**; step 6 adds the emitter |\n| 8 | FenceRaised | scope Tape only for ordering; none for DriveFault | ContainerQuarantine (cause 12) and Model (scope 2) decode but are refused before queuing or committing with ReservedNotYetUsed. `Write` requires tape scope; `DriveFault` requires drive scope (`FenceScopeMismatch`). An unqueued tape-scoped fence requires a live tape. A live or replay fence takes effect immediately. It defers its live-tape check only behind pending records on `Scope::Tape` of its scope tape; its queue entry contains only that scope. Label, operation and endpoint scopes neither block it nor are blocked by it while queued. A DriveFault fence has no tape-ordered check and never defers. A fence on a tape unknown while that tape has queued records is accepted; if its tape is unknown, of another incarnation or retired at resolution, the check is dropped and the failure is attached to the open fence as its full TapeRef and cause. This creates no tape contradiction; releasing the fence removes the report. The check runs in tape queue order; B4b writers check fence targets themselves. Contradiction status never decides a fence check. A fence raised on a contradicted tape with no pending predecessor validates liveness immediately. A queued check remains pending during replay even if a predecessor is later excluded. The next `resolve`, which runs only before a live append, retries it in tape queue order; a remaining NotYet predecessor still holds the check. The fence stays open throughout. The fence id is this record's sequence. No deduplication: every raise is its own fence. **`at` is evidence, not a dependency:** the fence applies at once, and an unresolvable `at` is reported, never waited for |\n| 9 | FenceReleased | target Tape or Endpoint of the named fence while it is open; none otherwise | `fence` remains a u64 FenceId: the raise sequence within the header-bound log UUID. Only this reference form uses sequence-only LibraryHistory lookup; DecisionRef always matches the record UUID. An earlier raise no longer open is `FenceAlreadyReleased`, even after later fences; another tag is `WrongCounterpart`; absent history is `ReleaseWithoutFence`. Zero/forward references remain `ForwardReference`. The latest identical release retry remains a no-op. A release that differs from an earlier release of the same fence is `FenceAlreadyReleased`. While the named fence is open, the release orders on its target tape or endpoint, without inheriting the raise's operation. A release of a fence that is no longer open, including an identical retry of an earlier release, orders on nothing. `forced` changes nothing in the fold but the fence: it cannot resolve a motion, a pending record or an ambiguity |\n| 10 | MotionIntent | Tape, Endpoint, Library, Operation | `command` is unique among open intents; a `command` already open is `ConflictingDuplicate`. **The LOAD attempt count lives only here** (item 6): `attempt` is 1 plus the number of earlier `Load` intents with the same `parent_operation` and endpoint; with no parent it is 1. An intent with no outcome makes its library (a `Bay` endpoint's serial, a `Move`'s serial, or a standalone endpoint) **InventoryUnknown** |\n| 11 | MotionOutcome | intent scopes | `intent` names an open `MotionIntent` (`OutcomeWithoutOpenIntent`; `WrongCounterpart` if another tag). An intent reference naming an existing sequence with a different record UUID is `OutcomeWithoutOpenIntent`. One outcome per intent. `Done` requires a confirmation: Inventory for Move and Unload, Readiness for Load. `Unknown` leaves the library InventoryUnknown |\n| 12 | InventoryReconciled | Library, resolved intent scopes | `observation_generation` strictly increases per library. `resolves` names intents of this library whose outcome is `Unknown` or absent. A partial poll (`complete = false`) may resolve only intents whose elements it lists. It clears exactly the named uncertainty and creates no placement ownership |\n| 13 | VerificationProgress | Tape, Operation | **Pending** on `at`. Within one operation, `at`, `plan_digest` and `modes` never change (`CoverageChanged`). `parts_done` strictly increases and `next` strictly advances in lexicographic order (`ProgressRegressed`). `next.part = parts_done` (`ImpossibleCursor`). Progress is never a verdict. **No production constructor in step 4** (item 7); step 7 emits it |\n| 14 | VerificationVerdict | Tape, Operation, progress scopes | **Pending** on `at`. Healthy means `damaged` is empty and `unprotected` is null; findings may combine. Each range has `start < end`; `w < t`. If the operation has progress records, `progress` must name the last one, with the same `at` (`VerdictWithoutCoverage`). It supersedes that operation's progress only. A verdict at tape sequence N says nothing about N+1 |\n| 15 | ManualFinalizationAccepted | Tape, Operation | **Pending** on `at`, which names the tape log's `FinalizationPrepared` record; its digest binds the immutable plan, so there is no separate plan digest. `assignment_generation` equals the tape's current one (`GenerationMismatch`; item 9's \"Accepted with a stale generation\"). One per incarnation. Retired in step 6 |\n| 16 | ConfigurationAccepted | Config | `generation` is the previous one plus 1, starting at 1. `config_digest` = SHA-256 of the canonical bytes of `definitions` (`ConfigDigest`). It holds only catalog-relevant fields, never a secret or a TLS key. Assignments still need `AssignPool`; replay never reinterprets an older config |\n| 17 | ReadinessObserved | Tape, Endpoint, Operation, previous and intent scopes | `previous` names the last `ReadinessObserved` of the same operation, and is null for its first. `load_intent`, if present, names an open or resolved `Load` intent on the same endpoint; resolved records use LibraryHistory. **It carries no LOAD count** (item 6). `ready_generation` strictly increases per endpoint. A terminal `result` closes the operation. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids |\n| 18 | DriveObserved | Drive, Endpoint | The first observation creates the drive with `stewardship_generation = 1`. The observation time is the envelope's |\n| 19 | DriveDecision | Drive | The drive is known. `change` against `stewardship_generation`. Retire requires active; Reinstate requires retired. Fencing is tags 8 and 9, never this |\n| 20 | DriveHealthObserved | Drive, Tape, Operation | The drive is known. A non-null (`session_id`, `trigger`) matching the drive's latest retained snapshot is a no-op if the body is identical, otherwise `ConflictingDuplicate`. The fold makes no lifetime uniqueness claim. B4's health projector must retain the (`session_id`, `trigger`) unique key with first-wins: ignore an identical later body; report a different later body as a projection conflict and never apply it. Null-session snapshots are independent. Counters are cumulative per mount |\n| 21 | CleaningRecorded | CleaningRun, Drive, Tape | `previous` chains a run's records. At most one active run per drive and per cartridge (today's unique indexes). Register and Expire concern the cartridge, not a run. **The fold never derives a fence from cleaning** (item 11): a run that needs an operator is a separate `FenceRaised(DriveFault)` |\n| 22 | AlarmChanged | Alarm, cause scopes | `change` against the alarm generation (0 when never raised). Raise requires absent or cleared; Acknowledge requires raised and unacknowledged, with an envelope actor other than System (the acknowledger is the actor, recorded once); Clear requires raised. `cause` may name any earlier record, using LibraryHistory after replacement |\n| 23 | OperationRecorded | Operation | `previous` chains the operation's records. Accepted comes first or not at all. Started follows nothing or Accepted. Cancel records follow a non-terminal state. Finished, Failed, CancelledBeforeDispatch, CompletedAfterCancel and CompletionUnknown are terminal; nothing follows them. The idempotency scope (`actor_fingerprint`, `kind`, `idempotency_key`) is unique: a second Accepted for that scope with a different operation or fingerprint is a `ConflictingDuplicate`. An identical keyed retry yields `Duplicate(original receipt)` while Accepted is latest, `Chain` after Started or another non-terminal successor, or `ClosedOperationReplay { operation }` after the operation closes. B4b's API must answer all three from its projection, treating `Chain` for an identical keyed Accepted as already running and using the operation id for a closed retry because the fold does not retain terminal receipts. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids. **No progress variant**: progress gates nothing in step 4 and stays `Diagnostic` |\n| 24 | SessionObserved | Operation(session), Tape, Endpoint | Opened comes first; the other events are terminal. **A write session cannot be expressed**: write sessions are the tape log's (item 5b), and kind 0 is refused. It has no receipts, because durable receipts are tape-log only |\n| 25 | WrapMapCached | Tape | `digest` = SHA-256(`descriptors`), whose bytes are today's descriptor serialisation, opaque to the fold. Only digest and calibration_generation are retained per tape; the projector reads descriptor bytes from the source record. `calibration_generation` never decreases per tape. The RAO control store (the third authority) still decides servability; this rebuilds only the SQL cache |\n| 26 | RecoveryRecorded | Tape, Operation, prior scopes | **Pending** on `at`. RepairApplied requires `retained_through = at.sequence`; a mismatch is InvalidSchema in shape validation, before any view lookup. On receipt or live validation, RepairBelowReference { highest } refuses a repair below any earlier received dependent reference on that tape, whether applied, duplicate, pending or excluded. Duplicates count toward the floor; refused candidates do not. A prior repair is itself a reference, so repairs are monotone. LibraryFold::highest_reference(tape) exposes the same floor for the future repair writer. An admitted repair is an ordinary dependent record, judged on its own reference; it neither clears contradictions nor undoes records. Resolution does not reapply the floor against references received after that repair. **`AppendRecoveryRequired` does not exist** (item 5c): action 0 is refused. Missing native proof stays pending. `prior` must name an earlier RecoveryRecorded, including one replaced in retained state |\n| 32 | Diagnostic | none | Detail keys are strictly ascending and unique (InvalidSchema); a nested value is refused at encode. **The fold validates and ignores it.** `DiagnosticEvent` is B2's own closed enum (below) |\n\nAll generation failures use GenerationMismatch. RepairBelowReference { highest } is a fold-only refusal with no new wire code. Shape violations use InvalidSchema; pair/type failures use WrongCounterpart or the named rule error. For a dependent record, digest mismatch is a scoped `TapeContradiction`, checked after shape and tape identity and before other library rules in validate_at. The receipt-time repair floor is also enforced for a scope-held repair, independent of its native view. A matching digest with the wrong native kind is the typed refusal `CounterpartKind`: replay stops there, and nothing is held for that record. Only tag 15 constrains the kind (`FinalizationPrepared`). Tag 3 adds mandatory key 4, detail: text <=4096 bytes or null; it is presentation only. Tag 21 is removed from production orchestration in step 5; its historical decoder remains.\n\n### Additional wire conventions\n\nId is b16; Hash is b32; Text/TextValue is UTF-8 text <=4096 bytes; LabelText is UTF-8 text <=32 bytes. Blob<N> is a CBOR byte string <=N bytes; Bounded<T,N> is a definite array <=N entries. Integer types are unsigned, except Negative, the diagnostic i64 <0. Struct names are mandatory ascending integer-keyed maps. Unit is null. DiagnosticEntry is [text,DiagnosticValue]. AuditActor is {0: kind (System=0, User=1, Service=2), 1: name (null exactly for System)}. Pool watermark fields encode the existing f64 IEEE-754 bits as u64, preserving exact configuration values without CBOR floats; they are not text.\n";
 
 fn optional_forms(l: &mut LibraryLog, config: DecisionRef) {
     for layer in [
@@ -2308,7 +2321,8 @@ fn absent_fence_vector() -> Vec<u8> {
         "case": "release-missing-fence",
         "contract": "Fold interface only: apply prefix; supply an empty LibraryHistory. This is not a store replay vector; contiguous store history includes the diagnostic and returns WrongCounterpart.",
         "history": [], "prefix_frame_hex": hex(&prefix_bytes),
-        "candidate_frame_hex": hex(&candidate_bytes), "expected": "ReleaseWithoutFence"
+        "candidate_frame_hex": hex(&candidate_bytes), "expected": "ReleaseWithoutFence",
+        "additional_vectors": contradiction_fold_vectors()
     })).unwrap();
     bytes.push(b'\n');
     bytes
@@ -2357,7 +2371,7 @@ fn review_replay_vectors(root: &Path) {
     assert_eq!(r.fold.pending.len(), 4);
     r.fold.resolve(&Present, &History::default()).unwrap();
     assert!(r.fold.pending.is_empty());
-    assert!(r.fold.contradictions.is_empty());
+    assert!(r.fold.contradicted_tapes() == 0);
     let dir = root.join("repaired-kind-scoped");
     let (mut log, _) = open(&dir, &Present);
     body(&mut log, provision(1, None));
@@ -2378,10 +2392,7 @@ fn review_replay_vectors(root: &Path) {
     let view = corpus_view(Path::new("repaired-kind-scoped"));
     let r = replay(&dir, LOG, view.as_ref()).unwrap();
     assert!(r.refusal.is_none());
-    assert_eq!(
-        r.fold.contradictions.get(&fold::Scope::Tape(tape(1).uuid)),
-        Some(&FoldError::TapeContradiction)
-    );
+    assert!(r.fold.contradicted(tape(1)));
     assert_eq!(r.fold.tapes[&tape(2).uuid].assignment_generation, 2);
 }
 
@@ -2478,6 +2489,44 @@ fn view_table() -> BTreeMap<&'static str, CorpusView> {
         )]),
     };
     BTreeMap::from([
+        (
+            "lost-reference-drive-release",
+            CorpusView {
+                present_default: true,
+                entries: BTreeMap::from([((tape(1).uuid, 1), TapeLookup::Contradiction)]),
+            },
+        ),
+        (
+            "retire-contradicted-tape",
+            CorpusView {
+                present_default: true,
+                entries: BTreeMap::from([((tape(1).uuid, 1), TapeLookup::Contradiction)]),
+            },
+        ),
+        (
+            "excluded-progress-verdict",
+            CorpusView {
+                present_default: true,
+                entries: BTreeMap::from([((tape(1).uuid, 1), TapeLookup::Contradiction)]),
+            },
+        ),
+        (
+            "blocked-reference-check-order",
+            CorpusView {
+                present_default: false,
+                entries: BTreeMap::from([((tape(1).uuid, 1), TapeLookup::Contradiction)]),
+            },
+        ),
+        ("notyet-reference-holds-endpoint", absent.clone()),
+        ("deferred-fence-unknown-at-resolution", absent.clone()),
+        ("rejected/repair-below-pending-reference", absent.clone()),
+        (
+            "rejected/repair-below-excluded-reference",
+            CorpusView {
+                present_default: true,
+                entries: BTreeMap::from([((tape(1).uuid, 9), TapeLookup::Contradiction)]),
+            },
+        ),
         ("queued-successor-fence", absent.clone()),
         ("assign-pool-held-by-current-label", absent.clone()),
         ("alarm-held-by-drive-fence-operation", absent.clone()),
@@ -2844,9 +2893,9 @@ fn freeze_vectors(root: &Path) {
             .iter()
             .map(|p| p.sequence)
             .collect::<Vec<_>>(),
-        [5]
+        Vec::<u64>::new()
     );
-    assert_eq!(r.fold.applied_through, 4);
+    assert_eq!(r.fold.applied_through, 5);
     let case = Path::new("fence-behind-contradicted-operation");
     let dir = root.join(case);
     let (mut log, _) = open(&dir, &Present);
@@ -2864,7 +2913,7 @@ fn freeze_vectors(root: &Path) {
             .iter()
             .map(|p| p.sequence)
             .collect::<Vec<_>>(),
-        [5]
+        Vec::<u64>::new()
     );
     assert_eq!(r.fold.open_fences(), 0);
     assert_eq!(r.fold.tapes[&tape(2).uuid].media_revision, 2);
@@ -2889,7 +2938,7 @@ fn freeze_vectors(root: &Path) {
             .iter()
             .map(|p| p.sequence)
             .collect::<Vec<_>>(),
-        [4]
+        Vec::<u64>::new()
     );
     assert_eq!(r.fold.open_fences(), 0);
 
@@ -3052,7 +3101,7 @@ fn alarm_fence_reference_vector(root: &Path) {
     assert_eq!(pending(&r.fold), [3, 5]);
     assert_eq!(r.fold.applied_through, 2);
     assert_eq!(r.fold.open_fences(), 1);
-    assert!(r.fold.contradictions.is_empty());
+    assert!(r.fold.contradicted_tapes() == 0);
     assert_eq!(
         r.fold.pending.last().unwrap().scope,
         std::collections::BTreeSet::from([
@@ -3126,7 +3175,7 @@ fn current_label_vector(root: &Path) {
     );
 }
 
-/// Production replay receives once; only explicit resolution drains the deferred fence.
+/// D1/D4: replay never resolves; a NotYet predecessor also keeps its fence check queued.
 #[test]
 fn replay_never_retries_pending() {
     let root =
@@ -3143,7 +3192,7 @@ fn replay_never_retries_pending() {
     assert_eq!(sequences(&r.fold), [11, 12, 13]);
     r.fold.resolve(view.as_ref(), &History::default()).unwrap();
     eprintln!("pending-cross-log after resolve: {:?}", sequences(&r.fold));
-    assert_eq!(sequences(&r.fold), [11, 12]);
+    assert_eq!(sequences(&r.fold), [11, 12, 13]);
     assert_eq!(r.fold.open_fences(), 1);
 }
 
@@ -3210,11 +3259,12 @@ fn fold_identities(dir: &Path, replay: &Replay) -> (String, String, String) {
         .fold
         .contradictions
         .iter()
-        .map(|(scope, error)| {
+        .filter(|(_, summary)| summary.contradicted())
+        .map(|(scope, _)| {
             let fold::Scope::Tape(tape) = scope else {
                 panic!("non-tape contradiction in corpus: {scope:?}")
             };
-            format!("{}:{error:?}", hex(tape))
+            format!("{}:TapeContradiction", hex(tape))
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -3262,4 +3312,351 @@ fn views_table_drives_replay_and_publication() {
         count
     );
     assert!(count >= 102);
+}
+
+/// D1-D8: persist writer-valid histories, then replay against the published native views.
+fn contradiction_vectors(root: &Path) {
+    let motion_history = || {
+        vec![
+            provision(1, None),
+            verdict(),
+            intent(1),
+            Body::FenceRaised(FenceRaised {
+                kind: FenceKind::DriveFault,
+                scope: FenceScope::Drive(endpoint("LIBA0001")),
+                cause: FenceCause::TransferError,
+                evidence: None,
+                at: None,
+                operation: None,
+            }),
+            release(4),
+        ]
+    };
+    let mut vv = verdict();
+    if let Body::VerificationVerdict(v) = &mut vv {
+        v.progress = Some(record(progress(1), 2).reference(2));
+    }
+    let supersede = |tape_id, sequence, operation| {
+        Body::SupersedeTail(SupersedeTail {
+            at: at(tape_id, sequence),
+            operation: [operation; 16],
+            session_id: [sequence as u8; 16],
+            preview_digest: [0; 32],
+            tail_file_count: 1,
+        })
+    };
+    for (name, bodies) in [
+        ("lost-reference-drive-release", motion_history()),
+        ("notyet-reference-holds-endpoint", motion_history()),
+        (
+            "excluded-progress-verdict",
+            vec![provision(1, None), progress(1), vv],
+        ),
+        (
+            "supersede-after-repair-above-reference",
+            vec![provision(1, None), b4b0_repair(8, 8), supersede(1, 7, 3)],
+        ),
+        (
+            "blocked-reference-check-order",
+            vec![
+                provision(1, None),
+                provision(2, None),
+                supersede(2, 30, 7),
+                progress(1),
+            ],
+        ),
+        (
+            "retire-contradicted-tape",
+            vec![
+                provision(1, None),
+                verdict(),
+                Body::Retire(Retire {
+                    tape: tape(1),
+                    reason: RetireReason::OperatorRequested,
+                    observed_tape_sequence: None,
+                    assignment_generation: 1,
+                    detail: None,
+                }),
+            ],
+        ),
+        // The persisted prefix pins the queued check. FOLD-VECTORS describes the
+        // injected identity loss used to exercise UnknownTape at resolution.
+        (
+            "deferred-fence-unknown-at-resolution",
+            vec![provision(1, None), verdict(), fence(1)],
+        ),
+    ] {
+        let dir = root.join(name);
+        let (mut log, _) = open(&dir, &Present);
+        for b in bodies {
+            body(&mut log, b);
+        }
+        drop(log);
+        let replay = replay(&dir, LOG, &case_view(Path::new(name))).unwrap();
+        assert!(replay.refusal.is_none(), "{name}: {:?}", replay.refusal);
+        let expected = match name {
+            "notyet-reference-holds-endpoint" => (vec![2, 3, 5], 1, 0, 1),
+            "blocked-reference-check-order" => (vec![3], 0, 1, 2),
+            "deferred-fence-unknown-at-resolution" => (vec![2, 3], 1, 0, 1),
+            "lost-reference-drive-release" => (vec![], 0, 1, 5),
+            "excluded-progress-verdict" | "retire-contradicted-tape" => (vec![], 0, 1, 3),
+            _ => (vec![], 0, 0, 3),
+        };
+        assert_eq!(
+            (
+                replay
+                    .fold
+                    .pending
+                    .iter()
+                    .map(|p| p.sequence)
+                    .collect::<Vec<_>>(),
+                replay.fold.open_fences(),
+                replay.fold.contradicted_tapes(),
+                replay.fold.applied_through
+            ),
+            expected,
+            "{name}"
+        );
+    }
+    for (name, prefix, candidate, expected) in [
+        (
+            "repair-below-applied-reference",
+            vec![provision(1, None), supersede(1, 9, 7)],
+            b4b0_repair(8, 8),
+            FoldError::RepairBelowReference { highest: 9 },
+        ),
+        (
+            "repair-below-pending-reference",
+            vec![provision(1, None), supersede(1, 9, 7)],
+            b4b0_repair(8, 8),
+            FoldError::RepairBelowReference { highest: 9 },
+        ),
+        (
+            "repair-below-excluded-reference",
+            vec![provision(1, None), supersede(1, 9, 7)],
+            b4b0_repair(8, 8),
+            FoldError::RepairBelowReference { highest: 9 },
+        ),
+        (
+            "second-repair-below-first",
+            vec![provision(1, None), b4b0_repair(9, 9)],
+            b4b0_repair(8, 8),
+            FoldError::RepairBelowReference { highest: 9 },
+        ),
+        (
+            "malformed-repair",
+            vec![provision(1, None)],
+            b4b0_repair(8, 7),
+            FoldError::InvalidSchema,
+        ),
+    ] {
+        let case = PathBuf::from("rejected").join(name);
+        let dir = root.join(&case);
+        let (mut log, _) = open(&dir, &Present);
+        for b in prefix {
+            body(&mut log, b);
+        }
+        assert!(
+            matches!(log.append(candidate.clone(), AuditActor::System, SourceLayer::Layer4, &Present), Err(StoreError::Fold(e)) if e == expected)
+        );
+        let n = log.state().last_sequence + 1;
+        let (bytes, _) =
+            codec::encode(n, log.state().terminal_hash, &record(candidate, n)).unwrap();
+        drop(log);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(segments(&dir).remove(0))
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let replay = replay(&dir, LOG, &case_view(&case)).unwrap();
+        assert_eq!(
+            replay.refusal.unwrap().fault,
+            RefusalKind::Fold(expected),
+            "{name}"
+        );
+        assert_eq!(replay.last_sequence, n - 1);
+    }
+}
+
+/// D4 property: every writer-valid positive history agrees with replay under a growing view.
+/// Each dependent reference is present and matching at append; fence evidence may be NotYet.
+/// The seed varies when unrelated immutable proofs appear.
+/// Native NotYet/contradiction corpus cases remain in the separate replay/bootstrap oracle.
+#[test]
+fn b4b0_d4_positive_corpus_growing_views_property() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/library-log");
+    let cases: std::collections::BTreeSet<_> = collect(&root)
+        .keys()
+        .map(|p| p.parent().unwrap().to_path_buf())
+        .collect();
+    for seed in [0x4b4b0001_u64, 0x91e10da5, 0xc0ffee, 0x5eed, 0xf00d] {
+        eprintln!("D4 growing-view property seed={seed:#x}");
+        let mut random = seed;
+        let mut absent_fence_evidence = 0;
+        for case in &cases {
+            if case.starts_with("rejected") {
+                continue;
+            }
+            // The growing-view property uses original writer evidence, including
+            // histories whose published restart view deliberately loses a reference.
+            let expected = replay(&root.join(case), LOG, &Present).unwrap();
+            if expected.refusal.is_some() {
+                continue;
+            } // byte-fault corpus is a different property
+            let mut frames = Vec::new();
+            for path in segments(&root.join(case)) {
+                let bytes = fs::read(path).unwrap();
+                let mut input = bytes.as_slice();
+                let header = codec::Header::decode(&mut input, LOG).unwrap();
+                let mut decoder = codec::Decoder::at(input, header.first_sequence, 84);
+                let mut hash = header.previous_segment_hash;
+                while let Ok(Some(frame)) = decoder.next_frame() {
+                    if frame.sequence > expected.last_sequence {
+                        break;
+                    }
+                    hash = codec::verify(&frame, hash).unwrap();
+                    let receipt = Receipt {
+                        sequence: frame.sequence,
+                        record_uuid: frame.record.envelope.record_uuid,
+                        record_hash: hash,
+                        synced: true,
+                    };
+                    frames.push((frame.record, receipt));
+                }
+            }
+            let mut references = BTreeMap::new();
+            let mut consistent = true;
+            for (r, _) in &frames {
+                if let Some(at) = r.body.at() {
+                    if references
+                        .insert((at.tape.uuid, at.sequence), at.record_digest)
+                        .is_some_and(|old| old != at.record_digest)
+                    {
+                        consistent = false;
+                    }
+                }
+            }
+            if !consistent {
+                eprintln!("D4 seed={seed:#x} case={} requires changed native bytes; outside grow-only premise", case.display());
+                assert_eq!(case.to_str().unwrap(), "pending-cross-log");
+                continue;
+            }
+            let mut live = LibraryFold::default();
+            let mut view = View::default();
+            let mut history = History::default();
+            for (record, receipt) in &frames {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                // Add extra immutable evidence at a seed-selected point. Nothing is removed.
+                if random & 1 == 0 {
+                    for (future, _) in &frames {
+                        if let Some(at) = future.body.at() {
+                            view.0
+                                .entry((at.tape.uuid, at.sequence))
+                                .or_insert_with(|| Present.lookup(at));
+                        }
+                    }
+                }
+                if let Some(at) = record.body.at() {
+                    view.0
+                        .entry((at.tape.uuid, at.sequence))
+                        .or_insert_with(|| Present.lookup(at));
+                }
+                // Fence evidence is not a dependency: do not force it to be present.
+                if let Body::FenceRaised(v) = &record.body {
+                    if let Some(at) = &v.at {
+                        if matches!(view.lookup(at), TapeLookup::NotYet) {
+                            absent_fence_evidence += 1;
+                        }
+                    }
+                }
+                live.resolve(&view, &history).unwrap();
+                live.apply(
+                    receipt.sequence,
+                    record.clone(),
+                    receipt.clone(),
+                    &view,
+                    &history,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "seed={seed:#x} case={} sequence={}: {e:?}",
+                        case.display(),
+                        receipt.sequence
+                    )
+                });
+                history.0.insert(receipt.sequence, record.clone());
+            }
+            let mut replayed = LibraryFold::default();
+            let mut prefix = History::default();
+            for (record, receipt) in frames {
+                replayed
+                    .receive(
+                        receipt.sequence,
+                        record.clone(),
+                        receipt.clone(),
+                        &view,
+                        &prefix,
+                    )
+                    .unwrap();
+                prefix.0.insert(receipt.sequence, record);
+            }
+            live.assert_same_state(&replayed);
+            assert!(
+                live.pending.is_empty(),
+                "seed={seed:#x} case={}",
+                case.display()
+            );
+        }
+        assert!(absent_fence_evidence > 0, "seed={seed:#x}");
+    }
+}
+
+/// D2/D4/D5/D6 fold-interface vectors include their native inputs and injection boundaries.
+fn contradiction_fold_vectors() -> Vec<serde_json::Value> {
+    let encode = |bodies: Vec<Body>| {
+        let mut hash = [0; 32];
+        bodies
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let n = i as u64 + 1;
+                let (bytes, next) = codec::encode(n, hash, &record(b, n)).unwrap();
+                hash = next;
+                hex(&bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut vv = verdict();
+    if let Body::VerificationVerdict(v) = &mut vv {
+        v.progress = Some(record(progress(1), 2).reference(2));
+    }
+    let mut high = verdict();
+    if let Body::VerificationVerdict(v) = &mut high {
+        v.at = at(1, 9);
+    }
+    vec![
+        serde_json::json!({
+            "case": "d2-verdict-after-excluded-progress", "rule": "D2 / Opus N1",
+            "frames_hex": encode(vec![provision(1,None), progress(1), vv]),
+            "view": {"default": "Present(FinalizationPrepared,echo)", "overrides": [{"tape_uuid":hex(&tape(1).uuid), "sequence":1, "answer":"Contradiction"}]},
+            "expected": {"received_through":3, "applied_through":3, "pending_sequences":[], "contradicted_tapes":[hex(&tape(1).uuid)], "excluded_diagnostics":2, "refusal":null}
+        }),
+        serde_json::json!({
+            "case": "d5-repair-below-received-reference", "rule":"D5",
+            "frames_hex":encode(vec![provision(1,None),high,b4b0_repair(8,8)]),
+            "views":["Present(FinalizationPrepared,echo)","NotYet","Contradiction"],
+            "expected": {"refusal_sequence":3,"refusal":"RepairBelowReference { highest: 9 }", "highest_reference":9}
+        }),
+        serde_json::json!({
+            "case":"d6-deferred-fence-unknown-at-resolution", "rule":"D6",
+            "frames_hex":encode(vec![provision(1,None), verdict(), fence(1)]),
+            "view":"NotYet",
+            "injection":"After receive, remove pending sequence 2 and its byte charge; remove tape 01010101010101010101010101010101 from the identity map; resolve with Present. This injected impossible production state exercises the defensive unknown-target rule.",
+            "expected":{"pending_sequences":[],"open_fence_ids":[3],"contradicted_tapes":[],"fence_liveness_failure":{"fence":3,"tape_uuid":hex(&tape(1).uuid),"incarnation":1,"cause":"UnknownTape"}},
+            "release":"Receive FenceReleased(3); its liveness report disappears."
+        }),
+    ]
 }

@@ -113,11 +113,8 @@ fn contradicted_fences_release_other_scopes_live_and_replay() {
                     );
                 }
             }
-            assert_eq!(
-                live.contradictions.get(&Scope::Tape(tape(1).uuid)),
-                Some(&FoldError::TapeContradiction)
-            );
-            assert_eq!(live.contradictions.len(), 1);
+            assert!(live.contradicted(tape(1)));
+            assert_eq!(live.contradicted_tapes(), 1);
             assert_eq!(live.tapes[&tape(2).uuid].media_revision, 2);
             assert_eq!(live.open_fences(), 1);
             assert!(live.pending.is_empty());
@@ -179,13 +176,12 @@ fn tape_view_advances_mid_history_live_and_replay() {
     assert_eq!(live.tapes[&tape(1).uuid].assignment_generation, 3);
     assert_eq!(live.applied_through, 6);
     assert_eq!(live.open_fences(), 1);
-    assert!(live.contradictions.is_empty());
+    assert!(live.contradicted_tapes() == 0);
 }
 
-/// A contradicted ordinary record may remain queued, but the fence must release
-/// its operation scope even when that earlier record still blocks the tape.
+/// D1/D4: excluding a native reference frees the ordinary successor and fence check.
 #[test]
-fn contradicted_fence_drains_past_an_ordinary_blocker() {
+fn b4b0_d1_d4_contradiction_frees_ordinary_blocker() {
     use super::tests::*;
     let mut live = LibraryFold::default();
     let mut replay = LibraryFold::default();
@@ -240,11 +236,11 @@ fn contradicted_fence_drains_past_an_ordinary_blocker() {
         TapeLookup::Contradiction,
     )]));
     resolve_pair(&mut live, &mut replay, &contradiction, &history);
-    assert_eq!(live.pending.len(), 1);
-    assert_eq!(live.pending[0].sequence, 4);
-    assert!(live.pending_bytes() > 0 && live.pending_bytes() < queued_bytes);
+    assert!(live.pending.is_empty());
+    assert_eq!(live.pending_bytes(), 0);
+    assert!(queued_bytes > 0);
     assert_eq!(live.open_fences(), 1);
-    assert_eq!(live.contradictions.len(), 1);
+    assert_eq!(live.contradicted_tapes(), 1);
     let r = record(
         op(
             Some(record(diagnostic(), 2).reference(2)),
@@ -267,8 +263,8 @@ fn contradicted_fence_drains_past_an_ordinary_blocker() {
         &history,
     )
     .unwrap();
-    assert_eq!(live.pending.len(), 1);
-    assert_eq!(live.applied_through, 3);
+    assert!(live.pending.is_empty());
+    assert_eq!(live.applied_through, 6);
 }
 
 /// Compare each transition, including refusals, duplicates, and all retained indexes.

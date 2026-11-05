@@ -536,7 +536,7 @@ fn tape_digest_mismatch_is_scoped_contradiction() {
     let r = record(verdict(), 3);
     f.receive(3, r.clone(), receipt(&r, 3), &v, &History::default())
         .unwrap();
-    assert_eq!(f.contradictions.len(), 1);
+    assert_eq!(f.contradicted_tapes(), 1);
     feed(&mut f, pool(2, 1), &Present).unwrap();
 }
 /// Rotation follows later UTC dates; regression appends to the newest segment.
@@ -1076,9 +1076,9 @@ fn append_duplicate_writes_nothing() {
     ));
     assert_eq!(tail, l.state().segments[0].through);
 }
-/// A native mismatch must not hide a writer-impossible local generation.
+/// D2: native mismatch excludes before local generation rules.
 #[test]
-fn library_contradiction_precedes_native_contradiction() {
+fn b4b0_d2_native_contradiction_precedes_library_rules() {
     let mut f = initialized();
     let b = Body::ManualFinalizationAccepted(ManualFinalizationAccepted {
         at: at(1, 1),
@@ -1096,7 +1096,7 @@ fn library_contradiction_precedes_native_contradiction() {
     let r = record(b, n);
     assert_eq!(
         f.receive(n, r.clone(), receipt(&r, n), &view, &History::default()),
-        Err(FoldError::GenerationMismatch)
+        Ok(())
     );
 }
 
@@ -2609,7 +2609,7 @@ fn freeze_fence_paths(drive: bool) {
             .iter()
             .map(|p| p.sequence)
             .collect::<Vec<_>>(),
-        [5]
+        Vec::<u64>::new()
     );
     assert_eq!(r.fold.open_fences(), 1);
     assert_eq!(r.fold.tapes[&tape(2).uuid].media_revision, 2);
@@ -2630,7 +2630,7 @@ fn freeze_fence_paths(drive: bool) {
     assert_eq!(log.state().fold.open_fences(), 0);
     assert_eq!(
         live.pending.iter().map(|p| p.sequence).collect::<Vec<_>>(),
-        [5]
+        Vec::<u64>::new()
     );
     assert_eq!(live.tapes[&tape(2).uuid].media_revision, 2);
     assert_eq!(live.open_fences(), 1);
@@ -2647,7 +2647,7 @@ fn freeze_fence_paths(drive: bool) {
     assert_eq!(live.open_fences(), 0);
     assert_eq!(
         live.pending.iter().map(|p| p.sequence).collect::<Vec<_>>(),
-        [5]
+        Vec::<u64>::new()
     );
 }
 
@@ -2684,7 +2684,7 @@ fn freeze_fence_still_waits_on_its_tape() {
     );
     r.fold.resolve(&Present, &History::default()).unwrap();
     assert!(r.fold.pending.is_empty());
-    assert!(r.fold.contradictions.is_empty());
+    assert!(r.fold.contradicted_tapes() == 0);
     assert_eq!(r.fold.open_fences(), 1);
     assert!(r.fold.tapes.contains_key(&tape(2).uuid));
 }
@@ -2802,4 +2802,471 @@ fn freeze_open_motion_command_is_conflicting_duplicate() {
         RefusalKind::Fold(FoldError::ConflictingDuplicate),
         3,
     );
+}
+
+/// D5: repairs are ordinary references, but may never cut an earlier received reference.
+pub(super) fn b4b0_repair(sequence: u64, retained: u64) -> Body {
+    Body::RecoveryRecorded(RecoveryRecorded {
+        at: at(1, sequence),
+        operation: [91; 16],
+        prior: None,
+        action: RecoveryAction::RepairApplied(RepairApplied {
+            archived_prefix_digest: [42; 32],
+            retained_through: retained,
+        }),
+    })
+}
+/// Receive a fixture record and retain history for the next causal check.
+pub(super) fn b4b0_receive(
+    f: &mut LibraryFold,
+    h: &mut History,
+    b: Body,
+    v: &dyn TapeView,
+) -> Result<(), FoldError> {
+    let n = f.received_through + 1;
+    let r = record(b, n);
+    f.receive(n, r.clone(), receipt(&r, n), v, h)?;
+    h.0.insert(n, r);
+    Ok(())
+}
+/// D1/D8: a contradicted tape's motion cannot retain the drive fence release.
+#[test]
+fn b4b0_d1_d8_drive_release_after_contradicted_motion() {
+    let mut f = LibraryFold::default();
+    let mut h = History::default();
+    let v = View(BTreeMap::from([(
+        (tape(1).uuid, 1),
+        TapeLookup::Contradiction,
+    )]));
+    for b in [
+        provision(1, None),
+        verdict(),
+        intent(1),
+        Body::FenceRaised(FenceRaised {
+            kind: FenceKind::DriveFault,
+            scope: FenceScope::Drive(endpoint("LIBA0001")),
+            cause: FenceCause::TransferError,
+            evidence: None,
+            at: None,
+            operation: None,
+        }),
+        release(4),
+    ] {
+        b4b0_receive(&mut f, &mut h, b, &v).unwrap();
+    }
+    assert!(f.pending.is_empty());
+    assert_eq!(f.open_fences(), 0);
+    assert_eq!(f.applied_through, 5);
+}
+/// D1/D7: labels and retirement remain available after native evidence is excluded.
+#[test]
+fn b4b0_d1_live_label_and_retire() {
+    let mut f = initialized();
+    let v = View(BTreeMap::from([(
+        (tape(1).uuid, 1),
+        TapeLookup::Contradiction,
+    )]));
+    b4b0_receive(&mut f, &mut History::default(), verdict(), &v).unwrap();
+    feed(
+        &mut f,
+        Body::Label(Label {
+            tape: tape(1),
+            label: Some("NEW".into()),
+            provenance: LabelProvenance::Operator,
+            change: GenerationChange {
+                expected: 1,
+                next: 2,
+            },
+            prior_holder: None,
+            observed_bot_uuid: None,
+        }),
+        &Present,
+    )
+    .unwrap();
+    feed(
+        &mut f,
+        Body::Retire(Retire {
+            tape: tape(1),
+            reason: RetireReason::OperatorRequested,
+            observed_tape_sequence: None,
+            assignment_generation: 1,
+            detail: None,
+        }),
+        &Present,
+    )
+    .unwrap();
+    assert!(f.tapes[&tape(1).uuid].retired);
+}
+/// D2/Opus N1: the verdict's digest is checked even when its progress was excluded.
+#[test]
+fn b4b0_d2_verdict_after_excluded_progress() {
+    let mut f = initialized();
+    let mut h = History::default();
+    let v = View(BTreeMap::from([(
+        (tape(1).uuid, 1),
+        TapeLookup::Contradiction,
+    )]));
+    b4b0_receive(&mut f, &mut h, progress(1), &v).unwrap();
+    let mut b = verdict();
+    if let Body::VerificationVerdict(v) = &mut b {
+        v.progress = Some(h.0[&3].reference(3));
+    }
+    b4b0_receive(&mut f, &mut h, b, &v).unwrap();
+    assert!(f.pending.is_empty());
+    assert_eq!(f.applied_through, 4);
+}
+/// D5: applied, pending and excluded references all protect the repair floor.
+#[test]
+fn b4b0_d5_repair_received_reference_floor() {
+    let absent = View::default();
+    let mismatch = View(BTreeMap::from([(
+        (tape(1).uuid, 9),
+        TapeLookup::Contradiction,
+    )]));
+    for view in [&Present as &dyn TapeView, &absent, &mismatch] {
+        let mut f = initialized();
+        let mut h = History::default();
+        let mut b = verdict();
+        if let Body::VerificationVerdict(v) = &mut b {
+            v.at = at(1, 9);
+        }
+        b4b0_receive(&mut f, &mut h, b, view).unwrap();
+        let r = record(b4b0_repair(8, 8), 4);
+        let error = f
+            .receive(4, r.clone(), receipt(&r, 4), &Present, &h)
+            .unwrap_err();
+        assert_eq!(format!("{error:?}"), "RepairBelowReference { highest: 9 }");
+        let error = f.validate(&r, &Present, &h).unwrap_err();
+        assert_eq!(format!("{error:?}"), "RepairBelowReference { highest: 9 }");
+    }
+}
+/// D5: an earlier repair's own reference prevents a lower second repair.
+#[test]
+fn b4b0_d5_second_repair_is_monotone() {
+    let mut f = initialized();
+    feed(&mut f, b4b0_repair(9, 9), &Present).unwrap();
+    let error = feed(&mut f, b4b0_repair(8, 8), &Present).unwrap_err();
+    assert_eq!(format!("{error:?}"), "RepairBelowReference { highest: 9 }");
+}
+/// D5: malformed repairs are shape errors, including under a mismatching view.
+#[test]
+fn b4b0_d5_malformed_repair_precedes_digest() {
+    let mut f = initialized();
+    let mut h = History::default();
+    let absent = View::default();
+    b4b0_receive(&mut f, &mut h, verdict(), &absent).unwrap();
+    let v = View(BTreeMap::from([(
+        (tape(1).uuid, 8),
+        TapeLookup::Contradiction,
+    )]));
+    assert_eq!(
+        b4b0_receive(&mut f, &mut h, b4b0_repair(8, 7), &v),
+        Err(FoldError::InvalidSchema)
+    );
+}
+/// D4/Opus S1: resolve checks a dependent reference even behind another scope wait.
+#[test]
+fn b4b0_d4_scope_held_reference_is_checked() {
+    let mut f = initialized();
+    let mut h = History::default();
+    let absent = View::default();
+    b4b0_receive(
+        &mut f,
+        &mut h,
+        Body::SupersedeTail(SupersedeTail {
+            at: at(2, 30),
+            operation: [7; 16],
+            session_id: [4; 16],
+            preview_digest: [0; 32],
+            tail_file_count: 1,
+        }),
+        &absent,
+    )
+    .unwrap();
+    b4b0_receive(&mut f, &mut h, progress(1), &absent).unwrap();
+    let v = View(BTreeMap::from([(
+        (tape(1).uuid, 1),
+        TapeLookup::Contradiction,
+    )]));
+    f.resolve(&v, &h).unwrap();
+    assert_eq!(
+        f.pending.iter().map(|p| p.sequence).collect::<Vec<_>>(),
+        [3]
+    );
+}
+
+/// D2/D3/D9: each reference is judged independently; summaries stay one entry per tape.
+#[test]
+fn b4b0_d2_d3_d9_minimum_and_diagnostics_are_bounded() {
+    let mut f = initialized();
+    let mut h = History::default();
+    for sequence in [9, 4, 12] {
+        let view = View(BTreeMap::from([(
+            (tape(1).uuid, sequence),
+            TapeLookup::Contradiction,
+        )]));
+        let mut b = verdict();
+        if let Body::VerificationVerdict(v) = &mut b {
+            v.at = at(1, sequence);
+        }
+        b4b0_receive(&mut f, &mut h, b, &view).unwrap();
+    }
+    assert_eq!(f.highest_reference(tape(1)), Some(12));
+    assert_eq!(f.highest_reference(tape(2)), None);
+    assert_eq!(f.contradictions.len(), 1);
+    let summary = &f.contradictions[&fold::Scope::Tape(tape(1).uuid)];
+    assert_eq!(summary.minimum_contradiction, Some(4));
+    assert_eq!(summary.excluded, 3);
+    b4b0_receive(
+        &mut f,
+        &mut h,
+        Body::SupersedeTail(SupersedeTail {
+            at: at(1, 3),
+            operation: [33; 16],
+            session_id: [34; 16],
+            preview_digest: [0; 32],
+            tail_file_count: 1,
+        }),
+        &Present,
+    )
+    .unwrap();
+    assert!(f.pending.is_empty());
+    assert!(f.supersede(f.received_through).is_some());
+    assert!(f.contradicted(tape(1)));
+}
+
+/// D5/D4: later receipts must not retroactively reject an already admitted queued repair.
+#[test]
+fn b4b0_d5_pending_repair_keeps_receipt_time_floor() {
+    let mut f = initialized();
+    let mut h = History::default();
+    b4b0_receive(&mut f, &mut h, b4b0_repair(8, 8), &View::default()).unwrap();
+    let mut b = verdict();
+    if let Body::VerificationVerdict(v) = &mut b {
+        v.at = at(1, 9);
+    }
+    b4b0_receive(&mut f, &mut h, b, &Present).unwrap();
+    assert_eq!(f.highest_reference(tape(1)), Some(9));
+    f.resolve(&Present, &h).unwrap();
+    assert!(f.pending.is_empty());
+    assert_eq!(f.applied_through, 4);
+}
+
+/// D2/D5: a contradiction at T@1 does not veto a matching live dependency at T@8.
+#[test]
+fn b4b0_fix1_matching_dependents_on_contradicted_tape() {
+    let mut ordinary = progress(1);
+    if let Body::VerificationProgress(v) = &mut ordinary {
+        v.at = at(1, 8);
+    }
+    for body in [b4b0_repair(8, 8), ordinary] {
+        let view = View(BTreeMap::from([
+            ((tape(1).uuid, 1), TapeLookup::Contradiction),
+            ((tape(1).uuid, 8), Present.lookup(&at(1, 8))),
+        ]));
+        let mut live = LibraryFold::default();
+        let mut history = History::default();
+        for b in [provision(1, None), b4b0_supersede(1)] {
+            b4b0_receive(&mut live, &mut history, b, &view).unwrap();
+        }
+        assert!(live.contradicted(tape(1)));
+        assert_eq!(live.highest_reference(tape(1)), Some(1));
+        let mut replay = live.clone();
+        let r = record(body, 3);
+        live.resolve(&view, &history).unwrap();
+        assert!(matches!(
+            live.apply(3, r.clone(), receipt(&r, 3), &view, &history),
+            Ok(fold::Validated::Apply)
+        ));
+        replay
+            .receive(3, r.clone(), receipt(&r, 3), &view, &history)
+            .unwrap();
+        live.assert_same_state(&replay);
+        assert_eq!(live.contradictions, replay.contradictions);
+        let summary = &live.contradictions[&fold::Scope::Tape(tape(1).uuid)];
+        assert_eq!(summary.minimum_contradiction, Some(1));
+        assert_eq!(summary.excluded, 1);
+        assert_eq!(live.highest_reference(tape(1)), Some(8));
+        assert_eq!(live.applied_through, 3);
+        assert!(live.pending.is_empty());
+    }
+}
+
+/// D2: live mismatch and NotYet refusals neither receive nor exclude the candidate.
+#[test]
+fn b4b0_fix1_live_own_reference_refusals_preserve_state() {
+    for (answer, error) in [
+        (TapeLookup::Contradiction, FoldError::TapeContradiction),
+        (
+            TapeLookup::Present {
+                kind: crate::tape_log::Tag::FinalizationPrepared,
+                digest: [99; 32],
+            },
+            FoldError::TapeContradiction,
+        ),
+        (TapeLookup::NotYet, FoldError::Unresolved),
+    ] {
+        let mut live = LibraryFold::default();
+        let mut history = History::default();
+        let view = View(BTreeMap::from([
+            ((tape(1).uuid, 1), TapeLookup::Contradiction),
+            ((tape(1).uuid, 8), answer),
+        ]));
+        for b in [provision(1, None), b4b0_supersede(1)] {
+            b4b0_receive(&mut live, &mut history, b, &view).unwrap();
+        }
+        let before = live.clone();
+        let r = record(b4b0_repair(8, 8), 3);
+        assert_eq!(
+            live.apply(3, r.clone(), receipt(&r, 3), &view, &history)
+                .unwrap_err(),
+            error
+        );
+        live.assert_same_state(&before);
+        assert_eq!(live.contradictions, before.contradictions);
+    }
+}
+
+/// D4/tag 8: NotYet fence evidence may differ diagnostically after grow-only replay.
+#[test]
+fn b4b0_fix1_growing_fence_evidence_three_records() {
+    let mut raised = fence(1);
+    if let Body::FenceRaised(v) = &mut raised {
+        v.at = Some(at(1, 1));
+    }
+    let bodies = [provision(1, None), raised, b4b0_supersede(1)];
+    let mut live = LibraryFold::default();
+    let mut history = History::default();
+    let mut view = View::default();
+    for (i, b) in bodies.iter().enumerate() {
+        let n = i as u64 + 1;
+        if n == 3 {
+            view.0.insert((tape(1).uuid, 1), Present.lookup(&at(1, 1)));
+        }
+        live.resolve(&view, &history).unwrap();
+        let r = record(b.clone(), n);
+        live.apply(n, r.clone(), receipt(&r, n), &view, &history)
+            .unwrap();
+        history.0.insert(n, r);
+        if n == 2 {
+            assert_eq!(
+                live.unresolved_fence_evidence
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [2]
+            );
+            assert_eq!(live.highest_reference(tape(1)), None);
+            assert!(live.pending.is_empty());
+        }
+    }
+    let mut replay = LibraryFold::default();
+    let mut prefix = History::default();
+    for b in bodies {
+        b4b0_receive(&mut replay, &mut prefix, b, &view).unwrap();
+    }
+    assert_eq!(
+        live.unresolved_fence_evidence
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert!(replay.unresolved_fence_evidence.is_empty());
+    live.assert_same_state(&replay);
+    assert_eq!(live.contradicted_tapes(), 0);
+    assert_eq!(live.open_fences(), 1);
+    assert_eq!(live.highest_reference(tape(1)), Some(1));
+    assert_eq!(live.applied_through, 3);
+    assert!(live.pending.is_empty());
+}
+
+/// D5: duplicate receipts count toward the floor; refused candidates change no summary.
+#[test]
+fn b4b0_fix1_duplicate_and_refused_reference_accounting() {
+    let mut f = LibraryFold::default();
+    let mut h = History::default();
+    for b in [provision(1, None), b4b0_supersede(9), b4b0_supersede(9)] {
+        b4b0_receive(&mut f, &mut h, b, &Present).unwrap();
+    }
+    assert_eq!(f.duplicates, 1);
+    assert_eq!(f.received_through, 3);
+    assert_eq!(f.highest_reference(tape(1)), Some(9));
+    let mut unknown = b4b0_supersede(99);
+    if let Body::SupersedeTail(v) = &mut unknown {
+        v.at.tape = tape(2);
+    }
+    for (body, error) in [
+        (
+            b4b0_repair(8, 8),
+            FoldError::RepairBelowReference { highest: 9 },
+        ),
+        (unknown, FoldError::UnknownTape),
+        (b4b0_supersede(99), FoldError::ConflictingDuplicate),
+    ] {
+        let before = f.clone();
+        let r = record(body, 4);
+        let mut live = f.clone();
+        assert_eq!(
+            live.apply(4, r.clone(), receipt(&r, 4), &Present, &h)
+                .unwrap_err(),
+            error
+        );
+        assert_eq!(
+            f.receive(4, r.clone(), receipt(&r, 4), &Present, &h),
+            Err(error)
+        );
+        for unchanged in [&live, &f] {
+            unchanged.assert_same_state(&before);
+            assert_eq!(unchanged.contradictions, before.contradictions);
+            assert_eq!(unchanged.highest_reference(tape(2)), None);
+        }
+    }
+}
+
+/// D5: receipt-time floor precedes a repair's mismatching reference for every disposition.
+#[test]
+fn b4b0_fix1_repair_floor_precedes_mismatch() {
+    for answer in [
+        Present.lookup(&at(1, 9)),
+        TapeLookup::NotYet,
+        TapeLookup::Contradiction,
+    ] {
+        let view = View(BTreeMap::from([
+            ((tape(1).uuid, 9), answer),
+            ((tape(1).uuid, 8), TapeLookup::Contradiction),
+        ]));
+        let mut f = LibraryFold::default();
+        let mut h = History::default();
+        for b in [provision(1, None), b4b0_supersede(9)] {
+            b4b0_receive(&mut f, &mut h, b, &view).unwrap();
+        }
+        let before = f.clone();
+        let r = record(b4b0_repair(8, 8), 3);
+        let mut live = f.clone();
+        assert_eq!(
+            live.apply(3, r.clone(), receipt(&r, 3), &view, &h)
+                .unwrap_err(),
+            FoldError::RepairBelowReference { highest: 9 }
+        );
+        assert_eq!(
+            f.receive(3, r.clone(), receipt(&r, 3), &view, &h),
+            Err(FoldError::RepairBelowReference { highest: 9 })
+        );
+        for unchanged in [&live, &f] {
+            unchanged.assert_same_state(&before);
+            assert_eq!(unchanged.contradictions, before.contradictions);
+        }
+    }
+}
+
+/// Fixed SupersedeTail inputs shared by the gate's permanent counterexamples.
+fn b4b0_supersede(sequence: u64) -> Body {
+    Body::SupersedeTail(SupersedeTail {
+        at: at(1, sequence),
+        operation: [33; 16],
+        session_id: [34; 16],
+        preview_digest: [0; 32],
+        tail_file_count: 1,
+    })
 }

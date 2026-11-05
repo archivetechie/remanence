@@ -170,6 +170,12 @@ pub enum FoldError {
     /// Refuses the `TapeContradiction` history violation.
     #[error("TapeContradiction")]
     TapeContradiction,
+    /// A repair may not discard any earlier received dependent reference (D5).
+    #[error("RepairBelowReference {{ highest: {highest} }}")]
+    RepairBelowReference {
+        /// Highest tape-log sequence referenced by an earlier received record.
+        highest: u64,
+    },
     /// Refuses the `FenceScopeMismatch` history violation.
     #[error("FenceScopeMismatch")]
     FenceScopeMismatch,
@@ -295,6 +301,23 @@ pub enum Validated {
     /// Existing identical authority; no bytes should be appended.
     Duplicate(Receipt),
 }
+/// Bounded tape-reference authority and replay diagnostics (D3/D9).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TapeReferences {
+    /// Lowest mismatching native sequence, if any.
+    pub minimum_contradiction: Option<u64>,
+    /// Highest dependent reference received, independent of its disposition.
+    pub highest_reference: Option<u64>,
+    /// Number of excluded records; diagnostic only, never an admission rule.
+    pub excluded: u64,
+}
+impl TapeReferences {
+    /// Contradiction status is derived from the minimum, never map membership.
+    pub fn contradicted(&self) -> bool {
+        self.minimum_contradiction.is_some()
+    }
+}
+
 /// O(resources), plus 80 bytes of key/value data per keyed operation (map overhead
 /// measured separately), lifetime crash supersedes/unprotected acceptances,
 /// pending up to the cap, and one looked-up frame.
@@ -303,7 +326,7 @@ pub enum Validated {
 pub struct LibraryFold {
     /// Last received frame.
     pub received_through: u64,
-    /// Highest contiguous successfully applied prefix, never crossing pending.
+    /// Highest contiguous decided prefix (including exclusions), never crossing pending.
     pub applied_through: u64,
     /// Number of identical duplicate records encountered on replay.
     pub duplicates: u64,
@@ -311,8 +334,10 @@ pub struct LibraryFold {
     pub tapes: BTreeMap<Id, TapeState>,
     /// Pending records in source sequence order.
     pub pending: Vec<PendingRecord>,
-    /// Cross-authority contradictions, isolated to affected resources.
-    pub contradictions: BTreeMap<Scope, FoldError>,
+    /// Per-tape summaries, including tapes with matching or pending references.
+    pub contradictions: BTreeMap<Scope, TapeReferences>,
+    /// Failed deferred liveness checks, attached to their open fence and full identity.
+    pub fence_liveness_failures: BTreeMap<u64, (TapeRef, FoldError)>,
     /// Missing fence evidence, which never delays the fence.
     pub unresolved_fence_evidence: BTreeSet<u64>,
     pending_bytes: usize,
@@ -366,7 +391,7 @@ impl Body {
             _ => None,
         }
     }
-    fn at(&self) -> Option<&TapeAt> {
+    pub(super) fn at(&self) -> Option<&TapeAt> {
         match self {
             Self::SupersedeTail(v) => Some(&v.at),
             Self::AcceptUnprotectedFinalization(v) => Some(&v.at),
@@ -730,6 +755,78 @@ impl LibraryFold {
         }
         Ok(last)
     }
+    /// Highest received dependent reference; repair writers check this before repair_tail.
+    pub fn highest_reference(&self, tape: TapeRef) -> Option<u64> {
+        self.contradictions
+            .get(&Scope::Tape(tape.uuid))?
+            .highest_reference
+    }
+    /// Whether replay has excluded any reference on this tape.
+    pub fn contradicted(&self, tape: TapeRef) -> bool {
+        self.contradictions
+            .get(&Scope::Tape(tape.uuid))
+            .is_some_and(TapeReferences::contradicted)
+    }
+    /// Number of contradicted tapes; summaries also retain non-contradicted tapes.
+    pub fn contradicted_tapes(&self) -> usize {
+        self.contradictions
+            .values()
+            .filter(|s| s.contradicted())
+            .count()
+    }
+    fn note_reference(&mut self, at: Option<&TapeAt>) {
+        if let Some(at) = at {
+            let summary = self
+                .contradictions
+                .entry(Scope::Tape(at.tape.uuid))
+                .or_default();
+            summary.highest_reference =
+                Some(summary.highest_reference.unwrap_or(0).max(at.sequence));
+        }
+    }
+    fn exclude(&mut self, at: &TapeAt) {
+        let summary = self
+            .contradictions
+            .entry(Scope::Tape(at.tape.uuid))
+            .or_default();
+        summary.minimum_contradiction = Some(
+            summary
+                .minimum_contradiction
+                .unwrap_or(at.sequence)
+                .min(at.sequence),
+        );
+        summary.excluded += 1;
+    }
+    // Check once on admission/receipt, not again when resolving an older pending repair:
+    // later references must not retroactively invalidate that repair.
+    fn check_repair_floor(&self, b: &Body) -> Result<(), FoldError> {
+        if let Body::RecoveryRecorded(v) = b {
+            if let RecoveryAction::RepairApplied(repair) = &v.action {
+                if let Some(highest) = self.highest_reference(v.at.tape) {
+                    if highest > repair.retained_through {
+                        return Err(FoldError::RepairBelowReference { highest });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn check_dependent_identity(&self, b: &Body) -> Result<(), FoldError> {
+        if b.at().is_some() {
+            for tape in b.tapes() {
+                self.tape(tape)?;
+            }
+        }
+        Ok(())
+    }
+    // Scope-held dependencies still validate identity before their own native reference.
+    fn check_reference(&self, b: &Body, view: &dyn TapeView) -> Result<(), FoldError> {
+        if b.at().is_some() {
+            self.check_dependent_identity(b)?;
+            self.check_tape(b, view)?;
+        }
+        Ok(())
+    }
     fn check_tape(&self, b: &Body, view: &dyn TapeView) -> Result<(), FoldError> {
         if let Some(at) = b.at() {
             match view.lookup(at) {
@@ -761,22 +858,18 @@ impl LibraryFold {
             history,
             before: self.received_through + 1,
         };
+        self.check_dependent_identity(&r.body)?;
+        self.check_repair_floor(&r.body)?;
         let scopes = self.scopes_for(&r.body, history)?;
         if matches!(r.body, Body::FenceRaised(_)) && self.blocked(&scopes) {
             self.validate_deferred_fence(r, &scopes)?;
             return Ok(Validated::Apply);
         }
-        if !matches!(r.body, Body::FenceRaised(_)) {
-            if scopes
-                .iter()
-                .any(|scope| self.contradictions.contains_key(scope))
-            {
-                return Err(FoldError::TapeContradiction);
-            }
-            if self.pending.iter().any(|p| !p.scope.is_disjoint(&scopes)) {
-                self.check_pending_capacity(r, &scopes)?;
-                return Err(FoldError::Unresolved);
-            }
+        if !matches!(r.body, Body::FenceRaised(_))
+            && self.pending.iter().any(|p| !p.scope.is_disjoint(&scopes))
+        {
+            self.check_pending_capacity(r, &scopes)?;
+            return Err(FoldError::Unresolved);
         }
         self.validate_at(self.received_through + 1, r, view, history)
     }
@@ -814,6 +907,11 @@ impl LibraryFold {
             _ => None,
         });
         if at.is_some_and(|at| at.sequence == 0 || at.tape.incarnation == 0) {
+            return Err(FoldError::InvalidSchema);
+        }
+        if matches!(b, Body::RecoveryRecorded(v) if matches!(&v.action,
+            RecoveryAction::RepairApplied(p) if p.retained_through != v.at.sequence))
+        {
             return Err(FoldError::InvalidSchema);
         }
         Ok(())
@@ -865,6 +963,7 @@ impl LibraryFold {
                 return Err(FoldError::InvalidSchema);
             }
         }
+        self.check_tape(b, view)?;
         if let Body::FenceReleased(v) = b {
             if let Some(old) = self
                 .released
@@ -1425,10 +1524,6 @@ impl LibraryFold {
                 }
             }
             RecoveryRecorded(v) => {
-                if matches!(&v.action,RecoveryAction::RepairApplied(p) if p.retained_through!=v.at.sequence)
-                {
-                    return Err(FoldError::InvalidSchema);
-                }
                 if let Some(d) = v.prior {
                     let record = self
                         .historical(d, history)?
@@ -1445,7 +1540,6 @@ impl LibraryFold {
             }
             SupersedeTail(_) => {}
         }
-        self.check_tape(b, view)?;
         Ok(Validated::Apply)
     }
     /// Validate and apply one contiguous record; unresolved native proofs are refused.
@@ -1461,10 +1555,12 @@ impl LibraryFold {
             return Err(FoldError::Sequence);
         }
         let result = self.validate(&record, view, history)?;
+        let at = record.body.at().cloned();
         match &result {
             Validated::Apply => self.apply_validated(sequence, record, receipt, view)?,
             Validated::Duplicate(_) => self.duplicates += 1,
         }
+        self.note_reference(at.as_ref());
         self.received_through = sequence;
         self.watermark();
         Ok(result)
@@ -1484,11 +1580,13 @@ impl LibraryFold {
         } else {
             None
         };
+        let at = record.body.at().cloned();
         if let Some(scope) = deferred_scope {
             self.defer_fence(sequence, record, receipt, scope, view)?;
         } else {
             self.commit(sequence, record, receipt, view)?;
         }
+        self.note_reference(at.as_ref());
         self.received_through = sequence;
         self.watermark();
         Ok(())
@@ -1587,6 +1685,7 @@ impl LibraryFold {
                 let scope = release_scope(&raised.scope)?;
                 self.fences.remove(&v.fence);
                 self.unresolved_fence_evidence.remove(&v.fence);
+                self.fence_liveness_failures.remove(&v.fence);
                 self.insert_latest(
                     (Tag::FenceReleased, scope, None),
                     Held {
@@ -1803,13 +1902,6 @@ impl LibraryFold {
     }
     fn blocked(&self, scopes: &BTreeSet<Scope>) -> bool {
         self.pending.iter().any(|p| !p.scope.is_disjoint(scopes))
-            || scopes.iter().any(|s| self.contradictions.contains_key(s))
-    }
-    /// A fence's scoped tape already has a verdict; no liveness check can clear it.
-    fn contradicted_fence_scope(&self, scopes: &BTreeSet<Scope>) -> bool {
-        scopes
-            .iter()
-            .any(|s| matches!(s, Scope::Tape(_)) && self.contradictions.contains_key(s))
     }
     fn validate_deferred_fence(
         &self,
@@ -1825,11 +1917,7 @@ impl LibraryFold {
         ) {
             return Err(FoldError::FenceScopeMismatch);
         }
-        if self.contradicted_fence_scope(scope) {
-            Ok(())
-        } else {
-            self.check_pending_capacity(record, scope)
-        }
+        self.check_pending_capacity(record, scope)
     }
     /// Restrict immediately, retaining the same queued liveness check for append and replay.
     fn defer_fence(
@@ -1841,10 +1929,8 @@ impl LibraryFold {
         view: &dyn TapeView,
     ) -> Result<(), FoldError> {
         self.validate_deferred_fence(&record, &scope)?;
-        if !self.contradicted_fence_scope(&scope) {
-            self.hold(sequence, record.clone(), receipt.clone(), scope)?;
-            self.pending.last_mut().unwrap().deferred_fence = true;
-        }
+        self.hold(sequence, record.clone(), receipt.clone(), scope)?;
+        self.pending.last_mut().unwrap().deferred_fence = true;
         self.commit(sequence, record, receipt, view)?;
         Ok(())
     }
@@ -1865,46 +1951,30 @@ impl LibraryFold {
             history,
             before: sequence,
         };
+        self.check_dependent_identity(&record.body)?;
+        self.check_repair_floor(&record.body)?;
         let scope = self.scopes_for(&record.body, history)?;
         let blocked = self.blocked(&scope);
-        // Unblocked records must first be self-consistent library history. For a queued
-        // scope only shape and native counterpart checks are decidable until predecessors apply.
-        let native = if blocked {
-            self.check_tape(&record.body, view)
+        let at = record.body.at().cloned();
+        // D2/D4: native evidence is decided even behind an unrelated scope wait.
+        let validation = if blocked {
+            self.check_reference(&record.body, view)
+                .map(|_| Validated::Apply)
         } else {
             self.validate_at(sequence, &record, view, history)
-                .map(|_| ())
         };
-        match native {
-            Err(FoldError::TapeContradiction) => {
-                self.contradictions.insert(
-                    Scope::Tape(record.body.at().unwrap().tape.uuid),
-                    FoldError::TapeContradiction,
-                );
-                self.received_through = sequence;
-                self.watermark();
-                return Ok(());
-            }
-            Err(FoldError::Unresolved) | Ok(()) => {}
+        match validation {
+            Err(FoldError::TapeContradiction) => self.exclude(at.as_ref().unwrap()),
+            Err(FoldError::Unresolved) => self.hold(sequence, record, receipt, scope)?,
             Err(e) => return Err(e),
-        }
-        if blocked && matches!(record.body, Body::FenceRaised(_)) {
-            self.defer_fence(sequence, record, receipt, scope, view)?;
-        } else if blocked {
-            self.hold(sequence, record, receipt, scope)?;
-        } else {
-            match self.validate_at(sequence, &record, view, history) {
-                Ok(Validated::Apply) => self.commit(sequence, record, receipt, view)?,
-                Ok(Validated::Duplicate(_)) => self.duplicates += 1,
-                Err(FoldError::Unresolved) => self.hold(sequence, record, receipt, scope)?,
-                Err(FoldError::TapeContradiction) => {
-                    let at = record.body.at().unwrap();
-                    self.contradictions
-                        .insert(Scope::Tape(at.tape.uuid), FoldError::TapeContradiction);
-                }
-                Err(e) => return Err(e),
+            Ok(_) if blocked && matches!(record.body, Body::FenceRaised(_)) => {
+                self.defer_fence(sequence, record, receipt, scope, view)?;
             }
+            Ok(_) if blocked => self.hold(sequence, record, receipt, scope)?,
+            Ok(Validated::Apply) => self.commit(sequence, record, receipt, view)?,
+            Ok(Validated::Duplicate(_)) => self.duplicates += 1,
         }
+        self.note_reference(at.as_ref());
         self.received_through = sequence;
         self.watermark();
         Ok(())
@@ -1979,18 +2049,6 @@ impl LibraryFold {
             let pending = std::mem::take(&mut self.pending);
             let mut it = pending.into_iter();
             while let Some(p) = it.next() {
-                // The fence is already open. Release its check even when an earlier
-                // record still waits on this tape; preserve the contradiction itself.
-                if p.deferred_fence && self.contradicted_fence_scope(&p.scope) {
-                    self.pending_bytes -= p.bytes.len();
-                    continue;
-                }
-                if self.pending.iter().any(|q| !q.scope.is_disjoint(&p.scope))
-                    || p.scope.iter().any(|s| self.contradictions.contains_key(s))
-                {
-                    self.pending.push(p);
-                    continue;
-                }
                 let record = match wire::decode(p.tag as u16, &p.bytes) {
                     Ok(record) => record,
                     Err(_) => {
@@ -2000,7 +2058,15 @@ impl LibraryFold {
                         return Err(FoldError::InvalidSchema);
                     }
                 };
-                match self.validate_at(p.sequence, &record, view, history) {
+                let blocked = self.blocked(&p.scope);
+                let validation = if blocked {
+                    self.check_reference(&record.body, view)
+                        .map(|_| Validated::Apply)
+                } else {
+                    self.validate_at(p.sequence, &record, view, history)
+                };
+                match validation {
+                    Ok(_) if blocked => self.pending.push(p),
                     Ok(Validated::Apply) => {
                         if !p.deferred_fence {
                             if let Err(e) = self.commit(p.sequence, record, p.receipt.clone(), view)
@@ -2020,10 +2086,7 @@ impl LibraryFold {
                     Err(FoldError::Unresolved) => self.pending.push(p),
                     Err(FoldError::TapeContradiction) => {
                         self.pending_bytes -= p.bytes.len();
-                        self.contradictions.insert(
-                            Scope::Tape(record.body.at().unwrap().tape.uuid),
-                            FoldError::TapeContradiction,
-                        );
+                        self.exclude(record.body.at().unwrap());
                     }
                     Err(
                         e @ (FoldError::UnknownTape
@@ -2031,8 +2094,12 @@ impl LibraryFold {
                         | FoldError::RetiredIdentity),
                     ) if p.deferred_fence => {
                         self.pending_bytes -= p.bytes.len();
-                        for t in record.body.tapes() {
-                            self.contradictions.insert(Scope::Tape(t.uuid), e.clone());
+                        if let Body::FenceRaised(FenceRaised {
+                            scope: FenceScope::Tape(tape),
+                            ..
+                        }) = record.body
+                        {
+                            self.fence_liveness_failures.insert(p.sequence, (tape, e));
                         }
                     }
                     Err(e) => {
@@ -2116,7 +2183,7 @@ fn idempotency_digest(actor: &Text, kind: OperationKind, key: Id) -> Hash {
 
 #[cfg(test)]
 impl LibraryFold {
-    /// Compare every authority-bearing field and lookup index, excluding probe instrumentation.
+    /// Compare authority and lookup indexes, excluding replay diagnostics and probe instrumentation.
     pub(super) fn assert_same_state(&self, other: &Self) {
         macro_rules! same { ($($field:ident),+ $(,)?) => { $(assert_eq!(self.$field, other.$field, stringify!($field));)+ }; }
         same!(
@@ -2125,8 +2192,7 @@ impl LibraryFold {
             duplicates,
             tapes,
             pending,
-            contradictions,
-            unresolved_fence_evidence,
+            fence_liveness_failures,
             pending_bytes,
             latest,
             fences,
@@ -2150,6 +2216,15 @@ impl LibraryFold {
             supersede_sequences,
             unprotected
         );
+        // D3/D4: excluded counts and unresolved_fence_evidence are replay diagnostics.
+        // FenceRaised.at is evidence, so it may be NotYet live and present on replay.
+        let authority = |fold: &Self| {
+            fold.contradictions
+                .iter()
+                .map(|(t, s)| (t.clone(), (s.minimum_contradiction, s.highest_reference)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(authority(self), authority(other));
         for sequence in 1..=self.received_through {
             assert_eq!(self.supersede(sequence), other.supersede(sequence));
         }
@@ -2273,5 +2348,52 @@ mod retention_tests {
         assert_eq!(fold.load_endpoints.len(), 0);
         assert_eq!(fold.retained_records(), 0);
         assert_eq!(fold.idempotency_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod contradiction_tests {
+    use super::*;
+    use crate::library_log::tests::*;
+
+    /// D6: injected liveness loss is reported on the fence, never the tape summary.
+    /// A healthy production history cannot lose a provisioned identity (C-P4/D6).
+    #[test]
+    fn b4b0_d6_unknown_mismatched_retired_deferred_fence() {
+        for cause in [
+            FoldError::UnknownTape,
+            FoldError::IncarnationMismatch,
+            FoldError::RetiredIdentity,
+        ] {
+            let mut f = LibraryFold::default();
+            let mut h = History::default();
+            b4b0_receive(&mut f, &mut h, provision(1, None), &Present).unwrap();
+            b4b0_receive(&mut f, &mut h, verdict(), &View::default()).unwrap();
+            b4b0_receive(&mut f, &mut h, fence(1), &View::default()).unwrap();
+            // Inject a lost predecessor/identity, preserving pending-byte accounting.
+            let predecessor = f.pending.remove(0);
+            f.pending_bytes -= predecessor.bytes.len();
+            match cause {
+                FoldError::UnknownTape => {
+                    f.tapes.remove(&tape(1).uuid);
+                }
+                FoldError::IncarnationMismatch => {
+                    f.tapes.get_mut(&tape(1).uuid).unwrap().tape.incarnation = 2
+                }
+                FoldError::RetiredIdentity => {
+                    f.tapes.get_mut(&tape(1).uuid).unwrap().retired = true
+                }
+                _ => unreachable!(),
+            }
+            f.resolve(&Present, &h).unwrap();
+            assert_eq!(f.contradicted_tapes(), 0);
+            assert_eq!(f.open_fences(), 1);
+            assert!(f.pending.is_empty());
+            assert_eq!(f.pending_bytes(), 0);
+            assert_eq!(f.fence_liveness_failures.get(&3), Some(&(tape(1), cause)));
+            b4b0_receive(&mut f, &mut h, release(3), &Present).unwrap();
+            assert!(f.fence_liveness_failures.is_empty());
+            assert_eq!(f.open_fences(), 0);
+        }
     }
 }

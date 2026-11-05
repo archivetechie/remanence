@@ -2,10 +2,15 @@ case	tape_uuid	sequence	answer	kind	digest
 alarm-held-by-drive-fence-operation	*	*	NotYet		
 all-records	*	*	Present	FinalizationPrepared	echo
 assign-pool-held-by-current-label	*	*	NotYet		
+blocked-reference-check-order	*	*	NotYet		
+blocked-reference-check-order	01010101010101010101010101010101	1	Contradiction		
 contradicted-tape-holds-later-record	*	*	NotYet		
 contradicted-tape-holds-later-record	01010101010101010101010101010101	4	Present	SessionEnded	eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+deferred-fence-unknown-at-resolution	*	*	NotYet		
 drive-fence-behind-contradicted-operation	*	*	Present	FinalizationPrepared	echo
 drive-fence-behind-contradicted-operation	01010101010101010101010101010101	9	Contradiction		
+excluded-progress-verdict	*	*	Present	FinalizationPrepared	echo
+excluded-progress-verdict	01010101010101010101010101010101	1	Contradiction		
 fence-behind-contradicted-operation	*	*	Present	FinalizationPrepared	echo
 fence-behind-contradicted-operation	01010101010101010101010101010101	9	Contradiction		
 health-identical-latest	*	*	Present	FinalizationPrepared	echo
@@ -14,7 +19,10 @@ health-replaced-key	*	*	Present	FinalizationPrepared	echo
 health-without-session	*	*	Present	FinalizationPrepared	echo
 historical-alarm-cause	*	*	Present	FinalizationPrepared	echo
 historical-recovery-prior	*	*	Present	FinalizationPrepared	echo
+lost-reference-drive-release	*	*	Present	FinalizationPrepared	echo
+lost-reference-drive-release	01010101010101010101010101010101	1	Contradiction		
 medium-label-generation-correction	*	*	Present	FinalizationPrepared	echo
+notyet-reference-holds-endpoint	*	*	NotYet		
 pending-cross-log	*	*	NotYet		
 pending-cross-log	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	1	Present	Initialized	d26d8bfaa389abf12b2c8047b52f0e31cb090c8982bc1e90e99116c379fd74e8
 pending-cross-log	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	2	Present	SessionOpened	f199113b0bdd3399a8c28bef3733383390b636c835087709e3070f9c29089ab6
@@ -56,6 +64,7 @@ rejected/inventory-resolved-parented	*	*	Present	FinalizationPrepared	echo
 rejected/label-held-twice	*	*	Present	FinalizationPrepared	echo
 rejected/load-attempt-gap	*	*	Present	FinalizationPrepared	echo
 rejected/load-three-after-one	*	*	Present	FinalizationPrepared	echo
+rejected/malformed-repair	*	*	Present	FinalizationPrepared	echo
 rejected/medium-capability-flip	*	*	Present	FinalizationPrepared	echo
 rejected/medium-family-change	*	*	Present	FinalizationPrepared	echo
 rejected/medium-measured-by-revision-generation-change	*	*	Present	FinalizationPrepared	echo
@@ -82,6 +91,10 @@ rejected/release-assign-pool	*	*	Present	FinalizationPrepared	echo
 rejected/release-diagnostic	*	*	Present	FinalizationPrepared	echo
 rejected/release-historical-wrong-tag	*	*	Present	FinalizationPrepared	echo
 rejected/release-wrong-counterpart	*	*	Present	FinalizationPrepared	echo
+rejected/repair-below-applied-reference	*	*	Present	FinalizationPrepared	echo
+rejected/repair-below-excluded-reference	*	*	Present	FinalizationPrepared	echo
+rejected/repair-below-excluded-reference	01010101010101010101010101010101	9	Contradiction		
+rejected/repair-below-pending-reference	*	*	NotYet		
 rejected/repeated-sequence	*	*	Present	FinalizationPrepared	echo
 rejected/reserved-container-quarantine	*	*	Present	FinalizationPrepared	echo
 rejected/reserved-empty-range	*	*	Present	FinalizationPrepared	echo
@@ -91,6 +104,7 @@ rejected/retired-identity	*	*	Present	FinalizationPrepared	echo
 rejected/rule-wrong-counterpart	*	*	Present	FinalizationPrepared	echo
 rejected/second-outcome-parented	*	*	Present	FinalizationPrepared	echo
 rejected/second-release	*	*	Present	FinalizationPrepared	echo
+rejected/second-repair-below-first	*	*	Present	FinalizationPrepared	echo
 rejected/second-start	*	*	Present	FinalizationPrepared	echo
 rejected/segment-first-gap	*	*	Present	FinalizationPrepared	echo
 rejected/segment-name-unparseable	*	*	Present	FinalizationPrepared	echo
@@ -114,7 +128,10 @@ rejected/wrong-prior-holder	*	*	Present	FinalizationPrepared	echo
 repaired-kind-scoped	*	*	NotYet		
 repaired-kind-scoped	01010101010101010101010101010101	4	Present	SessionEnded	eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 resolved-load-readiness	*	*	Present	FinalizationPrepared	echo
+retire-contradicted-tape	*	*	Present	FinalizationPrepared	echo
+retire-contradicted-tape	01010101010101010101010101010101	1	Contradiction		
 rotation-clock-regression	*	*	Present	FinalizationPrepared	echo
+supersede-after-repair-above-reference	*	*	Present	FinalizationPrepared	echo
 supersede-after-terminal	*	*	Present	FinalizationPrepared	echo
 torn-tail	*	*	Present	FinalizationPrepared	echo
 zero-filled-tail	*	*	Present	FinalizationPrepared	echo

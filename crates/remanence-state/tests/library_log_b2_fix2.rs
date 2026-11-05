@@ -371,7 +371,7 @@ mod live_fences {
         assert_eq!(f.pending.len(), 4);
         f.resolve(&Present, &NoHistory).unwrap();
         assert!(f.pending.is_empty());
-        assert!(f.contradictions.is_empty());
+        assert!(f.contradicted_tapes() == 0);
         assert_eq!(f.open_fences(), 1);
     }
     /// N5: live append vs replay of the same fence on a tape whose Retire is queued.
@@ -398,11 +398,17 @@ mod live_fences {
             "N5 live contradictions={:?} replay contradictions={:?}",
             live.contradictions, replay.contradictions
         );
-        assert_eq!(live.contradictions, replay.contradictions);
+        // D3: compare authority, not excluded-record diagnostic counters.
         assert_eq!(
-            live.contradictions.get(&Scope::Tape(tape(1).uuid)),
-            Some(&FoldError::RetiredIdentity)
+            live.highest_reference(tape(1)),
+            replay.highest_reference(tape(1))
         );
+        assert_eq!(live.contradicted_tapes(), replay.contradicted_tapes());
+        assert_eq!(live.contradicted_tapes(), 0);
+        let expected_reports =
+            std::collections::BTreeMap::from([(n, (tape(1), FoldError::RetiredIdentity))]);
+        assert_eq!(live.fence_liveness_failures, expected_reports);
+        assert_eq!(replay.fence_liveness_failures, expected_reports);
         assert_eq!(live.open_fences(), 1);
         assert_eq!(live.open_fences(), replay.open_fences());
         assert!(live.pending.is_empty());

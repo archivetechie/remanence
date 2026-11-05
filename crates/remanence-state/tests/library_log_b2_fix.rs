@@ -210,7 +210,7 @@ fn fence_on_tape_whose_provisioning_is_queued() {
     assert_eq!(f.open_fences(), 1);
     f.resolve(&Present, &NoHistory).unwrap();
     assert!(f.pending.is_empty());
-    assert!(f.contradictions.is_empty());
+    assert!(f.contradicted_tapes() == 0);
 }
 
 struct Repaired;
@@ -251,13 +251,10 @@ fn repaired_tape_log_kind_change_is_not_scoped() {
     );
     eprintln!(
         "replay of tag 15 against a repaired tape log: {r:?}; contradictions={}",
-        f.contradictions.len()
+        f.contradicted_tapes()
     );
     r.unwrap();
-    assert_eq!(
-        f.contradictions.get(&Scope::Tape(tape(1).uuid)),
-        Some(&FoldError::TapeContradiction)
-    );
+    assert!(f.contradicted(tape(1)));
     recv(&mut f, provision(2, None)).unwrap();
     assert!(f.tapes.contains_key(&tape(2).uuid));
 }
@@ -313,10 +310,11 @@ fn deferred_fence_liveness_failure_is_scoped() {
     .unwrap();
     assert_eq!(f.open_fences(), 1);
     f.resolve(&Present, &NoHistory).unwrap();
-    assert_eq!(
-        f.contradictions.get(&Scope::Tape(tape(1).uuid)),
-        Some(&FoldError::RetiredIdentity)
-    );
+    assert_eq!(f.contradicted_tapes(), 0);
+    assert!(f
+        .fence_liveness_failures
+        .values()
+        .any(|v| *v == (tape(1), FoldError::RetiredIdentity)));
     assert!(f.pending.is_empty());
     assert_eq!(f.open_fences(), 1);
     recv(&mut f, provision(2, None)).unwrap();
