@@ -416,6 +416,9 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
         let preview = catalog
             .supersede_tail(pb::SupersedeTailRequest {
                 tape_uuid: args.tape.as_bytes().to_vec(),
+                // The daemon requires the acknowledging tape on every call,
+                // including this read-only preview (the CLI always sends it).
+                ack_tape_uuid: args.tape.as_bytes().to_vec(),
                 ..Default::default()
             })
             .await;
