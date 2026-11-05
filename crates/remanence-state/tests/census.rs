@@ -816,6 +816,15 @@ fn scan_with_builders(
             .find_map(|s| s.as_deref())
             .or(pending.as_deref())
             .unwrap_or("<module>");
+        // The B4b writer preflight split did not move an audit producer.
+        let name = if kind == "audit-producer"
+            && path == "crates/remanence-state/src/library_log/store.rs"
+            && name == "append_checked"
+        {
+            "append"
+        } else {
+            name
+        };
         let mut add = |pattern: &str| {
             if kind == "text-decision" && std::env::var_os("CENSUS_SNIPPETS").is_some() {
                 println!(
@@ -845,14 +854,43 @@ fn scan_with_builders(
                         && !sequence(rest, &["index_write"]),
                     "forbidden catalog escape in {path}::{name}"
                 );
-                if sequence(rest, &["fn", "catalog_index"]) {
-                    let end = function_end(&t, i);
-                    assert!(
-                        !t[i..end]
-                            .windows(4)
-                            .any(|w| sequence(w, &["-", ">", "&", "mut"])),
-                        "mutable catalog_index in {path}"
-                    );
+                if sequence(rest, &["fn"]) {
+                    let signature_end = rest
+                        .iter()
+                        .position(|t| t.text == "{")
+                        .unwrap_or(rest.len());
+                    let signature = &rest[..signature_end];
+                    // Ignore arrows inside callback parameters: only the fn's
+                    // own return type is a capability escape.
+                    let mut depth = 0usize;
+                    let mut parameters_end = None;
+                    for (i, token) in signature.iter().enumerate() {
+                        if token.text == "(" {
+                            depth += 1;
+                        }
+                        if token.text == ")" {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                parameters_end = Some(i + 1);
+                                break;
+                            }
+                        }
+                    }
+                    let signature = &signature[parameters_end.unwrap_or(signature.len())..];
+                    if let Some(arrow) = signature.windows(2).position(|w| sequence(w, &["-", ">"]))
+                    {
+                        let returned = &signature[arrow + 2..];
+                        let mutable = returned.iter().any(|t| t.text == "&")
+                            && returned.iter().any(|t| t.text == "mut");
+                        assert!(
+                            !mutable
+                                || !returned.iter().any(|t| matches!(
+                                    t.text.as_str(),
+                                    "CatalogIndex" | "CatalogCore"
+                                )),
+                            "mutable catalog accessor in {path}"
+                        );
+                    }
                 }
                 if sequence(rest, &["projector", ":", ":", "open", "("]) {
                     add("projector::open");
@@ -2066,6 +2104,10 @@ fn b4a_catalog_writer_scanner() {
         "fn leak() { CatalogIndex::open(p); }",
         "fn leak() { c.index_write(); }",
         "fn catalog_index(&mut self) -> &mut CatalogIndex { &mut self.index }",
+        "fn other(&mut self) -> &mut CatalogIndex { &mut self.index }",
+        "fn core(&mut self) -> &mut CatalogCore { &mut self.core }",
+        "fn other(&mut self) -> &mut crate::projector::CatalogIndex { &mut self.index }",
+        "fn other<'a>(&'a mut self) -> &'a mut CatalogIndex { &mut self.index }",
     ] {
         assert!(
             std::panic::catch_unwind(|| scan("example.rs", forbidden, "catalog-writer")).is_err()

@@ -330,6 +330,8 @@ pub struct LibraryFold {
     pub applied_through: u64,
     /// Number of identical duplicate records encountered on replay.
     pub duplicates: u64,
+    /// Received positions decided without an application (observer bookkeeping only).
+    pub(crate) non_applications: u64,
     /// Current tape identities.
     pub tapes: BTreeMap<Id, TapeState>,
     /// Pending records in source sequence order.
@@ -341,6 +343,8 @@ pub struct LibraryFold {
     /// Missing fence evidence, which never delays the fence.
     pub unresolved_fence_evidence: BTreeSet<u64>,
     pending_bytes: usize,
+    /// Most recent pending retry refusal, observed without changing pending retention.
+    pub pending_rejection: Option<(u64, Id)>,
     latest: Index<(Tag, Scope, Option<Id>), Held>,
     fences: Index<u64, Held>,
     supersedes: Index<(TapeRef, Id), Held>,
@@ -1558,7 +1562,10 @@ impl LibraryFold {
         let at = record.body.at().cloned();
         match &result {
             Validated::Apply => self.apply_validated(sequence, record, receipt, view)?,
-            Validated::Duplicate(_) => self.duplicates += 1,
+            Validated::Duplicate(_) => {
+                self.duplicates += 1;
+                self.non_applications += 1;
+            }
         }
         self.note_reference(at.as_ref());
         self.received_through = sequence;
@@ -1572,6 +1579,18 @@ impl LibraryFold {
         receipt: Receipt,
         view: &dyn TapeView,
     ) -> Result<(), FoldError> {
+        self.apply_validated_observed(sequence, record, receipt, view, &mut |_| {})
+    }
+    /// Report successful applications synchronously, including the prefix before an error.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_validated_observed(
+        &mut self,
+        sequence: u64,
+        record: Record,
+        receipt: Receipt,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(u64),
+    ) -> Result<(), FoldError> {
         // Fence scopes have no historical references. Recompute exactly the scope
         // validated before publication; no mutation can intervene under the writer lock.
         let deferred_scope = if matches!(record.body, Body::FenceRaised(_)) {
@@ -1582,13 +1601,26 @@ impl LibraryFold {
         };
         let at = record.body.at().cloned();
         if let Some(scope) = deferred_scope {
-            self.defer_fence(sequence, record, receipt, scope, view)?;
+            self.defer_fence(sequence, record, receipt, scope, view, applied)?;
         } else {
-            self.commit(sequence, record, receipt, view)?;
+            self.commit_observed(sequence, record, receipt, view, applied)?;
         }
         self.note_reference(at.as_ref());
         self.received_through = sequence;
         self.watermark();
+        Ok(())
+    }
+    // Observing after commit keeps the frozen transition and all its early returns intact.
+    fn commit_observed(
+        &mut self,
+        sequence: u64,
+        record: Record,
+        receipt: Receipt,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(u64),
+    ) -> Result<(), FoldError> {
+        self.commit(sequence, record, receipt, view)?;
+        applied(sequence);
         Ok(())
     }
     fn commit(
@@ -1927,11 +1959,12 @@ impl LibraryFold {
         receipt: Receipt,
         scope: BTreeSet<Scope>,
         view: &dyn TapeView,
+        applied: &mut dyn FnMut(u64),
     ) -> Result<(), FoldError> {
         self.validate_deferred_fence(&record, &scope)?;
         self.hold(sequence, record.clone(), receipt.clone(), scope)?;
         self.pending.last_mut().unwrap().deferred_fence = true;
-        self.commit(sequence, record, receipt, view)?;
+        self.commit_observed(sequence, record, receipt, view, applied)?;
         Ok(())
     }
     /// Receive one frame during replay; only native contradictions are isolated.
@@ -1942,6 +1975,19 @@ impl LibraryFold {
         receipt: Receipt,
         view: &dyn TapeView,
         history: &dyn LibraryHistory,
+    ) -> Result<(), FoldError> {
+        self.receive_observed(sequence, record, receipt, view, history, &mut |_| {})
+    }
+    /// Report successful applications synchronously, including the prefix before an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_observed(
+        &mut self,
+        sequence: u64,
+        record: Record,
+        receipt: Receipt,
+        view: &dyn TapeView,
+        history: &dyn LibraryHistory,
+        applied: &mut dyn FnMut(u64),
     ) -> Result<(), FoldError> {
         if sequence != self.received_through + 1 {
             return Err(FoldError::Sequence);
@@ -1964,15 +2010,23 @@ impl LibraryFold {
             self.validate_at(sequence, &record, view, history)
         };
         match validation {
-            Err(FoldError::TapeContradiction) => self.exclude(at.as_ref().unwrap()),
+            Err(FoldError::TapeContradiction) => {
+                self.exclude(at.as_ref().unwrap());
+                self.non_applications += 1;
+            }
             Err(FoldError::Unresolved) => self.hold(sequence, record, receipt, scope)?,
             Err(e) => return Err(e),
             Ok(_) if blocked && matches!(record.body, Body::FenceRaised(_)) => {
-                self.defer_fence(sequence, record, receipt, scope, view)?;
+                self.defer_fence(sequence, record, receipt, scope, view, applied)?;
             }
             Ok(_) if blocked => self.hold(sequence, record, receipt, scope)?,
-            Ok(Validated::Apply) => self.commit(sequence, record, receipt, view)?,
-            Ok(Validated::Duplicate(_)) => self.duplicates += 1,
+            Ok(Validated::Apply) => {
+                self.commit_observed(sequence, record, receipt, view, applied)?
+            }
+            Ok(Validated::Duplicate(_)) => {
+                self.duplicates += 1;
+                self.non_applications += 1;
+            }
         }
         self.note_reference(at.as_ref());
         self.received_through = sequence;
@@ -2044,6 +2098,17 @@ impl LibraryFold {
         view: &dyn TapeView,
         history: &dyn LibraryHistory,
     ) -> Result<(), FoldError> {
+        self.resolve_observed(view, history, &mut |_| {})
+    }
+    /// Report successful applications synchronously, including the prefix before an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_observed(
+        &mut self,
+        view: &dyn TapeView,
+        history: &dyn LibraryHistory,
+        applied: &mut dyn FnMut(u64),
+    ) -> Result<(), FoldError> {
+        self.pending_rejection = None;
         loop {
             let before = self.pending.len();
             let pending = std::mem::take(&mut self.pending);
@@ -2052,6 +2117,7 @@ impl LibraryFold {
                 let record = match wire::decode(p.tag as u16, &p.bytes) {
                     Ok(record) => record,
                     Err(_) => {
+                        self.pending_rejection = Some((p.sequence, p.receipt.record_uuid));
                         self.pending.push(p);
                         self.pending.extend(it);
                         self.watermark();
@@ -2069,8 +2135,14 @@ impl LibraryFold {
                     Ok(_) if blocked => self.pending.push(p),
                     Ok(Validated::Apply) => {
                         if !p.deferred_fence {
-                            if let Err(e) = self.commit(p.sequence, record, p.receipt.clone(), view)
-                            {
+                            if let Err(e) = self.commit_observed(
+                                p.sequence,
+                                record,
+                                p.receipt.clone(),
+                                view,
+                                applied,
+                            ) {
+                                self.pending_rejection = Some((p.sequence, p.receipt.record_uuid));
                                 self.pending.push(p);
                                 self.pending.extend(it);
                                 self.watermark();
@@ -2082,11 +2154,13 @@ impl LibraryFold {
                     Ok(Validated::Duplicate(_)) => {
                         self.pending_bytes -= p.bytes.len();
                         self.duplicates += 1;
+                        self.non_applications += u64::from(!p.deferred_fence);
                     }
                     Err(FoldError::Unresolved) => self.pending.push(p),
                     Err(FoldError::TapeContradiction) => {
                         self.pending_bytes -= p.bytes.len();
                         self.exclude(record.body.at().unwrap());
+                        self.non_applications += u64::from(!p.deferred_fence);
                     }
                     Err(
                         e @ (FoldError::UnknownTape
@@ -2103,6 +2177,7 @@ impl LibraryFold {
                         }
                     }
                     Err(e) => {
+                        self.pending_rejection = Some((p.sequence, p.receipt.record_uuid));
                         self.pending.push(p);
                         self.pending.extend(it);
                         self.watermark();

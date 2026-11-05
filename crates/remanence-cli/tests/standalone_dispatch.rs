@@ -1065,6 +1065,33 @@ impl remanence_library::SgTransport for VersionMutationTransport {
     }
 }
 
+/// Occupied tapes report physical instances for both pool-change commands.
+#[test]
+fn occupied_tape_pool_changes_quote_instance_refusal() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("occupied.txt");
+    std::fs::write(&source, b"occupied").unwrap();
+    let written = f.ok(&["put", source.to_str().unwrap()]);
+    assert_eq!(written["summary"]["written"], 1);
+    let uuid = f.ok(&["tape", "identify"])["uuid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.ok(&["pool", "new", "offsite"]);
+    let expected = format!(
+        "tape {uuid} holds 1 committed instances; a tape holding data cannot change pool; it can only be retired"
+    );
+    for args in [
+        vec!["tape", "assign-pool", "--pool", "offsite"],
+        vec!["tape", "assign-pool", "--unassign"],
+    ] {
+        let (code, output, errors) = f.run(&args, true);
+        assert_ne!(code, ExitCode::SUCCESS, "{output}\n{errors}");
+        assert_eq!(VersionFixture::envelope(&output)["error"], expected);
+    }
+    assert_eq!(f.ok(&["tape", "identify"])["pool"], "default");
+}
+
 #[test]
 fn put_versions_are_pool_scoped_and_get_is_loaded_tape_scoped() {
     let f = VersionFixture::new();
@@ -1515,9 +1542,8 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
     );
     let mismatch =
         format!("--clobber-unknown-tape {wrong} does not match BOT uuid {bot}; no write attempted");
-    let copies = format!(
-        "--clobber-unknown-tape refuses: committed copies in this catalog reference BOT uuid {bot}; no write attempted"
-    );
+    // An orphan copy has no tape-level pool authority.
+    let copies = "pool assignment conflict: committed=unknown derived=default";
     let named = [
         "--clobber-data",
         "--clobber-unknown-tape",
@@ -1533,7 +1559,7 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
             false,
             hint.as_str(),
         ),
-        (named.to_vec(), true, false, copies.as_str()),
+        (named.to_vec(), true, false, copies),
         (
             vec![
                 "--clobber-data",
@@ -1599,8 +1625,8 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
             rusqlite::Connection::open(config.index.sqlite_path)
                 .unwrap()
                 .execute(
-                    "insert into object_copies(object_id, tape_uuid, tape_file_number, status, pool_id)
-                     values('seeded-object', ?1, ?2, 'committed', 'default')",
+                    "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+                     values('seeded-object', ?1, ?2, 'committed')",
                     rusqlite::params![
                         uuid::Uuid::parse_str(bot).unwrap().as_bytes().to_vec(),
                         1u64.to_be_bytes().to_vec()
@@ -3767,7 +3793,10 @@ fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(config.daemon.state_dir.join("authority-format").exists());
     let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
-    assert_eq!(state.catalog().schema_version().unwrap(), 24);
+    assert_eq!(
+        state.catalog().schema_version().unwrap(),
+        remanence_state::projector::index::SCHEMA_VERSION
+    );
     drop(state);
     assert!(!config.journal.dir.join("checkpoints").exists());
     f.new_tape("AFTERRESET");

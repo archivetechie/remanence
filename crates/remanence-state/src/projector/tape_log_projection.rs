@@ -64,9 +64,7 @@ impl CatalogCore {
     }
     /// Project all new closed groups from one immutable, validated snapshot.
     pub fn project_tape_log(&mut self, snapshot: &AuthoritySnapshot) -> Result<(), StateError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin tape-log projection", e))?;
         project_snapshot(&tx, snapshot)?;
         tx.commit()
@@ -80,9 +78,7 @@ impl CatalogCore {
         audit: &[AuditRecord],
         snapshots: &[AuthoritySnapshot],
     ) -> Result<RebuildReport, StateError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin projection-only rebuild", e))?;
         {
             let mut marks = tx
@@ -267,9 +263,7 @@ impl CatalogCore {
     ) -> Result<(), StateError> {
         self.validate_repair_prefix(snapshot)?;
         let uuid = snapshot.raw.header().tape_uuid;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin repaired tape projection", e))?;
         tx.execute_batch(
             "create temp table repaired_objects as select object_id from object_copies where 0",
@@ -286,6 +280,8 @@ impl CatalogCore {
             "tape_files",
             "tape_log_projection",
             "tape_log_object_commits",
+            "tape_projection_sources",
+            "tape_projection_chunks",
         ] {
             tx.execute(
                 &format!("delete from {table} where tape_uuid = ?1"),
@@ -310,9 +306,16 @@ fn projection_mark(conn: &Connection, uuid: [u8; 16]) -> Result<Option<(u64, u64
         Ok((row.get::<_, SqliteU64>(0)?.get(), row.get::<_, SqliteU64>(1)?.get()))
     }).optional().map_err(|e| sqlite_error("read tape-log projection mark", e))
 }
-fn project_snapshot(
-    tx: &rusqlite::Transaction<'_>,
+fn project_snapshot(tx: &Connection, snapshot: &AuthoritySnapshot) -> Result<(), StateError> {
+    project_snapshot_rows(tx, snapshot, false, &mut |_, _, _| Ok(false))
+}
+/// The callback commits a completed bounded row prefix, and can skip a durable
+/// prefix when restarting a partially projected native group.
+fn project_snapshot_rows(
+    tx: &Connection,
     snapshot: &AuthoritySnapshot,
+    historical: bool,
+    before_row: &mut dyn FnMut(&Connection, u64, u64) -> Result<bool, StateError>,
 ) -> Result<(), StateError> {
     let raw = &snapshot.raw;
     let uuid = raw.header().tape_uuid;
@@ -331,7 +334,32 @@ fn project_snapshot(
         if matches!(frame.record, Record::PayloadContinuation(_)) {
             continue;
         }
+        let mut row_number = 0;
         let group = raw.group_snapshot(sequence, begin, frame.end);
+        if historical {
+            // Write-session authority exists only in the native tape source.
+            let session = match &frame.record {
+                Record::SessionOpened(v) => Some((v.session_id, "open", v.opened_at_utc.as_str())),
+                Record::SessionEnded(v) => Some((v.session_id, "closed", v.ended_at_utc.as_str())),
+                _ => None,
+            };
+            if let Some((session, state, timestamp)) = session {
+                project_session_core(
+                    tx,
+                    SessionProjection {
+                        session_id: Uuid::from_bytes(session),
+                        kind: "write",
+                        tape_uuid: Some(uuid.to_vec()),
+                        library_serial: None,
+                        drive_bay: None,
+                        drive_uuid: None,
+                        state,
+                        timestamp,
+                        endpoint: None,
+                    },
+                )?;
+            }
+        }
         if let Record::Initialized(init) = &frame.record {
             insert_tape_file(tx, uuid, &init.bot)?;
             project_tape_written_extent_tx(tx, uuid, 2)?;
@@ -345,6 +373,15 @@ fn project_snapshot(
             let mut failure = None;
             group
                 .visit_file_rows(|row| {
+                    row_number += 1;
+                    match before_row(tx, frame.sequence, row_number) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => (),
+                        Err(error) => {
+                            failure = Some(error);
+                            return Err(StoreError::Refused("chunk checkpoint failed"));
+                        }
+                    }
                     insert_tape_file(tx, uuid, row).map_err(|e| {
                         failure = Some(e);
                         StoreError::Refused("closeout row projection failed")
@@ -380,6 +417,15 @@ fn project_snapshot(
             let mut failure = None;
             group
                 .visit_file_rows(|row| {
+                    row_number += 1;
+                    match before_row(tx, frame.sequence, row_number) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => (),
+                        Err(error) => {
+                            failure = Some(error);
+                            return Err(StoreError::Refused("chunk checkpoint failed"));
+                        }
+                    }
                     insert_tape_file(tx, uuid, row).map_err(|error| {
                         failure = Some(error);
                         StoreError::Refused("tape-file projection failed")
@@ -388,6 +434,10 @@ fn project_snapshot(
                 .map_err(|e| failure.take().unwrap_or_else(|| e.into()))?;
             group
                 .visit_catalog(|event| {
+                    row_number+=1;
+                    match before_row(tx,frame.sequence,row_number) {
+                        Ok(true)=>return Ok(()), Ok(false)=>(), Err(error)=> { failure=Some(error); return Err(StoreError::Refused("chunk checkpoint failed")); }
+                    }
                     let result = match event {
                         CatalogPayload::Object(p) => {
                             validate_object_metadata(
@@ -448,6 +498,8 @@ fn project_snapshot(
             project_tape_written_extent_tx(tx, uuid, commit.cursor.lba)?;
             project_checkpoint_tape_seal_tx(tx, uuid, false, commit.seal_due, &updated_at)?;
         }
+        row_number += 1;
+        before_row(tx, frame.sequence, row_number)?;
         tx.execute("insert into tape_log_projection values (?1, 1, ?2, ?3) on conflict(tape_uuid) do update set projected_through_sequence = excluded.projected_through_sequence, projected_through_offset = excluded.projected_through_offset", params![uuid.as_slice(), SqliteU64::new(frame.sequence), SqliteU64::new(frame.offset)])
             .map_err(|e| sqlite_error("advance tape-log projection mark", e))?;
         start = None;
@@ -483,7 +535,7 @@ fn project_snapshot(
                     ));
                 }
             }
-            project_terminal_log_progress(
+            project_terminal_log_progress_core(
                 tx,
                 &TerminalFinalizationProjectionInput {
                     tape_uuid: uuid,
@@ -505,6 +557,7 @@ fn project_snapshot(
                     updated_at_utc: None,
                 },
                 &updated_at,
+                historical,
             )?;
         }
     }
@@ -524,7 +577,7 @@ fn project_snapshot(
 /// repairable; contradicting rows are refused. Temporary key tables keep the
 /// extra-member check bounded even for multi-million-member Objects.
 fn validate_projected_history(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     snapshot: &AuthoritySnapshot,
 ) -> Result<(), StateError> {
     let uuid = snapshot.raw.header().tape_uuid;
@@ -599,7 +652,7 @@ fn validate_projected_history(
 }
 
 fn validate_object_metadata(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     object: &NativeObjectProjectionInput,
     uuid: [u8; 16],
     sequence: u64,
@@ -624,10 +677,11 @@ type ProjectedTerminalIdentity = (String, String, Option<String>, Vec<u8>, Vec<u
 
 // Earlier native groups may precede a directly projected acceptance/progress
 // row. Preserve a matching later view while still rejecting identity changes.
-fn project_terminal_log_progress(
-    tx: &rusqlite::Transaction<'_>,
+fn project_terminal_log_progress_core(
+    tx: &Connection,
     input: &TerminalFinalizationProjectionInput,
     updated: &str,
+    historical: bool,
 ) -> Result<(), StateError> {
     let existing: Option<ProjectedTerminalIdentity> = tx.query_row(
         "select finalization_progress, finalization_trigger, finalization_operation_id, finalization_edition_digest, finalization_layout_digest, finalization_outcome from tapes where tape_uuid = ?1 and finalization_progress is not null",
@@ -654,7 +708,7 @@ fn project_terminal_log_progress(
             return Ok(());
         }
     }
-    project_terminal_finalization_tx(tx, input, updated)
+    project_terminal_finalization_core(tx, input, updated, historical)
 }
 
 /// Fixture projection uses actual closed native groups and the same comparison
@@ -728,9 +782,7 @@ impl CatalogCore {
             }
         }
         let snapshot = writer.freeze()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin native fixture reconstruction", e))?;
         validate_projected_history(&tx, &snapshot)?;
         tx.execute(
@@ -1161,6 +1213,177 @@ mod tests {
         assert!(
             authority.acquire_exclusive().is_err(),
             "physical repair fence survives projection repair"
+        );
+    }
+}
+
+impl CatalogCore {
+    /// B4b-only bounded projection. All native row SQL stays in project_snapshot_rows.
+    pub(super) fn project_tape_log_bounded(
+        &mut self,
+        snapshot: &AuthoritySnapshot,
+    ) -> Result<(), StateError> {
+        let uuid = snapshot.raw.header().tape_uuid;
+        let prior: Option<(SqliteU64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "select byte_end,source_digest from tape_projection_sources where tape_uuid=?1",
+                [uuid.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| sqlite_error("read tape source digest", e))?;
+        if let Some((end, digest)) = prior {
+            if snapshot.raw.projection_prefix_digest(end.get())?.as_slice() != digest {
+                return Err(StateError::IndexCorrupt(
+                    "tape projection source digest changed".into(),
+                ));
+            }
+        }
+        let end = snapshot.raw.summary().closed_end;
+        let digest = snapshot.raw.projection_prefix_digest(end)?;
+        let resume:Option<(SqliteU64,SqliteU64)>=self.conn.query_row("select through_sequence,rows_committed from tape_projection_chunks where tape_uuid=?1",[uuid.as_slice()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|sqlite_error("read tape chunk resume",e))?;
+        let tx = projection_transaction(&mut self.conn)
+            .map_err(|e| sqlite_error("begin bounded tape projection", e))?;
+        tx.execute("insert into tape_projection_sources values(?1,?2,?3,?4) on conflict(tape_uuid) do update set received_sequence=excluded.received_sequence,byte_end=excluded.byte_end,source_digest=excluded.source_digest",params![uuid.as_slice(),SqliteU64::new(snapshot.log_reference().0),SqliteU64::new(end),digest.as_slice()]).map_err(|e|sqlite_error("bind tape projection source",e))?;
+        let mut count = 0;
+        let mut last = None;
+        project_snapshot_rows(&tx, snapshot, true, &mut |conn, sequence, row| {
+            if count == super::apply::TAPE_CHUNK_ROWS {
+                let (sequence, row) = last.expect("nonempty chunk");
+                conn.execute("insert into tape_projection_chunks values(?1,?2,?3) on conflict(tape_uuid) do update set through_sequence=excluded.through_sequence,rows_committed=excluded.rows_committed",params![uuid.as_slice(),SqliteU64::new(sequence),SqliteU64::new(row)]).map_err(|e|sqlite_error("checkpoint tape chunk",e))?;
+                conn.execute_batch("commit; begin immediate")
+                    .map_err(|e| sqlite_error("commit bounded tape chunk", e))?;
+                count = 0;
+            }
+            if resume.is_some_and(|(s, r)| s.get() == sequence && row <= r.get()) {
+                return Ok(true);
+            }
+            count += 1;
+            last = Some((sequence, row));
+            Ok(false)
+        })?;
+        tx.execute(
+            "delete from tape_projection_chunks where tape_uuid=?1",
+            [uuid.as_slice()],
+        )
+        .map_err(|e| sqlite_error("finish tape chunk projection", e))?;
+        tx.commit()
+            .map_err(|e| sqlite_error("commit final tape chunk", e))
+    }
+}
+
+#[cfg(test)]
+mod b4b1_tests {
+    use super::*;
+    use crate::{
+        authority::{TapeAuthority, TapeAuthorityView, TapeAuthorityWriter},
+        projector::{
+            apply::{ApplyPath, AuthorityRecord},
+            thread::{ProjectionClient, ProjectionResult},
+            CatalogReader,
+        },
+    };
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    fn large_snapshot(root: &std::path::Path, rows: usize) -> AuthoritySnapshot {
+        let id = [0x74; 16];
+        let authority = TapeAuthority::open_fixture(root, id).unwrap();
+        let mut writer = authority.acquire_exclusive().unwrap();
+        let mut record = crate::checkpoint::tests::record(id);
+        let object = record.objects[0].object.object_id.clone();
+        record.objects[0].files = (0..rows)
+            .map(|n| NativeObjectFileProjectionInput {
+                object_id: object.clone(),
+                file_id: format!("file-{n:06}"),
+                path: format!("member/{n:06}"),
+                size_bytes: 1,
+                file_sha256: vec![0x31; 32],
+                first_chunk_lba: Some(0),
+                chunk_count: 1,
+                mtime: None,
+                executable: None,
+            })
+            .collect();
+        writer.publish_report(&(&record).into()).unwrap();
+        writer.freeze().unwrap()
+    }
+    /// A partial native object resumes from its row watermark after SQL fails.
+    #[test]
+    fn authority_tape_chunk_failure_resumes_without_losing_or_duplicating_members() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = large_snapshot(root.path(), 2000);
+        let mut writer = crate::projector::open(root.path().join("catalog.sqlite"))
+            .unwrap()
+            .write_handle();
+        let inspect = Connection::open(writer.path()).unwrap();
+        inspect.execute_batch("create trigger stop_chunk before insert on object_files when (select count(*) from object_files)>=700 begin select raise(abort,'injected projection failure'); end;").unwrap();
+        let source = AuthorityRecord::Tape(Box::new(snapshot));
+        assert!(writer.apply(&source, ApplyPath::Live).is_err());
+        let count: u64 = inspect
+            .query_row("select count(*) from object_files", [], |r| r.get(0))
+            .unwrap();
+        assert!(count > 0 && count < 700, "committed chunk rows={count}");
+        inspect.execute_batch("drop trigger stop_chunk").unwrap();
+        writer.apply(&source, ApplyPath::Startup).unwrap();
+        writer.apply(&source, ApplyPath::Startup).unwrap();
+        assert_eq!(
+            inspect
+                .query_row("select count(*) from object_files", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            2000
+        );
+        assert_eq!(
+            inspect
+                .query_row("select count(*) from tape_projection_chunks", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    /// A hot read never queues behind the writer during a 100k-member projection.
+    #[test]
+    fn authority_reader_latency_during_100k_row_tape_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = large_snapshot(root.path(), 100_000);
+        let client = ProjectionClient::open(root.path().join("catalog.sqlite")).unwrap();
+        let reader: CatalogReader = client.reader().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(client.project(
+                    AuthorityRecord::Tape(Box::new(snapshot)),
+                    ApplyPath::Rebuild,
+                ))
+                .unwrap();
+        });
+        let mut worst = Duration::ZERO;
+        let mut reads = 0;
+        let response = loop {
+            let start = Instant::now();
+            reader.get_tape(&[0x74; 16]).unwrap();
+            worst = worst.max(start.elapsed());
+            reads += 1;
+            match done_rx.try_recv() {
+                Ok(result) => break result,
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+                Err(error) => panic!("worker disappeared: {error}"),
+            }
+        };
+        worker.join().unwrap();
+        assert!(matches!(response.unwrap(), ProjectionResult::Applied(_)));
+        eprintln!("B4b1 R4: 100000 members, chunk={} rows, {reads} concurrent reads; worst={worst:?}; bound=1000ms",super::super::apply::TAPE_CHUNK_ROWS);
+        assert!(reads > 1);
+        assert!(worst < Duration::from_secs(1), "reader stalled: {worst:?}");
+        assert_eq!(
+            reader
+                .list_native_object_files(&Uuid::from_bytes([0x51; 16]).to_string())
+                .unwrap()
+                .len(),
+            100_000
         );
     }
 }

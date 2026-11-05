@@ -774,12 +774,7 @@ impl CatalogIndex {
     ) -> Result<(), StateError> {
         self.with_core(|core| core.reconcile_tape_pool_projection_from_rules(pools, rules))
     }
-    /// Project a tape-to-pool membership for future write eligibility.
-    ///
-    /// Existing object-copy rows snapshot the pool used at commit time. To
-    /// avoid silently mixing data classes on one cartridge, a tape that already
-    /// has committed copies in a different or unknown pool cannot be
-    /// reassigned here.
+    /// Assign an empty tape to a pool under the guarded assignment transaction.
     pub fn project_tape_pool_membership(
         &mut self,
         tape_uuid: [u8; 16],
@@ -954,7 +949,7 @@ impl CatalogIndex {
     pub fn get_tape_by_voltag(&self, voltag: &str) -> Result<Option<TapeRecord>, StateError> {
         self.with_core(|core| core.get_tape_by_voltag(voltag))
     }
-    /// Distinct pool snapshots on committed object copies for one tape.
+    /// Current pools on committed copies for one tape (legacy method name).
     pub fn committed_copy_pool_snapshots(
         &self,
         tape_uuid: &[u8],

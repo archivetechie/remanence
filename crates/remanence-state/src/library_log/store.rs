@@ -11,6 +11,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 /// Origin attribution injected by the eventual authority owner.
 #[derive(Clone, Debug)]
@@ -106,6 +107,17 @@ pub enum StoreError {
     /// Semantic preflight refusal; writes nothing.
     #[error("{0}")]
     Fold(#[from] FoldError),
+    /// Assignment writer found a protected native finalization after pending retry.
+    #[error("finalization protects {0:?}")]
+    FinalizationInProgress(TapeRef),
+    /// Writer-only occupancy refusal; never a wire or frozen-fold rule.
+    #[error("tape {tape_uuid} holds {copy_count} committed instances; a tape holding data cannot change pool; it can only be retired")]
+    TapeHoldsCommittedCopies {
+        /// Occupied tape identity.
+        tape_uuid: uuid::Uuid,
+        /// Number of committed copies at the decision.
+        copy_count: u64,
+    },
     /// Recovery is required before appending.
     #[error("RecoveryRequired({0:?})")]
     RecoveryRequired(Refusal),
@@ -165,6 +177,29 @@ pub fn replay(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, S
     scan(dir, log_uuid, view)
 }
 fn scan(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreError> {
+    scan_observed(dir, log_uuid, view, &mut |_| Ok(()))
+}
+/// Stream validated applications without retaining a decoded history.
+pub fn replay_observed(
+    dir: &Path,
+    log_uuid: Id,
+    view: &dyn TapeView,
+    applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+) -> Result<Replay, StoreError> {
+    let _directory = directory_lock(dir, false)?;
+    let _lock = if dir.join("library-log.lock").try_exists()? {
+        Some(lock(dir, false)?)
+    } else {
+        None
+    };
+    scan_observed(dir, log_uuid, view, applied)
+}
+fn scan_observed(
+    dir: &Path,
+    log_uuid: Id,
+    view: &dyn TapeView,
+    applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+) -> Result<Replay, StoreError> {
     let mut files: Vec<_> = fs::read_dir(dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<Result<_, _>>()?;
@@ -173,10 +208,23 @@ fn scan(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreEr
             .is_some_and(|e| e == std::ffi::OsStr::new("remlib"))
     });
     files.sort();
+    let files = files
+        .into_iter()
+        .map(|path| (path, None))
+        .collect::<Vec<_>>();
+    scan_prefixes(dir, log_uuid, view, applied, &files)
+}
+fn scan_prefixes(
+    dir: &Path,
+    log_uuid: Id,
+    view: &dyn TapeView,
+    applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+    files: &[(PathBuf, Option<u64>)],
+) -> Result<Replay, StoreError> {
     let mut out = Replay::default();
-    for (index, path) in files.iter().enumerate() {
+    for (index, (path, limit)) in files.iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let mut f = fs::File::open(path)?;
+        let mut f = fs::File::open(path)?.take(limit.unwrap_or(u64::MAX));
         let mut header_bytes = [0; 84];
         let header_result = match f.read_exact(&mut header_bytes) {
             Ok(()) => Header::decode(&mut header_bytes.as_slice(), log_uuid),
@@ -247,7 +295,9 @@ fn scan(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreEr
                         record_hash: hash,
                         synced: true,
                     };
-                    if let Err(e) = out.fold.receive(
+                    let observed_record = frame.record.clone();
+                    let mut applied_sequences = Vec::new();
+                    if let Err(e) = out.fold.receive_observed(
                         frame.sequence,
                         frame.record,
                         receipt,
@@ -257,6 +307,7 @@ fn scan(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreEr
                             segments: &out.segments,
                             before: frame.sequence,
                         },
+                        &mut |sequence| applied_sequences.push(sequence),
                     ) {
                         out.refusal = Some(Refusal {
                             segment: name.clone(),
@@ -265,6 +316,15 @@ fn scan(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreEr
                             fault: RefusalKind::Fold(e),
                         });
                         break;
+                    }
+                    for sequence in applied_sequences {
+                        applied(super::authority::AppliedLibraryRecord {
+                            log_uuid,
+                            record_hash: hash,
+                            sequence,
+                            record: observed_record.clone(),
+                            progress: super::authority::FoldProgress::capture(&out.fold),
+                        })?;
                     }
                     out.last_sequence = frame.sequence;
                     out.terminal_hash = hash;
@@ -333,6 +393,9 @@ impl LibraryHistory for SegmentHistory<'_> {
 impl SegmentHistory<'_> {
     /// Stream one validated segment for either reference form without caching history.
     fn read_sequence(&self, sequence: u64) -> Result<Option<Record>, FoldError> {
+        Ok(self.read_application(sequence)?.map(|(record, _)| record))
+    }
+    fn read_application(&self, sequence: u64) -> Result<Option<(Record, Hash)>, FoldError> {
         if sequence == 0 || sequence >= self.before {
             return Ok(None);
         }
@@ -376,7 +439,7 @@ impl SegmentHistory<'_> {
             previous =
                 codec::verify(&frame, previous).map_err(|_| FoldError::HistoryUnavailable)?;
             if frame.sequence == sequence {
-                return Ok(Some(frame.record));
+                return Ok(Some((frame.record, previous)));
             }
             if frame.sequence > sequence {
                 break;
@@ -396,8 +459,8 @@ pub struct LibraryLog {
     clock: Box<dyn Clock>,
     uuids: Box<dyn UuidSource>,
     diagnostic_fsync: bool,
-    _lock: Flock<fs::File>,
-    _directory_lock: Flock<fs::File>,
+    _lock: Arc<Flock<fs::File>>,
+    _directory_lock: Arc<Flock<fs::File>>,
     state: Replay,
 }
 impl LibraryHistory for LibraryLog {
@@ -458,14 +521,17 @@ impl LibraryLog {
             clock,
             uuids,
             diagnostic_fsync,
-            _lock: lease,
-            _directory_lock: directory_lease,
+            _lock: Arc::new(lease),
+            _directory_lock: Arc::new(directory_lease),
             state,
         };
         if owner.state.refusal.is_none() && !publication::has_ambiguity(&owner.identity)? {
             owner.remove_absent_suffix()?;
         }
         Ok(owner)
+    }
+    pub(super) fn log_uuid(&self) -> Id {
+        self.log_uuid
     }
     /// Last validated replay, including any recovery-required boundary.
     pub fn state(&self) -> &Replay {
@@ -570,12 +636,35 @@ impl LibraryLog {
     }
     /// Preflight under the append lease, publish, then advance in-memory authority.
     #[allow(dead_code)] // No production caller until B4b.
-    pub(crate) fn append(
+    pub(super) fn append(
         &mut self,
         body: Body,
         actor: AuditActor,
         source_layer: SourceLayer,
         view: &dyn TapeView,
+    ) -> Result<Receipt, StoreError> {
+        self.append_observed(body, actor, source_layer, view, &mut |_| {})
+    }
+    /// Append while reporting the fold's application order, including pending retries.
+    pub(super) fn append_observed(
+        &mut self,
+        body: Body,
+        actor: AuditActor,
+        source_layer: SourceLayer,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(u64),
+    ) -> Result<Receipt, StoreError> {
+        self.append_checked(body, actor, source_layer, view, applied, &|_, _| Ok(()))
+    }
+    /// Writer-specific checks run after pending retry, under the same append ownership.
+    pub(super) fn append_checked(
+        &mut self,
+        body: Body,
+        actor: AuditActor,
+        source_layer: SourceLayer,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(u64),
+        check: &dyn Fn(&LibraryFold, &Body) -> Result<(), StoreError>,
     ) -> Result<Receipt, StoreError> {
         if publication::has_ambiguity(&self.identity)? {
             return Err(StoreError::Fenced);
@@ -588,7 +677,8 @@ impl LibraryLog {
             segments: &self.state.segments,
             before: self.state.last_sequence.saturating_add(1),
         };
-        self.state.fold.resolve(view, &history)?;
+        self.state.fold.resolve_observed(view, &history, applied)?;
+        check(&self.state.fold, &body)?;
         let sequence = self
             .state
             .last_sequence
@@ -692,11 +782,13 @@ impl LibraryLog {
             synced,
         };
         // The same frozen view is expected throughout this synchronous append.
-        if let Err(error) = self
-            .state
-            .fold
-            .apply_validated(sequence, record, receipt.clone(), view)
-        {
+        if let Err(error) = self.state.fold.apply_validated_observed(
+            sequence,
+            record,
+            receipt.clone(),
+            view,
+            applied,
+        ) {
             // Publication already happened: fail closed if a future scope lacks apply semantics.
             publication::fence_ambiguity(&self.dir, &self.identity);
             return Err(StoreError::Ambiguous(io::Error::other(error)));
@@ -712,7 +804,8 @@ impl LibraryLog {
     }
     /// Fixture-only producer; no production authority escape.
     #[cfg(feature = "fixtures")]
-    pub fn fixture_append(
+    #[allow(dead_code)] // fixture producers are module-private after B4b-1
+    pub(super) fn fixture_append(
         &mut self,
         body: Body,
         actor: AuditActor,
@@ -800,5 +893,58 @@ mod history_tests {
             history.lookup(decision(1)).unwrap_err(),
             FoldError::HistoryUnavailable
         );
+    }
+}
+
+/// Immutable validated byte prefixes retaining the exclusive owner leases.
+/// The active owner may append or rotate; it never modifies these prefixes.
+#[derive(Clone)]
+pub(super) struct ReadSnapshot {
+    dir: PathBuf,
+    uuid: Id,
+    files: Vec<(PathBuf, Option<u64>)>,
+    _lock: Arc<Flock<fs::File>>,
+    _directory_lock: Arc<Flock<fs::File>>,
+}
+impl ReadSnapshot {
+    pub(super) fn replay(
+        &self,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+    ) -> Result<Replay, StoreError> {
+        scan_prefixes(&self.dir, self.uuid, view, applied, &self.files)
+    }
+}
+impl LibraryLog {
+    pub(super) fn lookup_application(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<(Record, Hash)>, FoldError> {
+        SegmentHistory {
+            dir: &self.dir,
+            segments: &self.state.segments,
+            before: self.state.last_sequence.saturating_add(1),
+        }
+        .read_application(sequence)
+    }
+    pub(super) fn snapshot(&self) -> Result<ReadSnapshot, StoreError> {
+        if publication::has_ambiguity(&self.identity)? {
+            return Err(StoreError::Fenced);
+        }
+        if let Some(refusal) = &self.state.refusal {
+            return Err(StoreError::RecoveryRequired(refusal.clone()));
+        }
+        Ok(ReadSnapshot {
+            dir: self.dir.clone(),
+            uuid: self.log_uuid,
+            files: self
+                .state
+                .segments
+                .iter()
+                .map(|segment| (self.dir.join(&segment.name), Some(segment.through)))
+                .collect(),
+            _lock: self._lock.clone(),
+            _directory_lock: self._directory_lock.clone(),
+        })
     }
 }

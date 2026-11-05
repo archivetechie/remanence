@@ -1,3 +1,10 @@
 crates/remanence-state/src/lib.rs::<module>::library_log	1
 crates/remanence-state/src/library_log/mod.rs::fixture_progress::constructor::VerificationProgress	1
 crates/remanence-state/src/library_log/mod.rs::fixture_unprotected::constructor::AcceptUnprotectedFinalization	1
+crates/remanence-state/src/projector/apply.rs::<module>::library_log	1
+crates/remanence-state/src/projector/thread.rs::<module>::library_log	6
+crates/remanence-state/src/projector/thread.rs::catch_up_library::library_log	2
+crates/remanence-state/src/projector/thread.rs::project_library::library_log	2
+crates/remanence-state/src/projector/thread.rs::project_library_replay::library_log	5
+crates/remanence-state/src/projector/thread.rs::project_library_snapshot::library_log	2
+crates/remanence-state/src/projector/thread.rs::rebuild_library::library_log	3

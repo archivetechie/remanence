@@ -17,6 +17,11 @@
 //! key with first-wins: an identical later body is ignored; a different later body
 //! is reported as a projection conflict and never applied. Unkeyed (null-session)
 //! observations remain independent snapshots. Counters are cumulative per mount.
+pub mod authority;
+pub use authority::{
+    AppliedLibraryRecord, AuthorityError, AuthorityReceipt, FinalizationView, LibraryAuthority,
+    LibrarySnapshot,
+};
 pub mod codec;
 #[cfg(test)]
 mod differential_tests;
@@ -1510,7 +1515,7 @@ pub struct Record {
     /// Attribution.
     pub envelope: Envelope,
     /// Typed authority or diagnostic.
-    pub body: Body,
+    body: Body,
 }
 /// Allocated record kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1571,9 +1576,15 @@ pub enum Tag {
     /// Diagnostic.
     Diagnostic = 32,
 }
-/// Body selected by the prefix tag.
+/// Body selected by the prefix tag. Construction is confined to this crate's
+/// library writer and codec; downstream code uses LibraryAuthority.
+///
+/// ```compile_fail
+/// use remanence_state::library_log::{Body, Diagnostic};
+/// fn construct(value: Diagnostic) { let _ = Body::Diagnostic(value); }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Body {
+enum Body {
     /// AssignPool.
     AssignPool(AssignPool),
     /// Label.
@@ -1792,5 +1803,94 @@ impl ParityScheme {
         .validate()
         .map(|_| ())
         .map_err(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod library_log_b2_fix;
+
+#[cfg(test)]
+mod library_log_b2_fix2;
+
+#[cfg(test)]
+mod library_log_memory;
+
+impl Record {
+    /// Allocated wire tag, without exposing record construction.
+    pub fn tag(&self) -> Tag {
+        self.body.tag()
+    }
+    pub(crate) fn canonical_body(&self) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        wire::encode_body(&self.body, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Borrowed inspection vocabulary. This cannot construct an authority body.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Reserved and tape-owned records have no SQL fields to inspect.
+pub(crate) enum BodyView<'a> {
+    AssignPool(&'a AssignPool),
+    Label(&'a Label),
+    Retire(&'a Retire),
+    Reprovision(&'a Reprovision),
+    MediumSpecSet(&'a MediumSpecSet),
+    SupersedeTail(&'a SupersedeTail),
+    AcceptUnprotectedFinalization(&'a AcceptUnprotectedFinalization),
+    FenceRaised(&'a FenceRaised),
+    FenceReleased(&'a FenceReleased),
+    MotionIntent(&'a MotionIntent),
+    MotionOutcome(&'a MotionOutcome),
+    InventoryReconciled(&'a InventoryReconciled),
+    VerificationProgress(&'a VerificationProgress),
+    VerificationVerdict(&'a VerificationVerdict),
+    ManualFinalizationAccepted(&'a ManualFinalizationAccepted),
+    ConfigurationAccepted(&'a ConfigurationAccepted),
+    ReadinessObserved(&'a ReadinessObserved),
+    DriveObserved(&'a DriveObserved),
+    DriveDecision(&'a DriveDecision),
+    DriveHealthObserved(&'a DriveHealthObserved),
+    CleaningRecorded(&'a CleaningRecorded),
+    AlarmChanged(&'a AlarmChanged),
+    OperationRecorded(&'a OperationRecorded),
+    SessionObserved(&'a SessionObserved),
+    WrapMapCached(&'a WrapMapCached),
+    RecoveryRecorded(&'a RecoveryRecorded),
+    Diagnostic(&'a Diagnostic),
+}
+impl Record {
+    pub(crate) fn body_view(&self) -> BodyView<'_> {
+        match &self.body {
+            Body::AssignPool(value) => BodyView::AssignPool(value),
+            Body::Label(value) => BodyView::Label(value),
+            Body::Retire(value) => BodyView::Retire(value),
+            Body::Reprovision(value) => BodyView::Reprovision(value),
+            Body::MediumSpecSet(value) => BodyView::MediumSpecSet(value),
+            Body::SupersedeTail(value) => BodyView::SupersedeTail(value),
+            Body::AcceptUnprotectedFinalization(value) => {
+                BodyView::AcceptUnprotectedFinalization(value)
+            }
+            Body::FenceRaised(value) => BodyView::FenceRaised(value),
+            Body::FenceReleased(value) => BodyView::FenceReleased(value),
+            Body::MotionIntent(value) => BodyView::MotionIntent(value),
+            Body::MotionOutcome(value) => BodyView::MotionOutcome(value),
+            Body::InventoryReconciled(value) => BodyView::InventoryReconciled(value),
+            Body::VerificationProgress(value) => BodyView::VerificationProgress(value),
+            Body::VerificationVerdict(value) => BodyView::VerificationVerdict(value),
+            Body::ManualFinalizationAccepted(value) => BodyView::ManualFinalizationAccepted(value),
+            Body::ConfigurationAccepted(value) => BodyView::ConfigurationAccepted(value),
+            Body::ReadinessObserved(value) => BodyView::ReadinessObserved(value),
+            Body::DriveObserved(value) => BodyView::DriveObserved(value),
+            Body::DriveDecision(value) => BodyView::DriveDecision(value),
+            Body::DriveHealthObserved(value) => BodyView::DriveHealthObserved(value),
+            Body::CleaningRecorded(value) => BodyView::CleaningRecorded(value),
+            Body::AlarmChanged(value) => BodyView::AlarmChanged(value),
+            Body::OperationRecorded(value) => BodyView::OperationRecorded(value),
+            Body::SessionObserved(value) => BodyView::SessionObserved(value),
+            Body::WrapMapCached(value) => BodyView::WrapMapCached(value),
+            Body::RecoveryRecorded(value) => BodyView::RecoveryRecorded(value),
+            Body::Diagnostic(value) => BodyView::Diagnostic(value),
+        }
     }
 }

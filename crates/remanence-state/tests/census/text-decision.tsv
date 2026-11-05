@@ -352,8 +352,8 @@ crates/remanence-state/src/index.rs::media_readiness_scope_blocks_whole_library:
 crates/remanence-state/src/index.rs::merge_preserved_tape_operator_columns_tx::text-equality	1
 crates/remanence-state/src/index.rs::merge_preserved_tape_operator_columns_tx::text-matches	1
 crates/remanence-state/src/index.rs::migrate_standalone_evidence::text-contains	2
-crates/remanence-state/src/index.rs::observe_drive_tx::text-equality	1
-crates/remanence-state/src/index.rs::observe_drive_tx::text-matches	1
+crates/remanence-state/src/index.rs::observe_drive_core::text-equality	1
+crates/remanence-state/src/index.rs::observe_drive_core::text-matches	1
 crates/remanence-state/src/index.rs::observe_foreign_drive_tapealert_advisory::text-equality	2
 crates/remanence-state/src/index.rs::observe_managed_drive_cleaning_due::text-matches	1
 crates/remanence-state/src/index.rs::parse::text-match	4
@@ -365,7 +365,7 @@ crates/remanence-state/src/index.rs::project_idempotency_record::text-equality	1
 crates/remanence-state/src/index.rs::project_tape_identity_adopted_record::text-equality	5
 crates/remanence-state/src/index.rs::project_tape_identity_adopted_record::text-match	2
 crates/remanence-state/src/index.rs::project_tape_identity_adopted_record::text-matches	1
-crates/remanence-state/src/index.rs::project_terminal_finalization_tx::text-equality	2
+crates/remanence-state/src/index.rs::project_terminal_finalization_core::text-equality	3
 crates/remanence-state/src/index.rs::provision_replacing_media::text-equality	3
 crates/remanence-state/src/index.rs::provision_tape_tx::text-equality	1
 crates/remanence-state/src/index.rs::read_legacy_catalog_reset_erase_source::text-contains	1
@@ -389,6 +389,7 @@ crates/remanence-state/src/index.rs::validate_append_bundle_extension_tx::text-e
 crates/remanence-state/src/index.rs::validate_bootstrap_identity_adoption_conn::text-equality	3
 crates/remanence-state/src/index.rs::validate_catalog_digest_pair::text-match	1
 crates/remanence-state/src/index.rs::validate_unsigned_structural_schema::text-eq_ignore_ascii_case	1
+crates/remanence-state/src/library_log/authority.rs::write::text-equality	1
 crates/remanence-state/src/media.rs::parse_label_generation::text-match	10
 crates/remanence-state/src/media.rs::tape_generation::text-match	3
 crates/remanence-state/src/state.rs::adopt_bootstrap_identity::text-equality	3
@@ -404,8 +405,9 @@ crates/remanence-state/src/tape_log/authority.rs::list_entries::text-equality	2
 crates/remanence-state/src/tape_log/authority.rs::validate_rows::text-equality	1
 crates/remanence-state/src/tape_log/fold.rs::apply::text-equality	6
 crates/remanence-state/src/tape_log/fold.rs::validate_plan::text-equality	1
-crates/remanence-state/src/tape_log/projection.rs::project_terminal_log_progress::text-equality	1
-crates/remanence-state/src/tape_log/projection.rs::project_terminal_log_progress::text-matches	1
+crates/remanence-state/src/tape_log/projection.rs::project_tape_log_bounded::text-equality	1
+crates/remanence-state/src/tape_log/projection.rs::project_terminal_log_progress_core::text-equality	1
+crates/remanence-state/src/tape_log/projection.rs::project_terminal_log_progress_core::text-matches	1
 crates/remanence-state/src/tape_log/projection.rs::validate_projected_history::text-equality	1
 crates/remanence-state/src/tape_log/projection.rs::validate_repair_prefix::text-equality	3
 crates/remanence-state/src/tape_log/store.rs::cleanup_temporary::text-starts_with	1

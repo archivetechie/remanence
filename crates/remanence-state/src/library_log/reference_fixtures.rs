@@ -3660,3 +3660,927 @@ fn contradiction_fold_vectors() -> Vec<serde_json::Value> {
         }),
     ]
 }
+
+/// Positive corpus applications enter SQL twice through the same public apply.
+#[test]
+fn authority_positive_corpus_applies_twice() {
+    use crate::projector::{self, apply::ApplyPath, thread::rebuild_library};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/library-log");
+    let cases: std::collections::BTreeSet<_> = collect(&root)
+        .keys()
+        .map(|p| p.parent().unwrap().to_path_buf())
+        .collect();
+    let mut failures = Vec::new();
+    let mut tested = 0;
+    for case in cases {
+        let view = case_view(&case);
+        let expected = replay(&root.join(&case), LOG, &view).unwrap();
+        if expected.refusal.is_some() {
+            continue;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer = projector::open(temp.path().join("catalog.sqlite"))
+            .unwrap()
+            .write_handle();
+        for pass in 0..2 {
+            if let Err(error) = rebuild_library(
+                &mut writer,
+                &root.join(&case),
+                LOG,
+                &view,
+                ApplyPath::Rebuild,
+            ) {
+                failures.push(format!("{} pass {pass}: {error}", case.display()));
+                break;
+            }
+            // Even a stale individual retry must leave completed-prefix
+            // progress intact, including excluded and pending tail positions.
+            let before = writer.normalized_authority_dump();
+            let mut first = None;
+            super::store::replay_observed(&root.join(&case), LOG, &view, &mut |record| {
+                if first.is_none() {
+                    first = Some(record);
+                }
+                Ok(())
+            })
+            .unwrap();
+            if let Some(record) = first {
+                writer
+                    .apply(
+                        &crate::projector::apply::AuthorityRecord::Library(Box::new(record)),
+                        ApplyPath::Startup,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    before,
+                    writer.normalized_authority_dump(),
+                    "stale duplicate changed {} pass {pass}",
+                    case.display()
+                );
+            }
+        }
+        tested += 1;
+    }
+    assert!(tested > 10, "no positive corpus coverage");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Each corpus case gets 200 deterministic shuffles of the library stream and
+/// growing native streams. Each native stream retains its local sequence order.
+/// The fold alone selects applications; SQL sees only its observer notifications.
+#[test]
+fn authority_corpus_200_source_interleavings() {
+    use super::authority::AppliedLibraryRecord;
+    use crate::projector::{
+        self,
+        apply::{ApplyError, ApplyPath, AuthorityRecord},
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/library-log");
+    let cases: std::collections::BTreeSet<_> = collect(&root)
+        .keys()
+        .map(|p| p.parent().unwrap().to_path_buf())
+        .collect();
+    let mut tested = 0;
+    for case in cases {
+        let final_view = case_view(&case);
+        let expected = replay(&root.join(&case), LOG, &final_view).unwrap();
+        if expected.refusal.is_some() {
+            continue;
+        }
+        let mut frames = Vec::new();
+        for path in segments(&root.join(&case)) {
+            let bytes = fs::read(path).unwrap();
+            let mut input = bytes.as_slice();
+            let header = codec::Header::decode(&mut input, LOG).unwrap();
+            let mut decoder = codec::Decoder::at(input, header.first_sequence, 84);
+            let mut hash = header.previous_segment_hash;
+            while let Ok(Some(frame)) = decoder.next_frame() {
+                if frame.sequence > expected.last_sequence {
+                    break;
+                }
+                hash = codec::verify(&frame, hash).unwrap();
+                let receipt = Receipt {
+                    sequence: frame.sequence,
+                    record_uuid: frame.record.envelope.record_uuid,
+                    record_hash: hash,
+                    synced: true,
+                };
+                frames.push((frame.record, receipt));
+            }
+        }
+        let mut native: BTreeMap<Id, BTreeMap<u64, TapeLookup>> = BTreeMap::new();
+        for (record, _) in &frames {
+            let at = record.body.at().or({
+                if let Body::FenceRaised(f) = &record.body {
+                    f.at.as_ref()
+                } else {
+                    None
+                }
+            });
+            if let Some(at) = at {
+                native
+                    .entry(at.tape.uuid)
+                    .or_default()
+                    .insert(at.sequence, final_view.lookup(at));
+            }
+        }
+        // A fixture that deliberately supplies multiple conflicting bytes for
+        // one native position uses the published final view, never a last-wins map.
+        struct Growing<'a> {
+            view: &'a CorpusView,
+            through: BTreeMap<Id, u64>,
+        }
+        impl TapeView for Growing<'_> {
+            fn lookup(&self, at: &TapeAt) -> TapeLookup {
+                if self.through.get(&at.tape.uuid).copied().unwrap_or(0) >= at.sequence {
+                    self.view.lookup(at)
+                } else {
+                    TapeLookup::NotYet
+                }
+            }
+        }
+        let mut baseline = None;
+        for iteration in 0..200u64 {
+            let seed = 0xb4b1_0000u64 + iteration;
+            if iteration == 0 {
+                eprintln!(
+                    "B4b1 interleavings case={} seeds={seed:#x}..{:#x} (200)",
+                    case.display(),
+                    seed + 199
+                );
+            }
+            let mut random = seed;
+            let mut cursor = 0;
+            let mut remaining: BTreeMap<_, std::collections::VecDeque<_>> = native
+                .iter()
+                .map(|(id, rows)| (*id, rows.keys().copied().collect()))
+                .collect();
+            let mut view = Growing {
+                view: &final_view,
+                through: BTreeMap::new(),
+            };
+            let mut fold = LibraryFold::default();
+            let mut history = History::default();
+            let mut writer = projector::memory_projection_fixture();
+            let mut applied_records = Vec::new();
+            while cursor < frames.len() || remaining.values().any(|r| !r.is_empty()) {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let keys: Vec<_> = remaining
+                    .iter()
+                    .filter(|(_, rows)| !rows.is_empty())
+                    .map(|(id, _)| *id)
+                    .collect();
+                let choice = (random as usize) % (keys.len() + usize::from(cursor < frames.len()));
+                let mut applied = Vec::new();
+                if choice < keys.len() {
+                    let id = keys[choice];
+                    let n = remaining.get_mut(&id).unwrap().pop_front().unwrap();
+                    view.through.insert(id, n);
+                    fold.resolve_observed(&view, &history, &mut |n| applied.push(n))
+                        .unwrap_or_else(|e| panic!("case={} seed={seed:#x}: {e}", case.display()));
+                } else {
+                    let (record, receipt) = &frames[cursor];
+                    fold.receive_observed(
+                        receipt.sequence,
+                        record.clone(),
+                        receipt.clone(),
+                        &view,
+                        &history,
+                        &mut |n| applied.push(n),
+                    )
+                    .unwrap_or_else(|e| panic!("case={} seed={seed:#x}: {e}", case.display()));
+                    history.0.insert(receipt.sequence, record.clone());
+                    cursor += 1;
+                }
+                for sequence in applied {
+                    let record = AppliedLibraryRecord {
+                        log_uuid: LOG,
+                        record_hash: frames[(sequence - 1) as usize].1.record_hash,
+                        sequence,
+                        record: history.0[&sequence].clone(),
+                        progress: super::authority::FoldProgress::capture(&fold),
+                    };
+                    let source = AuthorityRecord::Library(Box::new(record));
+                    match writer.apply(&source, ApplyPath::Rebuild) {
+                        Ok(_) | Err(ApplyError::HealthConflict { .. }) => (),
+                        Err(e) => panic!(
+                            "case={} seed={seed:#x} sequence={sequence}: {e}",
+                            case.display()
+                        ),
+                    }
+                    applied_records.push(source);
+                }
+            }
+            writer.finish_observed_fold(&fold);
+            let before = writer.normalized_authority_dump();
+            for source in applied_records {
+                match writer.apply(&source, ApplyPath::Startup) {
+                    Ok(_) | Err(ApplyError::HealthConflict { .. }) => (),
+                    Err(e) => panic!("case={} seed={seed:#x} retry: {e}", case.display()),
+                }
+            }
+            writer.finish_observed_fold(&fold);
+            assert_eq!(
+                before,
+                writer.normalized_authority_dump(),
+                "retry case={} seed={seed:#x}",
+                case.display()
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(
+                    &before,
+                    expected,
+                    "interleaving case={} seed={seed:#x}",
+                    case.display()
+                );
+            } else {
+                baseline = Some(before);
+            }
+        }
+        tested += 1;
+    }
+    assert!(tested > 10);
+}
+
+/// Dispatch every canonical tag through its public typed writer method. The
+/// source references remain stable while fresh operation IDs are remapped.
+#[test]
+fn authority_every_typed_method_uses_corpus_rules() {
+    use std::sync::Arc;
+    struct Free;
+    impl FinalizationView for Free {
+        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+            0
+        }
+        fn finalization_blocks_change(&self, _: TapeRef) -> bool {
+            false
+        }
+    }
+    let source = tempfile::tempdir().unwrap();
+    all_records(source.path());
+    let target = tempfile::tempdir().unwrap();
+    let lease = Arc::new(crate::StateLockGuard::acquire(target.path()).unwrap());
+    let authority = LibraryAuthority::open(
+        &target.path().join("library"),
+        LOG,
+        Origin {
+            host: "test".into(),
+            pid: 1,
+            build: "b4b1".into(),
+        },
+        Box::new(FixedClock(Arc::new(std::sync::atomic::AtomicU64::new(NOW)))),
+        Box::new(Ids),
+        false,
+        &Present,
+        lease,
+    )
+    .unwrap();
+    let mut ids = BTreeMap::new();
+    let mut tags = std::collections::BTreeSet::new();
+    for path in segments(source.path()) {
+        let bytes = fs::read(path).unwrap();
+        let mut input = bytes.as_slice();
+        let header = codec::Header::decode(&mut input, LOG).unwrap();
+        let mut decoder = codec::Decoder::at(input, header.first_sequence, 84);
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            let tag = frame.record.tag();
+            tags.insert(tag as u16);
+            let actor = frame.record.envelope.actor.clone();
+            let layer = SourceLayer::Layer4;
+            // Every generation-bearing public method refuses a stale expectation.
+            let wrong = match frame.record.body.clone() {
+                Body::AssignPool(v) => {
+                    let expected = v.change.expected + 1;
+                    Some(authority.assign_pool(
+                        v,
+                        expected,
+                        &Free,
+                        actor.clone(),
+                        layer.clone(),
+                        &Present,
+                    ))
+                }
+                Body::Label(v) => {
+                    let expected = v.change.expected + 1;
+                    Some(authority.label(
+                        v,
+                        expected,
+                        &Free,
+                        actor.clone(),
+                        layer.clone(),
+                        &Present,
+                    ))
+                }
+                Body::Retire(v) => {
+                    let expected = v.assignment_generation + 1;
+                    Some(authority.retire(
+                        v,
+                        expected,
+                        &Free,
+                        actor.clone(),
+                        layer.clone(),
+                        &Present,
+                    ))
+                }
+                Body::MediumSpecSet(v) => {
+                    let expected = v.change.expected + 1;
+                    let source = v.medium.source;
+                    Some(authority.medium_spec_set(
+                        v,
+                        expected,
+                        source,
+                        actor.clone(),
+                        layer.clone(),
+                        &Present,
+                    ))
+                }
+                Body::DriveDecision(v) => {
+                    let expected = v.change.expected + 1;
+                    Some(authority.drive_decision(
+                        v,
+                        expected,
+                        actor.clone(),
+                        layer.clone(),
+                        &Present,
+                    ))
+                }
+                Body::AlarmChanged(v) => {
+                    let expected = v.change.expected + 1;
+                    Some(authority.alarm_changed(
+                        v,
+                        expected,
+                        actor.clone(),
+                        layer.clone(),
+                        &Present,
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(wrong) = wrong {
+                assert!(
+                    matches!(
+                        wrong,
+                        Err(AuthorityError::Store(StoreError::Fold(
+                            FoldError::GenerationMismatch
+                        )))
+                    ),
+                    "tag={tag:?}: {wrong:?}"
+                );
+            }
+            let result = match frame.record.body {
+                Body::AssignPool(v) => {
+                    let expected = v.change.expected;
+                    authority.assign_pool(v, expected, &Free, actor, layer, &Present)
+                }
+                Body::Label(v) => {
+                    let expected = v.change.expected;
+                    authority.label(v, expected, &Free, actor, layer, &Present)
+                }
+                Body::Retire(v) => {
+                    let expected = v.assignment_generation;
+                    authority.retire(v, expected, &Free, actor, layer, &Present)
+                }
+                Body::MediumSpecSet(v) => {
+                    let expected = v.change.expected;
+                    let source = v.medium.source;
+                    authority.medium_spec_set(v, expected, source, actor, layer, &Present)
+                }
+                Body::DriveDecision(v) => {
+                    let expected = v.change.expected;
+                    authority.drive_decision(v, expected, actor, layer, &Present)
+                }
+                Body::AlarmChanged(v) => {
+                    let expected = v.change.expected;
+                    authority.alarm_changed(v, expected, actor, layer, &Present)
+                }
+                Body::OperationRecorded(mut v) => {
+                    if let OperationEvent::Accepted(a) = v.event {
+                        authority
+                            .begin_operation(v.kind, a, actor, layer, &Present)
+                            .map(|(id, r)| {
+                                ids.insert(v.operation, id);
+                                r
+                            })
+                    } else if v.previous.is_none() && matches!(v.event, OperationEvent::Started(_))
+                    {
+                        authority
+                            .start_operation(v.kind, actor, layer, &Present)
+                            .map(|(id, r)| {
+                                ids.insert(v.operation, id);
+                                r
+                            })
+                    } else {
+                        v.operation = ids.get(&v.operation).copied().unwrap_or(v.operation);
+                        authority.operation_recorded(v, actor, layer, &Present)
+                    }
+                }
+                Body::ReadinessObserved(mut v) => {
+                    if v.previous.is_none() {
+                        let old = v.operation;
+                        authority
+                            .begin_readiness(v, actor, layer, &Present)
+                            .map(|(id, r)| {
+                                ids.insert(old, id);
+                                r
+                            })
+                    } else {
+                        v.operation = ids.get(&v.operation).copied().unwrap_or(v.operation);
+                        authority.readiness_observed(v, actor, layer, &Present)
+                    }
+                }
+                Body::Reprovision(v) => authority.reprovision(v, actor, layer, &Present),
+                Body::SupersedeTail(v) => authority.supersede_tail(v, actor, layer, &Present),
+                Body::AcceptUnprotectedFinalization(v) => {
+                    authority.accept_unprotected_finalization(v, actor, layer, &Present)
+                }
+                Body::FenceRaised(v) => authority.fence_raised(v, actor, layer, &Present),
+                Body::FenceReleased(v) => authority.fence_released(v, actor, layer, &Present),
+                Body::MotionIntent(v) => authority.motion_intent(v, actor, layer, &Present),
+                Body::MotionOutcome(v) => authority.motion_outcome(v, actor, layer, &Present),
+                Body::InventoryReconciled(v) => {
+                    authority.inventory_reconciled(v, actor, layer, &Present)
+                }
+                Body::VerificationProgress(v) => {
+                    authority.verification_progress(v, actor, layer, &Present)
+                }
+                Body::VerificationVerdict(v) => {
+                    authority.verification_verdict(v, actor, layer, &Present)
+                }
+                Body::ManualFinalizationAccepted(v) => {
+                    authority.manual_finalization_accepted(v, actor, layer, &Present)
+                }
+                Body::ConfigurationAccepted(v) => {
+                    authority.configuration_accepted(v, actor, layer, &Present)
+                }
+                Body::DriveObserved(v) => authority.drive_observed(v, actor, layer, &Present),
+                Body::DriveHealthObserved(v) => {
+                    authority.drive_health_observed(v, actor, layer, &Present)
+                }
+                Body::CleaningRecorded(v) => authority.cleaning_recorded(v, actor, layer, &Present),
+                Body::SessionObserved(v) => authority.session_observed(v, actor, layer, &Present),
+                Body::WrapMapCached(v) => authority.wrap_map_cached(v, actor, layer, &Present),
+                Body::RecoveryRecorded(v) => authority.recovery_recorded(v, actor, layer, &Present),
+                Body::Diagnostic(v) => authority.diagnostic(v, actor, layer, &Present),
+            };
+            let receipt =
+                result.unwrap_or_else(|e| panic!("tag={tag:?} sequence={}: {e}", frame.sequence));
+            assert_eq!(receipt.receipt.sequence, frame.sequence);
+            assert_eq!(receipt.receipt.synced, tag != Tag::Diagnostic);
+        }
+    }
+    assert_eq!(tags.len(), 27);
+}
+
+/// A high applied sequence cannot cover an older pending row. The observer
+/// reports the retry where it actually applies, and digest conflicts roll back.
+#[test]
+fn authority_observer_pending_lower_sequence_and_digest_conflict() {
+    use super::authority::AppliedLibraryRecord;
+    use crate::projector::apply::{ApplyError, ApplyPath, AuthorityRecord};
+    let mut fold = LibraryFold::default();
+    let mut history = History::default();
+    let mut applied = Vec::new();
+    let mut writer = crate::projector::memory_projection_fixture();
+    for (i, body) in [provision(1, None), verdict(), provision(2, None)]
+        .into_iter()
+        .enumerate()
+    {
+        let sequence = i as u64 + 1;
+        let record = record(body, sequence);
+        let receipt = Receipt {
+            sequence,
+            record_uuid: record.envelope.record_uuid,
+            record_hash: [0; 32],
+            synced: true,
+        };
+        fold.receive_observed(
+            sequence,
+            record.clone(),
+            receipt,
+            &View::default(),
+            &history,
+            &mut |n| applied.push(n),
+        )
+        .unwrap();
+        history.0.insert(sequence, record);
+    }
+    assert_eq!(applied, [1, 3]);
+    let proof = |n, fold: &LibraryFold| {
+        AuthorityRecord::Library(Box::new(AppliedLibraryRecord {
+            log_uuid: LOG,
+            record_hash: [0; 32],
+            sequence: n,
+            record: history.0[&n].clone(),
+            progress: super::authority::FoldProgress::capture(fold),
+        }))
+    };
+    for sequence in applied {
+        let marks = writer
+            .apply(&proof(sequence, &fold), ApplyPath::Live)
+            .unwrap();
+        if sequence == 3 {
+            assert_eq!((marks.received, marks.applied, marks.pending), (3, 1, 1));
+        }
+    }
+    let stale_fold = fold.clone();
+    let mut retried = Vec::new();
+    fold.resolve_observed(&Present, &history, &mut |n| retried.push(n))
+        .unwrap();
+    assert_eq!(retried, [2]);
+    let marks = writer.apply(&proof(2, &fold), ApplyPath::Startup).unwrap();
+    assert_eq!((marks.received, marks.applied, marks.pending), (3, 3, 0));
+    let before = writer.normalized_authority_dump();
+    writer.finish_observed_fold(&stale_fold);
+    assert_eq!(before, writer.normalized_authority_dump());
+    writer.apply(&proof(2, &fold), ApplyPath::Startup).unwrap();
+    assert_eq!(before, writer.normalized_authority_dump());
+    let mut conflict = proof(2, &fold);
+    let AuthorityRecord::Library(ref mut entry) = conflict else {
+        unreachable!()
+    };
+    entry.record.envelope.timestamp_unix_ns += 1;
+    assert!(matches!(
+        writer.apply(&conflict, ApplyPath::Live),
+        Err(ApplyError::Contradiction(_))
+    ));
+    assert_eq!(before, writer.normalized_authority_dump());
+    let mut conflict = proof(2, &fold);
+    let AuthorityRecord::Library(ref mut entry) = conflict else {
+        unreachable!()
+    };
+    entry.log_uuid = [0xff; 16];
+    assert!(matches!(
+        writer.apply(&conflict, ApplyPath::Live),
+        Err(ApplyError::Contradiction(_))
+    ));
+    assert_eq!(before, writer.normalized_authority_dump());
+    let mut changed_chain = proof(2, &fold);
+    let AuthorityRecord::Library(ref mut entry) = changed_chain else {
+        unreachable!()
+    };
+    entry.record_hash = [0x7e; 32];
+    assert!(matches!(
+        writer.apply(&changed_chain, ApplyPath::Live),
+        Err(ApplyError::Contradiction(_))
+    ));
+    assert_eq!(before, writer.normalized_authority_dump());
+}
+
+/// Actual tape bytes and library receipts commute across source schedules too;
+/// the corpus property above separately covers its synthetic native proof keys.
+#[test]
+fn authority_real_tape_and_library_200_interleavings() {
+    use crate::{
+        authority::TapeAuthorityView,
+        projector::apply::{ApplyPath, AuthorityRecord},
+    };
+    use std::sync::Arc;
+    struct Free;
+    impl FinalizationView for Free {
+        fn committed_copy_count(&self, _: TapeRef) -> u64 {
+            0
+        }
+        fn finalization_blocks_change(&self, _: TapeRef) -> bool {
+            false
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let lease = Arc::new(crate::StateLockGuard::acquire(root.path()).unwrap());
+    let authority = LibraryAuthority::open(
+        &root.path().join("library"),
+        LOG,
+        Origin {
+            host: "test".into(),
+            pid: 1,
+            build: "b4b1".into(),
+        },
+        Box::new(FixedClock(Arc::new(std::sync::atomic::AtomicU64::new(NOW)))),
+        Box::new(Ids),
+        false,
+        &Present,
+        lease,
+    )
+    .unwrap();
+    let Body::Reprovision(p) = provision(0xa3, None) else {
+        unreachable!()
+    };
+    let mut library = authority
+        .reprovision(p, AuditActor::System, SourceLayer::Layer4, &Present)
+        .unwrap()
+        .applied;
+    library.extend(
+        authority
+            .retire(
+                Retire {
+                    tape: tape(0xa3),
+                    reason: RetireReason::OperatorRequested,
+                    observed_tape_sequence: None,
+                    assignment_generation: 1,
+                    detail: None,
+                },
+                1,
+                &Free,
+                AuditActor::System,
+                SourceLayer::Layer4,
+                &Present,
+            )
+            .unwrap()
+            .applied,
+    );
+    let dir = root.path().join("tapes");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!(
+            "{}.remtape",
+            uuid::Uuid::from_bytes([0xa3; 16]).simple()
+        )),
+        include_bytes!("../../../../fixtures/tape-log/sealed-terminal.remtape"),
+    )
+    .unwrap();
+    let native = crate::TapeAuthority::open_fixture(&dir, [0xa3; 16])
+        .unwrap()
+        .freeze()
+        .unwrap();
+    let Body::Reprovision(mut p) = provision(0xa1, None) else {
+        unreachable!()
+    };
+    p.pool = Some("archive".into());
+    p.medium.record_size = 262144;
+    library.extend(
+        authority
+            .reprovision(p, AuditActor::System, SourceLayer::Layer4, &Present)
+            .unwrap()
+            .applied,
+    );
+    // This decision is admitted while the native tape is empty. Replay below
+    // may deliver it between committed prefixes without changing that history.
+    library.extend(
+        authority
+            .assign_pool(
+                AssignPool {
+                    tape: tape(0xa1),
+                    pool: Some("new-pool".into()),
+                    change: GenerationChange {
+                        expected: 1,
+                        next: 2,
+                    },
+                    source: AssignmentSource::Operator,
+                    configuration: None,
+                },
+                1,
+                &Free,
+                AuditActor::System,
+                SourceLayer::Layer4,
+                &Present,
+            )
+            .unwrap()
+            .applied,
+    );
+    let object_prefixes = object_tape_prefixes(root.path());
+    let mut assignment_between_commits = false;
+    let mut baseline = None;
+    for iteration in 0..200u64 {
+        let seed = 0xb4b1_a000 + iteration;
+        let mut random = seed;
+        let mut cursor = 0;
+        let mut tape_pending = true;
+        let mut objects = 0;
+        let mut writer = crate::projector::memory_projection_without_copy_pool_fixture();
+        while cursor < library.len() || tape_pending || objects < object_prefixes.len() {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let source = if objects < object_prefixes.len()
+                && (random % 3 == 0 || (cursor == library.len() && !tape_pending))
+            {
+                let source = AuthorityRecord::Tape(Box::new(object_prefixes[objects].clone()));
+                objects += 1;
+                source
+            } else if tape_pending && (cursor == library.len() || random & 1 == 0) {
+                tape_pending = false;
+                AuthorityRecord::Tape(Box::new(native.clone()))
+            } else {
+                if library[cursor].record.tag() == Tag::AssignPool && objects == 1 {
+                    assignment_between_commits = true;
+                }
+                let source = AuthorityRecord::Library(Box::new(library[cursor].clone()));
+                cursor += 1;
+                source
+            };
+            writer
+                .apply(&source, ApplyPath::Rebuild)
+                .unwrap_or_else(|e| panic!("seed={seed:#x}: {e}"));
+        }
+        let dump = writer.normalized_authority_dump();
+        for _ in 0..2 {
+            for record in &library {
+                writer
+                    .apply(
+                        &AuthorityRecord::Library(Box::new(record.clone())),
+                        ApplyPath::Startup,
+                    )
+                    .unwrap();
+            }
+            for snapshot in object_prefixes
+                .last()
+                .into_iter()
+                .chain(std::iter::once(&native))
+            {
+                writer
+                    .apply(
+                        &AuthorityRecord::Tape(Box::new(snapshot.clone())),
+                        ApplyPath::Startup,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                dump,
+                writer.normalized_authority_dump(),
+                "retry seed={seed:#x}"
+            );
+        }
+        eprintln!("B4b1 object-bearing native/library seed={seed:#x}");
+        if let Some(expected) = &baseline {
+            assert_eq!(&dump, expected, "actual tape source seed={seed:#x}");
+        } else {
+            baseline = Some(dump);
+        }
+    }
+    assert!(
+        assignment_between_commits,
+        "must exercise AssignPool between native commits"
+    );
+    eprintln!("B4b1 actual native/library sources seeds=0xb4b1a000..0xb4b1a0c7 (200)");
+}
+
+/// Make two frozen native prefixes, each ending at a real object commit. The
+/// first snapshot retains its original file after the source grows to two objects.
+fn object_tape_prefixes(root: &Path) -> Vec<crate::tape_log::authority::AuthoritySnapshot> {
+    use crate::authority::TapeAuthorityView;
+    let dir = root.join("objects");
+    fs::create_dir_all(&dir).unwrap();
+    let bytes = include_bytes!("../../../../fixtures/tape-log/parity-off-two-objects.remtape");
+    let mut cursor = std::io::Cursor::new(bytes);
+    crate::tape_log::store::Header::decode(&mut cursor, [0xa1; 16]).unwrap();
+    let offset = cursor.position();
+    let mut decoder = crate::tape_log::codec::Decoder::at(cursor, 1, offset);
+    let mut ends = Vec::new();
+    let mut distinct = bytes[..offset as usize].to_vec();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        let mut record = frame.record;
+        // Frozen fixtures reuse a session UUID. Give this independent tape its
+        // own session; fixed-width edits leave group offsets/digests unchanged.
+        match &mut record {
+            crate::tape_log::Record::SessionOpened(v) => v.session_id = [0xd1; 16],
+            crate::tape_log::Record::Committed(v) => v.session_id = Some([0xd1; 16]),
+            _ => (),
+        }
+        crate::tape_log::codec::encode_frame(&mut distinct, frame.sequence, &record, frame.payload)
+            .unwrap();
+        assert_eq!(distinct.len(), frame.end as usize);
+        if record.tag() == crate::tape_log::Tag::Committed {
+            ends.push(distinct.len());
+        }
+    }
+    let bytes = distinct;
+    assert_eq!(ends.len(), 2);
+    let path = dir.join(format!(
+        "{}.remtape",
+        uuid::Uuid::from_bytes([0xa1; 16]).simple()
+    ));
+    ends.into_iter()
+        .map(|end| {
+            // Replace the file, preserving earlier frozen descriptors.
+            let temp = dir.join("next");
+            fs::write(&temp, &bytes[..end]).unwrap();
+            fs::rename(temp, &path).unwrap();
+            crate::TapeAuthority::open_fixture(&dir, [0xa1; 16])
+                .unwrap()
+                .freeze()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Gate reproduction: a real committed object and a provisioned pool commute
+/// in both source orders, including repeated native and library delivery.
+#[test]
+fn authority_object_pool_both_orders_and_retries() {
+    use crate::projector::apply::{ApplyPath, AuthorityRecord};
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let lease = Arc::new(crate::StateLockGuard::acquire(root.path()).unwrap());
+    let authority = LibraryAuthority::open(
+        &root.path().join("library"),
+        LOG,
+        Origin {
+            host: "test".into(),
+            pid: 1,
+            build: "fix1".into(),
+        },
+        Box::new(FixedClock(Arc::new(std::sync::atomic::AtomicU64::new(NOW)))),
+        Box::new(Ids),
+        false,
+        &Present,
+        lease,
+    )
+    .unwrap();
+    let Body::Reprovision(mut p) = provision(0xa1, None) else {
+        unreachable!()
+    };
+    p.pool = Some("archive".into());
+    p.medium.record_size = 262144;
+    let library = authority
+        .reprovision(p, AuditActor::System, SourceLayer::Layer4, &Present)
+        .unwrap()
+        .applied
+        .remove(0);
+    let native = object_tape_prefixes(root.path()).remove(0);
+    let sources = [
+        AuthorityRecord::Library(Box::new(library)),
+        AuthorityRecord::Tape(Box::new(native)),
+    ];
+    let mut baseline = None;
+    for order in [[0, 1], [1, 0]] {
+        let mut writer = crate::projector::memory_projection_fixture();
+        for _ in 0..3 {
+            for i in order {
+                writer.apply(&sources[i], ApplyPath::Live).unwrap();
+            }
+            let copies = writer.list_native_objects().unwrap();
+            assert_eq!(copies.len(), 1);
+            assert_eq!(copies[0].copies[0].pool_id.as_deref(), Some("archive"));
+            let dump = writer.normalized_authority_dump();
+            if let Some(expected) = &baseline {
+                assert_eq!(&dump, expected);
+            } else {
+                baseline = Some(dump);
+            }
+        }
+    }
+}
+
+/// A decided duplicate is not a pending dependency on the next live append.
+#[test]
+fn authority_health_duplicate_then_live_append_has_no_pending() {
+    use crate::projector::{
+        apply::{ApplyPath, AuthorityRecord},
+        thread::{ProjectionClient, ProjectionResult},
+    };
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("library");
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/library-log/health-identical-latest");
+    fs::create_dir_all(&dir).unwrap();
+    for entry in fs::read_dir(&corpus).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+        }
+    }
+    let view = case_view(Path::new("health-identical-latest"));
+    let client = ProjectionClient::open(root.path().join("catalog.sqlite")).unwrap();
+    let report = client
+        .catch_up_library(dir.clone(), LOG, Box::new(view), ApplyPath::Startup)
+        .unwrap();
+    assert!(report.pending.is_empty());
+    let lease = Arc::new(crate::StateLockGuard::acquire(root.path()).unwrap());
+    let authority = LibraryAuthority::open(
+        &dir,
+        LOG,
+        Origin {
+            host: "test".into(),
+            pid: 1,
+            build: "fix1".into(),
+        },
+        Box::new(FixedClock(Arc::new(std::sync::atomic::AtomicU64::new(NOW)))),
+        Box::new(Ids),
+        false,
+        &case_view(Path::new("health-identical-latest")),
+        lease,
+    )
+    .unwrap();
+    let Body::Diagnostic(d) = diagnostic() else {
+        unreachable!()
+    };
+    let receipt = authority
+        .diagnostic(d, AuditActor::System, SourceLayer::Layer4, &Present)
+        .unwrap();
+    assert_eq!(receipt.receipt.sequence, 6);
+    for record in receipt.applied {
+        let ProjectionResult::Applied(marks) = client
+            .project(AuthorityRecord::Library(Box::new(record)), ApplyPath::Live)
+            .unwrap()
+        else {
+            panic!("duplicate became pending");
+        };
+        assert_eq!(marks.pending, 0);
+        assert_eq!(marks.applied_records, 5);
+        assert_eq!(marks.non_applications, 1);
+        assert_eq!(marks.applied, 4); // SQL prefix cannot cross the unapplied duplicate.
+        assert_eq!(marks.received, 6);
+    }
+}

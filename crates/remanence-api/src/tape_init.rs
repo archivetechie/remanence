@@ -330,7 +330,7 @@ pub enum TapeInitError {
     CommittedCopiesPresent,
     /// Committed copy pool snapshot conflicts with the derived pool.
     TapePoolAssignmentConflict {
-        /// Pool snapshot on committed copies; `None` means unknown/unassigned.
+        /// Pool of the tape holding committed copies; `None` means unknown/unassigned.
         committed_pool: Option<String>,
         /// Pool derived from the physical barcode.
         derived_pool: String,

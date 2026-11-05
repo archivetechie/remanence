@@ -48,8 +48,10 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
+#[path = "apply.rs"]
+pub mod apply;
 #[path = "tape_log_projection.rs"]
 mod tape_log_projection;
 
@@ -142,6 +144,8 @@ pub const OBJECT_COPY_REPRESENTATION_UNKNOWN: &str = "unknown";
 /// Typed owner for the rebuildable SQLite catalog projection.
 #[derive(Debug)]
 pub(super) struct CatalogCore {
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(in crate::projector) apply_counts: [u64; 3],
     conn: Connection,
     path: PathBuf,
 }
@@ -1092,7 +1096,7 @@ pub struct NativeObjectCopyRecord {
     pub protected_until_ordinal: Option<u64>,
     /// Projected copy status.
     pub status: String,
-    /// Pool of the tape when this copy was committed, if assigned.
+    /// Current pool of the tape holding this copy, if assigned.
     pub pool_id: Option<String>,
     /// REM-OBJECT representation stored in this copy: `plaintext`, `encrypted`, or `unknown`.
     pub representation: String,
@@ -1371,14 +1375,19 @@ impl CatalogCore {
         let version: u32 = conn
             .query_row("pragma user_version", [], |r| r.get(0))
             .map_err(|e| sqlite_error("read sqlite user_version", e))?;
-        if (1..SCHEMA_VERSION).contains(&version) {
+        if (1..24).contains(&version) {
             return Err(StateError::IndexMigrationFailed(
                 crate::authority_layout::RESET_REQUIRED.into(),
             ));
         }
         configure_sqlite(&conn)?;
         migrate(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            #[cfg(any(test, feature = "fixtures"))]
+            apply_counts: [0; 3],
+        })
     }
 
     /// Read structurally compatible schema-22/23 predecessors only for declared reset admission.
@@ -1398,6 +1407,8 @@ impl CatalogCore {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            #[cfg(any(test, feature = "fixtures"))]
+            apply_counts: [0; 3],
         })
     }
     /// Open the SQLite projection for read-only query serving.
@@ -1411,7 +1422,12 @@ impl CatalogCore {
             .map_err(|err| sqlite_open_error(&path, err))?;
         configure_read_only_sqlite(&conn)?;
         validate_schema(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            #[cfg(any(test, feature = "fixtures"))]
+            apply_counts: [0; 3],
+        })
     }
 
     /// Query the catalog in place without a temporary copy or writable read marks.
@@ -1453,7 +1469,12 @@ impl CatalogCore {
         conn.pragma_update(None, "temp_store", "MEMORY")
             .map_err(|e| sqlite_error("set inventory temp store", e))?;
         validate_schema(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            #[cfg(any(test, feature = "fixtures"))]
+            apply_counts: [0; 3],
+        })
     }
 
     /// Read only the tape identities needed to admit an exact full-catalog
@@ -2116,16 +2137,7 @@ impl CatalogCore {
         ack: &str,
         released_at: &str,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
-        self.conn
-            .execute(
-                "update tape_io_fences
-                 set state = 'released',
-                     updated_at_utc = ?2,
-                     release_ack = ?3
-                 where quarantine_id = ?1 and state = 'active'",
-                params![quarantine_id, released_at, ack],
-            )
-            .map_err(|err| sqlite_error("release tape io fence", err))?;
+        project_fence_release_core(&self.conn, quarantine_id, Some(ack), released_at, true)?;
         self.tape_io_fence_by_quarantine_id(quarantine_id)
     }
 
@@ -2189,9 +2201,7 @@ impl CatalogCore {
         state: &StructuralState,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin journal ingestion transaction", err))?;
         let report = index_committed_tape_journal_tx(&tx, &input, state, &updated_at)?;
         tx.commit()
@@ -2212,9 +2222,7 @@ impl CatalogCore {
         bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin tape-file bundle projection", err))?;
         let report = project_committed_tape_file_bundle_tx(&tx, &input, bundle, &updated_at)?;
         tx.commit()
@@ -2239,9 +2247,7 @@ impl CatalogCore {
         let updated_at = now_utc()?;
         let last_committed_tape_file = entries.iter().map(|entry| entry.tape_file_number).max();
         let last_committed_tape_file = last_committed_tape_file.map(SqliteU64::new);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin tape-files reconciliation", err))?;
         let changed = tx
             .execute(
@@ -2345,9 +2351,7 @@ impl CatalogCore {
             ));
         }
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin tape provisioning transaction", err))?;
         let previous: Option<(Vec<u8>, Option<String>)> = tx
             .query_row(
@@ -2429,9 +2433,7 @@ impl CatalogCore {
         let voltag = validate_adoption_label(input.voltag.as_deref())?;
         let pool_id = normalize_pool_id(pool_id)?;
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin bootstrap identity adoption", err))?;
         let outcome = adopt_bootstrap_identity_tx(
             &tx,
@@ -2744,9 +2746,7 @@ impl CatalogCore {
         tapes: &[CatalogResetPreservedTape],
     ) -> Result<(), StateError> {
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin catalog reset tape restore", err))?;
         for tape in tapes {
             let geometry = tape.geometry.as_ref();
@@ -2955,9 +2955,7 @@ impl CatalogCore {
         &mut self,
         input: DriveObservationInput,
     ) -> Result<DriveObservationOutcome, StateError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin drive observation transaction", err))?;
         let observed = observe_drive_tx(&tx, input, false)?;
         let serial_collision =
@@ -2992,9 +2990,7 @@ impl CatalogCore {
             .filter_map(|(serial, count)| (count > 1).then_some(serial))
             .collect::<std::collections::BTreeSet<_>>();
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin drive inventory transaction", err))?;
         let mut observed_rows = Vec::new();
         let mut touched_serials = std::collections::BTreeMap::<String, String>::new();
@@ -3216,12 +3212,12 @@ impl CatalogCore {
         drive_uuid: &[u8],
         fenced: bool,
     ) -> Result<Option<DriveRecord>, StateError> {
-        self.conn
-            .execute(
-                "update drives set fenced = ?2 where drive_uuid = ?1",
-                params![drive_uuid, if fenced { 1 } else { 0 }],
-            )
-            .map_err(|err| sqlite_error("set drive fenced", err))?;
+        project_drive_lifecycle_core(
+            &self.conn,
+            drive_uuid,
+            DriveLifecycleProjection::Fenced(fenced),
+            None,
+        )?;
         self.get_drive_by_uuid(drive_uuid)
     }
 
@@ -3238,17 +3234,15 @@ impl CatalogCore {
         }
         let run_id = Uuid::new_v4().to_string();
         let now = now_utc()?;
-        self.conn
-            .execute(
-                "insert into clean_runs(
-                   run_id, drive_uuid, library_serial, cart_tape_uuid,
-                   cart_home_slot, phase, trigger, started_at_utc,
-                   updated_at_utc, detail
-                 )
-                 values(?1, ?2, ?3, null, null, 'fencing', ?4, ?5, ?5, ?6)",
-                params![run_id, drive_uuid, library_serial, trigger, now, detail],
-            )
-            .map_err(|err| sqlite_error("insert clean run", err))?;
+        begin_clean_run_core(
+            &self.conn,
+            &run_id,
+            drive_uuid,
+            library_serial,
+            trigger,
+            detail,
+            &now,
+        )?;
         self.get_active_clean_run_by_drive(drive_uuid)?
             .ok_or_else(|| StateError::IndexCorrupt("inserted clean run is missing".to_string()))
     }
@@ -3317,42 +3311,9 @@ impl CatalogCore {
         detail: Option<&str>,
     ) -> Result<Option<DriveRecord>, StateError> {
         let now = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin verified clean run transaction", err))?;
-        if let Some(cart_tape_uuid) = cart_tape_uuid {
-            tx.execute(
-                "update tapes
-                 set cleaning_uses = coalesce(cleaning_uses, 0) + 1,
-                     cleaning_state = case
-                       when cleaning_state = 'unverified' then 'ok'
-                       else cleaning_state
-                     end
-                 where tape_uuid = ?1
-                   and kind = 'cleaning'",
-                params![cart_tape_uuid],
-            )
-            .map_err(|err| sqlite_error("credit cleaned cartridge", err))?;
-        }
-        tx.execute(
-            "update drives
-             set cleaning_due = 'none',
-                 fenced = 0,
-                 last_seen_utc = ?2
-             where drive_uuid = ?1",
-            params![drive_uuid, now.as_str()],
-        )
-        .map_err(|err| sqlite_error("clear drive cleaning due", err))?;
-        tx.execute(
-            "update clean_runs
-             set phase = 'done',
-                 updated_at_utc = ?2,
-                 detail = ?3
-             where run_id = ?1",
-            params![run_id, now.as_str(), detail],
-        )
-        .map_err(|err| sqlite_error("finish clean run", err))?;
+        finalize_clean_run_core(&tx, run_id, drive_uuid, cart_tape_uuid, detail, &now, true)?;
         tx.commit()
             .map_err(|err| sqlite_error("commit verified clean run transaction", err))?;
         self.get_drive_by_uuid(drive_uuid)
@@ -3591,6 +3552,8 @@ impl CatalogCore {
                  left join drive_health_snapshots h
                    on h.session_id = s.session_id
                   and h.drive_uuid = s.drive_uuid
+                  and h.snapshot_id = (select max(h2.snapshot_id) from drive_health_snapshots h2
+                       where h2.session_id = s.session_id and h2.drive_uuid = s.drive_uuid)
                  where s.drive_uuid = ?1
                    and s.tape_uuid is not null
                  group by s.tape_uuid, tapes.voltag, s.drive_uuid, drives.serial
@@ -3626,6 +3589,8 @@ impl CatalogCore {
                  left join drive_health_snapshots h
                    on h.session_id = s.session_id
                   and h.drive_uuid = s.drive_uuid
+                  and h.snapshot_id = (select max(h2.snapshot_id) from drive_health_snapshots h2
+                       where h2.session_id = s.session_id and h2.drive_uuid = s.drive_uuid)
                  where s.tape_uuid = ?1
                    and s.drive_uuid is not null
                  group by s.tape_uuid, tapes.voltag, s.drive_uuid, drives.serial
@@ -4076,9 +4041,7 @@ impl CatalogCore {
                 .as_deref()
                 .unwrap_or("(no reason recorded)")
         );
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin reinstate drive", err))?;
         tx.execute(
             "update drives
@@ -4129,9 +4092,7 @@ impl CatalogCore {
     /// copy-level preservation machinery is needed.
     pub fn retire_tape(&mut self, input: RetireTapeInput) -> Result<RetireTapeOutcome, StateError> {
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin tape retire transaction", err))?;
         let existing: Option<(Option<String>, String)> = tx
             .query_row(
@@ -4156,15 +4117,7 @@ impl CatalogCore {
                 copies_marked_missing: 0,
             });
         }
-        tx.execute(
-            "update tapes
-             set state = 'retired', seal_due = null,
-                 voltag = null,
-                 updated_at_utc = ?2
-             where tape_uuid = ?1",
-            params![input.tape_uuid.to_vec(), updated_at],
-        )
-        .map_err(|err| sqlite_error("retire tape", err))?;
+        project_tape_lifecycle_core(&tx, &input.tape_uuid, "retired", &updated_at)?;
         let copies_marked_missing = tx
             .execute(
                 "update object_copies
@@ -4231,12 +4184,9 @@ impl CatalogCore {
             None => now_utc()?,
         };
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| {
-                sqlite_error("begin native object and tape-file bundle projection", err)
-            })?;
+        let tx = projection_transaction(&mut self.conn).map_err(|err| {
+            sqlite_error("begin native object and tape-file bundle projection", err)
+        })?;
         upsert_native_object_projection_tx(
             &tx,
             &object,
@@ -4272,9 +4222,7 @@ impl CatalogCore {
             None => now_utc()?,
         };
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin native object append projection", err))?;
         validate_append_bundle_extension_tx(&tx, &tape_input, bundle)?;
         validate_append_object_conflicts_tx(&tx, &tape_input, bundle, &object, copies)?;
@@ -4406,9 +4354,7 @@ impl CatalogCore {
         &mut self,
         records: &[AuditRecord],
     ) -> Result<AuditReplayReport, StateError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin audit replay transaction", err))?;
         tx.execute("delete from idempotency_keys", [])
             .map_err(|err| sqlite_error("clear idempotency projection", err))?;
@@ -4449,9 +4395,7 @@ impl CatalogCore {
         tape_journals: &[RebuildTapeJournalInput],
     ) -> Result<RebuildReport, StateError> {
         let updated_at = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin full index rebuild transaction", err))?;
         let preserved_tapes = query_preserved_tape_rows_tx(&tx)?;
         let preserved_evidence = query_preserved_evidence_keys_tx(&tx)?;
@@ -4527,9 +4471,7 @@ impl CatalogCore {
 
     /// Incrementally project one newly appended audit record.
     pub fn project_audit_record(&mut self, record: &AuditRecord) -> Result<(), StateError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin incremental audit projection", err))?;
         project_session_record(&tx, record)?;
         project_operation_record(&tx, record)?;
@@ -4551,9 +4493,7 @@ impl CatalogCore {
     ) -> Result<(), StateError> {
         let pool_id = normalize_pool_id(input.pool_id.as_str())?;
         let created_at_utc = input.created_at_utc.unwrap_or(now_utc()?);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin tape pool projection", err))?;
         upsert_tape_pool_projection_tx(
             &tx,
@@ -4595,9 +4535,7 @@ impl CatalogCore {
             .map(|(pool_id, _, _, _, _)| pool_id.clone())
             .collect::<HashSet<_>>();
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin tape pool rule reconciliation", err))?;
 
         let normalized_memberships = query_tapes_for_pool_derivation_tx(&tx)?
@@ -4681,12 +4619,7 @@ impl CatalogCore {
         Ok(())
     }
 
-    /// Project a tape-to-pool membership for future write eligibility.
-    ///
-    /// Existing object-copy rows snapshot the pool used at commit time. To
-    /// avoid silently mixing data classes on one cartridge, a tape that already
-    /// has committed copies in a different or unknown pool cannot be
-    /// reassigned here.
+    /// Assign an empty tape to a pool under the guarded assignment transaction.
     pub fn project_tape_pool_membership(
         &mut self,
         tape_uuid: [u8; 16],
@@ -4805,9 +4738,7 @@ impl CatalogCore {
         }
         let pool_id = pool_id.map(normalize_pool_id).transpose()?;
         let updated_at_utc = now_utc()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin conditional tape pool assignment", err))?;
         set_tape_pool_membership_tx(
             &tx,
@@ -4898,9 +4829,7 @@ impl CatalogCore {
     ) -> Result<TapeRecord, StateError> {
         validate_terminal_finalization_input(&input)?;
         let updated_at_utc = input.updated_at_utc.clone().unwrap_or(now_utc()?);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin terminal finalization projection", err))?;
         project_terminal_finalization_tx(&tx, &input, updated_at_utc.as_str())?;
         tx.commit()
@@ -4949,9 +4878,7 @@ impl CatalogCore {
             .updated_at_utc
             .clone()
             .unwrap_or(now_utc()?);
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin guarded manual terminal acceptance", err))?;
         let assignment =
             query_tape_assignment_snapshot_tx(&tx, input.tape_uuid)?.ok_or_else(|| {
@@ -5018,9 +4945,7 @@ impl CatalogCore {
             Some(value) => value.to_string(),
             None => now_utc()?,
         };
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin native object projection", err))?;
         upsert_native_object_projection_tx(&tx, &object, None, copies, created_at_utc.as_str())?;
         tx.commit()
@@ -5285,16 +5210,7 @@ impl CatalogCore {
                 "kind flip refused because the tape has committed object copies".to_string(),
             ));
         }
-        self.conn
-            .execute(
-                "update tapes
-                 set kind = ?2,
-                     cleaning_uses = case when ?2 = 'cleaning' then coalesce(cleaning_uses, 0) else cleaning_uses end,
-                     cleaning_state = case when ?2 = 'cleaning' then coalesce(cleaning_state, 'unverified') else cleaning_state end
-                 where tape_uuid = ?1",
-                params![tape_uuid, kind],
-            )
-            .map_err(|err| sqlite_error("set tape kind", err))?;
+        project_tape_kind_core(&self.conn, tape_uuid, kind)?;
         self.get_tape(tape_uuid)
     }
 
@@ -5310,15 +5226,7 @@ impl CatalogCore {
                 "cleaning state {state:?} must be unverified, ok, expired, or rejected"
             )));
         }
-        self.conn
-            .execute(
-                "update tapes
-                 set cleaning_state = ?2
-                 where tape_uuid = ?1
-                   and kind = 'cleaning'",
-                params![tape_uuid, state],
-            )
-            .map_err(|err| sqlite_error("set tape cleaning state", err))?;
+        project_cleaning_state_core(&self.conn, tape_uuid, state, None)?;
         self.get_tape(tape_uuid)
     }
 
@@ -5425,7 +5333,7 @@ impl CatalogCore {
         }
     }
 
-    /// Distinct pool snapshots on committed object copies for one tape.
+    /// Current pools on committed copies for one tape (legacy method name).
     pub fn committed_copy_pool_snapshots(
         &self,
         tape_uuid: &[u8],
@@ -5433,11 +5341,11 @@ impl CatalogCore {
         let mut stmt = self
             .conn
             .prepare(
-                "select distinct pool_id
-                 from object_copies
-                 where tape_uuid = ?1
-                   and status = 'committed'
-                 order by pool_id is null, pool_id",
+                "select distinct t.pool_id
+                 from object_copies c left join tapes t on t.tape_uuid = c.tape_uuid
+                 where c.tape_uuid = ?1
+                   and c.status = 'committed'
+                 order by t.pool_id is null, t.pool_id",
             )
             .map_err(|err| sqlite_error("prepare committed-copy pool query", err))?;
         let mut rows = stmt
@@ -5448,7 +5356,7 @@ impl CatalogCore {
             .next()
             .map_err(|err| sqlite_error("iterate committed-copy pools", err))?
         {
-            pools.push(row_get(row, 0, "object_copies.pool_id")?);
+            pools.push(row_get(row, 0, "tapes.pool_id")?);
         }
         Ok(pools)
     }
@@ -5560,7 +5468,7 @@ impl CatalogCore {
                         object_copies.first_parity_data_ordinal,
                         object_copies.protected_until_ordinal,
                         object_copies.status,
-                        object_copies.pool_id,
+                        tapes.pool_id,
                         object_copies.representation,
                         object_copies.recipient_epoch_ids,
                         object_copies.metadata_frame_len,
@@ -5572,6 +5480,7 @@ impl CatalogCore {
                  from objects
                  left join object_copies
                    on object_copies.object_id = objects.object_id
+                 left join tapes on tapes.tape_uuid = object_copies.tape_uuid
                  left join tape_files tf
                    on tf.tape_uuid = object_copies.tape_uuid
                   and tf.tape_file_number = object_copies.tape_file_number
@@ -5682,7 +5591,7 @@ impl CatalogCore {
         Ok(files)
     }
 
-    /// Newest committed versions in the copy's pool, independent of tape assignment.
+    /// Newest committed versions in the tape's current pool.
     pub fn list_committed_versions_by_path(
         &self,
         pool_id: &str,
@@ -5708,7 +5617,7 @@ impl CatalogCore {
         self.committed_versions_by_path(archive_path, None, None)
     }
 
-    /// Read committed path inventories, grouped by copy pool, with deterministic newest versions.
+    /// Read committed paths grouped by their tapes' pools, with deterministic newest versions.
     pub fn list_committed_paths(
         &self,
         tape: Option<&str>,
@@ -5726,7 +5635,7 @@ impl CatalogCore {
                 )));
             }
         }
-        let mut stmt = self.conn.prepare("select distinct c.pool_id, f.path from object_files f join object_copies c on c.object_id=f.object_id join tapes t on t.tape_uuid=c.tape_uuid where c.status='committed' order by c.pool_id, f.path")
+        let mut stmt = self.conn.prepare("select distinct t.pool_id, f.path from object_files f join object_copies c on c.object_id=f.object_id join tapes t on t.tape_uuid=c.tape_uuid where c.status='committed' order by t.pool_id, f.path")
             .map_err(|e| sqlite_error("prepare path inventory", e))?;
         let paths = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -5788,7 +5697,7 @@ impl CatalogCore {
              join object_copies c on c.object_id = o.object_id
              join tapes t on t.tape_uuid = c.tape_uuid
              where f.path = ?1 and c.status = 'committed'
-               and (?2 is null or c.pool_id = ?2)
+               and (?2 is null or t.pool_id = ?2)
                and (?3 is null or c.tape_uuid = ?3)
              order by o.created_at_utc desc, o.rowid desc, c.tape_uuid",
             )
@@ -5874,9 +5783,9 @@ impl CatalogCore {
         let mut stmt = self
             .conn
             .prepare(
-                "select distinct c.pool_id from objects o join object_copies c
-             on c.object_id = o.object_id where o.caller_object_id = ?1
-             and c.status = 'committed' and c.pool_id is not null order by c.pool_id",
+                "select distinct t.pool_id from objects o join object_copies c
+             on c.object_id = o.object_id join tapes t on t.tape_uuid = c.tape_uuid where o.caller_object_id = ?1
+             and c.status = 'committed' and t.pool_id is not null order by t.pool_id",
             )
             .map_err(|err| sqlite_error("prepare caller-id pools", err))?;
         let pools = stmt
@@ -5911,9 +5820,9 @@ impl CatalogCore {
                  where caller_object_id = ?1
                    and exists (
                      select 1
-                     from object_copies
+                     from object_copies join tapes on tapes.tape_uuid = object_copies.tape_uuid
                      where object_copies.object_id = objects.object_id
-                       and object_copies.pool_id = ?2
+                       and tapes.pool_id = ?2
                        and object_copies.status = 'committed'
                    )
                  order by created_at_utc, object_id
@@ -5958,12 +5867,13 @@ impl CatalogCore {
             .prepare(
                 "select oc.object_id, oc.tape_uuid, oc.tape_file_number,
                         oc.first_body_lba, oc.first_parity_data_ordinal,
-                        oc.protected_until_ordinal, oc.status, oc.pool_id,
+                        oc.protected_until_ordinal, oc.status, t.pool_id,
                         oc.representation, oc.recipient_epoch_ids, oc.metadata_frame_len,
                         oc.plaintext_digest, oc.plaintext_digest_algorithm,
                         oc.stored_digest, oc.stored_digest_algorithm,
                         tf.physical_start_hint, tf.block_count
                  from object_copies oc
+                 left join tapes t on t.tape_uuid = oc.tape_uuid
                  left join tape_files tf
                    on tf.tape_uuid = oc.tape_uuid
                   and tf.tape_file_number = oc.tape_file_number
@@ -6026,12 +5936,13 @@ impl CatalogCore {
             .prepare(
                 "select oc.object_id, oc.tape_uuid, oc.tape_file_number,
                         oc.first_body_lba, oc.first_parity_data_ordinal,
-                        oc.protected_until_ordinal, oc.status, oc.pool_id,
+                        oc.protected_until_ordinal, oc.status, t.pool_id,
                         oc.representation, oc.recipient_epoch_ids, oc.metadata_frame_len,
                         oc.plaintext_digest, oc.plaintext_digest_algorithm,
                         oc.stored_digest, oc.stored_digest_algorithm,
                         tf.physical_start_hint, tf.block_count
                  from object_copies oc
+                 left join tapes t on t.tape_uuid = oc.tape_uuid
                  left join tape_files tf
                    on tf.tape_uuid = oc.tape_uuid
                   and tf.tape_file_number = oc.tape_file_number
@@ -6274,9 +6185,7 @@ impl CatalogCore {
             Some(value) => value.to_string(),
             None => now_utc()?,
         };
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let tx = projection_transaction(&mut self.conn)
             .map_err(|err| sqlite_error("begin idempotency registration", err))?;
         let registration = upsert_idempotency_request(
             &tx,
@@ -6762,9 +6671,7 @@ impl PreservedEvidenceKeys {
     }
 }
 
-fn query_preserved_evidence_keys_tx(
-    tx: &rusqlite::Transaction<'_>,
-) -> Result<PreservedEvidenceKeys, StateError> {
+fn query_preserved_evidence_keys_tx(tx: &Connection) -> Result<PreservedEvidenceKeys, StateError> {
     let alarms = query_text_column_tx(
         tx,
         "select condition_key from alarms order by condition_key",
@@ -6809,7 +6716,7 @@ fn query_preserved_evidence_keys_tx(
 }
 
 fn query_text_column_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     sql: &str,
     field: &str,
 ) -> Result<Vec<String>, StateError> {
@@ -6836,7 +6743,7 @@ impl ExistingProvisionedTape {
 }
 
 fn provision_tape_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     label: (&str, LabelProvenance),
     geometry: &ProvisionTapeGeometry,
@@ -6920,8 +6827,20 @@ fn validate_adoption_label(label: Option<&str>) -> Result<Option<&str>, StateErr
     Ok(label)
 }
 
+/// Adopted physical-tail state shared by live/audit adapters and library apply.
+/// Historical adoption cannot undo a later native seal or retirement.
+fn project_adopted_state_core(
+    conn: &Connection,
+    uuid: &[u8],
+    state: &str,
+    historical: bool,
+) -> Result<(), StateError> {
+    conn.execute("update tapes set state=?2 where tape_uuid=?1 and (?3=0 or state not in ('retired','sealed','sealed_degraded'))",params![uuid,state,historical]).map_err(|e|sqlite_error("project adopted physical-tail state",e))?;
+    Ok(())
+}
+
 fn adopt_bootstrap_identity_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     facts: BootstrapAdoptionCatalogFacts<'_>,
     updated_at: &str,
 ) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
@@ -6979,11 +6898,7 @@ fn adopt_bootstrap_identity_tx(
         updated_at,
         AssignmentWrite::Change,
     )?;
-    tx.execute(
-        "update tapes set state = ?2 where tape_uuid = ?1",
-        params![facts.tape_uuid.as_slice(), facts.state.as_str()],
-    )
-    .map_err(|e| sqlite_error("record adopted state", e))?;
+    project_adopted_state_core(tx, &facts.tape_uuid, facts.state.as_str(), false)?;
     Ok(AdoptBootstrapIdentityOutcome {
         newly_adopted: true,
         assignment_generation: 1,
@@ -7152,7 +7067,7 @@ where
 }
 
 fn find_provisioned_tape_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     voltag: &str,
 ) -> Result<Option<ExistingProvisionedTape>, StateError> {
@@ -7228,7 +7143,7 @@ fn find_provisioned_tape_tx(
 }
 
 fn query_provisioned_tape_tx<P>(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     sql: &str,
     params: P,
 ) -> Result<Option<ExistingProvisionedTape>, StateError>
@@ -7315,7 +7230,7 @@ fn set_tape_generation_at(
 
 /// Store shell provenance and generation together with identity creation.
 fn record_media_observation_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     uuid: &[u8],
     provenance: LabelProvenance,
     observation: Option<MediaObservation>,
@@ -7328,7 +7243,7 @@ fn record_media_observation_tx(
 }
 
 fn insert_provisioned_tape_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     label: (&str, LabelProvenance),
     geometry: &ProvisionTapeGeometry,
@@ -7362,7 +7277,7 @@ fn insert_provisioned_tape_tx(
 }
 
 fn update_provisioned_tape_voltag_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: &[u8],
     label: (&str, LabelProvenance),
     updated_at: &str,
@@ -7379,7 +7294,7 @@ fn update_provisioned_tape_voltag_tx(
 }
 
 fn reprovision_tape_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     old_tape_uuid: &[u8],
     new_tape_uuid: [u8; 16],
     label: (&str, LabelProvenance),
@@ -7460,7 +7375,7 @@ fn reprovision_tape_tx(
     Ok(())
 }
 
-fn clear_rebuildable_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
+fn clear_rebuildable_tables(tx: &Connection) -> Result<(), StateError> {
     // Verification values are rebuilt from audit, so their replay cursor resets
     // with those values. Assignment and label cursors retain their own authority.
     tx.execute(
@@ -7493,9 +7408,7 @@ fn clear_rebuildable_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), StateE
     Ok(())
 }
 
-fn query_preserved_tape_rows_tx(
-    tx: &rusqlite::Transaction<'_>,
-) -> Result<Vec<PreservedTapeRow>, StateError> {
+fn query_preserved_tape_rows_tx(tx: &Connection) -> Result<Vec<PreservedTapeRow>, StateError> {
     let mut stmt = tx
         .prepare(
             "select tape_uuid, voltag, pool_id, assignment_generation,
@@ -7568,7 +7481,7 @@ fn query_preserved_tape_rows_tx(
 }
 
 fn restore_preserved_tape_rows_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     rows: &[PreservedTapeRow],
 ) -> Result<(), StateError> {
     for row in rows {
@@ -7625,7 +7538,7 @@ fn restore_preserved_tape_rows_tx(
 }
 
 fn merge_preserved_tape_operator_columns_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     rows: &[PreservedTapeRow],
 ) -> Result<(), StateError> {
     for row in rows {
@@ -7710,7 +7623,7 @@ fn merge_preserved_tape_operator_columns_tx(
 }
 
 fn index_committed_tape_journal_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     input: &TapeJournalIndexInput,
     state: &StructuralState,
     updated_at: &str,
@@ -7840,7 +7753,7 @@ fn index_committed_tape_journal_tx(
 }
 
 fn upsert_native_object_projection_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     object: &NativeObjectProjectionInput,
     files: Option<&[NativeObjectFileProjectionInput]>,
     copies: &[NativeObjectCopyProjectionInput],
@@ -7928,7 +7841,7 @@ fn upsert_native_object_projection_tx(
 }
 
 fn replace_native_object_files_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     object_id: &str,
     files: &[NativeObjectFileProjectionInput],
 ) -> Result<(), StateError> {
@@ -7950,7 +7863,7 @@ fn replace_native_object_files_tx(
 }
 
 fn insert_native_object_file_projection_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     file: &NativeObjectFileProjectionInput,
 ) -> Result<(), StateError> {
     if file.file_id.is_empty() {
@@ -8300,7 +8213,7 @@ fn optional_projection_conflicts<T: PartialEq>(expected: &Option<T>, actual: &Op
 }
 
 fn project_committed_tape_file_bundle_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     input: &TapeJournalIndexInput,
     bundle: &FilePublication,
     updated_at: &str,
@@ -8421,7 +8334,7 @@ fn project_committed_tape_file_bundle_tx(
 }
 
 fn validate_append_bundle_extension_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     input: &TapeJournalIndexInput,
     bundle: &FilePublication,
 ) -> Result<(), StateError> {
@@ -8594,7 +8507,7 @@ struct AppendProjectionPrefix {
 }
 
 fn load_append_projection_prefix_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     input: &TapeJournalIndexInput,
 ) -> Result<AppendProjectionPrefix, StateError> {
     tx.query_row(
@@ -8668,7 +8581,7 @@ fn validate_append_geometry(
 }
 
 fn validate_append_object_conflicts_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     input: &TapeJournalIndexInput,
     bundle: &FilePublication,
     object: &NativeObjectProjectionInput,
@@ -8764,10 +8677,7 @@ fn validate_append_object_conflicts_tx(
     Ok(())
 }
 
-fn project_operation_record(
-    tx: &rusqlite::Transaction<'_>,
-    record: &AuditRecord,
-) -> Result<(), StateError> {
+fn project_operation_record(tx: &Connection, record: &AuditRecord) -> Result<(), StateError> {
     let Some(operation_id) = record.operation_id else {
         return Ok(());
     };
@@ -8803,6 +8713,30 @@ fn project_operation_record(
     } else {
         None
     };
+    project_operation_core(
+        tx,
+        operation_id,
+        &operation_kind,
+        state,
+        record.session_id,
+        subject,
+        error_summary,
+        &record.timestamp_utc,
+    )
+}
+
+/// Typed operation projection shared by audit replay and library apply.
+#[allow(clippy::too_many_arguments)]
+fn project_operation_core(
+    tx: &Connection,
+    operation_id: Uuid,
+    operation_kind: &str,
+    state: &str,
+    session_id: Option<Uuid>,
+    subject: Option<String>,
+    error_summary: Option<String>,
+    timestamp: &str,
+) -> Result<(), StateError> {
     tx.execute(
         "insert into operations(
            operation_id, operation_kind, state, session_id, subject, error_summary,
@@ -8823,10 +8757,10 @@ fn project_operation_record(
             operation_id.to_string(),
             operation_kind,
             state,
-            record.session_id.map(|uuid| uuid.to_string()),
+            session_id.map(|uuid| uuid.to_string()),
             subject,
             error_summary,
-            record.timestamp_utc.as_str(),
+            timestamp,
         ],
     )
     .map_err(|err| sqlite_error("project audit operation", err))?;
@@ -8853,10 +8787,7 @@ fn audit_endpoint(record: &AuditRecord) -> Result<Option<DriveKey>, StateError> 
     }
 }
 
-fn project_session_record(
-    tx: &rusqlite::Transaction<'_>,
-    record: &AuditRecord,
-) -> Result<(), StateError> {
+fn project_session_record(tx: &Connection, record: &AuditRecord) -> Result<(), StateError> {
     let Some(session_id) = record.session_id else {
         return Ok(());
     };
@@ -8878,6 +8809,34 @@ fn project_session_record(
     } else {
         session_kind
     };
+    project_session_core(
+        tx,
+        SessionProjection {
+            session_id,
+            kind: &session_kind,
+            tape_uuid: detail_tape_uuid(record, "tape_uuid"),
+            library_serial: detail_text(record, "library_serial"),
+            drive_bay: detail_i64(record, "drive_bay"),
+            drive_uuid: detail_bytes(record, "drive_uuid"),
+            state,
+            timestamp: &record.timestamp_utc,
+            endpoint: audit_endpoint(record)?.map(|e| e.encode()),
+        },
+    )
+}
+struct SessionProjection<'a> {
+    session_id: Uuid,
+    kind: &'a str,
+    tape_uuid: Option<Vec<u8>>,
+    library_serial: Option<String>,
+    drive_bay: Option<i64>,
+    drive_uuid: Option<Vec<u8>>,
+    state: &'a str,
+    timestamp: &'a str,
+    endpoint: Option<String>,
+}
+/// Typed session core, shared with the audit adapter.
+fn project_session_core(tx: &Connection, input: SessionProjection<'_>) -> Result<(), StateError> {
     tx.execute(
         "insert into sessions(
            session_id, session_kind, tape_uuid, library_serial, drive_bay,
@@ -8898,15 +8857,15 @@ fn project_session_record(
            state = excluded.state,
            updated_at_utc = excluded.updated_at_utc",
         params![
-            session_id.to_string(),
-            session_kind,
-            detail_tape_uuid(record, "tape_uuid"),
-            detail_text(record, "library_serial"),
-            detail_i64(record, "drive_bay"),
-            detail_bytes(record, "drive_uuid"),
-            state,
-            record.timestamp_utc.as_str(),
-            audit_endpoint(record)?.map(|endpoint| endpoint.encode()),
+            input.session_id.to_string(),
+            input.kind,
+            input.tape_uuid,
+            input.library_serial,
+            input.drive_bay,
+            input.drive_uuid,
+            input.state,
+            input.timestamp,
+            input.endpoint,
         ],
     )
     .map_err(|err| sqlite_error("project audit session", err))?;
@@ -8929,7 +8888,7 @@ struct IdempotencyRequestProjection<'a> {
 }
 
 fn project_idempotency_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     mode: IdempotencyProjectionMode,
 ) -> Result<(), StateError> {
@@ -8982,26 +8941,16 @@ fn project_idempotency_record(
                 "terminal idempotency record is missing operation_id".to_string(),
             ));
         };
-        tx.execute(
-            "update idempotency_keys
-             set terminal_state = ?1,
-                 response_fingerprint = coalesce(?2, response_fingerprint),
-                 updated_at_utc = ?3
-             where actor_fingerprint = ?4
-               and operation_kind = ?5
-               and idempotency_key = ?6
-               and operation_id = ?7",
-            params![
-                terminal_state,
-                detail_bytes(record, "response_fingerprint"),
-                record.timestamp_utc.as_str(),
-                actor_fingerprint,
-                operation_kind,
-                idempotency_key.to_string(),
-                operation_id.to_string(),
-            ],
-        )
-        .map_err(|err| sqlite_error("project idempotency terminal state", err))?;
+        project_idempotency_terminal_core(
+            tx,
+            terminal_state,
+            detail_bytes(record, "response_fingerprint"),
+            &record.timestamp_utc,
+            &actor_fingerprint,
+            &operation_kind,
+            idempotency_key,
+            operation_id,
+        )?;
     }
 
     Ok(())
@@ -9061,16 +9010,14 @@ fn replay_label_rebind(tx: &Connection, record: &AuditRecord) -> Result<(), Stat
     let label = detail_text(record, "voltag")
         .ok_or_else(|| StateError::IndexCorrupt("rebind has no label".into()))?;
     validate_label_rebind(tx, uuid, &label, previous)?;
-    tx.execute(
-        "update tapes set voltag=null,voltag_source=null,updated_at_utc=?2 where tape_uuid=?1",
-        params![previous.as_slice(), record.timestamp_utc],
-    )
-    .map_err(|e| sqlite_error("release rebound label", e))?;
-    tx.execute(
-        "update tapes set voltag=?2,voltag_source='operator',updated_at_utc=?3 where tape_uuid=?1",
-        params![uuid.as_slice(), label, record.timestamp_utc],
-    )
-    .map_err(|e| sqlite_error("project rebound label", e))?;
+    project_label_core(
+        tx,
+        uuid,
+        Some(previous),
+        Some(&label),
+        Some("operator"),
+        &record.timestamp_utc,
+    )?;
     remember_audit_intent(tx, &previous, "label", record)?;
     remember_audit_intent(tx, &uuid, "label", record)
 }
@@ -9202,7 +9149,7 @@ fn replay_assignment(
 /// full rebuild. Every statement is an upsert or an idempotent update so the
 /// same ordered ledger produces the same projection on every invocation.
 fn project_catalog_evidence_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -9232,7 +9179,7 @@ fn project_catalog_evidence_record(
                     ))
                 }
             };
-            tx.execute("update tapes set last_verified_at_utc = ?2, last_verification_state = ?3, last_verified_edition_digest = ?4 where tape_uuid = ?1", params![tape_uuid.as_slice(), record.timestamp_utc, state, digest]).map_err(|e| sqlite_error("project tape verification", e))?;
+            project_verification_core(tx, &tape_uuid, &record.timestamp_utc, state, digest)?;
             remember_audit_intent(tx, &tape_uuid, "verification", record)?;
         }
         AuditEvent::TapeLabelRebound => replay_label_rebind(tx, record)?,
@@ -9417,24 +9364,7 @@ fn project_catalog_evidence_record(
             } else {
                 "sealed"
             };
-            tx.execute(
-                "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
-                 values(?1, null, ?2, ?3)
-                 on conflict(tape_uuid) do update set
-                   seal_due = null,
-                   voltag = case when excluded.state = 'retired' then null else tapes.voltag end,
-                   state = case
-                     when tapes.state = 'retired' then tapes.state
-                     else excluded.state
-                   end,
-                   updated_at_utc = case
-                     when tapes.state = 'retired' and excluded.state = 'sealed'
-                       then tapes.updated_at_utc
-                     else excluded.updated_at_utc
-                   end",
-                params![tape_uuid, state, record.timestamp_utc.as_str()],
-            )
-            .map_err(|err| sqlite_error("project tape lifecycle audit record", err))?;
+            project_tape_lifecycle_core(tx, &tape_uuid, state, &record.timestamp_utc)?;
         }
         AuditEvent::CleaningCartridgeRegistered | AuditEvent::CleaningCartridgeExpired => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
@@ -9445,16 +9375,13 @@ fn project_catalog_evidence_record(
             } else {
                 "unverified"
             };
-            tx.execute(
-                "update tapes
-                 set kind = 'cleaning',
-                     cleaning_uses = coalesce(cleaning_uses, 0),
-                     cleaning_state = ?2,
-                     updated_at_utc = ?3
-                 where tape_uuid = ?1",
-                params![tape_uuid, cleaning_state, record.timestamp_utc.as_str()],
-            )
-            .map_err(|err| sqlite_error("project cleaning cartridge audit record", err))?;
+            project_tape_kind_core(tx, &tape_uuid, "cleaning")?;
+            project_cleaning_state_core(
+                tx,
+                &tape_uuid,
+                cleaning_state,
+                Some(&record.timestamp_utc),
+            )?;
         }
         AuditEvent::DriveRetired
         | AuditEvent::DriveAnnotated
@@ -9480,7 +9407,7 @@ fn project_catalog_evidence_record(
 }
 
 fn project_tape_identity_adopted_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -9795,11 +9722,7 @@ fn project_tape_identity_adopted_record(
         remember_audit_intent(tx, &uuid, "assignment", record)?;
         remember_audit_intent(tx, &uuid, "label", record)?;
         remember_audit_intent(tx, &uuid, "generation", record)?;
-        tx.execute(
-            "update tapes set state = ?2 where tape_uuid = ?1",
-            params![uuid.as_slice(), state],
-        )
-        .map_err(|e| sqlite_error("replay adopted state", e))?;
+        project_adopted_state_core(tx, &uuid, &state, false)?;
     }
     Ok(())
 }
@@ -9835,8 +9758,36 @@ fn audit_tape_geometry(record: &AuditRecord) -> AuditTapeGeometry {
     geometry
 }
 
+/// Shared tape lifecycle row; retirement remains terminal during historical replay.
+fn project_tape_lifecycle_core(
+    tx: &Connection,
+    tape_uuid: &[u8],
+    state: &str,
+    at: &str,
+) -> Result<(), StateError> {
+    tx.execute(
+        "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
+                 values(?1, null, ?2, ?3)
+                 on conflict(tape_uuid) do update set
+                   seal_due = null,
+                   voltag = case when excluded.state = 'retired' then null else tapes.voltag end,
+                   state = case
+                     when tapes.state = 'retired' then tapes.state
+                     else excluded.state
+                   end,
+                   updated_at_utc = case
+                     when tapes.state = 'retired' and excluded.state = 'sealed'
+                       then tapes.updated_at_utc
+                     else excluded.updated_at_utc
+                   end",
+        params![tape_uuid, state, at],
+    )
+    .map_err(|e| sqlite_error("project tape lifecycle", e))?;
+    Ok(())
+}
+
 fn project_drive_lifecycle_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -9868,63 +9819,69 @@ fn project_drive_lifecycle_record(
         return Ok(());
     }
 
-    match record.event {
+    let action = match record.event {
         AuditEvent::DriveRetired => {
-            tx.execute(
-                "update drives
-                 set state = 'retired', retired_at_utc = ?2,
-                     retire_reason = coalesce(?3, retire_reason), last_seen_utc = ?2
-                 where drive_uuid = ?1",
-                params![
-                    drive_uuid,
-                    record.timestamp_utc.as_str(),
-                    detail_text(record, "reason")
-                ],
-            )
-            .map_err(|err| sqlite_error("project DriveRetired audit record", err))?;
+            DriveLifecycleProjection::Retired(detail_text(record, "reason"))
         }
-        AuditEvent::DriveAnnotated => {
-            tx.execute(
-                "update drives set
-                   purchase_date = coalesce(?2, purchase_date),
-                   warranty_until = coalesce(?3, warranty_until),
-                   cost = coalesce(?4, cost),
-                   notes = coalesce(?5, notes)
-                 where drive_uuid = ?1",
-                params![
-                    drive_uuid,
-                    detail_text(record, "purchase_date"),
-                    detail_text(record, "warranty_until"),
-                    detail_text(record, "cost"),
-                    detail_text(record, "notes"),
-                ],
-            )
-            .map_err(|err| sqlite_error("project DriveAnnotated audit record", err))?;
-        }
+        AuditEvent::DriveAnnotated => DriveLifecycleProjection::Annotated {
+            purchase_date: detail_text(record, "purchase_date"),
+            warranty_until: detail_text(record, "warranty_until"),
+            cost: detail_text(record, "cost"),
+            notes: detail_text(record, "notes"),
+        },
         AuditEvent::DriveFenced | AuditEvent::DriveUnfenced => {
-            let fenced = i64::from(matches!(record.event, AuditEvent::DriveFenced));
-            tx.execute(
-                "update drives set fenced = ?2, last_seen_utc = ?3 where drive_uuid = ?1",
-                params![drive_uuid, fenced, record.timestamp_utc.as_str()],
-            )
-            .map_err(|err| sqlite_error("project drive fence audit record", err))?;
+            DriveLifecycleProjection::Fenced(matches!(record.event, AuditEvent::DriveFenced))
         }
-        AuditEvent::DriveCleaned => {
-            tx.execute(
-                "update drives
-                 set cleaning_due = 'none', fenced = 0, last_seen_utc = ?2
-                 where drive_uuid = ?1",
-                params![drive_uuid, record.timestamp_utc.as_str()],
-            )
-            .map_err(|err| sqlite_error("project DriveCleaned audit record", err))?;
+        AuditEvent::DriveCleaned => DriveLifecycleProjection::Cleaned { clear_fence: true },
+        _ => return Ok(()),
+    };
+    project_drive_lifecycle_core(tx, &drive_uuid, action, Some(&record.timestamp_utc))
+}
+
+/// Typed lifecycle mutations shared by audit replay and library projection.
+enum DriveLifecycleProjection {
+    Retired(Option<String>),
+    Annotated {
+        purchase_date: Option<String>,
+        warranty_until: Option<String>,
+        cost: Option<String>,
+        notes: Option<String>,
+    },
+    Fenced(bool),
+    Cleaned {
+        clear_fence: bool,
+    },
+}
+fn project_drive_lifecycle_core(
+    tx: &Connection,
+    drive_uuid: &[u8],
+    action: DriveLifecycleProjection,
+    at: Option<&str>,
+) -> Result<(), StateError> {
+    match action {
+        DriveLifecycleProjection::Retired(reason) => {
+            tx.execute("update drives set state='retired', retired_at_utc=?2, retire_reason=coalesce(?3,retire_reason), last_seen_utc=?2 where drive_uuid=?1",params![drive_uuid,at,reason]).map_err(|e|sqlite_error("project drive retirement",e))?;
         }
-        _ => {}
+        DriveLifecycleProjection::Annotated {
+            purchase_date,
+            warranty_until,
+            cost,
+            notes,
+        } => {
+            tx.execute("update drives set purchase_date=coalesce(?2,purchase_date), warranty_until=coalesce(?3,warranty_until), cost=coalesce(?4,cost), notes=coalesce(?5,notes) where drive_uuid=?1",params![drive_uuid,purchase_date,warranty_until,cost,notes]).map_err(|e|sqlite_error("project drive annotation",e))?;
+        }
+        DriveLifecycleProjection::Fenced(fenced) => {
+            tx.execute("update drives set fenced=?2,last_seen_utc=coalesce(?3,last_seen_utc) where drive_uuid=?1",params![drive_uuid,fenced,at]).map_err(|e|sqlite_error("project drive fence",e))?;
+        }
+        DriveLifecycleProjection::Cleaned { clear_fence } => {
+            tx.execute("update drives set cleaning_due='none',fenced=case when ?3 then 0 else fenced end,last_seen_utc=?2 where drive_uuid=?1",params![drive_uuid,at,clear_fence]).map_err(|e|sqlite_error("project drive cleaning credit",e))?;
+        }
     }
     Ok(())
 }
 
 fn project_alarm_raised_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -9949,39 +9906,18 @@ fn project_alarm_raised_record(
         ));
         return Ok(());
     };
-    tx.execute(
-        "insert into alarms(
-           condition_key, kind, severity, state, first_seen_utc,
-           last_seen_utc, acked_by, acked_at_utc, detail
-         )
-         values(?1, ?2, ?3, 'open', ?4, ?4, null, null, ?5)
-         on conflict(condition_key) do update set
-           kind = excluded.kind,
-           severity = excluded.severity,
-           state = case
-             when alarms.state = 'cleared' then 'open'
-             else alarms.state
-           end,
-           first_seen_utc = case
-             when alarms.state = 'cleared' then excluded.first_seen_utc
-             else alarms.first_seen_utc
-           end,
-           last_seen_utc = excluded.last_seen_utc,
-           detail = coalesce(excluded.detail, alarms.detail)",
-        params![
-            condition_key,
-            kind,
-            severity,
-            record.timestamp_utc.as_str(),
-            detail_text(record, "detail")
-        ],
+    raise_alarm_tx(
+        tx,
+        condition_key,
+        &kind,
+        &severity,
+        detail_text(record, "detail").as_deref(),
+        &record.timestamp_utc,
     )
-    .map_err(|err| sqlite_error("project AlarmRaised audit record", err))?;
-    Ok(())
 }
 
 fn project_alarm_state_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -9997,23 +9933,14 @@ fn project_alarm_state_record(
     } else {
         "cleared"
     };
-    let changed = tx
-        .execute(
-            "update alarms
-             set state = ?2,
-                 last_seen_utc = ?3,
-                 acked_by = case when ?2 = 'acked' then ?4 else acked_by end,
-                 acked_at_utc = case when ?2 = 'acked' then ?3 else acked_at_utc end
-             where condition_key = ?1",
-            params![
-                condition_key,
-                state,
-                record.timestamp_utc.as_str(),
-                actor_fingerprint(&record.actor)
-            ],
-        )
-        .map_err(|err| sqlite_error("project alarm state audit record", err))?;
-    if changed == 0 {
+    let changed = project_alarm_state_core(
+        tx,
+        condition_key,
+        state,
+        &record.timestamp_utc,
+        &actor_fingerprint(&record.actor),
+    )?;
+    if !changed {
         divergences.push(format!(
             "record {} {:?} references absent alarm condition_key={condition_key}",
             record.record_uuid, record.event
@@ -10022,8 +9949,30 @@ fn project_alarm_state_record(
     Ok(())
 }
 
+/// Typed acknowledgment/clear projection shared with library apply.
+fn project_alarm_state_core(
+    tx: &Connection,
+    condition_key: &str,
+    state: &str,
+    timestamp: &str,
+    actor: &str,
+) -> Result<bool, StateError> {
+    let changed = tx
+        .execute(
+            "update alarms
+             set state = ?2,
+                 last_seen_utc = ?3,
+                 acked_by = case when ?2 = 'acked' then ?4 else acked_by end,
+                 acked_at_utc = case when ?2 = 'acked' then ?3 else acked_at_utc end
+             where condition_key = ?1",
+            params![condition_key, state, timestamp, actor],
+        )
+        .map_err(|err| sqlite_error("project alarm state audit record", err))?;
+    Ok(changed != 0)
+}
+
 fn project_tape_io_fence_raised(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -10050,6 +9999,30 @@ fn project_tape_io_fence_raised(
         ));
         return Ok(());
     };
+    let tape_uuid: [u8; 16] = tape_uuid
+        .try_into()
+        .map_err(|_| StateError::IndexCorrupt("invalid fence UUID".into()))?;
+    project_fence_core(
+        tx,
+        TapeIoFenceInput {
+            tape_uuid,
+            barcode: detail_text(record, "barcode"),
+            reason,
+            evidence_json: detail_text(record, "evidence_json"),
+        },
+        &quarantine_id,
+        &record.timestamp_utc,
+        audit_endpoint(record)?.as_ref(),
+    )
+}
+/// Typed fence core shared by audit and library sources.
+fn project_fence_core(
+    tx: &Connection,
+    input: TapeIoFenceInput,
+    quarantine_id: &str,
+    timestamp: &str,
+    endpoint: Option<&DriveKey>,
+) -> Result<(), StateError> {
     tx.execute(
         "insert into tape_io_fences(
            tape_uuid, barcode, state, reason, evidence_json, quarantine_id,
@@ -10067,21 +10040,32 @@ fn project_tape_io_fence_raised(
            updated_at_utc = excluded.updated_at_utc,
            release_ack = null",
         params![
-            tape_uuid,
-            detail_text(record, "barcode"),
-            reason,
-            detail_text(record, "evidence_json"),
+            input.tape_uuid.as_slice(),
+            input.barcode,
+            input.reason,
+            input.evidence_json,
             quarantine_id,
-            record.timestamp_utc.as_str(),
-            audit_endpoint(record)?.map(|endpoint| endpoint.encode()),
+            timestamp,
+            endpoint.map(DriveKey::encode),
         ],
     )
     .map_err(|err| sqlite_error("project TapeIoFenceRaised audit record", err))?;
     Ok(())
 }
 
+/// One release mutation, with the live adapter's idempotent active-only guard.
+fn project_fence_release_core(
+    conn: &Connection,
+    quarantine_id: &str,
+    ack: Option<&str>,
+    at: &str,
+    active_only: bool,
+) -> Result<usize, StateError> {
+    conn.execute("update tape_io_fences set state='released',updated_at_utc=?2,release_ack=?3 where quarantine_id=?1 and (?4=0 or state='active')", params![quarantine_id,at,ack,active_only]).map_err(|e|sqlite_error("project tape fence release",e))
+}
+
 fn project_tape_io_fence_released(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -10094,18 +10078,13 @@ fn project_tape_io_fence_released(
         ));
         return Ok(());
     };
-    let changed = tx
-        .execute(
-            "update tape_io_fences
-             set state = 'released', updated_at_utc = ?2, release_ack = ?3
-             where quarantine_id = ?1",
-            params![
-                quarantine_id,
-                record.timestamp_utc.as_str(),
-                detail_text(record, "release_ack")
-            ],
-        )
-        .map_err(|err| sqlite_error("project TapeIoFenceReleased audit record", err))?;
+    let changed = project_fence_release_core(
+        tx,
+        &quarantine_id,
+        detail_text(record, "release_ack").as_deref(),
+        &record.timestamp_utc,
+        false,
+    )?;
     if changed == 0 {
         divergences.push(format!(
             "record {} TapeIoFenceReleased references absent fence quarantine_id={quarantine_id}",
@@ -10116,7 +10095,7 @@ fn project_tape_io_fence_released(
 }
 
 fn project_drive_health_record(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     record: &AuditRecord,
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
@@ -10138,6 +10117,45 @@ fn project_drive_health_record(
     };
     let at_utc = detail_text(record, "at_utc").unwrap_or_else(|| record.timestamp_utc.clone());
     let session_id = detail_text(record, "session_id");
+    let input = DriveHealthSnapshotInput {
+        drive_uuid,
+        trigger,
+        session_id,
+        at_utc: Some(at_utc),
+        tape_alert_flags: detail_text(record, "tape_alert_flags"),
+        write_errors_corrected: detail_i64(record, "write_errors_corrected"),
+        write_errors_uncorrected: detail_i64(record, "write_errors_uncorrected"),
+        read_errors_corrected: detail_i64(record, "read_errors_corrected"),
+        read_errors_uncorrected: detail_i64(record, "read_errors_uncorrected"),
+        raw_pages: detail_text(record, "raw_pages"),
+    };
+    let identity = DriveObservationInput {
+        serial: detail_text(record, "drive_serial").unwrap_or_default(),
+        vendor: detail_text(record, "vendor"),
+        product: detail_text(record, "product"),
+        firmware_rev: detail_text(record, "firmware_rev"),
+        managed: detail_text(record, "managed").unwrap_or_else(|| "foreign".into()),
+        identity_source: "audit-replay".into(),
+        library_serial: None,
+        element_address: None,
+        observed_at_utc: None,
+    };
+    project_drive_health_core(tx, input, Some(identity), true, divergences)
+}
+
+/// Typed health row core shared by audit replay and library apply. Library
+/// lifetime conflicts roll back the surrounding record transaction.
+fn project_drive_health_core(
+    tx: &Connection,
+    input: DriveHealthSnapshotInput,
+    identity: Option<DriveObservationInput>,
+    dedup_unkeyed: bool,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let drive_uuid = input.drive_uuid;
+    let trigger = input.trigger;
+    let session_id = input.session_id;
+    let at_utc = input.at_utc.unwrap_or(now_utc()?);
     let exists = tx
         .query_row(
             "select 1 from drives where drive_uuid = ?1",
@@ -10161,11 +10179,17 @@ fn project_drive_health_record(
                     'active', 'none', 0, ?7, ?7)",
             params![
                 drive_uuid.as_slice(),
-                detail_text(record, "drive_serial").unwrap_or_default(),
-                detail_text(record, "vendor"),
-                detail_text(record, "product"),
-                detail_text(record, "firmware_rev"),
-                detail_text(record, "managed").unwrap_or_else(|| "foreign".to_string()),
+                identity
+                    .as_ref()
+                    .map(|i| i.serial.clone())
+                    .unwrap_or_default(),
+                identity.as_ref().and_then(|i| i.vendor.clone()),
+                identity.as_ref().and_then(|i| i.product.clone()),
+                identity.as_ref().and_then(|i| i.firmware_rev.clone()),
+                identity
+                    .as_ref()
+                    .map(|i| i.managed.clone())
+                    .unwrap_or_else(|| "foreign".into()),
                 at_utc.as_str(),
             ],
         )
@@ -10209,7 +10233,7 @@ fn project_drive_health_record(
             read_cached,
         )
         .optional()
-    } else {
+    } else if dedup_unkeyed {
         tx.query_row(
             &format!(
                 "{select}
@@ -10222,14 +10246,16 @@ fn project_drive_health_record(
             read_cached,
         )
         .optional()
+    } else {
+        Ok(None)
     }
     .map_err(|err| sqlite_error("find replayed drive-health row", err))?;
-    let tape_alert_flags = detail_text(record, "tape_alert_flags");
-    let write_errors_corrected = detail_i64(record, "write_errors_corrected");
-    let write_errors_uncorrected = detail_i64(record, "write_errors_uncorrected");
-    let read_errors_corrected = detail_i64(record, "read_errors_corrected");
-    let read_errors_uncorrected = detail_i64(record, "read_errors_uncorrected");
-    let raw_pages = detail_text(record, "raw_pages");
+    let tape_alert_flags = input.tape_alert_flags;
+    let write_errors_corrected = input.write_errors_corrected;
+    let write_errors_uncorrected = input.write_errors_uncorrected;
+    let read_errors_corrected = input.read_errors_corrected;
+    let read_errors_uncorrected = input.read_errors_uncorrected;
+    let raw_pages = input.raw_pages;
     if let Some(cached) = cached {
         let row_id = drive_health_key(
             drive_uuid.as_slice(),
@@ -10398,7 +10424,7 @@ fn audit_drive_health_key(record: &AuditRecord) -> Option<String> {
 }
 
 fn upsert_idempotency_request(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     request: IdempotencyRequestProjection<'_>,
     mode: IdempotencyProjectionMode,
 ) -> Result<IdempotencyRegistration, StateError> {
@@ -10528,10 +10554,7 @@ fn actor_fingerprint(actor: &AuditActor) -> String {
     }
 }
 
-fn idempotency_operation_kind(
-    tx: &rusqlite::Transaction<'_>,
-    record: &AuditRecord,
-) -> Result<String, StateError> {
+fn idempotency_operation_kind(tx: &Connection, record: &AuditRecord) -> Result<String, StateError> {
     if let Some(operation_kind) = detail_text(record, "operation_kind") {
         let operation_kind = operation_kind.trim();
         if !operation_kind.is_empty() {
@@ -10616,7 +10639,7 @@ fn parse_hex(value: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn table_count(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<u64, StateError> {
+fn table_count(tx: &Connection, table: &str) -> Result<u64, StateError> {
     let sql = format!("select count(*) from {table}");
     let count = tx
         .query_row(&sql, [], |row| row.get::<_, u64>(0))
@@ -10630,7 +10653,7 @@ fn table_count(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<u64, State
 /// never moves backward, so replaying an older checkpoint record cannot
 /// shrink it.
 fn project_tape_written_extent_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     eod_lba: u64,
 ) -> Result<(), StateError> {
@@ -10648,7 +10671,7 @@ fn project_tape_written_extent_tx(
 }
 
 fn project_checkpoint_tape_seal_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     sealed_after_write: bool,
     seal_due: Option<crate::checkpoint::TerminalFinalizationTrigger>,
@@ -10683,7 +10706,7 @@ fn project_checkpoint_tape_seal_tx(
 }
 
 fn insert_tape_file(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     entry: &TapeFileEntry,
 ) -> Result<(), StateError> {
@@ -10732,7 +10755,7 @@ fn insert_tape_file(
 }
 
 fn upsert_tape_pool_projection_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     pool_id: &str,
     display_name: Option<&str>,
     copy_class: Option<&str>,
@@ -10761,7 +10784,7 @@ fn upsert_tape_pool_projection_tx(
 }
 
 fn project_tape_pool_membership_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     pool_id: &str,
 ) -> Result<(), StateError> {
@@ -10785,7 +10808,7 @@ fn project_tape_pool_membership_tx(
 }
 
 fn query_tape_assignment_snapshot_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
 ) -> Result<Option<TapeAssignmentSnapshot>, StateError> {
     tx.query_row(
@@ -10824,6 +10847,16 @@ enum AssignmentWrite {
     },
 }
 
+/// Read committed occupancy under the assignment transaction and catalog lock.
+fn committed_copy_count_tx(tx: &Connection, tape_uuid: &[u8]) -> Result<u64, StateError> {
+    tx.query_row(
+        "select count(*) from object_copies where tape_uuid = ?1 and status = 'committed'",
+        [tape_uuid],
+        |row| row.get(0),
+    )
+    .map_err(|err| sqlite_error("count committed tape copies", err))
+}
+
 fn set_tape_pool_membership_tx(
     tx: &Connection,
     tape_uuid: [u8; 16],
@@ -10855,6 +10888,15 @@ fn set_tape_pool_membership_tx(
             "stale assignment generation for tape {}: expected {expected_generation}, current {generation}",
             hex_uuid(tape_uuid)
         )));
+    }
+    if mode == AssignmentWrite::Change && existing_pool_id.as_deref() != pool_id {
+        let copy_count = committed_copy_count_tx(tx, &tape_uuid)?;
+        if copy_count != 0 {
+            return Err(StateError::TapeHoldsCommittedCopies {
+                tape_uuid: uuid::Uuid::from_bytes(tape_uuid),
+                copy_count,
+            });
+        }
     }
     let latest_source: Option<String> = tx.query_row(
         "select source from tape_pool_assignments where tape_uuid = ?1 order by seq desc limit 1",
@@ -10917,28 +10959,6 @@ fn set_tape_pool_membership_tx(
                 hex_uuid(tape_uuid)
             )));
         }
-        if let Some(pool_id) = pool_id {
-            let conflicting_pool: Option<Option<String>> = tx
-                .query_row(
-                    "select pool_id
-                 from object_copies
-                 where tape_uuid = ?1
-                   and (pool_id is null or pool_id != ?2)
-                 order by pool_id is not null, pool_id
-                 limit 1",
-                    params![tape_uuid.to_vec(), pool_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|err| sqlite_error("check tape pool reassignment", err))?;
-            if let Some(conflicting_pool) = conflicting_pool {
-                let conflicting_pool = conflicting_pool.as_deref().unwrap_or("unassigned");
-                return Err(StateError::TapePoolAssignmentConflict(format!(
-                "tape {} already has committed copies in pool {conflicting_pool}; cannot assign to {pool_id}",
-                hex_uuid(tape_uuid)
-            )));
-            }
-        }
         let next_generation = if let AssignmentWrite::Replay {
             generation: recorded,
         } = mode
@@ -10957,28 +10977,15 @@ fn set_tape_pool_membership_tx(
                 ))
             })?
         };
-        let changed = tx
-            .execute(
-                "update tapes
-             set pool_id = ?2,
-                 assignment_generation = ?3,
-                 updated_at_utc = ?4
-             where tape_uuid = ?1
-               and assignment_generation = ?5
-               and finalization_progress is null
-               and state not in (
-                 'finalizing', 'finalized', 'sealed', 'retired',
-                 'finalized_degraded', 'recovery_required'
-               )",
-                params![
-                    tape_uuid.to_vec(),
-                    pool_id,
-                    u64_to_i64(next_generation, "assignment_generation")?,
-                    updated_at_utc,
-                    u64_to_i64(expected_generation, "assignment_generation")?,
-                ],
-            )
-            .map_err(|err| sqlite_error("conditionally update tape pool assignment", err))?;
+        let changed = project_assignment_row(
+            tx,
+            tape_uuid,
+            expected_generation,
+            next_generation,
+            pool_id,
+            updated_at_utc,
+            true,
+        )?;
         if changed != 1 {
             return Err(StateError::TapePoolAssignmentConflict(format!(
             "tape {} assignment changed or became final while updating generation {expected_generation}",
@@ -10987,13 +10994,15 @@ fn set_tape_pool_membership_tx(
         }
         next_generation
     };
-    tx.execute(
-        "insert into tape_pool_assignments(tape_uuid, seq, pool_id, source, actor, at_utc, assignment_generation)
-         select ?1, coalesce(max(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6
-         from tape_pool_assignments where tape_uuid = ?1",
-        params![tape_uuid.as_slice(), pool_id, source, actor, updated_at_utc, u64_to_i64(next_generation, "assignment_generation")?],
-    ).map_err(|err| sqlite_error("append tape pool assignment", err))?;
-    Ok(())
+    project_assignment_history(
+        tx,
+        tape_uuid,
+        next_generation,
+        pool_id,
+        source,
+        actor,
+        updated_at_utc,
+    )
 }
 
 fn validate_terminal_finalization_input(
@@ -11046,9 +11055,19 @@ struct ExistingTerminalFinalizationProjection {
 }
 
 fn project_terminal_finalization_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     input: &TerminalFinalizationProjectionInput,
     updated_at_utc: &str,
+) -> Result<(), StateError> {
+    project_terminal_finalization_core(tx, input, updated_at_utc, false)
+}
+/// Rebuild may discover native seal evidence after a library retirement. Preserve
+/// retirement while filling its historical terminal fields, without authorizing I/O.
+fn project_terminal_finalization_core(
+    tx: &Connection,
+    input: &TerminalFinalizationProjectionInput,
+    updated_at_utc: &str,
+    historical: bool,
 ) -> Result<(), StateError> {
     let existing: Option<ExistingTerminalFinalizationProjection> = tx
         .query_row(
@@ -11086,7 +11105,7 @@ fn project_terminal_finalization_tx(
             hex_uuid(input.tape_uuid)
         )));
     };
-    if state == "retired" {
+    if state == "retired" && !historical {
         let exact_completed_replay = existing_progress
             .as_deref()
             .map(parse_terminal_finalization_progress)
@@ -11170,11 +11189,15 @@ fn project_terminal_finalization_tx(
         ));
     }
 
-    let state = match input.outcome {
-        TerminalFinalizationOutcome::InProgress => "finalizing",
-        TerminalFinalizationOutcome::Finalized => "sealed",
-        TerminalFinalizationOutcome::FinalizedDegraded => "finalized_degraded",
-        TerminalFinalizationOutcome::RecoveryRequired => "recovery_required",
+    let state = if state == "retired" {
+        "retired"
+    } else {
+        match input.outcome {
+            TerminalFinalizationOutcome::InProgress => "finalizing",
+            TerminalFinalizationOutcome::Finalized => "sealed",
+            TerminalFinalizationOutcome::FinalizedDegraded => "finalized_degraded",
+            TerminalFinalizationOutcome::RecoveryRequired => "recovery_required",
+        }
     };
     let changed = tx
         .execute(
@@ -11226,15 +11249,15 @@ fn terminal_progress_reaches(
     false
 }
 
-fn query_mutable_memberships_tx(
-    tx: &rusqlite::Transaction<'_>,
-) -> Result<Vec<(Vec<u8>, String)>, StateError> {
+fn query_mutable_memberships_tx(tx: &Connection) -> Result<Vec<(Vec<u8>, String)>, StateError> {
     let mut stmt = tx
         .prepare(
             "select tape_uuid, pool_id from tapes
              where pool_id is not null
                and coalesce((select source from tape_pool_assignments a
                  where a.tape_uuid = tapes.tape_uuid order by seq desc limit 1), 'rule') <> 'operator'
+               and not exists (select 1 from object_copies c
+                 where c.tape_uuid = tapes.tape_uuid and c.status = 'committed')
                and finalization_progress is null
                and state not in (
                  'finalizing', 'finalized', 'sealed', 'retired',
@@ -11259,10 +11282,12 @@ fn query_mutable_memberships_tx(
 }
 
 fn query_tapes_for_pool_derivation_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
 ) -> Result<Vec<([u8; 16], String)>, StateError> {
     let mut stmt = tx
         .prepare("select tape_uuid, voltag from tapes where voltag is not null
+               and not exists (select 1 from object_copies c
+                 where c.tape_uuid = tapes.tape_uuid and c.status = 'committed')
                and finalization_progress is null
                and state not in ('finalizing', 'finalized', 'sealed', 'retired', 'finalized_degraded', 'recovery_required')
                and coalesce((select source from tape_pool_assignments a
@@ -11288,7 +11313,7 @@ fn query_tapes_for_pool_derivation_tx(
     Ok(tapes)
 }
 
-fn query_tape_pool_ids_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>, StateError> {
+fn query_tape_pool_ids_tx(tx: &Connection) -> Result<Vec<String>, StateError> {
     let mut stmt = tx
         .prepare("select pool_id from tape_pools")
         .map_err(|err| sqlite_error("prepare tape pool reconciliation query", err))?;
@@ -11372,7 +11397,7 @@ fn object_copy_envelope_from_tape_entry(
 }
 
 fn insert_object_copy_projection_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     row: ObjectCopyProjectionRow<'_>,
 ) -> Result<(), StateError> {
     validate_object_copy_envelope(
@@ -11399,13 +11424,12 @@ fn insert_object_copy_projection_tx(
            protected_until_ordinal, status, representation, recipient_epoch_ids,
            metadata_frame_len,
            plaintext_digest, plaintext_digest_algorithm,
-           stored_digest, stored_digest_algorithm, pool_id
+           stored_digest, stored_digest_algorithm
          )
          values(
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, coalesce(?8, 'unknown'), ?9, ?10,
            ?11, case when ?11 is null then null else 'sha256' end,
-           ?12, case when ?12 is null then null else 'sha256' end,
-           (select pool_id from tapes where tape_uuid = ?2)
+           ?12, case when ?12 is null then null else 'sha256' end
          )
          on conflict(object_id, tape_uuid, tape_file_number) do update set
            first_body_lba =
@@ -11441,8 +11465,7 @@ fn insert_object_copy_projection_tx(
            stored_digest_algorithm = coalesce(
              excluded.stored_digest_algorithm,
              object_copies.stored_digest_algorithm
-           ),
-           pool_id = coalesce(object_copies.pool_id, excluded.pool_id)",
+           )",
         params![
             row.object_id,
             row.tape_uuid.to_vec(),
@@ -11575,7 +11598,7 @@ fn is_lower_hex_epoch_id(value: &str) -> bool {
 }
 
 fn insert_native_catalog_unit_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     object_id: &str,
     tape_uuid: [u8; 16],
     tape_file_number: u64,
@@ -11608,10 +11631,7 @@ fn insert_native_catalog_unit_tx(
     Ok(())
 }
 
-fn native_object_format_id_tx(
-    tx: &rusqlite::Transaction<'_>,
-    object_id: &str,
-) -> Result<String, StateError> {
+fn native_object_format_id_tx(tx: &Connection, object_id: &str) -> Result<String, StateError> {
     tx.query_row(
         "select body_format from objects where object_id = ?1",
         params![object_id],
@@ -11820,7 +11840,7 @@ fn native_object_copy_from_row(
         )?
         .map(SqliteU64::get),
         status: row_get(row, 6, "object_copies.status")?,
-        pool_id: row_get(row, 7, "object_copies.pool_id")?,
+        pool_id: row_get(row, 7, "tapes.pool_id")?,
         representation: envelope.representation,
         recipient_epoch_ids: envelope.recipient_epoch_ids,
         metadata_frame_len: envelope.metadata_frame_len,
@@ -11929,7 +11949,7 @@ fn native_object_copy_from_join_row(
         )?
         .map(SqliteU64::get),
         status: row_get(row, offset + 6, "object_copies.status")?,
-        pool_id: row_get(row, offset + 7, "object_copies.pool_id")?,
+        pool_id: row_get(row, offset + 7, "tapes.pool_id")?,
         representation: envelope.representation,
         recipient_epoch_ids: envelope.recipient_epoch_ids,
         metadata_frame_len: envelope.metadata_frame_len,
@@ -12349,6 +12369,14 @@ fn observe_drive_tx(
     input: DriveObservationInput,
     match_collided_serial_by_bay: bool,
 ) -> Result<ObservedDriveTx, StateError> {
+    observe_drive_core(conn, input, match_collided_serial_by_bay, None)
+}
+fn observe_drive_core(
+    conn: &Connection,
+    input: DriveObservationInput,
+    match_collided_serial_by_bay: bool,
+    identity: Option<[u8; 16]>,
+) -> Result<ObservedDriveTx, StateError> {
     let serial = input.serial.trim().to_string();
     let vendor = input.vendor.map(|value| value.trim().to_string());
     let product = input.product.map(|value| value.trim().to_string());
@@ -12366,7 +12394,9 @@ fn observe_drive_tx(
         )));
     }
     let observed_at = input.observed_at_utc.unwrap_or(now_utc()?);
-    let existing = if match_collided_serial_by_bay && !serial.is_empty() {
+    let existing = if let Some(uuid) = identity {
+        conn.query_row("select drive_uuid, serial, identity_source, actionable, vendor, product, firmware_rev, managed, state, cleaning_due, fenced, first_seen_utc, last_seen_utc, last_library_serial, last_element_address, purchase_date, warranty_until, cost, notes, retired_at_utc, retire_reason from drives where drive_uuid=?1", [uuid.as_slice()], drive_from_row).optional().map_err(|e|sqlite_error("find authority drive identity",e))?
+    } else if match_collided_serial_by_bay && !serial.is_empty() {
         find_collided_snapshot_drive_for_observation(
             conn,
             serial.as_str(),
@@ -12469,7 +12499,9 @@ fn observe_drive_tx(
             (row.drive_uuid, false)
         }
         None => {
-            let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
+            let drive_uuid = identity
+                .unwrap_or_else(|| *Uuid::new_v4().as_bytes())
+                .to_vec();
             let actionable = if serial.is_empty() { 0 } else { 1 };
             conn.execute(
                 "insert into drives(
@@ -13195,7 +13227,7 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
-    if (1..SCHEMA_VERSION).contains(&current) {
+    if (1..24).contains(&current) {
         return Err(StateError::IndexMigrationFailed(
             crate::authority_layout::RESET_REQUIRED.into(),
         ));
@@ -13205,11 +13237,29 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             "sqlite user_version {current} is newer than supported {SCHEMA_VERSION}"
         )));
     }
+    // Schema 25 keeps the dead instance pool column until B4b-2, but no index
+    // may continue reading it, including in catalogs already at version 25.
+    if current == 24 || current == SCHEMA_VERSION {
+        conn.execute_batch("drop index if exists object_copies_pool_idx")
+            .map_err(|err| sqlite_error("drop object_copies_pool_idx", err))?;
+    }
     if current == SCHEMA_VERSION {
         conn.execute_batch(tape_log_projection::SCHEMA)
             .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
         conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
             .map_err(|e| sqlite_error("install replay cursors", e))?;
+        return validate_unsigned_structural_schema(conn);
+    }
+    if current == 24 {
+        conn.execute_batch(super::apply::SCHEMA)
+            .map_err(|e| sqlite_error("migrate library projection bookkeeping", e))?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| sqlite_error("advance library projection schema", e))?;
+        conn.execute(
+            "update schema_meta set value = ?1 where key = 'schema_version'",
+            [SCHEMA_VERSION.to_string().into_bytes()],
+        )
+        .map_err(|e| sqlite_error("advance schema metadata", e))?;
         return validate_unsigned_structural_schema(conn);
     }
     // Every predecessor schema was refused above, so only an
@@ -13230,6 +13280,8 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
         "first_body_lba",
         "first_body_lba blob not null default X'0000000000000000' check(typeof(first_body_lba) = 'blob' and length(first_body_lba) = 8)",
     )?;
+    // Dead compatibility column in schema 25; B4b-2 removes it in its DDL.
+    // New copy rows omit pool_id; every attribution query joins the tape.
     ensure_column(conn, "object_copies", "pool_id", "pool_id text")?;
     ensure_column(
         conn,
@@ -13411,13 +13463,6 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             .map_err(|err| sqlite_error("drop legacy tape pool membership table", err))?;
     }
     conn.execute(
-        "create index if not exists object_copies_pool_idx
-         on object_copies(pool_id)
-         where pool_id is not null",
-        [],
-    )
-    .map_err(|err| sqlite_error("create object_copies_pool_idx", err))?;
-    conn.execute(
         "create index if not exists objects_content_digest_idx
          on objects(content_hash_algorithm, content_hash)
          where content_hash is not null",
@@ -13439,6 +13484,8 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     )
     .map_err(|err| sqlite_error("create tapes_pool_idx", err))?;
     migrate_standalone_evidence(conn)?;
+    conn.execute_batch(super::apply::SCHEMA)
+        .map_err(|e| sqlite_error("create library projection bookkeeping", e))?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|err| sqlite_error("set sqlite user_version", err))?;
     conn.execute(
@@ -14150,6 +14197,287 @@ impl CatalogCore {
     }
 }
 
+/// Compose existing typed projection methods inside a library-record transaction.
+/// Ordinary production calls retain their BEGIN IMMEDIATE behavior.
+enum ProjectionTransaction<'a> {
+    Transaction(rusqlite::Transaction<'a>),
+    Savepoint(rusqlite::Savepoint<'a>),
+}
+impl std::ops::Deref for ProjectionTransaction<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Transaction(tx) => tx,
+            Self::Savepoint(tx) => tx,
+        }
+    }
+}
+impl ProjectionTransaction<'_> {
+    fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            Self::Transaction(tx) => tx.commit(),
+            Self::Savepoint(tx) => tx.commit(),
+        }
+    }
+    fn rollback(mut self) -> rusqlite::Result<()> {
+        match self {
+            Self::Transaction(tx) => tx.rollback(),
+            Self::Savepoint(ref mut tx) => tx.rollback(),
+        }
+    }
+}
+fn projection_transaction(conn: &mut Connection) -> rusqlite::Result<ProjectionTransaction<'_>> {
+    if conn.is_autocommit() {
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(ProjectionTransaction::Transaction)
+    } else {
+        conn.savepoint().map(ProjectionTransaction::Savepoint)
+    }
+}
+
+/// Atomically release a previous holder and project the current label snapshot.
+fn project_label_core(
+    conn: &Connection,
+    uuid: [u8; 16],
+    previous: Option<[u8; 16]>,
+    label: Option<&str>,
+    provenance: Option<&str>,
+    timestamp: &str,
+) -> Result<(), StateError> {
+    if let Some(previous) = previous {
+        conn.execute(
+            "update tapes set voltag=null,voltag_source=null,updated_at_utc=?2 where tape_uuid=?1",
+            params![previous.as_slice(), timestamp],
+        )
+        .map_err(|e| sqlite_error("release rebound label", e))?;
+    }
+    conn.execute(
+        "update tapes set voltag=?2,voltag_source=?3,updated_at_utc=?4 where tape_uuid=?1",
+        params![uuid.as_slice(), label, provenance, timestamp],
+    )
+    .map_err(|e| sqlite_error("project rebound label", e))?;
+    Ok(())
+}
+
+/// Project a typed verification verdict; audit ordering stays in its adapter.
+fn project_verification_core(
+    conn: &Connection,
+    tape_uuid: &[u8],
+    at: &str,
+    state: i64,
+    digest: Option<&[u8]>,
+) -> Result<(), StateError> {
+    conn.execute("update tapes set last_verified_at_utc = ?2, last_verification_state = ?3, last_verified_edition_digest = ?4 where tape_uuid = ?1", params![tape_uuid, at, state, digest]).map_err(|e| sqlite_error("project tape verification", e))?;
+    Ok(())
+}
+
+/// Insert a clean run with a durable source identity and timestamp.
+#[allow(clippy::too_many_arguments)]
+fn begin_clean_run_core(
+    conn: &Connection,
+    run_id: &str,
+    drive_uuid: &[u8],
+    library_serial: &str,
+    trigger: &str,
+    detail: Option<&str>,
+    now: &str,
+) -> Result<(), StateError> {
+    conn.execute(
+        "insert into clean_runs(
+                   run_id, drive_uuid, library_serial, cart_tape_uuid,
+                   cart_home_slot, phase, trigger, started_at_utc,
+                   updated_at_utc, detail
+                 )
+                 values(?1, ?2, ?3, null, null, 'fencing', ?4, ?5, ?5, ?6)",
+        params![run_id, drive_uuid, library_serial, trigger, now, detail],
+    )
+    .map_err(|err| sqlite_error("insert clean run", err))?;
+    Ok(())
+}
+
+/// Shared assignment row mutation; live adapters guard admission, whereas the
+/// library projector consumes the decision already admitted by the fold/writer.
+#[allow(clippy::too_many_arguments)]
+fn project_assignment_row(
+    tx: &Connection,
+    tape_uuid: [u8; 16],
+    expected_generation: u64,
+    next_generation: u64,
+    pool_id: Option<&str>,
+    updated_at_utc: &str,
+    guarded: bool,
+) -> Result<usize, StateError> {
+    let changed = tx
+        .execute(
+            "update tapes
+             set pool_id = ?2,
+                 assignment_generation = ?3,
+                 updated_at_utc = ?4
+             where tape_uuid = ?1
+               and (?6 = 0 or (assignment_generation = ?5
+               and finalization_progress is null
+               and state not in (
+                 'finalizing', 'finalized', 'sealed', 'retired',
+                 'finalized_degraded', 'recovery_required'
+               )))",
+            params![
+                tape_uuid.to_vec(),
+                pool_id,
+                u64_to_i64(next_generation, "assignment_generation")?,
+                updated_at_utc,
+                u64_to_i64(expected_generation, "assignment_generation")?,
+                guarded,
+            ],
+        )
+        .map_err(|err| sqlite_error("conditionally update tape pool assignment", err))?;
+    Ok(changed)
+}
+
+/// One assignment-history snapshot per consumed decision.
+fn project_assignment_history(
+    tx: &Connection,
+    tape_uuid: [u8; 16],
+    next_generation: u64,
+    pool_id: Option<&str>,
+    source: &str,
+    actor: &str,
+    updated_at_utc: &str,
+) -> Result<(), StateError> {
+    tx.execute(
+        "insert into tape_pool_assignments(tape_uuid, seq, pool_id, source, actor, at_utc, assignment_generation)
+         select ?1, coalesce(max(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6
+         from tape_pool_assignments where tape_uuid = ?1",
+        params![tape_uuid.as_slice(), pool_id, source, actor, updated_at_utc, u64_to_i64(next_generation, "assignment_generation")?],
+    ).map_err(|err| sqlite_error("append tape pool assignment", err))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_idempotency_terminal_core(
+    tx: &Connection,
+    terminal_state: &str,
+    response: Option<Vec<u8>>,
+    at: &str,
+    actor_fingerprint: &str,
+    operation_kind: &str,
+    idempotency_key: Uuid,
+    operation_id: Uuid,
+) -> Result<(), StateError> {
+    tx.execute(
+        "update idempotency_keys
+             set terminal_state = ?1,
+                 response_fingerprint = coalesce(?2, response_fingerprint),
+                 updated_at_utc = ?3
+             where actor_fingerprint = ?4
+               and operation_kind = ?5
+               and idempotency_key = ?6
+               and operation_id = ?7",
+        params![
+            terminal_state,
+            response,
+            at,
+            actor_fingerprint,
+            operation_kind,
+            idempotency_key.to_string(),
+            operation_id.to_string(),
+        ],
+    )
+    .map_err(|err| sqlite_error("project idempotency terminal state", err))?;
+    Ok(())
+}
+
+/// Shared cleaning-cartridge state; only audit carries a row-update timestamp.
+fn project_cleaning_state_core(
+    conn: &Connection,
+    tape_uuid: &[u8],
+    state: &str,
+    at: Option<&str>,
+) -> Result<(), StateError> {
+    conn.execute("update tapes set cleaning_state=?2,updated_at_utc=coalesce(?3,updated_at_utc) where tape_uuid=?1 and kind='cleaning'", params![tape_uuid,state,at]).map_err(|e|sqlite_error("project tape cleaning state",e))?;
+    Ok(())
+}
+
+fn project_tape_kind_core(
+    conn: &Connection,
+    tape_uuid: &[u8],
+    kind: &str,
+) -> Result<(), StateError> {
+    conn
+            .execute(
+                "update tapes
+                 set kind = ?2,
+                     cleaning_uses = case when ?2 = 'cleaning' then coalesce(cleaning_uses, 0) else cleaning_uses end,
+                     cleaning_state = case when ?2 = 'cleaning' then coalesce(cleaning_state, 'unverified') else cleaning_state end
+                 where tape_uuid = ?1",
+                params![tape_uuid, kind],
+            )
+            .map_err(|err| sqlite_error("set tape kind", err))?;
+    Ok(())
+}
+
+#[cfg(test)]
+impl CatalogCore {
+    /// Prove copy pool independence before B4b-2 removes the dead schema field.
+    pub(super) fn remove_copy_pool_fixture(&self) {
+        self.conn
+            .execute_batch("alter table object_copies drop column pool_id")
+            .unwrap();
+    }
+
+    pub(super) fn memory_projection_fixture() -> Self {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        migrate(&conn).unwrap();
+        Self {
+            conn,
+            path: PathBuf::from(":memory:"),
+            apply_counts: [0; 3],
+        }
+    }
+}
+
+/// Shared verified credit; library projection leaves release to FenceReleased.
+fn finalize_clean_run_core(
+    tx: &Connection,
+    run_id: &str,
+    drive_uuid: &[u8],
+    cart_tape_uuid: Option<&[u8]>,
+    detail: Option<&str>,
+    now: &str,
+    clear_fence: bool,
+) -> Result<(), StateError> {
+    if let Some(cart_tape_uuid) = cart_tape_uuid {
+        tx.execute(
+            "update tapes
+                 set cleaning_uses = coalesce(cleaning_uses, 0) + 1,
+                     cleaning_state = case
+                       when cleaning_state = 'unverified' then 'ok'
+                       else cleaning_state
+                     end
+                 where tape_uuid = ?1
+                   and kind = 'cleaning'",
+            params![cart_tape_uuid],
+        )
+        .map_err(|err| sqlite_error("credit cleaned cartridge", err))?;
+    }
+    project_drive_lifecycle_core(
+        tx,
+        drive_uuid,
+        DriveLifecycleProjection::Cleaned { clear_fence },
+        Some(now),
+    )?;
+    tx.execute(
+        "update clean_runs
+             set phase = 'done',
+                 updated_at_utc = ?2,
+                 detail = ?3
+             where run_id = ?1",
+        params![run_id, now, detail],
+    )
+    .map_err(|err| sqlite_error("finish clean run", err))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -14548,7 +14876,7 @@ mod tests {
     }
 
     #[test]
-    fn path_versions_use_copy_pool_and_rowid_ties_with_legacy_caller_ids() {
+    fn path_versions_use_tape_pool_and_rowid_ties_with_legacy_caller_ids() {
         let mut index = CatalogCore::open(":memory:").unwrap();
         for (tape, label) in [([1; 16], "FIRST"), ([2; 16], "SECOND")] {
             index
@@ -14561,11 +14889,10 @@ mod tests {
                 })
                 .unwrap();
             index
-                .conn
-                .execute(
-                    "update tapes set pool_id = 'historical' where tape_uuid = ?1",
-                    params![tape.to_vec()],
-                )
+                .compare_and_set_tape_pool_assignment(tape, 0, Some("historical"))
+                .unwrap();
+            index
+                .compare_and_set_tape_pool_assignment(tape, 1, Some("current"))
                 .unwrap();
         }
         for (number, id, tape, status) in [
@@ -14582,13 +14909,30 @@ mod tests {
                 .unwrap();
             index.conn.execute("insert into object_files (object_id,file_id,path,size_bytes,file_sha256,chunk_count) values (?1,?1,'photos/a.txt',?2,?3,?4)", params![id, SqliteU64::new(42), vec![0x41u8;32], SqliteU64::new(1)]).unwrap();
         }
-        // Reproduce an older catalog whose current assignment differs from copy provenance.
-        index
+        let nonnull: u64 = index
             .conn
-            .execute("update tapes set pool_id = 'current'", [])
+            .query_row(
+                "select count(*) from object_copies where pool_id is not null",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
+        assert_eq!(nonnull, 0);
+        assert_eq!(
+            index.committed_copy_pool_snapshots(&[1; 16]).unwrap(),
+            vec![Some("current".into())]
+        );
+        assert_eq!(index.list_committed_paths(None, None).unwrap().len(), 1);
+        let copies = index.list_all_native_object_copies().unwrap();
+        assert_eq!(
+            copies
+                .iter()
+                .filter(|c| c.status == "committed" && c.pool_id.as_deref() == Some("current"))
+                .count(),
+            2
+        );
         let versions = index
-            .list_committed_versions_by_path("historical", "photos/a.txt")
+            .list_committed_versions_by_path("current", "photos/a.txt")
             .unwrap();
         assert_eq!(
             versions
@@ -14602,7 +14946,7 @@ mod tests {
             vec![(vec![2; 16], Some("SECOND".into()))]
         );
         assert!(index
-            .list_committed_versions_by_path("current", "photos/a.txt")
+            .list_committed_versions_by_path("historical", "photos/a.txt")
             .unwrap()
             .is_empty());
         assert_eq!(
@@ -15678,16 +16022,30 @@ mod tests {
             )
             .expect("project committed object");
 
-        let err = index
+        let empty = [45u8; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: empty,
+                voltag: "ACM002L9".into(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
             .reconcile_tape_pool_projection_from_rules(
                 &[pool_projection("camera.copy-b")],
                 &[pool_rule("ACM", "camera.copy-b")],
             )
-            .expect_err("committed pool conflict must fail");
-        assert!(
-            matches!(err, StateError::TapePoolAssignmentConflict(_)),
-            "{err}"
+            .expect("occupied tape is skipped, empty tape is assigned");
+        assert_eq!(
+            index.get_tape(&empty).unwrap().unwrap().pool_id.as_deref(),
+            Some("camera.copy-b")
         );
+        index
+            .reconcile_tape_pool_projection_from_rules(&[], &[])
+            .unwrap();
+        assert_eq!(index.get_tape(&empty).unwrap().unwrap().pool_id, None);
 
         let tape = index
             .get_tape(&tape_uuid)
@@ -17842,6 +18200,23 @@ mod tests {
             })
             .expect("snapshot");
 
+        // A second cumulative sample for the same session must replace the
+        // earlier contribution, not count the session/counters twice.
+        index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: drive_uuid.clone(),
+                trigger: "periodic".into(),
+                session_id: Some(session_id.to_string()),
+                tape_alert_flags: None,
+                write_errors_corrected: Some(7),
+                write_errors_uncorrected: Some(1),
+                read_errors_corrected: Some(11),
+                read_errors_uncorrected: Some(2),
+                raw_pages: None,
+                at_utc: Some("2026-07-04T00:04:00Z".into()),
+            })
+            .unwrap();
+
         let by_drive = index
             .drive_tape_correlation_rollups(&drive_uuid)
             .expect("drive rollups");
@@ -18729,10 +19104,10 @@ mod tests {
             Connection::open(index.path())
                 .unwrap()
                 .query_row("select pool_id from object_copies", [], |row| {
-                    row.get::<_, String>(0)
+                    row.get::<_, Option<String>>(0)
                 })
-                .expect("object copy pool"),
-            "camera.copy-a"
+                .expect("dead object copy pool"),
+            None
         );
         assert_eq!(
             Connection::open(index.path())
@@ -18818,7 +19193,7 @@ mod tests {
             .project_tape_pool_membership(tape_uuid, "camera.copy-b")
             .expect_err("conflicting committed pool must fail");
         assert!(
-            matches!(err, StateError::TapePoolAssignmentConflict(_)),
+            matches!(err, StateError::TapeHoldsCommittedCopies { .. }),
             "{err}"
         );
     }
@@ -19543,8 +19918,78 @@ mod tests {
         );
     }
 
+    /// Live decisions refuse occupied media without changing rows or history;
+    /// empty reassignment and retirement remain available.
     #[test]
-    fn object_copy_upsert_preserves_existing_pool_snapshot() {
+    fn occupied_tape_assignment_refused_without_state_change() {
+        let mut index = CatalogCore::open(":memory:").unwrap();
+        let tape = [0x41; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: tape,
+                voltag: "POOLTEST".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
+            .compare_and_set_tape_pool_assignment(tape, 0, Some("archive"))
+            .unwrap();
+        index
+            .compare_and_set_tape_pool_assignment(tape, 1, Some("new"))
+            .unwrap();
+        index
+            .upsert_native_object_projection(
+                append_object_projection("occupied"),
+                &[append_copy_projection("occupied", tape, 1)],
+            )
+            .unwrap();
+        let before = index.normalized_authority_dump().unwrap();
+        let tape_before = index.get_tape(&tape).unwrap();
+        for pool in [Some("archive"), None] {
+            let error = index
+                .compare_and_set_tape_pool_assignment_with_audit(tape, 2, pool, "operator", |_| {
+                    panic!("refusal must not publish audit")
+                })
+                .unwrap_err();
+            assert!(
+                matches!(error, StateError::TapeHoldsCommittedCopies { tape_uuid, copy_count: 1 }
+                if tape_uuid == uuid::Uuid::from_bytes(tape))
+            );
+            assert_eq!(error.to_string(), format!("tape {} holds 1 committed instances; a tape holding data cannot change pool; it can only be retired", uuid::Uuid::from_bytes(tape)));
+            assert_eq!(index.normalized_authority_dump().unwrap(), before);
+            assert_eq!(index.get_tape(&tape).unwrap(), tape_before);
+        }
+        index
+            .compare_and_set_tape_pool_assignment(tape, 2, Some("new"))
+            .unwrap();
+        assert_eq!(index.normalized_authority_dump().unwrap(), before);
+        let stored: Option<String> = index
+            .conn
+            .query_row("select pool_id from object_copies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, None);
+        assert_eq!(
+            index.find_native_object_copies("occupied").unwrap()[0]
+                .pool_id
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            index
+                .retire_tape(RetireTapeInput {
+                    tape_uuid: tape,
+                    reason: "test".into()
+                })
+                .unwrap()
+                .copies_marked_missing,
+            1
+        );
+    }
+
+    #[test]
+    fn object_copy_upsert_uses_current_tape_pool() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -19584,11 +20029,13 @@ mod tests {
         assert_eq!(
             Connection::open(index.path())
                 .unwrap()
-                .query_row("select pool_id from object_copies", [], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_row(
+                    "select t.pool_id from object_copies c join tapes t on t.tape_uuid=c.tape_uuid",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
                 .expect("object copy pool"),
-            "pool.at.commit"
+            "pool.after.commit"
         );
     }
 
@@ -21118,6 +21565,12 @@ mod tests {
                 .expect("project native object");
         }
 
+        index
+            .with_core(|core| {
+                core.remove_copy_pool_fixture();
+                Ok(())
+            })
+            .unwrap();
         let ambiguous = index
             .get_native_object_by_unique_caller_object_id("shared-caller")
             .unwrap_err();
@@ -21149,7 +21602,7 @@ mod tests {
         Connection::open(index.path())
             .unwrap()
             .execute(
-                "update object_copies set status = 'missing' where pool_id = 'pool-b'",
+                "update object_copies set status = 'missing' where tape_uuid in (select tape_uuid from tapes where pool_id = 'pool-b')",
                 [],
             )
             .unwrap();
@@ -23041,5 +23494,88 @@ mod tests {
             .idempotency_terminal_state("user:alice", key)
             .expect_err("actor/key-only compatibility lookup must fail closed");
         assert!(matches!(ambiguous, StateError::AmbiguousCatalogLookup(_)));
+    }
+    /// SQLite rejects dropping a column used by an index or view. Roll back the
+    /// probe so schema-25 catalogs retain the compatibility column and its data.
+    fn assert_no_instance_pool_schema_readers(conn: &Connection) {
+        conn.execute_batch("savepoint instance_pool_schema_probe")
+            .unwrap();
+        let result = conn.execute_batch("alter table object_copies drop column pool_id");
+        conn.execute_batch(
+            "rollback to instance_pool_schema_probe; release instance_pool_schema_probe",
+        )
+        .unwrap();
+        result.expect("no index or view may read object_copies.pool_id");
+    }
+
+    /// Existing schema-24 catalogs take one transactional bookkeeping migration;
+    /// opening them does not rebuild or change the production authority.
+    #[test]
+    fn b4b1_schema24_migrates_through_existing_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.sqlite");
+        {
+            let catalog = crate::projector::open(&path).unwrap();
+            let writer = catalog.write_handle();
+            writer.with_core(|core| {
+            assert_no_instance_pool_schema_readers(&core.conn);
+            core.conn.execute_batch("create index object_copies_pool_idx on object_copies(pool_id) where pool_id is not null").unwrap();
+            core.conn.execute_batch("insert into tapes(tape_uuid,pool_id,state,updated_at_utc) values(X'01','current','ready','test'); insert into objects(object_id,body_format,created_at_utc) values('migration-copy','rem-object-v1','test'); insert into object_copies(object_id,tape_uuid,tape_file_number,status,pool_id) values('migration-copy',X'01',X'0000000000000001','committed','historical')").unwrap();
+            let names:Vec<String>={let mut stmt=core.conn.prepare("select name from sqlite_master where type='table' and (name like 'library_%' or name in ('projection_sources','tape_projection_sources','tape_projection_chunks'))").unwrap();let rows=stmt.query_map([],|r|r.get(0)).unwrap();rows.collect::<Result<_,_>>().unwrap()};
+            for name in names {core.conn.execute_batch(&format!("drop table {name}")).unwrap();}
+            core.conn.execute_batch("pragma user_version=24; update schema_meta set value=X'3234' where key='schema_version'").unwrap();Ok(())
+        }).unwrap();
+        }
+        let catalog = crate::projector::open(&path).unwrap();
+        let writer = catalog.write_handle();
+        assert_eq!(writer.schema_version().unwrap(), SCHEMA_VERSION);
+        writer
+            .with_core(|core| {
+                assert_no_instance_pool_schema_readers(&core.conn);
+                let count: u64 = core
+                    .conn
+                    .query_row("select count(*) from library_projection_records", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+                let pool: String = core
+                    .conn
+                    .query_row(
+                        "select pool_id from object_copies where object_id='migration-copy'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(pool, "historical");
+                assert_eq!(
+                    core.find_native_object_copies("migration-copy")?
+                        .first()
+                        .unwrap()
+                        .pool_id
+                        .as_deref(),
+                    Some("current")
+                );
+                Ok(())
+            })
+            .unwrap();
+        writer.with_core(|core| {
+            core.conn.execute_batch("create index object_copies_pool_idx on object_copies(pool_id) where pool_id is not null").unwrap();
+            Ok(())
+        }).unwrap();
+        drop(writer);
+        drop(catalog);
+        let reopened = crate::projector::open(&path).unwrap();
+        assert_eq!(
+            reopened.write_handle().schema_version().unwrap(),
+            SCHEMA_VERSION
+        );
+        reopened
+            .write_handle()
+            .with_core(|core| {
+                assert_no_instance_pool_schema_readers(&core.conn);
+                Ok(())
+            })
+            .unwrap();
     }
 }

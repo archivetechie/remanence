@@ -1,10 +1,10 @@
 //! Second-round public fold regressions, ported from the reviewer scratch cases.
-use remanence_state::library_log::{fold::*, store::Receipt, *};
+use crate::library_log::{fold::*, store::Receipt, *};
 struct Present;
 impl TapeView for Present {
     fn lookup(&self, a: &TapeAt) -> TapeLookup {
         TapeLookup::Present {
-            kind: remanence_state::tape_log::Tag::FinalizationPrepared,
+            kind: crate::tape_log::Tag::FinalizationPrepared,
             digest: a.record_digest,
         }
     }
@@ -198,12 +198,12 @@ fn n6_unkeyed_id_reuse_is_not_detected() {
 }
 
 mod live_fences {
-    use remanence_state::library_log::{fold::*, store::Receipt, *};
+    use crate::library_log::{fold::*, store::Receipt, *};
     struct Present;
     impl TapeView for Present {
         fn lookup(&self, a: &TapeAt) -> TapeLookup {
             TapeLookup::Present {
-                kind: remanence_state::tape_log::Tag::FinalizationPrepared,
+                kind: crate::tape_log::Tag::FinalizationPrepared,
                 digest: a.record_digest,
             }
         }
@@ -428,7 +428,7 @@ fn library_fold_is_sync() {
 /// The generated schema records the limits needed by B4b's operation writers.
 #[test]
 fn schema_lifetime_and_writer_contracts() {
-    let schema = include_str!("../../../fixtures/library-log/SCHEMA.md");
+    let schema = include_str!("../../../../fixtures/library-log/SCHEMA.md");
     for clause in [
         "ClosedOperationReplay",
         "reuse of a closed unkeyed operation id is not detected in fold state",

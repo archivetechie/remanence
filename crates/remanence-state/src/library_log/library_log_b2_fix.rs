@@ -1,10 +1,10 @@
 //! Public-API regressions ported from review-4b2-repro.rs.
-use remanence_state::library_log::{fold::*, store::Receipt, *};
+use crate::library_log::{fold::*, store::Receipt, *};
 struct Present;
 impl TapeView for Present {
     fn lookup(&self, a: &TapeAt) -> TapeLookup {
         TapeLookup::Present {
-            kind: remanence_state::tape_log::Tag::FinalizationPrepared,
+            kind: crate::tape_log::Tag::FinalizationPrepared,
             digest: a.record_digest,
         }
     }
@@ -218,7 +218,7 @@ impl TapeView for Repaired {
     fn lookup(&self, _: &TapeAt) -> TapeLookup {
         // The tape log now holds a different record (other kind, other digest) at that sequence.
         TapeLookup::Present {
-            kind: remanence_state::tape_log::Tag::SessionEnded,
+            kind: crate::tape_log::Tag::SessionEnded,
             digest: [0xee; 32],
         }
     }

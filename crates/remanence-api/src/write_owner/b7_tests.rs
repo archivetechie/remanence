@@ -1501,7 +1501,7 @@ async fn b8_closeout_replay_precedes_finalizing_busy() {
 }
 
 #[tokio::test]
-async fn b9_closeout_completed_replay_precedes_changed_pool() {
+async fn b9_closeout_completed_replay_precedes_retirement() {
     closeout_replay_after_admission_change(false).await;
 }
 
@@ -1575,7 +1575,12 @@ async fn closeout_replay_after_admission_change(finalizing: bool) {
         }
         index
     }
-    .clear_tape_pool_membership(TAPE)
+    // Occupied tapes cannot be unassigned. Retirement is the permitted
+    // admission change; completed idempotent replay must still win over it.
+    .retire_tape(remanence_state::RetireTapeInput {
+        tape_uuid: TAPE,
+        reason: "completed replay after retirement".into(),
+    })
     .unwrap();
     state.operations = Default::default();
     assert_eq!(

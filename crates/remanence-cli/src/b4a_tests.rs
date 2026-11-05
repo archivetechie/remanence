@@ -9,7 +9,10 @@ fn b4a_dry_run_writes_nothing() {
     let path = parent.join("catalog.sqlite");
     let (reader, kind) = open_tape_init_dry_run_catalog(&path).unwrap();
     assert_eq!(kind, DryRunCatalog::Absent);
-    assert_eq!(reader.schema_version().unwrap(), 24);
+    assert_eq!(
+        reader.schema_version().unwrap(),
+        remanence_state::projector::index::SCHEMA_VERSION
+    );
     assert!(!path.exists());
     assert!(!parent.exists());
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

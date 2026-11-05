@@ -78,6 +78,14 @@ pub enum StateError {
     /// An idempotency key was reused for a different request.
     #[error("idempotency conflict: {0}")]
     IdempotencyConflict(String),
+    /// Only an empty tape may change pool; retirement remains a separate duty.
+    #[error("tape {tape_uuid} holds {copy_count} committed instances; a tape holding data cannot change pool; it can only be retired")]
+    TapeHoldsCommittedCopies {
+        /// Occupied tape identity.
+        tape_uuid: uuid::Uuid,
+        /// Number of committed copies at the assignment decision.
+        copy_count: u64,
+    },
     /// A tape with committed data was assigned to a conflicting pool.
     #[error("tape pool assignment conflict: {0}")]
     TapePoolAssignmentConflict(String),

@@ -97,3 +97,5 @@ crates/remanence-state/src/state.rs::rebuild_projection_from_config_file::projec
 crates/remanence-state/src/state.rs::rebuild_projection_from_config_file::write_handle	1
 # State facade issues capability from its retained projector client.
 crates/remanence-state/src/state.rs::write_handle::write_handle	1
+# B4b-1 disconnected worker takes the registered writer capability.
+crates/remanence-state/src/projector/thread.rs::open::write_handle	1

@@ -21834,8 +21834,8 @@ pool_id = "init-test"
         let conn =
             rusqlite::Connection::open(root.join("index/rem-state.sqlite")).expect("open catalog");
         conn.execute(
-            "insert into object_copies(object_id, tape_uuid, tape_file_number, status, pool_id)
-             values('seeded-object', ?1, ?2, 'committed', 'init-test')",
+            "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+             values('seeded-object', ?1, ?2, 'committed')",
             rusqlite::params![
                 Uuid::parse_str(UNKNOWN_BOT_UUID)
                     .unwrap()
@@ -22315,10 +22315,11 @@ pool_id = "init-test"
         );
         assert_eq!(run.code, ExitCode::from(1), "{}", run.stdout);
         assert_eq!(run.writes, 0, "{}", run.stderr);
+        // Without a tape row, copy-level bytes cannot supply pool authority.
+        // The existing init pool-conflict refusal still precedes any write.
         assert!(
-            run.stderr.contains(&format!(
-                "--clobber-unknown-tape refuses: committed copies in this catalog reference BOT uuid {UNKNOWN_BOT_UUID}; no write attempted"
-            )),
+            run.stderr
+                .contains("pool assignment conflict: committed=unknown derived=init-test"),
             "{}",
             run.stderr
         );

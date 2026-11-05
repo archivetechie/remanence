@@ -38,7 +38,10 @@ fn b4a_projector_open_shares_one_connection() {
     let other = projector::open(&other_path).unwrap();
     assert_eq!(b4a_writable_connections(&other_path), 1);
     let reader = CatalogReader::open(&file).unwrap();
-    assert_eq!(reader.schema_version().unwrap(), 24);
+    assert_eq!(
+        reader.schema_version().unwrap(),
+        remanence_state::projector::index::SCHEMA_VERSION
+    );
     drop((a, b));
     assert_eq!(b4a_writable_connections(&file), 1);
     drop(handle);
@@ -46,7 +49,10 @@ fn b4a_projector_open_shares_one_connection() {
     drop(reader);
     assert_eq!(b4a_writable_connections(&file), 0);
     let reopened = projector::open(&file).unwrap();
-    assert_eq!(reopened.write_handle().schema_version().unwrap(), 24);
+    assert_eq!(
+        reopened.write_handle().schema_version().unwrap(),
+        remanence_state::projector::index::SCHEMA_VERSION
+    );
     assert_eq!(b4a_writable_connections(&file), 1);
     drop((reopened, other));
 }
@@ -55,7 +61,10 @@ fn b4a_projector_open_shares_one_connection() {
 fn b4a_empty_reader_has_current_schema() {
     let dir = tempfile::tempdir().unwrap();
     let reader = CatalogReader::empty().unwrap();
-    assert_eq!(reader.schema_version().unwrap(), 24);
+    assert_eq!(
+        reader.schema_version().unwrap(),
+        remanence_state::projector::index::SCHEMA_VERSION
+    );
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
@@ -73,7 +82,10 @@ fn b4a_concurrent_open_and_last_drop_never_duplicate_writer() {
                 for _ in 0..20 {
                     barrier.wait();
                     let client = projector::open(&path).unwrap();
-                    assert_eq!(client.write_handle().schema_version().unwrap(), 24);
+                    assert_eq!(
+                        client.write_handle().schema_version().unwrap(),
+                        remanence_state::projector::index::SCHEMA_VERSION
+                    );
                     assert_eq!(b4a_writable_connections(&path), 1);
                     drop(client);
                 }

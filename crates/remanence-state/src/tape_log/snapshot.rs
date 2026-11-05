@@ -316,6 +316,36 @@ impl Snapshot {
     pub fn summary(&self) -> &TapeSummary {
         &self.summary
     }
+    /// Bind a projection checkpoint to exact frozen bytes using bounded memory.
+    pub(crate) fn projection_prefix_digest(&self, end: u64) -> Result<[u8; 32], StoreError> {
+        use sha2::{Digest, Sha256};
+        if end > self.summary.closed_end {
+            return Err(StoreError::Refused(
+                "projection source is shorter than its digest",
+            ));
+        }
+        let mut digest = Sha256::new();
+        if end != 0 {
+            let file = self
+                .file
+                .as_ref()
+                .ok_or(StoreError::Refused("projection source file absent"))?;
+            let mut reader = PrefixReader {
+                file: file.clone(),
+                position: 0,
+                end,
+            };
+            let mut bytes = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut bytes)?;
+                if n == 0 {
+                    break;
+                }
+                digest.update(&bytes[..n]);
+            }
+        }
+        Ok(digest.finalize().into())
+    }
     /// Classification of captured bytes after the last closed record.
     pub fn tail(&self) -> Tail {
         self.tail

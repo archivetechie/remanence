@@ -120,7 +120,7 @@ fn validate_layout(paths: &StatePaths) -> Result<Layout, StateError> {
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(|e| invalid(e.to_string()))?;
-        if version < crate::index::SCHEMA_VERSION && !empty_catalog {
+        if version < 24 && !empty_catalog {
             return Err(invalid(RESET_REQUIRED));
         }
     }

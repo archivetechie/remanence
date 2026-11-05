@@ -1,7 +1,7 @@
 //! Measured streaming replay over a fixed resource set, using the real append store.
-#[path = "support/heap.rs"]
+#[path = "../../tests/support/heap.rs"]
 mod heap;
-use remanence_state::library_log::{store::*, *};
+use crate::library_log::{store::*, *};
 use std::{
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
@@ -156,6 +156,9 @@ fn write(dir: &Path, count: u64) {
 /// Tenfold record growth retains the same ten tapes, two drives and three alarms.
 #[test]
 fn library_replay_memory_is_per_resource() {
+    if isolated("library_replay_memory_is_per_resource") {
+        return;
+    }
     let _measurement = MEMORY_MEASUREMENT.lock().unwrap();
     let mut peaks = Vec::new();
     let mut capped_peaks = Vec::new();
@@ -387,6 +390,9 @@ fn write_operations(dir: &Path, count: u64) {
 /// Terminal unkeyed operations retain nothing; keyed operations retain only 80-byte pairs.
 #[test]
 fn library_replay_operations_and_wrap_maps_are_bounded() {
+    if isolated("library_replay_operations_and_wrap_maps_are_bounded") {
+        return;
+    }
     let _measurement = MEMORY_MEASUREMENT.lock().unwrap();
     let mut costs = vec![];
     for operations in [10_000, 100_000] {
@@ -413,4 +419,23 @@ fn library_replay_operations_and_wrap_maps_are_bounded() {
         costs[1].0 * costs[0].1 <= costs[0].0 * costs[1].1,
         "{costs:?}"
     );
+}
+
+// Heap measurements run alone even though raw-record regressions now live inside
+// the library privacy boundary. Other tests cannot pollute their global peak.
+fn isolated(name: &str) -> bool {
+    if std::env::var("B4B1_HEAP_CHILD").as_deref() == Ok(name) {
+        return false;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("library_log::library_log_memory::{name}"),
+            "--test-threads=1",
+        ])
+        .env("B4B1_HEAP_CHILD", name)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated heap measurement failed: {name}");
+    true
 }

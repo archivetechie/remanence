@@ -128,7 +128,10 @@ fn b4a_writer_waits_without_busy_and_reader_keeps_wal_concurrency() {
             .unwrap();
     });
     entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(reader.schema_version().unwrap(), 24);
+    assert_eq!(
+        reader.schema_version().unwrap(),
+        super::index::SCHEMA_VERSION
+    );
     let mut waiting = client.write_handle();
     let (started_tx, started_rx) = channel();
     let (done_tx, done_rx) = channel();
@@ -165,7 +168,7 @@ fn b4a_writer_waits_without_busy_and_reader_keeps_wal_concurrency() {
     eprintln!("B4a serialized writer waited {elapsed:?}; reader progressed during the transaction");
     assert_eq!(
         read_done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-        24
+        index::SCHEMA_VERSION
     );
     reading_writer.join().unwrap();
     waiter.join().unwrap();

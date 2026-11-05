@@ -15,8 +15,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use crate::StateError;
 use index::{CatalogCore, MediaReadinessObserver};
 
+pub use index::apply;
 mod handle;
 pub mod index;
+pub mod thread;
 
 #[derive(Debug)]
 struct SharedCore {
@@ -283,3 +285,25 @@ pub(crate) fn read_legacy_catalog_reset_erase_source(
 
 #[cfg(test)]
 mod b4a_tests;
+
+#[cfg(test)]
+pub(crate) fn memory_projection_fixture() -> CatalogIndex {
+    CatalogIndex {
+        core: SharedCore::new(CatalogCore::memory_projection_fixture()),
+        path: PathBuf::from(":memory:"),
+        readiness_observer: None,
+    }
+}
+
+/// Test fixture for the future schema with no copy-level pool storage.
+#[cfg(test)]
+pub(crate) fn memory_projection_without_copy_pool_fixture() -> CatalogIndex {
+    let writer = memory_projection_fixture();
+    writer
+        .with_core(|core| {
+            core.remove_copy_pool_fixture();
+            Ok(())
+        })
+        .unwrap();
+    writer
+}
