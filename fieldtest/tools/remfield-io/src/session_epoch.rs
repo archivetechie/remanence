@@ -413,17 +413,21 @@ fn validate_preview(
 async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> {
     let mut catalog = pb::catalog_client::CatalogClient::new(channel.clone());
     if args.mode == "kill-mid-write" {
-        let preview = catalog
-            .supersede_tail(pb::SupersedeTailRequest {
-                tape_uuid: args.tape.as_bytes().to_vec(),
-                // The daemon requires the acknowledging tape on every call,
-                // including this read-only preview (the CLI always sends it).
-                ack_tape_uuid: args.tape.as_bytes().to_vec(),
-                ..Default::default()
-            })
-            .await;
+        let preview_request = pb::SupersedeTailRequest {
+            tape_uuid: args.tape.as_bytes().to_vec(),
+            // The daemon requires the acknowledging tape on every call,
+            // including this read-only preview (the CLI always sends it).
+            ack_tape_uuid: args.tape.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let preview = call_with_readiness_retry(channel.clone(), || {
+            let mut client = catalog.clone();
+            let request = preview_request.clone();
+            async move { client.supersede_tail(request).await }
+        })
+        .await?;
         let preview = match preview {
-            Ok(response) => Some(response.into_inner()),
+            Ok(response) => Some(response),
             Err(status)
                 if status.code() == tonic::Code::FailedPrecondition
                     && status
@@ -447,16 +451,19 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
                 let proof = read_json(&args.evidence.join("fault.json"))?;
                 let before = read_json(&args.evidence.join("before.json"))?;
                 validate_preview(args.tape, &before, &proof, &preview)?;
-                let ack = catalog
-                    .supersede_tail(pb::SupersedeTailRequest {
-                        tape_uuid: args.tape.as_bytes().to_vec(),
-                        ack_tape_uuid: args.tape.as_bytes().to_vec(),
-                        confirm_supersede: Some(preview.required_confirmation),
-                        expected_found: preview.found,
-                        observed_tape_log_sequence: Some(preview.tape_log_sequence),
-                    })
-                    .await?
-                    .into_inner();
+                let confirm_request = pb::SupersedeTailRequest {
+                    tape_uuid: args.tape.as_bytes().to_vec(),
+                    ack_tape_uuid: args.tape.as_bytes().to_vec(),
+                    confirm_supersede: Some(preview.required_confirmation),
+                    expected_found: preview.found,
+                    observed_tape_log_sequence: Some(preview.tape_log_sequence),
+                };
+                let ack = call_with_readiness_retry(channel.clone(), || {
+                    let mut client = catalog.clone();
+                    let request = confirm_request.clone();
+                    async move { client.supersede_tail(request).await }
+                })
+                .await??;
                 save(
                     &args.evidence.join("crash-ack.json"),
                     &json!({"completed":ack.completed,"sequence":ack.tape_log_sequence,"found":ack.found}),
@@ -469,16 +476,20 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
         &args.evidence.join("closeout-key.json"),
         &json!({"tape_uuid":args.tape.to_string(),"idempotency_key":key.to_string()}),
     )?;
-    let operation = catalog
-        .closeout_tape(pb::CloseoutTapeRequest {
-            tape_uuid: args.tape.as_bytes().to_vec(),
-            expected_pool_id: Some(args.pool.clone()),
-            idempotency_key: Some(pb::IdempotencyKey {
-                value: key.as_bytes().to_vec(),
-            }),
-        })
-        .await?
-        .into_inner();
+    // The same idempotency key on every retry: a fenced attempt started nothing.
+    let closeout_request = pb::CloseoutTapeRequest {
+        tape_uuid: args.tape.as_bytes().to_vec(),
+        expected_pool_id: Some(args.pool.clone()),
+        idempotency_key: Some(pb::IdempotencyKey {
+            value: key.as_bytes().to_vec(),
+        }),
+    };
+    let operation = call_with_readiness_retry(channel.clone(), || {
+        let mut client = catalog.clone();
+        let request = closeout_request.clone();
+        async move { client.closeout_tape(request).await }
+    })
+    .await??;
     let mut watch = pb::daemon_client::DaemonClient::new(channel)
         .watch_operation(pb::GetOperationRequest {
             operation_id: operation.operation_id,
