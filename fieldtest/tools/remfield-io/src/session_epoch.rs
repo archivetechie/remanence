@@ -184,22 +184,24 @@ pub(super) async fn run(endpoint: &str, args: Args) -> AppResult<()> {
     }
 }
 async fn prepare(channel: Channel, args: &Args) -> AppResult<()> {
-    let mut client = pb::write_session_service_client::WriteSessionServiceClient::new(channel);
-    let opened = client
-        .open_write_session(pb::OpenWriteSessionRequest {
-            target: Some(pb::open_write_session_request::Target::TapeTarget(
-                pb::TapeTarget {
-                    tape_uuid: args.tape.as_bytes().to_vec(),
-                    mount_if_needed: true,
-                    required_pool_id: args.pool.clone(),
-                    allow_unpooled: false,
-                },
-            )),
-            body_format: Some("rem-object-v1".into()),
-            ..Default::default()
-        })
-        .await?
-        .into_inner();
+    let mut client =
+        pb::write_session_service_client::WriteSessionServiceClient::new(channel.clone());
+    // A freshly loaded cartridge is often still becoming ready (02/04/01); the
+    // daemon fences the open with a resumable readiness operation. Wait on it
+    // through the shared open path, exactly as the other helper modes do.
+    let request = || pb::OpenWriteSessionRequest {
+        target: Some(pb::open_write_session_request::Target::TapeTarget(
+            pb::TapeTarget {
+                tape_uuid: args.tape.as_bytes().to_vec(),
+                mount_if_needed: true,
+                required_pool_id: args.pool.clone(),
+                allow_unpooled: false,
+            },
+        )),
+        body_format: Some("rem-object-v1".into()),
+        ..Default::default()
+    };
+    let opened = open_write_session_with(channel, &mut client, request, false).await?;
     let session = opened.session_id;
     save(
         &args.evidence.join("session.json"),
