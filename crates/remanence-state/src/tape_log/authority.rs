@@ -686,6 +686,24 @@ pub struct TapeAuthorityLease {
     read_cache: Arc<Mutex<Option<Snapshot>>>,
 }
 impl TapeAuthorityLease {
+    /// Bind actual geometry and sync an empty header before acknowledging a
+    /// fresh missing-filemark recovery. No native record or media write occurs.
+    pub fn publish_empty_prefix(
+        &mut self,
+        block_size: u32,
+        scheme: Option<remanence_parity::ParityScheme>,
+    ) -> Result<Snapshot, StateError> {
+        self.ensure_abandonment_allowed()?;
+        self.with_store(|core| {
+            core.bind_header(Header {
+                tape_uuid: core.header().tape_uuid,
+                block_size,
+                scheme,
+            })?;
+            core.publish_empty_prefix()?;
+            Ok(core.snapshot()?)
+        })
+    }
     /// Publish the proved session boundary before the first object dispatch.
     /// The store preflights the transition and poisons ambiguous publication.
     pub fn open_session(

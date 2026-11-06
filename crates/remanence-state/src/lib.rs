@@ -7,6 +7,8 @@
 
 pub mod authority;
 pub mod authority_layout;
+pub mod authority_manifest;
+pub mod library_runtime;
 pub use authority::{TapeAuthority, TapeAuthorityLease, TerminalIndexSource};
 pub mod adapters;
 pub mod audit;
@@ -14,6 +16,7 @@ pub mod calibration;
 pub mod checkpoint;
 pub mod config;
 pub mod error;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fence;
 pub mod projector;
 pub use projector::index;
@@ -94,8 +97,8 @@ pub use paths::StatePaths;
 pub use state::{
     BootstrapAdoptionEvidence, BootstrapAdoptionTailEvidence, CatalogResetPathEvidence,
     CatalogResetPreflightPaths, CatalogResetPreflightReport, CatalogResetPreflightTape,
-    CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState, StartupReplayReport,
-    StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
+    CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState, InitializationGuard,
+    StartupReplayReport, StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
 };
 
 pub use authority::{AuthorityCommit, AuthorityFinalization, AuthorityPrefixPlan, ObjectPayload};

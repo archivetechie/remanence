@@ -46,9 +46,9 @@ fn contradicted_fences_release_other_scopes_live_and_replay() {
                 op(None, OperationEvent::Started(Unit)),
                 Body::SupersedeTail(SupersedeTail {
                     at: at(1, 9),
-                    operation: [7; 16],
-                    session_id: [3; 16],
-                    preview_digest: [0; 32],
+                    operation: Some([7; 16]),
+                    session_id: Some([3; 16]),
+                    preview_digest: Some([0; 32]),
                     tail_file_count: 1,
                 }),
                 Body::FenceRaised(FenceRaised {
@@ -136,9 +136,9 @@ fn tape_view_advances_mid_history_live_and_replay() {
         provision(1, None),
         Body::SupersedeTail(SupersedeTail {
             at: at(1, 9),
-            operation: [7; 16],
-            session_id: [3; 16],
-            preview_digest: [0; 32],
+            operation: Some([7; 16]),
+            session_id: Some([3; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
         pool(1, 1),
@@ -204,9 +204,9 @@ fn b4b0_d1_d4_contradiction_frees_ordinary_blocker() {
         op(None, OperationEvent::Started(Unit)),
         Body::SupersedeTail(SupersedeTail {
             at: at(1, 9),
-            operation: [7; 16],
-            session_id: [3; 16],
-            preview_digest: [0; 32],
+            operation: Some([7; 16]),
+            session_id: Some([3; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
         pool(1, 1),

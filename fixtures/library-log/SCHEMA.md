@@ -298,6 +298,7 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | Key | Field | CBOR type / bound | Optional |
 |---:|---|---|---|
 | 0 | phase | `CleanPhase` | false |
+| 1 | home_slot | `Option<u16>` | true |
 
 ## Finish
 
@@ -305,6 +306,14 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 |---:|---|---|---|
 | 0 | result | `CleanResult` | false |
 | 1 | verified_credit | `bool` | false |
+
+## AlarmRefresh
+
+| Key | Field | CBOR type / bound | Optional |
+|---:|---|---|---|
+| 0 | severity | `Severity` | false |
+| 1 | reason | `Text` | false |
+| 2 | cause | `Option<DecisionRef>` | true |
 
 ## AlarmRaise
 
@@ -418,9 +427,9 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | Key | Field | CBOR type / bound | Optional |
 |---:|---|---|---|
 | 0 | at | `TapeAt` | false |
-| 1 | operation | `Id` | false |
-| 2 | session_id | `Id` | false |
-| 3 | preview_digest | `Hash` | false |
+| 1 | operation | `Option<Id>` | true |
+| 2 | session_id | `Option<Id>` | true |
+| 3 | preview_digest | `Option<Hash>` | true |
 | 4 | tail_file_count | `u64` | false |
 
 ## AcceptUnprotectedFinalization
@@ -476,7 +485,7 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 
 | Key | Field | CBOR type / bound | Optional |
 |---:|---|---|---|
-| 0 | library_serial | `Text` | false |
+| 0 | subject | `InventorySubject` | false |
 | 1 | observation_generation | `u64` | false |
 | 2 | resolves | `Bounded<DecisionRef, 1024>` | false |
 | 3 | complete | `bool` | false |
@@ -542,6 +551,8 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 10 | load_intent | `Option<DecisionRef>` | true |
 | 11 | ready_generation | `u64` | false |
 | 12 | result | `ReadinessResult` | false |
+| 13 | scope | `ReadinessScope` | false |
+| 14 | media | `Option<MediumFamily>` | true |
 
 ## DriveObserved
 
@@ -744,6 +755,7 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 10 | `CloseoutReadContradiction` |
 | 11 | `Cleaning` |
 | 12 | `ContainerQuarantine` |
+| 13 | `CheckpointBarrierFailed` |
 
 ### MotionResult
 
@@ -861,6 +873,13 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 14 | `Starting` |
 | 15 | `RecordingFailed` |
 
+### ReadinessScope
+
+| Code | Variant / payload |
+|---:|---|
+| 0 | `Endpoint` |
+| 1 | `Library` |
+
 ### ReadinessResult
 
 | Code | Variant / payload |
@@ -941,6 +960,8 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 6 | `CheckpointBarrierOverdue` |
 | 7 | `ForeignDriveWantsCleaning` |
 | 8 | `KindFlipRefused` |
+| 9 | `ContradictedTape` |
+| 10 | `PendingRecordRejected` |
 
 ### Severity
 
@@ -1033,6 +1054,13 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 1 | `Unload(Unload)` |
 | 2 | `Move(Move)` |
 
+### InventorySubject
+
+| Code | Variant / payload |
+|---:|---|
+| 0 | `Library(Text)` |
+| 1 | `Standalone(Standalone)` |
+
 ### Confirmation
 
 | Code | Variant / payload |
@@ -1057,6 +1085,7 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 2 | `Advance(Advance)` |
 | 3 | `Finish(Finish)` |
 | 4 | `Expire(Reason)` |
+| 5 | `Reject(Reason)` |
 
 ### AlarmAction
 
@@ -1065,6 +1094,7 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 0 | `Raise(AlarmRaise)` |
 | 1 | `Acknowledge(Unit)` |
 | 2 | `Clear(Reason)` |
+| 3 | `Refresh(AlarmRefresh)` |
 
 ### OperationEvent
 
@@ -1131,32 +1161,32 @@ LibraryHistory first uses retained state; otherwise the store binary-searches ex
 FRAMES.tsv lists complete decodable frames, including frames beyond the authoritative prefix and the decoded refused frame of a rejected case; authoritative records have sequence at most MANIFEST.last_sequence. Frames whose header or encoding cannot be decoded are not listed. MANIFEST.log_uuid is the first segment's on-disk header value; in wrong-log-uuid it differs from the expected identity. Tape views are external replay inputs published in VIEWS.tsv and README.md.
 ## Record tags, causal keys and scopes
 
-Every record except FenceRaised also orders on the current label of each tape it names in its direct tape set. For this rule the direct tape set is the tape field of tags 1, 3, 5 and 25, both holders for tag 2, the TapeAt tape of tags 6, 7, 13, 14, 15 and 26, and the optional tape or cartridge of tags 10, 17, 20, 21 and 24; other tags have no direct tapes. Reprovision adds its new and predecessor Tape scopes and its explicit new Label, but does not add the predecessor current label. A DecisionRef adds only the referenced record's direct scopes, defined separately from the ordering column below. These are Tape for its direct tape set above (also the scope tape for FenceRaised, and the new and predecessor tapes for Reprovision); Operation for the operation of tags 6, 7, 13, 14, 15, 17, 23 and 26, the optional operation of tags 8 and 20, the adoption operation of tag 4, the parent operation of tag 10, and the session_id of tag 24. Additional direct scopes are: the explicit new Label of tags 2 and 4; Endpoint of a drive FenceRaised; Endpoint of a Load/Unload MotionIntent, plus Library for a bay endpoint, or Library of a Move MotionIntent; Library of tag 12; Config of tag 16; Endpoint of tag 17; Drive and optional Endpoint of tag 18; Drive of tags 19 and 20; CleaningRun and optional Drive of tag 21; Alarm of tag 22; and optional Endpoint of tag 24. Thus a reference to a fence inherits its scope Tape or drive Endpoint plus its optional Operation, independent of tag 8's deferral column. Inheritance is one level only: no current labels, no scopes the referenced record itself inherited, and no Config from a referenced Rule AssignPool. A reference to FenceReleased inherits nothing. FenceReleased's own ordering instead adds only the target Tape or Endpoint of the fence it names, and only while that fence is open (a raised fence still awaiting its queued check counts as open), as described in tag 9. A release of a fence that is no longer open orders on nothing.
+Every record except FenceRaised also orders on the current label of each tape it names in its direct tape set. For this rule the direct tape set is the tape field of tags 1, 3, 5 and 25, both holders for tag 2, the TapeAt tape of tags 6, 7, 13, 14, 15 and 26, and the optional tape or cartridge of tags 10, 17, 20, 21 and 24; other tags have no direct tapes. Reprovision adds its new and predecessor Tape scopes and its explicit new Label, but does not add the predecessor current label. A DecisionRef adds only the referenced record's direct scopes, defined separately from the ordering column below. These are Tape for its direct tape set above (also the scope tape for FenceRaised, and the new and predecessor tapes for Reprovision); Operation for the operation of tags 6, 7, 13, 14, 15, 17, 23 and 26, the optional operation of tags 8 and 20, the adoption operation of tag 4, the parent operation of tag 10, and the session_id of tag 24. Additional direct scopes are: the explicit new Label of tags 2 and 4; Endpoint of a drive FenceRaised; Endpoint of a Load/Unload MotionIntent, plus Library for a bay endpoint, or Library of a Move MotionIntent; Library or standalone Endpoint of tag 12; Config of tag 16; Endpoint of tag 17; Drive and optional Endpoint of tag 18; Drive of tags 19 and 20; CleaningRun and optional Drive of tag 21; Alarm of tag 22; and optional Endpoint of tag 24. Thus a reference to a fence inherits its scope Tape or drive Endpoint plus its optional Operation, independent of tag 8's deferral column. Inheritance is one level only: no current labels, no scopes the referenced record itself inherited, and no Config from a referenced Rule AssignPool. A reference to FenceReleased inherits nothing. FenceReleased's own ordering instead adds only the target Tape or Endpoint of the fence it names, and only while that fence is open (a raised fence still awaiting its queued check counts as open), as described in tag 9. A release of a fence that is no longer open orders on nothing.
 
 | Tag | Record | Scopes | Causal rule |
 |---:|---|---|---|
 | 1 | AssignPool | Tape, current Label; also Config when `source` is `Rule` with a configuration reference | `change.expected` = the tape's `assignment_generation`. The tape is provisioned and not retired. `Rule` requires `configuration` to name the latest retained `ConfigurationAccepted`; an older reference is `StaleConfiguration`, including an identical retry. History classifies a mismatching reference: only an older ConfigurationAccepted is StaleConfiguration; another kind or absent reference is WrongCounterpart. `pool`, if present, is non-empty. An Operator assignment without a configuration reference has no Config scope; if it supplies a reference, the general historical-reference rule adds that referenced record's direct scopes |
 | 2 | Label | Tape (both holders), Label (old and new) | `change` against the tape's `label_generation`. Labels are unique among live tapes. If the label is held by live tape X, `prior_holder` must name X with X's current `label_generation`. The one record moves the label, clears X's label and bumps X's generation. If the label is free, `prior_holder` is null. `observed_bot_uuid`, if present, equals `tape.uuid`. **Recovery 4** |
-| 3 | Retire | Tape, Label | `assignment_generation` equals the current one. The tape is live. Retire ends the incarnation for good and releases its label and pool. `observed_tape_sequence` is evidence, never a prerequisite. No later record except `Diagnostic` may name a retired `TapeRef` (`RetiredIdentity`) |
+| 3 | Retire | Tape, Label | `assignment_generation` equals the current one. The tape is live. Retire ends the incarnation for good and releases its label and pool. `observed_tape_sequence` is evidence, never a prerequisite. Later live-target records cannot name a retired `TapeRef` (`RetiredIdentity`); `Reprovision.predecessor` may name its retired predecessor and `FenceRaised.at` remains evidential |
 | 4 | Reprovision | Tape (new and predecessor), Label, Operation (adoption) | A new UUID, never seen before. `predecessor`, if present, is retired. The label, if any, is free. `label_provenance` is null exactly when `label` is. `adoption` is present exactly for `Adopt`. Mandatory MediumSpec owns the sole fixed block size (record_size > 0, multiple of 512 for adoption). record_size, rerecord, lifecycle_ops and family kind are fixed for this incarnation; changing them requires a new incarnation. Former key 5 block_size is removed; parity_scheme is key 5, medium key 6, pool key 7, endpoint key 8 and adoption key 9. Sets assignment, label and media generations to 1 in one record; no separate `Label` or `AssignPool` for the initial state |
 | 5 | MediumSpecSet | Tape | `change` against the live tape's `media_revision`. Family kind (Lto/Disk) is fixed. Within Lto, generation may change only when the incarnation's derived ever_measured bit is false; otherwise MediumFamilyChanged. Provisioning (tag 4) initializes ever_measured from its own source, and every committed MediumSpecSet with source Measured sets it. The bit never clears within an incarnation, even if source is later revised to Label or Operator; it is derived from records, not stored on the wire. record_size, rerecord and lifecycle_ops must equal their current values, otherwise ImmutableMediumField { field }. Only usable_logical_bytes and source are generally revisable, with the stated LTO correction exception. Capacity may stay equal or decrease; an increase requires source Measured on this new revision (fresh measurement), otherwise CapacityIncreaseRequiresMeasurement. A retry is not a fresh revision. Fixed geometry and capabilities can change only through a new incarnation |
-| 6 | SupersedeTail | Tape, Operation | **Pending dependency** on `at`. At most one per (`at.tape`, `session_id`). B4b's tape fold checks the `SessionEnded.crash_ack_audit_sequence` that names it (kind, tape, session, count); B2 provides `LibraryFold::supersede(sequence)` for that lookup |
+| 6 | SupersedeTail | Tape, Operation | **Pending dependency** on `at`. Only this tag permits sequence 0, naming the existing native log's empty prefix: record_digest is SHA-256 of the exact immutable header bytes. Missing or replaced native identity contradicts it; it never raises the repair floor above 0. Other dependent tags and evidential FenceRaised.at still refuse sequence 0 as InvalidSchema. operation, session_id and preview_digest are nullable (keys remain mandatory); absent branch facts must not be fabricated. At most one per (`at.tape`, `session_id`), including session_id null. B4b's tape fold checks the `SessionEnded.crash_ack_audit_sequence` that names it (kind, tape, session, count); B2 provides `LibraryFold::supersede(sequence)` for that lookup |
 | 7 | AcceptUnprotectedFinalization | Tape, Operation | **Pending** on `at`. `w < t`. At most one per (incarnation, operation). Codec, fold and fixtures exist now. **No production constructor**; step 6 adds the emitter |
 | 8 | FenceRaised | scope Tape only for ordering; none for DriveFault | ContainerQuarantine (cause 12) and Model (scope 2) decode but are refused before queuing or committing with ReservedNotYetUsed. `Write` requires tape scope; `DriveFault` requires drive scope (`FenceScopeMismatch`). An unqueued tape-scoped fence requires a live tape. A live or replay fence takes effect immediately. It defers its live-tape check only behind pending records on `Scope::Tape` of its scope tape; its queue entry contains only that scope. Label, operation and endpoint scopes neither block it nor are blocked by it while queued. A DriveFault fence has no tape-ordered check and never defers. A fence on a tape unknown while that tape has queued records is accepted; if its tape is unknown, of another incarnation or retired at resolution, the check is dropped and the failure is attached to the open fence as its full TapeRef and cause. This creates no tape contradiction; releasing the fence removes the report. The check runs in tape queue order; B4b writers check fence targets themselves. Contradiction status never decides a fence check. A fence raised on a contradicted tape with no pending predecessor validates liveness immediately. A queued check remains pending during replay even if a predecessor is later excluded. The next `resolve`, which runs only before a live append, retries it in tape queue order; a remaining NotYet predecessor still holds the check. The fence stays open throughout. The fence id is this record's sequence. No deduplication: every raise is its own fence. **`at` is evidence, not a dependency:** the fence applies at once, and an unresolvable `at` is reported, never waited for |
 | 9 | FenceReleased | target Tape or Endpoint of the named fence while it is open; none otherwise | `fence` remains a u64 FenceId: the raise sequence within the header-bound log UUID. Only this reference form uses sequence-only LibraryHistory lookup; DecisionRef always matches the record UUID. An earlier raise no longer open is `FenceAlreadyReleased`, even after later fences; another tag is `WrongCounterpart`; absent history is `ReleaseWithoutFence`. Zero/forward references remain `ForwardReference`. The latest identical release retry remains a no-op. A release that differs from an earlier release of the same fence is `FenceAlreadyReleased`. While the named fence is open, the release orders on its target tape or endpoint, without inheriting the raise's operation. A release of a fence that is no longer open, including an identical retry of an earlier release, orders on nothing. `forced` changes nothing in the fold but the fence: it cannot resolve a motion, a pending record or an ambiguity |
 | 10 | MotionIntent | Tape, Endpoint, Library, Operation | `command` is unique among open intents; a `command` already open is `ConflictingDuplicate`. **The LOAD attempt count lives only here** (item 6): `attempt` is 1 plus the number of earlier `Load` intents with the same `parent_operation` and endpoint; with no parent it is 1. An intent with no outcome makes its library (a `Bay` endpoint's serial, a `Move`'s serial, or a standalone endpoint) **InventoryUnknown** |
-| 11 | MotionOutcome | intent scopes | `intent` names an open `MotionIntent` (`OutcomeWithoutOpenIntent`; `WrongCounterpart` if another tag). An intent reference naming an existing sequence with a different record UUID is `OutcomeWithoutOpenIntent`. One outcome per intent. `Done` requires a confirmation: Inventory for Move and Unload, Readiness for Load. `Unknown` leaves the library InventoryUnknown |
-| 12 | InventoryReconciled | Library, resolved intent scopes | `observation_generation` strictly increases per library. `resolves` names intents of this library whose outcome is `Unknown` or absent. A partial poll (`complete = false`) may resolve only intents whose elements it lists. It clears exactly the named uncertainty and creates no placement ownership |
+| 11 | MotionOutcome | intent scopes | `intent` names an open `MotionIntent` (`OutcomeWithoutOpenIntent`; `WrongCounterpart` if another tag). An intent reference naming an existing sequence with a different record UUID is `OutcomeWithoutOpenIntent`. One outcome per intent. `Done` requires a confirmation: Inventory for Move and Unload; Readiness for Load when a readiness flow follows, otherwise Inventory (including cleaning). The writer validates that the sequence exists and has the confirmation kind. An inventory confirmation must observe without resolving that intent; the following Done consumes it. `Unknown` leaves the library InventoryUnknown |
+| 12 | InventoryReconciled | observed Library or standalone Endpoint; resolved intent scopes | Key 0 is InventorySubject: [0, library serial] or [1, Standalone map]. Observation generation strictly increases per subject. Library observations use element status; a partial observation resolves only intents whose affected elements are all listed. Reconciliation clears exactly the named uncertainty and creates no placement ownership. Standalone observations use TEST UNIT READY plus READ POSITION, require complete=true and empty elements, and resolve only open or Unknown LOAD/UNLOAD intents on that exact endpoint. Naming another endpoint or a changer intent is InventoryScope; stale generation is InventoryGeneration. Each resolved intent is consumed once. Confirmation observations leave resolves empty, followed by MotionOutcome Done; never resolve and then append an outcome for the same intent |
 | 13 | VerificationProgress | Tape, Operation | **Pending** on `at`. Within one operation, `at`, `plan_digest` and `modes` never change (`CoverageChanged`). `parts_done` strictly increases and `next` strictly advances in lexicographic order (`ProgressRegressed`). `next.part = parts_done` (`ImpossibleCursor`). Progress is never a verdict. **No production constructor in step 4** (item 7); step 7 emits it |
 | 14 | VerificationVerdict | Tape, Operation, progress scopes | **Pending** on `at`. Healthy means `damaged` is empty and `unprotected` is null; findings may combine. Each range has `start < end`; `w < t`. If the operation has progress records, `progress` must name the last one, with the same `at` (`VerdictWithoutCoverage`). It supersedes that operation's progress only. A verdict at tape sequence N says nothing about N+1 |
 | 15 | ManualFinalizationAccepted | Tape, Operation | **Pending** on `at`, which names the tape log's `FinalizationPrepared` record; its digest binds the immutable plan, so there is no separate plan digest. `assignment_generation` equals the tape's current one (`GenerationMismatch`; item 9's "Accepted with a stale generation"). One per incarnation. Retired in step 6 |
 | 16 | ConfigurationAccepted | Config | `generation` is the previous one plus 1, starting at 1. `config_digest` = SHA-256 of the canonical bytes of `definitions` (`ConfigDigest`). It holds only catalog-relevant fields, never a secret or a TLS key. Assignments still need `AssignPool`; replay never reinterprets an older config |
-| 17 | ReadinessObserved | Tape, Endpoint, Operation, previous and intent scopes | `previous` names the last `ReadinessObserved` of the same operation, and is null for its first. `load_intent`, if present, names an open or resolved `Load` intent on the same endpoint; resolved records use LibraryHistory. **It carries no LOAD count** (item 6). `ready_generation` strictly increases per endpoint. A terminal `result` closes the operation. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids |
+| 17 | ReadinessObserved | Tape, Endpoint, Operation, previous and intent scopes | `scope` (key 13) is Endpoint=0 by default or Library=1; Library requires a bay endpoint and projects selected-library-snapshot admission uncertainty across all bays. `media` (key 14) is an optional MediumFamily, allowed only without `tape`; with a tape the family is its MediumSpec and supplying media is InvalidSchema. `previous` names the last `ReadinessObserved` of the same operation, and is null for its first. `load_intent`, if present, names an open or resolved `Load` intent on the same endpoint; resolved records use LibraryHistory. **It carries no LOAD count** (item 6). `ready_generation` strictly increases per endpoint. A terminal `result` closes the operation. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids |
 | 18 | DriveObserved | Drive, Endpoint | The first observation creates the drive with `stewardship_generation = 1`. The observation time is the envelope's |
 | 19 | DriveDecision | Drive | The drive is known. `change` against `stewardship_generation`. Retire requires active; Reinstate requires retired. Fencing is tags 8 and 9, never this |
 | 20 | DriveHealthObserved | Drive, Tape, Operation | The drive is known. A non-null (`session_id`, `trigger`) matching the drive's latest retained snapshot is a no-op if the body is identical, otherwise `ConflictingDuplicate`. The fold makes no lifetime uniqueness claim. B4's health projector must retain the (`session_id`, `trigger`) unique key with first-wins: ignore an identical later body; report a different later body as a projection conflict and never apply it. Null-session snapshots are independent. Counters are cumulative per mount |
-| 21 | CleaningRecorded | CleaningRun, Drive, Tape | `previous` chains a run's records. At most one active run per drive and per cartridge (today's unique indexes). Register and Expire concern the cartridge, not a run. **The fold never derives a fence from cleaning** (item 11): a run that needs an operator is a separate `FenceRaised(DriveFault)` |
-| 22 | AlarmChanged | Alarm, cause scopes | `change` against the alarm generation (0 when never raised). Raise requires absent or cleared; Acknowledge requires raised and unacknowledged, with an envelope actor other than System (the acknowledger is the actor, recorded once); Clear requires raised. `cause` may name any earlier record, using LibraryHistory after replacement |
+| 21 | CleaningRecorded | CleaningRun, Drive, Tape | `Begin` carries only trigger, with no home slot. `Advance` key 1 is home_slot (Option<u16>), present exactly when phase is MovingIn; that record must also name the selected cartridge. Missing slot/cartridge at MovingIn or a slot at any other phase is InvalidSchema. MovingBack returns to the run's MovingIn slot, retained through omitted cartridge/slot fields and delayed drive binding. Register.home_slot remains the initial home, and the projected cartridge home follows the latest run. `previous` chains a run's records. At most one active run per drive and per cartridge (today's unique indexes). Register, Expire and Reject concern the cartridge, not a run. Reject(Reason), wire code 5, requires a registered cartridge that is neither expired nor rejected (UnknownTape, WrongMediumKind, or RetiredIdentity otherwise). It permanently prevents selection and verified credit, including credit through an inherited run binding. It projects cleaning_state=rejected, distinct from expired. Reject precedes the separate Finish(Failed): a crash between them leaves an ineligible cartridge and an active run; replay cannot make it eligible. Failed closure and return motion remain legal after rejection. Reject has no previous run reference and does not advance the run chain. Register creates an inventory-only cleaning entity without MediumSpec or BOT identity: cartridge must be UUIDv5(NAMESPACE_OID, UTF-8 `remanence:cleaning-cartridge:{barcode}`), incarnation 1, previously unknown as either medium kind, except that ruling 17 permits a retired data UUID after Retire releases its label. The data retirement remains historical; a live data UUID still conflicts. The barcode must be nonempty and trimmed. A known live data or any cleaning UUID is ConflictingDuplicate; a malformed identity is InvalidSchema. Only Register exempts its cartridge from UnknownTape. Expire ends the cleaning entity permanently; it cannot be registered again. An inherited run cartridge cannot bypass expiry to advance or receive verified credit; Finish without verified credit may close the run. Data-tape records naming a cleaning cartridge, including Reprovision.predecessor and every dependent record, fail WrongMediumKind before native lookup. WrongMediumKind is fold-only, with no new wire code. The projector creates a cleaning tape row with null block_size and the home slot. **The fold never derives a fence from cleaning** (item 11): a run that needs an operator is a separate `FenceRaised(DriveFault)` |
+| 22 | AlarmChanged | Alarm, cause scopes | `change` against the alarm generation (0 when never raised). Raise requires absent or cleared; Acknowledge requires raised and unacknowledged, with an envelope actor other than System (the acknowledger is the actor, recorded once); Clear requires raised. Refresh (action code 3, payload keys severity=0/reason=1/cause=2) requires raised, acknowledged or not, advances generation by CAS, replaces severity/reason/cause, and preserves acknowledgement and its actor; a subsequent acknowledgement still refuses. `cause` may name any earlier record, using LibraryHistory after replacement |
 | 23 | OperationRecorded | Operation | `previous` chains the operation's records. Accepted comes first or not at all. Started follows nothing or Accepted. Cancel records follow a non-terminal state. Finished, Failed, CancelledBeforeDispatch, CompletedAfterCancel and CompletionUnknown are terminal; nothing follows them. The idempotency scope (`actor_fingerprint`, `kind`, `idempotency_key`) is unique: a second Accepted for that scope with a different operation or fingerprint is a `ConflictingDuplicate`. An identical keyed retry yields `Duplicate(original receipt)` while Accepted is latest, `Chain` after Started or another non-terminal successor, or `ClosedOperationReplay { operation }` after the operation closes. B4b's API must answer all three from its projection, treating `Chain` for an identical keyed Accepted as already running and using the operation id for a closed retry because the fold does not retain terminal receipts. Terminal is enforced for chained successors; reuse of a closed unkeyed operation id is not detected in fold state. B4b writers mint fresh ids. **No progress variant**: progress gates nothing in step 4 and stays `Diagnostic` |
 | 24 | SessionObserved | Operation(session), Tape, Endpoint | Opened comes first; the other events are terminal. **A write session cannot be expressed**: write sessions are the tape log's (item 5b), and kind 0 is refused. It has no receipts, because durable receipts are tape-log only |
 | 25 | WrapMapCached | Tape | `digest` = SHA-256(`descriptors`), whose bytes are today's descriptor serialisation, opaque to the fold. Only digest and calibration_generation are retained per tape; the projector reads descriptor bytes from the source record. `calibration_generation` never decreases per tape. The RAO control store (the third authority) still decides servability; this rebuilds only the SQL cache |

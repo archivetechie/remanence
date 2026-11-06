@@ -188,8 +188,9 @@ fields!(Annotation; purchase_date:Option<Text>,warranty_until:Option<Text>,cost:
 fields!(Counters; write_corrected:Option<u64>,write_uncorrected:Option<u64>,read_corrected:Option<u64>,read_uncorrected:Option<u64>);
 fields!(Register; barcode:LabelText,home_slot:u16);
 fields!(Begin; trigger:CleanTrigger);
-fields!(Advance; phase:CleanPhase);
+fields!(Advance; phase:CleanPhase,home_slot:Option<u16>);
 fields!(Finish; result:CleanResult,verified_credit:bool);
+fields!(AlarmRefresh; severity:Severity,reason:Text,cause:Option<DecisionRef>);
 fields!(AlarmRaise; kind:AlarmKind,severity:Severity,reason:Text);
 fields!(Accepted; actor_fingerprint:Text,idempotency_key:Option<Id>,request_fingerprint:Hash,subject:Option<Text>);
 fields!(Response; response_fingerprint:Option<Hash>);
@@ -202,18 +203,18 @@ fields!(Label; tape:TapeRef,label:Option<LabelText>,provenance:LabelProvenance,c
 fields!(Retire; tape:TapeRef,reason:RetireReason,observed_tape_sequence:Option<u64>,assignment_generation:u64,detail:Option<Text>);
 fields!(Reprovision; tape:TapeRef,predecessor:Option<TapeRef>,mode:ProvisionMode,label:Option<LabelText>,label_provenance:Option<LabelProvenance>,parity_scheme:Option<ParityScheme>,medium:MediumSpec,pool:Option<Text>,endpoint:Option<DriveKey>,adoption:Option<Adoption>);
 fields!(MediumSpecSet; tape:TapeRef,medium:MediumSpec,change:GenerationChange);
-fields!(SupersedeTail; at:TapeAt,operation:Id,session_id:Id,preview_digest:Hash,tail_file_count:u64);
+fields!(SupersedeTail; at:TapeAt,operation:Option<Id>,session_id:Option<Id>,preview_digest:Option<Hash>,tail_file_count:u64);
 fields!(AcceptUnprotectedFinalization; at:TapeAt,operation:Id,w:u64,t:u64,reason:Text);
 fields!(FenceRaised; kind:FenceKind,scope:FenceScope,cause:FenceCause,evidence:Option<CompletionEvidence>,at:Option<TapeAt>,operation:Option<Id>);
 fields!(FenceReleased; fence:u64,evidence:Text,forced:bool);
 fields!(MotionIntent; command:Id,parent_operation:Option<Id>,motion:Motion,tape:Option<TapeRef>,inventory_generation:Option<u64>,readiness_generation:Option<u64>);
 fields!(MotionOutcome; intent:DecisionRef,result:MotionResult,evidence:CompletionEvidence,confirmation:Option<Confirmation>);
-fields!(InventoryReconciled; library_serial:Text,observation_generation:u64,resolves:Bounded<DecisionRef, 1024>,complete:bool,elements:Bounded<Element, 65535>);
+fields!(InventoryReconciled; subject:InventorySubject,observation_generation:u64,resolves:Bounded<DecisionRef, 1024>,complete:bool,elements:Bounded<Element, 65535>);
 fields!(VerificationProgress; operation:Id,at:TapeAt,plan_digest:Hash,modes:u32,parts_done:u32,next:VerificationCursor,completed_digest:Hash);
 fields!(VerificationVerdict; operation:Id,at:TapeAt,damaged:Bounded<DamagedRange, 4096>,unprotected:Option<Unprotected>,modes:u32,edition_digest:Option<Hash>,progress:Option<DecisionRef>);
 fields!(ManualFinalizationAccepted; at:TapeAt,operation:Id,actor_fingerprint:Text,idempotency_key:Id,request_fingerprint:Hash,assignment_generation:u64);
 fields!(ConfigurationAccepted; generation:u64,config_digest:Hash,definitions:Definitions);
-fields!(ReadinessObserved; operation:Id,endpoint:DriveKey,tape:Option<TapeRef>,barcode:Option<LabelText>,phase:ReadinessPhase,state:ReadinessState,previous:Option<DecisionRef>,started_unix_ns:u64,limit_ms:u64,evidence:Option<CompletionEvidence>,load_intent:Option<DecisionRef>,ready_generation:u64,result:ReadinessResult);
+fields!(ReadinessObserved; operation:Id,endpoint:DriveKey,tape:Option<TapeRef>,barcode:Option<LabelText>,phase:ReadinessPhase,state:ReadinessState,previous:Option<DecisionRef>,started_unix_ns:u64,limit_ms:u64,evidence:Option<CompletionEvidence>,load_intent:Option<DecisionRef>,ready_generation:u64,result:ReadinessResult,scope:ReadinessScope,media:Option<MediumFamily>);
 fields!(DriveObserved; drive_uuid:Id,serial:Option<Text>,identity_source:IdentitySource,endpoint:Option<DriveKey>,managed:Managed,inventory_generation:u64,vendor:Option<Text>,product:Option<Text>,firmware_rev:Option<Text>);
 fields!(DriveDecision; drive_uuid:Id,decision:Stewardship,change:GenerationChange);
 fields!(DriveHealthObserved; drive_uuid:Id,tape:Option<TapeRef>,session_id:Option<Id>,operation:Option<Id>,trigger:HealthTrigger,tape_alert_flags:u64,counters:Counters,raw_pages:Option<Blob<65536>>);
@@ -231,7 +232,7 @@ enumeration!(ProvisionMode; 0=>Initialize,1=>Adopt);
 enumeration!(Dispatch; 0=>NotIssued,1=>Issued);
 enumeration!(Completion; 0=>Known,1=>Unknown);
 enumeration!(FenceKind; 0=>Write,1=>DriveFault);
-enumeration!(FenceCause; 0=>PartialBatch,1=>TransferError,2=>CloseoutCheckMismatch,3=>SupersedeTailFailed,4=>StandaloneWriteLostByRestart,5=>AppendAdmissionRefused,6=>ResetUnitAttention,7=>PositionDrift,8=>AuthorityAmbiguous,9=>SessionSuffixContradiction,10=>CloseoutReadContradiction,11=>Cleaning,12=>ContainerQuarantine);
+enumeration!(FenceCause; 0=>PartialBatch,1=>TransferError,2=>CloseoutCheckMismatch,3=>SupersedeTailFailed,4=>StandaloneWriteLostByRestart,5=>AppendAdmissionRefused,6=>ResetUnitAttention,7=>PositionDrift,8=>AuthorityAmbiguous,9=>SessionSuffixContradiction,10=>CloseoutReadContradiction,11=>Cleaning,12=>ContainerQuarantine,13=>CheckpointBarrierFailed);
 enumeration!(MotionResult; 0=>Done,1=>Failed,2=>Unknown);
 enumeration!(ElementKind; 0=>Transport,1=>Storage,2=>ImportExport,3=>Drive);
 enumeration!(SelectionPolicy; 0=>CompleteOrFill,1=>FillOldest);
@@ -239,6 +240,7 @@ enumeration!(PhysicalTail; 0=>ExactBootstrapFilemarkEod,1=>DataAfterBootstrap,2=
 enumeration!(AdoptedState; 0=>Ready,1=>RecoveryRequired);
 enumeration!(ReadinessPhase;0=>Planned,1=>InitializingCommandLoad,2=>ReadinessPoll,3=>Ready,4=>Cancelled,5=>Shutdown,6=>SessionOpenShortProbe,7=>SessionOpenImmediateLoad,8=>SessionOpenAfterImmediateLoad,9=>StartupReconcileTur,10=>StartupReconcile,11=>StartupReconcileRequiresRelease,12=>QuarantineRelease,13=>Released,14=>WaitReadyTur,15=>AfterWaitReadyTur,16=>BeforeConditionalImmediateLoad,17=>ConditionalImmediateLoad,18=>AfterConditionalImmediateLoad,19=>AfterBotClassification,20=>AfterClobberConfirmation,21=>AfterMoveMedium,22=>AfterOpenDrive,23=>AfterOpenLibrary,24=>AfterReadMediumPartitions,25=>AfterRewindBeforeBotRead,26=>ApplyInitWriteGate,27=>BeforeApplyInitWriteGate,28=>BeforeMoveMedium,29=>BeforeOpenDrive,30=>BeforeOpenLibrary,31=>BeforeReadDriveConfig,32=>BeforeRewindBeforeBootstrapWrite,33=>BeforeRewindBeforeBotRead,34=>BeforeWaitReadyTur,35=>MoveMedium,36=>OpenDrive,37=>OpenLibrary,38=>ReadDriveConfig,39=>ReadMediumPartitions,40=>RewindBeforeBootstrapWrite,41=>RewindBeforeBotRead,42=>ClobberConfirmation,43=>PreLoadTur,44=>AlreadyLoadedTur,45=>BeforePreLoadTur,46=>AfterPreLoadTur,47=>BeforeAlreadyLoadedTur,48=>AfterAlreadyLoadedTur);
 enumeration!(ReadinessState; 0=>Planned,1=>PreReadyLoading,2=>Ready,3=>MediaInitializing,4=>BecomingReady,5=>UnitAttention,6=>TargetBusy,7=>ReservationConflict,8=>TransportUnknown,9=>TerminalError,10=>TimeoutUnknown,11=>AbortedUnknown,12=>Cancelled,13=>Released,14=>Starting,15=>RecordingFailed);
+enumeration!(ReadinessScope; 0=>Endpoint,1=>Library);
 enumeration!(ReadinessResult; 0=>Pending,1=>Ready,2=>Failed,3=>Cancelled,4=>AbortedUnknown,5=>Released);
 enumeration!(IdentitySource; 0=>Standalone,1=>DvcidInline,2=>DvcidAndInquiry,3=>Derived);
 enumeration!(Managed; 0=>Rem,1=>Foreign);
@@ -246,7 +248,7 @@ enumeration!(HealthTrigger; 0=>SessionClose,1=>AppendFailure,2=>ReadFailure,3=>F
 enumeration!(CleanTrigger; 0=>Manual,1=>Periodic,2=>Now);
 enumeration!(CleanPhase; 0=>Fencing,1=>Selecting,2=>MovingIn,3=>Cleaning,4=>MovingBack,5=>Verifying,6=>Done,7=>Failed,8=>NeedsOperator);
 enumeration!(CleanResult; 0=>Done,1=>Failed,2=>NeedsOperator);
-enumeration!(AlarmKind; 0=>DriveCleaningAbnormalFrequency,1=>CleaningNeedsOperator,2=>NoClnCart,3=>ClnCartExpired,4=>CartNotCleaningBehavior,5=>SnapshotPersistFailing,6=>CheckpointBarrierOverdue,7=>ForeignDriveWantsCleaning,8=>KindFlipRefused);
+enumeration!(AlarmKind; 0=>DriveCleaningAbnormalFrequency,1=>CleaningNeedsOperator,2=>NoClnCart,3=>ClnCartExpired,4=>CartNotCleaningBehavior,5=>SnapshotPersistFailing,6=>CheckpointBarrierOverdue,7=>ForeignDriveWantsCleaning,8=>KindFlipRefused,9=>ContradictedTape,10=>PendingRecordRejected);
 enumeration!(Severity; 0=>Warning,1=>Critical,2=>Error);
 enumeration!(OperationKind; 0=>Unknown,1=>AckAlarm,2=>DriveStewardship,3=>CleanDrive,4=>RefreshInventory,5=>MoveMedium,6=>LoadDrive,7=>UnloadDrive,8=>MediaReadinessWait,9=>TapeVerification,10=>FinalizeTape,11=>ReconcileTape,12=>TapeCloseout,13=>CloseoutOverdue);
 enumeration!(Retry; 0=>Transient,1=>Operator,2=>Media);
@@ -329,10 +331,11 @@ impl Wire for FenceScope {
     }
 }
 union!(Motion; 0=>Load(Load),1=>Unload(Unload),2=>Move(Move));
+union!(InventorySubject; 0=>Library(Text),1=>Standalone(Standalone));
 union!(Confirmation; 0=>Inventory(u64),1=>Readiness(u64));
 union!(Stewardship; 0=>Retire(Reason),1=>Reinstate(Reason),2=>Annotate(Annotation));
-union!(CleaningAction; 0=>Register(Register),1=>Begin(Begin),2=>Advance(Advance),3=>Finish(Finish),4=>Expire(Reason));
-union!(AlarmAction; 0=>Raise(AlarmRaise),1=>Acknowledge(Unit),2=>Clear(Reason));
+union!(CleaningAction; 0=>Register(Register),1=>Begin(Begin),2=>Advance(Advance),3=>Finish(Finish),4=>Expire(Reason),5=>Reject(Reason));
+union!(AlarmAction; 0=>Raise(AlarmRaise),1=>Acknowledge(Unit),2=>Clear(Reason),3=>Refresh(AlarmRefresh));
 union!(OperationEvent; 0=>Accepted(Accepted),1=>Started(Unit),2=>CancelRequested(Unit),3=>CancellationRejected(Unit),4=>CancelledBeforeDispatch(Unit),5=>CompletedAfterCancel(Response),6=>Finished(Response),7=>Failed(Failed),8=>CompletionUnknown(Unit));
 union!(WrapAction; 0=>Cache(Cache),1=>Invalidate(Reason));
 union!(RecoveryAction; 1=>RepairApplied(RepairApplied),2=>AppendAuthorityRecovered(Recovered));
@@ -452,6 +455,7 @@ pub(super) const SCHEMA_FIELDS: &[(&str, &[(&str, &str)])] = &[
     ("Begin", Begin::FIELDS),
     ("Advance", Advance::FIELDS),
     ("Finish", Finish::FIELDS),
+    ("AlarmRefresh", AlarmRefresh::FIELDS),
     ("AlarmRaise", AlarmRaise::FIELDS),
     ("Accepted", Accepted::FIELDS),
     ("Response", Response::FIELDS),

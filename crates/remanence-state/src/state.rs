@@ -1,21 +1,25 @@
 //! Public Layer 4 state handle.
 
+mod authority_reset;
+
 use crate::authority::TapeAuthorityView;
-use std::collections::{BTreeMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use ciborium::value::Value as CborValue;
 use remanence_parity::ParityScheme;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use time::Duration;
 
-use crate::audit::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSink, AuditSubject, FileAuditLog, SourceLayer,
-};
+use crate::audit::{AuditActor, FileAuditLog, SourceLayer};
+#[cfg(test)]
+use crate::audit::{AuditEvent, AuditEventRecord, AuditSink, AuditSubject};
 use crate::calibration::CalibrationControlStore;
 use crate::config::{
     derive_tape_pool_from_voltag, load_config, parse_config_toml, validate_trusted_volume_paths,
@@ -24,45 +28,11 @@ use crate::config::{
 use crate::error::StateError;
 use crate::index::{
     AdoptBootstrapIdentityInput, AdoptBootstrapIdentityOutcome, AdoptedTapeState,
-    AuditReplayReport, CatalogIndex, CatalogResetPreservedTape, ProvisionTapeInput, RebuildReport,
-    RetireTapeInput, RetireTapeOutcome, TapeIoFenceRecord, TapeJournalIndexReport, TapeKindFilter,
-    TapePoolProjectionInput, TapeRecord,
+    AuditReplayReport, CatalogIndex, ProvisionTapeInput, RebuildReport, RetireTapeInput,
+    RetireTapeOutcome, TapeIoFenceRecord, TapeJournalIndexReport, TapeRecord,
 };
 use crate::lock::StateLockGuard;
 use crate::paths::StatePaths;
-
-/// Common replay schema for provisioning, reassignment and explicit unassignment.
-fn pool_assignment_event(
-    uuid: [u8; 16],
-    pool: Option<&str>,
-    generation: u64,
-    source: &str,
-) -> AuditEventRecord {
-    AuditEventRecord {
-        actor: AuditActor::local_user(),
-        source_layer: SourceLayer::Layer4,
-        operation_id: None,
-        session_id: None,
-        idempotency_key: None,
-        event: AuditEvent::TapePoolAssigned,
-        subject: AuditSubject {
-            kind: "tape".into(),
-            id: Some(hex_tape_uuid(uuid)),
-        },
-        detail: BTreeMap::from([
-            (
-                "pool_id".into(),
-                pool.map(|p| CborValue::Text(p.into()))
-                    .unwrap_or(CborValue::Null),
-            ),
-            (
-                "assignment_generation".into(),
-                CborValue::Integer(generation.into()),
-            ),
-            ("assignment_source".into(), CborValue::Text(source.into())),
-        ]),
-    }
-}
 
 /// Open Layer 4 state owner.
 #[derive(Debug)]
@@ -70,8 +40,8 @@ pub struct StateHandle {
     paths: StatePaths,
     config: RemConfig,
     config_warnings: Vec<StateConfigWarning>,
-    _lock: StateLockGuard,
-    audit: FileAuditLog,
+    _lock: std::sync::Arc<StateLockGuard>,
+    library: crate::library_runtime::LibraryRuntime,
     catalog: crate::ProjectionClient,
     index: CatalogIndex,
     calibration: CalibrationControlStore,
@@ -243,7 +213,7 @@ pub enum CatalogResetTapeState {
 /// Read-only, all-kinds catalog admission report for a proposed scoped reset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogResetPreflightReport {
-    /// SQLite schema version from which reset admission evidence was read.
+    /// Compatibility field, always zero: reset never opens SQL as inventory.
     pub source_schema_version: u32,
     /// Stable admission token over config, selectors, and source evidence.
     pub preflight_token: String,
@@ -290,7 +260,7 @@ pub struct CatalogResetPreflightPaths {
 }
 
 /// Typed all-kinds tape row returned by catalog-reset preflight.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CatalogResetPreflightTape {
     /// Exact tape UUID.
     pub tape_uuid: [u8; 16],
@@ -431,90 +401,58 @@ impl StateHandle {
         preserve_tape_voltags: &[String],
         allow_erase_tape_voltags: &[String],
     ) -> Result<CatalogResetPreflightReport, StateError> {
-        let preserve = validate_catalog_reset_selectors(preserve_tape_voltags, "preserve")?;
-        let allow_erase =
-            validate_catalog_reset_selectors(allow_erase_tape_voltags, "allow-erase")?;
-        validate_disjoint_catalog_reset_allowlists(&preserve, &allow_erase)?;
-        let config_path = config_path.as_ref();
-        let config = load_config(config_path)?;
-        let paths = StatePaths::from_config(config_path, &config);
-        let _lock = StateLockGuard::acquire(&paths.state_dir)?;
-        let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(config_path)?;
-        ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
-        let (mut report, _, output_is_clean) = preflight_catalog_reset_source(
-            &paths,
-            &locked_config,
-            &config_bytes,
-            &preserve,
-            &allow_erase,
-        )?;
-        if let Some((stored_request, stored_token, stored_output)) =
-            catalog_reset_fence_evidence(&paths)?
-        {
-            let expected_request = catalog_reset_request_digest(
-                &paths,
-                &config_bytes,
-                &preserve,
-                &allow_erase,
-                false,
-                &stored_token,
-            )?;
-            if stored_request != expected_request {
-                return Err(StateError::CatalogResetInProgress(
-                    "durable fence does not match this preflight request".to_string(),
-                ));
-            }
-            if report.preflight_token != stored_token
-                && (!output_is_clean
-                    || catalog_reset_current_output_token(&report.tapes) != stored_output)
-            {
-                return Err(StateError::CatalogResetInProgress(
-                    "catalog source changed during an interrupted reset".to_string(),
-                ));
-            }
-            report.preflight_token = stored_token;
-            report.request_digest = stored_request;
-            report.resume_exact = true;
-        } else {
-            report.request_digest = catalog_reset_request_digest(
-                &paths,
-                &config_bytes,
-                &preserve,
-                &allow_erase,
-                false,
-                &report.preflight_token,
-            )?;
-        }
-        Ok(report)
+        authority_reset::preflight(
+            config_path.as_ref(),
+            preserve_tape_voltags,
+            allow_erase_tape_voltags,
+        )
     }
 
     /// Open state with already-resolved paths and a parsed config.
     pub fn open_with_config(paths: StatePaths, config: RemConfig) -> Result<Self, StateError> {
-        let lock = StateLockGuard::acquire(&paths.state_dir)?;
+        crate::authority_manifest::AuthorityManifest::preflight(&paths)?;
+        let lock = std::sync::Arc::new(StateLockGuard::acquire(&paths.state_dir)?);
         ensure_no_catalog_reset_fence(&paths)?;
         ensure_state_directories(&paths)?;
         crate::authority_layout::admit(&paths)?;
         create_private_dir(&paths.journal_dir.join("tapes"))?;
         validate_trusted_volume_paths(&config)?;
-        let audit = FileAuditLog::open_with_clock_forward_tolerance(
-            &paths.audit_dir,
-            config.audit.fsync,
-            Some(Duration::seconds(
-                config.audit.clock_forward_tolerance_seconds as i64,
-            )),
-        )?;
-        let catalog = crate::projector::open(&paths.sqlite_path)?;
-        let mut index = catalog.write_handle();
-        crate::fence::reconcile(&mut index, &paths.audit_dir)?;
-        let config_warnings = project_configured_tape_pools(&mut index, &config)?;
-        index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
+        let library =
+            crate::library_runtime::LibraryRuntime::open(&paths, config.audit.fsync, lock.clone())
+                .map_err(|e| StateError::ConfigInvalid(e.to_string()))?;
+        let mut accepted = authority_reset::configuration_record(&config)?;
+        let prior_configuration = library.configuration();
+        if let Some(prior) = &prior_configuration {
+            accepted.generation = prior.generation;
+        }
+        if prior_configuration.as_ref() != Some(&accepted) {
+            accepted.generation = prior_configuration.map_or(Ok(1), |v| {
+                v.generation.checked_add(1).ok_or_else(|| {
+                    StateError::ConfigInvalid("configuration generation exhausted".into())
+                })
+            })?;
+            library
+                .append(|a, view| {
+                    a.configuration_accepted(
+                        accepted,
+                        AuditActor::System,
+                        SourceLayer::Layer4,
+                        view,
+                    )
+                })
+                .map_err(|e| StateError::ConfigInvalid(e.to_string()))?;
+        }
+        let catalog =
+            crate::projector::open(&paths.sqlite_path)?.with_library_runtime(library.clone());
+        let index = catalog.write_handle();
+        let config_warnings = configured_tape_pool_warnings(&config);
         let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
         Ok(Self {
             paths,
             config,
             config_warnings,
             _lock: lock,
-            audit,
+            library,
             catalog,
             index,
             calibration,
@@ -526,23 +464,7 @@ impl StateHandle {
         paths: StatePaths,
         config: RemConfig,
     ) -> Result<(), StateError> {
-        let _lock = StateLockGuard::acquire(&paths.state_dir)?;
-        let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(&paths.config_path)?;
-        ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
-        let token = "0".repeat(64);
-        let request_digest =
-            catalog_reset_request_digest(&paths, &config_bytes, &[], &[], true, &token)?;
-        reset_catalog_locked(
-            &paths,
-            &locked_config,
-            &[],
-            CatalogResetAdmission {
-                request_digest: &request_digest,
-                preflight_token: &token,
-                output_token: &token,
-                source_schema_version: None,
-            },
-        )
+        authority_reset::execute(paths, config, &[], &[], None, true).map(|_| ())
     }
 
     /// Scoped counterpart of [`Self::reset_catalog_with_config`] for callers
@@ -584,133 +506,14 @@ impl StateHandle {
         allow_erase_tape_voltags: &[String],
         expected_preflight_token: Option<&str>,
     ) -> Result<CatalogResetReport, StateError> {
-        let preserve = validate_catalog_reset_selectors(preserve_tape_voltags, "preserve")?;
-        let allow_erase =
-            validate_catalog_reset_selectors(allow_erase_tape_voltags, "allow-erase")?;
-        validate_disjoint_catalog_reset_allowlists(&preserve, &allow_erase)?;
-        let _lock = StateLockGuard::acquire(&paths.state_dir)?;
-        let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(&paths.config_path)?;
-        ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
-        let (preflight, preserved_tapes, output_is_clean) = preflight_catalog_reset_source(
-            &paths,
-            &locked_config,
-            &config_bytes,
-            &preserve,
-            &allow_erase,
-        )?;
-        let mut already_swapped = false;
-        let (token, output_token) = if let Some((stored_request, stored_token, stored_output)) =
-            catalog_reset_fence_evidence(&paths)?
-        {
-            if expected_preflight_token.is_some_and(|expected| expected != stored_token) {
-                return Err(StateError::CatalogResetInProgress(
-                    "expected preflight token does not match the durable reset fence".to_string(),
-                ));
-            }
-            let request = catalog_reset_request_digest(
-                &paths,
-                &config_bytes,
-                &preserve,
-                &allow_erase,
-                false,
-                &stored_token,
-            )?;
-            if request != stored_request {
-                return Err(StateError::CatalogResetInProgress(
-                    "durable fence does not match this reset request".to_string(),
-                ));
-            }
-            if preflight.preflight_token != stored_token
-                && (!output_is_clean
-                    || catalog_reset_current_output_token(&preflight.tapes) != stored_output)
-            {
-                return Err(StateError::CatalogResetInProgress(
-                    "catalog source changed during an interrupted reset".to_string(),
-                ));
-            }
-            already_swapped = preflight.preflight_token != stored_token;
-            (stored_token, stored_output)
-        } else {
-            if expected_preflight_token
-                .is_some_and(|expected| expected != preflight.preflight_token)
-            {
-                return Err(StateError::ConfigInvalid(
-                    "catalog reset source changed after preflight; run preflight again".to_string(),
-                ));
-            }
-            let intended_output =
-                catalog_reset_intended_output_token(&preflight.tapes, &preserved_tapes)?;
-            (preflight.preflight_token.clone(), intended_output)
-        };
-        let request_digest = catalog_reset_request_digest(
-            &paths,
-            &config_bytes,
-            &preserve,
-            &allow_erase,
+        authority_reset::execute(
+            paths,
+            config,
+            preserve_tape_voltags,
+            allow_erase_tape_voltags,
+            expected_preflight_token,
             false,
-            &token,
-        )?;
-        if already_swapped {
-            reset_helper_tripwire();
-            record_catalog_reset_boundary(&paths, &request_digest)?;
-            sync_regular_file(&paths.sqlite_path)?;
-            if let Some(parent) = paths.sqlite_path.parent() {
-                sync_directory(parent)?;
-            }
-            sync_directory(&paths.audit_dir)?;
-            sync_directory(&paths.journal_dir)?;
-            sync_directory(&paths.tape_cache_dir)?;
-            crate::authority_layout::install(&paths, true)?;
-            clear_catalog_reset_fence(&paths)?;
-            let preserve_set = preserve.iter().map(String::as_str).collect::<HashSet<_>>();
-            return Ok(CatalogResetReport {
-                preserved_tapes: preflight
-                    .tapes
-                    .into_iter()
-                    .filter_map(|tape| {
-                        let voltag = tape.voltag?;
-                        preserve_set
-                            .contains(voltag.as_str())
-                            .then(|| CatalogResetTapeReport {
-                                tape_uuid: tape.tape_uuid,
-                                voltag,
-                                pool_id: tape.pool_id,
-                                state: if tape.state == "ready" {
-                                    CatalogResetTapeState::Ready
-                                } else {
-                                    CatalogResetTapeState::RecoveryRequired
-                                },
-                            })
-                    })
-                    .collect(),
-            });
-        }
-        reset_catalog_locked(
-            &paths,
-            &locked_config,
-            &preserved_tapes,
-            CatalogResetAdmission {
-                request_digest: &request_digest,
-                preflight_token: &token,
-                output_token: &output_token,
-                source_schema_version: Some(preflight.source_schema_version),
-            },
-        )?;
-        Ok(CatalogResetReport {
-            preserved_tapes: preserved_tapes
-                .into_iter()
-                .map(|tape| CatalogResetTapeReport {
-                    tape_uuid: tape.tape_uuid,
-                    voltag: tape.voltag,
-                    pool_id: tape.pool_id,
-                    state: if tape.restore_ready {
-                        CatalogResetTapeState::Ready
-                    } else {
-                        CatalogResetTapeState::RecoveryRequired
-                    },
-                })
-                .collect(),
-        })
+        )
     }
 
     /// Return parsed operator config.
@@ -728,26 +531,11 @@ impl StateHandle {
         &self.paths
     }
 
-    /// Return the mutable audit sink.
-    pub fn audit(&mut self) -> &mut dyn AuditSink {
-        &mut self.audit
-    }
-
-    /// Reopen the audit sink after a coordinated external append.
-    ///
-    /// `FileAuditLog` caches the next sequence and previous hash. A caller
-    /// holding this exclusive state handle may use a separately opened log to
-    /// force-fsync a recovery fact; it must refresh this cursor before any
-    /// later append through [`Self::audit`].
-    pub fn refresh_audit_append_cursor(&mut self) -> Result<(), StateError> {
-        self.audit = FileAuditLog::open_with_clock_forward_tolerance(
-            &self.paths.audit_dir,
-            self.config.audit.fsync,
-            Some(Duration::seconds(
-                self.config.audit.clock_forward_tolerance_seconds as i64,
-            )),
-        )?;
-        Ok(())
+    /// Compatibility catch-up after an external typed producer completes.
+    pub fn catch_up_authority_projection(&mut self) -> Result<(), StateError> {
+        self.library
+            .catch_up()
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))
     }
 
     /// Read the catalog through the state's existing handle.
@@ -763,6 +551,11 @@ impl StateHandle {
     /// Share the projector owner with standalone drive actors.
     pub fn projection_client(&self) -> crate::ProjectionClient {
         self.catalog.clone()
+    }
+
+    /// Share the one manifest-bound library authority with actors and operators.
+    pub fn library_runtime(&self) -> crate::library_runtime::LibraryRuntime {
+        self.library.clone()
     }
 
     /// Provision or reprovision one tape while coordinating any old physical
@@ -812,47 +605,130 @@ impl StateHandle {
                 })
             })
             .transpose()?;
-        self.index.provision_replacing_media(
-            input,
-            provenance,
-            observation,
-            previous_uuid,
-            false,
-        )?;
+        use crate::library_log as lib;
+        let observation = observation.ok_or_else(|| StateError::TapeProvisionConflict(
+            "Reprovision requires recorded medium family; provisioning without generation awaits a representation ruling".into()))?;
+        let medium = lib::MediumSpec {
+            family: lib::MediumFamily::Lto(observation.generation),
+            usable_logical_bytes: observation.generation.raw_capacity_bytes(),
+            record_size: input.block_size,
+            rerecord: true,
+            lifecycle_ops: true,
+            source: observation.source,
+        };
+        // A replacing producer must retire its predecessor explicitly. Do not
+        // manufacture an identity from the old SQL row to make this append pass.
+        let predecessor = previous_uuid
+            .map(|uuid| {
+                self.library
+                    .tape_state(uuid)
+                    .filter(|t| t.retired)
+                    .map(|t| t.tape)
+                    .ok_or_else(|| {
+                        StateError::TapeProvisionConflict(
+                            "Reprovision predecessor must be retired in library authority".into(),
+                        )
+                    })
+            })
+            .transpose()?;
+        let pool = derive_tape_pool_from_voltag(&input.voltag, &self.config.tape_pool_rules)
+            .map(Into::into);
+        let parity_scheme = match input.parity {
+            remanence_parity::ParityConfig::None => None,
+            remanence_parity::ParityConfig::Scheme(scheme) => Some(lib::ParityScheme {
+                id: scheme.id.as_str().into(),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            }),
+        };
+        self.library
+            .append(|authority, view| {
+                authority.reprovision(
+                    lib::Reprovision {
+                        tape: lib::TapeRef {
+                            uuid: input.tape_uuid,
+                            incarnation: 1,
+                        },
+                        predecessor,
+                        mode: lib::ProvisionMode::Initialize,
+                        label: Some(input.voltag.as_str().into()),
+                        label_provenance: Some(match provenance {
+                            crate::LabelProvenance::Changer => lib::LabelProvenance::Changer,
+                            crate::LabelProvenance::Operator => lib::LabelProvenance::Operator,
+                        }),
+                        parity_scheme,
+                        medium,
+                        pool,
+                        endpoint: None,
+                        adoption: None,
+                    },
+                    AuditActor::local_user(),
+                    SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
         if let Some(prior_uuid) = prior_uuid_to_evict {
             self.calibration.record_map_evicted(prior_uuid)?;
         }
         Ok(())
     }
 
-    /// Assign or unassign through the existing guarded ledger transaction.
-    /// The audit record is fsynced before SQLite commits; replay completes a
-    /// crash between those steps. A refused setter never appends authority.
+    /// Assign or unassign under native admission and typed generation checks.
+    /// The library record is durable before projection; replay completes an
+    /// interrupted projection. A refused setter never appends authority.
     pub fn assign_tape_pool(
         &mut self,
         tape_uuid: [u8; 16],
         expected_generation: u64,
         pool_id: Option<&str>,
     ) -> Result<crate::TapeAssignmentSnapshot, StateError> {
-        self.replay_audit_projection()?;
-        let mut log = FileAuditLog::open(&self.paths.audit_dir, true)?;
-        let result = self.index.compare_and_set_tape_pool_assignment_with_audit(
+        use crate::library_log as lib;
+        let tape = self.library.tape_state(tape_uuid).ok_or_else(|| {
+            StateError::TapePoolAssignmentConflict("tape has no Reprovision authority".into())
+        })?;
+        if pool_id.is_some_and(|id| !self.config.tape_pools.iter().any(|p| p.id == id)) {
+            return Err(StateError::TapePoolAssignmentConflict(
+                "pool is not configured".into(),
+            ));
+        }
+        let authority = crate::TapeAuthority::open(
+            self.paths.journal_dir.join("tapes"),
             tape_uuid,
-            expected_generation,
-            pool_id,
-            "operator",
-            |snapshot| {
-                log.append(pool_assignment_event(
-                    tape_uuid,
-                    snapshot.pool_id.as_deref(),
-                    snapshot.assignment_generation,
-                    "operator",
-                ))?;
-                Ok(())
-            },
-        );
-        self.refresh_audit_append_cursor()?;
-        result
+            &self.paths.sqlite_path,
+        )?;
+        let owner = authority.acquire_exclusive()?;
+        self.library
+            .append_identity(&[&owner], |a, v, native| {
+                a.assign_pool(
+                    lib::AssignPool {
+                        tape: tape.tape,
+                        pool: pool_id.map(Into::into),
+                        change: lib::GenerationChange {
+                            expected: expected_generation,
+                            next: 0,
+                        },
+                        source: lib::AssignmentSource::Operator,
+                        configuration: None,
+                    },
+                    expected_generation,
+                    native,
+                    AuditActor::local_user(),
+                    SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .map_err(|e| StateError::TapePoolAssignmentConflict(e.to_string()))?;
+        let current = self
+            .library
+            .tape_state(tape_uuid)
+            .ok_or_else(|| StateError::IndexCorrupt("assigned identity disappeared".into()))?;
+        Ok(crate::TapeAssignmentSnapshot {
+            tape_uuid: tape_uuid.to_vec(),
+            pool_id: current.pool.map(|v| v.as_str().into()),
+            assignment_generation: current.assignment_generation,
+        })
     }
 
     /// Record a pool projection already established by provisioning/rules using
@@ -861,15 +737,21 @@ impl StateHandle {
         &mut self,
         tape_uuid: [u8; 16],
     ) -> Result<(), StateError> {
-        let tape = self.index.get_tape(&tape_uuid)?.ok_or_else(|| {
-            StateError::TapePoolAssignmentConflict("cannot audit an unknown tape".into())
+        let tape = self.library.tape_state(tape_uuid).ok_or_else(|| {
+            StateError::TapePoolAssignmentConflict("tape has no Reprovision authority".into())
         })?;
-        self.append_metadata_authority(pool_assignment_event(
-            tape_uuid,
-            tape.pool_id.as_deref(),
-            tape.assignment_generation,
-            "rule",
-        ))
+        let expected = tape.label.as_ref().and_then(|label| {
+            derive_tape_pool_from_voltag(label.as_str(), &self.config.tape_pool_rules)
+        });
+        if tape.pool.as_ref().map(|pool| pool.as_str()) != expected {
+            return Err(StateError::TapePoolAssignmentConflict(
+                "rule assignment changed; publish explicit AssignPool under current configuration"
+                    .into(),
+            ));
+        }
+        // Initial rule assignment is already part of Reprovision's atomic
+        // identity snapshot. Never import a later SQL row as another authority.
+        Ok(())
     }
 
     /// Persist a BOT-proven cartridge's correction before projecting its cache.
@@ -879,43 +761,41 @@ impl StateHandle {
         tape_uuid: [u8; 16],
         observation: crate::MediaObservation,
     ) -> Result<(), StateError> {
-        self.replay_audit_projection()?;
-        if self.index.get_tape(&tape_uuid)?.is_none() {
-            return Err(StateError::TapeProvisionConflict(
-                "cannot set generation for an unknown tape".into(),
-            ));
-        }
-        self.append_metadata_authority(AuditEventRecord {
-            actor: AuditActor::local_user(),
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::TapeGenerationChanged,
-            subject: AuditSubject {
-                kind: "tape".into(),
-                id: Some(hex_tape_uuid(tape_uuid)),
-            },
-            detail: BTreeMap::from([
-                (
-                    "cartridge_generation".into(),
-                    CborValue::Text(observation.generation.media_code().into()),
-                ),
-                (
-                    "generation_source".into(),
-                    CborValue::Text(observation.source.as_str().into()),
-                ),
-            ]),
+        use crate::library_log as lib;
+        let tape = self.library.tape_state(tape_uuid).ok_or_else(|| {
+            StateError::TapeProvisionConflict("tape has no Reprovision authority".into())
         })?;
-        self.replay_audit_projection()?;
+        let mut medium = tape.medium.clone();
+        medium.family = lib::MediumFamily::Lto(observation.generation);
+        medium.usable_logical_bytes = observation.generation.raw_capacity_bytes();
+        medium.source = observation.source;
+        if medium == tape.medium {
+            return Ok(());
+        }
+        self.library
+            .append(|authority, view| {
+                authority.medium_spec_set(
+                    lib::MediumSpecSet {
+                        tape: tape.tape,
+                        medium,
+                        change: lib::GenerationChange {
+                            expected: tape.media_revision,
+                            next: tape.media_revision.checked_add(1).ok_or({
+                                lib::AuthorityError::Store(lib::store::StoreError::Fold(
+                                    lib::FoldError::Sequence,
+                                ))
+                            })?,
+                        },
+                    },
+                    tape.media_revision,
+                    observation.source,
+                    AuditActor::local_user(),
+                    SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
         Ok(())
-    }
-
-    /// Authoritative metadata survives even when ordinary audit fsync is disabled.
-    fn append_metadata_authority(&mut self, record: AuditEventRecord) -> Result<(), StateError> {
-        let mut log = FileAuditLog::open(&self.paths.audit_dir, true)?;
-        log.append(record)?;
-        self.refresh_audit_append_cursor()
     }
 
     /// Rebind a shell label after the caller proves the target BOT identity.
@@ -926,43 +806,71 @@ impl StateHandle {
         label: &str,
         previous_uuid: [u8; 16],
     ) -> Result<(), StateError> {
-        let records = FileAuditLog::replay(&self.paths.audit_dir)?;
-        self.index.replay_audit_records(&records)?;
-        self.index
-            .preview_label_rebind(tape_uuid, label, previous_uuid)?;
-        self.audit.append(AuditEventRecord {
-            actor: AuditActor::local_user(),
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::TapeLabelRebound,
-            subject: AuditSubject {
-                kind: "tape".into(),
-                id: Some(hex_tape_uuid(tape_uuid)),
-            },
-            detail: BTreeMap::from([
-                ("voltag".into(), CborValue::Text(label.into())),
-                (
-                    "previous_uuid".into(),
-                    CborValue::Bytes(previous_uuid.to_vec()),
-                ),
-                ("voltag_source".into(), CborValue::Text("operator".into())),
-            ]),
+        use crate::library_log as lib;
+        let tape = self.library.tape_state(tape_uuid).ok_or_else(|| {
+            StateError::TapeProvisionConflict("target has no Reprovision authority".into())
         })?;
-        self.replay_audit_projection()?;
+        let prior = self.library.tape_state(previous_uuid).ok_or_else(|| {
+            StateError::TapeProvisionConflict("prior holder has no Reprovision authority".into())
+        })?;
+        if tape_uuid == previous_uuid || prior.label.as_ref().map(|v| v.as_str()) != Some(label) {
+            return Err(StateError::TapeProvisionConflict(
+                "label prior holder differs from BOT-proven correction".into(),
+            ));
+        }
+        let target_authority = crate::TapeAuthority::open(
+            self.paths.journal_dir.join("tapes"),
+            tape_uuid,
+            &self.paths.sqlite_path,
+        )?;
+        let prior_authority = crate::TapeAuthority::open(
+            self.paths.journal_dir.join("tapes"),
+            previous_uuid,
+            &self.paths.sqlite_path,
+        )?;
+        let target_owner = target_authority.acquire_exclusive()?;
+        let prior_owner = prior_authority.acquire_exclusive()?;
+        self.library
+            .append_identity(&[&target_owner, &prior_owner], |a, v, native| {
+                a.label(
+                    lib::Label {
+                        tape: tape.tape,
+                        label: Some(label.into()),
+                        provenance: lib::LabelProvenance::Operator,
+                        change: lib::GenerationChange {
+                            expected: tape.label_generation,
+                            next: 0,
+                        },
+                        prior_holder: Some(lib::PriorHolder {
+                            tape: prior.tape,
+                            change: lib::GenerationChange {
+                                expected: prior.label_generation,
+                                next: prior.label_generation.checked_add(1).ok_or({
+                                    lib::AuthorityError::Store(lib::store::StoreError::Fold(
+                                        lib::FoldError::GenerationMismatch,
+                                    ))
+                                })?,
+                            },
+                        }),
+                        observed_bot_uuid: Some(tape_uuid),
+                    },
+                    tape.label_generation,
+                    native,
+                    AuditActor::local_user(),
+                    SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
         Ok(())
     }
 
     /// Durably adopt a checksum-valid BOT Bootstrap as identity-only state.
     ///
-    /// Existing adoption audit is replayed before preview. An exact
-    /// identity-only projection may be returned as a no-op even when a later
-    /// physical recheck uses a fresh operation UUID. Reusing one operation UUID
-    /// for changed facts still conflicts. For a new identity, the audit record
-    /// is fsynced before the SQLite projection; a crash in between is completed
-    /// by the same replay-before-preview sequence on the next invocation. No
-    /// tape-file or Object authority is created.
+    /// Authenticated Reprovision and current native/library state prove an exact
+    /// identity-only retry, including fresh operation UUIDs. Changed immutable
+    /// facts or evolved authority refuse. The shared writer syncs the source
+    /// before projection; retries rebuild derived SQL without importing it.
     pub fn adopt_bootstrap_identity(
         &mut self,
         input: AdoptBootstrapIdentityInput,
@@ -1034,210 +942,166 @@ impl StateHandle {
             state,
             geometry.as_str(),
         );
-        let records = FileAuditLog::replay(&self.paths.audit_dir)?;
-        self.index.replay_audit_records(&records)?;
-        let tape_subject = hex_tape_uuid(input.tape_uuid);
-        let tape_display = uuid::Uuid::from_bytes(input.tape_uuid);
-        let mut matching_operation_authority = false;
-        let mut tape_adoption_authority = false;
-        let mut tape_adoption_generation = None;
-        for record in &records {
-            let operation_match = record.operation_id == Some(input.operation_id);
-            let tape_match = record.event == AuditEvent::TapeIdentityAdopted
-                && record.subject.kind == "tape"
-                && record.subject.id.as_deref() == Some(tape_subject.as_str());
-            if tape_match {
-                tape_adoption_authority = true;
-                let recorded_generation = record
-                    .detail
-                    .get("assignment_generation")
-                    .and_then(|value| match value {
-                        CborValue::Integer(value) => u64::try_from(i128::from(*value)).ok(),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        StateError::IndexCorrupt(format!(
-                            "TapeIdentityAdopted record {} has no valid assignment generation",
-                            record.record_uuid
-                        ))
-                    })?;
-                if tape_adoption_generation
-                    .replace(recorded_generation)
-                    .is_some_and(|prior| prior != recorded_generation)
-                {
-                    return Err(StateError::IndexCorrupt(format!(
-                        "tape {tape_display} has conflicting adoption assignment generations"
-                    )));
-                }
+        use crate::library_log as lib;
+        let observation = input.observation.ok_or_else(|| StateError::TapeProvisionConflict(
+            "Reprovision adoption requires recorded medium family; unknown-generation adoption awaits a representation ruling".into()))?;
+        let parity_scheme = match &input.parity {
+            remanence_parity::ParityConfig::None => None,
+            remanence_parity::ParityConfig::Scheme(scheme) => Some(lib::ParityScheme {
+                id: scheme.id.as_str().into(),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            }),
+        };
+        let physical_tail = match evidence.physical_tail {
+            BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod => {
+                lib::PhysicalTail::ExactBootstrapFilemarkEod
             }
-            if !operation_match {
-                continue;
+            BootstrapAdoptionTailEvidence::DataAfterBootstrap => {
+                lib::PhysicalTail::DataAfterBootstrap
             }
-            if record.event != AuditEvent::TapeIdentityAdopted || !tape_match {
-                return Err(StateError::TapeProvisionConflict(format!(
-                    "operation {} is already bound to a different recorded action",
-                    input.operation_id
-                )));
-            }
-            let recorded_fingerprint = record
-                .detail
-                .get("request_fingerprint")
-                .and_then(|value| match value {
-                    CborValue::Bytes(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).ok(),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    StateError::IndexCorrupt(format!(
-                        "TapeIdentityAdopted record {} has no valid request fingerprint",
-                        record.record_uuid
-                    ))
-                })?;
-            if recorded_fingerprint != request_fingerprint {
-                return Err(StateError::TapeProvisionConflict(format!(
-                    "bootstrap adoption operation {} was reused with changed immutable facts",
-                    input.operation_id
-                )));
-            }
-            matching_operation_authority = true;
-        }
-        let preview = self.index.preview_bootstrap_identity_adoption(
-            &input,
-            pool_id.as_str(),
-            state,
-            request_fingerprint,
-        )?;
-        if matching_operation_authority || tape_adoption_authority {
-            let outcome = preview.ok_or_else(|| {
-                StateError::IndexCorrupt(format!(
-                    "adoption audit for tape {tape_display} did not project its identity"
-                ))
-            })?;
-            if tape_adoption_generation != Some(outcome.assignment_generation) {
-                return Err(StateError::TapeProvisionConflict(format!(
-                    "Bootstrap identity {tape_display} assignment generation evolved after adoption"
-                )));
-            }
-            return Ok(outcome);
-        }
-        let projected_assignment_generation = preview
-            .as_ref()
-            .map(|outcome| outcome.assignment_generation)
-            .unwrap_or(1);
-        let mut detail = BTreeMap::from([
-            (
-                "voltag".to_string(),
-                input
-                    .voltag
-                    .clone()
-                    .map(CborValue::Text)
-                    .unwrap_or(CborValue::Null),
-            ),
-            ("pool_id".to_string(), CborValue::Text(pool_id.clone())),
-            (
-                "block_size".to_string(),
-                CborValue::Integer(input.block_size.into()),
-            ),
-            ("geometry".to_string(), CborValue::Text(geometry)),
-            (
-                "request_fingerprint".to_string(),
-                CborValue::Bytes(request_fingerprint.to_vec()),
-            ),
-            (
-                "state".to_string(),
-                CborValue::Text(state.as_str().to_string()),
-            ),
-            (
-                "assignment_generation".to_string(),
-                CborValue::Integer(projected_assignment_generation.into()),
-            ),
-            (
-                "endpoint_key".into(),
-                CborValue::Text(evidence.endpoint.encode()),
-            ),
-            (
-                "drive_serial".to_string(),
-                CborValue::Text(evidence.drive_serial),
-            ),
-            (
-                "bootstrap_drive_compression".to_string(),
-                CborValue::Bool(evidence.bootstrap_drive_compression),
-            ),
-            (
-                "configured_drive_compression".to_string(),
-                CborValue::Bool(evidence.configured_drive_compression),
-            ),
-            (
-                "physical_tail".to_string(),
-                CborValue::Text(evidence.physical_tail.as_str().to_string()),
-            ),
-        ]);
-        if let crate::DriveKey::Bay {
-            library_serial,
-            bay,
-        } = &evidence.endpoint
+            BootstrapAdoptionTailEvidence::MissingFilemark => lib::PhysicalTail::MissingFilemark,
+            BootstrapAdoptionTailEvidence::ExtraFilemark => lib::PhysicalTail::ExtraFilemark,
+            BootstrapAdoptionTailEvidence::Ambiguous => lib::PhysicalTail::Ambiguous,
+        };
+        if self.calibration.row(input.tape_uuid).state
+            == crate::calibration::VolumeCalibrationState::Calibrated
         {
-            detail.insert(
-                "library_serial".into(),
-                CborValue::Text(library_serial.clone()),
-            );
-            detail.insert("drive_element".into(), CborValue::Integer((*bay).into()));
-            detail.insert(
-                "library_revision".into(),
-                CborValue::Text(
-                    evidence
-                        .library_revision
-                        .clone()
-                        .expect("validated Bay revision"),
-                ),
-            );
-            detail.insert(
-                "home_slot".into(),
-                CborValue::Integer(evidence.home_slot.expect("validated Bay slot").into()),
-            );
+            return Err(StateError::TapeProvisionConflict(
+                "Bootstrap identity has a calibrated wrap map".into(),
+            ));
         }
-        detail.insert("media_observation_recorded".into(), CborValue::Bool(true));
-        detail.insert(
-            "voltag_source".into(),
-            CborValue::Text(input.label_provenance.as_str().into()),
-        );
-        detail.insert(
-            "assignment_source".into(),
-            CborValue::Text(
-                if input.pool_id.is_some() {
-                    "operator"
-                } else {
-                    "rule"
-                }
-                .into(),
-            ),
-        );
-        if let Some(observation) = input.observation {
-            detail.insert(
-                "cartridge_generation".into(),
-                CborValue::Text(observation.generation.media_code().into()),
-            );
-            detail.insert(
-                "generation_source".into(),
-                CborValue::Text(observation.source.as_str().into()),
-            );
-        }
-        detail.insert("identity_only".to_string(), CborValue::Bool(true));
-        self.audit.append(AuditEventRecord {
-            actor: AuditActor::local_user(),
-            source_layer: SourceLayer::Layer4,
-            operation_id: Some(input.operation_id),
-            session_id: None,
-            idempotency_key: Some(input.operation_id),
-            event: AuditEvent::TapeIdentityAdopted,
-            subject: AuditSubject {
-                kind: "tape".to_string(),
-                id: Some(tape_subject),
-            },
-            detail,
-        })?;
-
-        self.index
-            .adopt_bootstrap_identity(input, pool_id.as_str(), state, request_fingerprint)
+        let newly_adopted = self
+            .library
+            .adopt_identity(
+                lib::Reprovision {
+                    tape: lib::TapeRef {
+                        uuid: input.tape_uuid,
+                        incarnation: 1,
+                    },
+                    predecessor: None,
+                    mode: lib::ProvisionMode::Adopt,
+                    label: input.voltag.as_deref().map(Into::into),
+                    label_provenance: input.voltag.as_ref().map(|_| match input.label_provenance {
+                        crate::LabelProvenance::Changer => lib::LabelProvenance::Changer,
+                        crate::LabelProvenance::Operator => lib::LabelProvenance::Operator,
+                    }),
+                    parity_scheme,
+                    medium: lib::MediumSpec {
+                        family: lib::MediumFamily::Lto(observation.generation),
+                        usable_logical_bytes: observation.generation.raw_capacity_bytes(),
+                        record_size: input.block_size,
+                        rerecord: true,
+                        lifecycle_ops: true,
+                        source: observation.source,
+                    },
+                    pool: Some(pool_id.as_str().into()),
+                    endpoint: Some(match &evidence.endpoint {
+                        crate::DriveKey::Bay {
+                            library_serial,
+                            bay,
+                        } => lib::DriveKey::Bay(lib::Bay {
+                            library_serial: library_serial.as_str().into(),
+                            bay: *bay,
+                        }),
+                        crate::DriveKey::Standalone { drive_serial } => {
+                            lib::DriveKey::Standalone(lib::Standalone {
+                                drive_serial: drive_serial.as_str().into(),
+                            })
+                        }
+                    }),
+                    adoption: Some(lib::Adoption {
+                        request_fingerprint,
+                        operation: *input.operation_id.as_bytes(),
+                        idempotency_key: *input.operation_id.as_bytes(),
+                        physical_tail,
+                        state: match state {
+                            AdoptedTapeState::Ready => lib::AdoptedState::Ready,
+                            AdoptedTapeState::RecoveryRequired => {
+                                lib::AdoptedState::RecoveryRequired
+                            }
+                        },
+                        library_revision: evidence.library_revision.as_deref().map(Into::into),
+                        home_slot: evidence.home_slot,
+                        drive_serial: evidence.drive_serial.as_str().into(),
+                        identity_only: true,
+                        bootstrap_drive_compression: evidence.bootstrap_drive_compression,
+                        configured_drive_compression: evidence.configured_drive_compression,
+                    }),
+                },
+                |original| {
+                    let Some(prior) = &original.adoption else {
+                        return false;
+                    };
+                    let Some(endpoint) = &original.endpoint else {
+                        return false;
+                    };
+                    // A new physical check may observe another placement or tail with
+                    // the same adopted state. Reconstruct the original ceremony with
+                    // the current identity/pool intent; its authenticated fingerprint
+                    // proves that intent without importing a SQL assignment source.
+                    let original_evidence = BootstrapAdoptionEvidence {
+                        endpoint: match endpoint {
+                            lib::DriveKey::Bay(v) => {
+                                crate::DriveKey::new(v.library_serial.as_str(), v.bay)
+                            }
+                            lib::DriveKey::Standalone(v) => crate::DriveKey::Standalone {
+                                drive_serial: v.drive_serial.as_str().into(),
+                            },
+                        },
+                        library_revision: prior
+                            .library_revision
+                            .as_ref()
+                            .map(|v| v.as_str().into()),
+                        home_slot: prior.home_slot,
+                        drive_serial: prior.drive_serial.as_str().into(),
+                        bootstrap_drive_compression: prior.bootstrap_drive_compression,
+                        configured_drive_compression: prior.configured_drive_compression,
+                        physical_tail: match prior.physical_tail {
+                            lib::PhysicalTail::ExactBootstrapFilemarkEod => {
+                                BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod
+                            }
+                            lib::PhysicalTail::DataAfterBootstrap => {
+                                BootstrapAdoptionTailEvidence::DataAfterBootstrap
+                            }
+                            lib::PhysicalTail::MissingFilemark => {
+                                BootstrapAdoptionTailEvidence::MissingFilemark
+                            }
+                            lib::PhysicalTail::ExtraFilemark => {
+                                BootstrapAdoptionTailEvidence::ExtraFilemark
+                            }
+                            lib::PhysicalTail::Ambiguous => {
+                                BootstrapAdoptionTailEvidence::Ambiguous
+                            }
+                        },
+                    };
+                    let Some(source) = adoption_assignment_source(original) else {
+                        return false;
+                    };
+                    if input.pool_id.is_some() && source != "operator" {
+                        return false;
+                    }
+                    let mut normalized = input.clone();
+                    normalized.pool_id = (source == "operator").then(|| pool_id.clone());
+                    original_evidence.physical_tail.adopted_state() == state
+                        && bootstrap_adoption_request_fingerprint(
+                            &normalized,
+                            &original_evidence,
+                            &pool_id,
+                            state,
+                            &geometry,
+                        ) == prior.request_fingerprint
+                },
+            )
+            .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
+        Ok(AdoptBootstrapIdentityOutcome {
+            newly_adopted,
+            assignment_generation: 1,
+            state,
+            operation_id: input.operation_id,
+            request_fingerprint,
+        })
     }
 
     /// Return the durable calibration-control store (cloneable
@@ -1249,8 +1113,10 @@ impl StateHandle {
 
     /// Replay the authoritative audit log into SQLite-derived projections.
     pub fn replay_audit_projection(&mut self) -> Result<AuditReplayReport, StateError> {
-        let records = FileAuditLog::replay(&self.paths.audit_dir)?;
-        self.index.replay_audit_records(&records)
+        self.library
+            .catch_up()
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        self.index.typed_replay_report()
     }
 
     /// Compatibility name for the projection-only audit and tape-log rebuild.
@@ -1267,7 +1133,9 @@ impl StateHandle {
         let config_path = config_path.as_ref();
         let config = crate::load_config(config_path)?;
         let paths = StatePaths::from_config(config_path, &config);
+        crate::authority_manifest::AuthorityManifest::preflight(&paths)?;
         let _owner = StateLockGuard::acquire(&paths.state_dir)?;
+        ensure_no_catalog_reset_fence(&paths)?;
         crate::authority_layout::validate_owned_config_layout(&config)?;
         if !paths.state_dir.join("authority-format").exists() {
             return Err(StateError::ConfigInvalid(
@@ -1276,8 +1144,6 @@ impl StateHandle {
         }
         let catalog = crate::projector::open(&paths.sqlite_path)?;
         let mut index = catalog.write_handle();
-        project_configured_tape_pools(&mut index, &config)?;
-        index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
         let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
         Self::rebuild_projection_inputs(&paths, &mut index, &calibration)
     }
@@ -1286,7 +1152,13 @@ impl StateHandle {
     /// wrap maps and invalidate their calibration using the existing allocator.
     pub fn rebuild_projection_from_tape_logs(&mut self) -> Result<RebuildReport, StateError> {
         crate::authority_layout::validate_owned_config_layout(&self.config)?;
-        Self::rebuild_projection_inputs(&self.paths, &mut self.index, &self.calibration)
+        let report = self
+            .library
+            .rebuild_projection(&mut self.index)
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        self.calibration
+            .record_all_maps_evicted("projection_rebuild")?;
+        Ok(report)
     }
 
     /// Only immutable authority inputs and derived stores enter this operation.
@@ -1296,15 +1168,41 @@ impl StateHandle {
         index: &mut CatalogIndex,
         calibration: &CalibrationControlStore,
     ) -> Result<RebuildReport, StateError> {
-        let audit = FileAuditLog::replay(&paths.audit_dir)?;
-        let directory = paths.journal_dir.join("tapes");
-        let mut snapshots = Vec::new();
-        for path in crate::TapeAuthority::list_entries(&directory)? {
-            let uuid = crate::TapeAuthority::entry_tape_uuid(&path)?;
-            snapshots
-                .push(crate::TapeAuthority::open(&directory, uuid, &paths.sqlite_path)?.freeze()?);
-        }
-        let report = index.rebuild_tape_log_projection(&audit, &snapshots)?;
+        use crate::library_log as lib;
+        let manifest = crate::authority_manifest::AuthorityManifest::inspect_for_reset(paths)?
+            .ok_or_else(|| {
+                StateError::ConfigInvalid(
+                    "typed rebuild requires an authority manifest; run declared reset".into(),
+                )
+            })?;
+        let view =
+            lib::native_view::NativeTapeView::probe(manifest.tape_root(), &paths.sqlite_path)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        lib::session_ack::validate(&view, |applied| {
+            lib::store::replay_observed(
+                manifest.library_root(),
+                manifest.library_uuid(),
+                &view,
+                applied,
+            )
+        })?;
+        let natives = view
+            .snapshots()
+            .map(crate::tape_log::authority::AuthoritySnapshot::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let report = index
+            .rebuild_typed_sources(
+                |applied| {
+                    lib::store::replay_observed(
+                        manifest.library_root(),
+                        manifest.library_uuid(),
+                        &view,
+                        applied,
+                    )
+                },
+                &natives,
+            )
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
         calibration.record_all_maps_evicted("projection_rebuild")?;
         Ok(report)
     }
@@ -1318,29 +1216,17 @@ impl StateHandle {
         rebuild_projection: bool,
     ) -> Result<crate::tape_log::store::RepairEvidence, StateError> {
         crate::authority_layout::admit(&self.paths)?;
-        let projected = self.index.projected_through_sequence(uuid)?;
-        let store = crate::tape_log::store::Store::open(
-            self.paths.journal_dir.join("tapes"),
-            uuid,
-            &self.paths.sqlite_path,
-        )?;
-        let retained =
-            crate::tape_log::authority::AuthoritySnapshot::new(store.preview_repair(through)?)?;
-        self.index.validate_repair_prefix(&retained)?;
-        let evidence =
-            store.repair_tail(through, if rebuild_projection { 0 } else { projected })?;
-        if rebuild_projection {
-            let snapshot = crate::TapeAuthority::open(
-                self.paths.journal_dir.join("tapes"),
-                uuid,
-                &self.paths.sqlite_path,
-            )?
-            .freeze()?;
-            self.index.rebuild_repaired_tape_projection(&snapshot)?;
-        } else {
-            self.index.mark_repaired_tape(uuid)?;
-        }
-        Ok(evidence)
+        self.library
+            .repair_native(
+                &mut self.index,
+                crate::library_log::TapeRef {
+                    uuid,
+                    incarnation: 1,
+                },
+                through,
+                rebuild_projection,
+            )
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))
     }
 
     /// Run startup replay and mark non-terminal prior work as lost by restart.
@@ -1355,19 +1241,28 @@ impl StateHandle {
         })
     }
 
-    /// Retire one tape identity in the catalog and audit the transition.
-    ///
-    /// Ordering note: catalog first, audit second. A failed audit append
-    /// surfaces as an error but does not roll back the retire — the same
-    /// crash window exists for every audited mutation in the codebase today,
-    /// and audit-before-commit would invert the lie (an audit record for a
-    /// retire that never happened).
+    /// Retire through typed library authority while the native lease proves
+    /// closeout and finalization admission. Projection follows durable source.
     pub fn retire_tape(&mut self, input: RetireTapeInput) -> Result<RetireTapeOutcome, StateError> {
-        let tape_uuid = input.tape_uuid;
-        let reason = input.reason.clone();
+        use crate::library_log as lib;
+        if input.reason.trim().is_empty() {
+            return Err(StateError::TapeProvisionConflict(
+                "retirement reason is empty".into(),
+            ));
+        }
+        let tape = self.library.tape_state(input.tape_uuid).ok_or_else(|| {
+            StateError::TapeProvisionConflict("tape has no Reprovision authority".into())
+        })?;
+        if tape.retired {
+            return Ok(RetireTapeOutcome {
+                newly_retired: false,
+                released_voltag: None,
+                instances_marked_missing: 0,
+            });
+        }
         let authority = crate::TapeAuthority::open(
             self.paths.journal_dir.join("tapes"),
-            tape_uuid,
+            input.tape_uuid,
             &self.paths.sqlite_path,
         )?;
         authority.check_finalizing()?;
@@ -1376,40 +1271,34 @@ impl StateHandle {
         if let Some(refusal) = snapshot.tape_summary().closeout_required("retirement") {
             return Err(StateError::TapeProvisionConflict(refusal));
         }
-        let outcome = self.index.retire_tape(input)?;
-        // An idempotent rerun changed nothing, so it appends nothing: the
-        // `TapeRetired` event is the tamper-evident record of who declared
-        // the medium dead, when, and why — that declaration already exists.
-        if outcome.newly_retired {
-            let mut detail = BTreeMap::new();
-            detail.insert(
-                "voltag".to_string(),
-                outcome
-                    .released_voltag
-                    .clone()
-                    .map(CborValue::Text)
-                    .unwrap_or(CborValue::Null),
-            );
-            detail.insert("reason".to_string(), CborValue::Text(reason));
-            detail.insert(
-                "instances_marked_missing".to_string(),
-                CborValue::Integer(outcome.instances_marked_missing.into()),
-            );
-            self.audit.append(AuditEventRecord {
-                actor: AuditActor::local_user(),
-                source_layer: SourceLayer::Layer4,
-                operation_id: None,
-                session_id: None,
-                idempotency_key: None,
-                event: AuditEvent::TapeRetired,
-                subject: AuditSubject {
-                    kind: "tape".to_string(),
-                    id: Some(hex_tape_uuid(tape_uuid)),
-                },
-                detail,
-            })?;
-        }
-        Ok(outcome)
+        self.library
+            .refresh_native(&snapshot)
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        self.library
+            .append_identity(&[&lease], |a, v, native| {
+                a.retire(
+                    lib::Retire {
+                        tape: tape.tape,
+                        reason: lib::RetireReason::OperatorRequested,
+                        observed_tape_sequence: (snapshot.log_reference().0 != 0)
+                            .then_some(snapshot.log_reference().0),
+                        assignment_generation: tape.assignment_generation,
+                        detail: Some(input.reason.as_str().into()),
+                    },
+                    tape.assignment_generation,
+                    native,
+                    AuditActor::local_user(),
+                    SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
+        self.calibration.record_map_evicted(input.tape_uuid)?;
+        Ok(RetireTapeOutcome {
+            newly_retired: true,
+            released_voltag: tape.label.map(|v| v.as_str().into()),
+            instances_marked_missing: snapshot.raw.summary().object_count,
+        })
     }
 
     /// Sync release evidence before clearing a tape-I/O fence under the state lock.
@@ -1418,15 +1307,9 @@ impl StateHandle {
         quarantine_id: &str,
         ack: &str,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
-        let result = crate::fence::release(
-            &mut self.index,
-            &self.paths.audit_dir,
-            quarantine_id,
-            ack,
-            AuditActor::local_user(),
-        );
-        self.refresh_audit_append_cursor()?;
-        result
+        self.library
+            .release_tape_fence(quarantine_id, ack, AuditActor::local_user())
+            .map_err(|e| StateError::ConfigInvalid(e.to_string()))
     }
 
     /// Replay one Layer 3c journal through the 3c shared reader and index it.
@@ -1472,51 +1355,9 @@ impl StateHandle {
     }
 
     fn mark_lost_operations_by_restart(&mut self) -> Result<u64, StateError> {
-        let operations = self.index.non_terminal_operations()?;
-        let count = operations.len() as u64;
-        for operation in operations {
-            let mut detail = BTreeMap::new();
-            detail.insert(
-                "operation_kind".to_string(),
-                CborValue::Text(operation.operation_kind.clone()),
-            );
-            detail.insert(
-                "restart_reason".to_string(),
-                CborValue::Text("daemon_restart".to_string()),
-            );
-            if let Some(subject) = operation.subject.as_ref() {
-                detail.insert(
-                    "previous_subject".to_string(),
-                    CborValue::Text(subject.clone()),
-                );
-            }
-            if let Some(actor_fingerprint) = operation.actor_fingerprint.as_ref() {
-                detail.insert(
-                    "actor_fingerprint".to_string(),
-                    CborValue::Text(actor_fingerprint.clone()),
-                );
-            }
-            let subject_kind = operation
-                .subject
-                .as_deref()
-                .unwrap_or(operation.operation_kind.as_str())
-                .to_string();
-            let (_, record) = self.audit.append_and_return_record(AuditEventRecord {
-                actor: AuditActor::System,
-                source_layer: SourceLayer::Layer4,
-                operation_id: Some(operation.operation_id),
-                session_id: operation.session_id,
-                idempotency_key: operation.idempotency_key,
-                event: AuditEvent::OperationFailed,
-                subject: AuditSubject {
-                    kind: subject_kind,
-                    id: Some(operation.operation_id.to_string()),
-                },
-                detail,
-            })?;
-            self.index.project_audit_record(&record)?;
-        }
-        Ok(count)
+        self.library
+            .mark_operations_lost()
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))
     }
 
     /// Recover prior sessions under an owned state/endpoint boundary. A scoped
@@ -1527,18 +1368,36 @@ impl StateHandle {
         endpoint: Option<&crate::DriveKey>,
         mut quarantine: impl FnMut(&mut Self, &crate::RestartSession) -> Result<(), StateError>,
     ) -> Result<u64, StateError> {
+        use crate::library_log as lib;
         let sessions = self
-            .index
-            .non_terminal_sessions()?
-            .into_iter()
-            .filter(|s| endpoint.is_none_or(|key| s.drive_key.as_ref() == Some(key)))
-            .collect::<Vec<_>>();
-        let count = sessions.len() as u64;
-        for session in sessions {
-            invalidate_restart_session_volume(&self.calibration, &session)?;
+            .library
+            .open_sessions()
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        let mut count = 0;
+        for (mut source, reference) in sessions {
+            let session = crate::library_runtime::restart::session_projection(&source);
+            if endpoint.is_some_and(|key| session.drive_key.as_ref() != Some(key)) {
+                continue;
+            }
             quarantine(self, &session)?;
-            self.refresh_audit_append_cursor()?;
-            mark_restart_session_lost(&mut self.index, &mut self.audit, &session)?;
+            source.previous = Some(reference);
+            source.event = lib::SessionEvent::LostByRestart;
+            source.reason = Some("daemon_restart".into());
+            self.library
+                .append(|a, v| {
+                    a.session_observed(source, AuditActor::System, SourceLayer::Layer4, v)
+                })
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+            count += 1;
+        }
+        // A native write session has no endpoint or restart-ending vocabulary.
+        // Preserve its unresolved source; never manufacture a read-session row
+        // or a classified fence from broad native end reasons (C8-G2).
+        if endpoint.is_none() {
+            for session in self.library.open_native_sessions() {
+                invalidate_restart_session_volume(&self.calibration, &session)?;
+                quarantine(self, &session)?;
+            }
         }
         Ok(count)
     }
@@ -1555,56 +1414,38 @@ pub fn recover_library_sessions_after_restart(
     index: &mut CatalogIndex,
     config: &RemConfig,
 ) -> Result<u64, StateError> {
-    index.replay_audit_records(&FileAuditLog::replay(&config.audit.dir)?)?;
-    let libraries: HashSet<_> = config
-        .libraries
-        .iter()
-        .map(|library| library.serial.trim())
-        .collect();
-    let sessions: Vec<_> = index
-        .non_terminal_sessions()?
-        .into_iter()
-        .filter(|session| {
-            matches!(&session.drive_key, Some(crate::DriveKey::Bay { library_serial, .. })
-            if libraries.contains(library_serial.as_str()))
-        })
-        .collect();
-    let count = sessions.len() as u64;
-    if !sessions.is_empty() {
-        let calibration = CalibrationControlStore::open(
-            StatePaths::from_config(Path::new(""), config).calibration_dir,
-        )?;
-        let mut audit = FileAuditLog::open_with_clock_forward_tolerance(
-            &config.audit.dir,
-            config.audit.fsync,
-            Some(Duration::seconds(
-                config.audit.clock_forward_tolerance_seconds as i64,
-            )),
-        )?;
-        for session in sessions {
-            invalidate_restart_session_volume(&calibration, &session)?;
-            mark_restart_session_lost(index, &mut audit, &session)?;
-            if let Some(
-                endpoint @ crate::DriveKey::Bay {
-                    library_serial,
-                    bay,
-                },
-            ) = &session.drive_key
-            {
-                tracing::info!(
-                    session_id = %session.session_id,
-                    endpoint = %endpoint.encode(),
-                    library_serial = %library_serial,
-                    bay = *bay,
-                    "daemon marks prior library session lost"
-                );
-            }
+    use crate::library_log as lib;
+    let runtime = index.library_runtime().ok_or_else(|| {
+        StateError::ConfigInvalid(
+            "startup session recovery requires the shared library owner".into(),
+        )
+    })?;
+    runtime
+        .catch_up()
+        .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+    let mut count = 0;
+    for (mut source, reference) in runtime
+        .open_sessions()
+        .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
+    {
+        let Some(lib::DriveKey::Bay(endpoint)) = &source.endpoint else {
+            continue;
+        };
+        if !config
+            .libraries
+            .iter()
+            .any(|v| v.serial.trim() == endpoint.library_serial.as_str())
+        {
+            continue;
         }
+        source.previous = Some(reference);
+        source.event = lib::SessionEvent::LostByRestart;
+        source.reason = Some("daemon_restart".into());
+        runtime
+            .append(|a, v| a.session_observed(source, AuditActor::System, SourceLayer::Layer4, v))
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        count += 1;
     }
-    tracing::info!(
-        lost_sessions_marked = count,
-        "daemon startup session recovery completes"
-    );
     Ok(count)
 }
 
@@ -1629,62 +1470,6 @@ fn invalidate_restart_session_volume(
             calibration.record_possible_write_recovery(tape_uuid)?;
         }
     }
-    Ok(())
-}
-
-/// Persist and project the same terminal session transition for every recovery scope.
-fn mark_restart_session_lost(
-    index: &mut CatalogIndex,
-    audit: &mut FileAuditLog,
-    session: &crate::RestartSession,
-) -> Result<(), StateError> {
-    let mut detail = BTreeMap::new();
-    if let Some(key) = &session.drive_key {
-        detail.insert("endpoint_key".into(), CborValue::Text(key.encode()));
-    }
-    detail.insert(
-        "session_kind".to_string(),
-        CborValue::Text(session.session_kind.clone()),
-    );
-    detail.insert(
-        "restart_reason".to_string(),
-        CborValue::Text("daemon_restart".to_string()),
-    );
-    if let Some(tape_uuid) = session.tape_uuid.as_ref() {
-        detail.insert("tape_uuid".to_string(), CborValue::Bytes(tape_uuid.clone()));
-    }
-    if let Some(library_serial) = session.library_serial.as_ref() {
-        detail.insert(
-            "library_serial".to_string(),
-            CborValue::Text(library_serial.clone()),
-        );
-    }
-    if let Some(drive_bay) = session.drive_bay {
-        detail.insert(
-            "drive_bay".to_string(),
-            CborValue::Integer(drive_bay.into()),
-        );
-    }
-    if let Some(drive_uuid) = session.drive_uuid.as_ref() {
-        detail.insert(
-            "drive_uuid".to_string(),
-            CborValue::Bytes(drive_uuid.clone()),
-        );
-    }
-    let (_, record) = audit.append_and_return_record(AuditEventRecord {
-        actor: AuditActor::System,
-        source_layer: SourceLayer::Layer4,
-        operation_id: None,
-        session_id: Some(session.session_id),
-        idempotency_key: None,
-        event: AuditEvent::SessionLostByRestart,
-        subject: AuditSubject {
-            kind: session.session_kind.clone(),
-            id: Some(session.session_id.to_string()),
-        },
-        detail,
-    })?;
-    index.project_audit_record(&record)?;
     Ok(())
 }
 
@@ -1818,6 +1603,104 @@ fn bootstrap_adoption_request_fingerprint(
     hash.finalize().into()
 }
 
+/// Recover legacy pool-intent provenance only when the authenticated adoption
+/// fingerprint proves one of the original explicit producer inputs. Arbitrary
+/// external fingerprints remain unknown; no SQL or configuration is consulted.
+pub(crate) fn adoption_assignment_source(
+    value: &crate::library_log::Reprovision,
+) -> Option<&'static str> {
+    use crate::library_log as lib;
+    let adoption = value.adoption.as_ref()?;
+    let endpoint = value.endpoint.as_ref()?;
+    let pool = value.pool.as_ref()?.as_str();
+    let lib::MediumFamily::Lto(generation) = value.medium.family else {
+        return None;
+    };
+    let physical_tail = match adoption.physical_tail {
+        lib::PhysicalTail::ExactBootstrapFilemarkEod => {
+            BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod
+        }
+        lib::PhysicalTail::DataAfterBootstrap => BootstrapAdoptionTailEvidence::DataAfterBootstrap,
+        lib::PhysicalTail::MissingFilemark => BootstrapAdoptionTailEvidence::MissingFilemark,
+        lib::PhysicalTail::ExtraFilemark => BootstrapAdoptionTailEvidence::ExtraFilemark,
+        lib::PhysicalTail::Ambiguous => BootstrapAdoptionTailEvidence::Ambiguous,
+    };
+    let evidence = BootstrapAdoptionEvidence {
+        endpoint: match endpoint {
+            lib::DriveKey::Bay(v) => crate::DriveKey::new(v.library_serial.as_str(), v.bay),
+            lib::DriveKey::Standalone(v) => crate::DriveKey::Standalone {
+                drive_serial: v.drive_serial.as_str().into(),
+            },
+        },
+        library_revision: adoption
+            .library_revision
+            .as_ref()
+            .map(|v| v.as_str().into()),
+        home_slot: adoption.home_slot,
+        drive_serial: adoption.drive_serial.as_str().into(),
+        bootstrap_drive_compression: adoption.bootstrap_drive_compression,
+        configured_drive_compression: adoption.configured_drive_compression,
+        physical_tail,
+    };
+    let (parity, geometry) = match &value.parity_scheme {
+        None => (
+            remanence_parity::ParityConfig::None,
+            "no-parity".to_string(),
+        ),
+        Some(v) => (
+            remanence_parity::ParityConfig::Scheme(remanence_parity::ParityScheme {
+                id: remanence_parity::SchemeId::new_owned(v.id.as_str().into()),
+                data_blocks_per_stripe: v.data_blocks_per_stripe,
+                parity_blocks_per_stripe: v.parity_blocks_per_stripe,
+                stripes_per_neighborhood: v.stripes_per_neighborhood,
+            }),
+            format!(
+                "scheme={} data={} parity={} stripes={}",
+                v.id.as_str(),
+                v.data_blocks_per_stripe,
+                v.parity_blocks_per_stripe,
+                v.stripes_per_neighborhood
+            ),
+        ),
+    };
+    let provenances = match value.label_provenance {
+        Some(lib::LabelProvenance::Changer) => vec![crate::LabelProvenance::Changer],
+        Some(lib::LabelProvenance::Operator) => vec![crate::LabelProvenance::Operator],
+        None => vec![
+            crate::LabelProvenance::Changer,
+            crate::LabelProvenance::Operator,
+        ],
+    };
+    for provenance in provenances {
+        for source in ["rule", "operator"] {
+            let input = AdoptBootstrapIdentityInput {
+                operation_id: uuid::Uuid::from_bytes(adoption.operation),
+                tape_uuid: value.tape.uuid,
+                voltag: value.label.as_ref().map(|v| v.as_str().into()),
+                block_size: value.medium.record_size,
+                parity: parity.clone(),
+                label_provenance: provenance,
+                observation: Some(crate::MediaObservation {
+                    generation,
+                    source: value.medium.source,
+                }),
+                pool_id: (source == "operator").then(|| pool.into()),
+            };
+            if bootstrap_adoption_request_fingerprint(
+                &input,
+                &evidence,
+                pool,
+                physical_tail.adopted_state(),
+                &geometry,
+            ) == adoption.request_fingerprint
+            {
+                return Some(source);
+            }
+        }
+    }
+    None
+}
+
 fn validate_catalog_reset_selectors(
     selectors: &[String],
     role: &str,
@@ -1856,419 +1739,6 @@ fn validate_disjoint_catalog_reset_allowlists(
         )));
     }
     Ok(())
-}
-
-fn preflight_catalog_reset_index(
-    index: &CatalogIndex,
-    paths: &StatePaths,
-    config: &RemConfig,
-    config_bytes: &[u8],
-    preserve: &[String],
-    allow_erase: &[String],
-) -> Result<
-    (
-        CatalogResetPreflightReport,
-        Vec<CatalogResetPreservedTape>,
-        bool,
-    ),
-    StateError,
-> {
-    let preserved_tapes = index.capture_catalog_reset_tapes(preserve, &config.tape_pool_rules)?;
-    let source_schema_version = index.schema_version()?;
-    let source_tapes = index.list_tapes(None, TapeKindFilter::All)?;
-    let output_is_clean = index.catalog_reset_output_is_clean()?
-        && catalog_reset_output_pools_match(index, config)?
-        && catalog_reset_output_directories_clean(paths)?;
-    preflight_catalog_reset_rows(
-        paths,
-        config_bytes,
-        preserve,
-        allow_erase,
-        source_schema_version,
-        source_tapes,
-        preserved_tapes,
-        output_is_clean,
-    )
-}
-
-fn preflight_catalog_reset_source(
-    paths: &StatePaths,
-    config: &RemConfig,
-    config_bytes: &[u8],
-    preserve: &[String],
-    allow_erase: &[String],
-) -> Result<
-    (
-        CatalogResetPreflightReport,
-        Vec<CatalogResetPreservedTape>,
-        bool,
-    ),
-    StateError,
-> {
-    match crate::projector::open_reset_source(&paths.sqlite_path) {
-        Ok(index) => preflight_catalog_reset_index(
-            &index,
-            paths,
-            config,
-            config_bytes,
-            preserve,
-            allow_erase,
-        ),
-        Err(current_schema_error) => {
-            if !preserve.is_empty() || allow_erase.is_empty() {
-                return Err(current_schema_error);
-            }
-            let (source_schema_version, source_tapes) =
-                crate::projector::read_legacy_catalog_reset_erase_source(&paths.sqlite_path)?;
-            preflight_catalog_reset_rows(
-                paths,
-                config_bytes,
-                preserve,
-                allow_erase,
-                source_schema_version,
-                source_tapes,
-                Vec::new(),
-                false,
-            )
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn preflight_catalog_reset_rows(
-    paths: &StatePaths,
-    config_bytes: &[u8],
-    preserve: &[String],
-    allow_erase: &[String],
-    source_schema_version: u32,
-    source_tapes: Vec<TapeRecord>,
-    preserved_tapes: Vec<CatalogResetPreservedTape>,
-    output_is_clean: bool,
-) -> Result<
-    (
-        CatalogResetPreflightReport,
-        Vec<CatalogResetPreservedTape>,
-        bool,
-    ),
-    StateError,
-> {
-    let preserve_set = preserve.iter().map(String::as_str).collect::<HashSet<_>>();
-    let erase_set = allow_erase
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut seen_uuids = HashSet::with_capacity(source_tapes.len());
-    let mut seen_voltags = HashSet::with_capacity(source_tapes.len());
-    let mut tapes = Vec::with_capacity(source_tapes.len());
-    for tape in source_tapes {
-        let typed = catalog_reset_preflight_tape(tape)?;
-        if !seen_uuids.insert(typed.tape_uuid) {
-            return Err(StateError::AmbiguousCatalogLookup(format!(
-                "catalog reset preflight found duplicate tape uuid {}",
-                hex_tape_uuid(typed.tape_uuid)
-            )));
-        }
-        match typed.voltag.as_deref() {
-            Some(voltag) => {
-                if !seen_voltags.insert(voltag.to_string()) {
-                    return Err(StateError::AmbiguousCatalogLookup(format!(
-                        "catalog reset preflight found duplicate voltag {voltag:?}"
-                    )));
-                }
-                if !preserve_set.contains(voltag) && !erase_set.contains(voltag) {
-                    return Err(StateError::ConfigInvalid(format!(
-                        "catalog reset refuses bound tape {voltag:?} outside the exact preserve and allow-erase lists"
-                    )));
-                }
-            }
-            None if typed.state == "retired" => {}
-            None => {
-                return Err(StateError::ConfigInvalid(format!(
-                    "catalog reset refuses unbound nonretired tape {} in state {:?}",
-                    hex_tape_uuid(typed.tape_uuid),
-                    typed.state
-                )));
-            }
-        }
-        tapes.push(typed);
-    }
-    let preflight_token = catalog_reset_preflight_token(
-        paths,
-        config_bytes,
-        preserve,
-        allow_erase,
-        source_schema_version,
-        &tapes,
-        &preserved_tapes,
-    )?;
-    Ok((
-        CatalogResetPreflightReport {
-            source_schema_version,
-            preflight_token,
-            request_digest: String::new(),
-            resume_exact: false,
-            paths: catalog_reset_preflight_paths(paths)?,
-            preserve_tape_voltags: preserve.to_vec(),
-            allow_erase_tape_voltags: allow_erase.to_vec(),
-            tapes,
-        },
-        preserved_tapes,
-        output_is_clean,
-    ))
-}
-
-fn catalog_reset_output_pools_match(
-    index: &CatalogIndex,
-    config: &RemConfig,
-) -> Result<bool, StateError> {
-    let mut actual = index
-        .list_tape_pools()?
-        .into_iter()
-        .map(|pool| {
-            (
-                pool.pool_id,
-                pool.display_name,
-                pool.copy_class,
-                pool.content_class,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut expected = config
-        .tape_pools
-        .iter()
-        .map(|pool| {
-            (
-                pool.id.clone(),
-                pool.display_name.clone(),
-                pool.copy_class.clone(),
-                pool.content_class.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    actual.sort();
-    expected.sort();
-    Ok(actual == expected)
-}
-
-fn catalog_reset_output_directories_clean(paths: &StatePaths) -> Result<bool, StateError> {
-    for path in [&paths.audit_dir, &paths.journal_dir, &paths.tape_cache_dir] {
-        let metadata = fs::symlink_metadata(path).map_err(|err| {
-            StateError::io_at("inspect catalog reset output directory", path, err)
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Ok(false);
-        }
-        if path == &paths.audit_dir {
-            let records = match FileAuditLog::replay(path) {
-                Ok(records) => records,
-                Err(_) => return Ok(false),
-            };
-            let fence = catalog_reset_fence_evidence(paths)?;
-            if records.len() == 1
-                && records[0].event == AuditEvent::RecoveryEvent
-                && records[0].detail.get("action")
-                    == Some(&CborValue::Text("declared_state_reset".into()))
-                && fence.is_some_and(|(request, _, _)| {
-                    records[0].detail.get("reset_request_digest") == Some(&CborValue::Text(request))
-                })
-            {
-                let entries = fs::read_dir(path)
-                    .map_err(|e| StateError::io_at("read reset audit output", path, e))?;
-                let mut count = 0;
-                for entry in entries {
-                    let entry =
-                        entry.map_err(|e| StateError::io_at("read reset audit entry", path, e))?;
-                    if !entry
-                        .file_type()
-                        .map_err(|e| {
-                            StateError::io_at("inspect reset audit entry", entry.path(), e)
-                        })?
-                        .is_file()
-                        || entry.path().extension().is_none_or(|e| e != "remaudit")
-                    {
-                        return Ok(false);
-                    }
-                    count += 1;
-                }
-                if count == 1 {
-                    continue;
-                }
-            }
-        }
-        for entry in fs::read_dir(path)
-            .map_err(|err| StateError::io_at("read catalog reset output directory", path, err))?
-        {
-            let entry = entry.map_err(|err| {
-                StateError::io_at("iterate catalog reset output directory", path, err)
-            })?;
-            if path == &paths.journal_dir
-                && entry.file_name() == "tapes"
-                && entry
-                    .file_type()
-                    .map_err(|err| StateError::io_at("inspect tape directory", entry.path(), err))?
-                    .is_dir()
-                && fs::read_dir(entry.path())
-                    .map_err(|err| StateError::io_at("read tape directory", entry.path(), err))?
-                    .next()
-                    .is_none()
-            {
-                continue;
-            }
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn catalog_reset_preflight_paths(
-    paths: &StatePaths,
-) -> Result<CatalogResetPreflightPaths, StateError> {
-    Ok(CatalogResetPreflightPaths {
-        config: catalog_reset_path_evidence(&paths.config_path)?,
-        state_dir: catalog_reset_path_evidence(&paths.state_dir)?,
-        sqlite: catalog_reset_path_evidence(&paths.sqlite_path)?,
-        audit: catalog_reset_path_evidence(&paths.audit_dir)?,
-        journal: catalog_reset_path_evidence(&paths.journal_dir)?,
-        tape_cache: catalog_reset_path_evidence(&paths.tape_cache_dir)?,
-    })
-}
-
-fn catalog_reset_path_evidence(path: &Path) -> Result<CatalogResetPathEvidence, StateError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|err| StateError::io_at("stat catalog reset path", path, err))?;
-    let canonical_path = fs::canonicalize(path)
-        .map_err(|err| StateError::io_at("canonicalize catalog reset path", path, err))?;
-    Ok(CatalogResetPathEvidence {
-        configured_path: path.to_path_buf(),
-        canonical_path,
-        configured_path_is_symlink: metadata.file_type().is_symlink(),
-    })
-}
-
-fn catalog_reset_preflight_tape(tape: TapeRecord) -> Result<CatalogResetPreflightTape, StateError> {
-    let tape_uuid: [u8; 16] = tape.tape_uuid.as_slice().try_into().map_err(|_| {
-        StateError::IndexCorrupt(format!(
-            "catalog reset preflight tape uuid has length {}, expected 16",
-            tape.tape_uuid.len()
-        ))
-    })?;
-    if let Some(voltag) = tape.voltag.as_deref() {
-        if voltag.is_empty() || voltag.trim() != voltag {
-            return Err(StateError::IndexCorrupt(format!(
-                "catalog reset preflight tape {} has invalid voltag {voltag:?}",
-                hex_tape_uuid(tape_uuid)
-            )));
-        }
-    }
-    if !matches!(tape.kind.as_str(), "data" | "cleaning") {
-        return Err(StateError::IndexCorrupt(format!(
-            "catalog reset preflight tape {} has invalid kind {:?}",
-            hex_tape_uuid(tape_uuid),
-            tape.kind
-        )));
-    }
-    if !matches!(
-        tape.state.as_str(),
-        "ready"
-            | "ingested"
-            | "sealed"
-            | "retired"
-            | "finalizing"
-            | "finalized"
-            | "finalized_degraded"
-            | "recovery_required"
-    ) {
-        return Err(StateError::IndexCorrupt(format!(
-            "catalog reset preflight tape {} has invalid state {:?}",
-            hex_tape_uuid(tape_uuid),
-            tape.state
-        )));
-    }
-    match tape.scheme_id.as_deref() {
-        None => {
-            if tape.data_blocks_per_stripe.is_some()
-                || tape.parity_blocks_per_stripe.is_some()
-                || tape.stripes_per_neighborhood.is_some()
-            {
-                return Err(StateError::IndexCorrupt(format!(
-                    "catalog reset preflight tape {} has partial parity geometry",
-                    hex_tape_uuid(tape_uuid)
-                )));
-            }
-        }
-        Some(scheme_id) => {
-            let scheme = remanence_parity::ParityScheme {
-                id: remanence_parity::SchemeId::new_owned(scheme_id.to_string()),
-                data_blocks_per_stripe: u16::try_from(tape.data_blocks_per_stripe.ok_or_else(
-                    || {
-                        StateError::IndexCorrupt(
-                            "catalog reset preflight parity geometry is missing data width"
-                                .to_string(),
-                        )
-                    },
-                )?)
-                .map_err(|_| {
-                    StateError::IndexCorrupt(
-                        "catalog reset preflight parity data width exceeds u16".to_string(),
-                    )
-                })?,
-                parity_blocks_per_stripe: u16::try_from(tape.parity_blocks_per_stripe.ok_or_else(
-                    || {
-                        StateError::IndexCorrupt(
-                            "catalog reset preflight parity geometry is missing parity width"
-                                .to_string(),
-                        )
-                    },
-                )?)
-                .map_err(|_| {
-                    StateError::IndexCorrupt(
-                        "catalog reset preflight parity width exceeds u16".to_string(),
-                    )
-                })?,
-                stripes_per_neighborhood: tape.stripes_per_neighborhood.ok_or_else(|| {
-                    StateError::IndexCorrupt(
-                        "catalog reset preflight parity geometry is missing neighborhood width"
-                            .to_string(),
-                    )
-                })?,
-            };
-            scheme.validate().map_err(|error| {
-                StateError::IndexCorrupt(format!(
-                    "catalog reset preflight tape {} has invalid parity geometry: {error}",
-                    hex_tape_uuid(tape_uuid)
-                ))
-            })?;
-        }
-    }
-    if tape.kind == "data" && tape.block_size.is_none() {
-        return Err(StateError::IndexCorrupt(format!(
-            "catalog reset preflight data tape {} has no block size",
-            hex_tape_uuid(tape_uuid)
-        )));
-    }
-    if tape.block_size == Some(0) || tape.block_size.is_some_and(|value| value > u32::MAX.into()) {
-        return Err(StateError::IndexCorrupt(format!(
-            "catalog reset preflight tape {} has invalid block size {:?}",
-            hex_tape_uuid(tape_uuid),
-            tape.block_size
-        )));
-    }
-    Ok(CatalogResetPreflightTape {
-        tape_uuid,
-        voltag: tape.voltag,
-        voltag_source: tape.voltag_source.map(|source| source.as_str().to_string()),
-        cartridge_generation: tape.cartridge_generation,
-        generation_source: tape.generation_source,
-        kind: tape.kind,
-        pool_id: tape.pool_id,
-        assignment_generation: tape.assignment_generation,
-        state: tape.state,
-        block_size: tape.block_size,
-        scheme_id: tape.scheme_id,
-        data_blocks_per_stripe: tape.data_blocks_per_stripe,
-        parity_blocks_per_stripe: tape.parity_blocks_per_stripe,
-        stripes_per_neighborhood: tape.stripes_per_neighborhood,
-    })
 }
 
 const CATALOG_RESET_FENCE_FILE: &str = "catalog-reset.in-progress";
@@ -2344,213 +1814,6 @@ fn catalog_reset_request_digest(
         .collect())
 }
 
-fn catalog_reset_preflight_token(
-    paths: &StatePaths,
-    config_bytes: &[u8],
-    preserve: &[String],
-    allow_erase: &[String],
-    source_schema_version: u32,
-    tapes: &[CatalogResetPreflightTape],
-    preserved: &[CatalogResetPreservedTape],
-) -> Result<String, StateError> {
-    let path_evidence = catalog_reset_preflight_paths(paths)?;
-    let mut hasher = Sha256::new();
-    hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-PREFLIGHT-V1");
-    hash_catalog_reset_field(&mut hasher, &source_schema_version.to_be_bytes());
-    hash_catalog_reset_field(&mut hasher, config_bytes);
-    for path in [
-        &path_evidence.config,
-        &path_evidence.state_dir,
-        &path_evidence.sqlite,
-        &path_evidence.audit,
-        &path_evidence.journal,
-        &path_evidence.tape_cache,
-    ] {
-        hash_catalog_reset_field(
-            &mut hasher,
-            path.configured_path.as_os_str().as_encoded_bytes(),
-        );
-        hash_catalog_reset_field(
-            &mut hasher,
-            path.canonical_path.as_os_str().as_encoded_bytes(),
-        );
-        hash_catalog_reset_field(
-            &mut hasher,
-            if path.configured_path_is_symlink {
-                b"symlink"
-            } else {
-                b"direct"
-            },
-        );
-    }
-    let mut preserve = preserve.to_vec();
-    let mut allow_erase = allow_erase.to_vec();
-    preserve.sort();
-    allow_erase.sort();
-    for value in preserve {
-        hash_catalog_reset_field(&mut hasher, b"preserve");
-        hash_catalog_reset_field(&mut hasher, value.as_bytes());
-    }
-    for value in allow_erase {
-        hash_catalog_reset_field(&mut hasher, b"allow-erase");
-        hash_catalog_reset_field(&mut hasher, value.as_bytes());
-    }
-    let restore_ready = preserved
-        .iter()
-        .map(|tape| (tape.tape_uuid, tape.restore_ready))
-        .collect::<BTreeMap<_, _>>();
-    let mut tapes = tapes.to_vec();
-    tapes.sort_by_key(|tape| tape.tape_uuid);
-    for tape in tapes {
-        hash_catalog_reset_field(&mut hasher, &tape.tape_uuid);
-        for value in [
-            tape.voltag.as_deref(),
-            tape.voltag_source.as_deref(),
-            tape.cartridge_generation.as_deref(),
-            tape.generation_source.as_deref(),
-            Some(tape.kind.as_str()),
-            tape.pool_id.as_deref(),
-            Some(tape.state.as_str()),
-            tape.scheme_id.as_deref(),
-        ] {
-            match value {
-                Some(value) => {
-                    hash_catalog_reset_field(&mut hasher, b"some");
-                    hash_catalog_reset_field(&mut hasher, value.as_bytes());
-                }
-                None => hash_catalog_reset_field(&mut hasher, b"none"),
-            }
-        }
-        for value in [
-            tape.block_size,
-            Some(tape.assignment_generation),
-            tape.data_blocks_per_stripe.map(u64::from),
-            tape.parity_blocks_per_stripe.map(u64::from),
-            tape.stripes_per_neighborhood.map(u64::from),
-        ] {
-            match value {
-                Some(value) => hash_catalog_reset_field(&mut hasher, &value.to_be_bytes()),
-                None => hash_catalog_reset_field(&mut hasher, b"none"),
-            }
-        }
-        hash_catalog_reset_field(
-            &mut hasher,
-            if restore_ready.get(&tape.tape_uuid).copied().unwrap_or(false) {
-                b"restore-ready"
-            } else {
-                b"not-restore-ready"
-            },
-        );
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-fn hash_catalog_reset_output_tape(
-    hasher: &mut Sha256,
-    tape: &CatalogResetPreflightTape,
-    pool_id: Option<&str>,
-    assignment_generation: u64,
-    state: &str,
-) {
-    hash_catalog_reset_field(hasher, &tape.tape_uuid);
-    for value in [
-        tape.voltag.as_deref(),
-        tape.voltag_source.as_deref(),
-        tape.cartridge_generation.as_deref(),
-        tape.generation_source.as_deref(),
-        Some(tape.kind.as_str()),
-        pool_id,
-        Some(state),
-        tape.scheme_id.as_deref(),
-    ] {
-        match value {
-            Some(value) => {
-                hash_catalog_reset_field(hasher, b"some");
-                hash_catalog_reset_field(hasher, value.as_bytes());
-            }
-            None => hash_catalog_reset_field(hasher, b"none"),
-        }
-    }
-    for value in [
-        tape.block_size,
-        Some(assignment_generation),
-        tape.data_blocks_per_stripe.map(u64::from),
-        tape.parity_blocks_per_stripe.map(u64::from),
-        tape.stripes_per_neighborhood.map(u64::from),
-    ] {
-        match value {
-            Some(value) => {
-                hash_catalog_reset_field(hasher, b"some");
-                hash_catalog_reset_field(hasher, &value.to_be_bytes());
-            }
-            None => hash_catalog_reset_field(hasher, b"none"),
-        }
-    }
-}
-
-fn catalog_reset_intended_output_token(
-    tapes: &[CatalogResetPreflightTape],
-    preserved: &[CatalogResetPreservedTape],
-) -> Result<String, StateError> {
-    let by_uuid = tapes
-        .iter()
-        .map(|tape| (tape.tape_uuid, tape))
-        .collect::<BTreeMap<_, _>>();
-    let mut preserved = preserved.to_vec();
-    preserved.sort_by_key(|tape| tape.tape_uuid);
-    let mut hasher = Sha256::new();
-    hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-RESET-OUTPUT-V1");
-    for tape in preserved {
-        let source = by_uuid.get(&tape.tape_uuid).ok_or_else(|| {
-            StateError::IndexCorrupt("preserved tape missing from preflight rows".to_string())
-        })?;
-        let generation = source.assignment_generation.checked_add(1).ok_or_else(|| {
-            StateError::IndexCorrupt("catalog reset assignment generation exhausted".to_string())
-        })?;
-        hash_catalog_reset_output_tape(
-            &mut hasher,
-            source,
-            tape.pool_id.as_deref(),
-            generation,
-            if tape.restore_ready {
-                "ready"
-            } else {
-                "recovery_required"
-            },
-        );
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-fn catalog_reset_current_output_token(tapes: &[CatalogResetPreflightTape]) -> String {
-    let mut tapes = tapes.to_vec();
-    tapes.sort_by_key(|tape| tape.tape_uuid);
-    let mut hasher = Sha256::new();
-    hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-RESET-OUTPUT-V1");
-    for tape in tapes {
-        hash_catalog_reset_output_tape(
-            &mut hasher,
-            &tape,
-            tape.pool_id.as_deref(),
-            tape.assignment_generation,
-            tape.state.as_str(),
-        );
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn hash_catalog_reset_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
@@ -2561,22 +1824,41 @@ fn catalog_reset_fence_path(paths: &StatePaths) -> PathBuf {
 }
 
 pub(crate) fn ensure_no_catalog_reset_fence(paths: &StatePaths) -> Result<(), StateError> {
-    let fence = catalog_reset_fence_path(paths);
-    if fence.exists() {
-        return Err(StateError::CatalogResetInProgress(format!(
-            "durable fence {} requires an exact reset rerun",
-            fence.display()
-        )));
-    }
-    Ok(())
+    ensure_no_catalog_reset_at(&paths.state_dir)
 }
 
-fn catalog_reset_fence_evidence(
+/// Bare-lock motion recovery shares startup's reset exclusion without opening SQL.
+/// Treat every fence entry, including a dangling symlink, as unresolved; failed
+/// metadata reads cannot establish that a reset is absent.
+pub(crate) fn ensure_no_catalog_reset_at(state_dir: &Path) -> Result<(), StateError> {
+    let fence = state_dir.join(CATALOG_RESET_FENCE_FILE);
+    match fs::symlink_metadata(&fence) {
+        Ok(_) => Err(StateError::CatalogResetInProgress(format!(
+            "durable fence {} requires an exact reset rerun",
+            fence.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::io_at(
+            "inspect catalog reset fence",
+            &fence,
+            error,
+        )),
+    }
+}
+
+pub(crate) fn catalog_reset_fence_evidence(
     paths: &StatePaths,
 ) -> Result<Option<(String, String, String)>, StateError> {
     let fence = catalog_reset_fence_path(paths);
-    if !fence.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&fence) {
+        Ok(metadata) if metadata.is_file() => (),
+        Ok(_) => {
+            return Err(StateError::CatalogResetInProgress(
+                "reset fence is not a regular file".into(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StateError::io_at("inspect reset fence", &fence, error)),
     }
     let observed = fs::read_to_string(&fence)
         .map_err(|err| StateError::io_at("read catalog reset fence", &fence, err))?;
@@ -2683,35 +1965,6 @@ fn clear_catalog_reset_fence(paths: &StatePaths) -> Result<(), StateError> {
     sync_directory(&paths.state_dir)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CatalogResetPhase {
-    AuthoritativeInputsArchived,
-    SourceCheckpointed,
-    ReplacementSchemaCreated,
-    PoolsProjected,
-    TapesRestored,
-    AuthoritativeInputsCleared,
-    BeforeAtomicSwap,
-    AfterAtomicSwap,
-}
-
-#[derive(Clone, Copy)]
-struct CatalogResetAdmission<'a> {
-    request_digest: &'a str,
-    preflight_token: &'a str,
-    output_token: &'a str,
-    source_schema_version: Option<u32>,
-}
-
-fn reset_catalog_locked(
-    paths: &StatePaths,
-    config: &RemConfig,
-    preserved_tapes: &[CatalogResetPreservedTape],
-    admission: CatalogResetAdmission<'_>,
-) -> Result<(), StateError> {
-    reset_catalog_locked_with_hook(paths, config, preserved_tapes, admission, |_| Ok(()))
-}
-
 #[cfg(any(test, feature = "fixtures"))]
 thread_local! { static REJECT_RESET_HELPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
@@ -2738,93 +1991,7 @@ fn reset_helper_tripwire() {
         .with(|flag| assert!(!flag.get(), "projection rebuild reached reset helper"));
 }
 
-fn reset_catalog_locked_with_hook<F>(
-    paths: &StatePaths,
-    config: &RemConfig,
-    preserved_tapes: &[CatalogResetPreservedTape],
-    admission: CatalogResetAdmission<'_>,
-    mut phase_hook: F,
-) -> Result<(), StateError>
-where
-    F: FnMut(CatalogResetPhase) -> Result<(), StateError>,
-{
-    reset_helper_tripwire();
-    begin_or_resume_catalog_reset_fence(
-        paths,
-        admission.request_digest,
-        admission.preflight_token,
-        admission.output_token,
-    )?;
-    archive_reset_authoritative_inputs(paths, admission.request_digest)?;
-    phase_hook(CatalogResetPhase::AuthoritativeInputsArchived)?;
-    ensure_state_directories(paths)?;
-
-    // The source remains a complete, reusable catalog until the final atomic
-    // rename. Checkpointing first makes removal of its stale sidecars safe.
-    if paths.sqlite_path.exists() {
-        if let Some(expected_schema_version) = admission.source_schema_version {
-            crate::projector::prepare_admitted_catalog_reset_source_atomic_swap(
-                &paths.sqlite_path,
-                expected_schema_version,
-            )?;
-        } else {
-            let source = crate::projector::open_reset_source(&paths.sqlite_path)?;
-            let version = source.schema_version()?;
-            drop(source);
-            crate::projector::prepare_admitted_catalog_reset_source_atomic_swap(
-                &paths.sqlite_path,
-                version,
-            )?;
-        }
-    }
-    phase_hook(CatalogResetPhase::SourceCheckpointed)?;
-
-    let replacement_path = create_unique_reset_sqlite_path(&paths.sqlite_path)?;
-    let replacement_result = (|| {
-        let mut replacement = crate::projector::open_reset_replacement(&replacement_path)?;
-        phase_hook(CatalogResetPhase::ReplacementSchemaCreated)?;
-        let _config_warnings = project_configured_tape_pools(&mut replacement, config)?;
-        replacement.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
-        phase_hook(CatalogResetPhase::PoolsProjected)?;
-        replacement.restore_catalog_reset_tapes(preserved_tapes)?;
-        phase_hook(CatalogResetPhase::TapesRestored)?;
-        replacement.prepare_catalog_reset_atomic_swap()?;
-        drop(replacement);
-        sync_regular_file(&replacement_path)?;
-
-        // `paths.calibration_dir` is deliberately NOT reset. The durable
-        // allocator advances while every evicted projection disappears.
-        let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
-        calibration.record_all_maps_evicted("catalog_reset")?;
-        reset_directory_contents(&paths.audit_dir)?;
-        reset_directory_contents(&paths.journal_dir)?;
-        reset_directory_contents(&paths.tape_cache_dir)?;
-        record_catalog_reset_boundary(paths, admission.request_digest)?;
-        phase_hook(CatalogResetPhase::AuthoritativeInputsCleared)?;
-
-        // The source main file was checkpointed above. Its sidecars can now be
-        // removed without making the source unusable if the process stops
-        // before the atomic rename.
-        remove_sqlite_sidecars(&paths.sqlite_path)?;
-        phase_hook(CatalogResetPhase::BeforeAtomicSwap)?;
-        fs::rename(&replacement_path, &paths.sqlite_path).map_err(|err| {
-            StateError::io_at("atomically replace catalog sqlite", &paths.sqlite_path, err)
-        })?;
-        if let Some(parent) = paths.sqlite_path.parent() {
-            sync_directory(parent)?;
-        }
-        crate::authority_layout::install(paths, true)?;
-        phase_hook(CatalogResetPhase::AfterAtomicSwap)?;
-        clear_catalog_reset_fence(paths)?;
-        Ok(())
-    })();
-    if replacement_result.is_err() {
-        let _ = remove_file_if_exists(&replacement_path);
-        let _ = remove_sqlite_sidecars(&replacement_path);
-    }
-    replacement_result
-}
-
+#[cfg(test)]
 fn hex_tape_uuid(tape_uuid: [u8; 16]) -> String {
     let mut out = String::with_capacity(32);
     for byte in tape_uuid {
@@ -2834,29 +2001,14 @@ fn hex_tape_uuid(tape_uuid: [u8; 16]) -> String {
     out
 }
 
-fn project_configured_tape_pools(
-    index: &mut CatalogIndex,
-    config: &RemConfig,
-) -> Result<Vec<StateConfigWarning>, StateError> {
-    let pools = config
-        .tape_pools
-        .iter()
-        .map(|pool| TapePoolProjectionInput {
-            pool_id: pool.id.clone(),
-            display_name: pool.display_name.clone(),
-            copy_class: pool.copy_class.clone(),
-            content_class: pool.content_class.clone(),
-            created_at_utc: None,
-        })
-        .collect::<Vec<_>>();
+fn configured_tape_pool_warnings(config: &RemConfig) -> Vec<StateConfigWarning> {
     let mut warnings = Vec::new();
     if config.tape_pool_rules.is_empty() && !config.tape_pools.is_empty() {
         warnings.push(StateConfigWarning::TapePoolsWithoutRules {
             pool_count: config.tape_pools.len(),
         });
     }
-    index.reconcile_tape_pool_projection_from_rules(&pools, &config.tape_pool_rules)?;
-    Ok(warnings)
+    warnings
 }
 
 fn ensure_state_directories(paths: &StatePaths) -> Result<(), StateError> {
@@ -2892,108 +2044,7 @@ fn create_private_dir(path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-fn reset_directory_contents(path: &Path) -> Result<(), StateError> {
-    if path.exists() {
-        fs::remove_dir_all(path)
-            .map_err(|err| StateError::io_at("remove state subdirectory", path, err))?;
-    }
-    create_private_dir(path)
-}
-
 const RESET_ARCHIVE_DIR: &str = "reset-archives";
-
-/// Persist the declared boundary in the new audit chain as well as its archive.
-/// Exact reset retries do not append a second boundary record.
-fn record_catalog_reset_boundary(
-    paths: &StatePaths,
-    request_digest: &str,
-) -> Result<(), StateError> {
-    if FileAuditLog::replay(&paths.audit_dir)?.iter().any(|r| {
-        r.event == AuditEvent::RecoveryEvent
-            && r.detail.get("reset_request_digest") == Some(&CborValue::Text(request_digest.into()))
-    }) {
-        return Ok(());
-    }
-    let mut audit = FileAuditLog::open(&paths.audit_dir, true)?;
-    audit.append(AuditEventRecord {
-        actor: AuditActor::local_user(),
-        source_layer: SourceLayer::Layer4,
-        operation_id: None,
-        session_id: None,
-        idempotency_key: None,
-        event: AuditEvent::RecoveryEvent,
-        subject: AuditSubject {
-            kind: "authority-layout".into(),
-            id: Some(crate::authority_layout::FORMAT.into()),
-        },
-        detail: BTreeMap::from([
-            (
-                "action".into(),
-                CborValue::Text("declared_state_reset".into()),
-            ),
-            (
-                "reset_request_digest".into(),
-                CborValue::Text(request_digest.into()),
-            ),
-            (
-                "state_dir".into(),
-                CborValue::Text(paths.state_dir.display().to_string()),
-            ),
-            (
-                "journal_dir".into(),
-                CborValue::Text(paths.journal_dir.display().to_string()),
-            ),
-            (
-                "audit_dir".into(),
-                CborValue::Text(paths.audit_dir.display().to_string()),
-            ),
-        ]),
-    })?;
-    Ok(())
-}
-
-fn archive_reset_authoritative_inputs(
-    paths: &StatePaths,
-    request_digest: &str,
-) -> Result<(), StateError> {
-    reset_helper_tripwire();
-    if !paths.audit_dir.exists() && !paths.journal_dir.exists() {
-        return Ok(());
-    }
-
-    let archive_dir = create_unique_reset_archive_dir(&paths.state_dir)?;
-    archive_directory_if_exists(&paths.audit_dir, &archive_dir.join("audit"))?;
-    archive_directory_if_exists(&paths.journal_dir, &archive_dir.join("journals"))?;
-    let binding = archive_dir.join("authority-reset.json");
-    let mut manifest = fs::File::create(&binding)
-        .map_err(|e| StateError::io_at("create reset archive binding", &binding, e))?;
-    serde_json::to_writer(
-        &mut manifest,
-        &serde_json::json!({
-            "state_dir": paths.state_dir, "journal_dir": paths.journal_dir,
-            "audit_dir": paths.audit_dir, "config_path": paths.config_path,
-            "replacement_authority_format": crate::authority_layout::FORMAT,
-            "request_digest": request_digest,
-        }),
-    )
-    .map_err(|e| StateError::ConfigInvalid(format!("write reset archive binding: {e}")))?;
-    manifest
-        .sync_all()
-        .map_err(|e| StateError::io_at("sync reset archive binding", &binding, e))?;
-    let marker = paths.state_dir.join("authority-format");
-    if marker.exists() {
-        let saved = archive_dir.join("authority-format");
-        fs::copy(&marker, &saved)
-            .map_err(|e| StateError::io_at("archive authority format", &marker, e))?;
-        sync_regular_file(&saved)?;
-    }
-
-    sync_directory(&archive_dir)?;
-    if let Some(root) = archive_dir.parent() {
-        sync_directory(root)?;
-    }
-    Ok(())
-}
 
 fn create_unique_reset_archive_dir(state_dir: &Path) -> Result<PathBuf, StateError> {
     let root = state_dir.join(RESET_ARCHIVE_DIR);
@@ -3061,37 +2112,6 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<(), Sta
     Ok(())
 }
 
-fn create_unique_reset_sqlite_path(sqlite_path: &Path) -> Result<PathBuf, StateError> {
-    let parent = sqlite_path.parent().ok_or_else(|| {
-        StateError::ConfigInvalid(format!(
-            "catalog sqlite path {} has no parent directory",
-            sqlite_path.display()
-        ))
-    })?;
-    let filename = sqlite_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            StateError::ConfigInvalid(format!(
-                "catalog sqlite path {} has no UTF-8 filename",
-                sqlite_path.display()
-            ))
-        })?;
-    for index in 1..=999_999u32 {
-        let candidate = parent.join(format!(".{filename}.reset-{index:06}"));
-        if !candidate.exists()
-            && !sqlite_sidecar_path(&candidate, "wal").exists()
-            && !sqlite_sidecar_path(&candidate, "shm").exists()
-        {
-            return Ok(candidate);
-        }
-    }
-    Err(StateError::ConfigInvalid(format!(
-        "no free catalog reset replacement name beside {}",
-        sqlite_path.display()
-    )))
-}
-
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!(
         "{}-{suffix}",
@@ -3141,6 +2161,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
+    #[cfg(test)]
     use ciborium::value::Value as CborValue;
     use remanence_parity::ParityConfig;
     use uuid::Uuid;
@@ -3404,68 +2425,101 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
             )
             .unwrap();
-        let before = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
-        let events_before = FileAuditLog::replay(&handle.paths.audit_dir).unwrap().len();
+        let before = handle
+            .catalog()
+            .get_tape(&input.tape_uuid)
+            .unwrap()
+            .unwrap();
+        let source_before = handle.library.test_source_records();
         assert!(handle
             .assign_tape_pool(input.tape_uuid, before.assignment_generation + 1, None)
             .is_err());
-        assert_eq!(
-            FileAuditLog::replay(&handle.paths.audit_dir).unwrap().len(),
-            events_before
-        );
-        assert!(handle
-            .index
-            .compare_and_set_tape_pool_assignment_with_audit(
-                input.tape_uuid,
-                before.assignment_generation,
-                None,
-                "operator",
-                |_| Err(StateError::ConfigInvalid("injected audit failure".into())),
-            )
-            .is_err());
-        let unchanged = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
-        assert_eq!(unchanged.pool_id, before.pool_id);
-        assert_eq!(
-            unchanged.assignment_generation,
-            before.assignment_generation
-        );
+        assert_eq!(handle.library.test_source_records(), source_before);
         handle
             .assign_tape_pool(input.tape_uuid, before.assignment_generation, None)
             .unwrap();
+        // Approved MediumSpecSet preserves an already measured family. An
+        // operator cannot replace that fact or increase unmeasured capacity.
         for generation in [crate::LtoGen::Lto8, crate::LtoGen::Lto9] {
-            handle
+            let source_before = handle.library.test_source_records();
+            assert!(handle
                 .set_tape_generation(
                     input.tape_uuid,
                     crate::MediaObservation {
                         generation,
-                        source: crate::GenerationSource::Operator,
-                    },
+                        source: crate::GenerationSource::Operator
+                    }
                 )
-                .unwrap();
-            let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
-            assert_eq!(
-                records.last().unwrap().event,
-                AuditEvent::TapeGenerationChanged
-            );
-            let mut restored = crate::projector::open(":memory:")
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
-            for full_rebuild in [false, false, true] {
-                if full_rebuild {
-                    restored
-                        .rebuild_from_authoritative_sources(&records, &[])
-                        .unwrap();
-                } else {
-                    restored.replay_audit_records(&records).unwrap();
+                .is_err());
+            assert_eq!(handle.library.test_source_records(), source_before);
+        }
+        handle
+            .set_tape_generation(
+                input.tape_uuid,
+                crate::MediaObservation {
+                    generation: crate::LtoGen::Lto7,
+                    source: crate::GenerationSource::Operator,
+                },
+            )
+            .unwrap();
+        let mut unmeasured = adoption_input(Uuid::new_v4());
+        unmeasured.tape_uuid = *Uuid::new_v4().as_bytes();
+        unmeasured.voltag = Some("HINT01L7".into());
+        unmeasured.pool_id = Some("camera.copy-a".into());
+        unmeasured.observation = Some(crate::MediaObservation {
+            generation: crate::LtoGen::Lto7,
+            source: crate::GenerationSource::Label,
+        });
+        handle
+            .adopt_bootstrap_identity(
+                unmeasured.clone(),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .unwrap();
+        let source_before = handle.library.test_source_records();
+        assert!(handle
+            .set_tape_generation(
+                unmeasured.tape_uuid,
+                crate::MediaObservation {
+                    generation: crate::LtoGen::Lto8,
+                    source: crate::GenerationSource::Operator
                 }
-                let tape = restored.get_tape(&input.tape_uuid).unwrap().unwrap();
-                assert_eq!(
-                    crate::tape_generation(&tape),
-                    Some((generation, crate::GenerationSource::Operator))
-                );
-                assert_eq!(tape.pool_id, None);
-                assert_eq!(tape.assignment_generation, before.assignment_generation + 1);
+            )
+            .is_err());
+        assert_eq!(handle.library.test_source_records(), source_before);
+        handle
+            .set_tape_generation(
+                unmeasured.tape_uuid,
+                crate::MediaObservation {
+                    generation: crate::LtoGen::Lto8,
+                    source: crate::GenerationSource::Measured,
+                },
+            )
+            .unwrap();
+        for rebuild in [false, true] {
+            if rebuild {
+                handle.rebuild_index_from_journals().unwrap();
             }
+            let tape = handle
+                .catalog()
+                .get_tape(&input.tape_uuid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::tape_generation(&tape),
+                Some((crate::LtoGen::Lto7, crate::GenerationSource::Operator))
+            );
+            assert_eq!(tape.pool_id, None);
+            assert_eq!(tape.assignment_generation, before.assignment_generation + 1);
+            let corrected = handle
+                .catalog()
+                .get_tape(&unmeasured.tape_uuid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::tape_generation(&corrected),
+                Some((crate::LtoGen::Lto8, crate::GenerationSource::Measured))
+            );
         }
     }
 
@@ -3645,10 +2699,35 @@ pool_id = "camera.copy-a"
             .is_map_servable(uuid, write_epoch));
         input.block_size = 512 * 1024;
         input.force = true;
+        // Packet tag4 requires a new UUID/incarnation1. A refused same-UUID
+        // geometry change must leave calibration and the cached map intact.
+        assert!(handle
+            .provision_tape_with_media(
+                input.clone(),
+                crate::LabelProvenance::Operator,
+                Some(observation)
+            )
+            .is_err());
+        assert!(handle
+            .calibration_control()
+            .is_map_servable(uuid, write_epoch));
+        assert!(handle.index.get_wrap_map(&uuid).unwrap().is_some());
         handle
-            .provision_tape_with_media(input, crate::LabelProvenance::Operator, Some(observation))
+            .retire_tape(RetireTapeInput {
+                tape_uuid: uuid,
+                reason: "confirmed replacement".into(),
+            })
             .unwrap();
-        let tape = handle.index.get_tape(&uuid).unwrap().unwrap();
+        input.tape_uuid = [0x46; 16];
+        handle
+            .provision_replacing_media(
+                input.clone(),
+                crate::LabelProvenance::Operator,
+                Some(observation),
+                Some(uuid),
+            )
+            .unwrap();
+        let tape = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
         assert_eq!(tape.voltag_source, Some(crate::LabelProvenance::Operator));
         assert_eq!(
             crate::tape_generation(&tape),
@@ -3673,8 +2752,8 @@ pool_id = "camera.copy-a"
         fs::write(&config_path, config_text(temp.path())).unwrap();
         let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
         for (id, label) in [(1u8, "ACM001L9"), (2, "ACM002L9")] {
-            handle
-                .audit
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::System,
                     source_layer: SourceLayer::Layer4,
@@ -3890,18 +2969,32 @@ pool_id = "camera.copy-a"
             .list_tape_files(&adoption_input(operation_id).tape_uuid)
             .expect("list tape files")
             .is_empty());
-        let records = FileAuditLog::replay(&handle.paths().audit_dir).expect("replay audit");
+        let records = handle.library.test_source_records();
         let adoption_records: Vec<_> = records
             .iter()
-            .filter(|record| record.event == AuditEvent::TapeIdentityAdopted)
+            .filter(|record| {
+                matches!(
+                    record.body_view(),
+                    crate::library_log::BodyView::Reprovision(_)
+                )
+            })
             .collect();
         assert_eq!(adoption_records.len(), 1);
-        assert_eq!(adoption_records[0].operation_id, Some(operation_id));
-        assert_eq!(adoption_records[0].idempotency_key, Some(operation_id));
+        assert_eq!(
+            adoption_records[0].envelope.operation_id,
+            Some(*operation_id.as_bytes())
+        );
+        assert_eq!(
+            adoption_records[0].envelope.idempotency_key,
+            Some(*operation_id.as_bytes())
+        );
+        assert!(FileAuditLog::replay(&handle.paths.audit_dir)
+            .unwrap()
+            .is_empty());
 
         handle
             .write_handle()
-            .record_media_readiness_operation(crate::index::MediaReadinessOperationInput {
+            .begin_typed_media_readiness_operation(crate::index::MediaReadinessOperationInput {
                 operation_id: Uuid::new_v4(),
                 run_id: None,
                 endpoint: crate::DriveKey::new("LIB001".to_string(), 0x0101),
@@ -3911,10 +3004,15 @@ pool_id = "camera.copy-a"
                 barcode: Some("ACM901L9".to_string()),
                 source_slot: Some(0x0401),
                 media_generation: Some(9),
+                media_family: Some(crate::LtoGen::Lto9),
                 phase: "planned".to_string(),
                 state: "planned".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
-                deadline_at_utc: None,
+                deadline_at_utc: Some(
+                    (time::OffsetDateTime::now_utc() + Duration::minutes(1))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                ),
                 evidence_path: None,
             })
             .expect("record active physical operation guard");
@@ -3924,11 +3022,13 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
             )
             .expect_err("active physical operation evidence must forbid adoption no-op");
-        assert!(guarded.to_string().contains("conflicts with existing"));
+        assert!(guarded
+            .to_string()
+            .contains("active fence, session, readiness"));
     }
 
     #[test]
-    fn bootstrap_adoption_recovers_audit_before_projection_crash_cut() {
+    fn bootstrap_adoption_rebuilds_empty_sql_from_typed_source() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-adopt-crash-cut")
             .tempdir()
@@ -3945,16 +3045,13 @@ pool_id = "camera.copy-a"
                 )
                 .expect("initial adoption");
         }
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open sqlite");
-        conn.execute(
-            "delete from tapes where tape_uuid = ?1",
-            rusqlite::params![adoption_input(operation_id).tape_uuid.to_vec()],
-        )
-        .expect("simulate missing projection");
-        drop(conn);
+        fs::remove_file(temp.path().join("index/rem-state.sqlite")).unwrap();
 
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        handle.startup_replay().expect("actual startup replay");
+        handle
+            .rebuild_projection_from_tape_logs()
+            .expect("actual live rebuild");
         let recovery_operation_id = Uuid::new_v4();
         let outcome = handle
             .adopt_bootstrap_identity(
@@ -3974,78 +3071,85 @@ pool_id = "camera.copy-a"
                 .state,
             "recovery_required"
         );
+        let paths = handle.paths.clone();
+        let authority_before = authority_reset::test_authority_bytes(&paths);
+        drop(handle);
+        StateHandle::rebuild_projection_from_config_file(&config_path).unwrap();
+        assert_eq!(
+            authority_reset::test_authority_bytes(&paths),
+            authority_before
+        );
+        let reopened = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert_eq!(
+            reopened
+                .catalog()
+                .get_tape(&adoption_input(operation_id).tape_uuid)
+                .unwrap()
+                .unwrap()
+                .state,
+            "recovery_required"
+        );
     }
 
     #[test]
     fn bootstrap_adoption_replay_preserves_newer_conflicting_barcode_authority() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-adopt-replay-barcode-conflict")
-            .tempdir()
-            .expect("temp dir");
+        let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        let original_operation_id = Uuid::new_v4();
-        let original = adoption_input(original_operation_id);
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let original = adoption_input(Uuid::new_v4());
+        let conflicting_uuid = *Uuid::new_v4().as_bytes();
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
             handle
                 .adopt_bootstrap_identity(
                     original.clone(),
                     adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
                 )
-                .expect("initial adoption");
+                .unwrap();
+            let mut other = original.clone();
+            other.operation_id = Uuid::new_v4();
+            other.tape_uuid = conflicting_uuid;
+            other.voltag = Some("ACM902L9".into());
+            handle
+                .adopt_bootstrap_identity(
+                    other,
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                )
+                .unwrap();
+            handle
+                .rebind_tape_label(
+                    conflicting_uuid,
+                    original.voltag.as_deref().unwrap(),
+                    original.tape_uuid,
+                )
+                .unwrap();
         }
-
-        let conflicting_uuid = *Uuid::new_v4().as_bytes();
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open sqlite");
-        conn.execute(
-            "delete from tapes where tape_uuid = ?1",
-            rusqlite::params![original.tape_uuid.to_vec()],
-        )
-        .expect("simulate missing original projection");
-        conn.execute(
-            "insert into tapes(
-               tape_uuid, voltag, pool_id, assignment_generation, kind,
-               block_size, highest_protected_ordinal, total_committed_ordinals,
-               written_extent_lba, state, updated_at_utc
-             ) values(
-               ?1, ?2, 'camera.copy-a', 2, 'data', 1048576,
-               X'0000000000000000', X'0000000000000000',
-               X'0000000000000001', 'ready', '2026-08-09T00:00:00Z'
-             )",
-            rusqlite::params![
-                conflicting_uuid.to_vec(),
-                original.voltag.as_deref().unwrap()
-            ],
-        )
-        .expect("insert newer conflicting barcode authority");
-        drop(conn);
-
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
-        let error = handle
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        handle.startup_replay().unwrap();
+        assert!(handle
             .adopt_bootstrap_identity(
                 adoption_input(Uuid::new_v4()),
-                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
             )
-            .expect_err("old adoption replay must not displace newer barcode authority");
-        assert!(error.to_string().contains("conflicts with existing"));
-
-        let conflicting = handle
-            .catalog()
-            .get_tape(&conflicting_uuid)
-            .expect("lookup conflicting row")
-            .expect("conflicting row remains");
+            .is_err());
         assert_eq!(
-            conflicting.voltag.as_deref(),
-            Some(original.voltag.as_deref().unwrap())
+            handle
+                .catalog()
+                .get_tape(&conflicting_uuid)
+                .unwrap()
+                .unwrap()
+                .voltag,
+            original.voltag
         );
-        assert_eq!(conflicting.written_extent_lba, Some(1));
-        assert!(handle
-            .catalog()
-            .get_tape(&original.tape_uuid)
-            .expect("lookup original projection")
-            .is_none());
+        assert_eq!(
+            handle
+                .catalog()
+                .get_tape(&original.tape_uuid)
+                .unwrap()
+                .unwrap()
+                .voltag,
+            None
+        );
     }
 
     #[test]
@@ -4092,7 +3196,7 @@ pool_id = "camera.copy-a"
             .expect_err("fresh operation cannot change the tail-derived catalog state");
         assert!(changed_under_fresh_operation
             .to_string()
-            .contains("conflicts with existing"));
+            .contains("changed immutable facts"));
 
         let mut different_tape_same_operation = adoption_input(operation_id);
         different_tape_same_operation.tape_uuid[15] ^= 0x01;
@@ -4136,14 +3240,45 @@ pool_id = "camera.copy-a"
                 )
                 .expect("initial adoption");
         }
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open sqlite");
-        conn.execute(
-            "update tapes set written_extent_lba = X'0000000000000001' where tape_uuid = ?1",
-            rusqlite::params![adoption_input(operation_id).tape_uuid.to_vec()],
-        )
-        .expect("simulate later physical prefix authority");
-        drop(conn);
+        {
+            use crate::authority::TapeAuthorityView;
+            let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+            let input = adoption_input(operation_id);
+            let authority = crate::TapeAuthority::open(
+                handle.paths.journal_dir.join("tapes"),
+                input.tape_uuid,
+                &handle.paths.sqlite_path,
+            )
+            .unwrap();
+            let mut lease = authority.acquire_exclusive().unwrap();
+            let scheme = match input.parity {
+                ParityConfig::None => None,
+                ParityConfig::Scheme(v) => Some(v),
+            };
+            lease
+                .publish_initialized(
+                    input.block_size,
+                    scheme,
+                    crate::tape_log::CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+            let snapshot = lease.freeze().unwrap();
+            handle.index.project_tape_log(&snapshot).unwrap();
+            // This ordinary native producer refresh must survive live rebuild.
+            handle.rebuild_projection_from_tape_logs().unwrap();
+            assert_eq!(
+                handle
+                    .catalog()
+                    .get_tape(&input.tape_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .written_extent_lba,
+                Some(2)
+            );
+        }
 
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         let error = handle
@@ -4152,7 +3287,9 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
             )
             .expect_err("evolved prefix authority must forbid re-adoption");
-        assert!(error.to_string().contains("conflicts with existing"));
+        assert!(error
+            .to_string()
+            .contains("evolved after adoption in native authority"));
         assert_eq!(
             handle
                 .catalog()
@@ -4160,7 +3297,7 @@ pool_id = "camera.copy-a"
                 .expect("lookup")
                 .expect("evolved row")
                 .written_extent_lba,
-            Some(1)
+            Some(2)
         );
     }
 
@@ -4182,14 +3319,12 @@ pool_id = "camera.copy-a"
                 )
                 .expect("initial adoption");
         }
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open sqlite");
-        conn.execute(
-            "update tapes set assignment_generation = 2 where tape_uuid = ?1",
-            rusqlite::params![adoption_input(operation_id).tape_uuid.to_vec()],
-        )
-        .expect("simulate later assignment authority");
-        drop(conn);
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+            handle
+                .assign_tape_pool(adoption_input(operation_id).tape_uuid, 1, None)
+                .unwrap();
+        }
 
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         let error = handle
@@ -4198,51 +3333,206 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
             )
             .expect_err("evolved assignment generation must forbid re-adoption");
-        assert!(error.to_string().contains("assignment generation evolved"));
+        assert!(error
+            .to_string()
+            .contains("assignment or media generation evolved"));
     }
 
     #[test]
     fn bootstrap_adoption_checks_uuid_and_barcode_conflicts_across_tape_kinds() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-adopt-kind-conflict")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        {
-            StateHandle::open_from_config_file(&config_path).expect("initialize state");
+        for same_uuid in [true, false] {
+            use crate::library_log as lib;
+            let temp = tempfile::tempdir().unwrap();
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, config_text(temp.path())).unwrap();
+            let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+            let mut input = adoption_input(Uuid::new_v4());
+            let cartridge = lib::cleaning_cartridge_ref(&input.voltag.as_deref().unwrap().into());
+            if same_uuid {
+                input.tape_uuid = cartridge.uuid;
+            }
+            handle
+                .library
+                .append(|a, v| {
+                    a.cleaning_recorded(
+                        lib::CleaningRecorded {
+                            run_id: "register-cleaning".into(),
+                            previous: None,
+                            drive_uuid: None,
+                            cartridge: Some(cartridge),
+                            action: lib::CleaningAction::Register(lib::Register {
+                                barcode: input.voltag.as_deref().unwrap().into(),
+                                home_slot: 4,
+                            }),
+                        },
+                        AuditActor::System,
+                        SourceLayer::Layer4,
+                        v,
+                    )
+                })
+                .unwrap();
+            assert!(handle
+                .adopt_bootstrap_identity(
+                    input,
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
+                )
+                .is_err());
         }
-        let input = adoption_input(Uuid::new_v4());
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open sqlite");
-        conn.execute(
-            "insert into tapes(tape_uuid, voltag, kind, cleaning_uses, cleaning_state, state, updated_at_utc)
-             values(?1, ?2, 'cleaning', 0, 'unverified', 'ready', '2026-08-09T00:00:00Z')",
-            rusqlite::params![input.tape_uuid.to_vec(), input.voltag.as_deref()],
-        )
-        .expect("insert conflicting cleaning identity");
-        drop(conn);
-
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
-        let expected_identity = format!(
-            "Bootstrap identity {} barcode {}",
-            Uuid::from_bytes(input.tape_uuid),
-            input.voltag.as_deref().unwrap()
-        );
-        let error = handle
-            .adopt_bootstrap_identity(
-                input,
-                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
-            )
-            .expect_err("cleaning identity conflict must fail");
-        assert!(error.to_string().contains(&expected_identity), "{error}");
-        assert!(
-            error.to_string().contains("cleaning catalog row"),
-            "{error}"
-        );
     }
 
     /// Adoption refusals expose an optional barcode as ordinary operator text.
+    #[test]
+    fn bootstrap_adoption_fresh_pool_intent_preserves_asymmetric_rule() {
+        for original_explicit in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, config_text(temp.path())).unwrap();
+            let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+            let mut original = adoption_input(Uuid::new_v4());
+            original.pool_id = original_explicit.then(|| "camera.copy-a".into());
+            state
+                .adopt_bootstrap_identity(
+                    original,
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                )
+                .unwrap();
+            let mut retry = adoption_input(Uuid::new_v4());
+            retry.pool_id = (!original_explicit).then(|| "camera.copy-a".into());
+            let mut changed_endpoint =
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
+            changed_endpoint.endpoint = crate::DriveKey::new("LIB002", 0x0102);
+            changed_endpoint.drive_serial = "DRV002".into();
+            let result = state.adopt_bootstrap_identity(retry, changed_endpoint);
+            assert_eq!(result.is_ok(), original_explicit);
+            let records = state.library.test_source_records();
+            let source = records
+                .iter()
+                .find_map(|r| match r.body_view() {
+                    crate::library_log::BodyView::Reprovision(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                adoption_assignment_source(source),
+                Some(if original_explicit {
+                    "operator"
+                } else {
+                    "rule"
+                })
+            );
+            assert_eq!(
+                state
+                    .catalog()
+                    .get_tape(&adoption_input(Uuid::new_v4()).tape_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .assignment_generation,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_adoption_empty_header_and_concurrent_native_rebuild() {
+        use crate::authority::TapeAuthorityView;
+        use std::sync::{mpsc, Arc, Barrier};
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+        let input = adoption_input(Uuid::new_v4());
+        let authority = crate::TapeAuthority::open(
+            state.paths.journal_dir.join("tapes"),
+            input.tape_uuid,
+            &state.paths.sqlite_path,
+        )
+        .unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        let scheme = match &input.parity {
+            ParityConfig::None => None,
+            ParityConfig::Scheme(v) => Some(v.clone()),
+        };
+        lease
+            .publish_empty_prefix(input.block_size, scheme.clone())
+            .unwrap();
+        state
+            .library
+            .refresh_native(&lease.freeze().unwrap())
+            .unwrap();
+        state
+            .adopt_bootstrap_identity(
+                input.clone(),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .unwrap();
+        lease
+            .publish_initialized(
+                input.block_size,
+                scheme,
+                crate::tape_log::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        let snapshot = lease.freeze().unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let runtime = state.library.clone();
+        let mut writer = state.write_handle();
+        let native_thread = {
+            let entered = entered.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                runtime
+                    .project_native_before_apply(
+                        &mut writer,
+                        &snapshot,
+                        crate::projector::apply::ApplyPath::Live,
+                        || {
+                            entered.wait();
+                            release.wait();
+                        },
+                    )
+                    .unwrap()
+            })
+        };
+        entered.wait();
+        let (started, begun) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let runtime = state.library.clone();
+        let mut writer = state.write_handle();
+        let rebuild = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            runtime.rebuild_projection(&mut writer).unwrap();
+            done.send(()).unwrap();
+        });
+        begun.recv().unwrap();
+        assert!(matches!(
+            finished.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.wait();
+        native_thread.join().unwrap();
+        rebuild.join().unwrap();
+        finished.recv().unwrap();
+        assert_eq!(
+            state
+                .catalog()
+                .get_tape(&input.tape_uuid)
+                .unwrap()
+                .unwrap()
+                .written_extent_lba,
+            Some(2)
+        );
+        assert!(state
+            .adopt_bootstrap_identity(
+                input,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
+            )
+            .is_err());
+    }
+
     #[test]
     fn bootstrap_adoption_rule_refusal_prints_plain_barcode() {
         let temp = tempfile::tempdir().unwrap();
@@ -4326,13 +3616,11 @@ pool_id = "camera.copy-a"
         assert!(!temp.path().join("index/rem-state.sqlite-wal").exists());
         assert!(!temp.path().join("index/rem-state.sqlite-shm").exists());
         let archive_dir = temp.path().join("reset-archives/reset-000001");
-        let binding: serde_json::Value =
-            serde_json::from_slice(&fs::read(archive_dir.join("authority-reset.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            binding["replacement_authority_format"],
-            crate::authority_layout::FORMAT
-        );
+        let binding: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("authority-reset-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["phase"], "Complete");
         assert_eq!(
             fs::read(archive_dir.join("authority-format")).unwrap(),
             fs::read(temp.path().join("authority-format")).unwrap()
@@ -4366,370 +3654,6 @@ pool_id = "camera.copy-a"
                 .as_deref(),
             Some("Camera copy A")
         );
-    }
-
-    /// `authority-reset.json` names the request it archived: a scoped reset
-    /// writes exactly the preflight's `request_digest`, an ordinary full reset
-    /// the digest of its own fixed request. Both equal the new audit boundary.
-    #[test]
-    fn reset_archive_request_digest_is_the_preflight_and_audit_digest() {
-        let reset_binding = |root: &Path| -> (String, String) {
-            let binding: serde_json::Value = serde_json::from_slice(
-                &fs::read(root.join("reset-archives/reset-000001/authority-reset.json")).unwrap(),
-            )
-            .unwrap();
-            let digest = binding["request_digest"].as_str().unwrap().to_string();
-            assert_eq!(digest.len(), 64);
-            assert!(digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-            let records = FileAuditLog::replay(root.join("audit")).unwrap();
-            assert_eq!(records.len(), 1);
-            let Some(CborValue::Text(audited)) = records[0].detail.get("reset_request_digest")
-            else {
-                panic!("reset boundary has no request digest");
-            };
-            (digest, audited.clone())
-        };
-        for scoped in [true, false] {
-            let temp = tempfile::tempdir().unwrap();
-            let config_path = temp.path().join("config.toml");
-            fs::write(&config_path, config_text(temp.path())).unwrap();
-            {
-                let handle = StateHandle::open_from_config_file(&config_path).unwrap();
-                handle
-                    .write_handle()
-                    .provision_tape(crate::index::ProvisionTapeInput {
-                        tape_uuid: [0x93; 16],
-                        voltag: "ACM001L9".to_string(),
-                        block_size: 512 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .unwrap();
-            }
-            fs::write(temp.path().join("journals/source.remjournal"), b"journal").unwrap();
-            let expected = if scoped {
-                let admitted = StateHandle::preflight_catalog_reset_from_config_file(
-                    &config_path,
-                    &[],
-                    &["ACM001L9".to_string()],
-                )
-                .unwrap();
-                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                    &config_path,
-                    &[],
-                    &["ACM001L9".to_string()],
-                    &admitted.preflight_token,
-                )
-                .unwrap();
-                admitted.request_digest
-            } else {
-                StateHandle::reset_catalog_from_config_file(&config_path).unwrap();
-                let paths =
-                    StatePaths::from_config(&config_path, &load_config(&config_path).unwrap());
-                let (_, config_bytes) = load_catalog_reset_config_snapshot(&config_path).unwrap();
-                catalog_reset_request_digest(&paths, &config_bytes, &[], &[], true, &"0".repeat(64))
-                    .unwrap()
-            };
-            let (archived, audited) = reset_binding(temp.path());
-            assert_eq!(archived, expected, "scoped={scoped}");
-            assert_eq!(audited, expected, "scoped={scoped}");
-        }
-    }
-
-    #[test]
-    fn scoped_reset_preserves_only_exact_identity_geometry_and_current_pool() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-scoped-reset")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        let selected_uuid = [0x91; 16];
-        let discarded_uuid = [0x92; 16];
-        {
-            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-            for (tape_uuid, voltag) in [(selected_uuid, "ACM001L9"), (discarded_uuid, "ACM002L9")] {
-                handle
-                    .write_handle()
-                    .provision_tape(crate::index::ProvisionTapeInput {
-                        tape_uuid,
-                        voltag: voltag.to_string(),
-                        block_size: 512 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision tape");
-            }
-        }
-        fs::write(temp.path().join("audit/source.remaudit"), b"audit").expect("audit marker");
-        fs::write(temp.path().join("journals/source.remjournal"), b"journal")
-            .expect("journal marker");
-        fs::write(temp.path().join("cache/tapes/source.cache"), b"cache").expect("cache marker");
-
-        let admitted = StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &["ACM001L9".to_string()],
-            &["ACM002L9".to_string()],
-        )
-        .expect("preflight exact source");
-        let report = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-            &config_path,
-            &["ACM001L9".to_string()],
-            &["ACM002L9".to_string()],
-            &admitted.preflight_token,
-        )
-        .expect("scoped reset");
-
-        assert_eq!(report.preserved_tapes.len(), 1);
-        assert_eq!(report.preserved_tapes[0].tape_uuid, selected_uuid);
-        assert_eq!(report.preserved_tapes[0].voltag, "ACM001L9");
-        assert_eq!(
-            report.preserved_tapes[0].pool_id.as_deref(),
-            Some("camera.copy-a")
-        );
-        assert_eq!(
-            report.preserved_tapes[0].state,
-            CatalogResetTapeState::Ready
-        );
-        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
-        let tapes = handle
-            .catalog()
-            .list_tapes(None, TapeKindFilter::All)
-            .expect("list tapes");
-        assert_eq!(tapes.len(), 1);
-        let tape = &tapes[0];
-        assert_eq!(tape.tape_uuid, selected_uuid);
-        assert_eq!(tape.voltag.as_deref(), Some("ACM001L9"));
-        assert_eq!(tape.kind, "data");
-        assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
-        assert_eq!(tape.assignment_generation, 1);
-        assert_eq!(tape.block_size, Some(512 * 1024));
-        assert_eq!(tape.state, "ready");
-        assert_eq!(tape.last_committed_tape_file, None);
-        assert_eq!(tape.total_committed_ordinals, 0);
-        assert_eq!(tape.written_extent_lba, None);
-        assert_eq!(tape.terminal_finalization, None);
-        assert_eq!(
-            fs::read_dir(temp.path().join("journals/tapes"))
-                .unwrap()
-                .count(),
-            0
-        );
-        assert!(handle
-            .catalog()
-            .get_tape(&discarded_uuid)
-            .expect("discarded lookup")
-            .is_none());
-        drop(handle);
-
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open reset sqlite");
-        for table in [
-            "tape_files",
-            "object_instances",
-            "catalog_units",
-            "operations",
-            "sessions",
-            "idempotency_keys",
-            "ingested_sources",
-        ] {
-            let count: u64 = conn
-                .query_row(&format!("select count(*) from {table}"), [], |row| {
-                    row.get(0)
-                })
-                .expect("count reset projection");
-            assert_eq!(count, 0, "{table}");
-        }
-        let archive = temp.path().join("reset-archives/reset-000001");
-        assert_eq!(
-            fs::read(archive.join("audit/source.remaudit")).expect("archived audit"),
-            b"audit"
-        );
-        assert_eq!(
-            fs::read(archive.join("journals/source.remjournal")).expect("archived journal"),
-            b"journal"
-        );
-        assert!(!archive.join("cache/tapes/source.cache").exists());
-    }
-
-    #[test]
-    fn scoped_reset_normalizes_written_and_finalized_tapes_to_recovery_required() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-scoped-reset-written")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        let written_uuid = [0x93; 16];
-        let finalized_uuid = [0x94; 16];
-        {
-            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-            for (tape_uuid, voltag) in [(written_uuid, "ACM003L9"), (finalized_uuid, "ACM004L9")] {
-                handle
-                    .write_handle()
-                    .provision_tape(crate::index::ProvisionTapeInput {
-                        tape_uuid,
-                        voltag: voltag.to_string(),
-                        block_size: 256 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision tape");
-            }
-            handle
-                .write_handle()
-                .seal_tape(written_uuid)
-                .expect("seal written tape");
-            handle
-                .write_handle()
-                .project_terminal_finalization(crate::index::TerminalFinalizationProjectionInput {
-                    tape_uuid: finalized_uuid,
-                    trigger: crate::checkpoint::TerminalFinalizationTrigger::ReachedLowWatermark,
-                    operation_id: None,
-                    progress: crate::checkpoint::TerminalFinalizationProgress::AfterReplicaC,
-                    edition_digest: [0x31; 32],
-                    layout_digest: [0x32; 32],
-                    outcome: crate::index::TerminalFinalizationOutcome::Finalized,
-                    updated_at_utc: None,
-                })
-                .expect("finalize tape projection");
-        }
-
-        let report = StateHandle::reset_catalog_preserving_from_config_file(
-            &config_path,
-            &["ACM003L9".to_string(), "ACM004L9".to_string()],
-        )
-        .expect("scoped reset");
-        assert!(report
-            .preserved_tapes
-            .iter()
-            .all(|tape| tape.state == CatalogResetTapeState::RecoveryRequired));
-
-        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
-        for tape_uuid in [written_uuid, finalized_uuid] {
-            let tape = handle
-                .catalog()
-                .get_tape(&tape_uuid)
-                .expect("get tape")
-                .expect("preserved tape");
-            assert_eq!(tape.state, "recovery_required");
-            assert_eq!(tape.last_committed_tape_file, None);
-            assert_eq!(tape.total_committed_ordinals, 0);
-            assert_eq!(tape.written_extent_lba, None);
-            assert_eq!(tape.terminal_finalization, None);
-        }
-    }
-
-    #[test]
-    fn scoped_reset_drops_live_guards_but_never_restores_their_tapes_ready() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-scoped-reset-guards")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        let guarded = [
-            ([0xA1; 16], "ACM021L9"),
-            ([0xA2; 16], "ACM022L9"),
-            ([0xA3; 16], "ACM023L9"),
-            ([0xA4; 16], "ACM024L9"),
-        ];
-        {
-            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-            for (tape_uuid, voltag) in guarded {
-                handle
-                    .write_handle()
-                    .provision_tape(ProvisionTapeInput {
-                        tape_uuid,
-                        voltag: voltag.to_string(),
-                        block_size: 1024 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision guarded tape");
-            }
-        }
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open source sqlite");
-        conn.execute(
-            "insert into sessions(
-               session_id, session_kind, tape_uuid, state, opened_at_utc, updated_at_utc
-             ) values('reset-open-session', 'write', ?1, 'open',
-                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
-            rusqlite::params![guarded[0].0.as_slice()],
-        )
-        .expect("insert open session");
-        conn.execute(
-            "insert into tape_io_fences(
-               tape_uuid, barcode, state, reason, quarantine_id,
-               created_at_utc, updated_at_utc
-             ) values(?1, ?2, 'active', 'test', 'reset-active-fence',
-                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
-            rusqlite::params![guarded[1].0.as_slice(), guarded[1].1],
-        )
-        .expect("insert active fence");
-        conn.execute(
-            "insert into wrap_maps(
-               tape_uuid, descriptors_json, mapped_extent_lba, write_epoch,
-               calibration_generation, harvested_at_utc
-             ) values(?1, '[]', 0, 0, 1, '2026-08-09T00:00:00Z')",
-            rusqlite::params![guarded[2].0.as_slice()],
-        )
-        .expect("insert wrap map");
-        conn.execute(
-            "insert into media_readiness_ops(
-               operation_id, library_serial, drive_element, barcode,
-               phase, state, dirty_scope, started_at_utc, updated_at_utc
-             ) values('reset-readiness', 'LIB-RESET', 1, ?1,
-                      'load', 'running', 'drive+tape',
-                      '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
-            rusqlite::params![guarded[3].1],
-        )
-        .expect("insert active readiness operation");
-        drop(conn);
-
-        let preserve = guarded
-            .iter()
-            .map(|(_, voltag)| (*voltag).to_string())
-            .collect::<Vec<_>>();
-        let report =
-            StateHandle::reset_catalog_preserving_from_config_file(&config_path, &preserve)
-                .expect("reset guarded tapes");
-        assert_eq!(report.preserved_tapes.len(), guarded.len());
-        assert!(report
-            .preserved_tapes
-            .iter()
-            .all(|tape| tape.state == CatalogResetTapeState::RecoveryRequired));
-
-        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
-        for (tape_uuid, _) in guarded {
-            assert_eq!(
-                handle
-                    .catalog()
-                    .get_tape(&tape_uuid)
-                    .expect("lookup guarded tape")
-                    .expect("preserved tape")
-                    .state,
-                "recovery_required"
-            );
-        }
-        let reset_conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open replacement sqlite");
-        for table in [
-            "sessions",
-            "tape_io_fences",
-            "wrap_maps",
-            "media_readiness_ops",
-        ] {
-            let count: u64 = reset_conn
-                .query_row(&format!("select count(*) from {table}"), [], |row| {
-                    row.get(0)
-                })
-                .expect("count discarded guard rows");
-            assert_eq!(count, 0, "{table}");
-        }
     }
 
     #[test]
@@ -4798,693 +3722,53 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
-    fn scoped_reset_preflight_token_refuses_source_identity_geometry_state_and_pool_drift() {
-        for (label, mutation) in [
-            (
-                "uuid",
-                "update tapes set tape_uuid = X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' where voltag = 'ACM031L9'",
-            ),
-            (
-                "geometry",
-                "update tapes set block_size = 524288 where voltag = 'ACM031L9'",
-            ),
-            (
-                "state",
-                "update tapes set state = 'sealed' where voltag = 'ACM031L9'",
-            ),
-            (
-                "pool",
-                "update tapes set pool_id = null where voltag = 'ACM031L9'",
-            ),
-        ] {
-            let temp = tempfile::Builder::new()
-                .prefix(&format!("remanence-state-reset-token-{label}"))
-                .tempdir()
-                .expect("temp dir");
-            let config_path = temp.path().join("config.toml");
-            fs::write(&config_path, config_text(temp.path())).expect("write config");
-            {
-                let handle =
-                    StateHandle::open_from_config_file(&config_path).expect("open state");
-                handle
-                    .write_handle()
-                    .provision_tape(ProvisionTapeInput {
-                        tape_uuid: [0xBA; 16],
-                        voltag: "ACM031L9".to_string(),
-                        block_size: 1024 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision source");
-                handle
-                    .write_handle()
-                    .project_tape_pool_membership([0xBA; 16], "camera.copy-a")
-                    .expect("assign source pool");
-            }
-            let admitted = StateHandle::preflight_catalog_reset_from_config_file(
-                &config_path,
-                &["ACM031L9".to_string()],
-                &[],
-            )
-            .expect("preflight source");
-            fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("sentinel");
-            let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-                .expect("open source sqlite");
-            conn.execute(mutation, []).expect("mutate source evidence");
-            drop(conn);
-
-            let result = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                &config_path,
-                &["ACM031L9".to_string()],
-                &[],
-                &admitted.preflight_token,
-            );
-            let error = match result {
-                Err(error) => error,
-                Ok(report) => {
-                    panic!("{label}: source drift unexpectedly passed: {report:?}")
-                }
-            };
-            assert!(
-                matches!(error, StateError::ConfigInvalid(_)),
-                "{label}: {error}"
-            );
-            assert_eq!(
-                fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
-                b"unchanged",
-                "{label}"
-            );
-            assert!(
-                !temp.path().join("reset-archives").exists(),
-                "{label}: mutation must not start"
-            );
-            assert!(!catalog_reset_fence_path(&StatePaths::from_config(
-                &config_path,
-                &load_config(&config_path).expect("config")
-            ))
-            .exists());
-        }
-
-        #[cfg(unix)]
-        {
-            let temp = tempfile::Builder::new()
-                .prefix("remanence-state-reset-token-symlink")
-                .tempdir()
-                .expect("temp dir");
-            let config_path = temp.path().join("config.toml");
-            let config_link = temp.path().join("config-link.toml");
-            fs::write(&config_path, config_text(temp.path())).expect("write config");
-            {
-                let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-                handle
-                    .write_handle()
-                    .provision_tape(ProvisionTapeInput {
-                        tape_uuid: [0xBC; 16],
-                        voltag: "ACM032L9".to_string(),
-                        block_size: 1024 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision source");
-            }
-            let admitted = StateHandle::preflight_catalog_reset_from_config_file(
-                &config_path,
-                &["ACM032L9".to_string()],
-                &[],
-            )
-            .expect("direct-path preflight");
-            std::os::unix::fs::symlink(&config_path, &config_link).expect("symlink config");
-            let error =
-                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                    &config_link,
-                    &["ACM032L9".to_string()],
-                    &[],
-                    &admitted.preflight_token,
-                )
-                .expect_err("direct-to-symlink path-shape drift must fail");
-            assert!(matches!(error, StateError::ConfigInvalid(_)));
-            assert!(!temp.path().join("reset-archives").exists());
-        }
-    }
-
-    #[test]
-    fn scoped_reset_ambiguous_or_incompatible_catalog_fails_before_mutation() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-scoped-reset-corrupt")
-            .tempdir()
-            .expect("temp dir");
+    fn exact_full_reset_archives_schema16_while_scoped_legacy_refuses_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        {
-            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-            handle
-                .write_handle()
-                .provision_tape(crate::index::ProvisionTapeInput {
-                    tape_uuid: [0x96; 16],
-                    voltag: "ACM006L9".to_string(),
-                    block_size: 256 * 1024,
-                    parity: ParityConfig::None,
-                    force: false,
-                })
-                .expect("provision tape");
-        }
-        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
-        let sqlite_path = temp.path().join("index/rem-state.sqlite");
-        {
-            let conn = rusqlite::Connection::open(&sqlite_path).expect("open sqlite");
-            conn.execute("drop index tapes_voltag_unique", [])
-                .expect("drop unique index");
-            conn.execute(
-                "insert into tapes(
-                   tape_uuid, voltag, kind, block_size,
-                   highest_protected_ordinal, total_committed_ordinals,
-                   state, updated_at_utc
-                 ) values(?1, 'ACM006L9', 'data', 262144,
-                          X'0000000000000000', X'0000000000000000',
-                          'ready', '2026-08-09T00:00:00Z')",
-                rusqlite::params![[0x97_u8; 16].as_slice()],
-            )
-            .expect("insert ambiguous tape");
-        }
-        let error = StateHandle::reset_catalog_preserving_from_config_file(
-            &config_path,
-            &["ACM006L9".to_string()],
-        )
-        .expect_err("ambiguous catalog must fail");
-        assert!(matches!(error, StateError::AmbiguousCatalogLookup(_)));
-        assert_eq!(
-            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
-            b"unchanged"
-        );
-        assert!(!temp.path().join("reset-archives").exists());
-
-        let schema_temp = tempfile::Builder::new()
-            .prefix("remanence-state-scoped-reset-schema")
-            .tempdir()
-            .expect("temp dir");
-        let schema_config = schema_temp.path().join("config.toml");
-        fs::write(&schema_config, config_text(schema_temp.path())).expect("write config");
-        {
-            let _handle = StateHandle::open_from_config_file(&schema_config).expect("open state");
-        }
-        fs::write(schema_temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
-        let conn = rusqlite::Connection::open(schema_temp.path().join("index/rem-state.sqlite"))
-            .expect("open sqlite");
-        conn.pragma_update(None, "user_version", crate::index::SCHEMA_VERSION + 1)
-            .expect("advance schema");
-        drop(conn);
-        StateHandle::reset_catalog_preserving_from_config_file(
-            &schema_config,
-            &["ACM999L9".to_string()],
-        )
-        .expect_err("incompatible schema must fail");
-        assert_eq!(
-            fs::read(schema_temp.path().join("audit/sentinel")).expect("sentinel survives"),
-            b"unchanged"
-        );
-        assert!(!schema_temp.path().join("reset-archives").exists());
-
-        let config_temp = tempfile::Builder::new()
-            .prefix("remanence-state-scoped-reset-config")
-            .tempdir()
-            .expect("temp dir");
-        let invalid_config_path = config_temp.path().join("config.toml");
-        fs::write(&invalid_config_path, config_text(config_temp.path())).expect("write config");
-        {
-            let _handle = StateHandle::open_from_config_file(&invalid_config_path)
-                .expect("create valid source state");
-        }
-        fs::write(config_temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
-        let invalid_config = format!(
-            "{}\n[[tape_pools]]\nid = \"camera.copy-a\"\n",
-            config_text(config_temp.path())
-        );
-        fs::write(&invalid_config_path, invalid_config).expect("replace with invalid config");
-        StateHandle::reset_catalog_preserving_from_config_file(
-            &invalid_config_path,
-            &["ACM999L9".to_string()],
-        )
-        .expect_err("invalid config must fail");
-        assert_eq!(
-            fs::read(config_temp.path().join("audit/sentinel")).expect("sentinel survives"),
-            b"unchanged"
-        );
-        assert!(!config_temp.path().join("reset-archives").exists());
-    }
-
-    #[test]
-    fn scoped_reset_interruption_cuts_leave_a_rerunnable_catalog() {
-        for cut in [
-            CatalogResetPhase::AuthoritativeInputsArchived,
-            CatalogResetPhase::SourceCheckpointed,
-            CatalogResetPhase::ReplacementSchemaCreated,
-            CatalogResetPhase::PoolsProjected,
-            CatalogResetPhase::TapesRestored,
-            CatalogResetPhase::AuthoritativeInputsCleared,
-            CatalogResetPhase::BeforeAtomicSwap,
-            CatalogResetPhase::AfterAtomicSwap,
-        ] {
-            let temp = tempfile::Builder::new()
-                .prefix("remanence-state-scoped-reset-cut")
-                .tempdir()
-                .expect("temp dir");
-            let config_path = temp.path().join("config.toml");
-            fs::write(&config_path, config_text(temp.path())).expect("write config");
-            let tape_uuid = [0x98; 16];
-            {
-                let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-                handle
-                    .write_handle()
-                    .provision_tape(crate::index::ProvisionTapeInput {
-                        tape_uuid,
-                        voltag: "ACM008L9".to_string(),
-                        block_size: 1024 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision tape");
-                handle
-                    .write_handle()
-                    .seal_tape(tape_uuid)
-                    .expect("seal tape");
-            }
-            fs::write(temp.path().join("audit/sentinel"), b"audit").expect("write sentinel");
-            let admitted = StateHandle::preflight_catalog_reset_from_config_file(
-                &config_path,
-                &["ACM008L9".to_string()],
-                &[],
-            )
-            .expect("preflight cut fixture");
-            let config = load_config(&config_path).expect("load config");
-            let paths = StatePaths::from_config(&config_path, &config);
-            let config_bytes = fs::read(&config_path).expect("config bytes");
-            let request_digest = catalog_reset_request_digest(
-                &paths,
-                &config_bytes,
-                &["ACM008L9".to_string()],
-                &[],
-                false,
-                &admitted.preflight_token,
-            )
-            .expect("request digest");
-            let lock = StateLockGuard::acquire(&paths.state_dir).expect("acquire reset lock");
-            let preserved = crate::CatalogReader::open(&paths.sqlite_path)
-                .expect("open source")
-                .capture_catalog_reset_tapes(&["ACM008L9".to_string()], &config.tape_pool_rules)
-                .expect("capture source");
-            let output_token = catalog_reset_intended_output_token(&admitted.tapes, &preserved)
-                .expect("output token");
-            let error = reset_catalog_locked_with_hook(
-                &paths,
-                &config,
-                &preserved,
-                CatalogResetAdmission {
-                    request_digest: &request_digest,
-                    preflight_token: &admitted.preflight_token,
-                    output_token: &output_token,
-                    source_schema_version: Some(admitted.source_schema_version),
-                },
-                |phase| {
-                    if phase == cut {
-                        Err(StateError::ConfigInvalid(format!(
-                            "injected reset interruption at {phase:?}"
-                        )))
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-            .expect_err("cut must interrupt reset");
-            assert!(error.to_string().contains("injected reset interruption"));
-            drop(lock);
-
-            let open_error = StateHandle::open_from_config_file(&config_path)
-                .expect_err("durable reset fence must block ordinary state open");
-            assert!(
-                matches!(open_error, StateError::CatalogResetInProgress(_)),
-                "{open_error}"
-            );
-
-            let source_after_cut = crate::CatalogReader::open(&paths.sqlite_path)
-                .expect("a complete catalog survives every cut");
-            let tape_after_cut = source_after_cut
-                .get_tape_by_voltag("ACM008L9")
-                .expect("lookup after cut")
-                .expect("selected identity survives cut");
-            assert_eq!(tape_after_cut.tape_uuid, tape_uuid);
-            drop(source_after_cut);
-
-            if cut == CatalogResetPhase::SourceCheckpointed {
-                let conn = rusqlite::Connection::open(&paths.sqlite_path).expect("open cut sqlite");
-                conn.execute(
-                    "update tapes set tape_uuid = X'99999999999999999999999999999999' where voltag = 'ACM008L9'",
-                    [],
-                )
-                .expect("inject pre-swap source drift");
-                drop(conn);
-                let drift =
-                    StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                        &config_path,
-                        &["ACM008L9".to_string()],
-                        &[],
-                        &admitted.preflight_token,
-                    )
-                    .expect_err("pre-swap source drift must refuse resume");
-                assert!(matches!(drift, StateError::CatalogResetInProgress(_)));
-                let conn =
-                    rusqlite::Connection::open(&paths.sqlite_path).expect("repair cut sqlite");
-                conn.execute(
-                    "update tapes set tape_uuid = ?1 where voltag = 'ACM008L9'",
-                    rusqlite::params![tape_uuid.as_slice()],
-                )
-                .expect("remove pre-swap source drift");
-                conn.execute(
-                    "update tapes set assignment_generation = assignment_generation + 1,
-                                      state = 'recovery_required'
-                     where voltag = 'ACM008L9'",
-                    [],
-                )
-                .expect("mimic intended tape output before swap");
-                drop(conn);
-                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                    &config_path,
-                    &["ACM008L9".to_string()],
-                    &[],
-                    &admitted.preflight_token,
-                )
-                .expect_err("nonempty authority directories forbid false post-swap recognition");
-                let conn = rusqlite::Connection::open(&paths.sqlite_path)
-                    .expect("restore pre-swap source state");
-                conn.execute(
-                    "update tapes set assignment_generation = assignment_generation - 1,
-                                      state = 'sealed'
-                     where voltag = 'ACM008L9'",
-                    [],
-                )
-                .expect("restore source state after false-output probe");
-            }
-            if cut == CatalogResetPhase::AfterAtomicSwap {
-                let conn =
-                    rusqlite::Connection::open(&paths.sqlite_path).expect("open output sqlite");
-                conn.execute(
-                    "update tapes set total_committed_ordinals = X'0000000000000001' where voltag = 'ACM008L9'",
-                    [],
-                )
-                .expect("inject stale output counter");
-                drop(conn);
-                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                    &config_path,
-                    &["ACM008L9".to_string()],
-                    &[],
-                    &admitted.preflight_token,
-                )
-                .expect_err("stale output counter must refuse resume");
-                let conn =
-                    rusqlite::Connection::open(&paths.sqlite_path).expect("repair output sqlite");
-                conn.execute(
-                    "update tapes set total_committed_ordinals = X'0000000000000000' where voltag = 'ACM008L9'",
-                    [],
-                )
-                .expect("remove stale output counter");
-                conn.execute(
-                    "insert into object_files(object_id, file_id, path, size_bytes, file_sha256, chunk_count)
-                     values('stale', 'stale', 'stale', X'0000000000000000', X'', X'0000000000000000')",
-                    [],
-                )
-                .expect("inject omitted authority row");
-                drop(conn);
-                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-                    &config_path,
-                    &["ACM008L9".to_string()],
-                    &[],
-                    &admitted.preflight_token,
-                )
-                .expect_err("stale output authority must refuse resume");
-                let conn =
-                    rusqlite::Connection::open(&paths.sqlite_path).expect("clean output sqlite");
-                conn.execute("delete from object_files", [])
-                    .expect("remove omitted authority row");
-            }
-
-            let preflight = StateHandle::preflight_catalog_reset_from_config_file(
-                &config_path,
-                &["ACM008L9".to_string()],
-                &[],
-            )
-            .expect("exact preflight admits interrupted reset resume");
-            assert!(preflight.resume_exact, "resume status after {cut:?}");
-            assert_eq!(preflight.request_digest, request_digest);
-            let different = StateHandle::preflight_catalog_reset_from_config_file(
-                &config_path,
-                &[],
-                &["ACM008L9".to_string()],
-            )
-            .expect_err("different preflight must not cross an existing fence");
-            assert!(matches!(different, StateError::CatalogResetInProgress(_)));
-
-            let report = StateHandle::reset_catalog_preserving_from_config_file(
-                &config_path,
-                &["ACM008L9".to_string()],
-            )
-            .expect("rerun after interruption");
-            assert_eq!(report.preserved_tapes.len(), 1);
-            assert_eq!(report.preserved_tapes[0].tape_uuid, tape_uuid);
-            assert_eq!(report.preserved_tapes[0].voltag, "ACM008L9");
-            assert_eq!(
-                report.preserved_tapes[0].state,
-                CatalogResetTapeState::RecoveryRequired
-            );
-            let index_dir = temp.path().join("index");
-            let stale_replacements = fs::read_dir(index_dir)
-                .expect("read index dir")
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().contains(".reset-"))
-                .count();
-            assert_eq!(stale_replacements, 0, "stale replacement after {cut:?}");
-            assert!(!catalog_reset_fence_path(&paths).exists());
-            let _handle = StateHandle::open_from_config_file(&config_path)
-                .expect("ordinary open resumes after exact rerun clears fence");
-        }
-    }
-
-    #[test]
-    fn reset_preflight_lists_all_kinds_and_rechecks_admission_before_mutation() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-reset-preflight")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
-        let data_uuid = [0xA0; 16];
-        let cleaning_uuid = [0xA1; 16];
-        let erase_uuid = [0xA2; 16];
-        let retired_uuid = [0xA3; 16];
-        {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-            for (tape_uuid, voltag) in [
-                (data_uuid, "ACM010L9"),
-                (cleaning_uuid, "CLN010L9"),
-                (erase_uuid, "ACM011L9"),
-                (retired_uuid, "ACM012L9"),
-            ] {
-                handle
-                    .write_handle()
-                    .provision_tape(crate::index::ProvisionTapeInput {
-                        tape_uuid,
-                        voltag: voltag.to_string(),
-                        block_size: 1024 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
-                    .expect("provision tape");
-            }
-            handle
-                .write_handle()
-                .set_tape_kind(&cleaning_uuid, "cleaning")
-                .expect("set cleaning kind");
-            handle
-                .retire_tape(crate::index::RetireTapeInput {
-                    tape_uuid: retired_uuid,
-                    reason: "test retired history".to_string(),
-                })
-                .expect("retire unbound history");
-        }
-        let preserve = vec!["ACM010L9".to_string()];
-        let allow_erase = vec!["CLN010L9".to_string(), "ACM011L9".to_string()];
-        let report = StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &preserve,
-            &allow_erase,
-        )
-        .expect("all-kinds preflight");
-        assert_eq!(report.tapes.len(), 4);
-        assert!(report
-            .tapes
-            .iter()
-            .any(|tape| tape.tape_uuid == cleaning_uuid && tape.kind == "cleaning"));
-        assert!(report.tapes.iter().any(|tape| {
-            tape.tape_uuid == retired_uuid && tape.state == "retired" && tape.voltag.is_none()
-        }));
-        assert_eq!(report.paths.config.configured_path, config_path);
-        assert_eq!(
-            report.paths.config.canonical_path,
-            fs::canonicalize(&config_path).expect("canonical config")
-        );
-        assert!(!report.paths.config.configured_path_is_symlink);
-
-        let sqlite_path = temp.path().join("index/rem-state.sqlite");
-        let conn = rusqlite::Connection::open(&sqlite_path).expect("open sqlite");
-        conn.execute(
-            "update tapes set voltag = null where tape_uuid = ?1",
-            rusqlite::params![erase_uuid.as_slice()],
-        )
-        .expect("make active row unbound");
-        drop(conn);
-        StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &preserve,
-            &allow_erase,
-        )
-        .expect_err("only unbound retired history may sit outside allowlists");
-        let conn = rusqlite::Connection::open(&sqlite_path).expect("reopen sqlite");
-        conn.execute(
-            "update tapes set voltag = 'ACM011L9' where tape_uuid = ?1",
-            rusqlite::params![erase_uuid.as_slice()],
-        )
-        .expect("restore active binding");
-        drop(conn);
-
-        // Advisory preflight does not authorize a later changed catalog. The
-        // mutating API repeats admission under its own exclusive lock.
-        {
-            let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
-            handle
-                .write_handle()
-                .provision_tape(crate::index::ProvisionTapeInput {
-                    tape_uuid: [0xA4; 16],
-                    voltag: "ACM013L9".to_string(),
-                    block_size: 1024 * 1024,
-                    parity: ParityConfig::None,
-                    force: false,
-                })
-                .expect("add admission drift");
-        }
-        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write sentinel");
-        StateHandle::reset_catalog_preserving_with_allowlist_from_config_file(
-            &config_path,
-            &preserve,
-            &allow_erase,
-        )
-        .expect_err("new bound tape must fail repeated admission");
-        assert_eq!(
-            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives"),
-            b"unchanged"
-        );
-        assert!(!catalog_reset_fence_path(&StatePaths::from_config(
-            &config_path,
-            &load_config(&config_path).expect("config")
-        ))
-        .exists());
-    }
-
-    #[test]
-    fn exact_full_erase_admits_schema_v16_but_preserve_and_drift_fail_closed() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-reset-v16-full-erase")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
         seed_clean_break_reset_catalog(
             temp.path(),
             16,
             &[([0xC0; 16], "ACM020L9"), ([0xC1; 16], "ACM021L9")],
         );
-        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write audit sentinel");
-
-        let erase = vec![
-            "ACM020L9".to_string(),
-            "ACM021L9".to_string(),
-            "ACM022L9".to_string(),
-        ];
-        let admitted =
-            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
-                .expect("schema-16 full erase preflight");
-        assert_eq!(admitted.source_schema_version, 16);
-        assert_eq!(admitted.tapes.len(), 2);
-        assert!(admitted.preserve_tape_voltags.is_empty());
-
-        let preserve_error = StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &["ACM020L9".to_string()],
-            &["ACM021L9".to_string()],
-        )
-        .expect_err("legacy preservation must remain closed");
-        assert!(
-            preserve_error
-                .to_string()
-                .contains(crate::authority_layout::RESET_REQUIRED),
-            "{preserve_error}"
-        );
-        let incomplete_error = StateHandle::preflight_catalog_reset_from_config_file(
+        fs::write(temp.path().join("audit/sentinel"), b"unchanged").unwrap();
+        let sql = temp.path().join("index/rem-state.sqlite");
+        let before = fs::read(&sql).unwrap();
+        assert!(StateHandle::preflight_catalog_reset_from_config_file(
             &config_path,
             &[],
-            &["ACM020L9".to_string()],
+            &["ACM020L9".into(), "ACM021L9".into()]
         )
-        .expect_err("legacy erase must enumerate every bound tape");
-        assert!(
-            incomplete_error
-                .to_string()
-                .contains("outside the exact preserve and allow-erase"),
-            "{incomplete_error}"
-        );
-
-        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-            .expect("open legacy catalog for drift");
-        conn.execute(
-            "insert into tapes(
-               tape_uuid, voltag, pool_id, kind, block_size, state, updated_at_utc
-             ) values(?1, 'ACM022L9', 'camera.copy-a', 'data', 1048576, 'ready',
-                      '2026-08-09T00:00:00Z')",
-            rusqlite::params![[0xC2_u8; 16].as_slice()],
-        )
-        .expect("insert admitted-selector source drift");
-        drop(conn);
-        let stale = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+        .is_err());
+        assert!(StateHandle::preflight_catalog_reset_from_config_file(
             &config_path,
-            &[],
-            &erase,
-            &admitted.preflight_token,
+            &["ACM020L9".into()],
+            &["ACM021L9".into()]
         )
-        .expect_err("legacy source drift must invalidate preflight token");
-        assert!(stale.to_string().contains("source changed after preflight"));
+        .is_err());
+        assert_eq!(fs::read(&sql).unwrap(), before);
         assert_eq!(
-            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives refusal"),
+            fs::read(temp.path().join("audit/sentinel")).unwrap(),
             b"unchanged"
         );
-
-        let current =
-            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
-                .expect("refresh legacy full erase evidence");
-        let reset = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
-            &config_path,
-            &[],
-            &erase,
-            &current.preflight_token,
-        )
-        .expect("reset exact schema-16 source");
-        assert!(reset.preserved_tapes.is_empty());
-
-        let empty =
-            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
-                .expect("preflight current empty replacement");
-        assert_eq!(empty.source_schema_version, crate::index::SCHEMA_VERSION);
-        assert!(empty.tapes.is_empty());
-        assert!(!empty.resume_exact);
+        assert!(!temp.path().join("reset-archives").exists());
+        StateHandle::reset_catalog_from_config_file(&config_path).unwrap();
+        let archive = temp.path().join("reset-archives/reset-000001");
+        assert_eq!(fs::read(archive.join("catalog.sqlite")).unwrap(), before);
+        assert_eq!(
+            fs::read(archive.join("audit/sentinel")).unwrap(),
+            b"unchanged"
+        );
+        let handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert!(handle
+            .catalog()
+            .list_tapes(None, TapeKindFilter::All)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
-    fn exact_full_erase_admits_schema_v17() {
+    fn exact_full_erase_replaces_sql_only_schema17_without_inventory_read() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-reset-v17-full-erase")
             .tempdir()
@@ -5496,7 +3780,11 @@ pool_id = "camera.copy-a"
         let admitted =
             StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
                 .expect("schema-17 full erase preflight");
-        assert_eq!(admitted.source_schema_version, 17);
+        assert_eq!(
+            admitted.source_schema_version, 0,
+            "SQL schema is never read"
+        );
+        assert!(admitted.tapes.is_empty());
         StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
             &config_path,
             &[],
@@ -5504,114 +3792,6 @@ pool_id = "camera.copy-a"
             &admitted.preflight_token,
         )
         .expect("reset exact schema-17 source");
-    }
-
-    #[test]
-    fn reset_fence_binds_config_contents_and_rejects_changed_resume() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-state-reset-fence-config")
-            .tempdir()
-            .expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        let original_config = config_text(temp.path());
-        fs::write(&config_path, &original_config).expect("write config");
-        {
-            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
-            handle
-                .write_handle()
-                .provision_tape(crate::index::ProvisionTapeInput {
-                    tape_uuid: [0xA5; 16],
-                    voltag: "ACM014L9".to_string(),
-                    block_size: 1024 * 1024,
-                    parity: ParityConfig::None,
-                    force: false,
-                })
-                .expect("provision tape");
-        }
-        let config = load_config(&config_path).expect("load config");
-        let admitted = StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &["ACM014L9".to_string()],
-            &[],
-        )
-        .expect("preflight config fixture");
-        let paths = StatePaths::from_config(&config_path, &config);
-        let config_bytes = fs::read(&config_path).expect("config bytes");
-        let digest = catalog_reset_request_digest(
-            &paths,
-            &config_bytes,
-            &["ACM014L9".to_string()],
-            &[],
-            false,
-            &admitted.preflight_token,
-        )
-        .expect("request digest");
-        let lock = StateLockGuard::acquire(&paths.state_dir).expect("reset lock");
-        let preserved = crate::CatalogReader::open(&paths.sqlite_path)
-            .expect("source")
-            .capture_catalog_reset_tapes(&["ACM014L9".to_string()], &config.tape_pool_rules)
-            .expect("capture");
-        let output_token =
-            catalog_reset_intended_output_token(&admitted.tapes, &preserved).expect("output token");
-        reset_catalog_locked_with_hook(
-            &paths,
-            &config,
-            &preserved,
-            CatalogResetAdmission {
-                request_digest: &digest,
-                preflight_token: &admitted.preflight_token,
-                output_token: &output_token,
-                source_schema_version: Some(admitted.source_schema_version),
-            },
-            |phase| {
-                if phase == CatalogResetPhase::SourceCheckpointed {
-                    Err(StateError::ConfigInvalid("injected config cut".to_string()))
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .expect_err("interrupt reset");
-        drop(lock);
-
-        fs::write(
-            &config_path,
-            format!("{original_config}\n# changed bytes\n"),
-        )
-        .expect("change config bytes");
-        let changed_preflight = StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &["ACM014L9".to_string()],
-            &[],
-        )
-        .expect_err("changed config bytes must not preflight as an exact resume");
-        assert!(matches!(
-            changed_preflight,
-            StateError::CatalogResetInProgress(_)
-        ));
-        let changed = StateHandle::reset_catalog_preserving_from_config_file(
-            &config_path,
-            &["ACM014L9".to_string()],
-        )
-        .expect_err("same path with changed config must not resume");
-        assert!(matches!(changed, StateError::CatalogResetInProgress(_)));
-        assert!(catalog_reset_fence_path(&paths).exists());
-
-        fs::write(&config_path, original_config).expect("restore exact config bytes");
-        let exact_preflight = StateHandle::preflight_catalog_reset_from_config_file(
-            &config_path,
-            &["ACM014L9".to_string()],
-            &[],
-        )
-        .expect("exact config bytes admit resume");
-        assert!(exact_preflight.resume_exact);
-        assert_eq!(exact_preflight.request_digest, digest);
-        StateHandle::reset_catalog_preserving_from_config_file(
-            &config_path,
-            &["ACM014L9".to_string()],
-        )
-        .expect("exact request resumes");
-        assert!(!catalog_reset_fence_path(&paths).exists());
     }
 
     #[test]
@@ -5762,7 +3942,6 @@ pool_id = "camera.copy-a"
         let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
         let tape_uuid = [0xc3; 16];
         handle
-            .write_handle()
             .provision_tape(crate::index::ProvisionTapeInput {
                 tape_uuid,
                 voltag: "BUSY01L9".into(),
@@ -5893,10 +4072,10 @@ pool_id = "camera.copy-a"
         let operation_id = Uuid::from_u128(0x62);
 
         {
-            let mut handle =
+            let handle =
                 StateHandle::open_with_config(paths.clone(), config.clone()).expect("open first");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer5,
@@ -5914,8 +4093,8 @@ pool_id = "camera.copy-a"
                     )]),
                 })
                 .expect("append session opened");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer4,
@@ -5933,8 +4112,8 @@ pool_id = "camera.copy-a"
                     )]),
                 })
                 .expect("append tape provisioned");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer4,
@@ -5952,8 +4131,8 @@ pool_id = "camera.copy-a"
                     )]),
                 })
                 .expect("append tape retired");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer5,
@@ -6034,8 +4213,8 @@ pool_id = "camera.copy-a"
         let tape_uuid = [0x71; 16];
         {
             let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
-            let (_, opened) = state
-                .audit
+            let (_, opened) = crate::FileAuditLog::open(&state.paths().audit_dir, true)
+                .unwrap()
                 .append_and_return_record(library_restart_event(
                     session_id,
                     tape_uuid,
@@ -6047,8 +4226,8 @@ pool_id = "camera.copy-a"
                 .calibration_control()
                 .record_harvest_success(tape_uuid, 0)
                 .unwrap();
-            state
-                .audit()
+            crate::FileAuditLog::open(&state.paths().audit_dir, true)
+                .unwrap()
                 .append(library_restart_event(
                     session_id,
                     tape_uuid,
@@ -6091,9 +4270,9 @@ pool_id = "camera.copy-a"
         let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
         let session_id = Uuid::new_v4();
         {
-            let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
-            state
-                .audit()
+            let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            crate::FileAuditLog::open(&state.paths().audit_dir, true)
+                .unwrap()
                 .append(library_restart_event(
                     session_id,
                     [0x72; 16],
@@ -6189,10 +4368,16 @@ pool_id = "camera.copy-a"
                     },
                     detail,
                 };
-                state.audit().append(event.clone()).unwrap();
+                crate::FileAuditLog::open(&state.paths().audit_dir, true)
+                    .unwrap()
+                    .append(event.clone())
+                    .unwrap();
                 if *expected == "closed" {
                     event.event = AuditEvent::SessionClosed;
-                    state.audit().append(event).unwrap();
+                    crate::FileAuditLog::open(&state.paths().audit_dir, true)
+                        .unwrap()
+                        .append(event)
+                        .unwrap();
                 }
                 state
                     .calibration_control()
@@ -6268,10 +4453,10 @@ pool_id = "camera.copy-a"
         let idempotency_key = Uuid::from_u128(0x53);
 
         {
-            let mut handle =
+            let handle =
                 StateHandle::open_with_config(paths.clone(), config.clone()).expect("open first");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer5,
@@ -6289,8 +4474,8 @@ pool_id = "camera.copy-a"
                     )]),
                 })
                 .expect("append session opened");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer5,
@@ -6308,8 +4493,8 @@ pool_id = "camera.copy-a"
                     )]),
                 })
                 .expect("append request received");
-            handle
-                .audit()
+            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::User("alice".to_string()),
                     source_layer: SourceLayer::Layer5,
@@ -6516,18 +4701,21 @@ pool_id = "camera.copy-a"
                 parity: ParityConfig::None,
                 force: true,
             })
-            .expect("reprovision geometry under the same identity");
+            .expect_err("packet tag4 forbids geometry replacement under the same UUID");
         let after_geometry_change = handle.calibration_control().row(old_uuid);
         assert_eq!(
             after_geometry_change.state,
-            crate::calibration::VolumeCalibrationState::Uncalibrated
+            crate::calibration::VolumeCalibrationState::Calibrated
         );
-        assert!(after_geometry_change.calibration_generation > calibration_generation);
+        assert_eq!(
+            after_geometry_change.calibration_generation,
+            calibration_generation
+        );
         assert!(handle
             .catalog()
             .get_wrap_map(&old_uuid)
-            .expect("map lookup after geometry change")
-            .is_none());
+            .expect("map lookup after refused geometry change")
+            .is_some());
 
         let recalibrated = handle
             .calibration_control()
@@ -6550,13 +4738,24 @@ pool_id = "camera.copy-a"
             .expect("store replacement wrap map");
 
         handle
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: new_uuid,
-                voltag: "ACM045L9".to_string(),
-                block_size: 512 * 1024,
-                parity: ParityConfig::None,
-                force: true,
+            .retire_tape(RetireTapeInput {
+                tape_uuid: old_uuid,
+                reason: "confirmed replacement".into(),
             })
+            .unwrap();
+        handle
+            .provision_replacing_media(
+                ProvisionTapeInput {
+                    tape_uuid: new_uuid,
+                    voltag: "ACM045L9".to_string(),
+                    block_size: 512 * 1024,
+                    parity: ParityConfig::None,
+                    force: true,
+                },
+                crate::LabelProvenance::Changer,
+                crate::MediaObservation::label_hint("ACM045L9"),
+                Some(old_uuid),
+            )
             .expect("reprovision physical identity");
 
         assert!(handle
@@ -6739,14 +4938,14 @@ pool_id = "camera.copy-a"
         let read_session = Uuid::from_u128(0x72);
 
         let (write_map_epoch, read_map_epoch) = {
-            let mut handle =
+            let handle =
                 StateHandle::open_with_config(paths.clone(), config.clone()).expect("open");
             for (session_id, kind, tape) in [
                 (write_session, "write", write_tape),
                 (read_session, "read", read_tape),
             ] {
-                handle
-                    .audit()
+                crate::FileAuditLog::open(&handle.paths().audit_dir, true)
+                    .unwrap()
                     .append(AuditEventRecord {
                         actor: AuditActor::User("alice".to_string()),
                         source_layer: SourceLayer::Layer5,
@@ -7037,7 +5236,7 @@ mod cutover_tests {
         assert!(StateHandle::open_from_config_file(&config_path)
             .unwrap_err()
             .to_string()
-            .contains(crate::authority_layout::RESET_REQUIRED));
+            .contains("rem reset-catalog"));
         assert_eq!(fs::read(&paths.sqlite_path).unwrap(), before);
         StateHandle::reset_catalog_from_config_file(&config_path).unwrap();
         let archive = paths.state_dir.join("reset-archives/reset-000001");
@@ -7144,6 +5343,8 @@ mod cutover_tests {
             .unwrap()
             .write_all(b"torn")
             .unwrap();
+        drop(state);
+        let mut state = StateHandle::open_from_config_file(&config).unwrap();
         state.repair_tape_log_tail(id, through, false).unwrap();
         assert_eq!(
             state.index.get_tape(&id).unwrap().unwrap().state,
@@ -7247,3 +5448,6 @@ mod cutover_tests {
         assert_eq!(state.index.projected_through_sequence(id).unwrap(), 5);
     }
 }
+
+mod initialization;
+pub use initialization::InitializationGuard;

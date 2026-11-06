@@ -23,8 +23,8 @@ impl UuidSource for Uuids {
 }
 struct Absent;
 impl TapeView for Absent {
-    fn lookup(&self, _: &TapeAt) -> TapeLookup {
-        TapeLookup::NotYet
+    fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok(TapeLookup::NotYet)
     }
 }
 fn tape(n: u8) -> TapeRef {
@@ -351,6 +351,8 @@ fn write_operations(dir: &Path, count: u64) {
             }),
         }));
         let ready = ReadinessObserved {
+            scope: ReadinessScope::Endpoint,
+            media: None,
             operation,
             endpoint: DriveKey::Bay(Bay {
                 library_serial: "LIB".into(),
@@ -370,6 +372,8 @@ fn write_operations(dir: &Path, count: u64) {
         };
         let prior = emit(Body::ReadinessObserved(ready.clone()));
         emit(Body::ReadinessObserved(ReadinessObserved {
+            scope: ReadinessScope::Endpoint,
+            media: None,
             previous: Some(prior),
             ready_generation: i * 2,
             result: ReadinessResult::Ready,

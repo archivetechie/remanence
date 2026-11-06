@@ -49,7 +49,6 @@ pub(crate) fn status_from_state_error(err: impl std::borrow::Borrow<StateError>)
         StateError::TapePoolAssignmentConflict(_)
         | StateError::TapeHoldsCommittedInstances { .. }
         | StateError::TapeProvisionConflict(_)
-        | StateError::AppendRecoveryPrecondition(_)
         | StateError::JournalReplayFailed(_) => Status::failed_precondition(err.to_string()),
         _ => Status::internal(err.to_string()),
     }
@@ -143,6 +142,7 @@ pub(crate) fn media_readiness_initializing_load_transition(
         .map(|(key, asc, ascq)| media_readiness_sense_label(key, asc, ascq))
         .unwrap_or_else(|| "an initializing-command request".to_string());
     MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some(INITIALIZING_LOAD_PHASE.to_string()),
         state: "pre_ready_loading".to_string(),
@@ -179,6 +179,7 @@ pub(crate) fn media_readiness_initializing_load_failed_transition(
     let quarantine_id = media_readiness_state_requires_release(state.as_str())
         .then(|| media_readiness_quarantine_id_for_operation(operation_id));
     MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some(INITIALIZING_LOAD_PHASE.to_string()),
         state,
@@ -334,12 +335,28 @@ pub fn reconcile_media_readiness_on_startup(
         let active = index
             .list_active_media_readiness_operations(Some(library.serial.as_str()))
             .map_err(status_from_state_error)?;
-        if active.is_empty() {
+        let unresolved_motion = index.library_runtime().is_some_and(|runtime| {
+            remanence_library::motion::MotionAuthority::requires_reconciliation(
+                &runtime,
+                &remanence_library::motion::MotionCommand::Move {
+                    library_serial: library.serial.clone(),
+                    source: 0,
+                    destination: 0,
+                },
+            )
+        });
+        if active.is_empty() && !unresolved_motion {
             continue;
         }
         let mut handle = library
             .open(policy)
             .map_err(|err| Status::internal(format!("startup readiness open library: {err}")))?;
+        if let Some(authority) = index.library_runtime() {
+            handle.set_motion_authority(std::sync::Arc::new(authority));
+        }
+        handle.reconcile_startup_motion().map_err(|e| {
+            Status::failed_precondition(format!("startup motion reconciliation: {e}"))
+        })?;
         let mut opened_drives = Vec::new();
         for bay in &library.drive_bays {
             let Some(installed) = bay.installed.as_ref() else {
@@ -498,7 +515,7 @@ fn startup_media_readiness_initializing_load(
         .map_err(status_from_state_error)?
         .and_then(|record| record.cancel_source)
         .filter(|source| source == "operator");
-    let poll = drive
+    let poll = drive.with_readiness_operation(*operation_id.as_bytes(), |drive| drive
         .wait_for_media_readiness_with_initializing_load(
             family,
             Some(observed),
@@ -515,6 +532,8 @@ fn startup_media_readiness_initializing_load(
                         startup_media_readiness_probe_transition(operation_id, &poll.readiness)
                     }
                     MediaReadinessWaitEvent::InitializingLoad(poll) => {
+                        if index.library_runtime().is_some() { return Ok(()); }
+
                         tracing::warn!(
                             operation_id = %operation_id,
                             detail = %poll.readiness,
@@ -546,7 +565,7 @@ fn startup_media_readiness_initializing_load(
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             },
-        )
+        ))
         .map_err(|error| {
             Status::internal(format!(
                 "startup readiness LOAD for operation {operation_id}: {error}"
@@ -696,6 +715,7 @@ pub(crate) fn startup_media_readiness_probe_transition(
     let quarantine_id = media_readiness_state_requires_release(state.as_str())
         .then(|| media_readiness_quarantine_id_for_operation(operation_id));
     MediaReadinessTransitionInput {
+        completion_evidence: Some((&readiness.outcome().evidence).into()),
         operation_id,
         phase: Some("startup_reconcile_tur".to_string()),
         state,
@@ -728,6 +748,7 @@ pub(crate) fn startup_media_readiness_unresolved_transition(
     detail: String,
 ) -> MediaReadinessTransitionInput {
     MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some("startup_reconcile".to_string()),
         state: "aborted_unknown".to_string(),
@@ -755,6 +776,7 @@ pub(crate) fn startup_media_readiness_requires_release_transition(
 ) -> MediaReadinessTransitionInput {
     let state = record.state.trim();
     MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some("startup_reconcile_requires_release".to_string()),
         state: state.to_string(),

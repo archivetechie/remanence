@@ -1869,6 +1869,8 @@ impl super::DriveHandle {
                 continue;
             }
             if terminal || timed_out {
+                self.complete_readiness_loads(&poll.readiness, options.timeout)
+                    .map_err(|error| error.to_string())?;
                 return Ok(poll);
             }
 

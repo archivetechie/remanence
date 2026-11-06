@@ -269,6 +269,26 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )];
+    if let Some(health) = state
+        .live
+        .as_ref()
+        .and_then(|live| live.library_authority_health.as_ref())
+    {
+        if health.status != pb::component_health::Status::Healthy as i32 {
+            spans.push(Span::styled(
+                format!(
+                    "  authority={}{}",
+                    super::component_health_name(health.status),
+                    if health.status == pb::component_health::Status::ReadOnly as i32 {
+                        " MOTION FENCED"
+                    } else {
+                        ""
+                    }
+                ),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
     if state.paused {
         spans.push(Span::styled(
             "   ── PAUSED ──",
@@ -593,6 +613,7 @@ mod tests {
 
     fn sample_response() -> pb::GetLiveStatusResponse {
         pb::GetLiveStatusResponse {
+            library_authority_health: None,
             closeout_debt: Vec::new(),
             active_tape_io_fence_count: 0,
             active_tape_io_fences: Vec::new(),
@@ -698,6 +719,31 @@ mod tests {
     }
 
     #[test]
+    fn live_status_header_exposes_motion_fence() {
+        let mut response = sample_response();
+        response.alarms.clear();
+        response.library_authority_health = Some(pb::ComponentHealth {
+            component: "library_authority".into(),
+            status: pb::component_health::Status::ReadOnly as i32,
+            other_status: String::new(),
+        });
+        let state = TopState {
+            live: Some(response),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+        terminal.draw(|f| render_top(f, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("authority=read_only MOTION FENCED"), "{text}");
+    }
+
+    #[test]
     fn b7_fix_tui_caps_debt_band_and_shows_barcode_and_error() {
         let mut response = sample_response();
         response.closeout_debt = (0..30)
@@ -731,6 +777,7 @@ mod tests {
     #[test]
     fn b7_tui_lists_unseated_overdue_debt() {
         let response = pb::GetLiveStatusResponse {
+            library_authority_health: None,
             closeout_debt: vec![pb::Tape {
                 tape_uuid: vec![1; 16],
                 unprotected_bytes: Some(786432),

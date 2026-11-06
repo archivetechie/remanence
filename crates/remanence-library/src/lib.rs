@@ -113,3 +113,6 @@ pub const MEDIA_READINESS_SENSE_PROGRESS_KEYS: (&str, &str) = ("sense", "sense_n
 
 /// Shared append and directory durability seam.
 pub mod durable_file;
+
+/// Durable per-CDB motion publication boundary.
+pub mod motion;

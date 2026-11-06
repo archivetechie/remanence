@@ -22,37 +22,107 @@ struct Transport {
     fault: Arc<Mutex<Option<u8>>>,
     evidence: Option<PathBuf>,
     last_opcode: Option<u8>,
+    empty_prefix_recovery: Option<EmptyPrefixRecoveryProof>,
+}
+/// Test observer for exactly ruling19's recovery of a missing Bootstrap
+/// delimiter. One matching header-only ack permits one verified Bootstrap block
+/// and one delimiter. It cannot authorize initialization or a later write run.
+struct EmptyPrefixRecoveryProof {
+    runtime: remanence_state::library_runtime::LibraryRuntime,
+    step: u8,
+    fail_position_after_delimiter: bool,
+}
+impl EmptyPrefixRecoveryProof {
+    fn authorize(&mut self, cdb: &[u8], bytes: Option<&[u8]>) -> bool {
+        use sha2::{Digest, Sha256};
+        if !matches!(cdb[0], 0x0a | 0x10 | 0x19) || self.step == 2 {
+            return false;
+        }
+        if self.step == 0 {
+            assert_eq!(
+                cdb[0], 0x0a,
+                "recovery begins with its exact Bootstrap rewrite"
+            );
+            let bytes = bytes.expect("Bootstrap output bytes");
+            assert_eq!(bytes.len(), BLOCK as usize);
+            assert_eq!(
+                remanence_parity::bootstrap::parse_bootstrap_block(bytes)
+                    .unwrap()
+                    .tape_uuid,
+                UUID
+            );
+            let path = self
+                .runtime
+                .manifest()
+                .tape_root()
+                .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+            let raw = std::fs::read(path).unwrap();
+            let mut reader = std::io::Cursor::new(raw.as_slice());
+            remanence_state::tape_log::store::Header::decode(&mut reader, UUID).unwrap();
+            assert_eq!(
+                reader.position(),
+                raw.len() as u64,
+                "ack must name the current header-only source"
+            );
+            let at = remanence_state::library_log::TapeAt {
+                tape: remanence_state::library_log::TapeRef {
+                    uuid: UUID,
+                    incarnation: 1,
+                },
+                sequence: 0,
+                record_digest: Sha256::digest(&raw).into(),
+            };
+            let ack = self
+                .runtime
+                .supersede_at(at)
+                .unwrap()
+                .expect("matching applied recovery acknowledgement before WRITE");
+            assert_eq!(ack.session_id, None);
+            assert_eq!(ack.tail_file_count, 0);
+            assert_eq!(
+                ack.preview_digest, None,
+                "header-only recovery has no native session tail spool"
+            );
+            self.step = 1;
+        } else {
+            assert_eq!(cdb[0], 0x10);
+            assert_eq!(&cdb[2..5], &[0, 0, 1], "exactly one recovery delimiter");
+            self.step = 2;
+        }
+        true
+    }
 }
 impl Transport {
-    fn observe(&mut self, cdb: &[u8]) -> std::result::Result<(), ScsiError> {
+    fn observe(&mut self, cdb: &[u8], bytes: Option<&[u8]>) -> std::result::Result<(), ScsiError> {
         self.commands.lock().unwrap().push(cdb.to_vec());
         // Check each write run and every delimiter. Replaying the entire audit
         // per padding block makes the fixed two-GiB terminal layout quadratic.
         let previous = self.last_opcode.replace(cdb[0]);
-        if matches!(cdb[0], 0x0a | 0x10 | 0x19) && (previous != Some(0x0a) || cdb[0] != 0x0a) {
+        let recovery = self
+            .empty_prefix_recovery
+            .as_mut()
+            .is_some_and(|proof| proof.authorize(cdb, bytes));
+        if cdb[0] == 0x10
+            && self
+                .empty_prefix_recovery
+                .as_ref()
+                .is_some_and(|proof| proof.step == 2 && proof.fail_position_after_delimiter)
+        {
+            *self.fault.lock().unwrap() = Some(0x34);
+        }
+        if !recovery
+            && matches!(cdb[0], 0x0a | 0x10 | 0x19)
+            && (previous != Some(0x0a) || cdb[0] != 0x0a)
+        {
             if let Some(path) = &self.evidence {
-                let records = FileAuditLog::replay(path).unwrap();
-                let last = records
-                    .iter()
-                    .rev()
-                    .find(|r| {
-                        matches!(
-                            r.event,
-                            AuditEvent::SessionOpened
-                                | AuditEvent::SessionClosed
-                                | AuditEvent::SessionOrphaned
-                        )
-                    })
-                    .expect("durable session before modifying CDB");
-                if last.event != AuditEvent::SessionOpened {
-                    // A sealing session ends before its accepted terminal plan runs.
-                    assert_eq!(last.event, AuditEvent::SessionClosed);
-                    let native = path
-                        .parent()
-                        .unwrap()
-                        .join("journals/tapes")
-                        .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
-                    let mut file = std::fs::File::open(native).unwrap();
+                let native_path = path
+                    .parent()
+                    .unwrap()
+                    .join("journals/tapes")
+                    .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+                // Observe the actual durable native source without acquiring a
+                // second tape owner while execute_out holds the writer lease.
+                let native_authorized = if let Ok(mut file) = std::fs::File::open(&native_path) {
                     remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
                     let offset = std::io::Seek::stream_position(&mut file).unwrap();
                     let mut decoder =
@@ -62,31 +132,69 @@ impl Transport {
                         fold.push(&frame).unwrap();
                     }
                     let (summary, _) = fold.finish(decoder.tail()).unwrap();
-                    let closeout = records
+                    summary.open_session.is_some()
+                        || summary.finalization.as_ref().is_some_and(|v| !v.prepared)
+                } else {
+                    false
+                };
+                if !native_authorized {
+                    let records = FileAuditLog::replay(path).unwrap();
+                    let last = records
                         .iter()
                         .rev()
                         .find(|r| {
-                            r.detail.get("operation_kind")
-                                == Some(&ciborium::Value::Text("tape_closeout".into()))
+                            matches!(
+                                r.event,
+                                AuditEvent::SessionOpened
+                                    | AuditEvent::SessionClosed
+                                    | AuditEvent::SessionOrphaned
+                            )
                         })
-                        .is_some_and(|r| r.event == AuditEvent::OperationStarted);
-                    assert!(
+                        .expect("durable session before modifying CDB");
+                    if last.event != AuditEvent::SessionOpened {
+                        // A sealing session ends before its accepted terminal plan runs.
+                        assert_eq!(last.event, AuditEvent::SessionClosed);
+                        let native = path
+                            .parent()
+                            .unwrap()
+                            .join("journals/tapes")
+                            .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+                        let mut file = std::fs::File::open(native).unwrap();
+                        remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+                        let offset = std::io::Seek::stream_position(&mut file).unwrap();
+                        let mut decoder =
+                            remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+                        let mut fold = remanence_state::tape_log::fold::Fold::new();
+                        while let Some(frame) = decoder.next_frame().unwrap() {
+                            fold.push(&frame).unwrap();
+                        }
+                        let (summary, _) = fold.finish(decoder.tail()).unwrap();
+                        let closeout = records
+                            .iter()
+                            .rev()
+                            .find(|r| {
+                                r.detail.get("operation_kind")
+                                    == Some(&ciborium::Value::Text("tape_closeout".into()))
+                            })
+                            .is_some_and(|r| r.event == AuditEvent::OperationStarted);
+                        assert!(
                         summary.finalization.is_some() || (summary.closeout_due() && closeout),
                         "post-session writes require an accepted plan or a due closeout operation"
                     );
-                    assert!(summary.open_session.is_none());
+                        assert!(summary.open_session.is_none());
+                    }
+                    assert_eq!(
+                        last.detail.get("endpoint_key"),
+                        Some(&ciborium::value::Value::Text(
+                            remanence_library::DriveKey::Standalone {
+                                drive_serial: SERIAL.into()
+                            }
+                            .encode()
+                        ))
+                    );
+                    assert!(!last.detail.contains_key("library_serial"));
+                    assert!(!last.detail.contains_key("drive_bay"));
                 }
-                assert_eq!(
-                    last.detail.get("endpoint_key"),
-                    Some(&ciborium::value::Value::Text(
-                        remanence_library::DriveKey::Standalone {
-                            drive_serial: SERIAL.into()
-                        }
-                        .encode()
-                    ))
-                );
-                assert!(!last.detail.contains_key("library_serial"));
-                assert!(!last.detail.contains_key("drive_bay"));
             }
         }
         let mut fault = self.fault.lock().unwrap();
@@ -109,7 +217,7 @@ impl SgTransport for Transport {
         cdb: &[u8],
         bytes: &mut [u8],
     ) -> std::result::Result<TransferOutcome, ScsiError> {
-        self.observe(cdb)?;
+        self.observe(cdb, None)?;
         self.inner.execute_in(cdb, bytes)
     }
     fn execute_out(
@@ -117,11 +225,11 @@ impl SgTransport for Transport {
         cdb: &[u8],
         bytes: &[u8],
     ) -> std::result::Result<TransferOutcome, ScsiError> {
-        self.observe(cdb)?;
+        self.observe(cdb, Some(bytes))?;
         self.inner.execute_out(cdb, bytes)
     }
     fn execute_none(&mut self, cdb: &[u8]) -> std::result::Result<(), ScsiError> {
-        self.observe(cdb)?;
+        self.observe(cdb, None)?;
         if matches!(cdb[0], 0x1e | 0x16 | 0x17) {
             return Ok(());
         }
@@ -152,6 +260,63 @@ impl Fixture {
         };
         Self::with_parity(parity)
     }
+    /// This fixture's physical Bootstrap and delimiter are already complete.
+    /// Publish that actual fact for fault tests which begin after initialization.
+    fn initialized(parity: bool) -> (Self, StateHandle) {
+        let (fixture, state) = Self::new(parity);
+        fixture.publish_initialized(&state, parity);
+        (fixture, state)
+    }
+    fn publish_initialized(&self, state: &StateHandle, parity: bool) {
+        use remanence_state::authority::TapeAuthorityView;
+        let fixture = self;
+        let scheme = if parity {
+            Some(remanence_parity::ParityScheme {
+                data_blocks_per_stripe: 4,
+                parity_blocks_per_stripe: 2,
+                stripes_per_neighborhood: 2,
+                id: remanence_parity::SchemeId::new_static("mounted"),
+            })
+        } else {
+            None
+        };
+        let records = fixture.world.lock().unwrap().tapes["HAND"].records.clone();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[1], Record::Filemark));
+        let Record::Block(ref bytes) = records[0] else {
+            panic!("physical Bootstrap")
+        };
+        assert_eq!(
+            remanence_parity::bootstrap::parse_bootstrap_block(bytes)
+                .unwrap()
+                .tape_uuid,
+            UUID
+        );
+        let authority = remanence_state::TapeAuthority::open(
+            fixture.config.journal.dir.join("tapes"),
+            UUID,
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                BLOCK,
+                scheme,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        state
+            .library_runtime()
+            .refresh_native(&owner.freeze().unwrap())
+            .unwrap();
+        state.library_runtime().catch_up().unwrap();
+        drop(owner);
+    }
+
     fn with_parity(parity: crate::ParityConfig) -> (Self, StateHandle) {
         let root = tempfile::tempdir().unwrap();
         let mut config = remanence_state::parse_config_toml(&format!(
@@ -166,6 +331,9 @@ read_reservoir_bytes = "16 MiB"
 [[tape_pools]]
 id = "default"
 block_size = 262144
+[[tape_pool_rules]]
+prefix = "HAND"
+pool_id = "default"
 [journal]
 dir = "{0}/journals"
 require_trusted_volume = false
@@ -181,34 +349,26 @@ tape_catalog_dir = "{0}/cache"
         ))
         .unwrap();
         config.daemon.checkpoint_max_age_seconds = 1800;
-        let state = StateHandle::open_with_config(
+        let mut state = StateHandle::open_with_config(
             remanence_state::StatePaths::from_config(root.path().join("config.toml"), &config),
             config.clone(),
         )
         .unwrap();
         state
-            .write_handle()
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid: UUID,
-                voltag: "HAND".into(),
-                block_size: BLOCK,
-                parity: parity.clone(),
-                force: false,
-            })
-            .unwrap();
-        state
-            .write_handle()
-            .set_tape_generation(
-                UUID,
-                remanence_state::MediaObservation {
+            .provision_tape_with_media(
+                remanence_state::ProvisionTapeInput {
+                    tape_uuid: UUID,
+                    voltag: "HAND".into(),
+                    block_size: BLOCK,
+                    parity: parity.clone(),
+                    force: false,
+                },
+                remanence_state::LabelProvenance::Operator,
+                Some(remanence_state::MediaObservation {
                     generation: crate::LtoGen::Lto9,
                     source: remanence_state::GenerationSource::Operator,
-                },
+                }),
             )
-            .unwrap();
-        state
-            .write_handle()
-            .project_tape_pool_membership(UUID, "default")
             .unwrap();
         let payload = crate::build_tape_bootstrap(
             UUID,
@@ -245,7 +405,27 @@ tape_catalog_dir = "{0}/cache"
         )
     }
     fn owner(&self, state: StateHandle) -> MountedDrive {
-        MountedDrive::with_transport(
+        self.owner_with_recovery_observer(state, false)
+    }
+    fn owner_with_recovery_observer(
+        &self,
+        state: StateHandle,
+        empty_recovery: bool,
+    ) -> MountedDrive {
+        self.owner_with_recovery_fault(state, empty_recovery, None)
+    }
+    fn owner_with_recovery_fault(
+        &self,
+        state: StateHandle,
+        empty_recovery: bool,
+        fault: Option<u8>,
+    ) -> MountedDrive {
+        let proof = empty_recovery.then(|| EmptyPrefixRecoveryProof {
+            runtime: state.library_runtime(),
+            step: 0,
+            fail_position_after_delimiter: fault == Some(0x34),
+        });
+        let owner = MountedDrive::with_transport(
             state,
             Path::new(DEVICE),
             &StaticAllowlist::new([SERIAL]),
@@ -255,11 +435,16 @@ tape_catalog_dir = "{0}/cache"
                 fault: self.fault.clone(),
                 evidence: Some(self.config.audit.dir.clone()),
                 last_opcode: None,
+                empty_prefix_recovery: proof,
             }),
             self.root.path(),
             Some(UUID),
         )
-        .unwrap()
+        .unwrap();
+        if fault != Some(0x34) {
+            *self.fault.lock().unwrap() = fault;
+        }
+        owner
     }
     fn request(&self, name: &str) -> crate::WriteObjectToPoolRequest {
         let path = self.root.path().join(name);
@@ -418,6 +603,7 @@ fn encrypted_append_carries_recipients_and_replay_guard_without_deleting_source(
             fault: fixture.fault.clone(),
             evidence: None,
             last_opcode: None,
+            empty_prefix_recovery: None,
         }),
         &mut state,
         fixture.root.path(),
@@ -517,10 +703,27 @@ fn audit_failure_refuses_modifying_dispatch_even_when_config_fsync_is_false() {
 #[test]
 fn ready_only_gate_and_wrong_pool_refuse_before_write_motion() {
     let (fixture, state) = Fixture::new(false);
-    state
-        .write_handle()
-        .set_append_recovery_required(UUID, true)
+    use remanence_state::library_log as lib;
+    let runtime = state.library_runtime();
+    let tape = runtime.tape_state(UUID).unwrap().tape;
+    runtime
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape),
+                    cause: lib::FenceCause::TransferError,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
         .unwrap();
+    drop(runtime);
     let mut owner = fixture.owner(state);
     assert!(owner.open_session("default").is_err());
     assert!(owner.open_session("other").is_err());
@@ -731,6 +934,7 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
             fault: fixture.fault.clone(),
             evidence: None,
             last_opcode: None,
+            empty_prefix_recovery: None,
         }),
         &mut state,
         fixture.root.path(),
@@ -858,6 +1062,7 @@ fn transferred_reservation_and_audit_latch_survive_into_owner_and_finish() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            empty_prefix_recovery: None,
         }),
         &mut state,
         fixture.root.path(),
@@ -1052,6 +1257,7 @@ fn device_lock_excludes_another_state_directory_until_owner_finish() {
                 fault: other.fault.clone(),
                 evidence: None,
                 last_opcode: None,
+                empty_prefix_recovery: None,
             }),
             fixture.root.path(),
             Some(UUID),
@@ -1314,6 +1520,7 @@ async fn cleanup_spawn_failure_finishes_in_place_and_releases_every_obligation()
                 fault: fixture.fault.clone(),
                 evidence: Some(fixture.config.audit.dir.clone()),
                 last_opcode: None,
+                empty_prefix_recovery: None,
             }),
             &mut state,
             fixture.root.path(),
@@ -1425,6 +1632,7 @@ fn frontend_returns_committed_receipt_beside_post_projection_failure() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            empty_prefix_recovery: None,
         }),
         &mut state,
         fixture.root.path(),
@@ -1477,6 +1685,7 @@ fn projection_busy_returns_committed_receipt_on_native_replay() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            empty_prefix_recovery: None,
         }),
         &mut state,
         fixture.root.path(),
@@ -1541,6 +1750,7 @@ fn supersede_requires_mounted_generation_before_any_modifying_command() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            empty_prefix_recovery: None,
         }),
         &mut state,
         fixture.root.path(),
@@ -1697,14 +1907,16 @@ fn gate2b_rejected_tail_remains_ineligible() {
         drop(state);
         let backup = fixture.root.path().join("initial.sqlite");
         std::fs::copy(&fixture.config.index.sqlite_path, &backup).unwrap();
-        let mut owner = fixture.owner(fixture.reopen().unwrap());
+        let state = fixture.reopen().unwrap();
+        fixture.publish_initialized(&state, parity);
+        let mut owner = fixture.owner(state);
         owner.open_session("default").unwrap();
         owner.append(fixture.request("foreign")).unwrap();
         owner.finish().unwrap();
         drop(owner);
         std::fs::copy(&backup, &fixture.config.index.sqlite_path).unwrap();
         std::fs::remove_dir_all(&fixture.config.journal.dir).unwrap();
-        std::fs::create_dir_all(&fixture.config.journal.dir).unwrap();
+        std::fs::create_dir_all(fixture.config.journal.dir.join("tapes")).unwrap();
         let mut owner = fixture.owner(fixture.reopen().unwrap());
         fixture.commands.lock().unwrap().clear();
         let before = fixture.world.lock().unwrap().tapes["HAND"].records.clone();
@@ -1723,8 +1935,12 @@ fn gate2b_rejected_tail_remains_ineligible() {
         assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
         assert_eq!(
             fixture.index().get_tape(&UUID).unwrap().unwrap().state,
-            "recovery_required"
+            "ready"
         );
+        let fences = fixture.index().list_active_tape_io_fences().unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].tape_uuid, UUID);
+        assert_eq!(fences[0].reason, "session_suffix_contradiction");
         owner.finish().unwrap();
         let selected = crate::pool_write::select_tape_in_pool_for_write_session(
             &fixture.index(),
@@ -1738,14 +1954,532 @@ fn gate2b_rejected_tail_remains_ineligible() {
                 assert_eq!(pool_id, "default");
                 assert_eq!(
                     reasons,
-                    vec![crate::pool_write::WritabilityError::NotReady {
-                        state: "recovery_required".to_string(),
+                    vec![crate::pool_write::WritabilityError::TapeIoFence {
+                        quarantine_id: fences[0].quarantine_id.clone(),
+                        reason: fences[0].reason.clone(),
                     }]
                 );
             }
             other => {
                 panic!("refused physical tail must remain excluded from pool selection: {other:?}")
             }
+        }
+
+        let state = fixture.reopen().unwrap();
+        let runtime = state.library_runtime();
+        let mut owner = fixture.owner_with_recovery_observer(state, true);
+        // A real physical suffix remains after host rollback. The first typed
+        // acknowledgement is durable, but the injected cut issues no write.
+        crate::write_owner::cut_after_ack(runtime.manifest().library_uuid());
+        fixture.commands.lock().unwrap().clear();
+        let error = owner
+            .supersede_tail_confirmed("HAND", |_, found| {
+                assert!(!found.is_empty());
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected cut after typed supersede"),
+            "{error}"
+        );
+        assert!(!fixture
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+        assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
+        let found = owner
+            .supersede_tail_confirmed("HAND", |_, found| {
+                assert!(!found.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert!(!found.is_empty());
+        assert!(owner
+            .catalog_index()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty());
+        owner.open_session("default").unwrap();
+        owner.close_session().unwrap();
+        owner.finish().unwrap();
+        let manifest = runtime.manifest().clone();
+        drop(runtime);
+        let view = remanence_state::library_log::native_view::NativeTapeView::probe(
+            manifest.tape_root(),
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        let replay = remanence_state::library_log::store::replay(
+            manifest.library_root(),
+            manifest.library_uuid(),
+            &view,
+        )
+        .unwrap();
+        assert!(replay.refusal.is_none());
+        assert_eq!(
+            (1..=replay.last_sequence)
+                .filter(|sequence| replay.fold.supersede(*sequence).is_some())
+                .count(),
+            1,
+            "acknowledgment retry reuses the original source"
+        );
+    }
+}
+
+/// Ruling 19 reaches the physical missing-filemark producer, with a real
+/// durable header-only dependency and no invented native record.
+#[test]
+fn fresh_missing_filemark_recovery_uses_typed_empty_prefix() {
+    use remanence_state::library_log::{self as lib, native_view::NativeTapeView};
+    for parity in [false, true] {
+        let (fixture, state) = Fixture::new(parity);
+        fixture
+            .world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut("HAND")
+            .unwrap()
+            .records
+            .pop();
+        let manifest = state.library_runtime().manifest().clone();
+        let mut owner = fixture.owner_with_recovery_observer(state, true);
+        let found = owner
+            .supersede_tail_confirmed("HAND", |confirmation, found| {
+                assert_eq!(confirmation, "SUPERSEDE HAND");
+                assert!(found.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert!(found.is_empty());
+        owner.finish().unwrap();
+        let view =
+            NativeTapeView::probe(manifest.tape_root(), &fixture.config.index.sqlite_path).unwrap();
+        let replay =
+            lib::store::replay(manifest.library_root(), manifest.library_uuid(), &view).unwrap();
+        assert!(replay.refusal.is_none());
+        let supersede = (1..=replay.last_sequence)
+            .find_map(|sequence| replay.fold.supersede(sequence))
+            .expect("typed supersede acknowledgement");
+        assert_eq!(supersede.at.sequence, 0);
+        assert_eq!(supersede.session_id, None);
+        assert_eq!(supersede.tail_file_count, 0);
+        assert!(fixture.world.lock().unwrap().tapes["HAND"]
+            .records
+            .iter()
+            .any(|r| matches!(r, Record::Filemark)));
+    }
+}
+
+/// A real cut after the recovery delimiter must finish native publication on
+/// reopen, with or without a suffix fence, and issue no second media write.
+#[test]
+fn recovery_effect_cut_completes_initialization_without_rewriting() {
+    use remanence_state::library_log as lib;
+    for parity in [false, true] {
+        for suffix_fence in [false, true] {
+            let (fixture, state) = Fixture::new(parity);
+            fixture
+                .world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("HAND")
+                .unwrap()
+                .records
+                .pop();
+            let runtime = state.library_runtime();
+            if suffix_fence {
+                let tape = runtime.tape_state(UUID).unwrap().tape;
+                runtime
+                    .append(|a, v| {
+                        a.fence_raised(
+                            lib::FenceRaised {
+                                kind: lib::FenceKind::Write,
+                                scope: lib::FenceScope::Tape(tape),
+                                cause: lib::FenceCause::SessionSuffixContradiction,
+                                evidence: None,
+                                at: None,
+                                operation: None,
+                            },
+                            remanence_state::AuditActor::System,
+                            remanence_state::SourceLayer::Layer4,
+                            v,
+                        )
+                    })
+                    .unwrap();
+            }
+            crate::write_owner::cut_after_recovery_effect(runtime.manifest().library_uuid());
+            let mut owner = fixture.owner_with_recovery_observer(state, true);
+            let error = owner
+                .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected cut after physical recovery"),
+                "{error}"
+            );
+            owner.finish().unwrap();
+            drop(runtime);
+            let authority = remanence_state::TapeAuthority::open(
+                fixture.config.journal.dir.join("tapes"),
+                UUID,
+                &fixture.config.index.sqlite_path,
+            )
+            .unwrap();
+            assert_eq!(authority.freeze().unwrap().log_reference().0, 0);
+            let records = fixture.world.lock().unwrap().tapes["HAND"].records.clone();
+            assert_eq!(records.len(), 2);
+            let state = fixture.reopen().unwrap();
+            let runtime = state.library_runtime();
+            let mut owner = fixture.owner(state);
+            fixture.commands.lock().unwrap().clear();
+            owner
+                .supersede_tail_confirmed("HAND", |_, found| {
+                    assert!(found.is_empty());
+                    Ok(())
+                })
+                .unwrap();
+            assert!(owner
+                .catalog_index()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .is_empty());
+            assert!(!fixture
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+            assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, records);
+            owner.finish().unwrap();
+            let snapshot = authority.freeze().unwrap();
+            assert!(snapshot.tape_summary().last_media_commit.is_some());
+            let report = authority.latest_commit().unwrap().unwrap();
+            assert_eq!((report.cursor.partition, report.cursor.lba), (0, 2));
+            drop(runtime);
+            let state = fixture.reopen().unwrap();
+            assert!(state
+                .catalog()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .is_empty());
+        }
+    }
+}
+
+/// Failed recovery WRITE, delimiter, or post-effect position cannot publish a
+/// native initialization. This uses actual model transport failure boundaries.
+#[test]
+fn recovery_initialization_waits_for_complete_physical_evidence() {
+    for parity in [false, true] {
+        for fault in [0x0a, 0x10, 0x34] {
+            let (fixture, state) = Fixture::new(parity);
+            fixture
+                .world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("HAND")
+                .unwrap()
+                .records
+                .pop();
+            let mut owner = fixture.owner_with_recovery_fault(state, true, Some(fault));
+            let error = owner
+                .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+                .unwrap_err();
+            assert!(!error.to_string().is_empty());
+            owner.finish().unwrap();
+            let authority = remanence_state::TapeAuthority::open(
+                fixture.config.journal.dir.join("tapes"),
+                UUID,
+                &fixture.config.index.sqlite_path,
+            )
+            .unwrap();
+            assert_eq!(
+                authority.freeze().unwrap().log_reference().0,
+                0,
+                "fault {fault:x}"
+            );
+            assert!(authority.latest_commit().unwrap().is_none());
+            assert!(fixture
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c[0] == fault));
+        }
+    }
+}
+
+/// Matching UUID alone cannot authenticate a recovered initialization's geometry.
+#[test]
+fn recovery_effect_retry_refuses_changed_bootstrap_geometry() {
+    let (fixture, state) = Fixture::new(false);
+    fixture
+        .world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("HAND")
+        .unwrap()
+        .records
+        .pop();
+    let runtime = state.library_runtime();
+    let tape = runtime.tape_state(UUID).unwrap().tape;
+    use remanence_state::library_log as lib;
+    let fence = runtime
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape),
+                    cause: lib::FenceCause::SessionSuffixContradiction,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                },
+                remanence_state::AuditActor::System,
+                remanence_state::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    crate::write_owner::cut_after_recovery_effect(runtime.manifest().library_uuid());
+    let mut owner = fixture.owner_with_recovery_observer(state, true);
+    assert!(owner
+        .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+        .unwrap_err()
+        .to_string()
+        .contains("injected cut"));
+    owner.finish().unwrap();
+    drop(runtime);
+    {
+        let mut world = fixture.world.lock().unwrap();
+        let Record::Block(bytes) = &mut world.tapes.get_mut("HAND").unwrap().records[0] else {
+            panic!("Bootstrap")
+        };
+        let mut payload = remanence_parity::bootstrap::parse_bootstrap_block(bytes).unwrap();
+        payload.drive_compression = true;
+        remanence_parity::bootstrap::write_bootstrap_block(&payload, bytes).unwrap();
+    }
+    let state = fixture.reopen().unwrap();
+    let runtime = state.library_runtime();
+    let mut owner = fixture.owner(state);
+    fixture.commands.lock().unwrap().clear();
+    let error = owner
+        .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+        .unwrap_err();
+    assert!(error.to_string().contains("geometry differs"), "{error}");
+    assert!(runtime.active_fence(fence.sequence).is_some());
+    assert!(!fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+    owner.finish().unwrap();
+    let authority = remanence_state::TapeAuthority::open(
+        fixture.config.journal.dir.join("tapes"),
+        UUID,
+        &fixture.config.index.sqlite_path,
+    )
+    .unwrap();
+    assert_eq!(authority.freeze().unwrap().log_reference().0, 0);
+}
+
+/// The actual RPC preserves authenticated actor attribution, idempotent replies
+/// and the suffix fence's physical-recovery restriction across source replay.
+#[test]
+fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
+    use crate::pb::library_service_server::LibraryService;
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::initialized(false);
+    let runtime = state.library_runtime();
+    let tape = runtime.tape_state(UUID).unwrap().tape;
+    let raise = |cause| {
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(tape),
+                        cause,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                    },
+                    remanence_state::AuditActor::System,
+                    remanence_state::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+    };
+    let ordinary = raise(lib::FenceCause::TransferError);
+    let suffix = raise(lib::FenceCause::SessionSuffixContradiction);
+    let service = crate::library::LibraryServiceApi {
+        state: crate::ApiState::new(state.projection_client()),
+    };
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for sequence in [ordinary.sequence, ordinary.sequence, suffix.sequence] {
+        let mut request = tonic::Request::new(crate::pb::ReleaseTapeIoFenceRequest {
+            quarantine_id: format!("library:{sequence}"),
+            acknowledgment: "inspected original failure".into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-remanence-actor", "actual-operator".parse().unwrap());
+        let result = executor.block_on(service.release_tape_io_fence(request));
+        if sequence == suffix.sequence {
+            assert!(result
+                .unwrap_err()
+                .message()
+                .contains("physical tail recovery"));
+        } else {
+            assert_eq!(result.unwrap().into_inner().state, "released");
+        }
+    }
+    assert!(runtime.active_fence(suffix.sequence).is_some());
+    let manifest = runtime.manifest().clone();
+    drop(service);
+    drop(runtime);
+    drop(state);
+    let view = lib::native_view::NativeTapeView::probe(
+        manifest.tape_root(),
+        &fixture.config.index.sqlite_path,
+    )
+    .unwrap();
+    let mut actors = Vec::new();
+    lib::store::replay_observed(
+        manifest.library_root(),
+        manifest.library_uuid(),
+        &view,
+        &mut |record| {
+            if record.record().tag() == lib::Tag::FenceReleased {
+                actors.push(record.record().envelope.actor.clone());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        actors,
+        vec![remanence_state::AuditActor::Service(
+            "actual-operator".into()
+        )]
+    );
+    let state = fixture.reopen().unwrap();
+    assert_eq!(
+        state.catalog().list_active_tape_io_fences().unwrap().len(),
+        1
+    );
+    assert!(fixture.commands.lock().unwrap().is_empty());
+}
+
+/// The closed fence schema cannot preserve the original coupled tape/endpoint
+/// uncertainty and error text. Refuse without inventing a different source.
+#[test]
+fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
+    let (fixture, mut state) = Fixture::initialized(false);
+    let source_bytes = || {
+        let mut files: Vec<_> = std::fs::read_dir(&fixture.config.audit.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "remlib"))
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let before = source_bytes();
+    let error = crate::mount_support::raise_standalone_fence(
+        &mut state,
+        UUID,
+        Some(&remanence_library::DriveKey::Standalone {
+            drive_serial: SERIAL.into(),
+        }),
+        "standalone_write_lost_by_restart",
+        "unfinished durable write session requires recovery",
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("cannot durably record standalone write uncertainty"));
+    assert!(state.library_runtime().motion_fenced());
+    assert_eq!(source_bytes(), before);
+    assert!(state
+        .catalog()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(fixture.commands.lock().unwrap().is_empty());
+}
+
+/// R13 operator recovery releases only the typed suffix fence after the real
+/// physical proof; a repeated crash-after-effect proof performs no media write.
+#[test]
+fn suffix_fence_release_requires_explicit_physical_recovery_and_replays() {
+    use remanence_state::library_log as lib;
+    for parity in [false, true] {
+        let (fixture, state) = Fixture::new(parity);
+        let runtime = state.library_runtime();
+        let tape = runtime.tape_state(UUID).unwrap().tape;
+        let raise = runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(tape),
+                        cause: lib::FenceCause::SessionSuffixContradiction,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                    },
+                    remanence_state::AuditActor::System,
+                    remanence_state::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+        let mut owner = fixture.owner(state);
+        fixture.commands.lock().unwrap().clear();
+        let before = fixture.world.lock().unwrap().tapes["HAND"].records.clone();
+        let error = owner
+            .supersede_tail_confirmed("HAND", |_, _| Err("no acknowledgment".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("no acknowledgment"), "{error}");
+        assert!(runtime.active_fence(raise.sequence).is_some());
+        owner
+            .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+            .unwrap();
+        assert!(runtime.active_fence(raise.sequence).is_none());
+        assert!(!fixture
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+        assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
+        owner.finish().unwrap();
+        drop(runtime);
+        for _ in 0..2 {
+            let state = fixture.reopen().unwrap();
+            assert!(state
+                .catalog()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .is_empty());
         }
     }
 }

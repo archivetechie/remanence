@@ -276,40 +276,9 @@ impl LockedAuditedDevice {
         state: &StateHandle,
         lock: Option<Arc<DeviceLock>>,
     ) -> Result<Self, MountError> {
+        drive.set_motion_authority(Arc::new(state.library_runtime()));
+        drive.reconcile_startup_motion().map_err(refusal)?;
         let audit_error = Arc::new(Mutex::new(None));
-        if drive.endpoint().durable_key().is_some() {
-            let pending = Arc::clone(&audit_error);
-            let audit_dir = state.paths().audit_dir.clone();
-            let fsync = state.config().audit.fsync;
-            let mut log =
-                remanence_state::FileAuditLog::open(&audit_dir, fsync).map_err(refusal)?;
-            let mut known_len = std::fs::metadata(log.segment_path())
-                .map_err(refusal)?
-                .len();
-            drive.set_audit_hook(move |event| {
-                use remanence_state::AuditSink;
-                let result = (|| {
-                    let len = std::fs::metadata(log.segment_path())
-                        .map_err(|e| e.to_string())?
-                        .len();
-                    // Other appenders run synchronously under the invocation's
-                    // state lock. Replay only when one advanced the chain.
-                    if len != known_len {
-                        log = remanence_state::FileAuditLog::open(&audit_dir, fsync)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    log.append(remanence_state::library_audit_event_record(event))
-                        .map_err(|e| e.to_string())?;
-                    known_len = std::fs::metadata(log.segment_path())
-                        .map_err(|e| e.to_string())?
-                        .len();
-                    Ok::<_, String>(())
-                })();
-                if let Err(error) = result {
-                    *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
-                }
-            });
-        }
         let endpoint = drive.endpoint().clone();
         Ok(Self {
             drive: Some(drive),
@@ -322,7 +291,10 @@ impl LockedAuditedDevice {
         if matches!(self.endpoint, MountEndpoint::Ephemeral { .. }) {
             return Ok(());
         }
-        state.refresh_audit_append_cursor().map_err(refusal)?;
+        state
+            .library_runtime()
+            .ensure_motion_allowed()
+            .map_err(refusal)?;
         if let Some(error) = self
             .audit_error
             .lock()
@@ -338,12 +310,10 @@ impl LockedAuditedDevice {
 /// Drive device locks live here, one file per VPD serial.
 pub const DEVICE_LOCK_ROOT: &str = "/run/lock/rem";
 
-/// Exclusion acquired only after a drive refused UNLOAD with 05/53/02.
-/// The owner retains this value until any following changer MOVE has completed.
+/// Serial-device exclusion retained through removal recovery and return MOVE.
+/// Authority ownership is installed on the library before the first UNLOAD.
 pub(crate) struct UnloadRecoveryGuard {
     _device: DeviceLock,
-    _state: Option<remanence_state::StateLockGuard>,
-    audit_error: Arc<Mutex<Option<String>>>,
 }
 impl std::fmt::Debug for UnloadRecoveryGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -352,13 +322,7 @@ impl std::fmt::Debug for UnloadRecoveryGuard {
     }
 }
 impl UnloadRecoveryGuard {
-    fn acquire(
-        drive: &mut DriveHandle,
-        config: Option<&Path>,
-        lock_root: &Path,
-    ) -> Result<Self, MountError> {
-        // This is the same VPD serial used by standalone and placed-library mounts.
-        let serial = &drive.drive().serial;
+    fn acquire(drive: &mut DriveHandle, lock_root: &Path) -> Result<Self, MountError> {
         let root = lock_root.to_owned();
         let device = lock_device(
             &mut move |_, logical| {
@@ -368,65 +332,63 @@ impl UnloadRecoveryGuard {
                         .expect("device lock namespace"),
                 ))
             },
-            serial,
+            &drive.drive().serial,
         )?;
-        let audit_error = Arc::new(Mutex::new(None));
-        let state = if let Some(path) = config {
-            let config = remanence_state::load_config(path).map_err(refusal)?;
-            // Recovery must work during a catalog reset: never open StateHandle/SQLite.
-            let state = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir)
-                .map_err(refusal)?;
-            let mut audit =
-                remanence_state::FileAuditLog::open(&config.audit.dir, config.audit.fsync)
-                    .map_err(refusal)?;
-            let pending = audit_error.clone();
-            drive.set_audit_hook(move |event| {
-                use remanence_state::AuditSink;
-                if let Err(error) = audit.append(remanence_state::library_audit_event_record(event))
-                {
-                    *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
-                }
-            });
-            Some(state)
-        } else {
-            None
-        };
-        Ok(Self {
-            _device: device,
-            _state: state,
-            audit_error,
-        })
+        Ok(Self { _device: device })
     }
-
-    fn flush_audit(&self) -> Result<(), MountError> {
-        match self
-            .audit_error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            Some(error) => Err(refusal(format!("drive audit failed: {error}"))),
-            None => Ok(()),
-        }
-    }
-
-    /// An audit error must never hide the original ALLOW/UNLOAD/MOVE failure.
     fn finish(&self, result: Result<(), MountError>) -> Result<(), MountError> {
-        let audit = self.flush_audit();
-        if result.is_err() {
-            if let Err(error) = &audit {
-                tracing::error!(%error, "audit also failed during unload recovery");
-            }
-        }
-        result.and(audit)
+        result
     }
 }
 
-/// Try the normal unload first. Only 05/53/02 permits locked removal recovery.
-/// No config is read and no new lock is taken unless that exact refusal occurs.
-/// Explicit config adds only the bare state lock and an audit sink, never a
-/// catalog open/migration or reset-fence reconciliation. Without config, the
-/// serial device lock excludes external writers and existing audit hooks apply.
+/// Install invocation authority under the state lease before any physical unload.
+/// Existing daemon/mount owners already carry this capability. A direct caller
+/// supplies its configuration; startup reconciliation occurs before admission.
+pub fn bind_library_motion_authority(
+    library: &mut LibraryHandle,
+    config: Option<&Path>,
+) -> Result<(), MountError> {
+    let Some(path) = config else {
+        return if library.has_motion_authority() {
+            Ok(())
+        } else {
+            Err(refusal(
+                "typed motion authority or explicit configuration is required before UNLOAD",
+            ))
+        };
+    };
+    let config = remanence_state::load_config(path).map_err(refusal)?;
+    let paths = remanence_state::StatePaths::from_config(path, &config);
+    let manifest = remanence_state::authority_manifest::AuthorityManifest::preflight(&paths)
+        .map_err(refusal)?;
+    if library.has_motion_authority() {
+        let supplied = manifest
+            .ok_or_else(|| refusal("supplied configuration has no bound motion authority"))?;
+        let actual = library
+            .motion_authority_identity()
+            .ok_or_else(|| refusal("installed motion authority has no configuration binding"))?;
+        if actual.library_uuid != supplied.library_uuid()
+            || actual.library_root != supplied.library_root()
+            || actual.tape_root != supplied.tape_root()
+        {
+            return Err(refusal(
+                "installed motion authority differs from supplied configuration",
+            ));
+        }
+        return Ok(());
+    }
+    let state =
+        Arc::new(remanence_state::StateLockGuard::acquire(&paths.state_dir).map_err(refusal)?);
+    state.ensure_no_catalog_reset().map_err(refusal)?;
+    let runtime =
+        remanence_state::library_runtime::LibraryRuntime::open(&paths, config.audit.fsync, state)
+            .map_err(refusal)?;
+    library.set_motion_authority(Arc::new(runtime));
+    library.reconcile_startup_motion().map_err(refusal)
+}
+
+/// Try normal UNLOAD after authority admission. Only 05/53/02 permits
+/// serial-device-locked removal recovery; its guard spans the return MOVE.
 pub fn unload_library_bay(
     library: &mut LibraryHandle,
     bay: u16,
@@ -456,6 +418,7 @@ pub(crate) fn unload_library_bay_with_admission(
     lock_root: &Path,
     admit: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<UnloadOutcome, MountError> {
+    bind_library_motion_authority(library, config)?;
     match library.unload_with_admission(bay, destination, policy, admit) {
         Ok(()) => return Ok(UnloadOutcome::Unloaded),
         Err(remanence_library::UnloadError::DriveUnload(ref error))
@@ -468,7 +431,7 @@ pub(crate) fn unload_library_bay_with_admission(
         ))
     })?;
     let serial = drive.drive().serial.clone();
-    let guard = UnloadRecoveryGuard::acquire(&mut drive, config, lock_root)?;
+    let guard = UnloadRecoveryGuard::acquire(&mut drive, lock_root)?;
     let result = library
         .unload_recovering_removal_with_admission(bay, destination, policy, admit)
         .map_err(refusal);
@@ -512,7 +475,7 @@ pub(crate) fn unload_drive(
     }
     let serial = drive.drive().serial.clone();
     let guard =
-        UnloadRecoveryGuard::acquire(drive, None, lock_root).map_err(DriveUnloadError::Recovery)?;
+        UnloadRecoveryGuard::acquire(drive, lock_root).map_err(DriveUnloadError::Recovery)?;
     guard
         .finish((|| {
             drive.allow_medium_removal().map_err(refusal)?;
@@ -918,6 +881,9 @@ pub struct ChangerMount<'a> {
 }
 impl MountBackend for ChangerMount<'_> {
     fn mount(&mut self, target: MountTarget) -> Result<MountedTape, MountError> {
+        if let Some(authority) = self.index.library_runtime() {
+            self.library.set_motion_authority(Arc::new(authority));
+        }
         if let MountTarget::Tape { tape_uuid } = target {
             let mut drive =
                 crate::load_tape_by_uuid(self.index, self.library, self.policy, &tape_uuid)
@@ -1134,28 +1100,16 @@ pub(crate) fn raise_standalone_fence(
     reason: &str,
     detail: &str,
 ) -> Result<(), MountError> {
-    let barcode = state
-        .catalog()
-        .get_tape(&tape_uuid)
-        .map_err(refusal)?
-        .and_then(|t| t.voltag);
-    let audit_dir = state.paths().audit_dir.clone();
-    let fence = remanence_state::fence::raise(
-        &mut state.write_handle(),
-        &audit_dir,
-        remanence_state::TapeIoFenceInput {
-            tape_uuid,
-            barcode,
-            reason: reason.into(),
-            evidence_json: Some(serde_json::json!({"error": detail}).to_string()),
-        },
-        endpoint,
-        remanence_state::AuditActor::System,
-    )
-    .map_err(refusal)?;
-    let release_options = fence_release_options(&fence);
-    eprintln!("standalone tape-I/O fence {}; inspect `rem tape quarantine list`; release with `rem tape quarantine release {} {release_options}`", fence.quarantine_id, fence.quarantine_id);
-    state.refresh_audit_append_cursor().map_err(refusal)
+    // C8-G10: the original producer couples tape, endpoint and free-form
+    // evidence. FenceRaised has a single scope and CompletionEvidence only;
+    // neither an invented DriveFault nor dropping the endpoint is equivalent.
+    state
+        .library_runtime()
+        .fence_motion_after_evidence_failure();
+    Err(refusal(format!(
+        "cannot durably record standalone write uncertainty for {} at {:?} ({reason}): {detail}; motion is fenced and recovery is required",
+        uuid::Uuid::from_bytes(tape_uuid), endpoint
+    )))
 }
 
 #[cfg(test)]

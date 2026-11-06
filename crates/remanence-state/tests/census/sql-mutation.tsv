@@ -1,6 +1,8 @@
 # CLI pool_ops has two error-text false positives containing create temporary --out.
 # Mutating literals include TEMP/TEMPORARY, VIEW, REPLACE and CTE UPDATE forms.
 # Non-projector exceptions: remanence-chaos owns its separate fault database.
+# Ruling 15 adds the cleaning-identity INSERT in projector::apply_library_body.
+# Ruling 17 adds alarm refresh, selected-run home and non-LTO media projection updates.
 # SQL mutation/open candidates; complete files, excluding cfg(test) items/blocks.
 # authority_layout::validate_layout reads user_version; B4b replaces that gate.
 # remanence-chaos uses its own fault-scenario database, not the catalog.
@@ -17,18 +19,18 @@ crates/remanence-state/src/projector/apply.rs::<module>::mutating-sql	1
 crates/remanence-state/src/projector/apply.rs::apply_authority::execute	4
 crates/remanence-state/src/projector/apply.rs::apply_authority::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::apply_authority::mutating-sql	4
-crates/remanence-state/src/projector/apply.rs::apply_library_body::execute	14
-crates/remanence-state/src/projector/apply.rs::apply_library_body::mutating-sql	14
+crates/remanence-state/src/projector/apply.rs::apply_library_body::execute	16
+crates/remanence-state/src/projector/apply.rs::apply_library_body::mutating-sql	16
 crates/remanence-state/src/projector/apply.rs::commit::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::drop::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::finish_library_replay::execute	2
 crates/remanence-state/src/projector/apply.rs::finish_library_replay::mutating-sql	2
 crates/remanence-state/src/projector/apply.rs::library_watermarks::execute	1
 crates/remanence-state/src/projector/apply.rs::library_watermarks::mutating-sql	1
-crates/remanence-state/src/projector/apply.rs::project_library_cleaning_binding::execute	1
-crates/remanence-state/src/projector/apply.rs::project_library_cleaning_binding::mutating-sql	1
-crates/remanence-state/src/projector/apply.rs::project_library_medium::execute	1
-crates/remanence-state/src/projector/apply.rs::project_library_medium::mutating-sql	1
+crates/remanence-state/src/projector/apply.rs::project_library_cleaning_binding::execute	2
+crates/remanence-state/src/projector/apply.rs::project_library_cleaning_binding::mutating-sql	2
+crates/remanence-state/src/projector/apply.rs::project_library_medium::execute	2
+crates/remanence-state/src/projector/apply.rs::project_library_medium::mutating-sql	2
 crates/remanence-state/src/projector/apply.rs::record_fold_progress::execute	1
 crates/remanence-state/src/projector/apply.rs::record_fold_progress::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::<module>::mutating-sql	2
@@ -82,8 +84,8 @@ crates/remanence-state/src/projector/index.rs::migrate_inner::user_version-assig
 crates/remanence-state/src/projector/index.rs::migrate_object_instances::execute_batch	1
 crates/remanence-state/src/projector/index.rs::migrate_object_instances::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::execute	3
-crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::execute_batch	8
-crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::mutating-sql	8
+crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::execute_batch	7
+crates/remanence-state/src/projector/index.rs::migrate_standalone_evidence::mutating-sql	7
 crates/remanence-state/src/projector/index.rs::observe_drive_core::execute	2
 crates/remanence-state/src/projector/index.rs::observe_drive_core::mutating-sql	2
 crates/remanence-state/src/projector/index.rs::observe_managed_drive_cleaning_due::execute	1
@@ -221,3 +223,7 @@ crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_tape_log_pr
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::execute	2
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::execute_batch	2
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::mutating-sql	4
+
+# Endpoint trigger refresh is shared by fresh creation and current/predecessor schema repair.
+crates/remanence-state/src/projector/index.rs::refresh_endpoint_triggers::execute_batch	1
+crates/remanence-state/src/projector/index.rs::refresh_endpoint_triggers::mutating-sql	1

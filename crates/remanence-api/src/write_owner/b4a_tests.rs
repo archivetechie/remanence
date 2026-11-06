@@ -114,7 +114,7 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
         let snapshot = library_snapshot_cell(library.library().clone());
         let mut cfg =
             test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
-        cfg.audit_append_lock = audit_lock.clone();
+        cfg.fixture_audit_mut().audit_append_lock = audit_lock.clone();
         cfg.write_admissions = admissions.clone();
         cfg.checkpoint_max_objects = 1;
         cfg.lifecycle = Some(lifecycle.clone());

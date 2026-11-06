@@ -372,6 +372,14 @@ impl FileAuditLog {
             .map_err(|err| StateError::io_at("sync audit directory", &self.dir, err))
     }
 
+    /// Read-only legacy archive metadata, never used to reconstruct authority.
+    pub(crate) fn archive_terminal_hash(dir: &Path) -> Result<Option<[u8; 32]>, StateError> {
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let summary = replay_segments_summary(dir)?;
+        Ok(summary.latest_segment_date.map(|_| summary.terminal_hash))
+    }
     /// Replay all audit records in a directory into a collection.
     ///
     /// Call [`Self::replay_incremental`] when the caller does not inherently

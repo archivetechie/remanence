@@ -582,6 +582,9 @@ impl CompletionEvidence {
     /// CHECK CONDITION data counts prefer valid current sense over SG's count.
     /// Fixed commands express residuals in blocks; variable commands use bytes.
     /// A negative variable ILI describes a record larger than the supplied buffer.
+    /// This trusts the drive's VALID residual: a false residual in usable current
+    /// sense is not caught by comparing SG's byte count. In particular, it may
+    /// credit stale buffer bytes; SG is not an independent consistency veto.
     pub(crate) fn data_transfer_bytes(
         &self,
         host_bytes: u64,

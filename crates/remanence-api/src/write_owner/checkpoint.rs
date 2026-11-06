@@ -168,6 +168,7 @@ pub(super) fn checked_epoch_rebuild(
                     evidence_json: Some(evidence.to_string()),
                 },
                 cfg.terminal_config().mounted_endpoint.as_ref(),
+                Some(&outcome.evidence),
             ) {
                 tracing::error!(%error, tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
                     "failed to persist closeout mismatch tape-I/O fence");
@@ -1387,6 +1388,7 @@ pub(super) fn fence_failed_parity_raw_write(
             evidence_json: Some(evidence),
         },
         selected.standalone_endpoint.as_ref(),
+        Some(&classified.evidence),
     ) {
         Ok(_) => (status, true),
         Err(err) => {
@@ -1539,18 +1541,20 @@ pub(super) fn closeout(
             .and_then(|mut session| session.permit.take())
             .or(permit));
     }
-    let progress =
-        crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), selected.tape_uuid, None)?;
+    let progress = crate::closeout_progress::CloseoutProgress::for_owner(
+        &cfg.authority,
+        selected.tape_uuid,
+        true,
+    )?;
     progress.bind(
         snapshot.tape_summary(),
         if live.is_some() { "live" } else { "rebuilt" },
     );
     progress.phase("proving");
-    progress.audit(
+    progress.record(
         index,
-        &cfg.audit_dir,
-        &cfg.audit_append_lock,
-        remanence_state::AuditEvent::OperationStarted,
+        &cfg.authority,
+        crate::closeout_progress::CloseoutEvent::Started,
         None,
     )?;
     let result = (|| {
@@ -1597,11 +1601,10 @@ pub(super) fn closeout(
         write_closeout(index, drive, cfg, selected, lease, prepared, &progress)
     })();
     if let Err(error) = &result {
-        let _ = progress.audit(
+        let _ = progress.record(
             index,
-            &cfg.audit_dir,
-            &cfg.audit_append_lock,
-            remanence_state::AuditEvent::OperationFailed,
+            &cfg.authority,
+            crate::closeout_progress::CloseoutEvent::Failed,
             Some(error),
         );
     }
@@ -1655,11 +1658,10 @@ pub(super) fn write_closeout(
     progress.attempt(prepared.read_attempts.max(1));
     progress.reserved(prepared.permit.as_ref().map_or(0, |p| p.bytes()));
     if !progress.watched() {
-        progress.audit(
+        progress.record(
             index,
-            &cfg.audit_dir,
-            &cfg.audit_append_lock,
-            remanence_state::AuditEvent::OperationStarted,
+            &cfg.authority,
+            crate::closeout_progress::CloseoutEvent::Started,
             None,
         )?;
     }
@@ -1827,20 +1829,14 @@ pub(super) fn write_closeout(
     }
     if !progress.watched() {
         let event = if result.is_ok() {
-            remanence_state::AuditEvent::OperationFinished
+            crate::closeout_progress::CloseoutEvent::Finished
         } else {
-            remanence_state::AuditEvent::OperationFailed
+            crate::closeout_progress::CloseoutEvent::Failed
         };
         if result.is_ok() {
             progress.phase("complete");
         }
-        let audit = progress.audit(
-            index,
-            &cfg.audit_dir,
-            &cfg.audit_append_lock,
-            event,
-            result.as_ref().err(),
-        );
+        let audit = progress.record(index, &cfg.authority, event, result.as_ref().err());
         if result.is_ok() {
             audit?;
         }
@@ -2009,6 +2005,7 @@ pub(crate) fn record_closeout_fence(
             evidence_json: Some(evidence),
         },
         cfg.terminal_config().mounted_endpoint.as_ref(),
+        None,
     ) {
         tracing::error!(%error, "open epoch fence persistence fails");
     }

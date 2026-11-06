@@ -360,7 +360,10 @@ impl Store {
         let current = self.current_header()?;
         let captured = super::snapshot::Captured::open(&current)?;
         let snapshot = captured.validate()?;
-        if snapshot.summary.is_fresh() && snapshot.captured_end() != 0 {
+        if snapshot.summary.is_fresh()
+            && snapshot.captured_end() != 0
+            && snapshot.captured_end() != snapshot.summary.closed_end
+        {
             return Err(StoreError::Refused(
                 "active log has no closed initialization; fresh creation cannot replace it",
             ));
@@ -770,6 +773,36 @@ impl Lease {
             Err(StoreError::Header)
         }
     }
+    /// Durably publish an empty native header before a sequence-zero SupersedeTail.
+    /// This creates no record or media fact. Geometry must already be bound by
+    /// the caller; later initialization must use the same immutable header.
+    pub fn publish_empty_prefix(&mut self) -> Result<(), StoreError> {
+        self.check()?;
+        if self.store.path.try_exists()? {
+            return Ok(());
+        }
+        if !self.summary().is_fresh() || self.repair_pending {
+            return Err(StoreError::Refused(
+                "empty header requires a fresh native log",
+            ));
+        }
+        let mut temp = self.store.temporary("empty")?;
+        let bytes = self.store.header.bytes()?;
+        self.fenced = true;
+        let result = publication::append_and_publish(
+            &mut temp.file,
+            &bytes,
+            Some(&temp.path),
+            &self.store.path,
+            &self.store.directory,
+            || Ok(()),
+        );
+        if let Err(error) = result {
+            return Err(self.ambiguous(error));
+        }
+        self.fenced = false;
+        Ok(())
+    }
     /// Latest validated authority, excluding any provisional suffix.
     pub fn summary(&self) -> &TapeSummary {
         self.fold.summary()
@@ -856,7 +889,7 @@ impl Lease {
             self.tail = Tail::Complete;
             self.fenced = false;
         }
-        let mut temporary = if fresh {
+        let mut temporary = if fresh && !self.store.path.try_exists()? {
             Some(self.store.temporary("initial")?)
         } else {
             None

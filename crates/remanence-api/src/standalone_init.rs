@@ -7,10 +7,7 @@ use crate::{
     TapeUuid,
 };
 use remanence_library::DriveHandle;
-use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, SourceLayer, StateHandle,
-};
-use std::collections::BTreeMap;
+use remanence_state::{AuditEvent, StateHandle};
 
 impl OperatorMount<'_> {
     /// Prepare a BOT initialization decision, then run its write and provisioning
@@ -118,47 +115,16 @@ impl OperatorMount<'_> {
         Ok(value)
     }
 
+    /// C8-G5: a bootstrap write needs a durable pre-write session obligation,
+    /// but native SessionOpened requires an already committed Bootstrap. Keep
+    /// the real write gate closed; legacy audit is no longer that authority.
     pub(crate) fn session(
         &mut self,
-        tape_uuid: TapeUuid,
-        id: uuid::Uuid,
-        event: AuditEvent,
+        _tape_uuid: TapeUuid,
+        _id: uuid::Uuid,
+        _event: AuditEvent,
     ) -> Result<(), MountError> {
         self.flush_audit()?;
-        let key = self
-            .context
-            .endpoint
-            .durable_key()
-            .ok_or_else(|| refusal("ephemeral endpoint is read-only"))?;
-        let detail = BTreeMap::from([
-            ("session_kind".into(), ciborium::Value::Text("write".into())),
-            (
-                "tape_uuid".into(),
-                ciborium::Value::Bytes(tape_uuid.to_vec()),
-            ),
-            ("endpoint_key".into(), ciborium::Value::Text(key.encode())),
-        ]);
-        // Session recovery evidence must reach stable storage before any write,
-        // even when ordinary audit appends are configured without fsync.
-        use remanence_state::AuditSink;
-        let mut log = remanence_state::FileAuditLog::open(&self.state.paths().audit_dir, true)
-            .map_err(refusal)?;
-        log.append(AuditEventRecord {
-            event,
-            actor: AuditActor::local_user(),
-            source_layer: SourceLayer::Layer5,
-            session_id: Some(id),
-            operation_id: None,
-            idempotency_key: None,
-            subject: AuditSubject {
-                kind: "write".into(),
-                id: Some(id.to_string()),
-            },
-            detail,
-        })
-        .map_err(refusal)?;
-        self.state.refresh_audit_append_cursor().map_err(refusal)?;
-        self.state.replay_audit_projection().map_err(refusal)?;
-        Ok(())
+        Err(refusal("standalone initialization requires durable pre-Bootstrap write-session authority; no Bootstrap bytes were written"))
     }
 }

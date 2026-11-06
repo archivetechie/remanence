@@ -2,17 +2,17 @@
 use crate::library_log::{fold::*, store::Receipt, *};
 struct Present;
 impl TapeView for Present {
-    fn lookup(&self, a: &TapeAt) -> TapeLookup {
-        TapeLookup::Present {
+    fn lookup(&self, a: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok(TapeLookup::Present {
             kind: crate::tape_log::Tag::FinalizationPrepared,
             digest: a.record_digest,
-        }
+        })
     }
 }
 struct NotYetView;
 impl TapeView for NotYetView {
-    fn lookup(&self, _: &TapeAt) -> TapeLookup {
-        TapeLookup::NotYet
+    fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok(TapeLookup::NotYet)
     }
 }
 struct NoHistory;
@@ -143,7 +143,7 @@ fn second_outcome_for_resolved_parented_intent() {
     let inv = feed(
         &mut f,
         Body::InventoryReconciled(InventoryReconciled {
-            library_serial: "LIBA0001".into(),
+            subject: InventorySubject::Library("LIBA0001".into()),
             observation_generation: 1,
             resolves: Bounded(vec![intent]),
             complete: true,
@@ -174,9 +174,9 @@ fn fence_on_tape_whose_provisioning_is_queued() {
                 sequence: 9,
                 record_digest: [5; 32],
             },
-            operation: [3; 16],
-            session_id: [3; 16],
-            preview_digest: [0; 32],
+            operation: Some([3; 16]),
+            session_id: Some([3; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
     )
@@ -215,12 +215,14 @@ fn fence_on_tape_whose_provisioning_is_queued() {
 
 struct Repaired;
 impl TapeView for Repaired {
-    fn lookup(&self, _: &TapeAt) -> TapeLookup {
-        // The tape log now holds a different record (other kind, other digest) at that sequence.
-        TapeLookup::Present {
-            kind: crate::tape_log::Tag::SessionEnded,
-            digest: [0xee; 32],
-        }
+    fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok({
+            // The tape log now holds a different record (other kind, other digest) at that sequence.
+            TapeLookup::Present {
+                kind: crate::tape_log::Tag::SessionEnded,
+                digest: [0xee; 32],
+            }
+        })
     }
 }
 /// Finding: a digest mismatch with a different kind stops all of replay instead of scoping the tape.
@@ -278,9 +280,9 @@ fn deferred_fence_liveness_failure_is_scoped() {
                 sequence: 9,
                 record_digest: [5; 32],
             },
-            operation: [3; 16],
-            session_id: [3; 16],
-            preview_digest: [0; 32],
+            operation: Some([3; 16]),
+            session_id: Some([3; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
     )

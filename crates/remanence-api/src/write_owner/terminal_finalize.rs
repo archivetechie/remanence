@@ -2,11 +2,15 @@
 
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::authority::TapeAuthorityWriter as _;
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::ops::ControlFlow;
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use ciborium::value::Value as CborValue;
 use remanence_library::DriveHandle;
 use remanence_parity::{
@@ -16,9 +20,8 @@ use remanence_parity::{
     TerminalTripleWritePlan,
 };
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, FileAuditLog,
-    ManualTerminalFinalizationAcceptanceInput, SourceLayer, TapePoolConfig,
-    TerminalFinalizationOutcome, TerminalFinalizationProjectionInput,
+    AuditActor, AuditEvent, CatalogIndex, TapePoolConfig, TerminalFinalizationOutcome,
+    TerminalFinalizationProjectionInput,
 };
 use tonic::Status;
 use uuid::Uuid;
@@ -34,13 +37,13 @@ use super::terminal_types::{
     reconcile_and_authorize_parity_resume, reconcile_terminal_component_host_authority,
     state_progress_from_parity, terminal_reconciliation_outcome, ManualFinalizePreflightConfig,
     ManualFinalizeTapeActorReply, ManualFinalizeTapeActorRequest, ManualFinalizeTapeMountRequest,
-    TerminalFinalizeAuditConfig, TerminalFinalizeResult, TerminalFinalizeSpec,
-    TerminalTailCatalogAuthority,
+    TerminalAuthority, TerminalFinalizeResult, TerminalFinalizeSpec, TerminalTailCatalogAuthority,
 };
 use super::write_session::{
     prepare_drive_for_write, run_load_calibration_harvest, WriteMediaPolicy,
 };
 use super::{SelectedTape, SessionOpenReadinessContext};
+#[cfg(test)]
 use crate::audit_projection::{
     append_operation_audit, ensure_manual_finalize_finished_audit, OperationAuditInput,
 };
@@ -167,13 +170,7 @@ pub(crate) fn finalize_mounted_tape(
             )
         })?;
 
-        ensure_manual_finalize_finished_audit(
-            index,
-            cfg.audit_dir.as_path(),
-            &cfg.audit_append_lock,
-            request.tape_uuid,
-            completion,
-        )?;
+        finish_terminal_source(index, &cfg.authority, request.tape_uuid, completion)?;
         let projection = index
             .terminal_finalization(&request.tape_uuid)
             .map_err(crate::status_from_state_error)?
@@ -692,12 +689,9 @@ pub(super) fn publish_terminal_intent(
     Ok(())
 }
 
-/// Distinguish an accepted manual intent from the provisional companion left
-/// if the process dies before the guarded SQLite transaction commits.
-///
-/// Both database halves are committed by one transaction. Seeing neither is
-/// therefore the sole removable provisional state; seeing exactly one is
-/// corruption, while seeing both requires exact equality before recovery.
+/// Reconcile native Prepared against authenticated typed acceptance. Only
+/// authoritative absence permits provisional retirement; pending or archived
+/// acceptance keeps physical work fenced. The SQL branch serves legacy fixtures.
 pub(crate) fn reconcile_manual_terminal_acceptance(
     index: &CatalogIndex,
     checkpoint: &mut remanence_state::TapeAuthorityLease,
@@ -712,6 +706,53 @@ pub(crate) fn reconcile_manual_terminal_acceptance(
         return Err(Status::failed_precondition(
             "manual acceptance reconciliation has invalid operation authority",
         ));
+    }
+    if let Some(runtime) = index.library_runtime() {
+        let snapshot = checkpoint
+            .freeze()
+            .map_err(crate::status_from_state_error)?;
+        runtime
+            .refresh_native(&snapshot)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let accepted = runtime
+            .manual_acceptance(manual.operation_id)
+            .map_err(|e| {
+                Status::failed_precondition(format!("manual acceptance source lookup: {e}"))
+            })?;
+        let Some(accepted) = accepted else {
+            checkpoint
+                .retire_preparation(intent, false, false)
+                .map_err(crate::status_from_state_error)?;
+            return Ok(false);
+        };
+        let at = runtime
+            .manual_prepared_reference(&snapshot, manual.operation_id)
+            .map_err(|e| {
+                Status::failed_precondition(format!("manual Prepared source lookup: {e}"))
+            })?;
+        if accepted.status
+            != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+        {
+            return Err(Status::failed_precondition(format!(
+                "manual acceptance is {:?}; physical finalization remains fenced",
+                accepted.status
+            )));
+        }
+        let value = &accepted.value;
+        if value.at != at
+            || value.actor_fingerprint.as_str() != manual.actor_fingerprint
+            || value.idempotency_key != manual.idempotency_key
+            || value.request_fingerprint != manual.request_fingerprint
+            || value.assignment_generation != manual.assignment_generation
+        {
+            return Err(Status::failed_precondition(
+                "manual acceptance differs from its native Prepared source",
+            ));
+        }
+        checkpoint
+            .accept_preparation()
+            .map_err(crate::status_from_state_error)?;
+        return Ok(true);
     }
     let operation_id = Uuid::from_bytes(manual.operation_id);
     let idempotency_key = Uuid::from_bytes(manual.idempotency_key);
@@ -785,6 +826,35 @@ pub(crate) fn preflight_manual_finalize_cancellable(
     prefix: Option<&TerminalPrefixPlan>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<ManualFinalizeTapeActorReply>, Status> {
+    if let Some(runtime) = cfg.authority.runtime() {
+        if let Some(accepted) = runtime
+            .manual_acceptance_by_request(
+                &request.actor_fingerprint,
+                *request.idempotency_key.as_bytes(),
+            )
+            .map_err(|e| Status::failed_precondition(format!("manual acceptance lookup: {e}")))?
+        {
+            if accepted.value.request_fingerprint != request.request_fingerprint
+                || accepted.value.at.tape.uuid != request.tape_uuid
+            {
+                return Err(Status::already_exists(
+                    "FinalizeTape request differs from authenticated acceptance",
+                ));
+            }
+            if accepted.status
+                != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+            {
+                return Err(Status::failed_precondition(format!(
+                    "manual acceptance is {:?}; no physical work is admitted",
+                    accepted.status
+                )));
+            }
+            runtime
+                .ensure_manual_operation_continuable(accepted.value.operation)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            request.candidate_operation_id = Uuid::from_bytes(accepted.value.operation);
+        }
+    }
     let checkpoint_journal = remanence_state::TapeAuthority::open(
         cfg.checkpoint_journal_dir,
         request.tape_uuid,
@@ -876,20 +946,23 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             }
         }
     }
-    if let Some(scope) = index
-        .idempotency_scope_record(
-            request.actor_fingerprint.as_str(),
-            FINALIZE_TAPE_OPERATION_KIND,
-            request.idempotency_key,
-        )
-        .map_err(crate::status_from_state_error)?
-    {
-        if scope.request_fingerprint.as_slice() != request.request_fingerprint {
-            return Err(Status::already_exists(
-                "FinalizeTape idempotency key is already bound to a different request",
-            ));
+    #[cfg(test)]
+    if cfg.authority.runtime().is_none() {
+        if let Some(scope) = index
+            .idempotency_scope_record(
+                request.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                request.idempotency_key,
+            )
+            .map_err(crate::status_from_state_error)?
+        {
+            if scope.request_fingerprint.as_slice() != request.request_fingerprint {
+                return Err(Status::already_exists(
+                    "FinalizeTape idempotency key is already bound to a different request",
+                ));
+            }
+            request.candidate_operation_id = scope.operation_id;
         }
-        request.candidate_operation_id = scope.operation_id;
     }
     let had_existing_intent = existing_intent.is_some();
 
@@ -940,13 +1013,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             )
         })?;
 
-        ensure_manual_finalize_finished_audit(
-            index,
-            cfg.audit_dir,
-            cfg.audit_append_lock,
-            request.tape_uuid,
-            completion,
-        )?;
+        finish_terminal_source(index, &cfg.authority, request.tape_uuid, completion)?;
         let projection = index
             .terminal_finalization(&request.tape_uuid)
             .map_err(crate::status_from_state_error)?
@@ -969,6 +1036,30 @@ pub(crate) fn preflight_manual_finalize_cancellable(
         session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
     }
 
+    let new_acceptance = existing_intent.is_none();
+    if new_acceptance {
+        if let Some(runtime) = cfg.authority.runtime() {
+            let operation = runtime
+                .begin_manual_finalization(
+                    remanence_state::library_log::Accepted {
+                        actor_fingerprint: request.actor_fingerprint.as_str().into(),
+                        idempotency_key: Some(*request.idempotency_key.as_bytes()),
+                        request_fingerprint: request.request_fingerprint,
+                        subject: Some(
+                            Uuid::from_bytes(request.tape_uuid)
+                                .to_string()
+                                .as_str()
+                                .into(),
+                        ),
+                    },
+                    request.actor.clone(),
+                )
+                .map_err(|e| {
+                    Status::failed_precondition(format!("accept typed finalization request: {e}"))
+                })?;
+            request.candidate_operation_id = Uuid::from_bytes(operation);
+        }
+    }
     let spec = TerminalFinalizeSpec::operator(request);
     let selected = SelectedTape {
         standalone_endpoint: cfg.mounted_endpoint.cloned(),
@@ -980,7 +1071,6 @@ pub(crate) fn preflight_manual_finalize_cancellable(
         block_size: request.block_size,
         parity_config: request.parity_config.clone(),
     };
-    let new_acceptance = existing_intent.is_none();
     let (intent, plan) = match existing_intent {
         Some(intent) => {
             validate_manual_finalize_intent(request, &intent)?;
@@ -1117,6 +1207,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                 Status::failed_precondition(format!("TIX assignment-race hook: {error}"))
             })?;
     }
+    #[cfg(test)]
     let projected_recovery_required = index
         .terminal_finalization(&request.tape_uuid)
         .map_err(crate::status_from_state_error)?
@@ -1124,6 +1215,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             projection.progress == intent.progress
                 && projection.outcome == TerminalFinalizationOutcome::RecoveryRequired
         });
+    #[cfg(test)]
     let projection = TerminalFinalizationProjectionInput {
         tape_uuid: request.tape_uuid,
         trigger: intent.trigger,
@@ -1138,76 +1230,93 @@ pub(crate) fn preflight_manual_finalize_cancellable(
         },
         updated_at_utc: None,
     };
-    if intent.progress == remanence_state::TerminalFinalizationProgress::BeforeReplicaA {
-        index
-            .accept_manual_terminal_finalization_with(
-                ManualTerminalFinalizationAcceptanceInput {
-                    tape_uuid: request.tape_uuid,
-                    expected_pool_id: request.expected_pool_id.clone(),
-                    expected_assignment_generation: request.assignment_generation,
-                    actor_fingerprint: request.actor_fingerprint.clone(),
-                    operation_kind: FINALIZE_TAPE_OPERATION_KIND.to_string(),
-                    idempotency_key: request.idempotency_key,
-                    request_fingerprint: request.request_fingerprint,
-                    operation_id: request.candidate_operation_id,
-                    projection,
-                },
-                || {
-                    if let Some(fault) = tix_fault.as_ref() {
-                        fault
-                            .install(&checkpoint)
-                            .map_err(remanence_state::StateError::JournalReplayFailed)?;
-                    }
-                    checkpoint.begin_finalization(&intent)?;
-                    #[cfg(test)]
-                    PREFLIGHT_INTENT_HOOK.with(|hook| {
-                        if let Some(hook) = hook.borrow_mut().take() {
-                            hook();
-                        }
-                    });
-                    if new_acceptance && cancelled() {
-                        checkpoint.retire_preparation(&intent, false, false)?;
-                        return Err(remanence_state::StateError::ConfigInvalid(
-                            "finalization request dropped before acceptance".into(),
-                        ));
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|error| match error {
-                remanence_state::StateError::ConfigInvalid(detail) if cancelled() => {
-                    Status::cancelled(detail)
-                }
-                remanence_state::StateError::TapePoolAssignmentConflict(detail) => {
-                    Status::failed_precondition(detail)
-                }
-                other => crate::status_from_state_error(other),
-            })?;
-    } else {
-        index
-            .project_terminal_finalization(projection)
+    if let Some(runtime) = cfg.authority.runtime() {
+        if let Some(fault) = tix_fault.as_ref() {
+            fault
+                .install(&checkpoint)
+                .map_err(Status::failed_precondition)?;
+        }
+        checkpoint
+            .begin_finalization(&intent)
             .map_err(crate::status_from_state_error)?;
+        if new_acceptance && cancelled() {
+            checkpoint
+                .retire_preparation(&intent, false, false)
+                .map_err(crate::status_from_state_error)?;
+            return Err(Status::cancelled(
+                "finalization request dropped before acceptance",
+            ));
+        }
+        accept_manual_finalize_library(runtime, &checkpoint, request)?;
+    } else {
+        #[cfg(test)]
+        {
+            if intent.progress == remanence_state::TerminalFinalizationProgress::BeforeReplicaA {
+                index
+                    .accept_manual_terminal_finalization_with(
+                        ManualTerminalFinalizationAcceptanceInput {
+                            tape_uuid: request.tape_uuid,
+                            expected_pool_id: request.expected_pool_id.clone(),
+                            expected_assignment_generation: request.assignment_generation,
+                            actor_fingerprint: request.actor_fingerprint.clone(),
+                            operation_kind: FINALIZE_TAPE_OPERATION_KIND.to_string(),
+                            idempotency_key: request.idempotency_key,
+                            request_fingerprint: request.request_fingerprint,
+                            operation_id: request.candidate_operation_id,
+                            projection,
+                        },
+                        || {
+                            if let Some(fault) = tix_fault.as_ref() {
+                                fault
+                                    .install(&checkpoint)
+                                    .map_err(remanence_state::StateError::JournalReplayFailed)?;
+                            }
+                            checkpoint.begin_finalization(&intent)?;
+                            #[cfg(test)]
+                            PREFLIGHT_INTENT_HOOK.with(|hook| {
+                                if let Some(hook) = hook.borrow_mut().take() {
+                                    hook();
+                                }
+                            });
+                            if new_acceptance && cancelled() {
+                                checkpoint.retire_preparation(&intent, false, false)?;
+                                return Err(remanence_state::StateError::ConfigInvalid(
+                                    "finalization request dropped before acceptance".into(),
+                                ));
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| match error {
+                        remanence_state::StateError::ConfigInvalid(detail) if cancelled() => {
+                            Status::cancelled(detail)
+                        }
+                        remanence_state::StateError::TapePoolAssignmentConflict(detail) => {
+                            Status::failed_precondition(detail)
+                        }
+                        other => crate::status_from_state_error(other),
+                    })?;
+            } else {
+                index
+                    .project_terminal_finalization(projection)
+                    .map_err(crate::status_from_state_error)?;
+            }
+        }
+        #[cfg(not(test))]
+        {
+            unreachable!("production terminal authority is typed")
+        }
     }
     checkpoint
         .accept_preparation()
         .map_err(crate::status_from_state_error)?;
     // A crash after acceptance but before this append is repaired from the
     // accepted companion before any physical dispatch.
-    record_manual_finalize_request_with(
-        index,
-        cfg.audit_dir,
-        cfg.audit_fsync,
-        cfg.audit_append_lock,
-        request,
-    )?;
+    record_manual_finalize_request_with(index, &cfg.authority, request)?;
     if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
         let result = complete_terminal_finalization_host_only(
             index,
-            TerminalFinalizeAuditConfig {
-                audit_dir: cfg.audit_dir,
-                audit_fsync: cfg.audit_fsync,
-                audit_append_lock: cfg.audit_append_lock,
-            },
+            cfg.authority.clone(),
             &mut checkpoint,
             &previous,
             &spec,
@@ -1307,13 +1416,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 .map_err(crate::status_from_state_error)?;
         }
 
-        ensure_manual_finalize_finished_audit(
-            index,
-            cfg.audit_dir,
-            cfg.audit_append_lock,
-            selected.tape_uuid,
-            completion,
-        )?;
+        finish_terminal_source(index, &cfg.authority, selected.tape_uuid, completion)?;
         return Ok(true);
     }
     let Some(intent) = intent else {
@@ -1412,11 +1515,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
         })?;
     complete_terminal_finalization_host_only(
         index,
-        TerminalFinalizeAuditConfig {
-            audit_dir: cfg.audit_dir,
-            audit_fsync: cfg.audit_fsync,
-            audit_append_lock: cfg.audit_append_lock,
-        },
+        cfg.authority.clone(),
         &mut checkpoint,
         &previous,
         &spec,
@@ -1527,7 +1626,7 @@ pub(super) fn finalize_terminal_no_parity(
         drop(source);
         return complete_terminal_finalization_host_only(
             index,
-            TerminalFinalizeAuditConfig::from(cfg),
+            TerminalAuthority::from(cfg),
             checkpoint,
             previous,
             spec,
@@ -1863,7 +1962,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
         drop(source);
         return complete_terminal_finalization_host_only(
             index,
-            TerminalFinalizeAuditConfig::from(cfg),
+            TerminalAuthority::from(cfg),
             checkpoint,
             previous,
             spec,
@@ -2102,7 +2201,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn complete_terminal_finalization_host_only(
     index: &mut CatalogIndex,
-    audit: TerminalFinalizeAuditConfig<'_>,
+    audit: TerminalAuthority,
     checkpoint: &mut remanence_state::TapeAuthorityLease,
     previous: &remanence_state::authority::AuthorityCommit,
     spec: &TerminalFinalizeSpec,
@@ -2204,13 +2303,7 @@ pub(super) fn complete_terminal_finalization_host_only(
     let completion = final_record.finalization.as_ref().ok_or_else(|| {
         Status::internal("sealed terminal checkpoint omitted its completion authority")
     })?;
-    ensure_manual_finalize_finished_audit(
-        index,
-        audit.audit_dir,
-        audit.audit_append_lock,
-        spec.tape_uuid,
-        completion,
-    )?;
+    finish_terminal_source(index, &audit, spec.tape_uuid, completion)?;
     let projection = index
         .terminal_finalization(&spec.tape_uuid)
         .map_err(crate::status_from_state_error)?
@@ -2464,6 +2557,9 @@ pub(super) fn finish_terminal_tail(
                     authority.index,
                     cfg,
                     manual_request,
+                    remanence_state::library_log::OperationEvent::CompletionUnknown(
+                        remanence_state::library_log::Unit,
+                    ),
                     AuditEvent::CompletionUnknown,
                     state_progress,
                     Some((
@@ -2512,7 +2608,7 @@ pub(super) fn finish_terminal_tail(
     drop(authority);
     complete_terminal_finalization_host_only(
         index,
-        TerminalFinalizeAuditConfig::from(cfg),
+        TerminalAuthority::from(cfg),
         checkpoint,
         previous,
         spec,
@@ -2566,24 +2662,41 @@ pub(super) fn validate_manual_finalize_owned_request(
         }
     }
 
-    if let Some(scope) = index
-        .idempotency_scope_record(
-            request.actor_fingerprint.as_str(),
-            FINALIZE_TAPE_OPERATION_KIND,
-            request.idempotency_key,
-        )
-        .map_err(crate::status_from_state_error)?
-    {
-        if scope.request_fingerprint.as_slice() != request.request_fingerprint {
-            return Err(Status::already_exists(
-                "FinalizeTape idempotency key is already bound to a different request",
-            ));
+    if let Some(runtime) = index.library_runtime() {
+        if let Some(accepted) = runtime
+            .manual_acceptance_by_request(
+                &request.actor_fingerprint,
+                *request.idempotency_key.as_bytes(),
+            )
+            .map_err(|e| Status::failed_precondition(format!("manual acceptance lookup: {e}")))?
+        {
+            validate_typed_manual_binding(&accepted, request)?;
         }
-        if scope.operation_id != request.candidate_operation_id {
-            return Err(Status::failed_precondition(format!(
+    } else {
+        #[cfg(not(test))]
+        return Err(Status::failed_precondition(
+            "manual finalization requires typed authority",
+        ));
+        #[cfg(test)]
+        if let Some(scope) = index
+            .idempotency_scope_record(
+                request.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                request.idempotency_key,
+            )
+            .map_err(crate::status_from_state_error)?
+        {
+            if scope.request_fingerprint.as_slice() != request.request_fingerprint {
+                return Err(Status::already_exists(
+                    "FinalizeTape idempotency key is already bound to a different request",
+                ));
+            }
+            if scope.operation_id != request.candidate_operation_id {
+                return Err(Status::failed_precondition(format!(
                 "FinalizeTape owner received operation {}, but durable idempotency authority names {}",
                 request.candidate_operation_id, scope.operation_id
             )));
+            }
         }
     }
     Ok(())
@@ -2593,26 +2706,145 @@ pub(super) fn require_manual_finalize_preflight_binding(
     index: &CatalogIndex,
     request: &ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
-    let scope = index
-        .idempotency_scope_record(
-            request.actor_fingerprint.as_str(),
-            FINALIZE_TAPE_OPERATION_KIND,
-            request.idempotency_key,
-        )
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                "FinalizeTape drive dispatch is missing its durable preflight binding",
+    if let Some(runtime) = index.library_runtime() {
+        let accepted = runtime
+            .manual_acceptance_by_request(
+                &request.actor_fingerprint,
+                *request.idempotency_key.as_bytes(),
             )
-        })?;
-    if scope.operation_id != request.candidate_operation_id
-        || scope.request_fingerprint.as_slice() != request.request_fingerprint
+            .map_err(|e| Status::failed_precondition(format!("manual acceptance lookup: {e}")))?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "FinalizeTape drive dispatch is missing typed acceptance",
+                )
+            })?;
+        return validate_typed_manual_binding(&accepted, request);
+    }
+    #[cfg(not(test))]
+    return Err(Status::failed_precondition(
+        "manual finalization requires typed authority",
+    ));
+    #[cfg(test)]
+    {
+        let scope = index
+            .idempotency_scope_record(
+                request.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                request.idempotency_key,
+            )
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "FinalizeTape drive dispatch is missing its durable preflight binding",
+                )
+            })?;
+        if scope.operation_id != request.candidate_operation_id
+            || scope.request_fingerprint.as_slice() != request.request_fingerprint
+        {
+            return Err(Status::already_exists(
+                "FinalizeTape drive dispatch does not match its durable preflight binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Dispatch requires the immutable typed binding and its current applied status.
+fn validate_typed_manual_binding(
+    accepted: &remanence_state::library_runtime::terminal::ManualAcceptance,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    if accepted.status
+        != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+    {
+        return Err(Status::failed_precondition(format!(
+            "manual acceptance is {:?}; no physical work is admitted",
+            accepted.status
+        )));
+    }
+    let value = &accepted.value;
+    if value.operation != *request.candidate_operation_id.as_bytes()
+        || value.at.tape.uuid != request.tape_uuid
+        || value.actor_fingerprint.as_str() != request.actor_fingerprint
+        || value.idempotency_key != *request.idempotency_key.as_bytes()
+        || value.request_fingerprint != request.request_fingerprint
+        || value.assignment_generation != request.assignment_generation
     {
         return Err(Status::already_exists(
-            "FinalizeTape drive dispatch does not match its durable preflight binding",
+            "FinalizeTape drive dispatch does not match its typed acceptance",
         ));
     }
     Ok(())
+}
+
+/// Publish the exact native Prepared decision before native Decided or media.
+fn accept_manual_finalize_library(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    checkpoint: &remanence_state::TapeAuthorityLease,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    let snapshot = checkpoint
+        .freeze()
+        .map_err(crate::status_from_state_error)?;
+    let at = runtime
+        .manual_prepared_reference(&snapshot, *request.candidate_operation_id.as_bytes())
+        .map_err(|e| Status::failed_precondition(format!("native Prepared reference: {e}")))?;
+    let accepted = runtime
+        .accept_manual_finalization(
+            &snapshot,
+            remanence_state::library_log::ManualFinalizationAccepted {
+                at,
+                operation: *request.candidate_operation_id.as_bytes(),
+                actor_fingerprint: request.actor_fingerprint.as_str().into(),
+                idempotency_key: *request.idempotency_key.as_bytes(),
+                request_fingerprint: request.request_fingerprint,
+                assignment_generation: request.assignment_generation,
+            },
+            request.actor.clone(),
+        )
+        .map_err(|e| Status::failed_precondition(format!("persist manual acceptance: {e}")))?;
+    if accepted.status
+        != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+    {
+        return Err(Status::failed_precondition(format!(
+            "manual acceptance is {:?}; keep Prepared unresolved",
+            accepted.status
+        )));
+    }
+    Ok(())
+}
+
+fn finish_terminal_source(
+    index: &mut CatalogIndex,
+    authority: &TerminalAuthority,
+    tape_uuid: [u8; 16],
+    finalization: &remanence_state::authority::AuthorityFinalization,
+) -> Result<(), Status> {
+    if let Some(runtime) = authority.runtime() {
+        return crate::audit_projection::ensure_manual_finalize_finished_authority(
+            runtime,
+            tape_uuid,
+            finalization,
+        );
+    }
+    #[cfg(test)]
+    {
+        let fixture = authority
+            .historical_fixture()
+            .expect("historical fixture variant");
+        ensure_manual_finalize_finished_audit(
+            index,
+            &fixture.audit_dir,
+            &fixture.audit_append_lock,
+            tape_uuid,
+            finalization,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = index;
+        unreachable!("production terminal authority is typed")
+    }
 }
 
 pub(super) fn record_manual_finalize_request(
@@ -2621,16 +2853,59 @@ pub(super) fn record_manual_finalize_request(
     request: &ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
     let cfg = &cfg.terminal_config();
-    record_manual_finalize_request_with(
-        index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
-        request,
-    )
+    record_manual_finalize_request_with(index, &cfg.authority, request)
 }
 
 pub(super) fn record_manual_finalize_request_with(
+    index: &mut CatalogIndex,
+    authority: &TerminalAuthority,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    if let Some(runtime) = authority.runtime() {
+        let accepted = runtime
+            .manual_acceptance(*request.candidate_operation_id.as_bytes())
+            .map_err(|e| Status::failed_precondition(format!("manual acceptance lookup: {e}")))?
+            .ok_or_else(|| {
+                Status::failed_precondition("manual finalization has no typed acceptance")
+            })?;
+        if accepted.status
+            != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+            || accepted.value.at.tape.uuid != request.tape_uuid
+            || accepted.value.request_fingerprint != request.request_fingerprint
+            || accepted.value.actor_fingerprint.as_str() != request.actor_fingerprint
+            || accepted.value.idempotency_key != *request.idempotency_key.as_bytes()
+            || accepted.value.assignment_generation != request.assignment_generation
+        {
+            return Err(Status::failed_precondition(
+                "manual acceptance is archived, pending or differs from request",
+            ));
+        }
+        return runtime
+            .catch_up()
+            .map_err(|e| Status::internal(e.to_string()));
+    }
+    #[cfg(test)]
+    {
+        let fixture = authority
+            .historical_fixture()
+            .expect("historical fixture variant");
+        record_manual_finalize_request_fixture(
+            index,
+            &fixture.audit_dir,
+            fixture.audit_fsync,
+            &fixture.audit_append_lock,
+            request,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = index;
+        unreachable!("production terminal authority is typed")
+    }
+}
+
+#[cfg(test)]
+pub(super) fn record_manual_finalize_request_fixture(
     index: &mut CatalogIndex,
     audit_dir: &Path,
     _audit_fsync: bool,
@@ -2751,16 +3026,18 @@ pub(super) fn record_terminal_finalize_event(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
-    event: AuditEvent,
+    event: remanence_state::library_log::OperationEvent,
+    legacy_event: AuditEvent,
     progress: remanence_state::TerminalFinalizationProgress,
     detail_text: Option<(&str, String)>,
 ) -> Result<(), Status> {
     let cfg = &cfg.terminal_config();
     record_terminal_finalize_event_with(
         index,
-        TerminalFinalizeAuditConfig::from(cfg),
+        TerminalAuthority::from(cfg),
         manual_request,
         event,
+        legacy_event,
         progress,
         detail_text,
     )
@@ -2768,23 +3045,76 @@ pub(super) fn record_terminal_finalize_event(
 
 pub(super) fn record_terminal_finalize_event_with(
     index: &mut CatalogIndex,
-    audit: TerminalFinalizeAuditConfig<'_>,
+    audit: TerminalAuthority,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
-    event: AuditEvent,
+    event: remanence_state::library_log::OperationEvent,
+    legacy_event: AuditEvent,
     progress: remanence_state::TerminalFinalizationProgress,
     detail_text: Option<(&str, String)>,
 ) -> Result<(), Status> {
     let Some(request) = manual_request else {
         return Ok(());
     };
-    record_manual_finalize_event_with(index, audit, request, event, progress, detail_text)
+    record_manual_finalize_event_with(
+        index,
+        audit,
+        request,
+        event,
+        legacy_event,
+        progress,
+        detail_text,
+    )
 }
 
 pub(super) fn record_manual_finalize_event_with(
     index: &mut CatalogIndex,
-    audit: TerminalFinalizeAuditConfig<'_>,
+    audit: TerminalAuthority,
     request: &ManualFinalizeTapeActorRequest,
-    event: AuditEvent,
+    event: remanence_state::library_log::OperationEvent,
+    legacy_event: AuditEvent,
+    progress: remanence_state::TerminalFinalizationProgress,
+    detail_text: Option<(&str, String)>,
+) -> Result<(), Status> {
+    if let Some(runtime) = audit.runtime() {
+        use remanence_state::library_log as lib;
+        return runtime
+            .record_operation_event(
+                *request.candidate_operation_id.as_bytes(),
+                lib::OperationKind::FinalizeTape,
+                event,
+                AuditActor::System,
+            )
+            .map_err(|e| {
+                Status::failed_precondition(format!("terminal operation authority: {e}"))
+            });
+    }
+    #[cfg(test)]
+    {
+        let fixture = audit
+            .historical_fixture()
+            .expect("historical fixture variant");
+        record_manual_finalize_event_fixture(
+            index,
+            fixture,
+            request,
+            legacy_event,
+            progress,
+            detail_text,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (index, legacy_event, progress, detail_text);
+        unreachable!("production terminal authority is typed")
+    }
+}
+
+#[cfg(test)]
+fn record_manual_finalize_event_fixture(
+    index: &mut CatalogIndex,
+    audit: &super::terminal_types::FixtureTerminalAudit,
+    request: &ManualFinalizeTapeActorRequest,
+    legacy_event: AuditEvent,
     progress: remanence_state::TerminalFinalizationProgress,
     detail_text: Option<(&str, String)>,
 ) -> Result<(), Status> {
@@ -2807,14 +3137,14 @@ pub(super) fn record_manual_finalize_event_with(
     }
     append_operation_audit(
         index,
-        audit.audit_dir,
+        &audit.audit_dir,
         audit.audit_fsync,
-        audit.audit_append_lock,
+        &audit.audit_append_lock,
         OperationAuditInput {
             actor: AuditActor::System,
             operation_id: request.candidate_operation_id,
             operation_kind: FINALIZE_TAPE_OPERATION_KIND,
-            event,
+            event: legacy_event,
             subject_kind: "tape",
             subject_id: Some(Uuid::from_bytes(request.tape_uuid).to_string()),
             idempotency_key: Some(request.idempotency_key),
@@ -2823,6 +3153,7 @@ pub(super) fn record_manual_finalize_event_with(
     )
 }
 
+#[cfg(test)]
 const fn manual_finalize_progress_name(
     progress: remanence_state::TerminalFinalizationProgress,
 ) -> &'static str {
@@ -3089,6 +3420,9 @@ pub(super) fn terminal_tail_write_failure(
             index,
             cfg,
             manual_request,
+            remanence_state::library_log::OperationEvent::CompletionUnknown(
+                remanence_state::library_log::Unit,
+            ),
             AuditEvent::CompletionUnknown,
             intent.progress,
             Some(("recovery_detail", detail)),
@@ -3125,3 +3459,9 @@ pub(crate) fn set_manual_preflight_hook(after_intent: bool, hook: impl FnOnce() 
 #[cfg(test)]
 #[path = "terminal_finalize_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+use remanence_state::{
+    AuditEventRecord, AuditSubject, FileAuditLog, ManualTerminalFinalizationAcceptanceInput,
+    SourceLayer,
+};

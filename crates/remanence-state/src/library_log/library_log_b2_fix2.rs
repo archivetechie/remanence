@@ -2,11 +2,11 @@
 use crate::library_log::{fold::*, store::Receipt, *};
 struct Present;
 impl TapeView for Present {
-    fn lookup(&self, a: &TapeAt) -> TapeLookup {
-        TapeLookup::Present {
+    fn lookup(&self, a: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok(TapeLookup::Present {
             kind: crate::tape_log::Tag::FinalizationPrepared,
             digest: a.record_digest,
-        }
+        })
     }
 }
 struct NoHistory;
@@ -120,9 +120,9 @@ fn n1_supersede_lookup_survives_operation_terminal() {
             sequence: 9,
             record_digest: [5; 32],
         },
-        operation: [7; 16],
-        session_id: [3; 16],
-        preview_digest: [0; 32],
+        operation: Some([7; 16]),
+        session_id: Some([3; 16]),
+        preview_digest: Some([0; 32]),
         tail_file_count: 1,
     };
     feed(&mut f, Body::SupersedeTail(st.clone())).unwrap(); // 3
@@ -140,7 +140,7 @@ fn n1_supersede_lookup_survives_operation_terminal() {
     );
     assert!(matches!(again, Ok(Validated::Duplicate(receipt)) if receipt.sequence == 3));
     let mut conflict = st;
-    conflict.operation = [8; 16];
+    conflict.operation = Some([8; 16]);
     assert_eq!(
         feed(&mut f, Body::SupersedeTail(conflict)).unwrap_err(),
         FoldError::ConflictingDuplicate
@@ -201,17 +201,17 @@ mod live_fences {
     use crate::library_log::{fold::*, store::Receipt, *};
     struct Present;
     impl TapeView for Present {
-        fn lookup(&self, a: &TapeAt) -> TapeLookup {
-            TapeLookup::Present {
+        fn lookup(&self, a: &TapeAt) -> Result<TapeLookup, FoldError> {
+            Ok(TapeLookup::Present {
                 kind: crate::tape_log::Tag::FinalizationPrepared,
                 digest: a.record_digest,
-            }
+            })
         }
     }
     struct NotYetView;
     impl TapeView for NotYetView {
-        fn lookup(&self, _: &TapeAt) -> TapeLookup {
-            TapeLookup::NotYet
+        fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+            Ok(TapeLookup::NotYet)
         }
     }
     struct NoHistory;
@@ -304,9 +304,9 @@ mod live_fences {
                     sequence: 9,
                     record_digest: [5; 32],
                 },
-                operation: [3; 16],
-                session_id: [3; 16],
-                preview_digest: [0; 32],
+                operation: Some([3; 16]),
+                session_id: Some([3; 16]),
+                preview_digest: Some([0; 32]),
                 tail_file_count: 1,
             }),
             Body::Retire(Retire {

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(test)]
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,8 +43,8 @@ pub(crate) struct ProjectedAuditInput<'a> {
 }
 
 /// Append one audit fact and immediately feed that exact record through the
-/// catalog projector. All API-side evidence writers share this funnel so live
-/// state and rebuild replay cannot drift through duplicated append logic.
+/// historical projector. Typed owners are refused before any filesystem write;
+/// their producers must publish explicit typed source inputs.
 pub(crate) fn append_and_project_audit(
     index: &mut CatalogIndex,
     audit_dir: &Path,
@@ -63,6 +64,13 @@ pub(crate) fn append_and_project_audit_locked(
     audit_fsync: bool,
     input: ProjectedAuditInput<'_>,
 ) -> Result<AuditRecord, Status> {
+    // Deferred legacy producers may refuse, but cannot contaminate a typed
+    // namespace. Required owners select explicit typed inputs at their source.
+    if index.library_runtime().is_some() {
+        return Err(Status::failed_precondition(
+            "this operation has not been migrated to the active authority format",
+        ));
+    }
     fs::create_dir_all(audit_dir).map_err(|err| {
         Status::internal(format!(
             "create audit directory {}: {err}",
@@ -101,6 +109,56 @@ pub(crate) fn append_and_project_audit_locked(
 /// in-process read-before-append decision. An already durable record is
 /// reprojected instead of duplicated, and a new completion record always
 /// forces fsync.
+/// Publish terminal Finished from exact typed acceptance and sealed native facts.
+pub(crate) fn ensure_manual_finalize_finished_authority(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    tape_uuid: [u8; 16],
+    finalization: &remanence_state::authority::AuthorityFinalization,
+) -> Result<(), Status> {
+    let Some(manual) = finalization.manual.as_ref() else {
+        return Ok(());
+    };
+    if finalization.tape_uuid != tape_uuid
+        || finalization.trigger != remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+        || finalization.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC
+        || finalization.recovery_required
+        || manual.operation_kind != FINALIZE_TAPE_OPERATION_KIND
+    {
+        return Err(Status::failed_precondition(
+            "sealed manual finalization has invalid completion audit authority",
+        ));
+    }
+    use remanence_state::library_log as lib;
+    let accepted = runtime
+        .manual_acceptance(manual.operation_id)
+        .map_err(|e| Status::failed_precondition(e.to_string()))?
+        .ok_or_else(|| {
+            Status::failed_precondition("sealed finalization has no typed acceptance")
+        })?;
+    if accepted.status
+        != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+        || accepted.value.at.tape.uuid != tape_uuid
+        || accepted.value.actor_fingerprint.as_str() != manual.actor_fingerprint
+        || accepted.value.idempotency_key != manual.idempotency_key
+        || accepted.value.request_fingerprint != manual.request_fingerprint
+        || accepted.value.assignment_generation != manual.assignment_generation
+    {
+        return Err(Status::failed_precondition(
+            "sealed finalization acceptance is unresolved or differs",
+        ));
+    }
+    runtime
+        .record_operation_event(
+            manual.operation_id,
+            lib::OperationKind::FinalizeTape,
+            lib::OperationEvent::Finished(lib::Response {
+                response_fingerprint: None,
+            }),
+            AuditActor::System,
+        )
+        .map_err(|e| Status::failed_precondition(format!("persist terminal completion: {e}")))
+}
+
 pub(crate) fn ensure_manual_finalize_finished_audit(
     index: &mut CatalogIndex,
     audit_dir: &Path,
@@ -121,177 +179,192 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
             "sealed manual finalization has invalid completion audit authority",
         ));
     }
-    let operation_id = Uuid::from_bytes(manual.operation_id);
-    let idempotency_key = Uuid::from_bytes(manual.idempotency_key);
-    let _guard = audit_append_lock
-        .lock()
-        .map_err(|_| Status::internal("audit append lock poisoned"))?;
-    fs::create_dir_all(audit_dir).map_err(|error| {
-        Status::internal(format!(
-            "create audit directory {}: {error}",
-            audit_dir.display()
-        ))
-    })?;
-
-    let scope = index
-        .idempotency_scope_record(
-            manual.actor_fingerprint.as_str(),
-            FINALIZE_TAPE_OPERATION_KIND,
-            idempotency_key,
-        )
-        .map_err(status_from_state_error)?
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                "sealed manual finalization has no projected idempotency binding",
-            )
-        })?;
-    if scope.operation_id != operation_id
-        || scope.request_fingerprint.as_slice() != manual.request_fingerprint
+    if let Some(runtime) = index.library_runtime() {
+        return ensure_manual_finalize_finished_authority(&runtime, tape_uuid, finalization);
+    }
+    #[cfg(not(test))]
     {
-        return Err(Status::failed_precondition(
-            "sealed manual finalization differs from its idempotency binding",
-        ));
+        let _ = (audit_dir, audit_append_lock);
+        Err(Status::failed_precondition(
+            "terminal completion requires shared LibraryAuthority",
+        ))
     }
+    #[cfg(test)]
+    {
+        let operation_id = Uuid::from_bytes(manual.operation_id);
+        let idempotency_key = Uuid::from_bytes(manual.idempotency_key);
+        let _guard = audit_append_lock
+            .lock()
+            .map_err(|_| Status::internal("audit append lock poisoned"))?;
+        fs::create_dir_all(audit_dir).map_err(|error| {
+            Status::internal(format!(
+                "create audit directory {}: {error}",
+                audit_dir.display()
+            ))
+        })?;
 
-    let mut durable = None;
-    let mut durable_count = 0usize;
-    let mut conflict = None;
-    let mut incompatible_terminal = None;
-    let mut failed_attempt = false;
-    let mut latest_completion_unknown_sequence = None;
-    FileAuditLog::replay_incremental(audit_dir, |record| {
-        if record.operation_id != Some(operation_id) {
-            return ControlFlow::Continue(());
-        }
-        match &record.event {
-            AuditEvent::OperationFinished => {
-                if manual_finalize_finished_audit_matches(
-                    &record,
-                    tape_uuid,
-                    idempotency_key,
-                    manual,
-                ) {
-                    durable_count += 1;
-                    durable.get_or_insert(record);
-                } else {
-                    conflict.get_or_insert(record);
-                }
-            }
-            AuditEvent::CompletionUnknown => {
-                if manual_finalize_completion_unknown_audit_matches(
-                    &record,
-                    tape_uuid,
-                    idempotency_key,
-                    manual,
-                ) {
-                    latest_completion_unknown_sequence = Some(record.sequence);
-                } else {
-                    incompatible_terminal.get_or_insert(record);
-                }
-            }
-            AuditEvent::OperationFailed
-                if manual_finalize_audit_identity_matches(
-                    &record,
-                    tape_uuid,
-                    idempotency_key,
-                    manual,
-                ) && matches!(
-                    record.detail.get("finalize_attempt"),
-                    Some(CborValue::Bool(true))
-                ) =>
-            {
-                failed_attempt = true;
-            }
-            AuditEvent::OperationFailed
-            | AuditEvent::CancelledBeforeDispatch
-            | AuditEvent::CompletedAfterCancel => {
-                incompatible_terminal.get_or_insert(record);
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    })
-    .map_err(status_from_state_error)?;
-    if let Some(record) = incompatible_terminal {
-        return Err(Status::failed_precondition(format!(
-            "operation {operation_id} has incompatible durable terminal audit record {} ({:?})",
-            record.record_uuid, record.event
-        )));
-    }
-    if let Some(record) = conflict {
-        return Err(Status::failed_precondition(format!(
-            "operation {} has conflicting durable OperationFinished audit record {}",
-            operation_id, record.record_uuid
-        )));
-    }
-    if durable_count > 1 {
-        return Err(Status::failed_precondition(format!(
-            "operation {operation_id} has {durable_count} durable OperationFinished audit records"
-        )));
-    }
-    if let Some(record) = durable {
-        if latest_completion_unknown_sequence.is_some_and(|sequence| sequence > record.sequence) {
-            return Err(Status::failed_precondition(format!(
-                "operation {operation_id} has CompletionUnknown authority after its durable OperationFinished record"
-            )));
-        }
-        index
-            .project_audit_record(&record)
-            .map_err(status_from_state_error)?;
-        return Ok(());
-    }
-
-    match scope.terminal_state.as_deref() {
-        None | Some("completion_unknown") => {}
-        Some("failed") if failed_attempt => {}
-        Some("finished") => {
+        let scope = index
+            .idempotency_scope_record(
+                manual.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                idempotency_key,
+            )
+            .map_err(status_from_state_error)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "sealed manual finalization has no projected idempotency binding",
+                )
+            })?;
+        if scope.operation_id != operation_id
+            || scope.request_fingerprint.as_slice() != manual.request_fingerprint
+        {
             return Err(Status::failed_precondition(
-                "manual finalization is projected finished without its durable completion audit",
+                "sealed manual finalization differs from its idempotency binding",
             ));
         }
-        Some(state) => {
+
+        let mut durable = None;
+        let mut durable_count = 0usize;
+        let mut conflict = None;
+        let mut incompatible_terminal = None;
+        let mut failed_attempt = false;
+        let mut latest_completion_unknown_sequence = None;
+        FileAuditLog::replay_incremental(audit_dir, |record| {
+            if record.operation_id != Some(operation_id) {
+                return ControlFlow::Continue(());
+            }
+            match &record.event {
+                AuditEvent::OperationFinished => {
+                    if manual_finalize_finished_audit_matches(
+                        &record,
+                        tape_uuid,
+                        idempotency_key,
+                        manual,
+                    ) {
+                        durable_count += 1;
+                        durable.get_or_insert(record);
+                    } else {
+                        conflict.get_or_insert(record);
+                    }
+                }
+                AuditEvent::CompletionUnknown => {
+                    if manual_finalize_completion_unknown_audit_matches(
+                        &record,
+                        tape_uuid,
+                        idempotency_key,
+                        manual,
+                    ) {
+                        latest_completion_unknown_sequence = Some(record.sequence);
+                    } else {
+                        incompatible_terminal.get_or_insert(record);
+                    }
+                }
+                AuditEvent::OperationFailed
+                    if manual_finalize_audit_identity_matches(
+                        &record,
+                        tape_uuid,
+                        idempotency_key,
+                        manual,
+                    ) && matches!(
+                        record.detail.get("finalize_attempt"),
+                        Some(CborValue::Bool(true))
+                    ) =>
+                {
+                    failed_attempt = true;
+                }
+                AuditEvent::OperationFailed
+                | AuditEvent::CancelledBeforeDispatch
+                | AuditEvent::CompletedAfterCancel => {
+                    incompatible_terminal.get_or_insert(record);
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        })
+        .map_err(status_from_state_error)?;
+        if let Some(record) = incompatible_terminal {
             return Err(Status::failed_precondition(format!(
-                "manual finalization has incompatible projected terminal state {state:?}"
+                "operation {operation_id} has incompatible durable terminal audit record {} ({:?})",
+                record.record_uuid, record.event
             )));
         }
-    }
+        if let Some(record) = conflict {
+            return Err(Status::failed_precondition(format!(
+                "operation {} has conflicting durable OperationFinished audit record {}",
+                operation_id, record.record_uuid
+            )));
+        }
+        if durable_count > 1 {
+            return Err(Status::failed_precondition(format!(
+            "operation {operation_id} has {durable_count} durable OperationFinished audit records"
+        )));
+        }
+        if let Some(record) = durable {
+            if latest_completion_unknown_sequence.is_some_and(|sequence| sequence > record.sequence)
+            {
+                return Err(Status::failed_precondition(format!(
+                "operation {operation_id} has CompletionUnknown authority after its durable OperationFinished record"
+            )));
+            }
+            index
+                .project_audit_record(&record)
+                .map_err(status_from_state_error)?;
+            return Ok(());
+        }
 
-    append_and_project_audit_locked(
-        index,
-        audit_dir,
-        true,
-        ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: Some(operation_id),
-            session_id: None,
-            idempotency_key: Some(idempotency_key),
-            event: AuditEvent::OperationFinished,
-            subject_kind: "tape",
-            subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
-            detail: BTreeMap::from([
-                (
-                    "tape_uuid".to_string(),
-                    CborValue::Bytes(tape_uuid.to_vec()),
-                ),
-                (
-                    "actor_fingerprint".to_string(),
-                    CborValue::Text(manual.actor_fingerprint.clone()),
-                ),
-                (
-                    "finalization_progress".to_string(),
-                    CborValue::Text("after_replica_c".to_string()),
-                ),
-                (
-                    "operation_kind".to_string(),
-                    CborValue::Text(FINALIZE_TAPE_OPERATION_KIND.to_string()),
-                ),
-            ]),
-        },
-    )?;
-    Ok(())
+        match scope.terminal_state.as_deref() {
+            None | Some("completion_unknown") => {}
+            Some("failed") if failed_attempt => {}
+            Some("finished") => {
+                return Err(Status::failed_precondition(
+                "manual finalization is projected finished without its durable completion audit",
+            ));
+            }
+            Some(state) => {
+                return Err(Status::failed_precondition(format!(
+                    "manual finalization has incompatible projected terminal state {state:?}"
+                )));
+            }
+        }
+
+        append_and_project_audit_locked(
+            index,
+            audit_dir,
+            true,
+            ProjectedAuditInput {
+                actor: AuditActor::System,
+                source_layer: SourceLayer::Layer5,
+                operation_id: Some(operation_id),
+                session_id: None,
+                idempotency_key: Some(idempotency_key),
+                event: AuditEvent::OperationFinished,
+                subject_kind: "tape",
+                subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
+                detail: BTreeMap::from([
+                    (
+                        "tape_uuid".to_string(),
+                        CborValue::Bytes(tape_uuid.to_vec()),
+                    ),
+                    (
+                        "actor_fingerprint".to_string(),
+                        CborValue::Text(manual.actor_fingerprint.clone()),
+                    ),
+                    (
+                        "finalization_progress".to_string(),
+                        CborValue::Text("after_replica_c".to_string()),
+                    ),
+                    (
+                        "operation_kind".to_string(),
+                        CborValue::Text(FINALIZE_TAPE_OPERATION_KIND.to_string()),
+                    ),
+                ]),
+            },
+        )?;
+        Ok(())
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn manual_finalize_finished_audit_matches(
     record: &AuditRecord,
     tape_uuid: [u8; 16],
@@ -306,6 +379,7 @@ pub(crate) fn manual_finalize_finished_audit_matches(
         )
 }
 
+#[cfg(test)]
 pub(crate) fn manual_finalize_completion_unknown_audit_matches(
     record: &AuditRecord,
     tape_uuid: [u8; 16],
@@ -333,6 +407,7 @@ pub(crate) fn manual_finalize_completion_unknown_audit_matches(
         )
 }
 
+#[cfg(test)]
 pub(crate) fn manual_finalize_audit_identity_matches(
     record: &AuditRecord,
     tape_uuid: [u8; 16],
@@ -358,6 +433,7 @@ pub(crate) fn manual_finalize_audit_identity_matches(
         )
 }
 
+#[cfg(test)]
 pub(crate) fn audit_subject_matches_tape(record: &AuditRecord, tape_uuid: [u8; 16]) -> bool {
     record.subject.kind == "tape"
         && record.subject.id.as_deref().is_some_and(|value| {

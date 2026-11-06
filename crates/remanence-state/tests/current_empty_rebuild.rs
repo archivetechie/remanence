@@ -95,8 +95,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         id: Option<String>,
         detail: BTreeMap<String, Value>,
     ) {
-        self.state()
-            .audit()
+        FileAuditLog::open(&self.state().paths().audit_dir, true)
+            .unwrap()
             .append(AuditEventRecord {
                 actor: AuditActor::System,
                 source_layer: SourceLayer::Layer4,
@@ -228,6 +228,7 @@ fn current_empty_rebuild_readiness_operation_and_load_budget_lost() {
             barcode: Some("B1001L9".into()),
             source_slot: None,
             media_generation: Some(9),
+            media_family: None,
             phase: "load".into(),
             state: "planned".into(),
             dirty_scope: Some("drive+tape".into()),
@@ -238,6 +239,7 @@ fn current_empty_rebuild_readiness_operation_and_load_budget_lost() {
     for _ in 0..2 {
         s.index()
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id,
                 phase: Some("load".into()),
                 state: "pre_ready_loading".into(),
@@ -513,8 +515,8 @@ fn current_empty_rebuild_audited_idempotency_and_operation_kept() {
     let key = Uuid::new_v4();
     let operation = Uuid::new_v4();
     for event in [AuditEvent::RequestReceived, AuditEvent::OperationFinished] {
-        s.state()
-            .audit()
+        FileAuditLog::open(&s.state().paths().audit_dir, true)
+            .unwrap()
             .append(AuditEventRecord {
                 actor: AuditActor::System,
                 source_layer: SourceLayer::Layer5,

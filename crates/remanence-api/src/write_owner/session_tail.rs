@@ -3,7 +3,7 @@
 //! SessionEnded makes it durable; a process crash still uses the crash suffix row.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
 use remanence_library::transport::TransferOutcome;
@@ -171,6 +171,13 @@ impl SessionTail {
             hash.update(&block[..n]);
         }
         Ok(hash.finalize().into())
+    }
+
+    /// Exact native suffix row count after flushing the current observation.
+    pub(crate) fn file_count(&self) -> std::io::Result<u64> {
+        let mut evidence = self.0.lock().expect("session tail lock");
+        evidence.flush_current()?;
+        Ok(evidence.count)
     }
 
     /// Freeze a streaming reader after detaching the observer from the drive.
@@ -394,29 +401,7 @@ impl Iterator for TailFiles {
 }
 
 fn write_file(w: &mut File, f: &TailFile) -> std::io::Result<()> {
-    for n in [f.tape_file_number, f.known_blocks, f.unknown_blocks] {
-        w.write_all(&n.to_le_bytes())?;
-    }
-    w.write_all(&[match f.filemark {
-        TailFilemark::Present => 0,
-        TailFilemark::Absent => 1,
-        TailFilemark::Unknown => 2,
-    }])?;
-    match &f.identity {
-        TailIdentity::Object(id) => {
-            w.write_all(&[0])?;
-            w.write_all(&(id.len() as u32).to_le_bytes())?;
-            w.write_all(id.as_bytes())
-        }
-        TailIdentity::Sidecar(hash) => {
-            w.write_all(&[1])?;
-            w.write_all(hash)
-        }
-        TailIdentity::TornPrefix(hash) => {
-            w.write_all(&[2])?;
-            w.write_all(hash)
-        }
-    }
+    remanence_state::library_log::session_ack::write_preview_file(w, f)
 }
 
 fn read_file(r: &mut File) -> std::io::Result<TailFile> {

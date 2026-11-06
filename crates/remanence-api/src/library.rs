@@ -522,18 +522,21 @@ impl LibraryServiceApi {
             pool.release_library(&library_serial);
             return Err(err);
         }
-        let operation_id = Uuid::new_v4();
-        pool.set_library_holder(&library_serial, operation_kind, operation_id);
-        if let Err(err) = self.state.record_library_request_received(
+        let operation_id = match self.state.accept_owner_request(
             actor,
-            operation_id,
             operation_kind,
-            &library_serial,
-            detail,
+            "library",
+            library_serial.clone(),
+            crate::operation_source::robotics_fingerprint(&library_serial, &action),
         ) {
-            pool.release_library(&library_serial);
-            return Err(err);
-        }
+            Ok(id) => id,
+            Err(error) => {
+                pool.release_library(&library_serial);
+                return Err(error);
+            }
+        };
+        pool.set_library_holder(&library_serial, operation_kind, operation_id);
+        let _ = detail;
         let mut handle = self.state.operations.register(operation_id, operation_kind);
         if matches!(
             action,
@@ -662,25 +665,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         }
         let state = self.state.clone();
         let record = tokio::task::spawn_blocking(move || {
-            let _guard = state
-                .audit_append_lock
-                .lock()
-                .map_err(|_| Status::internal("audit append lock poisoned"))?;
-            remanence_state::fence::release(
-                &mut {
-                    let mut index = state.catalog.write_handle();
-                    if let Some(pool) = &state.drive_pool {
-                        index.set_readiness_observer(pool.readiness_wake.clone());
-                    }
-                    index
-                },
-                &state.audit_dir,
-                &request.quarantine_id,
-                &request.acknowledgment,
-                actor,
-            )
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("tape-I/O fence not found"))
+            let runtime = state.catalog.library_runtime().ok_or_else(|| {
+                Status::failed_precondition("fence release requires shared LibraryAuthority")
+            })?;
+            runtime
+                .release_tape_fence(&request.quarantine_id, &request.acknowledgment, actor)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?
+                .ok_or_else(|| Status::not_found("tape-I/O fence not found"))
         })
         .await
         .map_err(|error| Status::internal(error.to_string()))??;
@@ -2724,6 +2715,7 @@ mod tests {
             barcode: Some("S30002L9".to_string()),
             source_slot: Some(0x040a),
             media_generation: Some(9),
+            media_family: None,
             phase: "session_open_short_probe".to_string(),
             state: "becoming_ready".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
@@ -3020,6 +3012,7 @@ mod tests {
             barcode: Some("S30002L9".into()),
             source_slot: Some(0x040a),
             media_generation: Some(9),
+            media_family: None,
             phase: "session_open_short_probe".into(),
             state: state_name.into(),
             dirty_scope: Some("drive+tape".into()),
@@ -3781,8 +3774,11 @@ mod tests {
             .unwrap();
         for _ in 0..4 {
             let (reply, _) = tokio::sync::oneshot::channel();
-            tx.try_send(crate::write_owner::DriveCommand::Unload { reply })
-                .unwrap();
+            tx.try_send(crate::write_owner::DriveCommand::Unload {
+                reply,
+                continuation_return: false,
+            })
+            .unwrap();
         }
         assert!(state
             .start_readiness_wait(id, 9000, 30, "daemon", "session_open")

@@ -332,7 +332,7 @@ fn check_closeout_route_case(
             assert!(index.get_tape(&selected.tape_uuid).is_err());
         }
         if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
-            std::fs::write(&cfg.audit_dir, b"not an audit directory").unwrap();
+            std::fs::write(&cfg.fixture_audit().audit_dir, b"not an audit directory").unwrap();
         }
         let result = if terminal {
             let mut permit = None;
@@ -415,7 +415,9 @@ fn check_closeout_route_case(
                 );
                 assert!(status.message().contains("create audit dir"), "{status}");
                 assert!(
-                    status.message().contains(cfg.audit_dir.to_str().unwrap()),
+                    status
+                        .message()
+                        .contains(cfg.fixture_audit().audit_dir.to_str().unwrap()),
                     "{status}"
                 );
             }

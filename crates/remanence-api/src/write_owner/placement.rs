@@ -59,6 +59,11 @@ impl super::WriteOwnerConfig {
         }
     }
     pub(super) fn mounted_audit_ready(&self) -> Result<(), Status> {
+        if let Some(library) = self.authority.runtime() {
+            library
+                .ensure_motion_allowed()
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
         if let Some(mounted) = self.mounted() {
             if let Some(error) = mounted
                 .audit_error
@@ -76,6 +81,19 @@ impl super::WriteOwnerConfig {
         index: &CatalogIndex,
         drive: &DriveHandle,
     ) -> Result<(), Status> {
+        self.mounted_admission_inner(index, drive, false)
+    }
+    fn mounted_admission_inner(
+        &self,
+        index: &CatalogIndex,
+        drive: &DriveHandle,
+        recovering_tail: bool,
+    ) -> Result<(), Status> {
+        if let Some(library) = self.authority.runtime() {
+            library
+                .ensure_motion_allowed()
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
         self.mounted_audit_ready()?;
         let mounted = self.mounted().expect("mounted readiness capability");
         if drive.endpoint().durable_key() != Some(&mounted.endpoint)
@@ -93,9 +111,48 @@ impl super::WriteOwnerConfig {
             )
             .map_err(crate::status_from_state_error)?
         {
-            return Err(Status::failed_precondition(
-                "session blocked by active tape-I/O fence",
-            ));
+            use remanence_state::library_log as lib;
+            let allowed = if recovering_tail {
+                if let Some(library) = self.authority.runtime() {
+                    let mut fences = index
+                        .tape_io_admission_conflicts(&mounted.tape_uuid, mounted.barcode.as_deref())
+                        .map_err(crate::status_from_state_error)?;
+                    fences.extend(
+                        index
+                            .list_active_tape_io_fences()
+                            .map_err(crate::status_from_state_error)?
+                            .into_iter()
+                            .filter(|f| f.endpoint.as_ref() == Some(&mounted.endpoint)),
+                    );
+                    !fences.is_empty()
+                        && fences.into_iter().all(|fence| {
+                            fence
+                                .quarantine_id
+                                .strip_prefix("library:")
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .and_then(|n| library.active_fence(n))
+                                .is_some_and(|raise| {
+                                    raise.scope
+                                        == lib::FenceScope::Tape(lib::TapeRef {
+                                            uuid: mounted.tape_uuid,
+                                            incarnation: 1,
+                                        })
+                                        && raise.kind == lib::FenceKind::Write
+                                        && raise.cause
+                                            == lib::FenceCause::SessionSuffixContradiction
+                                })
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !allowed {
+                return Err(Status::failed_precondition(
+                    "session blocked by active tape-I/O fence",
+                ));
+            }
         }
         if !index
             .media_readiness_admission_conflicts(
@@ -118,7 +175,23 @@ impl super::WriteOwnerConfig {
         index: &CatalogIndex,
         drive: &mut DriveHandle,
     ) -> Result<(), Status> {
-        self.mounted_admission(index, drive)?;
+        self.mounted_ready_inner(index, drive, false)
+    }
+    /// Recovery preserves every admission gate except its exact suffix raises.
+    pub(super) fn mounted_recovery_ready(
+        &self,
+        index: &CatalogIndex,
+        drive: &mut DriveHandle,
+    ) -> Result<(), Status> {
+        self.mounted_ready_inner(index, drive, true)
+    }
+    fn mounted_ready_inner(
+        &self,
+        index: &CatalogIndex,
+        drive: &mut DriveHandle,
+        recovering_tail: bool,
+    ) -> Result<(), Status> {
+        self.mounted_admission_inner(index, drive, recovering_tail)?;
         let mounted = self.mounted().expect("mounted readiness capability");
         // An operator placement cannot authorize LOAD or a library readiness projection.
         let first = drive.probe_media_readiness(MediaFamily::Unknown);

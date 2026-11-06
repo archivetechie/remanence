@@ -202,6 +202,8 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<(), Status>>,
     },
     Unload {
+        /// Healthy continuation LOAD refusal returns an already moved cartridge.
+        continuation_return: bool,
         reply: oneshot::Sender<Result<DriveUnloadOutcome, Status>>,
     },
     PollHealth {

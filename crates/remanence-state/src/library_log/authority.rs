@@ -22,6 +22,9 @@ pub trait FinalizationView {
 /// Writer refusal; a pending failure names the durable entry requiring repair.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorityError {
+    /// Runtime admission found an open or Unknown physical motion in this scope.
+    #[error("motion scope requires physical reconciliation before another command")]
+    MotionReconciliationRequired,
     /// Resolve applied this prefix before refusing the candidate or a later pending record.
     /// Callers must project these records in order before reporting the refusal.
     #[error("{error}")]
@@ -143,9 +146,34 @@ impl LibraryAuthority {
             ))
             .into());
         }
+        Self::open_bound(
+            directory.as_path(),
+            log_uuid,
+            origin,
+            clock,
+            uuids,
+            diagnostic_fsync,
+            view,
+            state_lock,
+        )
+    }
+
+    /// Open canonical configured roots already validated by the state manifest.
+    /// Kept crate-private so arbitrary callers cannot bypass the lease binding.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_bound(
+        directory: &Path,
+        log_uuid: Id,
+        origin: Origin,
+        clock: Box<dyn Clock>,
+        uuids: Box<dyn UuidSource>,
+        diagnostic_fsync: bool,
+        view: &dyn TapeView,
+        state_lock: Arc<StateLockGuard>,
+    ) -> Result<Self, AuthorityError> {
         Ok(Self {
             log: Mutex::new(LibraryLog::open(
-                &directory,
+                directory,
                 log_uuid,
                 origin,
                 clock,
@@ -157,6 +185,29 @@ impl LibraryAuthority {
         })
     }
 
+    /// Current typed identity from the fold; this never consults SQL.
+    pub fn tape_state(&self, uuid: Id) -> Option<fold::TapeState> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .tapes
+            .get(&uuid)
+            .cloned()
+    }
+
+    /// Return exact typed raises for operator recovery; no SQL reason parsing.
+    pub fn active_fence(&self, sequence: u64) -> Option<FenceRaised> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .active_fence(sequence)
+            .cloned()
+    }
+
     fn write(
         &self,
         body: Body,
@@ -164,6 +215,19 @@ impl LibraryAuthority {
         layer: SourceLayer,
         view: &dyn TapeView,
         finalization: Option<(&dyn FinalizationView, Vec<TapeRef>)>,
+    ) -> Result<AuthorityReceipt, AuthorityError> {
+        self.write_with_readiness_owner(body, actor, layer, view, finalization, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_with_readiness_owner(
+        &self,
+        body: Body,
+        actor: AuditActor,
+        layer: SourceLayer,
+        view: &dyn TapeView,
+        finalization: Option<(&dyn FinalizationView, Vec<TapeRef>)>,
+        require_readiness_owner: bool,
     ) -> Result<AuthorityReceipt, AuthorityError> {
         let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((summary, tapes)) = &finalization {
@@ -174,6 +238,21 @@ impl LibraryAuthority {
                 }
             }
         }
+        // Confirmation is a writer duty, not a new replay-fold rule. Inspect
+        // durable history under append ownership; report any refusal only after
+        // pending resolution so its already-applied prefix is still forwarded.
+        let confirmation = if let Body::MotionOutcome(outcome) = &body {
+            outcome.confirmation.as_ref().map(|confirmation| {
+                let (sequence, expected) = match confirmation {
+                    Confirmation::Inventory(sequence) => (*sequence, Tag::InventoryReconciled),
+                    Confirmation::Readiness(sequence) => (*sequence, Tag::ReadinessObserved),
+                };
+                log.lookup_application(sequence)
+                    .map(|record| record.is_some_and(|(record, _)| record.body.tag() == expected))
+            })
+        } else {
+            None
+        };
         let mut sequences = Vec::new();
         let result = log
             .append_checked(
@@ -183,6 +262,22 @@ impl LibraryAuthority {
                 view,
                 &mut |n| sequences.push(n),
                 &|fold, body| {
+                    if require_readiness_owner {
+                        let Body::ReadinessObserved(readiness) = body else {
+                            return Err(FoldError::WrongCounterpart.into());
+                        };
+                        if !matches!(
+                            fold.open_operation_kind(readiness.operation),
+                            Some(OperationKind::LoadDrive | OperationKind::MediaReadinessWait)
+                        ) {
+                            return Err(FoldError::WrongCounterpart.into());
+                        }
+                    }
+                    if let Some(confirmation) = &confirmation {
+                        if !confirmation.clone()? {
+                            return Err(FoldError::Confirmation.into());
+                        }
+                    }
                     // Resolve may change the assignment. Check occupancy against
                     // the resolved state while the append/admission lock still holds.
                     if let (Body::AssignPool(assignment), Some((summary, _))) =
@@ -513,6 +608,93 @@ impl LibraryAuthority {
     ) -> Result<AuthorityReceipt, AuthorityError> {
         self.write(Body::FenceReleased(value), actor, layer, view, None)
     }
+    /// Current accepted configuration from authoritative replay.
+    pub fn configuration(&self) -> Option<ConfigurationAccepted> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .configuration()
+            .cloned()
+    }
+    /// Bounded active readiness lookup for the polling producer. Terminal
+    /// chains require a separate authenticated historical retry lookup.
+    pub(crate) fn active_readiness(
+        &self,
+        operation: Id,
+    ) -> Result<Option<(DecisionRef, ReadinessObserved)>, AuthorityError> {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        if log.state().refusal.is_some() || !log.state().fold.pending.is_empty() {
+            return Err(StoreError::Fold(FoldError::HistoryUnavailable).into());
+        }
+        Ok(log
+            .state()
+            .fold
+            .readiness_head(operation)
+            .map(|(r, v)| (r, v.clone())))
+    }
+    /// Existing chain and generation for a real readiness observation.
+    pub fn readiness_context(
+        &self,
+        operation: Id,
+        endpoint: &DriveKey,
+    ) -> Result<(Option<(DecisionRef, ReadinessObserved)>, u64), AuthorityError> {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let fold = &log.state().fold;
+        Ok((
+            fold.readiness_head(operation)
+                .map(|(source, value)| (source, value.clone())),
+            fold.next_readiness_generation(endpoint)
+                .map_err(StoreError::Fold)?,
+        ))
+    }
+    /// Actual per-operation LOAD budget from admitted intent records.
+    pub fn readiness_load_attempts(&self, operation: Id) -> Result<u32, AuthorityError> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .readiness_load_attempts(operation)
+            .map_err(|error| StoreError::Fold(error).into())
+    }
+    /// Runtime admission checks the exact CDB target's open/Unknown motion.
+    pub fn motion_requires_reconciliation(&self, motion: &Motion) -> bool {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .motion_requires_reconciliation(motion)
+    }
+    /// Read the next observation generation while runtime dispatch is serialized.
+    pub fn next_inventory_generation(
+        &self,
+        subject: &InventorySubject,
+    ) -> Result<u64, AuthorityError> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .next_inventory_generation(subject)
+            .map_err(|error| StoreError::Fold(error).into())
+    }
+    /// Read the next LOAD attempt while the runtime serializes producer dispatch.
+    pub fn next_load_attempt(
+        &self,
+        operation: Option<Id>,
+        endpoint: &DriveKey,
+    ) -> Result<u32, AuthorityError> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .next_load_attempt(operation, endpoint)
+            .map_err(|error| StoreError::Fold(error).into())
+    }
     /// Publish a typed MotionIntent; fold validation precedes any publication.
     pub fn motion_intent(
         &self,
@@ -605,6 +787,27 @@ impl LibraryAuthority {
         let operation = value.operation;
         let receipt = self.write(Body::ReadinessObserved(value), actor, layer, view, None)?;
         Ok((operation, receipt))
+    }
+    /// Begin readiness under an already writer-minted live operation. Owner
+    /// validation and append share the source lock, including pending resolution.
+    pub fn begin_readiness_for_operation(
+        &self,
+        value: ReadinessObserved,
+        actor: AuditActor,
+        layer: SourceLayer,
+        view: &dyn TapeView,
+    ) -> Result<AuthorityReceipt, AuthorityError> {
+        if value.previous.is_some() {
+            return Err(AuthorityError::OperationIdentityRequired);
+        }
+        self.write_with_readiness_owner(
+            Body::ReadinessObserved(value),
+            actor,
+            layer,
+            view,
+            None,
+            true,
+        )
     }
     /// Advance an existing readiness chain; initial observations use begin_readiness.
     pub fn readiness_observed(
@@ -699,6 +902,14 @@ pub struct LibrarySnapshot {
     _state_lock: Arc<StateLockGuard>,
 }
 impl LibrarySnapshot {
+    pub(crate) fn inspect(
+        &self,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(AppliedLibraryRecord) -> Result<(), StoreError>,
+        received: &mut dyn FnMut(&Record, &Receipt) -> Result<(), StoreError>,
+    ) -> Result<store::Replay, StoreError> {
+        self.source.inspect(view, applied, received)
+    }
     pub(crate) fn replay(
         &self,
         view: &dyn TapeView,

@@ -618,6 +618,9 @@ message GetLiveStatusResponse {
   repeated TapeIoFence active_tape_io_fences = 8;
   // All due tapes, including unavailable and unseated cartridges.
   repeated Tape closeout_debt = 9;
+  // Process-local authority, projection or evidence failure disables motion.
+  // This reports the sticky runtime latch; it is not a durable alarm.
+  ComponentHealth library_authority_health = 10;
 }
 
 message Slot {

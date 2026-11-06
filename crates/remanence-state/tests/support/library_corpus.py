@@ -57,9 +57,7 @@ def uint(value, bits):
         raise ValueError(f"expected unsigned {bits}-bit integer")
 
 
-def medium(value):
-    keys(value, 6)
-    family = value[0]
+def medium_family(family):
     if not (type(family) is list and len(family) == 2):
         raise ValueError("expected two-element medium family union")
     uint(family[0], 8)
@@ -70,13 +68,19 @@ def medium(value):
     else:
         if family != [1, None]:
             raise ValueError('invalid medium family')
+    return family[0]
+
+
+def medium(value):
+    keys(value, 6)
+    family_code = medium_family(value[0])
     uint(value[1], 64)
     uint(value[2], 32)
     if not (type(value[3]) is bool and type(value[4]) is bool):
         raise ValueError("medium capabilities must be booleans")
     if not (type(value[5]) is int and value[5] in (0, 1, 2)):
         raise ValueError("invalid medium source")
-    return family[0]
+    return family_code
 
 
 def main(root):
@@ -100,6 +104,17 @@ def main(root):
             raise ValueError("frame digest disagrees with manifest")
         keys(value, 2)
         body = value[1]
+        if code == 6:
+            keys(body, 5)
+            keys(body[0], 3)
+            for key, size in [(1, 16), (2, 16), (3, 32)]:
+                if body[key] is not None and not (type(body[key]) is bytes and len(body[key]) == size):
+                    raise ValueError("invalid optional supersede field")
+            uint(body[4], 64)
+            if body[0][1] == 0:
+                seen.add(("empty-prefix", True))
+                if body[2] is not None:
+                    raise ValueError("fresh corpus supersede must have no session")
         if code == 4:
             if tag != "Reprovision":
                 raise ValueError("Reprovision tag mismatch")
@@ -125,7 +140,7 @@ def main(root):
             if scope[0] not in (0, 1, 2):
                 raise ValueError("invalid fence scope")
             uint(body[2], 8)
-            if body[2] > 12:
+            if body[2] > 13:
                 raise ValueError("invalid fence cause")
             if scope[0] == 2:
                 keys(scope[1], 2)
@@ -134,8 +149,62 @@ def main(root):
                 seen.add(("reserved", "model"))
             if body[2] == 12:
                 seen.add(("reserved", "quarantine"))
-    required = {("family", 0), ("family", 1), ("tag", 5),
-                ("reserved", "model"), ("reserved", "quarantine")}
+        elif code == 12:
+            keys(body, 5)
+            subject = body[0]
+            if not (type(subject) is list and len(subject) == 2):
+                raise ValueError("invalid inventory subject")
+            if type(subject[0]) is not int or subject[0] not in (0, 1):
+                raise ValueError("invalid inventory subject code")
+            serial = subject[1]
+            if subject[0] == 1:
+                keys(serial, 1)
+                serial = serial[0]
+            if not (type(serial) is str and len(serial.encode()) <= 4096):
+                raise ValueError("invalid inventory subject serial")
+            uint(body[1], 64)
+            seen.add(("inventory-subject", subject[0]))
+        elif code == 17:
+            keys(body, 15)
+            if type(body[13]) is not int or body[13] not in (0, 1):
+                raise ValueError("invalid readiness scope")
+            seen.add(("readiness-scope", body[13]))
+            if body[14] is not None:
+                medium_family(body[14])
+                seen.add(("readiness-media", True))
+        elif code == 21:
+            keys(body, 5)
+            action, payload = body[4]
+            if type(action) is not int or action not in range(6):
+                raise ValueError("invalid cleaning action")
+            if action == 1:
+                keys(payload, 1)
+            elif action == 2:
+                keys(payload, 2)
+                if payload[1] is not None:
+                    uint(payload[1], 16)
+                # Shape-negative histories decode; the fold refuses their meaning.
+                if payload[0] == 2 and payload[1] is not None:
+                    seen.add(("cleaning-home", True))
+            elif action == 5:
+                keys(payload, 1)
+                seen.add(("cleaning-reject", True))
+        elif code == 22:
+            keys(body, 4)
+            action, payload = body[2]
+            if type(action) is not int or action not in range(4):
+                raise ValueError("invalid alarm action")
+            if action == 3:
+                keys(payload, 3)
+                uint(payload[0], 8)
+                if payload[2] is not None:
+                    keys(payload[2], 2)
+                seen.add(("alarm-refresh", True))
+    required = {("empty-prefix", True), ("inventory-subject", 0), ("inventory-subject", 1), ("family", 0), ("family", 1), ("tag", 5),
+                ("reserved", "model"), ("reserved", "quarantine"),
+                ("readiness-scope", 0), ("readiness-scope", 1),
+                ("readiness-media", True), ("alarm-refresh", True),
+                ("cleaning-home", True), ("cleaning-reject", True)}
     if not required <= seen:
         raise ValueError(f"missing corpus coverage: {required - seen}")
     # These complete histories pin the measured-generation ruling before corpus freeze.
@@ -146,7 +215,7 @@ def main(root):
     }.items():
         if medium_cases.get(case) != expected:
             raise ValueError(f"missing medium history frames: {case}")
-    print(f"independent decoder: {count} medium records; both families and reserved fence codes; all three generation histories")
+    print(f"independent decoder: {count} medium records; both families and reserved fence codes; all three generation histories; ruling 17/18 layouts")
 
 
 if __name__ == "__main__":

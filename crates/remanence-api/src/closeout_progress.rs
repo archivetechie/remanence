@@ -1,17 +1,24 @@
 //! Closeout diagnostics shared by automatic drive work and the operator watch.
 //! These observations never replace the native tape log's media authority.
 use crate::{operations::OperationHandle, pb};
+#[cfg(test)]
 use ciborium::Value;
-use remanence_state::{tape_log::fold::TapeSummary, AuditActor, AuditEvent, CatalogIndex};
+use remanence_state::{tape_log::fold::TapeSummary, AuditActor, CatalogIndex};
 use std::{
     collections::BTreeMap,
-    path::Path,
     sync::{Arc, Mutex},
     time::Instant,
 };
 use tonic::Status;
 use uuid::Uuid;
 
+/// Selected by the closeout owner at its actual lifecycle boundary.
+#[derive(Clone, Copy)]
+pub(crate) enum CloseoutEvent {
+    Started,
+    Finished,
+    Failed,
+}
 #[derive(Clone)]
 pub(crate) struct CloseoutProgress {
     pub(crate) id: Uuid,
@@ -49,6 +56,98 @@ impl CloseoutProgress {
                 ("source".into(), "rebuilt".into()),
             ]))),
         })
+    }
+    /// Autonomous closeout gets its operation identity from the shared writer.
+    /// An inactive planning object publishes no work; its id remains local only.
+    pub(crate) fn for_owner(
+        authority: &crate::write_owner::TerminalAuthority,
+        tape: [u8; 16],
+        active: bool,
+    ) -> Result<Self, Status> {
+        let id = if active {
+            if let Some(runtime) = authority.runtime() {
+                Uuid::from_bytes(
+                    runtime
+                        .start_owned_operation(
+                            remanence_state::library_log::OperationKind::TapeCloseout,
+                            AuditActor::System,
+                        )
+                        .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                )
+            } else {
+                Uuid::new_v4()
+            }
+        } else {
+            Uuid::new_v4()
+        };
+        Self::new(id, tape, None)
+    }
+    /// Publish direct owner-selected lifecycle facts; progress detail stays live
+    /// presentation. Historical audit serialization exists only in unit fixtures.
+    pub(crate) fn record(
+        &self,
+        index: &mut CatalogIndex,
+        authority: &crate::write_owner::TerminalAuthority,
+        event: CloseoutEvent,
+        error: Option<&Status>,
+    ) -> Result<(), Status> {
+        if let Some(runtime) = authority.runtime() {
+            use remanence_state::library_log as lib;
+            let mut audited = self.audited.lock().unwrap();
+            let done = match event {
+                CloseoutEvent::Started => &mut audited.0,
+                _ => &mut audited.1,
+            };
+            if *done {
+                return Ok(());
+            }
+            let event = match event {
+                CloseoutEvent::Started => lib::OperationEvent::Started(lib::Unit),
+                CloseoutEvent::Finished => lib::OperationEvent::Finished(lib::Response {
+                    response_fingerprint: None,
+                }),
+                CloseoutEvent::Failed => lib::OperationEvent::Failed(lib::Failed {
+                    retry: None,
+                    refusal_code: None,
+                    summary: error
+                        .ok_or_else(|| {
+                            Status::internal("failed closeout requires its actual error")
+                        })?
+                        .message()
+                        .into(),
+                }),
+            };
+            runtime
+                .record_operation_event(
+                    *self.id.as_bytes(),
+                    lib::OperationKind::TapeCloseout,
+                    event,
+                    self.actor.clone(),
+                )
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            *done = true;
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            let fixture = authority.historical_fixture().expect("historical fixture");
+            self.audit(
+                index,
+                &fixture.audit_dir,
+                &fixture.audit_append_lock,
+                match event {
+                    CloseoutEvent::Started => AuditEvent::OperationStarted,
+                    CloseoutEvent::Finished => AuditEvent::OperationFinished,
+                    CloseoutEvent::Failed => AuditEvent::OperationFailed,
+                },
+                error,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            let _ = index;
+            unreachable!("only typed authority exists in production")
+        }
     }
     pub(crate) fn request(mut self, actor: AuditActor, key: Uuid) -> Self {
         self.actor = actor;
@@ -120,6 +219,7 @@ impl CloseoutProgress {
         );
         fields
     }
+    #[cfg(test)]
     pub(crate) fn detail(&self) -> BTreeMap<String, Value> {
         self.fields()
             .into_iter()
@@ -161,6 +261,7 @@ impl CloseoutProgress {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn audit(
         &self,
         index: &mut CatalogIndex,
@@ -205,3 +306,8 @@ impl CloseoutProgress {
         Ok(())
     }
 }
+
+#[cfg(test)]
+use remanence_state::AuditEvent;
+#[cfg(test)]
+use std::path::Path;

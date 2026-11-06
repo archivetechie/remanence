@@ -21,6 +21,8 @@ enum Fault {
     },
     InvalidResidual,
     HostDisagree,
+    HostUnderreports,
+    FalseValidResidual,
     UnconfirmedHead,
     UnconfirmedBody,
 }
@@ -165,25 +167,36 @@ impl SgTransport for WireFault {
                 self.boundary = remanence_library::decode_scsi_sense(&sense)
                     .unwrap()
                     .filemark;
-                // An invalid residual cannot authorize the stale third slot.
+                // Compare the same false residual with VALID clear and set.
                 if fixed
                     && self.boundary
-                    && matches!(self.fault, Fault::InvalidResidual)
+                    && matches!(
+                        self.fault,
+                        Fault::InvalidResidual | Fault::FalseValidResidual
+                    )
                     && count == 4
                 {
                     assert_eq!(bytes_transferred, 2 * BLOCK_SIZE);
                     sense[3..7].copy_from_slice(&1u32.to_be_bytes());
-                    sense[0] &= 0x7f;
+                    if matches!(self.fault, Fault::InvalidResidual) {
+                        sense[0] &= 0x7f;
+                    } else {
+                        assert_ne!(sense[0] & 0x80, 0, "false residual retains VALID");
+                    }
                 }
-                // Model the field trust rule: valid sense is correct while SG
-                // overstates the delivered prefix. Stale slots remain hidden.
+                // Keep sense truthful while SG overstates or understates the
+                // delivered prefix. Stale slots remain hidden in both cases.
                 let bytes_transferred = if fixed
                     && self.boundary
-                    && matches!(self.fault, Fault::HostDisagree)
+                    && matches!(self.fault, Fault::HostDisagree | Fault::HostUnderreports)
                     && count == 4
                 {
                     assert_eq!(bytes_transferred, 2 * BLOCK_SIZE);
-                    3 * BLOCK_SIZE
+                    if matches!(self.fault, Fault::HostUnderreports) {
+                        BLOCK_SIZE
+                    } else {
+                        3 * BLOCK_SIZE
+                    }
                 } else {
                     bytes_transferred
                 };
@@ -332,11 +345,22 @@ fn fixed_batch_chaos_damage_vectors_match_single_record_walk() {
 /// stale third slot was transferred. This is a synthetic fixed READ conflict.
 #[test]
 fn valid_residual_keeps_stale_batch_slots_hidden_when_host_overstates() {
+    assert_truthful_residual_prefix(Fault::HostDisagree);
+}
+
+/// A truthful residual delivers both final blocks even when SG credits only one.
+#[test]
+fn valid_residual_delivers_complete_prefix_when_host_understates() {
+    assert_truthful_residual_prefix(Fault::HostUnderreports);
+}
+
+/// Exercise the production READ/classifier/verification/forward-reader chain.
+fn assert_truthful_residual_prefix(fault: Fault) {
     let records: Vec<_> = (0..7)
         .map(|i| Record::Block(block(i)))
         .chain([Record::Filemark])
         .collect();
-    let (mut drive, _) = drive(&records, Fault::HostDisagree);
+    let (mut drive, counts) = drive(&records, fault);
     let mut source = DriveHandleRawSource::new(&mut drive);
     source.configure_fixed_block_size(BLOCK_SIZE).unwrap();
     source
@@ -362,6 +386,49 @@ fn valid_residual_keeps_stale_batch_slots_hidden_when_host_overstates() {
     assert_eq!(observation.whole_blocks, 7);
     assert_eq!(observation.last_block, block(6));
     assert!(observation.requires_spacing.is_none());
+    assert_eq!(*counts.lock().unwrap(), [1, 4, 4]);
+}
+
+/// VALID is a drive assertion, not independently checked against SG. A false
+/// residual exposes the prior batch's third slot to the callback; the later
+/// position mismatch requests spacing but cannot undo that callback delivery.
+#[test]
+fn false_valid_residual_can_expose_stale_batch_bytes_before_position_recheck() {
+    let records: Vec<_> = (0..7)
+        .map(|i| Record::Block(block(i)))
+        .chain([Record::Filemark])
+        .collect();
+    let (mut drive, counts) = drive(&records, Fault::FalseValidResidual);
+    let mut source = DriveHandleRawSource::new(&mut drive);
+    source.configure_fixed_block_size(BLOCK_SIZE).unwrap();
+    source
+        .locate_physical(PhysicalPositionHint::new(0))
+        .unwrap();
+    let mut seen = Vec::new();
+    let observation = ForwardFileReader::new(BLOCK_SIZE, 4)
+        .unwrap()
+        .read_file(
+            &mut source,
+            0,
+            PhysicalPositionHint::new(0),
+            HeadProvenance::Locate,
+            8,
+            8,
+            &mut |_, bytes| {
+                seen.push(bytes[0]);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(*counts.lock().unwrap(), [1, 4, 4]);
+    assert_eq!(seen, [0, 1, 2, 3, 4, 5, 6, 3]);
+    assert_eq!(observation.whole_blocks, 8);
+    assert_eq!(observation.last_block, block(3));
+    assert_eq!(
+        observation.requires_spacing,
+        Some(SpacingReason::PositionMismatch)
+    );
+    assert!(observation.retained(7).is_none());
 }
 
 /// A prior full batch leaves recognizable bytes in the untouched buffer slots.

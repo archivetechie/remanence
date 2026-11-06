@@ -69,7 +69,6 @@ pub type Frame<'a> = crate::log_frame::Frame<'a, Record>;
 
 /// Digest one fully decoded frame, binding a cross-log reference to its bytes.
 /// Call only on full frames: structural row scans deliberately omit payloads.
-#[allow(dead_code)] // Consumed by the library TapeView adapter in the later cutover.
 pub(crate) fn record_digest(frame: &Frame<'_>) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     assert!(

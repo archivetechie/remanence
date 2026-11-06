@@ -64,7 +64,9 @@ async fn caller_matrix(caller: &str) {
                 )
                 .unwrap();
         }
-        let audit_before = FileAuditLog::replay(&cfg.audit_dir).unwrap().len();
+        let audit_before = FileAuditLog::replay(&cfg.fixture_audit().audit_dir)
+            .unwrap()
+            .len();
         rusqlite::Connection::open(&cfg.index_path)
             .unwrap()
             .execute_batch(
@@ -80,7 +82,7 @@ async fn caller_matrix(caller: &str) {
         assert_eq!(before_state, "ready");
         let observed = Arc::new(Mutex::new(None));
         let capture = observed.clone();
-        let audit_path = cfg.audit_dir.clone();
+        let audit_path = cfg.fixture_audit().audit_dir.clone();
         b3b_caller_injection::set(move || {
             *capture.lock().unwrap() = Some((
                 census::total(),
@@ -259,7 +261,7 @@ async fn caller_matrix(caller: &str) {
             "{caller}/{kind}: each durable mutation occurs exactly once"
         );
         if !fail_audit {
-            let audit = FileAuditLog::replay(&cfg.audit_dir).unwrap();
+            let audit = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).unwrap();
             let consequences: Vec<_> = audit[audit_before..]
                 .iter()
                 .filter(|r| {
@@ -289,7 +291,7 @@ async fn caller_matrix(caller: &str) {
             );
         } else {
             assert_eq!(
-                FileAuditLog::replay(cfg.audit_dir.with_extension("saved"))
+                FileAuditLog::replay(cfg.fixture_audit().audit_dir.with_extension("saved"))
                     .unwrap()
                     .len(),
                 observed.lock().unwrap().unwrap().1,

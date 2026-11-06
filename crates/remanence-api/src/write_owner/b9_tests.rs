@@ -462,11 +462,14 @@ async fn fresh_maintenance_settlement(kind: &str) {
                     index
                 },
                 super::super::ManualFinalizePreflightConfig {
+                    authority: crate::write_owner::TerminalAuthority::fixture(
+                        None,
+                        state.audit_dir.as_path(),
+                        state.audit_fsync,
+                        &state.audit_append_lock
+                    ),
                     mounted_endpoint: None,
                     checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
-                    audit_dir: state.audit_dir.as_path(),
-                    audit_fsync: state.audit_fsync,
-                    audit_append_lock: &state.audit_append_lock,
                 },
                 Some(BARCODE),
                 &mut request,

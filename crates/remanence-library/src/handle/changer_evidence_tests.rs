@@ -415,3 +415,241 @@ fn b3b_removal_predicate_preserves_drive_error_scope() {
         before
     );
 }
+
+/// Gate contract without filesystem substitutions: the authority sees the actual
+/// CDB target/context and a refused intent dispatches no physical MOVE.
+#[test]
+fn typed_motion_gate_preserves_context_and_refusal_kind() {
+    use crate::motion::*;
+    #[derive(Default)]
+    struct Authority {
+        refusal: Option<MotionAuthorityFailure>,
+        calls: Mutex<Vec<(MotionCommand, MotionContext)>>,
+        confirmations: Mutex<usize>,
+    }
+    impl MotionAuthority for Authority {
+        fn intent(
+            &self,
+            command: &MotionCommand,
+            context: &MotionContext,
+        ) -> Result<MotionTicket, MotionAuthorityError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((command.clone(), context.clone()));
+            if let Some(kind) = self.refusal {
+                return Err(MotionAuthorityError {
+                    message: "test refusal".into(),
+                    kind,
+                });
+            }
+            Ok(MotionTicket {
+                sequence: 1,
+                record_uuid: [1; 16],
+            })
+        }
+        fn failed(
+            &self,
+            _: MotionTicket,
+            _: &crate::outcome::CompletionEvidence,
+        ) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+        fn unconfirmed(&self, _: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+        fn confirm_inventory(
+            &self,
+            pending: &PendingMotion,
+            observed: &Library,
+        ) -> Result<(), MotionAuthorityError> {
+            assert_eq!(pending.ticket.sequence, 1);
+            assert!(
+                !observed
+                    .slots
+                    .iter()
+                    .find(|s| s.element_address == SLOT)
+                    .unwrap()
+                    .full
+            );
+            assert!(
+                observed
+                    .drive_bays
+                    .iter()
+                    .find(|d| d.element_address == BAY)
+                    .unwrap()
+                    .loaded
+            );
+            *self.confirmations.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn confirm_readiness(
+            &self,
+            _: &PendingMotion,
+            _: &crate::MediaReadiness,
+            _: std::time::Duration,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("changer test");
+        }
+        fn confirm_standalone(&self, _: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            panic!("changer test");
+        }
+        fn ensure_motion_allowed(&self) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+    }
+    for refusal in [
+        None,
+        Some(MotionAuthorityFailure::SemanticRefusal),
+        Some(MotionAuthorityFailure::StoreFailure),
+    ] {
+        let (mut handle, log, _) = open(None, None);
+        let authority = Arc::new(Authority {
+            refusal,
+            ..Default::default()
+        });
+        handle.set_motion_authority(authority.clone());
+        let context = MotionContext {
+            parent_operation: Some([7; 16]),
+            tape: Some(([8; 16], 1)),
+            inventory_generation: Some(3),
+            readiness_generation: Some(4),
+            load_confirmation: LoadConfirmation::Inventory,
+        };
+        let result = handle
+            .changer_mut()
+            .with_motion_context(context.clone(), |changer| {
+                changer.move_medium(SLOT, BAY, &policy())
+            });
+        assert_eq!(
+            authority.calls.lock().unwrap().as_slice(),
+            &[(
+                MotionCommand::Move {
+                    library_serial: SERIAL.into(),
+                    source: SLOT,
+                    destination: BAY
+                },
+                context
+            )]
+        );
+        if let Some(kind) = refusal {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error.kind, crate::MoveErrorKind::MotionAuthority(ref e) if e.kind == kind)
+            );
+            assert!(!log.borrow().iter().any(|cdb| cdb[0] == 0xa5));
+        } else {
+            result.unwrap();
+            assert_eq!(*authority.confirmations.lock().unwrap(), 1);
+            let log = log.borrow();
+            let moved = log.iter().position(|cdb| cdb[0] == 0xa5).unwrap();
+            assert!(
+                log[moved + 1..].iter().any(|cdb| cdb[0] == 0xb8),
+                "confirmation follows physical MOVE"
+            );
+            assert!(handle.changer_mut().take_pending_motion().is_empty());
+        }
+    }
+}
+
+/// A GOOD MOVE followed by an unreadable inventory is Unknown, not a failed
+/// MOVE eligible for retry. The original successful completion stays attached.
+#[test]
+fn typed_motion_confirmation_failure_never_repeats_move() {
+    use crate::motion::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FailConfirmation {
+        inner: Box<dyn SgTransport>,
+        moved: bool,
+    }
+    impl SgTransport for FailConfirmation {
+        fn execute_in(&mut self, cdb: &[u8], out: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+            if self.moved && cdb[0] == 0xb8 {
+                return Err(ScsiError::InvalidInput("confirmation read failed"));
+            }
+            self.inner.execute_in(cdb, out)
+        }
+        fn execute_out(&mut self, cdb: &[u8], input: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            self.inner.execute_out(cdb, input)
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+            let result = self.inner.execute_none(cdb);
+            if cdb[0] == 0xa5 && result.is_ok() {
+                self.moved = true;
+            }
+            result
+        }
+    }
+    struct Authority(AtomicUsize);
+    impl MotionAuthority for Authority {
+        fn intent(
+            &self,
+            _: &MotionCommand,
+            _: &MotionContext,
+        ) -> Result<MotionTicket, MotionAuthorityError> {
+            Ok(MotionTicket {
+                sequence: 1,
+                record_uuid: [1; 16],
+            })
+        }
+        fn failed(
+            &self,
+            _: MotionTicket,
+            _: &crate::outcome::CompletionEvidence,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("GOOD MOVE must not become Failed");
+        }
+        fn unconfirmed(&self, pending: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            assert_eq!(pending.evidence.dispatch, crate::outcome::Dispatch::Issued);
+            assert_eq!(
+                pending.evidence.completion,
+                crate::outcome::Completion::Known
+            );
+            assert!(!pending.evidence.failed);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn confirm_inventory(
+            &self,
+            _: &PendingMotion,
+            _: &Library,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("no physical observation exists");
+        }
+        fn confirm_readiness(
+            &self,
+            _: &PendingMotion,
+            _: &crate::MediaReadiness,
+            _: std::time::Duration,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("changer test");
+        }
+        fn confirm_standalone(&self, _: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            panic!("changer test");
+        }
+        fn ensure_motion_allowed(&self) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+    }
+    let (mut handle, log, _) = open(None, None);
+    {
+        let mut transport = handle.changer.transport.lock().unwrap();
+        let inner = std::mem::replace(&mut *transport, Box::new(FixtureTransport::new()));
+        *transport = Box::new(FailConfirmation {
+            inner,
+            moved: false,
+        });
+    }
+    let authority = Arc::new(Authority(AtomicUsize::new(0)));
+    handle.set_motion_authority(authority.clone());
+    let error = handle
+        .changer_mut()
+        .move_medium(SLOT, BAY, &policy())
+        .unwrap_err();
+    assert!(
+        matches!(error.kind, crate::MoveErrorKind::MotionAuthority(ref error) if error.kind == MotionAuthorityFailure::EvidenceFailure)
+    );
+    assert_eq!(authority.0.load(Ordering::SeqCst), 1);
+    assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0xa5).count(), 1);
+    assert!(handle.changer_mut().take_pending_motion().is_empty());
+}

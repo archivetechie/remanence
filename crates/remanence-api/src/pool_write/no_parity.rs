@@ -357,6 +357,7 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
             evidence_json: Some(evidence),
         },
         selected.standalone_endpoint.as_ref(),
+        Some(&outcome.evidence),
     )?;
     Ok(())
 }

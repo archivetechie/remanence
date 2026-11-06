@@ -182,9 +182,8 @@ fn b4a_reset_refuses_live_shared_connection() {
     let path = dir.path().join("catalog.sqlite");
     let client = open(&path).unwrap();
     let writer = client.write_handle();
-    let version = writer.schema_version().unwrap();
     drop(client);
-    let result = prepare_admitted_catalog_reset_source_atomic_swap(&path, version);
+    let result = ensure_reset_catalog_idle(&path);
     assert!(
         matches!(result, Err(StateError::ConfigInvalid(_))),
         "{result:?}"
@@ -198,6 +197,10 @@ fn b4a_reset_refuses_live_shared_connection() {
     assert_eq!(journal_mode(), "wal");
     assert_eq!(writer.quick_check().unwrap(), "ok");
     drop(writer);
-    prepare_admitted_catalog_reset_source_atomic_swap(&path, version).unwrap();
-    assert_eq!(journal_mode(), "delete");
+    ensure_reset_catalog_idle(&path).unwrap();
+    assert_eq!(
+        journal_mode(),
+        "wal",
+        "reset admission never opens or checkpoints SQL"
+    );
 }

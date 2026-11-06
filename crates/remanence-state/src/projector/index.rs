@@ -54,11 +54,6 @@ pub mod apply;
 #[path = "tape_log_projection.rs"]
 mod tape_log_projection;
 
-/// Oldest clean-break catalog whose tape table can be inspected safely by the
-/// exact full-catalog erase admission path. Ordinary opens refuse all predecessor
-/// schemas; only the declared reset may read this older catalog shape.
-const MIN_EXACT_ERASE_SCHEMA_VERSION: u32 = 16;
-
 const STRUCTURAL_U64_COLUMNS: &[(&str, &str)] = &[
     ("tapes", "highest_protected_ordinal"),
     ("tapes", "total_committed_ordinals"),
@@ -439,24 +434,6 @@ pub struct AdoptBootstrapIdentityOutcome {
     pub request_fingerprint: [u8; 32],
 }
 
-/// Typed identity-only tape row carried across one explicitly scoped catalog
-/// reset. This type is intentionally crate-private: it is reset plumbing, not
-/// a general-purpose way to manufacture catalog authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CatalogResetPreservedTape {
-    pub(crate) tape_uuid: [u8; 16],
-    pub(crate) voltag: String,
-    voltag_source: Option<LabelProvenance>,
-    cartridge_generation: Option<String>,
-    generation_source: Option<String>,
-    assignment_source: String,
-    pub(crate) kind: String,
-    pub(crate) pool_id: Option<String>,
-    assignment_generation: i64,
-    geometry: Option<ProvisionTapeGeometry>,
-    pub(crate) restore_ready: bool,
-}
-
 /// Request to permanently end one tape identity's life in the catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetireTapeInput {
@@ -568,6 +545,9 @@ pub struct MediaReadinessOperationInput {
     pub source_slot: Option<u16>,
     /// LTO generation hint, when known.
     pub media_generation: Option<u8>,
+    /// Exact observed generation for typed readiness, preserving Type-M.
+    /// The numeric media_generation remains a legacy display field.
+    pub media_family: Option<crate::LtoGen>,
     /// Current coarse operation phase.
     pub phase: String,
     /// Current durable readiness state.
@@ -583,6 +563,9 @@ pub struct MediaReadinessOperationInput {
 /// Input for recording one durable media-readiness transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaReadinessTransitionInput {
+    /// Actual captured command completion, supplied by the original producer.
+    /// Legacy display fields are never used to invent dispatch or completion.
+    pub completion_evidence: Option<crate::library_log::CompletionEvidence>,
     /// Operation UUID to update.
     pub operation_id: Uuid,
     /// New phase, when it changed.
@@ -1359,27 +1342,6 @@ impl CatalogCore {
         })
     }
 
-    /// Read structurally compatible schema-22–25 predecessors only for declared reset admission.
-    /// This capability cannot mutate or migrate the predecessor catalog.
-    pub(crate) fn open_reset_source(path: &Path) -> Result<Self, StateError> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| sqlite_open_error(path, e))?;
-        configure_read_only_sqlite(&conn)?;
-        let version: u32 = conn
-            .query_row("pragma user_version", [], |r| r.get(0))
-            .map_err(|e| sqlite_error("read reset source version", e))?;
-        if !(22..SCHEMA_VERSION).contains(&version) {
-            validate_schema(&conn)?;
-        } else {
-            validate_unsigned_structural_schema_for_table(&conn, "object_copies")?;
-        }
-        Ok(Self {
-            conn,
-            path: path.to_path_buf(),
-            #[cfg(any(test, feature = "fixtures"))]
-            apply_counts: [0; 3],
-        })
-    }
     /// Open the SQLite projection for read-only query serving.
     ///
     /// This does not create directories or run migrations. The owner process
@@ -1444,86 +1406,6 @@ impl CatalogCore {
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
         })
-    }
-
-    /// Read only the tape identities needed to admit an exact full-catalog
-    /// erase from a known clean-break predecessor schema.
-    ///
-    /// This is intentionally not a general legacy-catalog reader. It is used
-    /// only when the preserve set is empty, and it requires the complete
-    /// identity/geometry column set needed to enumerate every bound tape.
-    pub(crate) fn read_legacy_catalog_reset_erase_source(
-        path: impl AsRef<Path>,
-    ) -> Result<(u32, Vec<TapeRecord>), StateError> {
-        let path = path.as_ref();
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|err| sqlite_open_error(path, err))?;
-        configure_read_only_sqlite(&conn)?;
-        let schema_version = conn
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            .map_err(|err| sqlite_error("read legacy reset sqlite user_version", err))?;
-        if !(MIN_EXACT_ERASE_SCHEMA_VERSION..SCHEMA_VERSION).contains(&schema_version) {
-            return Err(StateError::IndexMigrationFailed(format!(
-                "sqlite user_version {schema_version} is not a supported clean-break predecessor for exact full-catalog erase (supported: {MIN_EXACT_ERASE_SCHEMA_VERSION}..{}); restore a schema-{SCHEMA_VERSION} catalog backup or use matching older Remanence tooling to reset it",
-                SCHEMA_VERSION - 1
-            )));
-        }
-
-        let mut column_stmt = conn
-            .prepare("PRAGMA table_info(tapes)")
-            .map_err(|err| sqlite_error("inspect legacy reset tapes table", err))?;
-        let columns = column_stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|err| sqlite_error("query legacy reset tapes columns", err))?
-            .collect::<Result<HashSet<_>, _>>()
-            .map_err(|err| sqlite_error("read legacy reset tapes columns", err))?;
-        let required = [
-            "tape_uuid",
-            "voltag",
-            "kind",
-            "pool_id",
-            "state",
-            "block_size",
-            "scheme_id",
-            "data_blocks_per_stripe",
-            "parity_blocks_per_stripe",
-            "stripes_per_neighborhood",
-        ];
-        let missing = required
-            .into_iter()
-            .filter(|column| !columns.contains(*column))
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(StateError::IndexMigrationFailed(format!(
-                "sqlite user_version {schema_version} cannot prove exact full-catalog erase because tapes is missing columns {}; restore a schema-{SCHEMA_VERSION} catalog backup or use matching older Remanence tooling to reset it",
-                missing.join(", ")
-            )));
-        }
-        let assignment_generation = if columns.contains("assignment_generation") {
-            "assignment_generation"
-        } else {
-            "0"
-        };
-        let sql = format!(
-            "select tape_uuid, voltag, kind, pool_id, state, block_size, scheme_id,
-                    data_blocks_per_stripe, parity_blocks_per_stripe,
-                    stripes_per_neighborhood, {assignment_generation}
-             from tapes order by hex(tape_uuid)"
-        );
-        let mut tape_stmt = conn
-            .prepare(&sql)
-            .map_err(|err| sqlite_error("prepare legacy reset tape enumeration", err))?;
-        let mut rows = tape_stmt
-            .query([])
-            .map_err(|err| sqlite_error("query legacy reset tape enumeration", err))?;
-        let mut tapes = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|err| sqlite_error("iterate legacy reset tape enumeration", err))?
-        {
-            tapes.push(legacy_catalog_reset_tape_from_row(row)?);
-        }
-        Ok((schema_version, tapes))
     }
 
     /// Path resolved by this connection opener.
@@ -1730,6 +1612,7 @@ impl CatalogCore {
     /// crash), dispatch failure, or unknown completion still counts.
     /// Readiness waits use it to bound the LOADs one
     /// operation sends, so a resumed or restarted wait does not repeat one.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn media_readiness_load_attempts_since_ready(
         &self,
         operation_id: Uuid,
@@ -2135,34 +2018,6 @@ impl CatalogCore {
             .map_err(|err| sqlite_error("sqlite quick_check", err))
     }
 
-    /// Checkpoint every WAL frame into the main database and switch to a
-    /// single-file journal mode before an atomic catalog-reset swap.
-    pub(crate) fn prepare_catalog_reset_atomic_swap(&mut self) -> Result<(), StateError> {
-        prepare_catalog_reset_atomic_swap_conn(&self.conn)
-    }
-
-    /// Checkpoint a preflight-admitted source without asking ordinary catalog
-    /// open to migrate or validate its intentionally stale schema.
-    pub(crate) fn prepare_admitted_catalog_reset_source_atomic_swap(
-        path: impl AsRef<Path>,
-        expected_schema_version: u32,
-    ) -> Result<(), StateError> {
-        let path = path.as_ref();
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|err| sqlite_open_error(path, err))?;
-        conn.pragma_update(None, "busy_timeout", 5000)
-            .map_err(|err| sqlite_error("set reset-source sqlite busy_timeout", err))?;
-        let actual_schema_version = conn
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            .map_err(|err| sqlite_error("recheck reset-source sqlite user_version", err))?;
-        if actual_schema_version != expected_schema_version {
-            return Err(StateError::ConfigInvalid(format!(
-                "catalog reset source schema changed after admission from {expected_schema_version} to {actual_schema_version}; run preflight again"
-            )));
-        }
-        prepare_catalog_reset_atomic_swap_conn(&conn)
-    }
-
     /// Index one fully replayed 3c committed state.
     pub fn index_structural_authority(
         &mut self,
@@ -2365,16 +2220,6 @@ impl CatalogCore {
         Ok(())
     }
 
-    /// Validate the compare-and-swap before the state owner appends rebind authority.
-    pub(crate) fn preview_label_rebind(
-        &self,
-        tape_uuid: [u8; 16],
-        label: &str,
-        previous_uuid: [u8; 16],
-    ) -> Result<(), StateError> {
-        validate_label_rebind(&self.conn, tape_uuid, label, previous_uuid)
-    }
-
     /// Persist an explicit generation assertion for an already proven tape UUID.
     /// The caller owns the device/BOT proof; this updates no identity or capacity counters.
     pub fn set_tape_generation(
@@ -2383,436 +2228,6 @@ impl CatalogCore {
         observation: MediaObservation,
     ) -> Result<(), StateError> {
         set_tape_generation_at(&self.conn, &tape_uuid, observation, &now_utc()?)
-    }
-
-    /// Adopt one checksum-validated Bootstrap as identity-only catalog state.
-    ///
-    /// This never manufactures tape-file, Object, extent, wrap-map, or
-    /// finalization authority. UUID and barcode conflicts are checked across
-    /// all tape kinds in the same transaction that inserts the row and its
-    /// pool assignment with its provenance.
-    pub(crate) fn adopt_bootstrap_identity(
-        &mut self,
-        input: AdoptBootstrapIdentityInput,
-        pool_id: &str,
-        state: AdoptedTapeState,
-        request_fingerprint: [u8; 32],
-    ) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
-        let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
-        let voltag = validate_adoption_label(input.voltag.as_deref())?;
-        let pool_id = normalize_pool_id(pool_id)?;
-        let updated_at = now_utc()?;
-        let tx = projection_transaction(&mut self.conn)
-            .map_err(|err| sqlite_error("begin bootstrap identity adoption", err))?;
-        let outcome = adopt_bootstrap_identity_tx(
-            &tx,
-            BootstrapAdoptionCatalogFacts {
-                tape_uuid: input.tape_uuid,
-                voltag,
-                geometry: &geometry,
-                pool_id: pool_id.as_str(),
-                state,
-                operation_id: input.operation_id,
-                request_fingerprint,
-                provenance: input.label_provenance,
-                observation: input.observation,
-                assignment_source: if input.pool_id.is_some() {
-                    "operator"
-                } else {
-                    "rule"
-                },
-            },
-            updated_at.as_str(),
-        )?;
-        tx.commit()
-            .map_err(|err| sqlite_error("commit bootstrap identity adoption", err))?;
-        Ok(outcome)
-    }
-
-    /// Validate a Bootstrap identity adoption without changing catalog state.
-    ///
-    /// The state owner uses this before durably appending adoption evidence;
-    /// the mutating transaction repeats the same checks before insertion.
-    pub(crate) fn preview_bootstrap_identity_adoption(
-        &self,
-        input: &AdoptBootstrapIdentityInput,
-        pool_id: &str,
-        state: AdoptedTapeState,
-        request_fingerprint: [u8; 32],
-    ) -> Result<Option<AdoptBootstrapIdentityOutcome>, StateError> {
-        let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
-        let voltag = validate_adoption_label(input.voltag.as_deref())?;
-        let pool_id = normalize_pool_id(pool_id)?;
-        validate_bootstrap_identity_adoption_conn(
-            &self.conn,
-            BootstrapAdoptionCatalogFacts {
-                tape_uuid: input.tape_uuid,
-                voltag,
-                geometry: &geometry,
-                pool_id: pool_id.as_str(),
-                state,
-                operation_id: input.operation_id,
-                request_fingerprint,
-                provenance: input.label_provenance,
-                observation: input.observation,
-                assignment_source: if input.pool_id.is_some() {
-                    "operator"
-                } else {
-                    "rule"
-                },
-            },
-        )
-    }
-
-    /// Capture exactly one valid tape identity for every exact voltag selector.
-    ///
-    /// The caller must hold the state-owner lock. This read-only pass is
-    /// deliberately separate from reset mutation so every selector and every
-    /// source row is validated before audit, journal, cache, or SQLite state is
-    /// archived or removed.
-    pub(crate) fn capture_catalog_reset_tapes(
-        &self,
-        voltags: &[String],
-        pool_rules: &[TapePoolRuleConfig],
-    ) -> Result<Vec<CatalogResetPreservedTape>, StateError> {
-        voltags
-            .iter()
-            .map(|voltag| self.capture_catalog_reset_tape(voltag, pool_rules))
-            .collect()
-    }
-
-    /// Whether every authority/cache table that reset promises to clear is
-    /// empty. Used only to recognize the exact post-swap crash-resume state.
-    pub(crate) fn catalog_reset_output_is_clean(&self) -> Result<bool, StateError> {
-        let invalid_tape: bool = self
-            .conn
-            .query_row(
-                "select exists(
-                   select 1 from tapes
-                   where highest_protected_ordinal <> X'0000000000000000'
-                      or total_committed_ordinals <> X'0000000000000000'
-                      or last_committed_tape_file is not null
-                      or written_extent_lba is not null
-                      or finalization_progress is not null
-                      or finalization_trigger is not null
-                      or finalization_operation_id is not null
-                      or finalization_edition_digest is not null
-                      or finalization_layout_digest is not null
-                      or completed_replicas is not null
-                      or finalization_outcome is not null
-                      or seal_due is not null
-                      or (kind = 'cleaning' and (
-                           cleaning_uses is null or cleaning_uses <> 0
-                           or cleaning_state is null or cleaning_state <> 'unverified'
-                         ))
-                      or (kind = 'data' and (cleaning_uses is not null or cleaning_state is not null))
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| sqlite_error("validate reset tape authority", err))?;
-        if invalid_tape {
-            return Ok(false);
-        }
-        let invalid_assignments: bool = self.conn.query_row(
-            "select exists(select 1 from tape_pool_assignments a left join tapes t on t.tape_uuid = a.tape_uuid
-                where t.tape_uuid is null or a.seq <> 1 or a.actor <> 'catalog-reset'
-                  or a.assignment_generation <> t.assignment_generation or a.pool_id is not t.pool_id)
-             or exists(select 1 from tapes t where t.pool_id is not null and not exists(
-                select 1 from tape_pool_assignments a where a.tape_uuid = t.tape_uuid))",
-            [], |r|r.get(0),
-        ).map_err(|e|sqlite_error("validate reset assignment evidence",e))?;
-        if invalid_assignments {
-            return Ok(false);
-        }
-        let mut stmt = self
-            .conn
-            .prepare(
-                "select name from sqlite_master
-                 where type = 'table' and name not like 'sqlite_%'
-                 order by name",
-            )
-            .map_err(|err| sqlite_error("list reset output tables", err))?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| sqlite_error("query reset output tables", err))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| sqlite_error("read reset output table", err))?;
-        for name in names {
-            if matches!(
-                name.as_str(),
-                "schema_meta" | "tapes" | "tape_pools" | "tape_pool_assignments"
-            ) {
-                continue;
-            }
-            let quoted = name.replace('"', "\"\"");
-            let sql = format!("select exists(select 1 from \"{quoted}\")");
-            let has_rows: bool = self
-                .conn
-                .query_row(&sql, [], |row| row.get(0))
-                .map_err(|err| sqlite_error("inspect reset output table", err))?;
-            if has_rows {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn capture_catalog_reset_tape(
-        &self,
-        voltag: &str,
-        pool_rules: &[TapePoolRuleConfig],
-    ) -> Result<CatalogResetPreservedTape, StateError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "select tapes.tape_uuid, tapes.voltag, tapes.kind, tapes.pool_id,
-                        null,
-                        tapes.block_size, tapes.scheme_id,
-                        tapes.data_blocks_per_stripe, tapes.parity_blocks_per_stripe,
-                        tapes.stripes_per_neighborhood, tapes.last_committed_tape_file,
-                        tapes.total_committed_ordinals, tapes.written_extent_lba,
-                        tapes.state, tapes.updated_at_utc, tapes.assignment_generation,
-                        tapes.finalization_progress, tapes.finalization_trigger,
-                        tapes.finalization_operation_id, tapes.finalization_edition_digest,
-                        tapes.finalization_layout_digest, tapes.completed_replicas,
-                        tapes.finalization_outcome, tapes.highest_protected_ordinal,
-                        exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
-                          or exists(select 1 from object_instances where object_instances.tape_uuid = tapes.tape_uuid)
-                          or exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
-                          or exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid)
-                          or exists(select 1 from tape_io_fences
-                                    where tape_io_fences.tape_uuid = tapes.tape_uuid
-                                      and tape_io_fences.state = 'active')
-                          or exists(select 1 from sessions
-                                    where sessions.tape_uuid = tapes.tape_uuid
-                                      and sessions.state = 'open')
-                          or exists(select 1 from media_readiness_ops
-                                    where media_readiness_ops.barcode = tapes.voltag
-                                      and media_readiness_ops.state not in ('ready', 'released')
-                                      and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none'),
-                        tapes.voltag_source, tapes.cartridge_generation, tapes.generation_source,
-                        tapes.last_verified_at_utc, tapes.last_verification_state, tapes.last_verified_edition_digest, tapes.seal_due
-                 from tapes
-                 where tapes.voltag = ?1
-                 order by hex(tapes.tape_uuid)",
-            )
-            .map_err(|err| sqlite_error("prepare catalog reset tape capture", err))?;
-        let mut rows = stmt
-            .query(params![voltag])
-            .map_err(|err| sqlite_error("query catalog reset tape capture", err))?;
-        let first = rows
-            .next()
-            .map_err(|err| sqlite_error("iterate catalog reset tape capture", err))?
-            .ok_or_else(|| {
-                StateError::ConfigInvalid(format!(
-                    "catalog reset preserve selector {voltag:?} matches no tape"
-                ))
-            })?;
-        let tape = tape_from_row(first)?;
-        let highest_protected_ordinal =
-            row_get::<SqliteU64>(first, 23, "tapes.highest_protected_ordinal")?.get();
-        let has_dependent_rows: bool = row_get(first, 24, "tapes.has_dependent_rows")?;
-        if rows
-            .next()
-            .map_err(|err| sqlite_error("iterate catalog reset tape ambiguity", err))?
-            .is_some()
-        {
-            return Err(StateError::AmbiguousCatalogLookup(format!(
-                "catalog reset preserve selector {voltag:?} matches multiple tapes"
-            )));
-        }
-
-        let source_voltag = tape.voltag.as_deref().ok_or_else(|| {
-            StateError::IndexCorrupt(format!(
-                "catalog reset preserve selector {voltag:?} resolved to a tape without a voltag"
-            ))
-        })?;
-        if source_voltag != voltag || source_voltag.trim() != source_voltag {
-            return Err(StateError::IndexCorrupt(format!(
-                "catalog reset preserve selector {voltag:?} resolved to invalid voltag {source_voltag:?}"
-            )));
-        }
-        let tape_uuid: [u8; 16] = tape.tape_uuid.as_slice().try_into().map_err(|_| {
-            StateError::IndexCorrupt(format!(
-                "tape {source_voltag} uuid has length {}, expected 16",
-                tape.tape_uuid.len()
-            ))
-        })?;
-        if !matches!(tape.kind.as_str(), "data" | "cleaning") {
-            return Err(StateError::IndexCorrupt(format!(
-                "tape {source_voltag} has invalid kind {:?}",
-                tape.kind
-            )));
-        }
-        if !matches!(
-            tape.state.as_str(),
-            "ready"
-                | "ingested"
-                | "sealed"
-                | "retired"
-                | "finalizing"
-                | "finalized"
-                | "finalized_degraded"
-                | "recovery_required"
-        ) {
-            return Err(StateError::IndexCorrupt(format!(
-                "tape {source_voltag} has invalid state {:?}",
-                tape.state
-            )));
-        }
-        let geometry = catalog_reset_geometry(&tape)?
-            .map(|(block_size, parity)| ProvisionTapeGeometry::from_parity(block_size, &parity))
-            .transpose()?;
-        if tape.kind == "data" && geometry.is_none() {
-            return Err(StateError::IndexCorrupt(format!(
-                "data tape {source_voltag} has no block geometry"
-            )));
-        }
-        let restore_ready = tape.state == "ready"
-            && tape.last_committed_tape_file.is_none()
-            && tape.total_committed_ordinals == 0
-            && tape.written_extent_lba.is_none()
-            && tape.terminal_finalization.is_none()
-            && tape.seal_due.is_none()
-            && highest_protected_ordinal == 0
-            && !has_dependent_rows;
-        let assignment_generation = tape
-            .assignment_generation
-            .checked_add(1)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or_else(|| {
-                StateError::IndexCorrupt(format!(
-                    "tape {source_voltag} assignment generation cannot advance across reset"
-                ))
-            })?;
-
-        let assignment_source: String = self.conn.query_row("select source from tape_pool_assignments where tape_uuid = ?1 order by seq desc limit 1", params![tape_uuid.as_slice()], |r|r.get(0)).optional().map_err(|e|sqlite_error("capture reset assignment source",e))?.unwrap_or_else(|| "rule".into());
-        let pool_id = if assignment_source == "operator" {
-            tape.pool_id.clone()
-        } else {
-            derive_tape_pool_from_voltag(source_voltag, pool_rules).map(str::to_string)
-        };
-        Ok(CatalogResetPreservedTape {
-            tape_uuid,
-            voltag: source_voltag.to_string(),
-            kind: tape.kind,
-            pool_id,
-            assignment_source,
-            voltag_source: tape.voltag_source,
-            cartridge_generation: tape.cartridge_generation,
-            generation_source: tape.generation_source,
-            assignment_generation,
-            geometry,
-            restore_ready,
-        })
-    }
-
-    /// Restore previously validated reset rows into a newly created empty
-    /// catalog. All counters and write/finalization projections remain clear.
-    pub(crate) fn restore_catalog_reset_tapes(
-        &mut self,
-        tapes: &[CatalogResetPreservedTape],
-    ) -> Result<(), StateError> {
-        let updated_at = now_utc()?;
-        let tx = projection_transaction(&mut self.conn)
-            .map_err(|err| sqlite_error("begin catalog reset tape restore", err))?;
-        for tape in tapes {
-            let geometry = tape.geometry.as_ref();
-            let assignment_event = tape.pool_id.is_some() || tape.assignment_source == "operator";
-            let initial_generation = tape.assignment_generation - i64::from(assignment_event);
-            tx.execute(
-                "insert into tapes(
-                   tape_uuid, voltag, pool_id, assignment_generation, kind,
-                   cleaning_uses, cleaning_state, block_size, scheme_id,
-                   data_blocks_per_stripe, parity_blocks_per_stripe,
-                   stripes_per_neighborhood, highest_protected_ordinal,
-                   total_committed_ordinals, last_committed_tape_file,
-                   written_extent_lba, finalization_progress, finalization_trigger,
-                   finalization_operation_id, finalization_edition_digest,
-                   finalization_layout_digest, completed_replicas,
-                   finalization_outcome, state, updated_at_utc, voltag_source, cartridge_generation, generation_source
-                 ) values(
-                   ?1, ?2, null, ?4, ?5,
-                   case when ?5 = 'cleaning' then 0 else null end,
-                   case when ?5 = 'cleaning' then 'unverified' else null end,
-                   ?6, ?7, ?8, ?9, ?10,
-                   X'0000000000000000', X'0000000000000000', null,
-                   null, null, null, null, null, null, null, null, 'ready', ?12, ?13, ?14, ?15
-                 )",
-                params![
-                    tape.tape_uuid.as_slice(),
-                    tape.voltag.as_str(),
-                    tape.pool_id.as_deref(),
-                    initial_generation,
-                    tape.kind.as_str(),
-                    geometry.map(|value| value.block_size),
-                    geometry.and_then(|value| value.scheme_id.as_deref()),
-                    geometry.and_then(|value| value.data_blocks_per_stripe),
-                    geometry.and_then(|value| value.parity_blocks_per_stripe),
-                    geometry.and_then(|value| value.stripes_per_neighborhood),
-                    if tape.restore_ready {
-                        "ready"
-                    } else {
-                        "recovery_required"
-                    },
-                    updated_at.as_str(),
-                    tape.voltag_source.map(LabelProvenance::as_str),
-                    tape.cartridge_generation.as_deref(), tape.generation_source.as_deref(),
-                ],
-            )
-            .map_err(|err| sqlite_error("restore catalog reset tape", err))?;
-            if assignment_event {
-                set_tape_pool_membership_tx(
-                    &tx,
-                    tape.tape_uuid,
-                    i64_to_u64(initial_generation, "assignment_generation")?,
-                    tape.pool_id.as_deref(),
-                    (&tape.assignment_source, "catalog-reset"),
-                    &updated_at,
-                    AssignmentWrite::Change,
-                )?;
-            }
-            if !tape.restore_ready {
-                tx.execute(
-                    "update tapes set state = 'recovery_required' where tape_uuid = ?1",
-                    params![tape.tape_uuid.as_slice()],
-                )
-                .map_err(|e| sqlite_error("restore reset recovery requirement", e))?;
-            }
-        }
-        tx.commit()
-            .map_err(|err| sqlite_error("commit catalog reset tape restore", err))?;
-        Ok(())
-    }
-
-    /// Update the existing append-recovery projection without creating an I/O fence.
-    /// Sealed, retired, and terminal-finalizing tapes cannot be reopened here.
-    pub fn set_append_recovery_required(
-        &mut self,
-        tape_uuid: [u8; 16],
-        required: bool,
-    ) -> Result<(), StateError> {
-        let changed = self.conn.execute(
-            "update tapes set state = ?2, updated_at_utc = ?3 where tape_uuid = ?1
-             and kind = 'data' and (state in ('ready', 'recovery_required') or (?4 and state in ('finalizing', 'ingestion_pending')))
-             and (?4 or (finalization_progress is null and finalization_trigger is null
-             and finalization_operation_id is null and finalization_outcome is null))",
-            params![tape_uuid.as_slice(), if required { "recovery_required" } else { "ready" }, now_utc()?, required],
-        ).map_err(|e| sqlite_error("update append recovery state", e))?;
-        if changed != 1 {
-            return Err(StateError::AppendRecoveryPrecondition(format!(
-                "tape {} cannot {} append recovery: requires a data tape in an admissible state{}",
-                hex_uuid(tape_uuid),
-                if required { "enter" } else { "clear" },
-                if required {
-                    ""
-                } else {
-                    " with no terminal finalization projection"
-                }
-            )));
-        }
-        Ok(())
     }
 
     /// Mark a tape closed to future writes while preserving its catalog rows.
@@ -4329,7 +3744,10 @@ impl CatalogCore {
             .map_err(|err| sqlite_error("clear idempotency projection", err))?;
         tx.execute("delete from operations", [])
             .map_err(|err| sqlite_error("clear operations projection", err))?;
-        tx.execute("delete from sessions", [])
+        // Native write-session records have no audit mirror. An audit-only
+        // refresh must not erase their rows while retaining native watermarks,
+        // since the next native catch-up would correctly skip that prefix.
+        tx.execute("delete from sessions where session_kind != 'write'", [])
             .map_err(|err| sqlite_error("clear sessions projection", err))?;
 
         let mut replay_divergences = Vec::new();
@@ -6428,20 +5846,6 @@ struct ExistingAdoptedTape {
     identity_only: bool,
 }
 
-#[derive(Clone, Copy)]
-struct BootstrapAdoptionCatalogFacts<'a> {
-    tape_uuid: [u8; 16],
-    voltag: Option<&'a str>,
-    geometry: &'a ProvisionTapeGeometry,
-    pool_id: &'a str,
-    state: AdoptedTapeState,
-    operation_id: Uuid,
-    request_fingerprint: [u8; 32],
-    provenance: LabelProvenance,
-    observation: Option<MediaObservation>,
-    assignment_source: &'a str,
-}
-
 #[derive(Clone, Debug)]
 struct PreservedTapeRow {
     tape_uuid: Vec<u8>,
@@ -6735,15 +6139,6 @@ fn provision_tape_tx(
 }
 
 /// Absence is valid; a supplied shell label must be nonempty and canonical.
-fn validate_adoption_label(label: Option<&str>) -> Result<Option<&str>, StateError> {
-    if label.is_some_and(|label| label.is_empty() || label.trim() != label) {
-        return Err(StateError::ConfigInvalid(
-            "bootstrap adoption label must be non-empty and trimmed when supplied".into(),
-        ));
-    }
-    Ok(label)
-}
-
 /// Adopted physical-tail state shared by live/audit adapters and library apply.
 /// Historical adoption cannot undo a later native seal or retirement.
 fn project_adopted_state_core(
@@ -6754,165 +6149,6 @@ fn project_adopted_state_core(
 ) -> Result<(), StateError> {
     conn.execute("update tapes set state=?2 where tape_uuid=?1 and (?3=0 or state not in ('retired','sealed','sealed_degraded'))",params![uuid,state,historical]).map_err(|e|sqlite_error("project adopted physical-tail state",e))?;
     Ok(())
-}
-
-fn adopt_bootstrap_identity_tx(
-    tx: &Connection,
-    facts: BootstrapAdoptionCatalogFacts<'_>,
-    updated_at: &str,
-) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
-    if let Some(outcome) = validate_bootstrap_identity_adoption_conn(tx, facts)? {
-        return Ok(outcome);
-    }
-
-    let pool_exists: bool = tx
-        .query_row(
-            "select exists(select 1 from tape_pools where pool_id = ?1)",
-            params![facts.pool_id],
-            |row| row.get(0),
-        )
-        .map_err(|err| sqlite_error("validate bootstrap adoption pool", err))?;
-    if !pool_exists {
-        return Err(StateError::TapeProvisionConflict(format!(
-            "bootstrap adoption pool {:?} is not projected",
-            facts.pool_id
-        )));
-    }
-
-    tx.execute(
-        "insert into tapes(
-           tape_uuid, voltag, pool_id, assignment_generation, kind,
-           block_size, scheme_id, data_blocks_per_stripe,
-           parity_blocks_per_stripe, stripes_per_neighborhood,
-           highest_protected_ordinal, total_committed_ordinals,
-           last_committed_tape_file, state, updated_at_utc
-         ) values(
-           ?1, ?2, null, 0, 'data', ?4, ?5, ?6, ?7, ?8,
-           X'0000000000000000', X'0000000000000000', null, 'ready', ?10
-         )",
-        params![
-            facts.tape_uuid.to_vec(),
-            facts.voltag,
-            facts.pool_id,
-            facts.geometry.block_size,
-            facts.geometry.scheme_id.as_deref(),
-            facts.geometry.data_blocks_per_stripe,
-            facts.geometry.parity_blocks_per_stripe,
-            facts.geometry.stripes_per_neighborhood,
-            facts.state.as_str(),
-            updated_at,
-        ],
-    )
-    .map_err(|err| sqlite_error("insert adopted Bootstrap identity", err))?;
-
-    record_media_observation_tx(tx, &facts.tape_uuid, facts.provenance, facts.observation)?;
-    set_tape_pool_membership_tx(
-        tx,
-        facts.tape_uuid,
-        0,
-        Some(facts.pool_id),
-        (facts.assignment_source, "bootstrap-adoption"),
-        updated_at,
-        AssignmentWrite::Change,
-    )?;
-    project_adopted_state_core(tx, &facts.tape_uuid, facts.state.as_str(), false)?;
-    Ok(AdoptBootstrapIdentityOutcome {
-        newly_adopted: true,
-        assignment_generation: 1,
-        state: facts.state,
-        operation_id: facts.operation_id,
-        request_fingerprint: facts.request_fingerprint,
-    })
-}
-
-fn validate_bootstrap_identity_adoption_conn(
-    conn: &rusqlite::Connection,
-    facts: BootstrapAdoptionCatalogFacts<'_>,
-) -> Result<Option<AdoptBootstrapIdentityOutcome>, StateError> {
-    if facts.operation_id.is_nil() {
-        return Err(StateError::TapeProvisionConflict(
-            "Bootstrap adoption operation_id must not be nil".to_string(),
-        ));
-    }
-    if facts.tape_uuid[6] >> 4 != 4 || facts.tape_uuid[8] & 0xc0 != 0x80 {
-        return Err(StateError::TapeProvisionConflict(
-            "Bootstrap tape UUID must be an RFC 4122 UUIDv4".to_string(),
-        ));
-    }
-    let by_uuid = query_adopted_tape_conn(
-        conn,
-        "where tapes.tape_uuid = ?1",
-        params![facts.tape_uuid.to_vec()],
-    )?;
-    let by_voltag =
-        query_adopted_tape_conn(conn, "where tapes.voltag = ?1", params![facts.voltag])?;
-
-    if let (Some(by_uuid), Some(by_voltag)) = (&by_uuid, &by_voltag) {
-        if by_uuid.tape_uuid != by_voltag.tape_uuid {
-            return Err(StateError::TapeProvisionConflict(format!(
-                "Bootstrap UUID {} and barcode {} resolve to different catalog identities",
-                Uuid::from_bytes(facts.tape_uuid),
-                facts.voltag.unwrap_or("unlabelled")
-            )));
-        }
-    }
-
-    let Some(existing) = by_uuid.or(by_voltag) else {
-        return Ok(None);
-    };
-    if existing.state == "retired" {
-        return Err(StateError::TapeProvisionConflict(format!(
-            "Bootstrap identity {} is retired; retired identities are permanent",
-            Uuid::from_slice(&existing.tape_uuid)
-                .map_err(|error| StateError::IndexCorrupt(format!("invalid tape UUID: {error}")))?
-        )));
-    }
-    let evidence: (Option<String>, Option<String>, Option<String>) = conn.query_row(
-        "select voltag_source, cartridge_generation, generation_source from tapes where tape_uuid=?1",
-        params![existing.tape_uuid.as_slice()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))
-    ).map_err(|e|sqlite_error("validate adoption media evidence",e))?;
-    let same_media = evidence.0.as_deref() == facts.voltag.map(|_| facts.provenance.as_str())
-        && facts.observation.is_none_or(|o| {
-            evidence.1.as_deref() == Some(o.generation.media_code())
-                && evidence.2.as_deref() == Some(o.source.as_str())
-        });
-    let assignment_source: Option<String> = conn
-        .query_row(
-            "select source from tape_pool_assignments where tape_uuid=?1 order by seq desc limit 1",
-            params![existing.tape_uuid.as_slice()],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| sqlite_error("validate adoption assignment authority", e))?;
-    // A repeated adoption must not silently discard new explicit pool intent.
-    // Evolved assignment authority is changed by assign-pool, not adoption.
-    let same_assignment =
-        facts.assignment_source != "operator" || assignment_source.as_deref() == Some("operator");
-    let exact_identity = same_media
-        && same_assignment
-        && existing.tape_uuid == facts.tape_uuid.to_vec()
-        && existing.voltag.as_deref() == facts.voltag
-        && existing.kind == "data"
-        && existing.geometry.as_ref() == Some(facts.geometry)
-        && existing.pool_id.as_deref() == Some(facts.pool_id)
-        && existing.state == facts.state.as_str()
-        && existing.identity_only;
-    if !exact_identity {
-        return Err(StateError::TapeProvisionConflict(format!(
-            "Bootstrap identity {} barcode {} conflicts with existing {} catalog row",
-            Uuid::from_bytes(facts.tape_uuid),
-            facts.voltag.unwrap_or("unlabelled"),
-            existing.kind
-        )));
-    }
-
-    Ok(Some(AdoptBootstrapIdentityOutcome {
-        newly_adopted: false,
-        assignment_generation: i64_to_u64(existing.assignment_generation, "assignment_generation")?,
-        state: facts.state,
-        operation_id: facts.operation_id,
-        request_fingerprint: facts.request_fingerprint,
-    }))
 }
 
 fn query_adopted_tape_conn<P>(
@@ -7505,6 +6741,7 @@ fn merge_preserved_tape_operator_columns_tx(
                  seal_due = case when ?15 in ('sealed', 'retired', 'finalized', 'finalized_degraded') then null else ?19 end,
                  state =
                    case
+                     when state in ('sealed', 'finalized', 'finalized_degraded') and ?15 = 'ready' then state
                      when ?15 in (
                        'ready', 'sealed', 'retired', 'finalizing',
                        'finalized', 'finalized_degraded', 'recovery_required'
@@ -8726,6 +7963,15 @@ fn project_session_record(tx: &Connection, record: &AuditRecord) -> Result<(), S
     } else {
         session_kind
     };
+    // Native sessions own write state on both live projection and rebuild.
+    // A legacy ending without its kind must not overwrite an existing native row.
+    let native_session: bool = tx.query_row(
+        "select exists(select 1 from sessions where session_id = ?1 and session_kind = 'write')",
+        [session_id.to_string()], |row| row.get(0),
+    ).map_err(|err| sqlite_error("check native session owner", err))?;
+    if session_kind == "write" || record.subject.kind == "write" || native_session {
+        return Ok(());
+    }
     project_session_core(
         tx,
         SessionProjection {
@@ -10855,16 +10101,20 @@ fn set_tape_pool_membership_tx(
         {
             return Ok(());
         }
-        if finalization_progress.is_some()
-            || matches!(
-                state.as_str(),
-                "finalizing"
-                    | "finalized"
-                    | "sealed"
-                    | "retired"
-                    | "finalized_degraded"
-                    | "recovery_required"
-            )
+        // A recorded assignment was admitted before the native terminal state
+        // now visible during rebuild. Replay restores that accepted generation;
+        // only a new live change must consult today's finalization guard.
+        if !matches!(mode, AssignmentWrite::Replay { .. })
+            && (finalization_progress.is_some()
+                || matches!(
+                    state.as_str(),
+                    "finalizing"
+                        | "finalized"
+                        | "sealed"
+                        | "retired"
+                        | "finalized_degraded"
+                        | "recovery_required"
+                ))
         {
             return Err(StateError::TapePoolAssignmentConflict(format!(
                 "tape {} is {state}; pool assignment is frozen",
@@ -10896,7 +10146,7 @@ fn set_tape_pool_membership_tx(
             next_generation,
             pool_id,
             updated_at_utc,
-            true,
+            !matches!(mode, AssignmentWrite::Replay { .. }),
         )?;
         if changed != 1 {
             return Err(StateError::TapePoolAssignmentConflict(format!(
@@ -12796,76 +12046,6 @@ fn configure_read_only_sqlite(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
-fn prepare_catalog_reset_atomic_swap_conn(conn: &Connection) -> Result<(), StateError> {
-    let (_busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = conn
-        .query_row("pragma wal_checkpoint(truncate)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .map_err(|err| sqlite_error("checkpoint catalog reset sqlite WAL", err))?;
-    conn.pragma_update(None, "journal_mode", "DELETE")
-        .map_err(|err| sqlite_error("set catalog reset sqlite journal mode", err))?;
-    Ok(())
-}
-
-fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
-    let optional_u64 = |index, field| -> Result<Option<u64>, StateError> {
-        let value: Option<i64> = row_get(row, index, field)?;
-        value
-            .map(|value| {
-                u64::try_from(value).map_err(|_| {
-                    StateError::IndexCorrupt(format!(
-                        "legacy catalog reset field {field} is negative"
-                    ))
-                })
-            })
-            .transpose()
-    };
-    let optional_u32 = |index, field| -> Result<Option<u32>, StateError> {
-        optional_u64(index, field)?
-            .map(|value| {
-                u32::try_from(value).map_err(|_| {
-                    StateError::IndexCorrupt(format!(
-                        "legacy catalog reset field {field} exceeds u32"
-                    ))
-                })
-            })
-            .transpose()
-    };
-    let assignment_generation =
-        optional_u64(10, "tapes.assignment_generation")?.ok_or_else(|| {
-            StateError::IndexCorrupt(
-                "legacy catalog reset assignment_generation is null".to_string(),
-            )
-        })?;
-    Ok(TapeRecord {
-        highest_protected_ordinal: 0,
-        last_verified_at_utc: None,
-        last_verification_state: None,
-        last_verified_edition_digest: None,
-        seal_due: None,
-        tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
-        voltag: row_get(row, 1, "tapes.voltag")?,
-        voltag_source: Some(LabelProvenance::Changer),
-        cartridge_generation: None,
-        generation_source: None,
-        kind: row_get(row, 2, "tapes.kind")?,
-        pool_id: row_get(row, 3, "tapes.pool_id")?,
-        assignment_generation,
-        body_format: None,
-        block_size: optional_u64(5, "tapes.block_size")?,
-        scheme_id: row_get(row, 6, "tapes.scheme_id")?,
-        data_blocks_per_stripe: optional_u32(7, "tapes.data_blocks_per_stripe")?,
-        parity_blocks_per_stripe: optional_u32(8, "tapes.parity_blocks_per_stripe")?,
-        stripes_per_neighborhood: optional_u32(9, "tapes.stripes_per_neighborhood")?,
-        last_committed_tape_file: None,
-        total_committed_ordinals: 0,
-        written_extent_lba: None,
-        terminal_finalization: None,
-        state: row_get(row, 4, "tapes.state")?,
-        updated_at_utc: String::new(),
-    })
-}
-
 fn parse_label_source(value: Option<String>) -> Result<Option<LabelProvenance>, StateError> {
     match value.as_deref() {
         None => Ok(None),
@@ -12876,6 +12056,13 @@ fn parse_label_source(value: Option<String>) -> Result<Option<LabelProvenance>, 
 }
 
 /// Add evidence and backfill only once, within the schema migration savepoint.
+const ENDPOINT_PROJECTIONS: [(&str, &str, &str); 4] = [
+    ("media_readiness_ops", "library_serial", "drive_element"),
+    ("sessions", "library_serial", "drive_bay"),
+    ("drives", "last_library_serial", "last_element_address"),
+    ("drive_events", "library_serial", "element_address"),
+];
+
 fn migrate_standalone_evidence(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
         .map_err(|e| sqlite_error("install replay cursors", e))?;
@@ -12998,12 +12185,7 @@ fn migrate_standalone_evidence(conn: &Connection) -> Result<(), StateError> {
         conn.execute_batch(MINIMUM_SCHEMA)
             .map_err(|e| sqlite_error("restore readiness indexes", e))?;
     }
-    for (table, serial, bay) in [
-        ("media_readiness_ops", "library_serial", "drive_element"),
-        ("sessions", "library_serial", "drive_bay"),
-        ("drives", "last_library_serial", "last_element_address"),
-        ("drive_events", "library_serial", "element_address"),
-    ] {
+    for (table, serial, bay) in ENDPOINT_PROJECTIONS {
         ensure_column(conn, table, "endpoint_key", "endpoint_key text")?;
         let rows = {
             let mut stmt = conn.prepare(&format!("select rowid, {serial}, {bay} from {table} where {serial} is not null and {bay} is not null")).map_err(|e| sqlite_error("prepare endpoint backfill", e))?;
@@ -13023,15 +12205,31 @@ fn migrate_standalone_evidence(conn: &Connection) -> Result<(), StateError> {
         for (rowid, serial, bay) in rows {
             conn.execute(&format!("update {table} set endpoint_key = ?2 where rowid = ?1 and endpoint_key is null"), params![rowid, DriveKey::new(serial, bay).encode()]).map_err(|e| sqlite_error("backfill endpoint", e))?;
         }
-        // Legacy library projections continue to write their original columns;
-        // derive their collision-free key in the same statement/transaction.
+    }
+    refresh_endpoint_triggers(conn)?;
+    // Tape fences have always been keyed by UUID. Record an endpoint when known;
+    // never fabricate a bay for historical fences that have no endpoint evidence.
+    ensure_column(conn, "tape_io_fences", "endpoint_key", "endpoint_key text")?;
+    Ok(())
+}
+
+/// Refresh only endpoint DDL on already migrated catalogs; never re-run data
+/// backfills or ledger seeding when repairing the current trigger definition.
+fn refresh_endpoint_triggers(conn: &Connection) -> Result<(), StateError> {
+    for (table, serial, bay) in ENDPOINT_PROJECTIONS {
+        // Derive a legacy key only when coordinates actually change and no new
+        // explicit endpoint was supplied. A replay upsert may name unchanged,
+        // stale bay columns beside a standalone key; it must preserve that key.
         conn.execute_batch(&format!("create trigger if not exists {table}_endpoint_insert after insert on {table}
             when new.endpoint_key is null and new.{serial} is not null and new.{bay} is not null
             begin update {table} set endpoint_key = json_object('kind','bay','library_serial',new.{serial},'bay',new.{bay}) where rowid = new.rowid; end;
             drop trigger if exists {table}_endpoint_update;
             create trigger {table}_endpoint_update after update of {serial}, {bay} on {table}
-            when (new.{serial} is not null and new.{bay} is not null)
-              or (new.endpoint_key is old.endpoint_key and json_extract(new.endpoint_key, '$.kind') = 'bay')
+            when new.endpoint_key is old.endpoint_key
+              and (new.endpoint_key is null or json_extract(new.endpoint_key, '$.kind') = 'bay')
+              and (new.{serial} is not old.{serial} or new.{bay} is not old.{bay})
+              and ((new.{serial} is not null and new.{bay} is not null)
+                or json_extract(new.endpoint_key, '$.kind') = 'bay')
             begin update {table} set endpoint_key = case
                 when new.{serial} is not null and new.{bay} is not null
                 then json_object('kind','bay','library_serial',new.{serial},'bay',new.{bay})
@@ -13039,9 +12237,6 @@ fn migrate_standalone_evidence(conn: &Connection) -> Result<(), StateError> {
             create index if not exists {table}_endpoint_idx on {table}(endpoint_key);"))
             .map_err(|e| sqlite_error("install endpoint projection", e))?;
     }
-    // Tape fences have always been keyed by UUID. Record an endpoint when known;
-    // never fabricate a bay for historical fences that have no endpoint evidence.
-    ensure_column(conn, "tape_io_fences", "endpoint_key", "endpoint_key text")?;
     Ok(())
 }
 
@@ -13159,6 +12354,21 @@ drop table object_instances_legacy;"#)
         .map_err(|err| sqlite_error("migrate object instances", err))
 }
 
+/// Complete the cleaning binding projection shape on predecessor catalogs.
+/// These nullable fields were absent before delayed binding was retained; do not
+/// invent a selection for historical rows. Subsequent projection fills these
+/// fields; the final cutover replaces legacy projections by authority rebuild.
+fn migrate_cleaning_binding_columns(conn: &Connection) -> Result<(), StateError> {
+    ensure_column(conn, "library_cleaning_runs", "cartridge", "cartridge blob")?;
+    ensure_column(
+        conn,
+        "library_cleaning_runs",
+        "home_slot",
+        "home_slot integer",
+    )?;
+    Ok(())
+}
+
 fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
@@ -13174,6 +12384,10 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
         )));
     }
     if current == SCHEMA_VERSION {
+        // Refuse a spoofed version/noncanonical base before extending its shape.
+        validate_unsigned_structural_schema(conn)?;
+        migrate_cleaning_binding_columns(conn)?;
+        refresh_endpoint_triggers(conn)?;
         conn.execute_batch(tape_log_projection::SCHEMA)
             .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
         conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
@@ -13187,7 +12401,9 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             conn.execute_batch(super::apply::SCHEMA)
                 .map_err(|e| sqlite_error("migrate library projection bookkeeping", e))?;
         }
+        migrate_cleaning_binding_columns(conn)?;
         migrate_object_instances(conn)?;
+        refresh_endpoint_triggers(conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| sqlite_error("advance library projection schema", e))?;
         conn.execute(
@@ -14518,7 +13734,6 @@ mod tests {
             .unwrap();
         Connection::open(index.path()).unwrap().execute_batch("alter table tapes drop column last_verified_at_utc; alter table tapes drop column last_verification_state; alter table tapes drop column last_verified_edition_digest; PRAGMA user_version = 20;").unwrap();
         drop(index);
-        assert!(crate::projector::read_legacy_catalog_reset_erase_source(&path).is_ok());
         assert!(crate::projector::open(&path)
             .map(|catalog| catalog.write_handle())
             .unwrap_err()
@@ -14528,7 +13743,7 @@ mod tests {
         conn.execute_batch("alter table tapes drop column block_size;")
             .unwrap();
         drop(conn);
-        assert!(crate::projector::read_legacy_catalog_reset_erase_source(&path).is_err());
+        assert!(crate::projector::open(&path).is_err());
     }
 
     /// Checkpoint replay is the sole source of new obligations; legacy cache rows
@@ -16736,6 +15951,7 @@ mod tests {
                 barcode: Some("AOX030L9".to_string()),
                 source_slot: Some(0x03eb),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "planned".to_string(),
                 state: "planned".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -16756,6 +15972,7 @@ mod tests {
 
         let becoming = index
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id,
                 phase: Some("readiness_poll".to_string()),
                 state: "media_initializing".to_string(),
@@ -16802,6 +16019,7 @@ mod tests {
 
         index
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id,
                 phase: Some("readiness_poll".to_string()),
                 state: "timeout_unknown".to_string(),
@@ -16830,6 +16048,7 @@ mod tests {
 
         index
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id,
                 phase: Some("ready".to_string()),
                 state: "ready".to_string(),
@@ -16888,6 +16107,7 @@ mod tests {
                 barcode: Some("AOX031L9".to_string()),
                 source_slot: None,
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "planned".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -16896,6 +16116,7 @@ mod tests {
             })
             .expect("record operation");
         let transition = |state: &str, opcode: Option<u8>| MediaReadinessTransitionInput {
+            completion_evidence: None,
             operation_id,
             phase: Some("test".to_string()),
             state: state.to_string(),
@@ -16961,6 +16182,7 @@ mod tests {
                 barcode: Some("AOX031L9".to_string()),
                 source_slot: None,
                 media_generation: Some(9),
+                media_family: None,
                 phase: "planned".to_string(),
                 state: "planned".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -17083,6 +16305,7 @@ mod tests {
                 barcode: Some("AOX032L9".to_string()),
                 source_slot: Some(0x03ed),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "media_initializing".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -17145,6 +16368,7 @@ mod tests {
                 barcode: Some("AOX033L9".to_string()),
                 source_slot: Some(0x03ee),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "transport_unknown".to_string(),
                 dirty_scope: Some("selected-library-snapshot".to_string()),
@@ -17161,6 +16385,7 @@ mod tests {
         );
         index
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id: library_scope_operation,
                 phase: Some("released".to_string()),
                 state: "released".to_string(),
@@ -17194,6 +16419,7 @@ mod tests {
                 barcode: Some("AOX034L9".to_string()),
                 source_slot: Some(0x03ef),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "transport_unknown".to_string(),
                 dirty_scope: None,
@@ -17210,6 +16436,7 @@ mod tests {
         );
         index
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id: missing_scope_operation,
                 phase: Some("released".to_string()),
                 state: "released".to_string(),
@@ -17233,6 +16460,7 @@ mod tests {
 
         index
             .record_media_readiness_transition(MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id,
                 phase: Some("ready".to_string()),
                 state: "ready".to_string(),
@@ -22571,6 +21799,112 @@ mod tests {
         );
     }
 
+    /// Legacy coordinate maintenance cannot replace a typed standalone key;
+    /// genuine legacy bay moves still update and clear their derived key.
+    #[test]
+    fn endpoint_trigger_preserves_explicit_identity_and_tracks_legacy_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let index = crate::projector::open(root.path().join("index.sqlite"))
+            .unwrap()
+            .write_handle();
+        let conn = Connection::open(index.path()).unwrap();
+        let standalone = DriveKey::Standalone {
+            drive_serial: "DIRECT".into(),
+        }
+        .encode();
+        let bay = DriveKey::new("LIB001", 256).encode();
+        for (id, key) in [
+            ("standalone", &standalone),
+            ("bay", &bay),
+            ("explicit", &bay),
+        ] {
+            conn.execute("insert into sessions(session_id,session_kind,library_serial,drive_bay,state,opened_at_utc,updated_at_utc,endpoint_key) values(?1,'write','LIB001',256,'open','now','now',?2)", params![id,key]).unwrap();
+        }
+        let endpoint = |id: &str| {
+            conn.query_row(
+                "select endpoint_key from sessions where session_id=?1",
+                [id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        conn.execute("update sessions set library_serial='STALE',drive_bay=999 where session_id='standalone'", []).unwrap();
+        assert_eq!(endpoint("standalone"), Some(standalone.clone()));
+        conn.execute(
+            "update sessions set library_serial='LIB002',drive_bay=257 where session_id='bay'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(endpoint("bay"), Some(DriveKey::new("LIB002", 257).encode()));
+        conn.execute(
+            "update sessions set library_serial=null,drive_bay=null where session_id='bay'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(endpoint("bay"), None);
+        conn.execute("update sessions set library_serial='STALE',drive_bay=999,endpoint_key=?1 where session_id='explicit'", [&standalone]).unwrap();
+        assert_eq!(endpoint("explicit"), Some(standalone));
+    }
+
+    /// Current-version catalogs may still contain the predecessor trigger.
+    /// Reopen repairs its DDL without replaying row/assignment backfills.
+    #[test]
+    fn current_schema_refreshes_legacy_endpoint_trigger_without_changing_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index.sqlite");
+        drop(crate::projector::open(&path).unwrap());
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(include_str!("../../tests/fixtures/schema25.sql"))
+            .unwrap();
+        let old: String = legacy
+            .query_row(
+                "select sql from sqlite_master where name='sessions_endpoint_update'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let standalone = DriveKey::Standalone {
+            drive_serial: "DIRECT".into(),
+        }
+        .encode();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("drop trigger sessions_endpoint_update")
+                .unwrap();
+            conn.execute_batch(&old).unwrap();
+            conn.execute("insert into sessions(session_id,session_kind,library_serial,drive_bay,state,opened_at_utc,updated_at_utc,endpoint_key) values('retained','write','STALE',256,'open','then','then',?1)", [&standalone]).unwrap();
+        }
+        for _ in 0..2 {
+            let catalog = crate::projector::open(&path).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            let row: (String, u16, String, String) = conn.query_row("select library_serial,drive_bay,state,endpoint_key from sessions where session_id='retained'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(
+                row,
+                ("STALE".into(), 256, "open".into(), standalone.clone())
+            );
+            let new: String = conn
+                .query_row(
+                    "select sql from sqlite_master where name='sessions_endpoint_update'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_ne!(new, old);
+            conn.execute("update sessions set library_serial=library_serial,drive_bay=drive_bay where session_id='retained'", []).unwrap();
+            let key: String = conn
+                .query_row(
+                    "select endpoint_key from sessions where session_id='retained'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(key, standalone);
+            drop(conn);
+            drop(catalog);
+        }
+    }
+
     #[test]
     fn audit_replay_projects_operations_sessions_and_idempotency() {
         let temp = tempfile::Builder::new()
@@ -23425,7 +22759,16 @@ mod tests {
         let preserved: Vec<_> = tables
             .iter()
             .map(|table| {
-                let query = format!("select * from {table} order by rowid");
+                // Compare every predecessor column by name: a migration may
+                // add nullable fields without changing any historical value.
+                let columns: Vec<String> = conn
+                    .prepare(&format!("pragma table_info({table})"))
+                    .unwrap()
+                    .query_map([], |r| r.get(1))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                let query = format!("select {} from {table} order by rowid", columns.join(","));
                 let rows = migration_rows(&conn, &query);
                 // Every library table introduced by schema 25 is populated, as are
                 // all tape bookkeeping tables already present in schema 24.
@@ -23471,6 +22814,16 @@ mod tests {
             .unwrap(),
             b"26"
         );
+        assert!(table_column_exists(&conn, "library_cleaning_runs", "cartridge").unwrap());
+        assert!(table_column_exists(&conn, "library_cleaning_runs", "home_slot").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "select count(*) from library_cleaning_runs where cartridge is not null or home_slot is not null",
+                [], |r| r.get::<_, u64>(0),
+            ).unwrap(),
+            0,
+            "migration must not invent historical cartridge or slot selections",
+        );
         assert!(!table_column_exists(&conn, "object_instances", "pool_id").unwrap());
         assert!(!table_exists(&conn, "object_copies").unwrap());
         let pool: String = conn.query_row("select t.pool_id from object_instances i join tapes t using(tape_uuid) where i.tape_file_number=X'FFFFFFFFFFFFFFFF'", [], |r| r.get(0)).unwrap();
@@ -23487,6 +22840,53 @@ mod tests {
         for (query, rows) in &preserved {
             assert_eq!(&migration_rows(&conn, query), rows);
         }
+    }
+
+    /// A catalog opened before the binding fix can already advertise schema 26.
+    /// Its missing nullable fields must be repaired once, with old bytes retained
+    /// and later selected bindings preserved on subsequent opens.
+    #[test]
+    fn current_schema_repairs_missing_cleaning_bindings_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.sqlite");
+        drop(crate::projector::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "alter table library_cleaning_runs drop column home_slot;
+             alter table library_cleaning_runs drop column cartridge;
+             insert into library_cleaning_runs values('run',X'0000000000000003',X'00FF06');",
+        )
+        .unwrap();
+        drop(crate::projector::open(&path).unwrap());
+        assert_eq!(
+            migration_rows(
+                &conn,
+                "select begin_sequence,body,cartridge,home_slot from library_cleaning_runs"
+            ),
+            vec![vec![
+                rusqlite::types::Value::Blob(3_u64.to_be_bytes().to_vec()),
+                rusqlite::types::Value::Blob(vec![0, 255, 6]),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Null,
+            ]],
+        );
+        conn.execute(
+            "update library_cleaning_runs set cartridge=?1,home_slot=42",
+            [vec![7_u8; 16]],
+        )
+        .unwrap();
+        let before = migration_rows(&conn, "select * from library_cleaning_runs");
+        drop(crate::projector::open(&path).unwrap());
+        assert_eq!(
+            migration_rows(&conn, "select * from library_cleaning_runs"),
+            before
+        );
+        let fresh = root.path().join("fresh.sqlite");
+        drop(crate::projector::open(&fresh).unwrap());
+        assert_eq!(
+            migration_schema(&conn),
+            migration_schema(&Connection::open(fresh).unwrap())
+        );
     }
 
     /// B4b-1 schema 25 already contains populated library projection bookkeeping.

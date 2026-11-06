@@ -191,11 +191,14 @@ fn complete_model_tail(
             index
         },
         crate::write_owner::ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                state.audit_dir.as_ref(),
+                true,
+                &state.audit_append_lock,
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_ref(),
-            audit_dir: state.audit_dir.as_ref(),
-            audit_fsync: true,
-            audit_append_lock: &state.audit_append_lock,
         },
         Some("OWN001L9"),
         request,

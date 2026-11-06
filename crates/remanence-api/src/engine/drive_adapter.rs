@@ -73,7 +73,7 @@ impl Owner {
         let joined = self.thread.join();
         let refresh = self
             .state
-            .refresh_audit_append_cursor()
+            .catch_up_authority_projection()
             .map_err(|e| ActorFailure::from(crate::status_from_state_error(e)));
         // state.lock is released only after join, including failure and panic paths.
         if let Err(panic) = joined {
@@ -312,7 +312,7 @@ impl MountedDrive {
         acknowledge: &str,
         confirm: impl FnOnce(&str, &[String]) -> std::result::Result<(), String>,
     ) -> std::result::Result<Vec<String>, crate::MountError> {
-        self.standalone_write_admission()?;
+        self.standalone_tail_recovery_admission()?;
         crate::standalone_write::supersede(
             &self.client,
             &mut self
@@ -332,6 +332,61 @@ impl MountedDrive {
         self.standalone_write_admission()?;
         self.finalize(request)
             .map_err(crate::standalone_write::legacy_status)
+    }
+
+    /// Explicit tail recovery may cross only its exact typed suffix fences.
+    /// Endpoint and unrelated tape quarantines retain the ordinary refusal.
+    fn standalone_tail_recovery_admission(&mut self) -> std::result::Result<(), crate::MountError> {
+        use remanence_state::library_log as lib;
+        let owner = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| crate::mount_support::refusal("mounted drive finished"))?;
+        let runtime = owner.state.library_runtime();
+        runtime
+            .ensure_motion_allowed()
+            .map_err(crate::mount_support::refusal)?;
+        let tape = runtime.tape_state(self.client.tape_uuid).ok_or_else(|| {
+            crate::mount_support::refusal("tail recovery requires Reprovision authority")
+        })?;
+        let row = owner
+            .state
+            .catalog()
+            .get_tape(&self.client.tape_uuid)
+            .map_err(crate::mount_support::refusal)?;
+        let mut conflicts = owner
+            .state
+            .catalog()
+            .tape_io_admission_conflicts(
+                &self.client.tape_uuid,
+                row.as_ref().and_then(|r| r.voltag.as_deref()),
+            )
+            .map_err(crate::mount_support::refusal)?;
+        conflicts.extend(
+            owner
+                .state
+                .catalog()
+                .list_active_tape_io_fences()
+                .map_err(crate::mount_support::refusal)?
+                .into_iter()
+                .filter(|f| f.endpoint.as_ref() == Some(&self.client.endpoint)),
+        );
+        for fence in conflicts {
+            let allowed = fence
+                .quarantine_id
+                .strip_prefix("library:")
+                .and_then(|n| n.parse::<u64>().ok())
+                .and_then(|n| runtime.active_fence(n))
+                .is_some_and(|raise| {
+                    raise.scope == lib::FenceScope::Tape(tape.tape)
+                        && raise.kind == lib::FenceKind::Write
+                        && raise.cause == lib::FenceCause::SessionSuffixContradiction
+                });
+            if !allowed {
+                return self.standalone_write_admission();
+            }
+        }
+        Ok(())
     }
 
     /// Preserve standalone quarantine guidance before dispatching a terminal command.
@@ -563,7 +618,7 @@ impl MountedCommands {
         }
         self.reconcile_checkpoints(state)?;
         state
-            .refresh_audit_append_cursor()
+            .catch_up_authority_projection()
             .map_err(|e| ActorFailure::from(crate::status_from_state_error(e)))?;
         let pool_cfg = state
             .config()
@@ -813,6 +868,7 @@ pub(crate) fn mounted_config(
     })?;
     let c = state.config();
     Ok(write_owner::WriteOwnerConfig {
+        authority: write_owner::TerminalAuthority::Typed(state.library_runtime()),
         catalog: state.projection_client(),
         index_path: state.paths().sqlite_path.clone(),
         report: remanence_library::DiscoveryReport {
@@ -823,9 +879,6 @@ pub(crate) fn mounted_config(
             warnings: vec![],
         },
         policy,
-        audit_dir: state.paths().audit_dir.clone(),
-        audit_fsync: c.audit.fsync,
-        audit_append_lock: Arc::new(Mutex::new(())),
         reservations: Arc::new(Default::default()),
         placement: write_owner::ActorPlacement::Mounted(write_owner::MountedDriveContext {
             endpoint,

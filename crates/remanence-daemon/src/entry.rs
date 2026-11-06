@@ -114,8 +114,15 @@ pub async fn main_entry_with_registry(
     // offline-maintenance mutex. It prevents a second daemon on another socket
     // (or a direct state mutator) from racing SQLite, checkpoint recovery, or
     // the hash-chained audit append sequence.
+    let state_paths = remanence_state::StatePaths::from_config(&args.config, &config);
+    if let Err(error) =
+        remanence_state::authority_manifest::AuthorityManifest::preflight(&state_paths)
+    {
+        stderr_message!("error: authority layout: {error}");
+        return ExitCode::from(1);
+    }
     let _state_lock = match remanence_state::StateLockGuard::acquire(&config.daemon.state_dir) {
-        Ok(lock) => lock,
+        Ok(lock) => std::sync::Arc::new(lock),
         Err(error) => {
             stderr_message!(
                 "error: acquire daemon state ownership {}: {error}",
@@ -130,12 +137,24 @@ pub async fn main_entry_with_registry(
         return ExitCode::from(1);
     }
 
+    let library = match remanence_state::library_runtime::LibraryRuntime::open(
+        &state_paths,
+        config.audit.fsync,
+        _state_lock.clone(),
+    ) {
+        Ok(library) => library,
+        Err(error) => {
+            stderr_message!("error: open library authority: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
     let socket_path = args
         .socket
         .unwrap_or_else(|| config.daemon.socket_path_or_default());
 
     let index = match remanence_state::projector::open(&config.index.sqlite_path) {
-        Ok(index) => index,
+        Ok(index) => index.with_library_runtime(library),
         Err(error) => {
             stderr_message!(
                 "error: open index {}: {error}",

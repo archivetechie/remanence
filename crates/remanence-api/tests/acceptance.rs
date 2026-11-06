@@ -21,6 +21,7 @@ use remanence_chaos::model::{
 use remanence_library::transport::TransferOutcome;
 use remanence_library::{DiscoveryReport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass};
 use remanence_parity::{bootstrap::write_bootstrap_block, parse_parity_arg, ParityConfig};
+use remanence_state::AuditSink as _;
 use remanence_state::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSubject, RemConfig, SourceLayer, StateHandle,
     StatePaths,
@@ -262,8 +263,8 @@ impl Rig {
             } else {
                 "no-parity"
             };
-            state
-                .audit()
+            remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::System,
                     source_layer: SourceLayer::Layer4,
@@ -312,8 +313,8 @@ impl Rig {
             write_bootstrap_block(&payload, &mut block).unwrap();
             tape.records[0] = Record::Block(block);
             world.put_tape_in_slot(SLOT + 1, barcode(n + 10), tape);
-            state
-                .audit()
+            remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
+                .unwrap()
                 .append(AuditEventRecord {
                     actor: AuditActor::System,
                     source_layer: SourceLayer::Layer4,
@@ -839,8 +840,8 @@ fn daemon_startup_leaves_standalone_session_open() {
     let id = uuid::Uuid::new_v4();
     {
         let mut state = StateHandle::open_with_config(paths, config.clone()).unwrap();
-        state
-            .audit()
+        remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
+            .unwrap()
             .append(AuditEventRecord {
                 actor: AuditActor::System,
                 source_layer: SourceLayer::Layer5,

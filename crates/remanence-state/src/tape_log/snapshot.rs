@@ -247,7 +247,11 @@ impl Captured {
     }
     pub(super) fn validate(self) -> Result<Snapshot, StoreError> {
         let (summary, tail, metrics, plan_base) = self.fold()?;
-        if self.file.is_some() && summary.is_fresh() && tail == Tail::Complete {
+        if self.file.is_some()
+            && summary.is_fresh()
+            && tail == Tail::Complete
+            && self.end != self.start
+        {
             return Err(StoreError::Refused(
                 "active log has no closed initialization",
             ));
@@ -285,6 +289,16 @@ pub struct ReplayMetrics {
     /// Maximum incremental catalog-validator heap retained at frame boundaries.
     pub peak_catalog_bytes: usize,
 }
+/// Exact native counterpart for a dependent library decision. Continuations are
+/// never counterparts, even when their enclosing group has closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordEvidence {
+    /// Native discriminator, checked by the library fold where required.
+    pub kind: Tag,
+    /// SHA-256 of the full frame's prefix, structural and payload bytes.
+    pub digest: [u8; 32],
+}
+
 /// Fully trust-validated immutable prefix. Provisional rows never escape visitors.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -300,6 +314,19 @@ pub struct Snapshot {
     capture_time: std::time::Duration,
 }
 impl Snapshot {
+    /// Identity of the pinned native source, used to reject an old inode after
+    /// an explicit authority repair atomically replaces the file.
+    pub(crate) fn file_identity(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        use std::os::unix::fs::MetadataExt;
+        self.file
+            .as_ref()
+            .map(|file| {
+                file.metadata()
+                    .map(|m| (m.dev(), m.ino()))
+                    .map_err(StoreError::from)
+            })
+            .transpose()
+    }
     /// Measurements of the full validation pass performed outside the lock.
     pub fn replay_metrics(&self) -> ReplayMetrics {
         self.metrics
@@ -315,6 +342,54 @@ impl Snapshot {
     /// Bounded fold including check provenance and finalization references.
     pub fn summary(&self) -> &TapeSummary {
         &self.summary
+    }
+    /// Hash the exact validated immutable header of an existing log. A factory
+    /// for an absent log is not evidence of an empty prefix (ruling 19 / D10).
+    pub fn header_digest(&self) -> Result<Option<[u8; 32]>, StoreError> {
+        use sha2::{Digest, Sha256};
+        let Some(file) = &self.file else {
+            return Ok(None);
+        };
+        let mut reader = PrefixReader {
+            file: file.clone(),
+            position: 0,
+            end: self.start,
+        };
+        let length = Header::read(&mut reader, &self.header)?;
+        let mut bytes = vec![0; length as usize];
+        file.read_exact_at(&mut bytes, 0)?;
+        Ok(Some(Sha256::digest(bytes).into()))
+    }
+    /// Read one closing record from this frozen prefix, retaining at most one
+    /// frame. A missing sequence or a continuation has no authoritative proof.
+    /// Full frames are required: row scans may omit payload bytes. I/O and byte
+    /// corruption remain errors, never absence. Acquiring a snapshot does not
+    /// replace the writer's obligation to finish a successful native sync before
+    /// appending a dependent decision; ambiguous leases cannot yield snapshots.
+    pub fn record_evidence(&self, sequence: u64) -> Result<Option<RecordEvidence>, StoreError> {
+        if sequence == 0 || sequence > self.summary.last_closed_sequence {
+            return Ok(None);
+        }
+        if let Some(mut decoder) = self.decoder() {
+            while let Some(frame) = decoder.next_frame()? {
+                if frame.sequence == sequence {
+                    return Ok(
+                        (!matches!(frame.record, Record::PayloadContinuation(_))).then(|| {
+                            RecordEvidence {
+                                kind: frame.record.tag(),
+                                digest: super::codec::record_digest(&frame),
+                            }
+                        }),
+                    );
+                }
+            }
+        }
+        // A validated prefix must contain every sequence through its closed end.
+        // A later short read must not turn into a missing-record contradiction.
+        Err(StoreError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "native evidence disappeared from a validated snapshot",
+        )))
     }
     /// Bind a projection checkpoint to exact frozen bytes using bounded memory.
     pub(crate) fn projection_prefix_digest(&self, end: u64) -> Result<[u8; 32], StoreError> {
@@ -358,11 +433,20 @@ impl Snapshot {
     /// The bounded summary holds only its group reference, never these files.
     pub fn visit_last_session_tail(
         &self,
-        mut visitor: impl FnMut(&TailFile) -> Result<(), StoreError>,
+        visitor: impl FnMut(&TailFile) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let Some(end) = &self.summary.last_session_end else {
             return Ok(());
         };
+        self.visit_session_tail_group(end, visitor)
+    }
+    /// Stream an ending's already validated group, including an EOD refinement
+    /// that names the earlier ending's exact original tail reference.
+    pub(crate) fn visit_session_tail_group(
+        &self,
+        end: &super::SessionEnded,
+        mut visitor: impl FnMut(&TailFile) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let Some(file) = &self.file else {
             return Ok(());
         };
@@ -446,6 +530,53 @@ impl Snapshot {
         }
         Ok(())
     }
+    /// Visit only frames appended after a prefix already validated by the same
+    /// process owner. Explicit repair must discard that owner's progress mark.
+    pub(crate) fn visit_frames_after(
+        &self,
+        through: u64,
+        end: u64,
+        mut visitor: impl FnMut(&Frame<'_>) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        if through == 0 {
+            return self.visit_frames(visitor);
+        }
+        if through > self.summary.last_closed_sequence
+            || end > self.summary.closed_end
+            || end < self.start
+        {
+            return Err(StoreError::Refused(
+                "invalid native acknowledgement progress",
+            ));
+        }
+        if through == self.summary.last_closed_sequence {
+            return if end == self.summary.closed_end {
+                Ok(())
+            } else {
+                Err(StoreError::Refused(
+                    "native acknowledgement progress mismatch",
+                ))
+            };
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or(StoreError::Refused("missing native acknowledgement prefix"))?;
+        let mut decoder = Decoder::at(
+            PrefixReader {
+                file: file.clone(),
+                position: end,
+                end: self.summary.closed_end,
+            },
+            through + 1,
+            end,
+        );
+        while let Some(frame) = decoder.next_frame()? {
+            visitor(&frame)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn before(&self, sequence: u64) -> Result<Self, StoreError> {
         if let Some((first, summary)) = &self.plan_base {
             if *first == sequence {

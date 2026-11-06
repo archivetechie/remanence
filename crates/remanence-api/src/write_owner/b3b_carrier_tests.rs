@@ -414,7 +414,7 @@ fn check_settle_audit(scenario: &str) {
     let fences = index.list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "transfer_error");
-    let records = FileAuditLog::replay(&cfg.audit_dir).unwrap();
+    let records = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).unwrap();
     assert_eq!(
         records
             .iter()
@@ -498,7 +498,7 @@ fn mounted_message_failure(
     let fences = index.list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "transfer_error");
-    let records = FileAuditLog::replay(&cfg.audit_dir).unwrap();
+    let records = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).unwrap();
     assert_eq!(
         records
             .iter()
@@ -790,7 +790,7 @@ fn b3b_mounted_definite_rejection_no_fence() {
     );
     assert!(result.is_err());
     assert!(index.list_active_tape_io_fences().unwrap().is_empty());
-    assert!(FileAuditLog::replay(&cfg.audit_dir)
+    assert!(FileAuditLog::replay(&cfg.fixture_audit().audit_dir)
         .unwrap()
         .iter()
         .all(|r| r.event != AuditEvent::TapeIoFenceRaised));
@@ -1073,12 +1073,15 @@ fn b3b_fix1_terminal_prefix_eom_fence_precedes_recovery() {
         })
         .unwrap();
     let cfg = crate::write_owner::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::fixture(
+            None,
+            root.path().join("audit"),
+            true,
+            &(Arc::new(Mutex::new(()))),
+        ),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024).unwrap(),
         mounted_endpoint: None,
         checkpoint_journal_dir: root.path().join("tapes"),
-        audit_dir: root.path().join("audit"),
-        audit_fsync: true,
-        audit_append_lock: Arc::new(Mutex::new(())),
     };
     let mut lease = remanence_state::authority::fixtures::AuthorityBuilder::new(
         &cfg.checkpoint_journal_dir,

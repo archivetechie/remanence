@@ -103,13 +103,25 @@ impl Drop for Entered {
 /// Cloneable owner of the process's single writable connection to a catalog.
 #[derive(Clone, Debug)]
 pub struct ProjectionClient {
+    library: Option<crate::library_runtime::LibraryRuntime>,
     core: Arc<SharedCore>,
     path: PathBuf,
 }
 impl ProjectionClient {
+    /// Carry the shared library authority to peers of this existing catalog.
+    /// The projector worker's private client has no authority back-reference.
+    pub fn with_library_runtime(mut self, library: crate::library_runtime::LibraryRuntime) -> Self {
+        self.library = Some(library);
+        self
+    }
+    /// Shared authority, absent only in isolated projection/test constructors.
+    pub fn library_runtime(&self) -> Option<crate::library_runtime::LibraryRuntime> {
+        self.library.clone()
+    }
     /// Issue a fresh writer with no readiness observer.
     pub fn write_handle(&self) -> CatalogIndex {
         CatalogIndex {
+            library: self.library.clone(),
             core: self.core.clone(),
             path: self.path.clone(),
             readiness_observer: None,
@@ -124,11 +136,17 @@ impl ProjectionClient {
 /// Writer capability issued only by a projector client; no constructor or clone.
 #[derive(Debug)]
 pub struct CatalogIndex {
+    library: Option<crate::library_runtime::LibraryRuntime>,
     core: Arc<SharedCore>,
     path: PathBuf,
     readiness_observer: Option<Arc<dyn MediaReadinessObserver>>,
 }
 impl CatalogIndex {
+    /// Authority capability from the state owner; absent on read-only readers
+    /// and isolated projection fixtures. No global path-based registry is used.
+    pub fn library_runtime(&self) -> Option<crate::library_runtime::LibraryRuntime> {
+        self.library.clone()
+    }
     /// Subscribe only this handle to durable readiness changes.
     pub fn set_readiness_observer(&mut self, observer: Arc<dyn MediaReadinessObserver>) {
         self.readiness_observer = Some(observer);
@@ -164,6 +182,7 @@ impl Deref for CatalogReader {
 impl CatalogReader {
     fn from_core(core: CatalogCore, path: PathBuf) -> Self {
         Self(CatalogIndex {
+            library: None,
             core: SharedCore::new(core),
             path,
             readiness_observer: None,
@@ -210,6 +229,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<ProjectionClient, StateError> {
     let path = path.as_ref();
     if path == Path::new(":memory:") {
         return Ok(ProjectionClient {
+            library: None,
             core: SharedCore::new(CatalogCore::open(path)?),
             path: path.to_path_buf(),
         });
@@ -235,29 +255,14 @@ pub fn open(path: impl AsRef<Path>) -> Result<ProjectionClient, StateError> {
         }
     };
     Ok(ProjectionClient {
+        library: None,
         core,
         path: path.to_path_buf(),
     })
 }
 
-/// Reset-only compatible predecessor reader; ordinary readers keep their gates.
-pub(crate) fn open_reset_source(path: &Path) -> Result<CatalogReader, StateError> {
-    Ok(CatalogReader::from_core(
-        CatalogCore::open_reset_source(path)?,
-        path.to_path_buf(),
-    ))
-}
-
-/// The replacement has its own registry key until the existing atomic swap.
-pub(crate) fn open_reset_replacement(path: &Path) -> Result<CatalogIndex, StateError> {
-    Ok(open(path)?.write_handle())
-}
-
 /// Serialize the reset's special checkpoint opener with ordinary catalog opens.
-pub(crate) fn prepare_admitted_catalog_reset_source_atomic_swap(
-    path: impl AsRef<Path>,
-    version: u32,
-) -> Result<(), StateError> {
+pub(crate) fn ensure_reset_catalog_idle(path: impl AsRef<Path>) -> Result<(), StateError> {
     let path = path.as_ref();
     let key = registry_key(path)?;
     let registry = REGISTRY
@@ -273,14 +278,7 @@ pub(crate) fn prepare_admitted_catalog_reset_source_atomic_swap(
             "catalog reset refused while a shared catalog connection is live".into(),
         ));
     }
-    CatalogCore::prepare_admitted_catalog_reset_source_atomic_swap(path, version)
-}
-
-/// Exact-erase legacy reader remains confined to the reset path.
-pub(crate) fn read_legacy_catalog_reset_erase_source(
-    path: impl AsRef<Path>,
-) -> Result<(u32, Vec<index::TapeRecord>), StateError> {
-    CatalogCore::read_legacy_catalog_reset_erase_source(path)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -289,6 +287,7 @@ mod b4a_tests;
 #[cfg(test)]
 pub(crate) fn memory_projection_fixture() -> CatalogIndex {
     CatalogIndex {
+        library: None,
         core: SharedCore::new(CatalogCore::memory_projection_fixture()),
         path: PathBuf::from(":memory:"),
         readiness_observer: None,

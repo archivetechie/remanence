@@ -282,11 +282,14 @@ fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
         !preflight_automatic_terminal_completion(
             &mut index,
             ManualFinalizePreflightConfig {
+                authority: crate::write_owner::TerminalAuthority::fixture(
+                    None,
+                    temp.path(),
+                    false,
+                    &audit_append_lock
+                ),
                 mounted_endpoint: None,
                 checkpoint_journal_dir: &checkpoint_dir,
-                audit_dir: temp.path(),
-                audit_fsync: false,
-                audit_append_lock: &audit_append_lock,
             },
             &selected,
             &pool_cfg,
@@ -1005,11 +1008,14 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
     assert!(preflight_automatic_terminal_completion(
         &mut index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                temp.path(),
+                false,
+                &audit_append_lock
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &temp.path().join("tapes"),
-            audit_dir: temp.path(),
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         &selected,
         &pool_cfg,
@@ -3204,6 +3210,7 @@ fn session_open_refuses_active_media_readiness_fence_before_drive_probe() {
             barcode: Some("AOX030L9".to_string()),
             source_slot: Some(0x03eb),
             media_generation: Some(9),
+            media_family: None,
             phase: "readiness_poll".to_string(),
             state: "media_initializing".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
@@ -3389,6 +3396,7 @@ fn record_unthreaded_readiness_operation(
             barcode: Some("UNT001L9".to_string()),
             source_slot: Some(0x0400),
             media_generation: Some(9),
+            media_family: None,
             phase: "readiness_poll".to_string(),
             state: "media_initializing".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
@@ -3745,6 +3753,7 @@ async fn resume_readiness_rpc_without_inventory_sends_no_load() {
             barcode: None,
             source_slot: None,
             media_generation: Some(9),
+            media_family: None,
             phase: "readiness_poll".to_string(),
             state: "media_initializing".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
@@ -4135,6 +4144,12 @@ fn test_write_owner_config(
     let checkpoint_journal_dir = index_path.parent().unwrap().join("tapes");
     std::fs::create_dir_all(&checkpoint_journal_dir).unwrap();
     WriteOwnerConfig {
+        authority: crate::write_owner::TerminalAuthority::fixture(
+            None,
+            &audit_dir,
+            false,
+            &Arc::new(std::sync::Mutex::new(())),
+        ),
         catalog: remanence_state::projector::open(&(index_path)).unwrap(),
         index_path,
         report: DiscoveryReport {
@@ -4145,9 +4160,6 @@ fn test_write_owner_config(
             warnings: Vec::new(),
         },
         policy: remanence_library::StaticAllowlist::new([serial.as_str()]),
-        audit_dir,
-        audit_fsync: false,
-        audit_append_lock: Arc::new(std::sync::Mutex::new(())),
         reservations: Arc::new(HashMap::new()),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
@@ -5190,7 +5202,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
     cfg.checkpoint_max_objects = 1;
     cfg.checkpoint_max_age_seconds = 3600;
-    let audit_append_lock = Arc::clone(&cfg.audit_append_lock);
+    let audit_append_lock = Arc::clone(&cfg.fixture_audit().audit_append_lock);
     let drive = library
         .open_drive(0x0100, &policy)
         .expect("open model drive");
@@ -5289,11 +5301,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let rejected = preflight_manual_finalize_tape(
         &mut rejected_index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &audit_dir,
+                false,
+                &audit_append_lock,
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
-            audit_dir: &audit_dir,
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         Some(barcode),
         &mut impossible,
@@ -5331,11 +5346,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
         let error = super::terminal_finalize::preflight_manual_finalize_cancellable(
             &mut rejected_index,
             ManualFinalizePreflightConfig {
+                authority: crate::write_owner::TerminalAuthority::fixture(
+                    None,
+                    &audit_dir,
+                    false,
+                    &audit_append_lock,
+                ),
                 mounted_endpoint: None,
                 checkpoint_journal_dir: &checkpoint_dir,
-                audit_dir: &audit_dir,
-                audit_fsync: false,
-                audit_append_lock: &audit_append_lock,
             },
             Some(barcode),
             &mut request.clone(),
@@ -5371,11 +5389,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let crash_error = preflight_manual_finalize_tape(
         &mut crash_index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &audit_dir,
+                false,
+                &audit_append_lock,
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
-            audit_dir: &audit_dir,
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         Some(barcode),
         &mut request.clone(),
@@ -5416,11 +5437,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     assert!(preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &audit_dir,
+                false,
+                &audit_append_lock
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
-            audit_dir: &audit_dir,
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         Some(barcode),
         &mut recovered_request,
@@ -5506,11 +5530,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     assert!(preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &audit_dir,
+                false,
+                &audit_append_lock
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
-            audit_dir: &audit_dir,
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         Some(barcode),
         &mut provisional_retry,
@@ -5541,11 +5568,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let changed = preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &audit_dir,
+                false,
+                &audit_append_lock,
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
-            audit_dir: &audit_dir,
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         Some(barcode),
         &mut changed_request,
@@ -5558,9 +5588,8 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
         "changed retry conflict must issue zero drive commands"
     );
 
-    retry_index
-        .set_append_recovery_required(tape_uuid, true)
-        .unwrap();
+    // The retained native manual plan itself refuses ordinary append;
+    // no obsolete SQL recovery flag is needed to manufacture that exclusion.
     let before_open = world.lock().unwrap().command_log.len();
     let (reply, rx) = oneshot::channel();
     drive_tx
@@ -5703,11 +5732,14 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let repaired = preflight_manual_finalize_tape(
         &mut host_index,
         ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &audit_dir,
+                false,
+                &audit_append_lock,
+            ),
             mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
-            audit_dir: &audit_dir,
-            audit_fsync: false,
-            audit_append_lock: &audit_append_lock,
         },
         Some(barcode),
         &mut host_retry,
@@ -6405,6 +6437,12 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
     let changer = handle.into_changer();
     let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
     let cfg = WriteOwnerConfig {
+        authority: crate::write_owner::TerminalAuthority::fixture(
+            None,
+            temp.path().join("audit"),
+            false,
+            &(Arc::new(std::sync::Mutex::new(()))),
+        ),
         catalog: remanence_state::projector::open(&index_path).unwrap(),
         index_path: index_path.clone(),
         report: DiscoveryReport {
@@ -6415,9 +6453,6 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
             warnings: Vec::new(),
         },
         policy,
-        audit_dir: temp.path().join("audit"),
-        audit_fsync: false,
-        audit_append_lock: Arc::new(std::sync::Mutex::new(())),
         reservations: Arc::new(HashMap::new()),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
@@ -6899,6 +6934,27 @@ fn failure_snapshots_are_keyed_by_failing_session() {
         &mut misses,
     );
 
+    // The old producer preserves the first snapshot but separately observes
+    // a stronger cleaning obligation from a later sample of the same key.
+    world.lock().unwrap().set_drive_alert(0x0100, 20);
+    record_session_snapshot(
+        &mut index,
+        &cfg,
+        &mut drive,
+        Some(drive_uuid.clone()),
+        append_session,
+        tape_uuid,
+        "append-failure",
+        &mut misses,
+    );
+    assert_eq!(
+        index
+            .get_drive_by_uuid(&drive_uuid)
+            .unwrap()
+            .unwrap()
+            .cleaning_due,
+        "now"
+    );
     let rows = index
         .list_drive_health_snapshots(&drive_uuid)
         .expect("list failure snapshots");
@@ -7895,7 +7951,7 @@ fn periodic_cleaning_defers_on_busy_drive_and_now_fences_after_session_end() {
         &busy_library,
         busy_snapshot,
     );
-    std::fs::create_dir_all(&busy_cfg.audit_dir).expect("create audit dir");
+    std::fs::create_dir_all(&busy_cfg.fixture_audit().audit_dir).expect("create audit dir");
 
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry.register(Uuid::new_v4(), "cleaning");
@@ -7991,7 +8047,7 @@ fn periodic_cleaning_defers_on_busy_drive_and_now_fences_after_session_end() {
         &now_library,
         now_snapshot,
     );
-    std::fs::create_dir_all(&now_cfg.audit_dir).expect("create audit dir");
+    std::fs::create_dir_all(&now_cfg.fixture_audit().audit_dir).expect("create audit dir");
 
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry.register(Uuid::new_v4(), "cleaning");
@@ -8055,7 +8111,7 @@ fn no_cln_cart_branch_unfences_drive_and_raises_alarm() {
         &library,
         snapshot,
     );
-    std::fs::create_dir_all(&cfg.audit_dir).expect("create audit dir");
+    std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).expect("create audit dir");
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry.register(Uuid::new_v4(), "cleaning");
     let mut library = library;
@@ -8149,7 +8205,7 @@ fn cleaning_frequency_cap_refuses_before_fence_or_run() {
             snapshot,
         )
     };
-    std::fs::create_dir_all(&cfg.audit_dir).expect("create audit dir");
+    std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).expect("create audit dir");
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry.register(Uuid::new_v4(), "cleaning");
     let mut library = library;
@@ -8233,7 +8289,7 @@ fn inventory_only_cleaning_cart_is_recognized_before_fast_eject() {
         &library,
         snapshot,
     );
-    std::fs::create_dir_all(&cfg.audit_dir).expect("create audit dir");
+    std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).expect("create audit dir");
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry.register(Uuid::new_v4(), "cleaning");
     let mut library = library;
@@ -8706,7 +8762,8 @@ fn reconcile_unreadable_bootstrap_uses_catalog_hints() {
             let registry = crate::operations::OperationRegistry::default();
             let operation = registry.register(Uuid::new_v4(), "reconcile_tape");
             super::reconcile::reconcile_loaded_tape(index, cfg, drive, RANGE_TAPE_UUID, operation);
-            let audit = FileAuditLog::replay(&cfg.audit_dir).expect("reconcile audit");
+            let audit =
+                FileAuditLog::replay(&cfg.fixture_audit().audit_dir).expect("reconcile audit");
             assert!(
                 audit
                     .iter()
@@ -8799,7 +8856,8 @@ fn catalog_recovery_paths_refuse_readable_bootstrap_disagreement() {
             let registry = crate::operations::OperationRegistry::default();
             let operation = registry.register(Uuid::new_v4(), "reconcile_tape");
             super::reconcile::reconcile_loaded_tape(index, cfg, drive, RANGE_TAPE_UUID, operation);
-            let audit = FileAuditLog::replay(&cfg.audit_dir).expect("reconcile audit");
+            let audit =
+                FileAuditLog::replay(&cfg.fixture_audit().audit_dir).expect("reconcile audit");
             assert!(audit
                 .iter()
                 .any(|record| record.event == AuditEvent::OperationFailed));
@@ -8939,7 +8997,7 @@ fn assert_catalog_recovery_refusal(
         RANGE_TAPE_UUID,
         registry.register(operation_id, "reconcile_tape"),
     );
-    let audit = FileAuditLog::replay(&cfg.audit_dir).expect("audit");
+    let audit = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).expect("audit");
     let failed = audit
         .iter()
         .find(|record| record.event == AuditEvent::OperationFailed)
@@ -11540,6 +11598,7 @@ async fn detached_verification_waits_for_load_drive_release() {
             barcode: Some("VERIFY001L9".into()),
             source_slot: Some(0x400),
             media_generation: Some(9),
+            media_family: None,
             phase: "load_drive_readiness".into(),
             state: "becoming_ready".into(),
             dirty_scope: Some("drive+tape".into()),
@@ -12744,7 +12803,7 @@ async fn magazine_eviction_scenario(
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    std::fs::create_dir_all(&cfg.audit_dir).unwrap();
+    std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).unwrap();
     let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     let board = crate::live_status::ChangerWaitBoard::default();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -12799,7 +12858,7 @@ async fn magazine_eviction_scenario(
         remanence_state::projector::open(&index_path).unwrap(),
         cfg.tape_pools.clone(),
     );
-    api.audit_dir = Arc::new(cfg.audit_dir.clone());
+    api.audit_dir = Arc::new(cfg.fixture_audit().audit_dir.clone());
     api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
     api.changer_waits = board.clone();
@@ -12972,7 +13031,7 @@ async fn changer_actor_move_wait_stops_for_a_gone_caller_and_skips_during_shutdo
             &library,
             library_snapshot_cell(library.library().clone()),
         );
-        std::fs::create_dir_all(&cfg.audit_dir).unwrap();
+        std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).unwrap();
         remanence_state::projector::open(&cfg.index_path)
             .map(|catalog| catalog.write_handle())
             .unwrap();
@@ -13186,7 +13245,7 @@ pub(crate) async fn unload_adopted_cartridge(
     pool.park_cartridge(seated.clone());
     let mut api =
         crate::ApiState::new(remanence_state::projector::open(&state.paths().sqlite_path).unwrap());
-    api.audit_dir = Arc::new(cfg.audit_dir.clone());
+    api.audit_dir = Arc::new(cfg.fixture_audit().audit_dir.clone());
     api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
     api.drive_idle_unload_seconds = 1;
@@ -13265,7 +13324,7 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1, "predecessor length={length:?}");
         assert_eq!(fences[0].reason, "SessionSuffixContradiction");
-        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
+        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.fixture_audit().audit_dir);
         assert!(world
             .lock()
             .unwrap()
@@ -13318,7 +13377,7 @@ fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].reason, "SessionSuffixContradiction");
-        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
+        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.fixture_audit().audit_dir);
         let evidence: serde_json::Value =
             serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
         assert_eq!(evidence["phase"], "append_admission");
@@ -13360,30 +13419,48 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
 /// Exercise the production failure handlers without a recoverable terminal intent.
 fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
     let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::projector::open(root.path().join("index.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[daemon]
+state_dir="{0}"
+default_idle_timeout_seconds=1800
+[journal]
+dir="{0}/journals"
+require_trusted_volume=false
+[audit]
+dir="{0}/audit"
+[index]
+sqlite_path="{0}/index.sqlite"
+[cache]
+tape_catalog_dir="{0}/cache"
+"#,
+            root.path().display()
+        ),
+    )
+    .unwrap();
+    let mut state = StateHandle::open_from_config_file(&config).unwrap();
     let uuid = [0x68; 16];
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: uuid,
-            voltag: "FENCE001".into(),
-            block_size: 4096,
-            parity: ParityConfig::None,
-            force: false,
-        })
+    state
+        .provision_tape_with_media(
+            ProvisionTapeInput {
+                tape_uuid: uuid,
+                voltag: "FENCE001L9".into(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            remanence_state::MediaObservation::label_hint("FENCE001L9"),
+        )
         .unwrap();
+    let mut index = state.projection_client().write_handle();
     let cfg = super::terminal_types::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::Typed(state.library_runtime()),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: {
-            let p = root.path().join("tapes");
-            std::fs::create_dir_all(&p).unwrap();
-            p
-        },
-        audit_dir: root.path().join("audit"),
-        audit_fsync: true,
-        audit_append_lock: Arc::new(Mutex::new(())),
+        checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
     };
     let mut lease = remanence_state::authority::fixtures::AuthorityBuilder::new(
         &cfg.checkpoint_journal_dir,
@@ -13445,11 +13522,13 @@ fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
         return;
     }
     assert_eq!(fences.len(), 1);
-    assert!(fences[0]
-        .evidence_json
-        .as_deref()
-        .unwrap()
-        .contains("terminal write fails"));
+    assert!(
+        fences[0]
+            .evidence_json
+            .as_deref()
+            .is_some_and(|evidence| evidence.contains("terminal write fails")),
+        "durable terminal fence must retain the original failure diagnostic: {fences:?}"
+    );
 }
 
 /// Tape and endpoint scopes both stop actual changer dispatch admission, then release in place.
@@ -13573,7 +13652,7 @@ async fn two_tape_sessions_checkpoint_concurrently() {
         let snapshot = library_snapshot_cell(library.library().clone());
         let mut cfg =
             test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
-        cfg.audit_append_lock = audit_lock.clone();
+        cfg.fixture_audit_mut().audit_append_lock = audit_lock.clone();
         cfg.write_admissions = admissions.clone();
         cfg.checkpoint_max_objects = 1;
         let drive = library.open_drive(0x0100, &cfg.policy).unwrap();
@@ -13920,3 +13999,1680 @@ mod b3b_golden_tests;
 
 #[path = "b4a_tests.rs"]
 mod b4a_tests;
+
+/// A real finite readiness owner carries its original source facts through the
+/// actual SSC gate and ready probe. Replaying without SQL retains that chain.
+#[test]
+fn typed_readiness_owner_closes_actual_load_and_preserves_source_facts() {
+    run_typed_readiness_owner_source_case(true, false);
+}
+
+/// A representable finite owner uses the same writer-minted operation for its
+/// registry, every observation and the actual LOAD/Done chain.
+#[test]
+fn typed_finite_readiness_source_owner_preserves_load_chain() {
+    run_typed_readiness_owner_source_case(false, false);
+}
+
+/// An actual CHECK CONDITION retains its intent budget and closes that command
+/// as Failed; the source contains no successful readiness confirmation.
+#[test]
+fn typed_finite_readiness_failed_load_retains_intent_budget() {
+    run_typed_readiness_owner_source_case(false, true);
+}
+
+struct ReadinessFailedLoad {
+    inner: ModelTransport,
+    dispatched: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl SgTransport for ReadinessFailedLoad {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        buf: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_in(cdb, buf)
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        buf: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        if cdb.first() == Some(&0x1b) && cdb.get(4).is_some_and(|value| value & 1 != 0) {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+            return Err(remanence_library::ScsiError::CheckCondition {
+                sense: readiness_fixed_sense(5, 0x24, 0),
+                bytes_transferred: 0,
+            });
+        }
+        self.inner.execute_none(cdb)
+    }
+}
+
+fn run_typed_readiness_owner_source_case(with_legacy_metadata: bool, failed_load: bool) {
+    use remanence_state::{
+        library_log as lib, library_runtime::LibraryRuntime, StateLockGuard, StatePaths,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let paths = StatePaths {
+        config_path: root.path().join("config"),
+        state_dir: root.path().join("state"),
+        audit_dir: root.path().join("library"),
+        journal_dir: root.path().join("native"),
+        sqlite_path: root.path().join("catalog.sqlite"),
+        tape_cache_dir: root.path().join("cache"),
+        calibration_dir: root.path().join("calibration"),
+    };
+    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
+    let library_uuid = runtime.manifest().library_uuid();
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime.clone());
+    let mut index = catalog.write_handle();
+    let (world, mut library) = unthreaded_cartridge_world("LIB-TYPED-READY");
+    let failed_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    if failed_load {
+        let model = world.lock().unwrap().library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new(["LIB-TYPED-READY"]);
+        library = model
+            .open_with(&policy, {
+                let world = world.clone();
+                let dispatched = failed_dispatches.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(ReadinessFailedLoad {
+                        inner: ModelTransport::new(world.clone(), role),
+                        dispatched: dispatched.clone(),
+                    }))
+                }
+            })
+            .unwrap();
+    }
+    library.set_motion_authority(Arc::new(runtime.clone()));
+    let policy = remanence_library::StaticAllowlist::new(["LIB-TYPED-READY"]);
+    let mut drive = library.open_drive(0x0100, &policy).unwrap();
+    let operation_id = Uuid::from_bytes(
+        runtime
+            .start_owned_operation(
+                lib::OperationKind::MediaReadinessWait,
+                remanence_state::AuditActor::System,
+            )
+            .unwrap(),
+    );
+    let owner = index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB-TYPED-READY", 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: with_legacy_metadata.then(|| "DRV-UNTHREADED".into()),
+            barcode: Some("UNT001L9".into()),
+            source_slot: with_legacy_metadata.then_some(0x0400),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "readiness_poll".into(),
+            state: "planned".into(),
+            dirty_scope: Some("selected-library-snapshot".into()),
+            deadline_at_utc: Some(
+                (time::OffsetDateTime::now_utc() + time::Duration::seconds(60))
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            ),
+            evidence_path: None,
+        })
+        .unwrap();
+    assert_eq!(Uuid::parse_str(&owner.operation_id).unwrap(), operation_id);
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation_id, "media_readiness_wait");
+    let poll = poll_drive_media_readiness(
+        &mut index,
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family: MediaFamily::Lto9OrLater,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: StdDuration::from_secs(1),
+                poll_interval: StdDuration::ZERO,
+            },
+            cartridge_in_drive: true,
+            phase: "readiness_poll",
+        },
+        &handle,
+    );
+    if failed_load {
+        assert!(
+            poll.is_err(),
+            "actual LOAD refusal must fail this poll: {poll:?}"
+        );
+        assert_eq!(failed_dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(drive_load_commands(&world), 0);
+    } else {
+        assert!(poll.unwrap().readiness.is_ready());
+        assert_eq!(drive_load_commands(&world), 1);
+    }
+    assert_eq!(
+        index
+            .media_readiness_load_attempts_since_ready(operation_id)
+            .unwrap(),
+        if failed_load { 1 } else { 0 }
+    );
+    drop(drive);
+    drop(library);
+    drop(index);
+    drop(catalog);
+    drop(runtime);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", paths.sqlite_path.display()));
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
+    let row = runtime
+        .reader()
+        .unwrap()
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    if failed_load {
+        assert_ne!(row.state, "ready");
+    } else {
+        assert_eq!(row.state, "ready");
+    }
+    drop(runtime);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut readiness = Vec::new();
+    let mut intents = Vec::new();
+    let mut outcomes = Vec::new();
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+        if let Some(value) = applied.record().readiness_observation() {
+            readiness.push((applied.sequence(), value.clone()));
+        }
+        if let Some(value) = applied.record().motion_intent() {
+            intents.push((applied.sequence(), value.clone()));
+        }
+        if let Some(value) = applied.record().motion_outcome() {
+            outcomes.push((applied.sequence(), value.clone()));
+        }
+        Ok(())
+    })
+    .unwrap();
+    if failed_load {
+        assert_eq!(intents.len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1.intent.sequence, intents[0].0);
+        assert_eq!(outcomes[0].1.result, lib::MotionResult::Failed);
+        assert!(outcomes[0].1.confirmation.is_none());
+        assert!(readiness
+            .iter()
+            .all(|(_, value)| value.result != lib::ReadinessResult::Ready));
+        return;
+    }
+    assert!(
+        readiness.len() >= 3,
+        "initial owner, actual pending TUR and ready TUR are distinct source observations"
+    );
+    assert_eq!(intents.len(), 1);
+    assert_eq!(outcomes.len(), 1);
+    let (start_seq, start) = &readiness[0];
+    let (ready_seq, ready) = readiness.last().unwrap();
+    assert_eq!(ready.started_unix_ns, start.started_unix_ns);
+    assert_eq!(ready.limit_ms, start.limit_ms);
+    assert!(ready.limit_ms > 0);
+    assert_eq!(ready.scope, lib::ReadinessScope::Library);
+    assert_eq!(ready.media, Some(lib::MediumFamily::Lto(lib::LtoGen::Lto9)));
+    assert_eq!(ready.barcode.as_ref().unwrap().as_str(), "UNT001L9");
+    assert_eq!(ready.load_intent.unwrap().sequence, intents[0].0);
+    assert_eq!(
+        intents[0].1.parent_operation,
+        Some(*operation_id.as_bytes())
+    );
+    assert!(*start_seq < intents[0].0 && intents[0].0 < *ready_seq && *ready_seq < outcomes[0].0);
+    assert_eq!(outcomes[0].1.result, lib::MotionResult::Done);
+    assert_eq!(
+        outcomes[0].1.confirmation,
+        Some(lib::Confirmation::Readiness(*ready_seq))
+    );
+    assert!(ready.evidence.is_some());
+}
+
+/// Fresh READ ELEMENT STATUS resolves a restarted changer scope, without
+/// dispatching the interrupted MOVE or resolving another library's command.
+#[test]
+fn typed_startup_changer_reconciliation_precedes_new_load() {
+    use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
+    let root = tempfile::tempdir().unwrap();
+    let paths = StatePaths {
+        config_path: root.path().join("config"),
+        state_dir: root.path().join("state"),
+        audit_dir: root.path().join("library"),
+        journal_dir: root.path().join("native"),
+        sqlite_path: root.path().join("catalog.sqlite"),
+        tape_cache_dir: root.path().join("cache"),
+        calibration_dir: root.path().join("calibration"),
+    };
+    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
+    let command = MotionCommand::Move {
+        library_serial: "LIB-RESTART".into(),
+        source: 0x400,
+        destination: 0x100,
+    };
+    let other = MotionCommand::Move {
+        library_serial: "OTHER".into(),
+        source: 0x400,
+        destination: 0x100,
+    };
+    runtime.intent(&command, &MotionContext::default()).unwrap();
+    runtime.intent(&other, &MotionContext::default()).unwrap();
+    drop(runtime);
+    let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
+    let (world, mut library) = unthreaded_cartridge_world("LIB-RESTART");
+    library.set_motion_authority(Arc::new(runtime.clone()));
+    world.lock().unwrap().command_log.clear();
+    library.reconcile_startup_motion().unwrap();
+    assert!(!runtime.requires_reconciliation(&command));
+    assert!(runtime.requires_reconciliation(&other));
+    let commands = world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .map(|v| v.opcode)
+        .collect::<Vec<_>>();
+    assert!(commands.contains(&0xb8));
+    assert!(
+        !commands.iter().any(|v| matches!(v, 0xa5 | 0x1b)),
+        "startup only observes: {commands:?}"
+    );
+    let policy = remanence_library::StaticAllowlist::new(["LIB-RESTART"]);
+    let mut drive = library.open_drive(0x100, &policy).unwrap();
+    drive.load().unwrap();
+    assert_eq!(drive_load_commands(&world), 1);
+    assert!(!runtime.requires_reconciliation(&MotionCommand::Load(
+        remanence_library::DriveKey::new("LIB-RESTART", 0x100)
+    )));
+}
+
+/// The real composer returns media for a healthy typed LOAD refusal, but an
+/// actual segment append failure after MOVE prohibits every subsequent CDB.
+#[tokio::test]
+async fn typed_composed_load_refusal_returns_media_only_with_healthy_authority() {
+    use crate::pb::daemon_server::Daemon;
+    use remanence_library::motion::{LoadConfirmation, MotionAuthorityFailure, MotionContext};
+    use remanence_library::motion::{MotionAuthority, MotionCommand};
+    use remanence_state::library_log as lib;
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
+    for storage_failure in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths {
+            config_path: root.path().join("config"),
+            state_dir: root.path().join("state"),
+            audit_dir: root.path().join("library"),
+            journal_dir: root.path().join("native"),
+            sqlite_path: root.path().join("catalog.sqlite"),
+            tape_cache_dir: root.path().join("cache"),
+            calibration_dir: root.path().join("calibration"),
+        };
+        let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+        let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
+        let catalog = remanence_state::projector::open(&paths.sqlite_path)
+            .unwrap()
+            .with_library_runtime(runtime.clone());
+        let mut api = crate::ApiState::new(catalog);
+        api.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    libraries: vec![],
+                    unattached_drives: vec![],
+                    complete: true,
+                    incomplete_evidence: vec![],
+                    warnings: vec![],
+                },
+                captured_at: time::OffsetDateTime::now_utc(),
+            },
+        ))));
+        let cached = api.live_status_response_inner(true).unwrap();
+        assert_eq!(
+            cached.library_authority_health.unwrap().status,
+            crate::pb::component_health::Status::Healthy as i32
+        );
+        let mut world = VirtualWorld::single_drive("LIB-CONTINUE", 0x100, "DRV-CONTINUE", 0x400, 1);
+        world.put_tape_in_slot(0x400, "RETURN-L9", VirtualTape::default());
+        let world = Arc::new(Mutex::new(world));
+        let observed = world.lock().unwrap().library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new(["LIB-CONTINUE"]);
+        let factory_world = world.clone();
+        let library_dir = paths.audit_dir.clone();
+        let mut library = observed
+            .open_with(&policy, move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                if storage_failure
+                    && matches!(role, remanence_chaos::model::DeviceRole::Drive { .. })
+                {
+                    let segment = std::fs::read_dir(&library_dir)
+                        .unwrap()
+                        .map(|v| v.unwrap().path())
+                        .find(|v| v.extension().is_some_and(|v| v == "remlib"))
+                        .unwrap();
+                    std::fs::rename(&segment, segment.with_extension("saved")).unwrap();
+                    std::fs::create_dir(&segment).unwrap();
+                }
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            })
+            .unwrap();
+        library.set_motion_authority(Arc::new(runtime.clone()));
+        let context = MotionContext {
+            load_confirmation: if storage_failure {
+                LoadConfirmation::Inventory
+            } else {
+                LoadConfirmation::Readiness
+            },
+            ..Default::default()
+        };
+        let error = library
+            .with_motion_context(context, |library| library.load(0x400, 0x100, &policy))
+            .unwrap_err();
+        assert!(
+            matches!(&error,remanence_library::LoadError::DriveLoad(error) if matches!(&error.kind,remanence_library::DriveOpErrorKind::MotionAuthority(error) if error.kind==if storage_failure {MotionAuthorityFailure::StoreFailure}else{MotionAuthorityFailure::SemanticRefusal})),
+            "{error:?}"
+        );
+        {
+            let world = world.lock().unwrap();
+            assert_eq!(
+                world
+                    .command_log
+                    .iter()
+                    .filter(|v| v.opcode == 0xa5)
+                    .count(),
+                if storage_failure { 1 } else { 2 }
+            );
+            assert_eq!(
+                world
+                    .command_log
+                    .iter()
+                    .filter(|v| v.opcode == 0x1b)
+                    .count(),
+                if storage_failure { 0 } else { 1 }
+            );
+            assert_eq!(world.library_snapshot().slots[0].full, !storage_failure);
+            assert_eq!(runtime.motion_fenced(), storage_failure);
+        }
+        let health = api
+            .daemon_service()
+            .health(tonic::Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            health.status,
+            if storage_failure {
+                crate::pb::health_response::Status::ReadOnly
+            } else {
+                crate::pb::health_response::Status::Healthy
+            } as i32
+        );
+        for cached in [true, false] {
+            let status = api.live_status_response_inner(cached).unwrap();
+            assert_eq!(
+                status.library_authority_health.unwrap().status,
+                if storage_failure {
+                    crate::pb::component_health::Status::ReadOnly
+                } else {
+                    crate::pb::component_health::Status::Healthy
+                } as i32
+            );
+            assert!(
+                status.alarms.is_empty(),
+                "reporting the latch must not append an alarm"
+            );
+        }
+        if !storage_failure {
+            let command =
+                MotionCommand::Load(remanence_library::DriveKey::new("LIB-CONTINUE", 0x100));
+            assert!(!runtime.requires_reconciliation(&command));
+            let library_uuid = runtime.manifest().library_uuid();
+            drop(library);
+            drop(api);
+            drop(runtime);
+            let view = lib::native_view::NativeTapeView::probe(
+                &paths.journal_dir.join("tapes"),
+                &paths.sqlite_path,
+            )
+            .unwrap();
+            let mut intents = Vec::new();
+            let mut outcomes = Vec::new();
+            lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+                if let Some(v) = applied.record().motion_intent() {
+                    intents.push((applied.sequence(), v.clone()));
+                }
+                if let Some(v) = applied.record().motion_outcome() {
+                    outcomes.push((applied.sequence(), v.clone()));
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(intents.len(), 3);
+            assert_eq!(outcomes.len(), 3);
+            for ((intent_seq, _), (outcome_seq, outcome)) in intents.iter().zip(&outcomes) {
+                assert!(*intent_seq < *outcome_seq);
+                assert_eq!(outcome.result, lib::MotionResult::Done);
+                assert_eq!(outcome.intent.sequence, *intent_seq);
+            }
+            assert!(outcomes[0].0 < intents[1].0 && outcomes[1].0 < intents[2].0);
+        }
+    }
+}
+
+/// The real drive actor admits only the proven continuation return during
+/// shutdown and hands its counted guard to the subsequent physical MOVE.
+#[tokio::test]
+async fn typed_actor_continuation_return_retains_shutdown_guard_through_move() {
+    use remanence_library::motion::{LoadConfirmation, MotionAuthorityFailure, MotionContext};
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
+    let root = tempfile::tempdir().unwrap();
+    let paths = StatePaths {
+        config_path: root.path().join("config"),
+        state_dir: root.path().join("state"),
+        audit_dir: root.path().join("library"),
+        journal_dir: root.path().join("native"),
+        sqlite_path: root.path().join("catalog.sqlite"),
+        tape_cache_dir: root.path().join("cache"),
+        calibration_dir: root.path().join("calibration"),
+    };
+    let runtime = LibraryRuntime::open(
+        &paths,
+        true,
+        Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+    )
+    .unwrap();
+    let mut model = VirtualWorld::single_drive("LIB-RETURN", 0x100, "DRV-RETURN", 0x400, 1);
+    model.put_tape_in_slot(0x400, "RETURN-L9", VirtualTape::default());
+    let world = Arc::new(Mutex::new(model));
+    let mut library = open_model_library(world.clone());
+    library.set_motion_authority(Arc::new(runtime.clone()));
+    let policy = remanence_library::StaticAllowlist::new(["LIB-RETURN"]);
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+    let key = remanence_library::DriveKey::new("LIB-RETURN", 0x100);
+    let initial_guard = lifecycle.begin_motion(&key).unwrap();
+    library.move_medium(0x400, 0x100, &policy).unwrap();
+    let mut drive = library.open_drive(0x100, &policy).unwrap();
+    let error = drive
+        .with_motion_context(
+            MotionContext {
+                load_confirmation: LoadConfirmation::Readiness,
+                ..Default::default()
+            },
+            |drive| drive.load(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error.kind,remanence_library::DriveOpErrorKind::MotionAuthority(ref error) if error.kind==MotionAuthorityFailure::SemanticRefusal)
+    );
+    let mut cfg = test_write_owner_config(
+        paths.sqlite_path.clone(),
+        paths.audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime);
+    cfg.lifecycle = Some(lifecycle.clone());
+    cfg.checkpoint_journal_dir = paths.journal_dir.join("tapes");
+    let actor = spawn_drive_actor(0x100, drive, cfg);
+    {
+        let _gate = lifecycle.dismounts.lock().unwrap();
+        lifecycle
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .send(DriveCommand::Unload {
+            reply: tx,
+            continuation_return: false,
+        })
+        .await
+        .unwrap();
+    assert!(rx.await.unwrap().is_err());
+    assert_eq!(drive_load_commands(&world), 0);
+    assert_eq!(
+        lifecycle.dismounts.lock().unwrap().get(&key),
+        Some(&1),
+        "initial admitted sequence still bridges actor dispatch"
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor
+        .send(DriveCommand::Unload {
+            reply: tx,
+            continuation_return: true,
+        })
+        .await
+        .unwrap();
+    let returned = rx.await.unwrap().unwrap();
+    assert!(returned.dismount_guard.is_some());
+    assert_eq!(lifecycle.dismounts.lock().unwrap().get(&key), Some(&2));
+    drop(initial_guard);
+    let active = lifecycle.dismounts.clone();
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = observed.clone();
+    let target = key.clone();
+    library.set_audit_hook(move |event| {
+        if let remanence_library::AuditEvent::Started { cdb, .. } = event {
+            if cdb[0] == 0xa5 {
+                assert_eq!(active.lock().unwrap().get(&target), Some(&1));
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    library.move_medium(0x100, 0x400, &policy).unwrap();
+    assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(world.lock().unwrap().library_snapshot().slots[0].full);
+    drop(returned);
+    assert!(lifecycle.dismounts.lock().unwrap().is_empty());
+    assert_eq!(
+        world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .filter(|c| c.opcode == 0x1b)
+            .count(),
+        1
+    );
+    drop(actor);
+}
+
+/// Actual typed owner producers retain read-session actor provenance, sampled
+/// health and alarm state through the public state rebuild and process reopen.
+#[test]
+fn typed_owner_read_health_alarm_sources_survive_rebuild_and_reopen() {
+    use remanence_state::library_log as lib;
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[daemon]
+state_dir="{0}"
+default_idle_timeout_seconds=1800
+[journal]
+dir="{0}/journals"
+require_trusted_volume=false
+[audit]
+dir="{0}/audit"
+[index]
+sqlite_path="{0}/index.sqlite"
+[cache]
+tape_catalog_dir="{0}/cache"
+"#,
+            root.path().display()
+        ),
+    )
+    .unwrap();
+    let mut state = StateHandle::open_from_config_file(&config).unwrap();
+    let tape = [0x91; 16];
+    state
+        .provision_tape_with_media(
+            remanence_state::ProvisionTapeInput {
+                tape_uuid: tape,
+                voltag: "OWN001L9".into(),
+                block_size: 262144,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            remanence_state::MediaObservation::label_hint("OWN001L9"),
+        )
+        .unwrap();
+    let mut model = VirtualWorld::single_drive("LIB-OWNER", 0x100, "DRV-OWNER", 0x400, 1);
+    model.put_tape_in_drive(0x100, "OWN001L9", Some(0x400), VirtualTape::default());
+    let world = Arc::new(Mutex::new(model));
+    let mut library = open_model_library(world.clone());
+    let runtime = state.library_runtime();
+    let mut index = state.projection_client().write_handle();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from(["LIB-OWNER".into()]),
+    )
+    .unwrap();
+    let drive_uuid = index.list_drives(true, true).unwrap()[0].drive_uuid.clone();
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.catalog = state.projection_client();
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
+    cfg.placement =
+        crate::write_owner::ActorPlacement::Mounted(crate::write_owner::MountedDriveContext {
+            endpoint: remanence_library::DriveKey::new("LIB-OWNER", 0x100),
+            tape_uuid: tape,
+            barcode: Some("OWN001L9".into()),
+            cartridge_generation: Some(crate::LtoGen::Lto9),
+            identity_generation: 0,
+            actor: AuditActor::User("real-reader".into()),
+            audit_error: Arc::new(Mutex::new(None)),
+            audit_session: Arc::new(Mutex::new(None)),
+            direct_replay_fault: None,
+        });
+    let session = Uuid::new_v4();
+    for event in [lib::SessionEvent::Opened, lib::SessionEvent::Closed] {
+        super::actor_runtime::record_read_session(
+            &mut index,
+            &cfg,
+            super::actor_runtime::ReadSessionInput {
+                session_id: session,
+                event,
+                tape_uuid: tape,
+                endpoint: cfg.endpoint(0),
+                drive_uuid: Some(drive_uuid.clone()),
+                drive_serial: Some("DRV-OWNER".into()),
+                reason: None,
+            },
+        )
+        .unwrap();
+    }
+    let mut drive = library
+        .open_drive(
+            0x100,
+            &remanence_library::StaticAllowlist::new(["LIB-OWNER"]),
+        )
+        .unwrap();
+    let mut misses = 0;
+    for _ in 0..2 {
+        record_session_snapshot(
+            &mut index,
+            &cfg,
+            &mut drive,
+            Some(drive_uuid.clone()),
+            session,
+            tape,
+            "read-failure",
+            &mut misses,
+        );
+    }
+    assert_eq!(misses, 0);
+    let snapshots = index.list_drive_health_snapshots(&drive_uuid).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].raw_pages.as_deref(),Some(format!("{{\"tape_uuid\":\"{}\",\"tape_alert\":true,\"write_error_counter\":true,\"read_error_counter\":true}}",Uuid::from_bytes(tape)).as_str()));
+    let alarm = raise_alarm_with_evidence(
+        &mut index,
+        &cfg,
+        "owner-test",
+        "snapshot-persist-failing",
+        "warning",
+        Some("sample persistence failed"),
+    )
+    .unwrap();
+    assert_eq!(alarm.state, "open");
+    runtime
+        .append(|a, v| {
+            a.alarm_changed(
+                lib::AlarmChanged {
+                    condition_key: "owner-test".into(),
+                    change: lib::GenerationChange {
+                        expected: 1,
+                        next: 2,
+                    },
+                    action: lib::AlarmAction::Acknowledge(lib::Unit),
+                    cause: None,
+                },
+                1,
+                AuditActor::User("real-acker".into()),
+                lib::SourceLayer::Layer5,
+                v,
+            )
+        })
+        .unwrap();
+    raise_alarm_with_evidence(
+        &mut index,
+        &cfg,
+        "owner-test",
+        "snapshot-persist-failing",
+        "critical",
+        Some("second sample failed"),
+    )
+    .unwrap();
+    let refreshed = index.get_alarm("owner-test").unwrap().unwrap();
+    assert_eq!(refreshed.state, "acked");
+    assert!(refreshed
+        .acked_by
+        .as_deref()
+        .is_some_and(|v| v.contains("real-acker")));
+    clear_alarm_with_evidence(&mut index, &cfg, "owner-test").unwrap();
+    assert_eq!(
+        clear_alarm_with_evidence(&mut index, &cfg, "owner-test")
+            .unwrap()
+            .unwrap()
+            .state,
+        "cleared"
+    );
+    world.lock().unwrap().set_drive_alert(0x100, 20);
+    record_session_snapshot(
+        &mut index,
+        &cfg,
+        &mut drive,
+        Some(drive_uuid.clone()),
+        session,
+        tape,
+        "read-failure",
+        &mut misses,
+    );
+    assert_eq!(
+        misses, 1,
+        "C8-G9 repeated sample must refuse rather than silently discard new cleaning duty"
+    );
+    assert!(runtime.motion_fenced());
+    assert_eq!(
+        index
+            .get_drive_by_uuid(&drive_uuid)
+            .unwrap()
+            .unwrap()
+            .cleaning_due,
+        "none",
+        "no fabricated replacement health source"
+    );
+    state.rebuild_index_from_journals().unwrap();
+    assert_eq!(
+        index.list_drive_health_snapshots(&drive_uuid).unwrap(),
+        snapshots
+    );
+    assert_eq!(
+        index.get_alarm("owner-test").unwrap().unwrap().state,
+        "cleared"
+    );
+    let library_uuid = runtime.manifest().library_uuid();
+    let paths = state.paths().clone();
+    drop(drive);
+    drop(library);
+    drop(cfg);
+    drop(index);
+    drop(runtime);
+    drop(state);
+    let state = StateHandle::open_from_config_file(&config).unwrap();
+    assert_eq!(
+        state
+            .catalog()
+            .list_drive_health_snapshots(&drive_uuid)
+            .unwrap(),
+        snapshots
+    );
+    assert_eq!(
+        state
+            .catalog()
+            .get_alarm("owner-test")
+            .unwrap()
+            .unwrap()
+            .state,
+        "cleared"
+    );
+    drop(state);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut sessions = 0;
+    let mut health = 0;
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+        match record.record().tag() {
+            lib::Tag::SessionObserved => {
+                sessions += 1;
+                assert_eq!(
+                    record.record().envelope.actor,
+                    AuditActor::User("real-reader".into())
+                );
+            }
+            lib::Tag::DriveHealthObserved => health += 1,
+            _ => {}
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!((sessions, health), (2, 1));
+    assert_eq!(
+        world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .filter(|v| matches!(v.opcode, 0x0a | 0x10 | 0x1b | 0xa5))
+            .count(),
+        0
+    );
+}
+
+/// An unsupported collision never publishes the earlier unique member of the
+/// same snapshot and cannot dispatch motion through the already-open handle.
+#[test]
+fn typed_discovery_unsupported_batch_keeps_source_and_refuses_motion() {
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
+    for fault in ["duplicate", "blank", "historical"] {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths {
+            config_path: root.path().join("config"),
+            state_dir: root.path().join("state"),
+            audit_dir: root.path().join("library"),
+            journal_dir: root.path().join("native"),
+            sqlite_path: root.path().join("catalog.sqlite"),
+            tape_cache_dir: root.path().join("cache"),
+            calibration_dir: root.path().join("calibration"),
+        };
+        let runtime = LibraryRuntime::open(
+            &paths,
+            true,
+            Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+        )
+        .unwrap();
+        let input = |serial: &str, bay| remanence_state::DriveObservationInput {
+            serial: serial.into(),
+            identity_source: "DvcidAndInquiry".into(),
+            vendor: Some("IBM".into()),
+            product: Some("LTO".into()),
+            firmware_rev: Some("A".into()),
+            managed: "rem".into(),
+            library_serial: Some("LIB-DISCOVERY".into()),
+            element_address: Some(bay),
+            observed_at_utc: None,
+        };
+        let known = runtime.observe_drives(vec![input("KNOWN", 0x100)]).unwrap();
+        let refreshed = runtime.observe_drives(vec![input("KNOWN", 0x101)]).unwrap();
+        assert_eq!(known[0].drive_uuid, refreshed[0].drive_uuid);
+        assert!(!refreshed[0].newly_seen);
+        let source_bytes = || {
+            std::fs::read_dir(runtime.manifest().library_root())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .map(|p| (p.file_name().unwrap().to_owned(), std::fs::read(p).unwrap()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = source_bytes();
+        let mut batch = vec![input("NEW", 0x102)];
+        match fault {
+            "duplicate" => batch.extend([input("SAME", 0x103), input("SAME", 0x104)]),
+            "blank" => batch.push(input(" ", 0x103)),
+            _ => {
+                let mut changed = input("KNOWN", 0x103);
+                changed.product = Some("DIFFERENT".into());
+                batch.push(changed)
+            }
+        }
+        let error = runtime.observe_drives(batch).unwrap_err();
+        assert!(
+            error.to_string().contains("required identity alarm"),
+            "{error}"
+        );
+        assert!(runtime.motion_fenced());
+        assert_eq!(source_bytes(), before, "no partial unique observation");
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-DISCOVERY",
+            0x100,
+            "KNOWN",
+            0x400,
+            1,
+        )));
+        let mut library = open_model_library(world.clone());
+        library.set_motion_authority(Arc::new(runtime.clone()));
+        assert!(library
+            .move_medium(
+                0x400,
+                0x100,
+                &remanence_library::StaticAllowlist::new(["LIB-DISCOVERY"])
+            )
+            .is_err());
+        assert_eq!(
+            world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .filter(|v| matches!(v.opcode, 0xa5 | 0x1b | 0x0a | 0x10))
+                .count(),
+            0
+        );
+        drop(library);
+        drop(runtime);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", paths.sqlite_path.display()));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = LibraryRuntime::open(
+            &paths,
+            true,
+            Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+        )
+        .unwrap();
+        let drives = reopened.reader().unwrap().list_drives(true, true).unwrap();
+        assert_eq!(
+            drives.len(),
+            1,
+            "refused batch published no partial identity"
+        );
+        assert_eq!(drives[0].drive_uuid, known[0].drive_uuid);
+        assert_eq!(drives[0].last_element_address, Some(0x101));
+    }
+}
+
+/// The actual owner selects inventory-only media, persists its run and fence,
+/// then records the physical fast-eject refusal through typed sources.
+#[test]
+fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
+    use remanence_state::{
+        library_log as lib, library_runtime::LibraryRuntime, StateLockGuard, StatePaths,
+    };
+    struct RejectMoveEvidence;
+    impl remanence_library::motion::MotionAuthority for RejectMoveEvidence {
+        fn intent(
+            &self,
+            _: &remanence_library::motion::MotionCommand,
+            _: &remanence_library::motion::MotionContext,
+        ) -> Result<
+            remanence_library::motion::MotionTicket,
+            remanence_library::motion::MotionAuthorityError,
+        > {
+            Err(remanence_library::motion::MotionAuthorityError {
+                message: "injected pre-MOVE evidence refusal".into(),
+                kind: remanence_library::motion::MotionAuthorityFailure::EvidenceFailure,
+            })
+        }
+        fn ensure_motion_allowed(
+            &self,
+        ) -> Result<(), remanence_library::motion::MotionAuthorityError> {
+            Ok(())
+        }
+        fn failed(
+            &self,
+            _: remanence_library::motion::MotionTicket,
+            _: &remanence_library::outcome::CompletionEvidence,
+        ) -> Result<(), remanence_library::motion::MotionAuthorityError> {
+            panic!("no dispatch")
+        }
+        fn unconfirmed(
+            &self,
+            _: &remanence_library::motion::PendingMotion,
+        ) -> Result<(), remanence_library::motion::MotionAuthorityError> {
+            panic!("no dispatch")
+        }
+        fn confirm_inventory(
+            &self,
+            _: &remanence_library::motion::PendingMotion,
+            _: &remanence_library::Library,
+        ) -> Result<(), remanence_library::motion::MotionAuthorityError> {
+            panic!("no dispatch")
+        }
+        fn confirm_standalone(
+            &self,
+            _: &remanence_library::motion::PendingMotion,
+        ) -> Result<(), remanence_library::motion::MotionAuthorityError> {
+            panic!("no dispatch")
+        }
+        fn confirm_readiness(
+            &self,
+            _: &remanence_library::motion::PendingMotion,
+            _: &remanence_library::MediaReadiness,
+            _: std::time::Duration,
+        ) -> Result<(), remanence_library::motion::MotionAuthorityError> {
+            panic!("no dispatch")
+        }
+    }
+    for (expired, before_move) in [(true, false), (false, false), (true, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let paths = StatePaths {
+            config_path: root.join("config"),
+            state_dir: root.join("state"),
+            audit_dir: root.join("library"),
+            journal_dir: root.join("native"),
+            sqlite_path: root.join("catalog.sqlite"),
+            tape_cache_dir: root.join("cache"),
+            calibration_dir: root.join("calibration"),
+        };
+        let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+        let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
+        let catalog = remanence_state::projector::open(&paths.sqlite_path)
+            .unwrap()
+            .with_library_runtime(runtime.clone());
+        let mut index = catalog.write_handle();
+        let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 1);
+        model.put_tape_in_slot(
+            0x400,
+            "CLNU01L9",
+            VirtualTape {
+                cleaning_cart: true,
+                cleaning_cart_expired: expired,
+                ..VirtualTape::default()
+            },
+        );
+        let world = Arc::new(Mutex::new(model));
+        let mut library = open_model_library(world.clone());
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut index,
+            [library.library()],
+            &HashSet::from(["LIB-CLEAN".into()]),
+        )
+        .unwrap();
+        let drive = index.list_drives(true, true).unwrap()[0].drive_uuid.clone();
+        let mut cfg = test_write_owner_config(
+            paths.sqlite_path.clone(),
+            paths.audit_dir.clone(),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        cfg.catalog = catalog.clone();
+        cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
+        cfg.cleaning.min_cycle_duration = "0s".into();
+        let api = crate::ApiState::new(catalog.clone());
+        let action = crate::write_owner::RoboticsAction::Clean {
+            drive_uuid: drive.clone(),
+            trigger: "now".into(),
+        };
+        let fingerprint = crate::operation_source::robotics_fingerprint("LIB-CLEAN", &action);
+        let operation = api
+            .accept_owner_request(
+                AuditActor::User("real-cleaner".into()),
+                "clean_drive",
+                "library",
+                "LIB-CLEAN".into(),
+                fingerprint,
+            )
+            .unwrap();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(operation, "clean_drive");
+        super::robotics::record_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-CLEAN",
+            lib::OperationEvent::Started(lib::Unit),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        cfg.configure_operation_library(&mut library, &handle);
+        if before_move {
+            library.set_motion_authority(Arc::new(RejectMoveEvidence));
+        }
+        let result = run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive, "now");
+        let event = if expired {
+            let error = result.unwrap_err();
+            assert!(
+                error.message().contains(if before_move {
+                    "injected pre-MOVE"
+                } else {
+                    "fast-ejected"
+                }),
+                "{error}"
+            );
+            lib::OperationEvent::Failed(lib::Failed {
+                retry: None,
+                refusal_code: None,
+                summary: error.message().into(),
+            })
+        } else {
+            result.unwrap();
+            lib::OperationEvent::Finished(lib::Response {
+                response_fingerprint: None,
+            })
+        };
+        super::robotics::record_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-CLEAN",
+            event,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let cart = index.get_tape_by_voltag("CLNU01L9").unwrap().unwrap();
+        assert_eq!(cart.kind, "cleaning");
+        assert_eq!(
+            index
+                .get_tape_cleaning_state(&cart.tape_uuid)
+                .unwrap()
+                .flatten()
+                .as_deref(),
+            Some(if before_move {
+                "unverified"
+            } else if expired {
+                "expired"
+            } else {
+                "ok"
+            })
+        );
+        assert_eq!(
+            index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
+            expired
+        );
+        assert!(index
+            .get_active_clean_run_by_drive(&drive)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            index.list_clean_runs(true).unwrap()[0].phase,
+            if expired { "failed" } else { "done" }
+        );
+        assert_eq!(
+            world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .any(|c| c.opcode == 0xa5),
+            !before_move
+        );
+        if before_move {
+            assert!(!world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .any(|c| matches!(c.opcode, 0xa5 | 0x1b | 0x0a | 0x10)));
+        }
+        let library_uuid = runtime.manifest().library_uuid();
+        drop(api);
+        drop(library);
+        drop(cfg);
+        drop(index);
+        drop(catalog);
+        drop(runtime);
+        let mut operation_events = Vec::new();
+        let mut load_intents = Vec::new();
+        let mut motion_outcomes = Vec::new();
+        let mut inventories = Vec::new();
+        let mut expire_at = None;
+        let mut finish_at = None;
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+            if let Some(value) = record.record().motion_intent() {
+                if matches!(value.motion, lib::Motion::Load(_)) {
+                    assert_eq!(value.parent_operation, Some(*operation.as_bytes()));
+                    load_intents.push(record.sequence());
+                }
+            }
+            if record.record().inventory_observation().is_some() {
+                inventories.push(record.sequence());
+            }
+            if let Some(value) = record.record().motion_outcome() {
+                motion_outcomes.push((record.sequence(), value.clone()));
+            }
+            if let Some(value) = record.record().operation_recorded() {
+                if value.operation == *operation.as_bytes() {
+                    operation_events.push(value.event.clone());
+                }
+            }
+            if let Some(value) = record.record().cleaning_recorded() {
+                match value.action {
+                    lib::CleaningAction::Expire(_) => expire_at = Some(record.sequence()),
+                    lib::CleaningAction::Finish(_) => finish_at = Some(record.sequence()),
+                    _ => (),
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        if before_move {
+            assert!(
+                load_intents.is_empty(),
+                "pre-MOVE refusal occurs before LOAD admission"
+            );
+        } else {
+            assert_eq!(
+                load_intents.len(),
+                1,
+                "the actual cleaning producer attempts one LOAD"
+            );
+            let outcomes: Vec<_> = motion_outcomes
+                .iter()
+                .filter(|(_, value)| value.intent.sequence == load_intents[0])
+                .collect();
+            assert_eq!(outcomes.len(), 1);
+            let (sequence, outcome) = outcomes[0];
+            assert!(*sequence > load_intents[0]);
+            assert_eq!(
+                outcome.result,
+                if expired {
+                    lib::MotionResult::Failed
+                } else {
+                    lib::MotionResult::Done
+                }
+            );
+            if expired {
+                assert!(outcome.confirmation.is_none());
+            } else {
+                let Some(lib::Confirmation::Inventory(observation)) = outcome.confirmation else {
+                    panic!("cleaning LOAD requires inventory proof")
+                };
+                assert!(load_intents[0] < observation && observation < *sequence);
+                assert!(inventories.contains(&observation));
+            }
+        }
+        assert_eq!(operation_events.len(), 3);
+        assert!(matches!(
+            operation_events[0],
+            lib::OperationEvent::Accepted(_)
+        ));
+        assert!(matches!(
+            operation_events[1],
+            lib::OperationEvent::Started(_)
+        ));
+        assert_eq!(
+            matches!(operation_events[2], lib::OperationEvent::Failed(_)),
+            expired
+        );
+        if expired && !before_move {
+            assert!(
+                expire_at.unwrap() < finish_at.unwrap(),
+                "cartridge exclusion precedes run closure"
+            );
+        } else {
+            assert!(expire_at.is_none());
+        }
+        let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
+        let index = runtime.reader().unwrap();
+        assert_eq!(
+            index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
+            expired
+        );
+        assert_eq!(
+            index
+                .get_tape_cleaning_state(&cart.tape_uuid)
+                .unwrap()
+                .flatten()
+                .as_deref(),
+            Some(if before_move {
+                "unverified"
+            } else if expired {
+                "expired"
+            } else {
+                "ok"
+            })
+        );
+    }
+}
+
+/// A real no-op closeout has no ClosedOut record for its operation. Its Finished
+/// reply remains read-only even after a later valid native Objects prefix owes
+/// closeout again. The checked-in writer-produced fixture supplies that prefix.
+#[tokio::test]
+async fn typed_closeout_noop_finished_retry_survives_later_objects() {
+    use remanence_state::tape_log::{codec::Decoder, store::Header, Record as NativeRecord};
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[daemon]
+state_dir="{0}"
+default_idle_timeout_seconds=1800
+[journal]
+dir="{0}/journals"
+require_trusted_volume=false
+[audit]
+dir="{0}/audit"
+[index]
+sqlite_path="{0}/index.sqlite"
+[cache]
+tape_catalog_dir="{0}/cache"
+"#,
+            root.path().display()
+        ),
+    )
+    .unwrap();
+    let tape = [0xa2; 16];
+    let bytes = include_bytes!("../../../../fixtures/tape-log/parity-object-session-close.remtape");
+    let mut reader = std::io::Cursor::new(bytes.as_slice());
+    let header = Header::decode(&mut reader, tape).unwrap();
+    let mut decoder = Decoder::at(&bytes[reader.position() as usize..], 1, reader.position());
+    let mut initialized_end = None;
+    let mut objects_end = None;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        match frame.record {
+            NativeRecord::SessionOpened(_) => initialized_end = Some(frame.offset as usize),
+            NativeRecord::ClosedOut(_) => {}
+            NativeRecord::PayloadContinuation(_) if objects_end.is_none() && frame.sequence > 5 => {
+                objects_end = Some(frame.offset as usize)
+            }
+            _ => {}
+        }
+    }
+    let initialized_end = initialized_end.unwrap();
+    let objects_end = objects_end.unwrap();
+    let mut owner = StateHandle::open_from_config_file(&config).unwrap();
+    owner
+        .provision_tape_with_media(
+            remanence_state::ProvisionTapeInput {
+                tape_uuid: tape,
+                voltag: "NOP001L9".into(),
+                block_size: header.block_size,
+                parity: ParityConfig::Scheme(header.scheme.unwrap()),
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            remanence_state::MediaObservation::label_hint("NOP001L9"),
+        )
+        .unwrap();
+    let native_dir = owner.paths().journal_dir.join("tapes");
+    std::fs::create_dir_all(&native_dir).unwrap();
+    let native_path = native_dir.join(format!("{}.remtape", Uuid::from_bytes(tape).simple()));
+    std::fs::write(&native_path, &bytes[..initialized_end]).unwrap();
+    owner.rebuild_index_from_journals().unwrap();
+    let mut state = crate::ApiState::new(owner.projection_client());
+    state.checkpoint_journal_dir = Arc::new(native_dir.clone());
+    let request = pb::CloseoutTapeRequest {
+        tape_uuid: tape.to_vec(),
+        expected_pool_id: None,
+        idempotency_key: Some(pb::IdempotencyKey {
+            value: Uuid::new_v4().as_bytes().to_vec(),
+        }),
+    };
+    let response =
+        crate::tape_closeout::start(&state, AuditActor::System, request.clone()).unwrap();
+    let id = Uuid::from_slice(&response.operation_id).unwrap();
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while state.operations.is_live(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Succeeded as i32
+    );
+    assert_eq!(
+        std::fs::read(&native_path).unwrap(),
+        &bytes[..initialized_end],
+        "no-op creates no native closeout"
+    );
+    drop(state);
+    drop(owner);
+    // Append only a writer-produced closed Objects prefix after the no-op.
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&native_path)
+        .unwrap();
+    file.write_all(&bytes[initialized_end..objects_end])
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let owner = StateHandle::open_from_config_file(&config).unwrap();
+    let authority =
+        remanence_state::TapeAuthority::open(&native_dir, tape, &owner.paths().sqlite_path)
+            .unwrap();
+    let lease = authority.acquire_exclusive().unwrap();
+    let snapshot = lease.freeze().unwrap();
+    assert!(snapshot.tape_summary().closeout_due());
+    assert!(!snapshot.has_closeout_operation(*id.as_bytes()).unwrap());
+    drop(snapshot);
+    drop(lease);
+    let mut state = crate::ApiState::new(owner.projection_client());
+    state.checkpoint_journal_dir = Arc::new(native_dir);
+    state.readiness_shutdown.store(true, Ordering::SeqCst);
+    let before = std::fs::read(&native_path).unwrap();
+    assert_eq!(
+        crate::tape_closeout::start(&state, AuditActor::System, request).unwrap(),
+        response
+    );
+    assert_eq!(
+        state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Succeeded as i32
+    );
+    assert_eq!(std::fs::read(&native_path).unwrap(), before);
+    assert!(
+        state.drive_pool.is_none(),
+        "historical reply has no device owner to dispatch"
+    );
+}
+
+/// Explicit model measurement of the RES confirmation cost and the actual
+/// projector submit/ack boundary with two independent drive owners. This is a
+/// debug host measurement, not a hardware latency claim.
+#[test]
+#[ignore = "explicit two-drive motion/projection measurement"]
+fn motion_projection_cutover_measurement() {
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
+    for typed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths {
+            config_path: root.path().join("config"),
+            state_dir: root.path().join("state"),
+            audit_dir: root.path().join("library"),
+            journal_dir: root.path().join("native"),
+            sqlite_path: root.path().join("catalog.sqlite"),
+            tape_cache_dir: root.path().join("cache"),
+            calibration_dir: root.path().join("calibration"),
+        };
+        let runtime = LibraryRuntime::open(
+            &paths,
+            true,
+            Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+        )
+        .unwrap();
+        runtime.take_projection_measurement();
+        runtime.take_source_projection_lag();
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for n in 0..2 {
+            let runtime = runtime.clone();
+            let start = start.clone();
+            threads.push(std::thread::spawn(move || {
+                let serial = format!("MEASURE-{n}");
+                let (world, mut library) = unthreaded_cartridge_world(&serial);
+                if typed {
+                    library.set_motion_authority(Arc::new(runtime));
+                }
+                let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+                world.lock().unwrap().command_log.clear();
+                start.wait();
+                let begin = std::time::Instant::now();
+                for _ in 0..20 {
+                    library.move_medium(0x100, 0x400, &policy).unwrap();
+                    library.move_medium(0x400, 0x100, &policy).unwrap();
+                }
+                let elapsed = begin.elapsed().as_secs_f64();
+                let world = world.lock().unwrap();
+                (
+                    elapsed,
+                    world
+                        .command_log
+                        .iter()
+                        .filter(|c| c.opcode == 0xa5)
+                        .count(),
+                    world
+                        .command_log
+                        .iter()
+                        .filter(|c| c.opcode == 0xb8)
+                        .count(),
+                )
+            }));
+        }
+        start.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let moves: usize = results.iter().map(|v| v.1).sum();
+        let res: usize = results.iter().map(|v| v.2).sum();
+        assert_eq!(moves, 80);
+        let (queue, mut latency) = runtime.take_projection_measurement();
+        latency.sort();
+        let percentile = |p: usize| {
+            latency
+                .get((latency.len().saturating_sub(1) * p) / 100)
+                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+        };
+        let mut lag = runtime.take_source_projection_lag();
+        lag.sort();
+        let lag_percentile = |p: usize| {
+            lag.get((lag.len().saturating_sub(1) * p) / 100)
+                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+        };
+        println!("CUTOVER_SOURCE_LAG library_append_samples={} durable_return_to_projection_p50_ms={} durable_return_to_projection_p99_ms={}",lag.len(),lag_percentile(50),lag_percentile(99));
+        println!("CUTOVER_MOTION {{\"typed\":{typed},\"drives\":2,\"moves\":{moves},\"res\":{res},\"res_per_move\":{},\"owner_seconds\":{:?},\"projection_samples\":{},\"queued_apply_high_water\":{queue},\"projection_ack_p50_ms\":{},\"projection_ack_p99_ms\":{}}}",res as f64/moves as f64,results.iter().map(|v|v.0).collect::<Vec<_>>(),latency.len(),percentile(50),percentile(99));
+    }
+}
+
+/// The robotics producer's immediate LOAD publishes its actual writer-owned
+/// parent and exactly one normal Done/Failed outcome after the physical command.
+#[test]
+fn typed_robotics_immediate_load_records_normal_outcomes() {
+    use remanence_state::{
+        library_log as lib, library_runtime::LibraryRuntime, StateLockGuard, StatePaths,
+    };
+    for failed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let paths = StatePaths {
+            config_path: root.join("config"),
+            state_dir: root.join("state"),
+            audit_dir: root.join("library"),
+            journal_dir: root.join("native"),
+            sqlite_path: root.join("catalog.sqlite"),
+            tape_cache_dir: root.join("cache"),
+            calibration_dir: root.join("calibration"),
+        };
+        let runtime = LibraryRuntime::open(
+            &paths,
+            true,
+            Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+        )
+        .unwrap();
+        let catalog = remanence_state::projector::open(&paths.sqlite_path)
+            .unwrap()
+            .with_library_runtime(runtime.clone());
+        let mut index = catalog.write_handle();
+        let mut model = VirtualWorld::single_drive("LIB-LOAD", 0x100, "DRV-LOAD", 0x400, 1);
+        model.put_tape_in_slot(0x400, "LOAD01L9", VirtualTape::default());
+        let world = Arc::new(Mutex::new(model));
+        let snapshot = world.lock().unwrap().library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new(["LIB-LOAD"]);
+        let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut library = snapshot
+            .open_with(&policy, {
+                let world = world.clone();
+                let dispatched = dispatched.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    let inner = ModelTransport::new(world.clone(), role);
+                    Ok(if failed {
+                        Box::new(ReadinessFailedLoad {
+                            inner,
+                            dispatched: dispatched.clone(),
+                        }) as Box<dyn SgTransport>
+                    } else {
+                        Box::new(inner) as Box<dyn SgTransport>
+                    })
+                }
+            })
+            .unwrap();
+        let mut cfg = test_write_owner_config(
+            paths.sqlite_path.clone(),
+            paths.audit_dir.clone(),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        cfg.catalog = catalog.clone();
+        cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
+        let api = crate::ApiState::new(catalog.clone());
+        let operation = api
+            .accept_owner_request(
+                AuditActor::User("loader".into()),
+                "load_drive",
+                "library",
+                "LIB-LOAD".into(),
+                [0x31; 32],
+            )
+            .unwrap();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(operation, "load_drive");
+        cfg.configure_operation_library(&mut library, &handle);
+        let result = super::robotics::run_load_sequence(
+            &mut index,
+            &cfg,
+            &handle,
+            &mut library,
+            0x400,
+            0x100,
+            false,
+        );
+        assert_eq!(result.is_err(), failed, "{result:?}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), usize::from(failed));
+        let uuid = runtime.manifest().library_uuid();
+        drop(api);
+        drop(cfg);
+        drop(index);
+        drop(catalog);
+        drop(library);
+        drop(runtime);
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let mut loads = Vec::new();
+        let mut outcomes = Vec::new();
+        let mut inventories = Vec::new();
+        lib::store::replay_observed(&paths.audit_dir, uuid, &view, &mut |record| {
+            if let Some(intent) = record.record().motion_intent() {
+                if matches!(intent.motion, lib::Motion::Load(_)) {
+                    assert_eq!(intent.parent_operation, Some(*operation.as_bytes()));
+                    loads.push(record.sequence());
+                }
+            }
+            if record.record().inventory_observation().is_some() {
+                inventories.push(record.sequence());
+            }
+            if let Some(outcome) = record.record().motion_outcome() {
+                outcomes.push((record.sequence(), outcome.clone()));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(loads.len(), 1);
+        let load_outcomes: Vec<_> = outcomes
+            .iter()
+            .filter(|(_, o)| o.intent.sequence == loads[0])
+            .collect();
+        assert_eq!(load_outcomes.len(), 1);
+        let (sequence, outcome) = load_outcomes[0];
+        assert!(*sequence > loads[0]);
+        assert_eq!(
+            outcome.result,
+            if failed {
+                lib::MotionResult::Failed
+            } else {
+                lib::MotionResult::Done
+            }
+        );
+        if failed {
+            assert!(outcome.confirmation.is_none());
+        } else {
+            let Some(lib::Confirmation::Inventory(observation)) = outcome.confirmation else {
+                panic!("normal LOAD requires inventory confirmation")
+            };
+            assert!(loads[0] < observation && observation < *sequence);
+            assert!(inventories.contains(&observation));
+        }
+    }
+}

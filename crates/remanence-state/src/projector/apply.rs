@@ -31,7 +31,7 @@ create table library_tape_status (
  media_revision blob not null, medium_spec blob not null);
 create table library_drive_endpoints (endpoint text primary key, drive_uuid blob not null unique);
 create table library_drive_fences (sequence blob primary key, endpoint text not null, released integer not null default 0);
-create table library_cleaning_runs (run_id text primary key, begin_sequence blob not null, body blob not null);
+create table library_cleaning_runs (run_id text primary key, begin_sequence blob not null, body blob not null, cartridge blob, home_slot integer);
 create table library_cleaning_homes (tape_uuid blob primary key, home_slot integer not null);
 create table library_configuration (singleton integer primary key check(singleton=1), body blob not null);
 create table library_motion (sequence blob primary key, operation blob, endpoint text, state text not null, body blob not null);
@@ -99,7 +99,10 @@ struct RecordTransaction<'a> {
 impl Drop for RecordTransaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = self.core.conn.execute_batch("rollback");
+            let _ = self
+                .core
+                .conn
+                .execute_batch("rollback to authority_record; release authority_record");
         }
     }
 }
@@ -107,7 +110,7 @@ impl RecordTransaction<'_> {
     fn commit(mut self) -> Result<(), StateError> {
         self.core
             .conn
-            .execute_batch("commit")
+            .execute_batch("release authority_record")
             .map_err(|e| sqlite_error("commit authority projection", e))?;
         self.committed = true;
         Ok(())
@@ -142,7 +145,7 @@ impl CatalogCore {
             }
             AuthorityRecord::Library(value) => {
                 self.conn
-                    .execute_batch("begin immediate")
+                    .execute_batch("savepoint authority_record")
                     .map_err(|e| sqlite_error("begin authority projection", e))?;
                 let guard = RecordTransaction {
                     core: self,
@@ -283,6 +286,9 @@ impl CatalogCore {
                     tape_uuid: v.tape.uuid,
                     reason: format!("{:?}", v.reason),
                 })?;
+                // A retired physical identity cannot serve its cached wrap map.
+                // The control store also advances its eviction generation.
+                self.delete_wrap_map(&v.tape.uuid)?;
                 project_assignment_row(
                     &self.conn,
                     v.tape.uuid,
@@ -302,6 +308,11 @@ impl CatalogCore {
                     Some(&a.reason.0),
                     &at,
                 )?,
+                lib::AlarmAction::Refresh(a) => {
+                    // UPDATE preserves state, acknowledgement time and actor.
+                    self.conn.execute("update alarms set severity=?2,detail=?3,last_seen_utc=?4 where condition_key=?1", params![v.condition_key.0, spelling(a.severity), a.reason.0, at])
+                        .map_err(|e| sqlite_error("refresh raised alarm", e))?;
+                }
                 lib::AlarmAction::Acknowledge(_) => {
                     project_alarm_state_core(&self.conn, &v.condition_key.0, "acked", &at, &actor)?;
                 }
@@ -480,15 +491,17 @@ impl CatalogCore {
                     &at,
                     false,
                 )?;
-                project_assignment_history(
-                    &self.conn,
-                    v.tape.uuid,
-                    1,
-                    v.pool.as_ref().map(|p| p.0.as_str()),
-                    "operator",
-                    &actor,
-                    &at,
-                )?;
+                if let Some(source) = crate::state::adoption_assignment_source(v) {
+                    project_assignment_history(
+                        &self.conn,
+                        v.tape.uuid,
+                        1,
+                        v.pool.as_ref().map(|p| p.0.as_str()),
+                        source,
+                        &actor,
+                        &at,
+                    )?;
+                }
                 self.project_library_medium(
                     v.tape,
                     &v.medium,
@@ -647,16 +660,23 @@ impl CatalogCore {
                         write_errors_uncorrected: counter(v.counters.write_uncorrected),
                         read_errors_corrected: counter(v.counters.read_corrected),
                         read_errors_uncorrected: counter(v.counters.read_uncorrected),
-                        raw_pages: v
-                            .raw_pages
-                            .as_ref()
-                            .map(|b| b.0.iter().map(|x| format!("{x:02x}")).collect()),
-                        at_utc: Some(at),
+                        raw_pages: v.raw_pages.as_ref().map(|b| health_raw_pages(&b.0)),
+                        at_utc: Some(at.clone()),
                     },
                     None,
                     false,
                     &mut divergences,
                 )?;
+                // TapeAlert cleaning requests and last-seen are projections of
+                // this exact sampled source, never supplemental owner SQL.
+                let due = if v.tape_alert_flags & (1 << 19) != 0 {
+                    Some("now")
+                } else if v.tape_alert_flags & (1 << 20) != 0 {
+                    Some("periodic")
+                } else {
+                    None
+                };
+                self.conn.execute("update drives set cleaning_due=case when state='active' and managed='rem' and ?2 is not null then case when cleaning_due='now' or ?2='now' then 'now' else 'periodic' end else cleaning_due end,last_seen_utc=?3 where drive_uuid=?1 and state='active'",params![v.drive_uuid.as_slice(),due,at]).map_err(|e|sqlite_error("project sampled drive cleaning request",e))?;
                 if !divergences.is_empty() {
                     return Err(ApplyError::HealthConflict {
                         sequence: value.sequence,
@@ -665,11 +685,25 @@ impl CatalogCore {
             }
             Body::SessionObserved(v) => {
                 let endpoint = v.endpoint.as_ref().map(endpoint);
-                let drive = endpoint
-                    .as_ref()
-                    .map(|e| self.library_drive_at(e))
-                    .transpose()?
-                    .flatten();
+                let drive_uuid = if v.previous.is_some() {
+                    self.conn
+                        .query_row(
+                            "select drive_uuid from sessions where session_id=?1",
+                            [Uuid::from_bytes(v.session_id).to_string()],
+                            |row| row.get::<_, Option<Vec<u8>>>(0),
+                        )
+                        .optional()
+                        .map_err(|e| sqlite_error("read derived session creation identity", e))?
+                        .flatten()
+                } else {
+                    endpoint
+                        .as_ref()
+                        .map(|e| self.library_drive_at(e))
+                        .transpose()?
+                        .flatten()
+                        .filter(|drive| drive.state == "active")
+                        .map(|drive| drive.drive_uuid)
+                };
                 project_session_core(
                     &self.conn,
                     SessionProjection {
@@ -680,7 +714,7 @@ impl CatalogCore {
                             .as_ref()
                             .and_then(|e| e.library_serial().map(str::to_owned)),
                         drive_bay: endpoint.as_ref().and_then(|e| e.bay().map(i64::from)),
-                        drive_uuid: drive.map(|d| d.drive_uuid),
+                        drive_uuid,
                         state: match v.event {
                             lib::SessionEvent::Opened => "open",
                             lib::SessionEvent::Closed => "closed",
@@ -733,18 +767,54 @@ impl CatalogCore {
                                 "cleaning registration has no cartridge".into(),
                             )
                         })?;
-                        project_tape_kind_core(&self.conn, &tape.uuid, "cleaning")?;
+                        // Register creates a fresh inventory entity, including
+                        // the collision with a retired data UUID. Use insertion
+                        // defaults for every data-only field, not an inherited row.
+                        self.conn
+                            .execute(
+                                "delete from tapes where tape_uuid=?1",
+                                [tape.uuid.as_slice()],
+                            )
+                            .map_err(|e| {
+                                sqlite_error(
+                                    "replace retired data entity with cleaning inventory",
+                                    e,
+                                )
+                            })?;
+                        self.conn.execute(
+                            "insert into tapes(tape_uuid,voltag,kind,cleaning_uses,cleaning_state,highest_protected_ordinal,total_committed_ordinals,last_committed_tape_file,state,updated_at_utc) values(?1,?2,'cleaning',0,'unverified',X'0000000000000000',X'0000000000000000',null,'ready',?3)",
+                            params![tape.uuid.as_slice(), a.barcode.0, at],
+                        ).map_err(|e| sqlite_error("project cleaning identity", e))?;
                         self.conn.execute("insert into library_cleaning_homes values(?1,?2) on conflict(tape_uuid) do update set home_slot=excluded.home_slot",params![tape.uuid.as_slice(),a.home_slot]).map_err(|e|sqlite_error("project cleaning home slot",e))?;
+                        // Native data remains on disk as historical evidence;
+                        // these caches describe the newly registered inventory.
+                        for table in [
+                            "tape_files",
+                            "object_instances",
+                            "catalog_units",
+                            "wrap_maps",
+                            "tape_log_object_commits",
+                            "tape_log_projection",
+                            "tape_projection_chunks",
+                        ] {
+                            self.conn
+                                .execute(
+                                    &format!("delete from {table} where tape_uuid=?1"),
+                                    [tape.uuid.as_slice()],
+                                )
+                                .map_err(|e| {
+                                    sqlite_error(
+                                        "clear retired data projection after cleaning registration",
+                                        e,
+                                    )
+                                })?;
+                        }
                     }
                     lib::CleaningAction::Begin(_) => {
-                        if let Some(tape) = v.cartridge {
-                            self.project_library_cleaning_selection(&v.run_id.0, tape)?;
-                        }
+                        self.project_library_cleaning_selection(v)?;
                     }
                     lib::CleaningAction::Advance(a) => {
-                        if let Some(tape) = v.cartridge {
-                            self.project_library_cleaning_selection(&v.run_id.0, tape)?;
-                        }
+                        self.project_library_cleaning_selection(v)?;
                         self.advance_clean_run(
                             &v.run_id.0,
                             &spelling(a.phase).replace('_', "-"),
@@ -776,6 +846,11 @@ impl CatalogCore {
                             )?;
                         }
                     }
+                    lib::CleaningAction::Reject(_) => {
+                        if let Some(t) = v.cartridge {
+                            self.set_tape_cleaning_state(&t.uuid, "rejected")?;
+                        }
+                    }
                     lib::CleaningAction::Expire(_) => {
                         if let Some(t) = v.cartridge {
                             self.set_tape_cleaning_state(&t.uuid, "expired")?;
@@ -784,6 +859,20 @@ impl CatalogCore {
                 }
             }
             Body::ReadinessObserved(v) => {
+                let drive_serial = if v.previous.is_some() {
+                    self.media_readiness_operation(Uuid::from_bytes(v.operation))?
+                        .and_then(|row| row.drive_serial)
+                } else {
+                    match &v.endpoint {
+                        lib::DriveKey::Standalone(key) => {
+                            Some(key.drive_serial.as_str().to_owned())
+                        }
+                        lib::DriveKey::Bay(_) => self
+                            .library_drive_at(&endpoint(&v.endpoint))?
+                            .filter(|drive| drive.state == "active")
+                            .and_then(|drive| drive.serial),
+                    }
+                };
                 self.record_media_readiness_operation(
                     None,
                     MediaReadinessOperationInput {
@@ -792,16 +881,39 @@ impl CatalogCore {
                         endpoint: endpoint(&v.endpoint),
                         changer_sg: None,
                         drive_sg: None,
-                        drive_serial: None,
+                        drive_serial,
                         barcode: v.barcode.as_ref().map(|x| x.0.clone()),
                         source_slot: None,
-                        media_generation: None,
+                        media_generation: match v.tape {
+                            Some(t) => self.get_tape(&t.uuid)?.and_then(|t| {
+                                crate::tape_generation(&t).map(|(g, _)| g.generation_number())
+                            }),
+                            None => match v.media {
+                                Some(lib::MediumFamily::Lto(g)) => Some(g.generation_number()),
+                                _ => None,
+                            },
+                        },
+                        media_family: match v.tape {
+                            Some(t) => self
+                                .get_tape(&t.uuid)?
+                                .and_then(|t| crate::tape_generation(&t).map(|(g, _)| g)),
+                            None => match v.media {
+                                Some(lib::MediumFamily::Lto(g)) => Some(g),
+                                _ => None,
+                            },
+                        },
                         phase: spelling(v.phase),
                         state: spelling(v.state),
                         dirty_scope: if v.state == lib::ReadinessState::Ready {
                             None
                         } else {
-                            Some("drive+tape".into())
+                            Some(
+                                match v.scope {
+                                    lib::ReadinessScope::Endpoint => "drive+tape",
+                                    lib::ReadinessScope::Library => "selected-library-snapshot",
+                                }
+                                .into(),
+                            )
                         },
                         deadline_at_utc: Some(
                             OffsetDateTime::from_unix_timestamp_nanos(
@@ -814,10 +926,19 @@ impl CatalogCore {
                         evidence_path: None,
                     },
                 )?;
+                self.conn.execute(
+                    "update media_readiness_ops set started_at_utc = ?2 where operation_id = ?1",
+                    params![Uuid::from_bytes(v.operation).to_string(),
+                        OffsetDateTime::from_unix_timestamp_nanos(i128::from(v.started_unix_ns))
+                            .map_err(|e| StateError::IndexCorrupt(e.to_string()))?
+                            .format(&Rfc3339).map_err(|e| StateError::IndexCorrupt(e.to_string()))?],
+                ).map_err(|e| sqlite_error("project readiness source start", e))?;
                 self.library_readiness_transition(
                     v.operation,
                     &spelling(v.state),
-                    None,
+                    v.evidence
+                        .as_ref()
+                        .and_then(|_| crate::library_runtime::readiness::phase_opcode(v.phase)),
                     v.evidence.as_ref(),
                 )?;
             }
@@ -913,6 +1034,7 @@ impl CatalogCore {
                                 barcode: None,
                                 source_slot: None,
                                 media_generation: None,
+                                media_family: None,
                                 phase: "load".into(),
                                 state: "planned".into(),
                                 dirty_scope: Some("drive+tape".into()),
@@ -938,7 +1060,15 @@ impl CatalogCore {
                     .map_err(|e| sqlite_error("project motion outcome", e))?;
             }
             Body::InventoryReconciled(v) => {
-                self.conn.execute("insert into library_inventory values(?1,?2,?3) on conflict(library_serial) do update set generation=excluded.generation,body=excluded.body",params![v.library_serial.0,SqliteU64::new(v.observation_generation),record.canonical_body().map_err(|e|StateError::IndexCorrupt(e.to_string()))?]).map_err(|e|sqlite_error("project inventory reconciliation",e))?;
+                // The historical SQL column is named library_serial; namespace
+                // its derived key so identical library/drive serials cannot collide.
+                let subject = match &v.subject {
+                    lib::InventorySubject::Library(serial) => format!("library:{}", serial.0),
+                    lib::InventorySubject::Standalone(endpoint) => {
+                        format!("standalone:{}", endpoint.drive_serial.0)
+                    }
+                };
+                self.conn.execute("insert into library_inventory values(?1,?2,?3) on conflict(library_serial) do update set generation=excluded.generation,body=excluded.body",params![subject,SqliteU64::new(v.observation_generation),record.canonical_body().map_err(|e|StateError::IndexCorrupt(e.to_string()))?]).map_err(|e|sqlite_error("project inventory reconciliation",e))?;
                 for reference in &v.resolves.0 {
                     self.conn
                         .execute(
@@ -1107,6 +1237,9 @@ impl CatalogCore {
                 },
                 at,
             )?;
+        } else {
+            self.conn.execute("update tapes set cartridge_generation=null,generation_source=null where tape_uuid=?1", [tape.uuid.as_slice()])
+                .map_err(|e| sqlite_error("project non-LTO family", e))?;
         }
         self.conn.execute("insert into library_tape_status(tape_uuid,incarnation,media_revision,medium_spec) values(?1,?2,?3,?4) on conflict(tape_uuid) do update set incarnation=excluded.incarnation,media_revision=excluded.media_revision,medium_spec=excluded.medium_spec",params![tape.uuid.as_slice(),SqliteU64::new(tape.incarnation),SqliteU64::new(revision),bytes]).map_err(|e|sqlite_error("project library medium capabilities",e))?;
         Ok(())
@@ -1124,6 +1257,30 @@ impl CatalogCore {
             )
             .optional()
             .map_err(|e| sqlite_error("read observed endpoint identity", e))?;
+        let id = if id.is_none() {
+            if let DriveKey::Standalone { drive_serial } = endpoint {
+                let mut statement = self
+                    .conn
+                    .prepare(
+                        "select drive_uuid from drives where serial=?1 and state='active' limit 2",
+                    )
+                    .map_err(|e| sqlite_error("find source-observed standalone drive", e))?;
+                let ids = statement
+                    .query_map([drive_serial], |row| row.get::<_, Vec<u8>>(0))
+                    .map_err(|e| sqlite_error("query standalone drive identity", e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| sqlite_error("read standalone drive identity", e))?;
+                if ids.len() == 1 {
+                    ids.into_iter().next()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            id
+        };
         id.map(|id| self.get_drive_by_uuid(&id))
             .transpose()
             .map(Option::flatten)
@@ -1141,6 +1298,7 @@ impl CatalogCore {
         self.record_media_readiness_transition(
             None,
             MediaReadinessTransitionInput {
+                completion_evidence: None,
                 operation_id: Uuid::from_bytes(operation),
                 phase: None,
                 state: state.into(),
@@ -1162,7 +1320,15 @@ impl CatalogCore {
                 signal: None,
                 evidence_path: None,
                 last_error_json: None,
-                quarantine_id: None,
+                quarantine_id: matches!(
+                    state,
+                    "aborted_unknown"
+                        | "timeout_unknown"
+                        | "transport_unknown"
+                        | "terminal_error"
+                        | "reservation_conflict"
+                )
+                .then(|| format!("mrq-{}", Uuid::from_bytes(operation))),
             },
         )?;
         Ok(())
@@ -1225,14 +1391,23 @@ impl CatalogCore {
     ) -> Result<bool, StateError> {
         if matches!(
             v.action,
-            lib::CleaningAction::Register(_) | lib::CleaningAction::Expire(_)
+            lib::CleaningAction::Register(_)
+                | lib::CleaningAction::Expire(_)
+                | lib::CleaningAction::Reject(_)
         ) {
             return Ok(true);
         }
         self.conn.execute(
-            "insert into library_cleaning_runs values(?1,?2,?3) on conflict(run_id) do update set body=excluded.body",
-            params![v.run_id.0, SqliteU64::new(value.sequence), value.record.canonical_body().map_err(|e|StateError::IndexCorrupt(e.to_string()))?],
+            "insert into library_cleaning_runs values(?1,?2,?3,?4,?5) on conflict(run_id) do update set body=excluded.body,cartridge=coalesce(excluded.cartridge,library_cleaning_runs.cartridge),home_slot=coalesce(excluded.home_slot,library_cleaning_runs.home_slot)",
+            params![v.run_id.0, SqliteU64::new(value.sequence), value.record.canonical_body().map_err(|e|StateError::IndexCorrupt(e.to_string()))?, v.cartridge.map(|t|t.uuid.to_vec()), match &v.action { lib::CleaningAction::Advance(a) => a.home_slot, _ => None }],
         ).map_err(|e|sqlite_error("retain cleaning run binding",e))?;
+        if let (Some(tape), Some(home)) = (
+            self.library_cleaning_run_cartridge(&v.run_id.0)?,
+            self.library_cleaning_run_home(v)?,
+        ) {
+            self.conn.execute("insert into library_cleaning_homes values(?1,?2) on conflict(tape_uuid) do update set home_slot=excluded.home_slot", params![tape, home])
+                .map_err(|e| sqlite_error("project selected cleaning home", e))?;
+        }
         if self.get_clean_run(&v.run_id.0)?.is_some() {
             return Ok(true);
         }
@@ -1280,6 +1455,7 @@ impl CatalogCore {
             None,
             &started,
         )?;
+        self.project_library_cleaning_selection(v)?;
         Ok(true)
     }
 
@@ -1290,22 +1466,38 @@ impl CatalogCore {
         }
         Ok(())
     }
-    fn project_library_cleaning_selection(
-        &mut self,
-        run: &str,
-        tape: lib::TapeRef,
-    ) -> Result<(), StateError> {
-        let home: Option<i64> = self
-            .conn
+    /// MovingIn fixes the return slot; an unselected run has no home.
+    fn library_cleaning_run_home(
+        &self,
+        current: &lib::CleaningRecorded,
+    ) -> Result<Option<u16>, StateError> {
+        self.conn
             .query_row(
-                "select home_slot from library_cleaning_homes where tape_uuid=?1",
-                [tape.uuid.as_slice()],
+                "select home_slot from library_cleaning_runs where run_id=?1",
+                [&current.run_id.0],
                 |r| r.get(0),
             )
-            .optional()
-            .map_err(|e| sqlite_error("read cleaning home slot", e))?;
-        if let Some(home) = home {
-            self.select_clean_run_cart(run, &tape.uuid, home, None)?;
+            .map_err(|e| sqlite_error("read cleaning run home", e))
+    }
+    /// Retain a selected cartridge through records that omit an unchanged binding.
+    fn library_cleaning_run_cartridge(&self, run: &str) -> Result<Option<Vec<u8>>, StateError> {
+        self.conn
+            .query_row(
+                "select cartridge from library_cleaning_runs where run_id=?1",
+                [run],
+                |r| r.get(0),
+            )
+            .map_err(|e| sqlite_error("read cleaning run cartridge", e))
+    }
+    fn project_library_cleaning_selection(
+        &mut self,
+        current: &lib::CleaningRecorded,
+    ) -> Result<(), StateError> {
+        if let (Some(tape), Some(home)) = (
+            self.library_cleaning_run_cartridge(&current.run_id.0)?,
+            self.library_cleaning_run_home(current)?,
+        ) {
+            self.select_clean_run_cart(&current.run_id.0, &tape, i64::from(home), None)?;
         }
         Ok(())
     }
@@ -1396,6 +1588,16 @@ impl CatalogCore {
 
 /// TapeAlert flag numbers are 1..=64; library mask bit zero represents flag 1.
 /// Keep the existing catalog's JSON array representation for current readers.
+/// Legacy health producers emit JSON presence metadata, not transport bytes.
+/// Preserve that presentation exactly; opaque page blobs retain hex display.
+fn health_raw_pages(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v.is_object()) {
+            return text.to_owned();
+        }
+    }
+    bytes.iter().map(|x| format!("{x:02x}")).collect()
+}
 fn tape_alert_json(mask: u64) -> String {
     let flags = (0..64)
         .filter(|bit| mask & (1u64 << bit) != 0)

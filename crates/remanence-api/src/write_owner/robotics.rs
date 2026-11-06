@@ -1,4 +1,5 @@
 //! Changer motion, load sequencing, snapshot publication, and library-operation audit.
+use remanence_state::library_log as lib;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -8,7 +9,9 @@ use remanence_library::{
     classify_media_readiness_error_ref, LoadError, MediaFamily, MediaReadiness,
     MediaReadinessWaitOptions,
 };
-use remanence_state::{AuditActor, AuditEvent, CatalogIndex};
+#[cfg(test)]
+use remanence_state::AuditEvent;
+use remanence_state::{AuditActor, CatalogIndex};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tonic::Status;
@@ -25,6 +28,7 @@ use super::readiness::{
 };
 use super::reconcile::publish_running;
 use super::{LOAD_READY_POLL_INTERVAL, LOAD_READY_TIMEOUT};
+#[cfg(test)]
 use crate::audit_projection::{append_operation_audit, OperationAuditInput};
 use crate::drive_collection::observe_drive_catalog_from_libraries;
 use crate::pb;
@@ -95,12 +99,12 @@ pub(crate) fn handle_robotics(
         return RoboticsOutcome::Cancelled;
     }
     publish_running(handle, &[("phase", "open")]);
-    if let Err(err) = record_library_event(
+    if let Err(err) = record_library_operation(
         index,
         cfg,
         handle,
         library_serial,
-        AuditEvent::OperationStarted,
+        lib::OperationEvent::Started(lib::Unit),
         robotics_detail(&action),
     ) {
         return RoboticsOutcome::Failed {
@@ -170,7 +174,17 @@ pub(crate) fn handle_robotics(
                 crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(*dst));
             library
                 .changer_mut()
-                .move_medium_with_admission(*src, *dst, &cfg.policy, &mut || motion.admit())
+                .with_motion_context(
+                    remanence_library::motion::MotionContext {
+                        parent_operation: Some(*handle.op_id_uuid().as_bytes()),
+                        ..Default::default()
+                    },
+                    |changer| {
+                        changer.move_medium_with_admission(*src, *dst, &cfg.policy, &mut || {
+                            motion.admit()
+                        })
+                    },
+                )
                 .map_err(|err| err.to_string())
         }
         RoboticsAction::Load {
@@ -194,17 +208,26 @@ pub(crate) fn handle_robotics(
                 Ok(())
             };
             library.set_changer_ready_wait(cfg.changer_ready_wait.clone().without_stop_signals());
-            crate::mount_support::unload_library_bay_with_admission(
-                &mut library,
-                *bay,
-                *destination,
-                &cfg.policy,
-                None,
-                std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
-                &mut admit,
-            )
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+            library
+                .with_motion_context(
+                    remanence_library::motion::MotionContext {
+                        parent_operation: Some(*handle.op_id_uuid().as_bytes()),
+                        ..Default::default()
+                    },
+                    |library| {
+                        crate::mount_support::unload_library_bay_with_admission(
+                            library,
+                            *bay,
+                            *destination,
+                            &cfg.policy,
+                            None,
+                            std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+                            &mut admit,
+                        )
+                    },
+                )
+                .map(|_| ())
+                .map_err(|err| err.to_string())
         }
         RoboticsAction::Clean {
             drive_uuid,
@@ -247,12 +270,14 @@ pub(crate) fn finish_library_operation(
 ) {
     match (action_result, observe_result) {
         (Ok(()), Ok(())) => {
-            if let Err(err) = record_library_event(
+            if let Err(err) = record_library_operation(
                 index,
                 cfg,
                 handle,
                 library_serial,
-                AuditEvent::OperationFinished,
+                lib::OperationEvent::Finished(lib::Response {
+                    response_fingerprint: None,
+                }),
                 BTreeMap::new(),
             ) {
                 fail_library_operation(
@@ -316,6 +341,29 @@ pub(crate) fn run_load_sequence(
     bay: u16,
     wait_ready: bool,
 ) -> Result<(), String> {
+    library.with_motion_context(
+        remanence_library::motion::MotionContext {
+            parent_operation: Some(*handle.op_id_uuid().as_bytes()),
+            load_confirmation: if wait_ready {
+                remanence_library::motion::LoadConfirmation::Readiness
+            } else {
+                remanence_library::motion::LoadConfirmation::Inventory
+            },
+            ..Default::default()
+        },
+        |library| run_load_sequence_owned(index, cfg, handle, library, slot, bay, wait_ready),
+    )
+}
+
+fn run_load_sequence_owned(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library: &mut remanence_library::LibraryHandle,
+    slot: u16,
+    bay: u16,
+    wait_ready: bool,
+) -> Result<(), String> {
     let mut motion =
         crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(bay));
     if !wait_ready {
@@ -346,14 +394,6 @@ pub(crate) fn run_load_sequence(
         .readiness_media_observation(barcode.as_deref())
         .map_err(|e| e.to_string())?;
     let family = session_open_media_family(observation);
-    let retryable_load_completion =
-        match library.load_with_admission(slot, bay, &cfg.policy, &mut || motion.admit()) {
-            Ok(()) => None,
-            Err(error) => match retryable_readiness_from_load_error(&error, family) {
-                Some(readiness) => Some(readiness),
-                None => return Err(error.to_string()),
-            },
-        };
 
     let operation_id = handle.op_id_uuid();
     index
@@ -367,6 +407,7 @@ pub(crate) fn run_load_sequence(
             barcode,
             source_slot: Some(slot),
             media_generation: observation.map(|o| o.generation.generation_number()),
+            media_family: observation.map(|o| o.generation),
             phase: "load_drive_readiness".to_string(),
             state: "planned".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
@@ -378,6 +419,15 @@ pub(crate) fn run_load_sequence(
             evidence_path: None,
         })
         .map_err(|error| format!("record load media-readiness operation: {error}"))?;
+    let retryable_load_completion =
+        match library.load_with_admission(slot, bay, &cfg.policy, &mut || motion.admit()) {
+            Ok(()) => None,
+            Err(error) => match retryable_readiness_from_load_error(&error, family) {
+                Some(readiness) => Some(readiness),
+                None => return Err(error.to_string()),
+            },
+        };
+
     if let Some(readiness) = retryable_load_completion.as_ref() {
         record_session_open_readiness_poll_transition(
             index,
@@ -534,6 +584,43 @@ pub(crate) fn publish_library_snapshot(
     *snapshot_guard = snapshot;
 }
 
+pub(crate) fn record_library_operation(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library_serial: &str,
+    event: lib::OperationEvent,
+    detail: BTreeMap<String, CborValue>,
+) -> Result<(), Status> {
+    if let Some(runtime) = cfg.authority.runtime() {
+        return runtime
+            .record_operation_event(
+                *handle.op_id_uuid().as_bytes(),
+                crate::operation_source::kind(handle.operation_kind())?,
+                event,
+                AuditActor::System,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()));
+    }
+    #[cfg(test)]
+    {
+        record_library_event(
+            index,
+            cfg,
+            handle,
+            library_serial,
+            crate::operation_source::fixture_event(&event),
+            detail,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (index, library_serial, detail);
+        unreachable!("only typed authority exists in production")
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn record_library_event(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -542,15 +629,18 @@ pub(crate) fn record_library_event(
     event: AuditEvent,
     mut detail: BTreeMap<String, CborValue>,
 ) -> Result<(), Status> {
+    if cfg.authority.runtime().is_some() {
+        return Ok(());
+    }
     detail.insert(
         "library_serial".to_string(),
         CborValue::Text(library_serial.to_string()),
     );
     append_operation_audit(
         index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
+        cfg.fixture_audit().audit_dir.as_path(),
+        cfg.fixture_audit().audit_fsync,
+        &cfg.fixture_audit().audit_append_lock,
         OperationAuditInput {
             actor: AuditActor::System,
             operation_id: handle.op_id_uuid(),
@@ -623,12 +713,16 @@ pub(crate) fn fail_library_operation(
         "error_summary".to_string(),
         CborValue::Text(error_summary.to_string()),
     );
-    if let Err(err) = record_library_event(
+    if let Err(err) = record_library_operation(
         index,
         cfg,
         handle,
         library_serial,
-        AuditEvent::OperationFailed,
+        lib::OperationEvent::Failed(lib::Failed {
+            retry: None,
+            refusal_code: None,
+            summary: error_summary.into(),
+        }),
         detail,
     ) {
         let audit_error = format!("{error_summary}; audit record failed: {err}");
@@ -662,12 +756,12 @@ pub(crate) fn cancel_library_operation(
         "cancel_detail".to_string(),
         CborValue::Text(detail_message.to_string()),
     );
-    if let Err(err) = record_library_event(
+    if let Err(err) = record_library_operation(
         index,
         cfg,
         handle,
         library_serial,
-        AuditEvent::CancelledBeforeDispatch,
+        lib::OperationEvent::CancelledBeforeDispatch(lib::Unit),
         detail,
     ) {
         let audit_error = format!("{detail_message}; audit record failed: {err}");

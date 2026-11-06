@@ -118,7 +118,7 @@ async fn cleaning_shutdown(before_unload: bool) {
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    std::fs::create_dir_all(&cfg.audit_dir).unwrap();
+    std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).unwrap();
     cfg.cleaning.min_cycle_duration = "0s".into();
     cfg.lifecycle = Some(lifecycle.clone());
     let board = crate::live_status::ChangerWaitBoard::default();

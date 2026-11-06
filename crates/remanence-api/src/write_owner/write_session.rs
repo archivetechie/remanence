@@ -1,17 +1,14 @@
 //! Write-session state, append handling, close, and media preparation.
 
 use crate::closeout_obligation::RetryCauseExt as _;
-use ciborium::Value as CborValue;
 use remanence_state::authority::TapeAuthorityView;
-use remanence_state::SourceLayer;
-use std::collections::BTreeMap;
 use std::time::{Duration as StdDuration, Instant};
 
 use remanence_library::{DriveHandle, DriveHandleSink, DriveHandleSource, TapeConfig};
 use remanence_parity::DriveHandleRawSink;
 use remanence_state::{
-    AuditActor, AuditEvent, CatalogIndex, TapeIoFenceRecord, TapePoolConfig,
-    TerminalFinalizationOutcome, TerminalFinalizationProjectionInput,
+    CatalogIndex, TapeIoFenceRecord, TapePoolConfig, TerminalFinalizationOutcome,
+    TerminalFinalizationProjectionInput,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
@@ -19,8 +16,7 @@ use uuid::Uuid;
 
 use super::actor_protocol::DriveCommand;
 use super::actor_runtime::{
-    record_session_close_snapshot, record_session_event, record_session_snapshot,
-    OpenWriteActorRequest, SessionAuditInput, WriteOwnerConfig,
+    record_session_close_snapshot, record_session_snapshot, OpenWriteActorRequest, WriteOwnerConfig,
 };
 use super::checkpoint::{
     arm_checkpoint_idle_close, arm_checkpoint_timer, extend_durable_checkpoint_records,
@@ -148,9 +144,7 @@ pub(super) struct WriteSessionState<'a> {
     pool_cfg: TapePoolConfig,
     selected: SelectedTape,
     target_kind: pb::write_session::TargetKind,
-    library_serial: Option<String>,
     drive_uuid: Option<Vec<u8>>,
-    drive_serial: Option<String>,
     session_id: Uuid,
     tape_uuid: TapeUuid,
     opened_at_utc: String,
@@ -392,7 +386,7 @@ impl WriteSessionState<'_> {
                         "drive has an active session",
                     )));
                 }
-                DriveCommand::Unload { reply } => {
+                DriveCommand::Unload { reply, .. } => {
                     let _ = reply.send(Err(Status::failed_precondition(
                         "write session already active",
                     )));
@@ -623,104 +617,16 @@ impl WriteSessionState<'_> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
         }
-        let sequence = self
+        let snapshot = self
             .checkpoint_lease
             .freeze()
-            .map_err(status_from_state_error)?
-            .log_reference()
-            .0;
-        let mut detail = BTreeMap::from([
-            ("session_kind".into(), CborValue::Text("write".into())),
-            (
-                "tape_uuid".into(),
-                CborValue::Bytes(self.tape_uuid.to_vec()),
-            ),
-            (
-                "tape_log_sequence".into(),
-                CborValue::Integer(sequence.into()),
-            ),
-            (
-                "end_reason".into(),
-                CborValue::Text(
-                    match self.end_reason {
-                        SessionEndReason::CleanClose => "clean_close",
-                        SessionEndReason::Abort => "abort",
-                        SessionEndReason::FailedAppend => "failed_append",
-                        SessionEndReason::ClientStall => "client_stall",
-                        SessionEndReason::DriveError => "drive_error",
-                        SessionEndReason::GracefulShutdown => "graceful_shutdown",
-                        SessionEndReason::ClientDisconnected => "client_disconnected",
-                        SessionEndReason::CrashRecovered => "crash_recovered",
-                        SessionEndReason::CloseoutFailed => "closeout_failed",
-                    }
-                    .into(),
-                ),
-            ),
-        ]);
-        if let Some(reason) = &self.abort_reason {
-            detail.insert("abort_reason".into(), CborValue::Text(reason.clone()));
+            .map_err(status_from_state_error)?;
+        if let Some(library) = self.cfg.authority.runtime() {
+            library
+                .refresh_native(&snapshot)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
         }
-        if let Some(library) = &self.library_serial {
-            detail.insert("library_serial".into(), CborValue::Text(library.clone()));
-            detail.insert(
-                "drive_bay".into(),
-                CborValue::Integer(u64::from(self.bay).into()),
-            );
-        }
-        if let Some(id) = &self.drive_uuid {
-            detail.insert("drive_uuid".into(), CborValue::Bytes(id.clone()));
-        }
-        if let Some(serial) = &self.drive_serial {
-            detail.insert("drive_serial".into(), CborValue::Text(serial.clone()));
-        }
-        if let Some(mounted) = self.cfg.mounted() {
-            detail.remove("drive_uuid");
-            if let remanence_library::DriveKey::Bay {
-                library_serial,
-                bay,
-            } = &mounted.endpoint
-            {
-                detail.insert(
-                    "library_serial".into(),
-                    CborValue::Text(library_serial.clone()),
-                );
-                detail.insert(
-                    "drive_bay".into(),
-                    CborValue::Integer(u64::from(*bay).into()),
-                );
-            }
-            detail.insert(
-                "endpoint_key".into(),
-                CborValue::Text(mounted.endpoint.encode()),
-            );
-        }
-        // The native ending is authority. Optional audit/projection work must
-        // not start another host wait after the shutdown budget is exhausted.
-        let audit_result = if self.drive.command_deadline_expired() {
-            Ok(())
-        } else {
-            crate::audit_projection::append_and_project_audit(
-                self.index,
-                &self.cfg.audit_dir,
-                true,
-                &self.cfg.audit_append_lock,
-                crate::audit_projection::ProjectedAuditInput {
-                    actor: self
-                        .cfg
-                        .mounted()
-                        .map_or(AuditActor::System, |m| m.actor.clone()),
-                    source_layer: SourceLayer::Layer5,
-                    operation_id: None,
-                    session_id: Some(self.session_id),
-                    idempotency_key: None,
-                    event: AuditEvent::SessionClosed,
-                    subject_kind: "write",
-                    subject_id: Some(self.session_id.to_string()),
-                    detail,
-                },
-            )
-            .map(|_| ())
-        };
+        let audit_result: Result<(), Status> = Ok(());
         if let Some(lifecycle) = &self.cfg.lifecycle {
             let mut session = session_proto(WriteSessionProtoInput {
                 session_id: self.session_id,
@@ -1378,6 +1284,25 @@ impl WriteSessionState<'_> {
                 let mut status = status_from_selected_write_error(&selected, err);
                 let typed_status = status.clone();
                 if tape_started {
+                    if let Some(before) = mounted_dispatches {
+                        let classified =
+                            super::checkpoint::write_failure_outcome(self.drive, before, None);
+                        let (fenced_status, persisted) = fence_failed_parity_raw_write(
+                            self.index,
+                            cfg,
+                            &selected,
+                            "object_append",
+                            Some(&current_caller_object_id),
+                            self.pending_batch.as_ref(),
+                            &classified,
+                            &original_error,
+                            status,
+                        );
+                        status = fenced_status;
+                        if persisted {
+                            self.drive.mark_media_failure_outcome_applied();
+                        }
+                    }
                     let failed_batch = self.pending_batch.take();
                     if let Some(batch) = failed_batch.as_ref() {
                         status = Status::unavailable(format!(
@@ -2380,14 +2305,17 @@ pub(super) fn handle_drive_open_write(
             return None;
         }
     };
-    let closeout_progress =
-        match crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None) {
-            Ok(progress) => progress,
-            Err(status) => {
-                let _ = reply.send(Err(status));
-                return None;
-            }
-        };
+    let closeout_progress = match crate::closeout_progress::CloseoutProgress::for_owner(
+        &cfg.authority,
+        tape_uuid,
+        snapshot_before_open.tape_summary().closeout_due(),
+    ) {
+        Ok(progress) => progress,
+        Err(status) => {
+            let _ = reply.send(Err(status));
+            return None;
+        }
+    };
     closeout_progress.bind(snapshot_before_open.tape_summary(), "rebuilt");
     closeout_progress.phase("rebuilding");
     let closeout_due = snapshot_before_open.tape_summary().closeout_due();
@@ -2395,11 +2323,10 @@ pub(super) fn handle_drive_open_write(
         if let Some(permit) = &preflight_rebuild_permit {
             closeout_progress.reserved(permit.bytes());
         }
-        if let Err(status) = closeout_progress.audit(
+        if let Err(status) = closeout_progress.record(
             index,
-            &cfg.audit_dir,
-            &cfg.audit_append_lock,
-            AuditEvent::OperationStarted,
+            &cfg.authority,
+            crate::closeout_progress::CloseoutEvent::Started,
             None,
         ) {
             let _ = reply.send(Err(status));
@@ -2425,11 +2352,10 @@ pub(super) fn handle_drive_open_write(
                 Ok(session) => Some(session),
                 Err(status) => {
                     if closeout_due {
-                        let _ = closeout_progress.audit(
+                        let _ = closeout_progress.record(
                             index,
-                            &cfg.audit_dir,
-                            &cfg.audit_append_lock,
-                            AuditEvent::OperationFailed,
+                            &cfg.authority,
+                            crate::closeout_progress::CloseoutEvent::Failed,
                             Some(&status),
                         );
                     }
@@ -2456,11 +2382,10 @@ pub(super) fn handle_drive_open_write(
             Ok(prepared) => Some(prepared),
             Err(error) => {
                 if closeout_due {
-                    let _ = closeout_progress.audit(
+                    let _ = closeout_progress.record(
                         index,
-                        &cfg.audit_dir,
-                        &cfg.audit_append_lock,
-                        AuditEvent::OperationFailed,
+                        &cfg.authority,
+                        crate::closeout_progress::CloseoutEvent::Failed,
                         Some(&error),
                     );
                 }
@@ -2531,11 +2456,10 @@ pub(super) fn handle_drive_open_write(
                 )
             };
             if closeout_due {
-                let _ = closeout_progress.audit(
+                let _ = closeout_progress.record(
                     index,
-                    &cfg.audit_dir,
-                    &cfg.audit_append_lock,
-                    AuditEvent::OperationFailed,
+                    &cfg.authority,
+                    crate::closeout_progress::CloseoutEvent::Failed,
                     Some(&status),
                 );
             }
@@ -2548,26 +2472,16 @@ pub(super) fn handle_drive_open_write(
     let bytes_committed = 0u64;
     let last_checkpoint_at_utc = None;
     let mut last_durable_checkpoint = durable_checkpoint_records.last().cloned();
-    if cfg.mounted().is_none() {
-        if let Err(status) = record_session_event(
-            index,
-            cfg,
-            SessionAuditInput {
-                session_id,
-                session_kind: "write",
-                event: AuditEvent::SessionOpened,
-                tape_uuid: Some(tape_uuid),
-                library_serial: library_serial.clone(),
-                drive_bay: Some(bay),
-                drive_uuid: drive_uuid.clone(),
-                drive_serial: drive_serial.clone(),
-                abort_reason: None,
-            },
-        ) {
-            let _ = reply.send(Err(status));
-            return None;
-        }
+    // Rulings 1–19 have no durable write-session representation before the
+    // first Initialized commit. Both parity construction and the plain writer
+    // can dispatch Bootstrap bytes; refuse before either writer after proving the actual physical boundary.
+    if cfg.authority.runtime().is_some() && durable_checkpoint_records.is_empty() {
+        let _ = reply.send(Err(Status::failed_precondition(
+            "cannot open a fresh write session without durable pre-Bootstrap session authority; no Bootstrap bytes were written",
+        )));
+        return None;
     }
+
     let bootstrap_dispatch_before = drive.media_write_dispatch_count();
     if let Some(authority) = fresh_parity_authority {
         parity_session = match open_parity_actor_session(
@@ -2746,11 +2660,10 @@ pub(super) fn handle_drive_open_write(
             &status,
         );
         if closeout_due {
-            let _ = closeout_progress.audit(
+            let _ = closeout_progress.record(
                 index,
-                &cfg.audit_dir,
-                &cfg.audit_append_lock,
-                AuditEvent::OperationFailed,
+                &cfg.authority,
+                crate::closeout_progress::CloseoutEvent::Failed,
                 Some(&status),
             );
         }
@@ -2828,6 +2741,20 @@ pub(super) fn handle_drive_open_write(
         let _ = reply.send(Err(status));
         return None;
     }
+    if let Some(library) = cfg.authority.runtime() {
+        match checkpoint_lease.freeze() {
+            Ok(snapshot) => {
+                if let Err(error) = library.refresh_native(&snapshot) {
+                    let _ = reply.send(Err(Status::failed_precondition(error.to_string())));
+                    return None;
+                }
+            }
+            Err(error) => {
+                let _ = reply.send(Err(status_from_state_error(error)));
+                return None;
+            }
+        }
+    }
     drive.set_media_dispatch_observer(Some(Box::new(tail.clone())));
     let open_reply_lost = reply.send(Ok(open_reply)).is_err();
     let mut session_state = WriteSessionState {
@@ -2848,9 +2775,7 @@ pub(super) fn handle_drive_open_write(
         pool_cfg,
         selected,
         target_kind,
-        library_serial,
         drive_uuid,
-        drive_serial,
         session_id,
         tape_uuid,
         opened_at_utc,
@@ -2912,18 +2837,84 @@ pub(super) fn handle_drive_open_write(
     })
 }
 
-/// Raise a fence under the same append lock as the other daemon audit writers.
+/// Publish the typed write fence before applying its quarantine effect. The
+/// shared runtime latches a failed publication independently of native endings.
 pub(crate) fn raise_tape_io_fence(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     input: remanence_state::TapeIoFenceInput,
-    endpoint: Option<&remanence_library::DriveKey>,
+    _endpoint: Option<&remanence_library::DriveKey>,
+    completion: Option<&remanence_library::outcome::CompletionEvidence>,
 ) -> Result<TapeIoFenceRecord, remanence_state::StateError> {
+    use remanence_state::library_log as lib;
     let cfg = cfg.terminal_config();
-    let _guard = cfg.audit_append_lock.lock().map_err(|_| {
-        remanence_state::StateError::IndexCorrupt("audit append lock poisoned".into())
-    })?;
-    remanence_state::fence::raise(index, &cfg.audit_dir, input, endpoint, AuditActor::System)
+    let invalid = |message: String| remanence_state::StateError::IndexCorrupt(message);
+    let library = cfg
+        .authority
+        .runtime()
+        .ok_or_else(|| invalid("write fence requires shared LibraryAuthority".into()))?;
+    let tape = library
+        .tape_state(input.tape_uuid)
+        .ok_or_else(|| invalid("write fence requires Reprovision identity".into()))?;
+    let cause = match input.reason.as_str() {
+        "partial_batch" => lib::FenceCause::PartialBatch,
+        "transfer_error" => lib::FenceCause::TransferError,
+        "closeout_check_mismatch" | "CloseoutCheckMismatch" => {
+            lib::FenceCause::CloseoutCheckMismatch
+        }
+        "supersede_tail_failed" => lib::FenceCause::SupersedeTailFailed,
+        "standalone_write_lost_by_restart" => lib::FenceCause::StandaloneWriteLostByRestart,
+        "append_admission_refused" => lib::FenceCause::AppendAdmissionRefused,
+        "reset_unit_attention" => lib::FenceCause::ResetUnitAttention,
+        "position_drift" => lib::FenceCause::PositionDrift,
+        "authority_ambiguous" | "AuthorityAmbiguous" => lib::FenceCause::AuthorityAmbiguous,
+        "session_suffix_contradiction" | "SessionSuffixContradiction" => {
+            lib::FenceCause::SessionSuffixContradiction
+        }
+        "closeout_read_contradiction" | "CloseoutReadContradiction" => {
+            lib::FenceCause::CloseoutReadContradiction
+        }
+        "checkpoint_barrier_failed" => lib::FenceCause::CheckpointBarrierFailed,
+        other => return Err(invalid(format!("unrepresented write fence cause: {other}"))),
+    };
+    let evidence = completion.map(|evidence| lib::CompletionEvidence {
+        dispatch: match evidence.dispatch {
+            remanence_library::outcome::Dispatch::Issued => lib::Dispatch::Issued,
+            remanence_library::outcome::Dispatch::NotIssued => lib::Dispatch::NotIssued,
+        },
+        completion: match evidence.completion {
+            remanence_library::outcome::Completion::Known => lib::Completion::Known,
+            remanence_library::outcome::Completion::Unknown => lib::Completion::Unknown,
+        },
+        scsi_status: evidence.scsi_status,
+        host_status: evidence.host_status,
+        driver_status: evidence.driver_status,
+        sense: evidence.sense.clone().map(lib::Blob),
+        residual: evidence.residual,
+    });
+    let at = library
+        .current_native_reference(input.tape_uuid)
+        .map_err(|e| invalid(e.to_string()))?;
+    let receipt = library
+        .append(|authority, view| {
+            authority.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape.tape),
+                    cause,
+                    evidence,
+                    at,
+                    operation: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer5,
+                view,
+            )
+        })
+        .map_err(|e| invalid(e.to_string()))?;
+    index
+        .tape_io_fence_by_quarantine_id(&format!("library:{}", receipt.sequence))?
+        .ok_or_else(|| invalid("typed fence projection missing after acknowledgement".into()))
 }
 
 /// Run the load-time wrap-map harvest for a freshly mounted cartridge

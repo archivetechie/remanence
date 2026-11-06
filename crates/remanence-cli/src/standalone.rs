@@ -2075,7 +2075,7 @@ struct InitPlan {
     observation: MediaObservation,
     decision: remanence_api::InitDecision,
     clobber_data_confirmed: bool,
-    previous_uuid: Option<[u8; 16]>,
+    initialization_guard: remanence_state::InitializationGuard,
     /// Confirmed destruction of a BOT identity unknown to this catalog.
     clobber_unknown_tape: Option<remanence_api::UnknownTapeClobber>,
 }
@@ -2200,12 +2200,6 @@ fn prepare_init(
             ))
         });
     let replacement_uuid = *Uuid::new_v4().as_bytes();
-    let previous_uuid = loaded_uuid.filter(|_| {
-        facts
-            .catalog_row
-            .as_ref()
-            .is_some_and(|row| row.disposition != remanence_api::CatalogRowDisposition::Retired)
-    });
     // A named unknown-tape clobber must match this exact decision before any
     // confirmation prompt; a mismatch or any other decision refuses unwritten.
     let clobber_unknown_tape = clobber
@@ -2224,24 +2218,13 @@ fn prepare_init(
         &decision,
         clobber_unknown_tape.map(|named| named.bot_uuid()),
     );
-    if confirm_clobber {
-        state
-            .write_handle()
-            .provision_replacing_media(
-                remanence_state::ProvisionTapeInput {
-                    tape_uuid: replacement_uuid,
-                    voltag: label.into(),
-                    block_size: size,
-                    parity: parity.clone(),
-                    force: true,
-                },
-                LabelProvenance::Operator,
-                Some(observation),
-                previous_uuid,
-                true,
-            )
-            .map_err(err)?;
-    }
+    let initialization_guard = state
+        .prepare_tape_initialization(
+            loaded_uuid,
+            label,
+            clobber_unknown_tape.map(|v| v.bot_uuid()),
+        )
+        .map_err(err)?;
     let clobber_data_confirmed = if confirm_clobber {
         use std::io::IsTerminal;
         if clobber.2 {
@@ -2318,11 +2301,7 @@ fn prepare_init(
             observation,
             decision,
             clobber_data_confirmed,
-            previous_uuid: if clobber_data_confirmed {
-                previous_uuid
-            } else {
-                None
-            },
+            initialization_guard,
             clobber_unknown_tape: clobber_unknown_tape.filter(|_| clobber_data_confirmed),
         },
     ))
@@ -2358,7 +2337,7 @@ fn complete_init(
         observation,
         decision,
         clobber_data_confirmed,
-        previous_uuid,
+        initialization_guard,
         clobber_unknown_tape,
     } = plan;
     let action = remanence_api::maybe_write_tape_init_bootstrap_on_drive(
@@ -2386,6 +2365,9 @@ fn complete_init(
     }
     let clobbered_unknown_uuid = clobber_unknown_tape.map(|named| named.bot_uuid());
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
+        let previous_uuid = state
+            .record_initialization_replacement(initialization_guard)
+            .map_err(err)?;
         let config = state.config().clone();
         crate::provision_initialized_tape_with_media(
             state,

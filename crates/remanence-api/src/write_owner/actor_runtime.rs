@@ -1,17 +1,18 @@
 //! Drive/changer actor startup, command dispatch, health, and session audit.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
 use ciborium::value::Value as CborValue;
 use remanence_library::{ChangerHandle, DiscoveryReport, DriveHandle, StaticAllowlist};
 use remanence_state::{
-    AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
-    CleaningConfig, DriveHealthSnapshotInput, DriveHealthSnapshotRecord, FileAuditLog, SourceLayer,
-    TapeIoConfig,
+    AlarmRecord, AuditActor, CatalogIndex, CleaningConfig, DriveHealthSnapshotRecord, TapeIoConfig,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
@@ -31,6 +32,7 @@ use super::terminal_inventory::{handle_drive_tape_inventory, handle_drive_verify
 use super::terminal_types::ManualFinalizeTapeMountRequest;
 use super::write_session::handle_drive_open_write;
 use super::{DriveKey, ExclusiveGuard, SelectedTape, WriteAdmissionCoordinator};
+#[cfg(test)]
 use crate::audit_projection::{
     alarm_audit_detail, append_and_project_audit, drive_health_audit_detail, ProjectedAuditInput,
 };
@@ -39,13 +41,11 @@ use remanence_state::TapePoolConfig;
 
 #[derive(Clone)]
 pub(crate) struct WriteOwnerConfig {
+    pub authority: super::terminal_types::TerminalAuthority,
     pub catalog: remanence_state::ProjectionClient,
     pub index_path: PathBuf,
     pub report: DiscoveryReport,
     pub policy: StaticAllowlist,
-    pub audit_dir: PathBuf,
-    pub audit_fsync: bool,
-    pub audit_append_lock: Arc<std::sync::Mutex<()>>,
     pub reservations: Arc<HashMap<crate::drive_pool::DriveKey, AtomicBool>>,
     pub placement: super::ActorPlacement,
     pub snapshot_miss_alarm: u32,
@@ -74,6 +74,20 @@ pub(crate) struct WriteOwnerConfig {
 }
 
 impl WriteOwnerConfig {
+    #[cfg(test)]
+    pub(crate) fn fixture_audit(&self) -> &super::terminal_types::FixtureTerminalAudit {
+        self.authority
+            .historical_fixture()
+            .expect("explicit historical fixture authority")
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_audit_mut(&mut self) -> &mut super::terminal_types::FixtureTerminalAudit {
+        match &mut self.authority {
+            super::terminal_types::TerminalAuthority::HistoricalFixture(value) => value,
+            _ => panic!("explicit historical fixture authority"),
+        }
+    }
+
     /// The configured changer wait, which also stops once `stop` is set.
     pub(crate) fn changer_ready_wait_for(
         &self,
@@ -94,6 +108,9 @@ impl WriteOwnerConfig {
         library: &mut remanence_library::LibraryHandle,
         handle: &crate::operations::OperationHandle,
     ) {
+        if let Some(authority) = self.authority.runtime() {
+            library.set_motion_authority(Arc::new(authority.clone()));
+        }
         library.set_changer_ready_wait(
             self.changer_ready_wait_for(Some(handle.cancel_flag()), "operation cancelled"),
         );
@@ -104,6 +121,9 @@ pub(crate) fn spawn_changer_actor(
     mut changer: ChangerHandle,
     cfg: WriteOwnerConfig,
 ) -> mpsc::Sender<ChangerCommand> {
+    if let Some(authority) = cfg.authority.runtime() {
+        changer.set_motion_authority(Arc::new(authority.clone()));
+    }
     let (tx, rx) = mpsc::channel::<ChangerCommand>(16);
     let actor_name = format!("rem-changer-actor-{}", cfg.library().serial);
     std::thread::Builder::new()
@@ -118,6 +138,9 @@ pub(crate) fn spawn_drive_actor(
     mut drive: DriveHandle,
     cfg: WriteOwnerConfig,
 ) -> mpsc::Sender<DriveCommand> {
+    if let Some(authority) = cfg.authority.runtime() {
+        drive.set_motion_authority(Arc::new(authority.clone()));
+    }
     let (tx, rx) = mpsc::channel::<DriveCommand>(16);
     let actor_tx = tx.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -138,6 +161,11 @@ pub(crate) fn spawn_mounted_actor(
     mut mounted: crate::MountedTape,
     cfg: WriteOwnerConfig,
 ) -> std::io::Result<(mpsc::Sender<DriveCommand>, std::thread::JoinHandle<()>)> {
+    if let Some(authority) = cfg.authority.runtime() {
+        mounted
+            .drive
+            .set_motion_authority(Arc::new(authority.clone()));
+    }
     let (tx, rx) = mpsc::channel(16);
     let actor_tx = tx.clone();
     let audit_error = cfg.mounted().expect("mounted config").audit_error.clone();
@@ -382,11 +410,9 @@ pub(super) fn drive_loop(
                 match super::preflight_automatic_terminal_completion(
                     &mut index,
                     super::ManualFinalizePreflightConfig {
+                        authority: super::terminal_types::TerminalAuthority::from(&cfg),
                         mounted_endpoint: Some(&mounted.endpoint),
                         checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
-                        audit_dir: &cfg.audit_dir,
-                        audit_fsync: cfg.audit_fsync,
-                        audit_append_lock: &cfg.audit_append_lock,
                     },
                     &selected,
                     &pool_cfg,
@@ -796,11 +822,15 @@ pub(super) fn drive_loop(
             DriveCommand::PrepareRemoval { reply } => {
                 let _ = reply.send(Ok(()));
             }
-            DriveCommand::Unload { reply } => {
-                let result = unload_actor_drive(
+            DriveCommand::Unload {
+                reply,
+                continuation_return,
+            } => {
+                let result = unload_actor_drive_with_return(
                     drive,
                     std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
                     cfg.lifecycle.as_ref(),
+                    continuation_return,
                 );
                 if let Some(library) = drive.observed_library() {
                     let _ = observe_refreshed_library(&mut index, &cfg, &library);
@@ -970,7 +1000,7 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
             DriveCommand::PrepareRemoval { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
-            DriveCommand::Unload { reply } => {
+            DriveCommand::Unload { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::PollHealth { reply, .. } => {
@@ -1035,6 +1065,90 @@ pub(super) struct OpenReadActorRequest {
     pub(super) reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
 }
 
+/// Read-session producer facts, before persistence or projection.
+pub(super) struct ReadSessionInput {
+    pub session_id: Uuid,
+    pub event: remanence_state::library_log::SessionEvent,
+    pub tape_uuid: [u8; 16],
+    pub endpoint: remanence_library::DriveKey,
+    pub drive_uuid: Option<Vec<u8>>,
+    pub drive_serial: Option<String>,
+    pub reason: Option<String>,
+}
+pub(super) fn record_read_session(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    input: ReadSessionInput,
+) -> Result<(), Status> {
+    if let Some(runtime) = cfg.authority.runtime() {
+        runtime
+            .observe_session(
+                *input.session_id.as_bytes(),
+                remanence_state::library_log::SessionKind::Read,
+                Some(&input.endpoint),
+                Some(input.tape_uuid),
+                input.event,
+                input.reason,
+                cfg.mounted()
+                    .map_or(AuditActor::System, |mounted| mounted.actor.clone()),
+                (
+                    input
+                        .drive_uuid
+                        .as_deref()
+                        .map(|id| {
+                            <[u8; 16]>::try_from(id).map_err(|_| {
+                                Status::failed_precondition("read session drive UUID is invalid")
+                            })
+                        })
+                        .transpose()?,
+                    input.drive_serial,
+                ),
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        let (library_serial, drive_bay) = match &input.endpoint {
+            remanence_library::DriveKey::Bay {
+                library_serial,
+                bay,
+            } => (Some(library_serial.clone()), Some(*bay)),
+            _ => (None, None),
+        };
+        record_session_event(
+            index,
+            cfg,
+            SessionAuditInput {
+                session_id: input.session_id,
+                session_kind: "read",
+                event: match input.event {
+                    remanence_state::library_log::SessionEvent::Opened => AuditEvent::SessionOpened,
+                    remanence_state::library_log::SessionEvent::Closed => AuditEvent::SessionClosed,
+                    remanence_state::library_log::SessionEvent::Orphaned => {
+                        AuditEvent::SessionOrphaned
+                    }
+                    remanence_state::library_log::SessionEvent::LostByRestart => {
+                        AuditEvent::SessionLostByRestart
+                    }
+                },
+                tape_uuid: Some(input.tape_uuid),
+                library_serial,
+                drive_bay,
+                drive_uuid: input.drive_uuid,
+                drive_serial: input.drive_serial,
+                abort_reason: input.reason,
+            },
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = index;
+        unreachable!("only typed authority exists in production")
+    }
+}
+
+#[cfg(test)]
 pub(super) struct SessionAuditInput {
     pub(super) session_id: Uuid,
     pub(super) session_kind: &'static str,
@@ -1049,19 +1163,21 @@ pub(super) struct SessionAuditInput {
     pub(super) abort_reason: Option<String>,
 }
 
+#[cfg(test)]
 pub(super) fn record_session_event(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
     mut input: SessionAuditInput,
 ) -> Result<(), Status> {
     let _guard = cfg
+        .fixture_audit()
         .audit_append_lock
         .lock()
         .map_err(|_| Status::internal("session audit append lock poisoned"))?;
-    std::fs::create_dir_all(cfg.audit_dir.as_path()).map_err(|err| {
+    std::fs::create_dir_all(cfg.fixture_audit().audit_dir.as_path()).map_err(|err| {
         Status::internal(format!(
             "create session audit directory {}: {err}",
-            cfg.audit_dir.display()
+            cfg.fixture_audit().audit_dir.display()
         ))
     })?;
     let mut detail = BTreeMap::new();
@@ -1114,8 +1230,8 @@ pub(super) fn record_session_event(
         detail.insert("abort_reason".to_string(), CborValue::Text(abort_reason));
     }
     let mut audit = FileAuditLog::open(
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync || cfg.mounted().is_some(),
+        cfg.fixture_audit().audit_dir.as_path(),
+        cfg.fixture_audit().audit_fsync || cfg.mounted().is_some(),
     )
     .map_err(crate::status_from_state_error)?;
     let (_, record) = audit
@@ -1177,36 +1293,108 @@ pub(super) fn collect_drive_health_snapshot(
         "{{\"tape_uuid\":\"{}\",\"tape_alert\":true,\"write_error_counter\":true,\"read_error_counter\":true}}",
         tape_uuid_text
     );
-    let snapshot = index
-        .record_drive_health_snapshot(DriveHealthSnapshotInput {
-            drive_uuid: request.drive_uuid.clone(),
-            trigger: request.trigger.to_string(),
-            session_id: request.session_id.map(|uuid| uuid.to_string()),
-            tape_alert_flags: Some(tape_alert_flags_json(alerts.active())),
-            write_errors_corrected: counters.write_errors_corrected.and_then(u64_to_i64),
-            write_errors_uncorrected: counters.write_errors_uncorrected.and_then(u64_to_i64),
-            read_errors_corrected: counters.read_errors_corrected.and_then(u64_to_i64),
-            read_errors_uncorrected: counters.read_errors_uncorrected.and_then(u64_to_i64),
-            raw_pages: Some(raw_pages),
-            at_utc: None,
-        })
-        .map_err(crate::status_from_state_error)?;
-    if alerts.is_set(20) || alerts.is_set(21) {
-        let due = if alerts.is_set(20) { "now" } else { "periodic" };
-        index
-            .observe_managed_drive_cleaning_due(&request.drive_uuid, due)
-            .map_err(crate::status_from_state_error)?;
-    } else {
-        index
-            .touch_drive_last_seen(&request.drive_uuid)
-            .map_err(crate::status_from_state_error)?;
+    if let Some(runtime) = cfg.authority.runtime() {
+        use remanence_state::library_log as lib;
+        let trigger = match request.trigger {
+            "session-close" => lib::HealthTrigger::SessionClose,
+            "append-failure" => lib::HealthTrigger::AppendFailure,
+            "read-failure" => lib::HealthTrigger::ReadFailure,
+            "foreign-counter" => lib::HealthTrigger::ForeignCounter,
+            "manual" => lib::HealthTrigger::Manual,
+            other => {
+                return Err(Status::failed_precondition(format!(
+                    "unrepresentable health trigger {other}"
+                )))
+            }
+        };
+        let drive_uuid: [u8; 16] = request
+            .drive_uuid
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("health drive UUID length"))?;
+        let tape = request
+            .tape_uuid
+            .map(|uuid| {
+                runtime
+                    .tape_state(uuid)
+                    .filter(|v| !v.retired)
+                    .map(|v| v.tape)
+                    .ok_or_else(|| Status::failed_precondition("health tape requires Reprovision"))
+            })
+            .transpose()?;
+        let flags = alerts.active().iter().try_fold(0u64, |mask, flag| {
+            if (1..=64).contains(flag) {
+                Ok(mask | (1u64 << (*flag - 1)))
+            } else {
+                Err(Status::failed_precondition(
+                    "TapeAlert flag outside typed mask",
+                ))
+            }
+        })?;
+        runtime
+            .observe_drive_health(
+                lib::DriveHealthObserved {
+                    drive_uuid,
+                    tape,
+                    session_id: request.session_id.map(|v| *v.as_bytes()),
+                    operation: None,
+                    trigger,
+                    tape_alert_flags: flags,
+                    counters: lib::Counters {
+                        write_corrected: counters.write_errors_corrected,
+                        write_uncorrected: counters.write_errors_uncorrected,
+                        read_corrected: counters.read_errors_corrected,
+                        read_uncorrected: counters.read_errors_uncorrected,
+                    },
+                    raw_pages: Some(lib::Blob(raw_pages.into_bytes())),
+                },
+                AuditActor::System,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let session = request.session_id.map(|v| v.to_string());
+        return index
+            .list_drive_health_snapshots(&request.drive_uuid)
+            .map_err(crate::status_from_state_error)?
+            .into_iter()
+            .find(|v| v.session_id == session && v.trigger == request.trigger)
+            .ok_or_else(|| Status::internal("typed health projection missing"));
     }
-    append_drive_health_evidence(index, cfg, &snapshot)?;
-    Ok(snapshot)
+    #[cfg(test)]
+    {
+        let snapshot = index
+            .record_drive_health_snapshot(DriveHealthSnapshotInput {
+                drive_uuid: request.drive_uuid.clone(),
+                trigger: request.trigger.to_string(),
+                session_id: request.session_id.map(|uuid| uuid.to_string()),
+                tape_alert_flags: Some(tape_alert_flags_json(alerts.active())),
+                write_errors_corrected: counters.write_errors_corrected.and_then(u64_to_i64),
+                write_errors_uncorrected: counters.write_errors_uncorrected.and_then(u64_to_i64),
+                read_errors_corrected: counters.read_errors_corrected.and_then(u64_to_i64),
+                read_errors_uncorrected: counters.read_errors_uncorrected.and_then(u64_to_i64),
+                raw_pages: Some(raw_pages),
+                at_utc: None,
+            })
+            .map_err(crate::status_from_state_error)?;
+        if alerts.is_set(20) || alerts.is_set(21) {
+            let due = if alerts.is_set(20) { "now" } else { "periodic" };
+            index
+                .observe_managed_drive_cleaning_due(&request.drive_uuid, due)
+                .map_err(crate::status_from_state_error)?;
+        } else {
+            index
+                .touch_drive_last_seen(&request.drive_uuid)
+                .map_err(crate::status_from_state_error)?;
+        }
+        append_drive_health_evidence(index, cfg, &snapshot)?;
+        Ok(snapshot)
+    }
+    #[cfg(not(test))]
+    unreachable!("only typed authority exists in production")
 }
 
 /// Append the durable evidence twin for a just-committed health snapshot and
 /// project that exact record through the same replay funnel used at rebuild.
+#[cfg(test)]
 pub(super) fn append_drive_health_evidence(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -1215,9 +1403,9 @@ pub(super) fn append_drive_health_evidence(
     let detail = drive_health_audit_detail(index, snapshot)?;
     append_and_project_audit(
         index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
+        cfg.fixture_audit().audit_dir.as_path(),
+        cfg.fixture_audit().audit_fsync,
+        &cfg.fixture_audit().audit_append_lock,
         ProjectedAuditInput {
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer4,
@@ -1244,16 +1432,67 @@ pub(super) fn raise_alarm_with_evidence(
     severity: &str,
     alarm_detail: Option<&str>,
 ) -> Result<AlarmRecord, Status> {
-    let alarm = index
-        .raise_alarm(condition_key, kind, severity, alarm_detail)
-        .map_err(crate::status_from_state_error)
-        .inspect_err(
-            |error| tracing::warn!(condition_key, %error, "failed to raise catalog alarm"),
+    if let Some(runtime) = cfg.authority.runtime() {
+        use remanence_state::library_log as lib;
+        let kind = match kind {
+            "drive-cleaning-abnormal-frequency" => lib::AlarmKind::DriveCleaningAbnormalFrequency,
+            "cleaning-needs-operator" => lib::AlarmKind::CleaningNeedsOperator,
+            "no-cln-cart" => lib::AlarmKind::NoClnCart,
+            "cln-cart-expired" => lib::AlarmKind::ClnCartExpired,
+            "cart-not-cleaning-behavior" => lib::AlarmKind::CartNotCleaningBehavior,
+            "snapshot-persist-failing" => lib::AlarmKind::SnapshotPersistFailing,
+            "checkpoint-barrier-overdue" => lib::AlarmKind::CheckpointBarrierOverdue,
+            "foreign-drive-wants-cleaning" => lib::AlarmKind::ForeignDriveWantsCleaning,
+            "kind-flip-refused" => lib::AlarmKind::KindFlipRefused,
+            other => {
+                return Err(Status::failed_precondition(format!(
+                    "unrepresentable alarm kind {other}"
+                )))
+            }
+        };
+        let severity = match severity {
+            "warning" => lib::Severity::Warning,
+            "critical" => lib::Severity::Critical,
+            "error" => lib::Severity::Error,
+            other => {
+                return Err(Status::failed_precondition(format!(
+                    "unrepresentable alarm severity {other}"
+                )))
+            }
+        };
+        let reason = alarm_detail
+            .ok_or_else(|| Status::failed_precondition("alarm producer omitted typed reason"))?;
+        runtime
+            .observe_alarm(
+                condition_key,
+                Some(lib::AlarmRaise {
+                    kind,
+                    severity,
+                    reason: reason.into(),
+                }),
+                "",
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        return index
+            .get_alarm(condition_key)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::internal("typed alarm projection missing"));
+    }
+    #[cfg(test)]
+    {
+        let alarm = index
+            .raise_alarm(condition_key, kind, severity, alarm_detail)
+            .map_err(crate::status_from_state_error)
+            .inspect_err(
+                |error| tracing::warn!(condition_key, %error, "failed to raise catalog alarm"),
+            )?;
+        append_alarm_evidence(index, cfg, &alarm, AuditEvent::AlarmRaised).inspect_err(
+            |error| tracing::warn!(condition_key, %error, "failed to append raised-alarm evidence"),
         )?;
-    append_alarm_evidence(index, cfg, &alarm, AuditEvent::AlarmRaised).inspect_err(
-        |error| tracing::warn!(condition_key, %error, "failed to append raised-alarm evidence"),
-    )?;
-    Ok(alarm)
+        Ok(alarm)
+    }
+    #[cfg(not(test))]
+    unreachable!("only typed authority exists in production")
 }
 
 pub(super) fn clear_alarm_with_evidence(
@@ -1261,22 +1500,36 @@ pub(super) fn clear_alarm_with_evidence(
     cfg: &WriteOwnerConfig,
     condition_key: &str,
 ) -> Result<Option<AlarmRecord>, Status> {
-    let alarm = index
-        .clear_alarm(condition_key)
-        .map_err(crate::status_from_state_error)
-        .inspect_err(
-            |error| tracing::warn!(condition_key, %error, "failed to clear catalog alarm"),
-        )?;
-    if let Some(alarm) = alarm.as_ref() {
-        append_alarm_evidence(index, cfg, alarm, AuditEvent::AlarmCleared).inspect_err(
+    if let Some(runtime) = cfg.authority.runtime() {
+        runtime
+            .observe_alarm(condition_key, None, "condition cleared by its owner")
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        return index
+            .get_alarm(condition_key)
+            .map_err(crate::status_from_state_error);
+    }
+    #[cfg(test)]
+    {
+        let alarm = index
+            .clear_alarm(condition_key)
+            .map_err(crate::status_from_state_error)
+            .inspect_err(
+                |error| tracing::warn!(condition_key, %error, "failed to clear catalog alarm"),
+            )?;
+        if let Some(alarm) = alarm.as_ref() {
+            append_alarm_evidence(index, cfg, alarm, AuditEvent::AlarmCleared).inspect_err(
             |error| {
                 tracing::warn!(condition_key, %error, "failed to append cleared-alarm evidence")
             },
         )?;
+        }
+        Ok(alarm)
     }
-    Ok(alarm)
+    #[cfg(not(test))]
+    unreachable!("only typed authority exists in production")
 }
 
+#[cfg(test)]
 pub(super) fn append_alarm_evidence(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -1285,9 +1538,9 @@ pub(super) fn append_alarm_evidence(
 ) -> Result<(), Status> {
     append_and_project_audit(
         index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
+        cfg.fixture_audit().audit_dir.as_path(),
+        cfg.fixture_audit().audit_fsync,
+        &cfg.fixture_audit().audit_append_lock,
         ProjectedAuditInput {
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer4,
@@ -1413,6 +1666,12 @@ pub(super) fn clear_snapshot_persist_alarm(
     }
 }
 
+#[cfg(test)]
+fn u64_to_i64(value: u64) -> Option<i64> {
+    i64::try_from(value).ok()
+}
+
+#[cfg(test)]
 pub(super) fn tape_alert_flags_json(flags: &std::collections::BTreeSet<u8>) -> String {
     let body = flags
         .iter()
@@ -1422,16 +1681,21 @@ pub(super) fn tape_alert_flags_json(flags: &std::collections::BTreeSet<u8>) -> S
     format!("[{body}]")
 }
 
-pub(super) fn u64_to_i64(value: u64) -> Option<i64> {
-    i64::try_from(value).ok()
-}
-
 /// Actor unload after the exclusion handshake has settled. Keep recovery's
 /// device lock in the reply so a following changer MOVE remains protected.
+#[cfg(test)]
 pub(crate) fn unload_actor_drive(
     drive: &mut remanence_library::DriveHandle,
     lock_root: &std::path::Path,
     lifecycle: Option<&crate::drive_pool::DrivePoolLifecycle>,
+) -> Result<super::DriveUnloadOutcome, Status> {
+    unload_actor_drive_with_return(drive, lock_root, lifecycle, false)
+}
+fn unload_actor_drive_with_return(
+    drive: &mut remanence_library::DriveHandle,
+    lock_root: &std::path::Path,
+    lifecycle: Option<&crate::drive_pool::DrivePoolLifecycle>,
+    continuation_return: bool,
 ) -> Result<super::DriveUnloadOutcome, Status> {
     let started = Instant::now();
     let bay = drive
@@ -1443,7 +1707,14 @@ pub(crate) fn unload_actor_drive(
     let mut admit = || {
         if dismount_guard.is_none() {
             dismount_guard = lifecycle
-                .map(|l| l.begin_dismount(key.as_ref().expect("daemon drive has a durable key")))
+                .map(|l| {
+                    let key = key.as_ref().expect("daemon drive has a durable key");
+                    if continuation_return {
+                        Ok(l.begin_continuation_return(key))
+                    } else {
+                        l.begin_dismount(key)
+                    }
+                })
                 .transpose()
                 .map_err(|error| {
                     let message = error.message().to_string();
@@ -1484,3 +1755,8 @@ pub(crate) fn unload_actor_drive(
         recovery_guard: guard,
     })
 }
+
+#[cfg(test)]
+use remanence_state::{
+    AuditEvent, AuditEventRecord, AuditSubject, DriveHealthSnapshotInput, FileAuditLog, SourceLayer,
+};

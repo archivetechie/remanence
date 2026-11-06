@@ -1270,6 +1270,7 @@ mod fix_tests {
                 barcode: Some("TAPE".into()),
                 source_slot: None,
                 media_generation: Some(9),
+                media_family: None,
                 phase: "poll".into(),
                 state: "becoming_ready".into(),
                 dirty_scope: Some("drive".into()),
@@ -1304,6 +1305,7 @@ mod fix_tests {
             index
         }
         .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+            completion_evidence: None,
             operation_id: id,
             phase: None,
             state: "ready".into(),

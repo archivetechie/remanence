@@ -221,6 +221,19 @@ fn scan_prefixes(
     applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
     files: &[(PathBuf, Option<u64>)],
 ) -> Result<Replay, StoreError> {
+    scan_prefixes_observed(dir, log_uuid, view, applied, &mut |_, _| Ok(()), files)
+}
+
+/// Received observations follow byte-chain and fold validation, including
+/// pending/excluded dispositions; they never grant projector application proof.
+fn scan_prefixes_observed(
+    dir: &Path,
+    log_uuid: Id,
+    view: &dyn TapeView,
+    applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+    received: &mut dyn FnMut(&Record, &Receipt) -> Result<(), StoreError>,
+    files: &[(PathBuf, Option<u64>)],
+) -> Result<Replay, StoreError> {
     let mut out = Replay::default();
     for (index, (path, limit)) in files.iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -300,7 +313,7 @@ fn scan_prefixes(
                     if let Err(e) = out.fold.receive_observed(
                         frame.sequence,
                         frame.record,
-                        receipt,
+                        receipt.clone(),
                         view,
                         &SegmentHistory {
                             dir,
@@ -309,6 +322,11 @@ fn scan_prefixes(
                         },
                         &mut |sequence| applied_sequences.push(sequence),
                     ) {
+                        if matches!(e, FoldError::TapeUnavailable(_)) {
+                            // Environmental evidence failure is not a damaged
+                            // library suffix and must never authorize repair.
+                            return Err(e.into());
+                        }
                         out.refusal = Some(Refusal {
                             segment: name.clone(),
                             offset: frame.offset,
@@ -317,6 +335,7 @@ fn scan_prefixes(
                         });
                         break;
                     }
+                    received(&observed_record, &receipt)?;
                     for sequence in applied_sequences {
                         applied(super::authority::AppliedLibraryRecord {
                             log_uuid,
@@ -697,7 +716,7 @@ impl LibraryLog {
                 operation_id: body.operation(),
                 session_id: match &body {
                     Body::SessionObserved(v) => Some(v.session_id),
-                    Body::SupersedeTail(v) => Some(v.session_id),
+                    Body::SupersedeTail(v) => v.session_id,
                     Body::DriveHealthObserved(v) => v.session_id,
                     _ => None,
                 },
@@ -907,6 +926,14 @@ pub(super) struct ReadSnapshot {
     _directory_lock: Arc<Flock<fs::File>>,
 }
 impl ReadSnapshot {
+    pub(super) fn inspect(
+        &self,
+        view: &dyn TapeView,
+        applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+        received: &mut dyn FnMut(&Record, &Receipt) -> Result<(), StoreError>,
+    ) -> Result<Replay, StoreError> {
+        scan_prefixes_observed(&self.dir, self.uuid, view, applied, received, &self.files)
+    }
     pub(super) fn replay(
         &self,
         view: &dyn TapeView,

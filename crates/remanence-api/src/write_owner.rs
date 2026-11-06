@@ -10,6 +10,7 @@ use tonic::Status;
 
 mod bot_recovery;
 mod cleaning;
+mod cleaning_source;
 #[cfg(feature = "field-kit")]
 pub(crate) mod field_gate;
 mod readiness;
@@ -186,3 +187,5 @@ pub(crate) use actor_runtime::spawn_mounted_actor;
 
 mod tail_recovery;
 pub(crate) use tail_recovery::supersede_mounted_tail;
+#[cfg(test)]
+pub(crate) use tail_recovery::{cut_after_ack, cut_after_recovery_effect};

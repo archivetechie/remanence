@@ -27,6 +27,7 @@ pub mod codec;
 mod differential_tests;
 pub mod fold;
 mod index;
+pub mod native_view;
 #[cfg(test)]
 mod reference_fixtures;
 pub mod store;
@@ -44,6 +45,14 @@ pub use store::{LibraryLog, Receipt};
 pub use wire::{Blob, Negative, TextValue, Unit};
 /// Binary UUID.
 pub type Id = [u8; 16];
+/// Stable inventory identity used by cleaning registration; no BOT is required.
+pub fn cleaning_cartridge_ref(barcode: &LabelText) -> TapeRef {
+    let name = format!("remanence:cleaning-cartridge:{}", barcode.as_str());
+    TapeRef {
+        uuid: *uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).as_bytes(),
+        incarnation: 1,
+    }
+}
 /// SHA-256 digest.
 pub type Hash = [u8; 32];
 /// Bounded UTF-8 presentation or identifier text.
@@ -363,6 +372,8 @@ pub struct Begin {
 pub struct Advance {
     /// CBOR key 0: `CleanPhase`.
     pub phase: CleanPhase,
+    /// CBOR key 1: selected source slot, present exactly for MovingIn.
+    pub home_slot: Option<u16>,
 }
 /// Finish fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -519,12 +530,12 @@ pub struct MediumSpecSet {
 pub struct SupersedeTail {
     /// CBOR key 0: `TapeAt`.
     pub at: TapeAt,
-    /// CBOR key 1: `Id`.
-    pub operation: Id,
-    /// CBOR key 2: `Id`.
-    pub session_id: Id,
-    /// CBOR key 3: `Hash`.
-    pub preview_digest: Hash,
+    /// CBOR key 1: optional `Id`.
+    pub operation: Option<Id>,
+    /// CBOR key 2: optional `Id`.
+    pub session_id: Option<Id>,
+    /// CBOR key 3: optional `Hash`.
+    pub preview_digest: Option<Hash>,
     /// CBOR key 4: `u64`.
     pub tail_file_count: u64,
 }
@@ -557,6 +568,26 @@ pub struct FenceRaised {
     pub at: Option<TapeAt>,
     /// CBOR key 5: `Option<Id>`.
     pub operation: Option<Id>,
+}
+impl From<&remanence_library::outcome::CompletionEvidence> for CompletionEvidence {
+    fn from(value: &remanence_library::outcome::CompletionEvidence) -> Self {
+        use remanence_library::outcome;
+        Self {
+            dispatch: match value.dispatch {
+                outcome::Dispatch::Issued => Dispatch::Issued,
+                outcome::Dispatch::NotIssued => Dispatch::NotIssued,
+            },
+            completion: match value.completion {
+                outcome::Completion::Known => Completion::Known,
+                outcome::Completion::Unknown => Completion::Unknown,
+            },
+            scsi_status: value.scsi_status,
+            host_status: value.host_status,
+            driver_status: value.driver_status,
+            sense: value.sense.clone().map(Blob),
+            residual: value.residual,
+        }
+    }
 }
 /// FenceReleased fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -599,8 +630,8 @@ pub struct MotionOutcome {
 /// InventoryReconciled fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventoryReconciled {
-    /// CBOR key 0: `Text`.
-    pub library_serial: Text,
+    /// CBOR key 0: library or standalone observation subject.
+    pub subject: InventorySubject,
     /// CBOR key 1: `u64`.
     pub observation_generation: u64,
     /// CBOR key 2: `Bounded<DecisionRef, 1024>`.
@@ -672,6 +703,25 @@ pub struct ConfigurationAccepted {
     /// CBOR key 2: `Definitions`.
     pub definitions: Definitions,
 }
+/// Admission scope of a readiness observation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadinessScope {
+    /// Wire code 0: the observed endpoint (ordinary readiness).
+    #[default]
+    Endpoint,
+    /// Wire code 1: every endpoint of the observed library.
+    Library,
+}
+/// Replacement evidence for an already raised alarm; acknowledgement is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlarmRefresh {
+    /// CBOR key 0: replacement severity.
+    pub severity: Severity,
+    /// CBOR key 1: replacement reason.
+    pub reason: Text,
+    /// CBOR key 2: replacement causal reference.
+    pub cause: Option<DecisionRef>,
+}
 /// ReadinessObserved fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessObserved {
@@ -701,6 +751,10 @@ pub struct ReadinessObserved {
     pub ready_generation: u64,
     /// CBOR key 12: `ReadinessResult`.
     pub result: ReadinessResult,
+    /// CBOR key 13: admission uncertainty scope; ordinary observations use Endpoint.
+    pub scope: ReadinessScope,
+    /// CBOR key 14: family before provisioning; forbidden with a tape identity.
+    pub media: Option<MediumFamily>,
 }
 /// DriveObserved fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -935,6 +989,8 @@ pub enum FenceCause {
     Cleaning = 11,
     /// Wire code 12; decoded but reserved until disk quarantine is implemented.
     ContainerQuarantine = 12,
+    /// Wire code 13; a checkpoint durability barrier failed.
+    CheckpointBarrierFailed = 13,
 }
 /// Closed MotionResult wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1254,6 +1310,10 @@ pub enum AlarmKind {
     ForeignDriveWantsCleaning = 7,
     /// Wire code 8; producer vocabulary is recorded in SCHEMA.md.
     KindFlipRefused = 8,
+    /// Wire code 9; native evidence contradicts a library reference.
+    ContradictedTape = 9,
+    /// Wire code 10; a durable pending record failed resolution.
+    PendingRecordRejected = 10,
 }
 /// Closed Severity wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1385,6 +1445,17 @@ pub enum DriveKey {
     /// Wire code 1.
     Standalone(Standalone),
 }
+/// Inventory observation subject: a changer or one standalone endpoint.
+/// Standalone observations are obtained with TEST UNIT READY and READ POSITION;
+/// they never borrow a changer identity or resolve another endpoint's intents.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InventorySubject {
+    /// Wire code 0: library serial, observed through element status.
+    Library(Text),
+    /// Wire code 1: standalone endpoint, observed through TUR and READ POSITION.
+    Standalone(Standalone),
+}
+
 /// FenceScope: each variant is encoded as `[code, payload]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FenceScope {
@@ -1441,6 +1512,8 @@ pub enum CleaningAction {
     Finish(Finish),
     /// Wire code 4.
     Expire(Reason),
+    /// Wire code 5. Permanently reject an unexpired registered cartridge.
+    Reject(Reason),
 }
 /// AlarmAction: each variant is encoded as `[code, payload]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1451,6 +1524,8 @@ pub enum AlarmAction {
     Acknowledge(Unit),
     /// Wire code 2.
     Clear(Reason),
+    /// Wire code 3: update evidence without clearing acknowledgement.
+    Refresh(AlarmRefresh),
 }
 /// OperationEvent: each variant is encoded as `[code, payload]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1816,6 +1891,48 @@ mod library_log_b2_fix2;
 mod library_log_memory;
 
 impl Record {
+    /// Read the typed operation body without permitting record construction.
+    pub fn operation_recorded(&self) -> Option<&OperationRecorded> {
+        match &self.body {
+            Body::OperationRecorded(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Read the typed cleaning body without permitting record construction.
+    pub fn cleaning_recorded(&self) -> Option<&CleaningRecorded> {
+        match &self.body {
+            Body::CleaningRecorded(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Borrow the authenticated readiness owner facts and actual observation.
+    pub fn readiness_observation(&self) -> Option<&ReadinessObserved> {
+        match &self.body {
+            Body::ReadinessObserved(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Borrow an authenticated motion intent without exposing body construction.
+    pub fn motion_intent(&self) -> Option<&MotionIntent> {
+        match &self.body {
+            Body::MotionIntent(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Borrow the physical inventory observation named by a motion outcome.
+    pub fn inventory_observation(&self) -> Option<&InventoryReconciled> {
+        match &self.body {
+            Body::InventoryReconciled(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Borrow a motion outcome for read-only status and replay verification.
+    pub fn motion_outcome(&self) -> Option<&MotionOutcome> {
+        match &self.body {
+            Body::MotionOutcome(value) => Some(value),
+            _ => None,
+        }
+    }
     /// Allocated wire tag, without exposing record construction.
     pub fn tag(&self) -> Tag {
         self.body.tag()
@@ -1894,3 +2011,6 @@ impl Record {
         }
     }
 }
+
+/// Native crash acknowledgement join and shared preview encoding.
+pub mod session_ack;

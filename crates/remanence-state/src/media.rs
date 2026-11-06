@@ -28,6 +28,22 @@ pub enum LtoGen {
 }
 
 impl LtoGen {
+    /// Existing uncompressed cartridge capacity table, shared by provisioning
+    /// authority and pool selection rather than independently inferred by each.
+    pub fn raw_capacity_bytes(self) -> u64 {
+        match self {
+            Self::Lto1 => 100_000_000_000,
+            Self::Lto2 => 200_000_000_000,
+            Self::Lto3 => 400_000_000_000,
+            Self::Lto4 => 800_000_000_000,
+            Self::Lto5 => 1_500_000_000_000,
+            Self::Lto6 => 2_500_000_000_000,
+            Self::Lto7 => 6_000_000_000_000,
+            Self::M8 => 9_000_000_000_000,
+            Self::Lto8 => 12_000_000_000_000,
+            Self::Lto9 => 18_000_000_000_000,
+        }
+    }
     /// Numeric LTO generation, with Type-M represented as LTO-8 media class.
     pub fn generation_number(self) -> u8 {
         match self {

@@ -31,11 +31,12 @@ impl UuidSource for Ids {
 #[derive(Default)]
 pub(super) struct View(pub BTreeMap<(Id, u64), TapeLookup>);
 impl TapeView for View {
-    fn lookup(&self, a: &TapeAt) -> TapeLookup {
-        self.0
+    fn lookup(&self, a: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok(self
+            .0
             .get(&(a.tape.uuid, a.sequence))
             .cloned()
-            .unwrap_or(TapeLookup::NotYet)
+            .unwrap_or(TapeLookup::NotYet))
     }
 }
 #[derive(Default)]
@@ -54,11 +55,17 @@ impl LibraryHistory for History {
 }
 pub(super) struct Present;
 impl TapeView for Present {
-    fn lookup(&self, a: &TapeAt) -> TapeLookup {
-        TapeLookup::Present {
-            kind: crate::tape_log::Tag::FinalizationPrepared,
-            digest: a.record_digest,
-        }
+    fn lookup(&self, a: &TapeAt) -> Result<TapeLookup, FoldError> {
+        Ok(if a.sequence == 0 {
+            TapeLookup::EmptyPrefix {
+                digest: a.record_digest,
+            }
+        } else {
+            TapeLookup::Present {
+                kind: crate::tape_log::Tag::FinalizationPrepared,
+                digest: a.record_digest,
+            }
+        })
     }
 }
 pub(super) fn tape(n: u8) -> TapeRef {
@@ -944,7 +951,7 @@ fn inventory_unknown_is_library_scoped() {
     let mut f = initialized();
     feed(&mut f, intent(1), &Present).unwrap();
     let b = Body::InventoryReconciled(InventoryReconciled {
-        library_serial: "LIBA0001".into(),
+        subject: InventorySubject::Library("LIBA0001".into()),
         observation_generation: 1,
         resolves: Bounded(vec![DecisionRef {
             sequence: 3,
@@ -959,7 +966,7 @@ fn inventory_unknown_is_library_scoped() {
     );
     assert!(!f.inventory_unknown(&fold::Scope::Library("LIBB0002".into())));
     let b = Body::InventoryReconciled(InventoryReconciled {
-        library_serial: "LIBA0001".into(),
+        subject: InventorySubject::Library("LIBA0001".into()),
         observation_generation: 1,
         resolves: Bounded(vec![DecisionRef {
             sequence: 3,
@@ -1105,6 +1112,8 @@ fn b4b0_d2_native_contradiction_precedes_library_rules() {
 fn readiness_chain_generation_and_terminal_rules() {
     let mut f = initialized();
     let mut v = ReadinessObserved {
+        scope: ReadinessScope::Endpoint,
+        media: None,
         operation: [90; 16],
         endpoint: endpoint("LIBA0001"),
         tape: None,
@@ -1225,6 +1234,7 @@ fn cleaning_late_cartridge_selection_checks_exclusion() {
     first.cartridge = Some(tape(1));
     first.action = CleaningAction::Advance(Advance {
         phase: CleanPhase::Selecting,
+        home_slot: None,
     });
     feed(&mut f, Body::CleaningRecorded(first), &Present).unwrap();
     let mut other = CleaningRecorded {
@@ -1241,6 +1251,7 @@ fn cleaning_late_cartridge_selection_checks_exclusion() {
     other.cartridge = Some(tape(1));
     other.action = CleaningAction::Advance(Advance {
         phase: CleanPhase::Selecting,
+        home_slot: None,
     });
     assert_eq!(
         feed(&mut f, Body::CleaningRecorded(other), &Present).unwrap_err(),
@@ -1310,7 +1321,7 @@ fn cleaning_cartridge_records_do_not_replace_run_state() {
         run_id: "run".into(),
         previous: None,
         drive_uuid: None,
-        cartridge: Some(tape(1)),
+        cartridge: Some(cleaning_cartridge_ref(&"CLN".into())),
         action: CleaningAction::Register(Register {
             barcode: "CLN".into(),
             home_slot: 1,
@@ -1342,6 +1353,8 @@ pub(super) fn configuration(generation: u64) -> Body {
 /// Readiness can cite a LOAD after its outcome has removed the open intent.
 pub(super) fn readiness_for(reference: DecisionRef) -> Body {
     Body::ReadinessObserved(ReadinessObserved {
+        scope: ReadinessScope::Endpoint,
+        media: None,
         operation: [90; 16],
         endpoint: endpoint("LIBA0001"),
         tape: None,
@@ -2155,9 +2168,9 @@ fn reserved_fences_decode_then_refuse() {
                 let pending = record(
                     Body::SupersedeTail(SupersedeTail {
                         at: at(1, 9),
-                        operation: [7; 16],
-                        session_id: [3; 16],
-                        preview_digest: [0; 32],
+                        operation: Some([7; 16]),
+                        session_id: Some([3; 16]),
+                        preview_digest: Some([0; 32]),
                         tail_file_count: 1,
                     }),
                     2,
@@ -2456,9 +2469,9 @@ fn queued_measured_two_step_generation_change_is_refused_on_drain() {
     let bodies = [
         Body::SupersedeTail(SupersedeTail {
             at: at(1, 9),
-            operation: [7; 16],
-            session_id: [3; 16],
-            preview_digest: [0; 32],
+            operation: Some([7; 16]),
+            session_id: Some([3; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
         medium_change(medium_spec(), 1),
@@ -2518,9 +2531,9 @@ pub(super) fn freeze_history(drive: bool) -> Vec<Body> {
     let supersede = |sequence, session| {
         Body::SupersedeTail(SupersedeTail {
             at: at(1, sequence),
-            operation: [9; 16],
-            session_id: [session; 16],
-            preview_digest: [0; 32],
+            operation: Some([9; 16]),
+            session_id: Some([session; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         })
     };
@@ -2975,9 +2988,9 @@ fn b4b0_d4_scope_held_reference_is_checked() {
         &mut h,
         Body::SupersedeTail(SupersedeTail {
             at: at(2, 30),
-            operation: [7; 16],
-            session_id: [4; 16],
-            preview_digest: [0; 32],
+            operation: Some([7; 16]),
+            session_id: Some([4; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
         &absent,
@@ -3022,9 +3035,9 @@ fn b4b0_d2_d3_d9_minimum_and_diagnostics_are_bounded() {
         &mut h,
         Body::SupersedeTail(SupersedeTail {
             at: at(1, 3),
-            operation: [33; 16],
-            session_id: [34; 16],
-            preview_digest: [0; 32],
+            operation: Some([33; 16]),
+            session_id: Some([34; 16]),
+            preview_digest: Some([0; 32]),
             tail_file_count: 1,
         }),
         &Present,
@@ -3062,7 +3075,7 @@ fn b4b0_fix1_matching_dependents_on_contradicted_tape() {
     for body in [b4b0_repair(8, 8), ordinary] {
         let view = View(BTreeMap::from([
             ((tape(1).uuid, 1), TapeLookup::Contradiction),
-            ((tape(1).uuid, 8), Present.lookup(&at(1, 8))),
+            ((tape(1).uuid, 8), Present.lookup(&at(1, 8)).unwrap()),
         ]));
         let mut live = LibraryFold::default();
         let mut history = History::default();
@@ -3141,7 +3154,8 @@ fn b4b0_fix1_growing_fence_evidence_three_records() {
     for (i, b) in bodies.iter().enumerate() {
         let n = i as u64 + 1;
         if n == 3 {
-            view.0.insert((tape(1).uuid, 1), Present.lookup(&at(1, 1)));
+            view.0
+                .insert((tape(1).uuid, 1), Present.lookup(&at(1, 1)).unwrap());
         }
         live.resolve(&view, &history).unwrap();
         let r = record(b.clone(), n);
@@ -3228,7 +3242,7 @@ fn b4b0_fix1_duplicate_and_refused_reference_accounting() {
 #[test]
 fn b4b0_fix1_repair_floor_precedes_mismatch() {
     for answer in [
-        Present.lookup(&at(1, 9)),
+        Present.lookup(&at(1, 9)).unwrap(),
         TapeLookup::NotYet,
         TapeLookup::Contradiction,
     ] {
@@ -3264,9 +3278,221 @@ fn b4b0_fix1_repair_floor_precedes_mismatch() {
 fn b4b0_supersede(sequence: u64) -> Body {
     Body::SupersedeTail(SupersedeTail {
         at: at(1, sequence),
-        operation: [33; 16],
-        session_id: [34; 16],
-        preview_digest: [0; 32],
+        operation: Some([33; 16]),
+        session_id: Some([34; 16]),
+        preview_digest: Some([0; 32]),
         tail_file_count: 1,
     })
+}
+
+/// Inventory identity has no native proof or geometry, and expiry reserves its UUID forever.
+#[test]
+fn cleaning_identity_creation_expiry_and_data_kind_refusals() {
+    struct NoNative;
+    impl TapeView for NoNative {
+        fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+            panic!("cleaning identity must be checked before native proof")
+        }
+    }
+    let cartridge = cleaning_cartridge_ref(&"CLNR15".into());
+    let registration = Body::CleaningRecorded(CleaningRecorded {
+        run_id: "register".into(),
+        previous: None,
+        drive_uuid: None,
+        cartridge: Some(cartridge),
+        action: CleaningAction::Register(Register {
+            barcode: "CLNR15".into(),
+            home_slot: 23,
+        }),
+    });
+    let mut f = initialized();
+    feed(&mut f, registration.clone(), &NoNative).unwrap();
+    assert!(!f.tapes.contains_key(&cartridge.uuid));
+    assert_eq!(f.cleaning_cartridges[&cartridge.uuid].home_slot, 23);
+    assert!(!f.cleaning_cartridges[&cartridge.uuid].expired);
+    assert_eq!(
+        feed(&mut f, registration.clone(), &NoNative).unwrap_err(),
+        FoldError::ConflictingDuplicate
+    );
+    let mut assignment = pool(1, 1);
+    if let Body::AssignPool(v) = &mut assignment {
+        v.tape = cartridge;
+    }
+    let mut dependent = verdict();
+    if let Body::VerificationVerdict(v) = &mut dependent {
+        v.at.tape = cartridge;
+    }
+    let mut predecessor = provision(3, None);
+    if let Body::Reprovision(v) = &mut predecessor {
+        v.predecessor = Some(cartridge);
+    }
+    let mut reprovision = provision(3, None);
+    if let Body::Reprovision(v) = &mut reprovision {
+        v.tape = cartridge;
+    }
+    let candidates = [
+        assignment,
+        dependent,
+        predecessor,
+        reprovision,
+        Body::Label(Label {
+            tape: cartridge,
+            label: Some("DATA".into()),
+            provenance: LabelProvenance::Operator,
+            change: GenerationChange {
+                expected: 0,
+                next: 1,
+            },
+            prior_holder: None,
+            observed_bot_uuid: None,
+        }),
+        Body::Retire(Retire {
+            tape: cartridge,
+            reason: RetireReason::OperatorRequested,
+            observed_tape_sequence: None,
+            assignment_generation: 0,
+            detail: None,
+        }),
+        Body::MediumSpecSet(MediumSpecSet {
+            tape: cartridge,
+            medium: medium_spec(),
+            change: GenerationChange {
+                expected: 0,
+                next: 1,
+            },
+        }),
+    ];
+    for candidate in &candidates {
+        assert_eq!(
+            feed(&mut f, candidate.clone(), &NoNative).unwrap_err(),
+            FoldError::WrongMediumKind
+        );
+    }
+    let mut run = CleaningRecorded {
+        run_id: "run".into(),
+        previous: None,
+        drive_uuid: None,
+        cartridge: Some(cartridge),
+        action: CleaningAction::Begin(Begin {
+            trigger: CleanTrigger::Manual,
+        }),
+    };
+    feed(&mut f, Body::CleaningRecorded(run.clone()), &NoNative).unwrap();
+    run.previous = Some(record(diagnostic(), f.received_through).reference(f.received_through));
+    run.action = CleaningAction::Finish(Finish {
+        result: CleanResult::Done,
+        verified_credit: false,
+    });
+    feed(&mut f, Body::CleaningRecorded(run), &NoNative).unwrap();
+    feed(
+        &mut f,
+        Body::CleaningRecorded(CleaningRecorded {
+            run_id: "expire".into(),
+            previous: None,
+            drive_uuid: None,
+            cartridge: Some(cartridge),
+            action: CleaningAction::Expire(Reason {
+                reason: "used".into(),
+            }),
+        }),
+        &NoNative,
+    )
+    .unwrap();
+    assert!(f.cleaning_cartridges[&cartridge.uuid].expired);
+    assert_eq!(
+        feed(&mut f, registration, &NoNative).unwrap_err(),
+        FoldError::ConflictingDuplicate
+    );
+    for candidate in candidates {
+        assert_eq!(
+            feed(&mut f, candidate, &NoNative).unwrap_err(),
+            FoldError::WrongMediumKind
+        );
+    }
+}
+
+/// Native I/O failures neither persist contradiction state nor make a valid
+/// library suffix eligible for destructive repair on the next open.
+#[test]
+fn native_view_read_failure_stops_live_and_replay_without_contradiction() {
+    struct Unavailable;
+    impl TapeView for Unavailable {
+        fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+            Err(FoldError::TapeUnavailable("injected read failure".into()))
+        }
+    }
+    for body in [verdict(), fence(1)] {
+        let original = initialized();
+        let r = record(body.clone(), 3);
+        let mut live = original.clone();
+        assert!(matches!(
+            live.apply(
+                3,
+                r.clone(),
+                receipt(&r, 3),
+                &Unavailable,
+                &History::default()
+            ),
+            Err(FoldError::TapeUnavailable(_))
+        ));
+        live.assert_same_state(&original);
+        assert!(live.contradictions.is_empty());
+        let mut replay = original.clone();
+        assert!(matches!(
+            replay.receive(
+                3,
+                r.clone(),
+                receipt(&r, 3),
+                &Unavailable,
+                &History::default()
+            ),
+            Err(FoldError::TapeUnavailable(_))
+        ));
+        replay.assert_same_state(&original);
+        assert!(replay.contradictions.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, clock) = open(dir.path(), &Present);
+        put(&mut log, provision(1, Some("A")));
+        put(&mut log, provision(2, Some("B")));
+        let before = log.state().last_sequence;
+        let result = log.append(
+            body.clone(),
+            AuditActor::System,
+            SourceLayer::Layer4,
+            &Unavailable,
+        );
+        assert!(
+            matches!(result, Err(StoreError::Fold(FoldError::TapeUnavailable(_)))),
+            "{result:?}"
+        );
+        assert_eq!(log.state().last_sequence, before);
+        put(&mut log, body);
+        let expected = log.state().terminal_hash;
+        drop(log);
+        assert!(matches!(
+            store::replay(dir.path(), LOG, &Unavailable),
+            Err(StoreError::Fold(FoldError::TapeUnavailable(_)))
+        ));
+        assert!(matches!(
+            LibraryLog::open(
+                dir.path(),
+                LOG,
+                Origin {
+                    host: "fixture-host".into(),
+                    pid: 4242,
+                    build: "remanence-fixture".into()
+                },
+                Box::new(clock),
+                Box::new(Ids),
+                false,
+                &Unavailable
+            ),
+            Err(StoreError::Fold(FoldError::TapeUnavailable(_)))
+        ));
+        let restored = store::replay(dir.path(), LOG, &Present).unwrap();
+        assert!(restored.refusal.is_none());
+        assert_eq!(restored.last_sequence, 3);
+        assert_eq!(restored.terminal_hash, expected);
+    }
 }

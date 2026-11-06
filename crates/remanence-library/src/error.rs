@@ -352,6 +352,9 @@ impl MoveError {
 /// Original error detail, retained without a policy decision.
 #[derive(Debug, Error)]
 pub enum MoveErrorKind {
+    /// Typed authority refusal, preserving whether compensating motion is safe.
+    #[error("motion authority: {0}")]
+    MotionAuthority(crate::motion::MotionAuthorityError),
     /// The owner refused new motion immediately before dispatch.
     #[error("motion admission refused: {0}")]
     Admission(String),
@@ -516,6 +519,9 @@ impl DriveOpError {
 /// Original error detail, retained without a policy decision.
 #[derive(Debug, Error)]
 pub enum DriveOpErrorKind {
+    /// Typed authority refusal, preserving whether compensating motion is safe.
+    #[error("motion authority: {0}")]
+    MotionAuthority(crate::motion::MotionAuthorityError),
     /// The owner stopped a fresh LOAD after preparation, before dispatch.
     #[error("load admission refused: {0}")]
     LoadAdmission(String),

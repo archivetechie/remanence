@@ -1,10 +1,6 @@
 //! Mounted one-shot commands compose today's admission, finalization and recovery primitives.
 
-use super::{
-    actor_runtime::{record_session_event, SessionAuditInput},
-    terminal_types::TerminalConfig,
-    WriteOwnerConfig,
-};
+use super::{terminal_types::TerminalConfig, WriteOwnerConfig};
 use remanence_library::DriveHandle;
 use remanence_state::{AuditEvent, CatalogIndex};
 use tonic::Status;
@@ -42,27 +38,19 @@ fn event(
     id: Uuid,
     event: AuditEvent,
 ) -> Result<(), Status> {
-    let mounted = cfg.mounted().expect("mounted audit");
-    record_session_event(
-        index,
-        cfg,
-        SessionAuditInput {
-            session_id: id,
-            session_kind: "write",
-            event,
-            tape_uuid: Some(mounted.tape_uuid),
-            library_serial: None,
-            drive_bay: None,
-            drive_uuid: None,
-            drive_serial: match &mounted.endpoint {
-                remanence_library::DriveKey::Standalone { drive_serial } => {
-                    Some(drive_serial.clone())
-                }
-                _ => None,
-            },
-            abort_reason: None,
-        },
-    )
+    let _ = (index, id);
+    let mounted = cfg.mounted().expect("mounted operation");
+    let library = cfg.authority.runtime().ok_or_else(|| {
+        Status::failed_precondition("mounted write requires shared LibraryAuthority")
+    })?;
+    library
+        .ensure_motion_allowed()
+        .map_err(|e| Status::internal(e.to_string()))?;
+    *mounted
+        .audit_session
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = (event == AuditEvent::SessionOpened).then_some(id);
+    Ok(())
 }
 
 /// Settle an open whose caller disappeared or whose command failed before normal close.
@@ -111,9 +99,9 @@ pub(super) fn settle_audit(
         };
         drive.retain_operation_failure(before, outcome.clone());
         if let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect {
-            remanence_state::fence::raise(
+            super::write_session::raise_tape_io_fence(
                 index,
-                &cfg.audit_dir,
+                cfg,
                 remanence_state::TapeIoFenceInput {
                     tape_uuid: mounted.tape_uuid,
                     barcode: mounted.barcode.clone(),
@@ -123,7 +111,7 @@ pub(super) fn settle_audit(
                     ),
                 },
                 Some(&mounted.endpoint),
-                mounted.actor.clone(),
+                Some(&outcome.evidence),
             )
             .map_err(crate::status_from_state_error)?;
         }
@@ -152,6 +140,15 @@ pub(super) fn with_evidence<T>(
     let before = drive.media_write_dispatch_count();
     let result =
         operation(index, drive).and_then(|value| cfg.mounted_audit_ready().map(|()| value));
+    // A modeled process cut must not execute post-crash failure settlement.
+    #[cfg(test)]
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.metadata().contains_key("remanence-test-crash-cut"))
+    {
+        return result;
+    }
     let audit = if result.is_ok() {
         event(index, cfg, id, AuditEvent::SessionClosed)
     } else {
@@ -242,11 +239,9 @@ pub(super) fn finalize(
         if let Some(reply) = super::preflight_manual_finalize_with_prefix(
             index,
             super::ManualFinalizePreflightConfig {
+                authority: terminal.authority.clone(),
                 mounted_endpoint: Some(&mounted.endpoint),
                 checkpoint_journal_dir: &terminal.checkpoint_journal_dir,
-                audit_dir: &terminal.audit_dir,
-                audit_fsync: terminal.audit_fsync,
-                audit_append_lock: &terminal.audit_append_lock,
             },
             tape.voltag.as_deref(),
             &mut request,
@@ -301,7 +296,7 @@ pub(super) fn supersede(
             "tape generation is required before superseding a tail",
         ));
     }
-    cfg.mounted_ready(index, drive)?;
+    cfg.mounted_recovery_ready(index, drive)?;
     with_evidence(index, cfg, drive, |index, drive| {
         let tape = index
             .get_tape(&mounted.tape_uuid)

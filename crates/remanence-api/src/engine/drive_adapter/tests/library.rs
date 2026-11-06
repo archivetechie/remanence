@@ -33,6 +33,7 @@ pub(super) fn library_parts(
                 fault: fault.clone(),
                 evidence: None,
                 last_opcode: None,
+                empty_prefix_recovery: None,
             }))
         })
         .unwrap();
@@ -530,12 +531,15 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
     let (_library, mut drive, _policy) = library_parts(&fixture);
     for mounted in [true, false] {
         let cfg = write_owner::TerminalWriteConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                fixture.config.audit.dir.clone(),
+                true,
+                &(Arc::new(Mutex::new(()))),
+            ),
             io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
             mounted_endpoint: mounted.then(|| remanence_library::DriveKey::new(LIBRARY, BAY)),
             checkpoint_journal_dir: fixture.config.journal.dir.join("tapes"),
-            audit_dir: fixture.config.audit.dir.clone(),
-            audit_fsync: true,
-            audit_append_lock: Arc::new(Mutex::new(())),
         };
         let status = write_owner::finalize_mounted_tape(
             &mut state.write_handle(),

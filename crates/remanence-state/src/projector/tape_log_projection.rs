@@ -8,12 +8,10 @@
 //! not re-examined here. Only a full projection rebuild compares every group
 //! with SQLite and surfaces such a gap.
 //!
-//! A startup tape whose log is absent or ends below its mark is fenced with
-//! `tape_log_below_projection`, and that fence is released automatically once
-//! the log validates through the mark again and projects. Startup inspects a
-//! fenced log read-only and never clears its ambiguity marker, and a marker
-//! refuses every snapshot. A below-mark log that also carries an ambiguity
-//! marker therefore never releases itself: an operator must resolve it.
+//! Projection marks are derived cache positions, not fence authority. A mark
+//! beyond the validated source refuses incremental projection; an explicit
+//! source rebuild replaces the cache. Native ambiguity and received library
+//! dependency floors remain independent admission and repair constraints.
 use super::*;
 use crate::authority::{CatalogPayload, TapeAuthoritySnapshot};
 use crate::tape_log::store::StoreError;
@@ -32,6 +30,124 @@ create table if not exists tape_log_object_commits (
 );";
 
 impl CatalogCore {
+    /// One writer lease and outer transaction cover full replacement. Nested
+    /// library/native apply uses savepoints, so any failed chunk retains the
+    /// prior complete cache while the runtime keeps catch-up admission dirty.
+    pub(crate) fn rebuild_typed_sources(
+        &mut self,
+        replay: impl FnOnce(
+            &mut dyn FnMut(
+                crate::library_log::AppliedLibraryRecord,
+            ) -> Result<(), crate::library_log::store::StoreError>,
+        ) -> Result<
+            crate::library_log::store::Replay,
+            crate::library_log::store::StoreError,
+        >,
+        snapshots: &[AuthoritySnapshot],
+    ) -> Result<RebuildReport, apply::ApplyError> {
+        self.conn
+            .execute_batch("begin immediate")
+            .map_err(|e| sqlite_error("begin atomic typed rebuild", e))?;
+        let result = (|| {
+            self.clear_typed_projection()?;
+            let mut projection_error = None;
+            let folded = replay(&mut |record| match self.apply_authority(
+                &apply::AuthorityRecord::Library(Box::new(record)),
+                apply::ApplyPath::Rebuild,
+            ) {
+                Ok(_) | Err(apply::ApplyError::HealthConflict { .. }) => Ok(()),
+                Err(error) => {
+                    projection_error = Some(error);
+                    Err(std::io::Error::other("typed rebuild projection failed").into())
+                }
+            })
+            .map_err(|error| {
+                projection_error.take().unwrap_or_else(|| {
+                    apply::ApplyError::Catalog(StateError::JournalReplayFailed(error.to_string()))
+                })
+            })?;
+            if let Some(refusal) = folded.refusal {
+                return Err(apply::ApplyError::Contradiction(format!(
+                    "typed rebuild source refused: {refusal:?}"
+                )));
+            }
+            self.finish_library_replay(&folded.fold)?;
+            for snapshot in snapshots {
+                self.apply_authority(
+                    &apply::AuthorityRecord::Tape(Box::new(snapshot.clone())),
+                    apply::ApplyPath::Rebuild,
+                )?;
+            }
+            self.typed_rebuild_report(snapshots.iter().map(|s| s.log_reference().0).sum())
+                .map_err(Into::into)
+        })();
+        match result {
+            Ok(report) => {
+                if let Err(error) = self.conn.execute_batch("commit") {
+                    let _ = self.conn.execute_batch("rollback");
+                    return Err(sqlite_error("commit atomic typed rebuild", error).into());
+                }
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("rollback");
+                Err(error)
+            }
+        }
+    }
+    /// Current cache counts after typed replay; no audit records were consumed.
+    pub(crate) fn typed_replay_report(&self) -> Result<AuditReplayReport, StateError> {
+        Ok(AuditReplayReport {
+            audit_records_replayed: 0,
+            operations_rebuilt: table_count(&self.conn, "operations")?,
+            sessions_rebuilt: table_count(&self.conn, "sessions")?,
+            idempotency_keys_rebuilt: table_count(&self.conn, "idempotency_keys")?,
+        })
+    }
+    /// Drop every derived row before replaying the complete typed source set.
+    /// Schema metadata is infrastructure; no catalog identity is preserved as
+    /// fallback authority. Callers validate all source prefixes before this.
+    pub(crate) fn clear_typed_projection(&mut self) -> Result<(), StateError> {
+        let tx = projection_transaction(&mut self.conn)
+            .map_err(|e| sqlite_error("begin typed projection rebuild", e))?;
+        tx.execute_batch("pragma defer_foreign_keys=on")
+            .map_err(|e| sqlite_error("defer projection foreign keys", e))?;
+        let names = {
+            let mut query = tx.prepare("select name from sqlite_master where type='table' and name not like 'sqlite_%' and name <> 'schema_meta'")
+                .map_err(|e| sqlite_error("list derived tables", e))?;
+            let result = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| sqlite_error("query derived tables", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| sqlite_error("read derived table", e))?;
+            result
+        };
+        for name in names {
+            tx.execute(
+                &format!("delete from \"{}\"", name.replace('"', "\"\"")),
+                [],
+            )
+            .map_err(|e| sqlite_error("clear typed projection", e))?;
+        }
+        tx.commit()
+            .map_err(|e| sqlite_error("commit empty typed projection", e))
+    }
+
+    /// Counts of the rebuilt derived rows, without fabricating audit replay.
+    pub(crate) fn typed_rebuild_report(
+        &self,
+        native_records: u64,
+    ) -> Result<RebuildReport, StateError> {
+        Ok(RebuildReport {
+            tapes_rebuilt: table_count(&self.conn, "tapes")?,
+            tape_files_rebuilt: table_count(&self.conn, "tape_files")?,
+            object_instances_rebuilt: table_count(&self.conn, "object_instances")?,
+            audit_records_replayed: 0,
+            journal_records_replayed: native_records,
+            preserved_fallbacks: Vec::new(),
+            replay_divergences: Vec::new(),
+        })
+    }
     /// Catalog accelerator only; the log remains authority and must be validated.
     pub fn projected_through_sequence(&self, uuid: [u8; 16]) -> Result<u64, StateError> {
         Ok(projection_mark(&self.conn, uuid)?.map_or(0, |(sequence, _)| sequence))
@@ -319,6 +435,19 @@ fn project_snapshot_rows(
 ) -> Result<(), StateError> {
     let raw = &snapshot.raw;
     let uuid = raw.header().tape_uuid;
+    // A retired data prefix remains evidence for library replay, but Register
+    // gives its barcode UUID a new inventory-only cleaning entity. That old
+    // native prefix must not restore data geometry or terminal state.
+    let inventory_only: bool = tx
+        .query_row(
+            "select exists(select 1 from library_cleaning_homes where tape_uuid=?1)",
+            [uuid.as_slice()],
+            |r| r.get(0),
+        )
+        .map_err(|e| sqlite_error("check registered cleaning projection", e))?;
+    if inventory_only {
+        return Ok(());
+    }
     let mark = projection_mark(tx, uuid)?;
     let (through, offset) = mark.unwrap_or((0, 0));
     if through > raw.summary().last_closed_sequence {
@@ -336,29 +465,29 @@ fn project_snapshot_rows(
         }
         let mut row_number = 0;
         let group = raw.group_snapshot(sequence, begin, frame.end);
-        if historical {
-            // Write-session authority exists only in the native tape source.
-            let session = match &frame.record {
-                Record::SessionOpened(v) => Some((v.session_id, "open", v.opened_at_utc.as_str())),
-                Record::SessionEnded(v) => Some((v.session_id, "closed", v.ended_at_utc.as_str())),
-                _ => None,
-            };
-            if let Some((session, state, timestamp)) = session {
-                project_session_core(
-                    tx,
-                    SessionProjection {
-                        session_id: Uuid::from_bytes(session),
-                        kind: "write",
-                        tape_uuid: Some(uuid.to_vec()),
-                        library_serial: None,
-                        drive_bay: None,
-                        drive_uuid: None,
-                        state,
-                        timestamp,
-                        endpoint: None,
-                    },
-                )?;
-            }
+        // Write-session authority exists only in the native tape source. Apply
+        // it on live catch-up as well as rebuild; metadata is preserved by
+        // project_session_core when this native record supplies no endpoint.
+        let session = match &frame.record {
+            Record::SessionOpened(v) => Some((v.session_id, "open", v.opened_at_utc.as_str())),
+            Record::SessionEnded(v) => Some((v.session_id, "closed", v.ended_at_utc.as_str())),
+            _ => None,
+        };
+        if let Some((session, state, timestamp)) = session {
+            project_session_core(
+                tx,
+                SessionProjection {
+                    session_id: Uuid::from_bytes(session),
+                    kind: "write",
+                    tape_uuid: Some(uuid.to_vec()),
+                    library_serial: None,
+                    drive_bay: None,
+                    drive_uuid: None,
+                    state,
+                    timestamp,
+                    endpoint: None,
+                },
+            )?;
         }
         if let Record::Initialized(init) = &frame.record {
             insert_tape_file(tx, uuid, &init.bot)?;
@@ -802,6 +931,68 @@ mod tests {
     use crate::authority::{TapeAuthority, TapeAuthorityView, TapeAuthorityWriter};
     use crate::checkpoint::tests::{record, second_record};
 
+    /// Audit refresh cannot erase native session rows behind an already advanced
+    /// tape watermark. Live catch-up and a fresh rebuild consume the same facts.
+    #[test]
+    fn native_sessions_survive_audit_refresh_and_idempotent_catch_up() {
+        let root = tempfile::tempdir().unwrap();
+        let id = [0xa1; 16];
+        std::fs::write(
+            root.path()
+                .join(format!("{}.remtape", Uuid::from_bytes(id).simple())),
+            include_bytes!("../../../../fixtures/tape-log/session-tail-synchronized.remtape"),
+        )
+        .unwrap();
+        let authority = TapeAuthority::open_fixture(root.path(), id).unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        lease
+            .open_session([0xda; 16], "2026-11-05T00:00:00Z".into())
+            .unwrap();
+        let snapshot = lease.freeze().unwrap();
+        let mut expected = std::collections::BTreeMap::new();
+        snapshot
+            .raw
+            .visit_frames(|frame| {
+                match &frame.record {
+                    Record::SessionOpened(v) => {
+                        expected.insert(Uuid::from_bytes(v.session_id), "open");
+                    }
+                    Record::SessionEnded(v) => {
+                        expected.insert(Uuid::from_bytes(v.session_id), "closed");
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(expected.values().any(|state| *state == "closed"));
+        assert_eq!(expected[&Uuid::from_bytes([0xda; 16])], "open");
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .unwrap()
+            .write_handle();
+        index.project_tape_log(&snapshot).unwrap();
+        for _ in 0..2 {
+            index.replay_audit_records(&[]).unwrap();
+            index.project_tape_log(&snapshot).unwrap();
+            for (id, state) in &expected {
+                assert_eq!(index.session_state(*id).unwrap().as_deref(), Some(*state));
+            }
+            assert_eq!(
+                index.projected_through_sequence(id).unwrap(),
+                snapshot.log_reference().0
+            );
+        }
+        let mut rebuilt = crate::projector::open(root.path().join("rebuilt.sqlite"))
+            .unwrap()
+            .write_handle();
+        rebuilt
+            .rebuild_tape_log_projection(&[], &[snapshot])
+            .unwrap();
+        for (id, state) in expected {
+            assert_eq!(rebuilt.session_state(id).unwrap().as_deref(), Some(state));
+        }
+    }
+
     #[test]
     fn projection_is_atomic_idempotent_and_frozen_order_cannot_regress() {
         let root = tempfile::tempdir().unwrap();
@@ -1223,6 +1414,14 @@ impl CatalogCore {
         &mut self,
         snapshot: &AuthoritySnapshot,
     ) -> Result<(), StateError> {
+        // A newly opened native writer has a synthetic spool header offset but
+        // no published authority. It contributes no rows or projection mark.
+        // Published header-only sequence zero still has a real header digest.
+        if snapshot.raw.summary().last_closed_sequence == 0
+            && snapshot.raw.header_digest()?.is_none()
+        {
+            return Ok(());
+        }
         let uuid = snapshot.raw.header().tape_uuid;
         let prior: Option<(SqliteU64, Vec<u8>)> = self
             .conn

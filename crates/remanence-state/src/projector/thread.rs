@@ -51,6 +51,18 @@ enum Request {
 pub struct ProjectionClient {
     worker: Arc<Worker>,
     path: PathBuf,
+    #[cfg(any(test, feature = "fixtures"))]
+    measurement: Arc<ProjectionMeasurement>,
+}
+
+/// Fixture-only measurements at the actual submit/receive/acknowledgement
+/// boundaries. No clocks, counters or allocations enter production builds.
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Default)]
+struct ProjectionMeasurement {
+    queued: std::sync::atomic::AtomicUsize,
+    high_water: std::sync::atomic::AtomicUsize,
+    latency: std::sync::Mutex<Vec<std::time::Duration>>,
 }
 struct Worker {
     requests: Option<mpsc::SyncSender<Request>>,
@@ -70,6 +82,10 @@ impl ProjectionClient {
         let path = path.as_ref().to_path_buf();
         let mut writer = super::open(&path)?.write_handle();
         let (requests, queue) = mpsc::sync_channel::<Request>(64);
+        #[cfg(any(test, feature = "fixtures"))]
+        let measurement = Arc::new(ProjectionMeasurement::default());
+        #[cfg(any(test, feature = "fixtures"))]
+        let worker_measurement = measurement.clone();
         let join = std::thread::Builder::new()
             .name("library-projector".into())
             .spawn(move || {
@@ -80,6 +96,10 @@ impl ProjectionClient {
                             path,
                             reply,
                         } => {
+                            #[cfg(any(test, feature = "fixtures"))]
+                            worker_measurement
+                                .queued
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             let result = match writer.apply(&source, path) {
                                 Ok(marks) if marks.pending == 0 => ProjectionResult::Applied(marks),
                                 Ok(marks) => ProjectionResult::Pending(marks),
@@ -130,7 +150,20 @@ impl ProjectionClient {
                 join: Some(join),
             }),
             path,
+            #[cfg(any(test, feature = "fixtures"))]
+            measurement,
         })
+    }
+    /// Reset and read live Apply queue/acknowledgement measurements. Call only
+    /// at a quiescent fixture boundary; snapshots/rebuilds are measured separately.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn take_measurement(&self) -> (usize, Vec<std::time::Duration>) {
+        (
+            self.measurement
+                .high_water
+                .swap(0, std::sync::atomic::Ordering::SeqCst),
+            std::mem::take(&mut *self.measurement.latency.lock().unwrap()),
+        )
     }
     /// Submit after releasing authority/tape locks. No catalog lock is held while waiting.
     pub fn project(
@@ -139,7 +172,20 @@ impl ProjectionClient {
         path: ApplyPath,
     ) -> Result<ProjectionResult, StateError> {
         let (reply, answer) = mpsc::channel();
-        self.worker
+        #[cfg(any(test, feature = "fixtures"))]
+        let started = {
+            let depth = self
+                .measurement
+                .queued
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.measurement
+                .high_water
+                .fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
+            std::time::Instant::now()
+        };
+        let sent = self
+            .worker
             .requests
             .as_ref()
             .expect("live worker")
@@ -148,10 +194,24 @@ impl ProjectionClient {
                 path,
                 reply,
             })
-            .map_err(|_| StateError::IndexCorrupt("projector worker stopped".into()))?;
-        answer.recv().map_err(|_| {
+            .map_err(|_| StateError::IndexCorrupt("projector worker stopped".into()));
+        if let Err(error) = sent {
+            #[cfg(any(test, feature = "fixtures"))]
+            self.measurement
+                .queued
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(error);
+        }
+        let result = answer.recv().map_err(|_| {
             StateError::IndexCorrupt("projector worker stopped before response".into())
-        })
+        });
+        #[cfg(any(test, feature = "fixtures"))]
+        self.measurement
+            .latency
+            .lock()
+            .unwrap()
+            .push(started.elapsed());
+        result
     }
     /// Retry a durable library prefix against a frozen native view. This also
     /// publishes fold-selected pending scopes and per-tape contradiction status,
@@ -212,6 +272,18 @@ impl ProjectionClient {
 impl CatalogIndex {
     /// Single apply entry shared by live, startup and empty rebuild callers.
     pub fn apply(
+        &mut self,
+        source: &AuthorityRecord,
+        path: ApplyPath,
+    ) -> Result<Watermarks, ApplyError> {
+        if let (Some(runtime), AuthorityRecord::Tape(snapshot)) = (self.library.clone(), source) {
+            return runtime.project_native(self, snapshot, path);
+        }
+        self.apply_frozen(source, path)
+    }
+
+    /// Runtime replay already owns the frozen view and dispatch lock.
+    pub(crate) fn apply_frozen(
         &mut self,
         source: &AuthorityRecord,
         path: ApplyPath,

@@ -418,6 +418,9 @@ enum RemCommand {
         /// Destination element address.
         #[arg(long, value_parser = parse_element_addr)]
         dst: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// Load a cartridge from a slot into a drive bay.
@@ -431,6 +434,9 @@ enum RemCommand {
         /// Destination drive bay.
         #[arg(long, value_parser = parse_element_addr)]
         bay: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// Unload a cartridge from a drive bay.
@@ -444,7 +450,7 @@ enum RemCommand {
         /// Destination slot.
         #[arg(long, value_parser = parse_element_addr)]
         dest: Option<u16>,
-        /// Optionally require the state-directory lock when recovering a prevented unload.
+        /// Authority configuration; defaults to /etc/rem/config.toml when omitted.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
@@ -680,8 +686,28 @@ impl From<RemCommand> for Command {
                 slots,
                 json,
             },
-            RemCommand::Move { serial, src, dst } => Self::Move { serial, src, dst },
-            RemCommand::Load { serial, slot, bay } => Self::Load { serial, slot, bay },
+            RemCommand::Move {
+                serial,
+                src,
+                dst,
+                config,
+            } => Self::Move {
+                serial,
+                src,
+                dst,
+                config,
+            },
+            RemCommand::Load {
+                serial,
+                slot,
+                bay,
+                config,
+            } => Self::Load {
+                serial,
+                slot,
+                bay,
+                config,
+            },
             RemCommand::Unload {
                 serial,
                 bay,
@@ -1026,6 +1052,9 @@ enum Command {
         /// Destination element address.
         #[arg(long, value_parser = parse_element_addr)]
         dst: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// Load a cartridge from a slot into a drive bay
@@ -1039,6 +1068,9 @@ enum Command {
         /// Destination drive bay.
         #[arg(long, value_parser = parse_element_addr)]
         bay: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// Unload a cartridge from a drive bay
@@ -1054,7 +1086,7 @@ enum Command {
         /// from) — pass this flag to override.
         #[arg(long, value_parser = parse_element_addr)]
         dest: Option<u16>,
-        /// Optionally require the state-directory lock when recovering a prevented unload.
+        /// Authority configuration; defaults to /etc/rem/config.toml when omitted.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
@@ -2123,6 +2155,7 @@ where
 fn run_bot_identity_hardware(
     library: &Library,
     policy: &StaticAllowlist,
+    authority: remanence_state::library_runtime::LibraryRuntime,
     candidate: TapeInitCandidate,
     drive_element: u16,
     mode: BotIdentityReadMode,
@@ -2131,9 +2164,17 @@ fn run_bot_identity_hardware(
     with_bot_identity_drive(
         library,
         policy,
-        candidate,
-        drive_element,
-        expected_home_slot,
+        authority,
+        BotMountPlan {
+            candidate,
+            drive_element,
+            expected_home_slot,
+            wait: MediaReadinessWaitOptions {
+                wait: true,
+                timeout: MEDIA_CONDITIONING_TIMEOUT,
+                poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
+            },
+        },
         |drive, identity| {
             with_temporary_bot_read_config(drive, |drive| {
                 let (classification, adoption) = match mode {
@@ -2195,16 +2236,31 @@ struct BotMountIdentity {
     drive_serial: String,
 }
 
+/// Physical target and bounded TUR-only wait of this invocation. The wait has
+/// no initializing LOAD budget; unthreaded media is not silently loaded.
+#[cfg(target_os = "linux")]
+struct BotMountPlan {
+    candidate: TapeInitCandidate,
+    drive_element: u16,
+    expected_home_slot: u16,
+    wait: MediaReadinessWaitOptions,
+}
+
 /// Mount an exact barcode, run a read-only operation and return it to its home slot.
 #[cfg(target_os = "linux")]
 fn with_bot_identity_drive<T>(
     library: &Library,
     policy: &StaticAllowlist,
-    candidate: TapeInitCandidate,
-    drive_element: u16,
-    expected_home_slot: u16,
+    authority: remanence_state::library_runtime::LibraryRuntime,
+    plan: BotMountPlan,
     operation: impl FnOnce(&mut DriveHandle, BotMountIdentity) -> Result<T, String>,
 ) -> Result<T, String> {
+    let BotMountPlan {
+        candidate,
+        drive_element,
+        expected_home_slot,
+        wait,
+    } = plan;
     let voltag = candidate
         .voltag
         .clone()
@@ -2214,6 +2270,12 @@ fn with_bot_identity_drive<T>(
         .ok_or_else(|| barcode_generation_error(Some(&voltag)))?;
     let mut handle = open_library_handle(library, policy)
         .map_err(|error| format!("opening library: {error}"))?;
+    handle.set_motion_authority(Arc::new(authority));
+    // This invocation owns the state lease before opening the device. Resolve
+    // interrupted motion before admitting its first MOVE or return UNLOAD.
+    handle
+        .reconcile_startup_motion()
+        .map_err(|error| format!("reconcile BOT mount motion: {error}"))?;
     handle
         .refresh()
         .map_err(|error| format!("refresh live library inventory before BOT read: {error}"))?;
@@ -2290,11 +2352,7 @@ fn with_bot_identity_drive<T>(
             .wait_for_media_readiness(
                 media_family_for_init_generation(generation),
                 Some(initial),
-                MediaReadinessWaitOptions {
-                    wait: true,
-                    timeout: MEDIA_CONDITIONING_TIMEOUT,
-                    poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
-                },
+                wait,
                 || None,
                 |_| Ok(()),
             )
@@ -2337,6 +2395,7 @@ fn with_bot_identity_drive<T>(
 fn run_bot_identity_hardware(
     _library: &Library,
     _policy: &StaticAllowlist,
+    _authority: remanence_state::library_runtime::LibraryRuntime,
     _candidate: TapeInitCandidate,
     _drive_element: u16,
     _mode: BotIdentityReadMode,
@@ -4792,10 +4851,16 @@ where
         Command::TapeVerifyIndexClient(_) => {
             unreachable!("daemon tape index verification dispatched pre-discovery")
         }
-        Command::Move { serial, src, dst } => {
-            return run_state_change(
+        Command::Move {
+            serial,
+            src,
+            dst,
+            config,
+        } => {
+            return run_state_change_with_config(
                 &report,
                 &serial,
+                &config,
                 &allow,
                 &allow_derived,
                 out,
@@ -4808,10 +4873,16 @@ where
                 },
             );
         }
-        Command::Load { serial, slot, bay } => {
-            return run_state_change(
+        Command::Load {
+            serial,
+            slot,
+            bay,
+            config,
+        } => {
+            return run_state_change_with_config(
                 &report,
                 &serial,
+                &config,
                 &allow,
                 &allow_derived,
                 out,
@@ -4830,9 +4901,12 @@ where
             dest,
             config,
         } => {
-            return run_state_change(
+            return run_state_change_with_config(
                 &report,
                 &serial,
+                config
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("/etc/rem/config.toml")),
                 &allow,
                 &allow_derived,
                 out,
@@ -7729,7 +7803,7 @@ fn print_live_status_json(
     response: &pb::GetLiveStatusResponse,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let data = json!({
+    let mut data = json!({
         "active_tape_io_fence_count": response.active_tape_io_fence_count,
         "active_tape_io_fences": response.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>(),
         "libraries": response.libraries.iter().map(library_state_json).collect::<Vec<_>>(),
@@ -7743,6 +7817,10 @@ fn print_live_status_json(
         "snapshot_at_utc": response.snapshot_at_utc,
         "daemon_epoch": response.daemon_epoch,
     });
+    if let Some(health) = &response.library_authority_health {
+        data["library_authority_health"] =
+            json!({"component":health.component,"status":component_health_name(health.status)});
+    }
     print_json_envelope("rem.top.v1", "item", data, out)
 }
 
@@ -7760,6 +7838,18 @@ fn print_live_status_text(
         "active tape-I/O fences: {}",
         response.active_tape_io_fence_count
     );
+    if let Some(health) = &response.library_authority_health {
+        let _ = writeln!(
+            out,
+            "library authority: {}{}",
+            component_health_name(health.status),
+            if health.status == pb::component_health::Status::ReadOnly as i32 {
+                " (motion fenced)"
+            } else {
+                ""
+            }
+        );
+    }
     for fence in &response.active_tape_io_fences {
         let _ = writeln!(out, "{}", proto_fence_json(fence));
     }
@@ -7930,6 +8020,20 @@ fn dash_if_empty(value: &str) -> &str {
         "-"
     } else {
         value
+    }
+}
+
+/// Stable status spelling shared by text, JSON and the live TUI.
+fn component_health_name(value: i32) -> &'static str {
+    match pb::component_health::Status::try_from(value)
+        .unwrap_or(pb::component_health::Status::Unspecified)
+    {
+        pb::component_health::Status::Healthy => "healthy",
+        pb::component_health::Status::ReadOnly => "read_only",
+        pb::component_health::Status::Degraded => "degraded",
+        pb::component_health::Status::Failed => "failed",
+        pb::component_health::Status::Other => "other",
+        pb::component_health::Status::Unspecified => "unspecified",
     }
 }
 
@@ -9009,9 +9113,32 @@ struct TapeInitProvisionAuthority {
     force: bool,
     /// The destroyed BOT identity had no row in this catalog.
     clobbered_unknown_uuid: Option<remanence_api::TapeUuid>,
+    previous_uuid: Option<remanence_api::TapeUuid>,
 }
 
 trait TapeInitStateOps {
+    /// Production init shares the state owner's authority with every motion peer.
+    fn motion_authority(&self) -> Option<remanence_state::library_runtime::LibraryRuntime> {
+        None
+    }
+    /// Retain production typed/native ownership before the destructive write.
+    fn prepare_initialization(
+        &mut self,
+        previous: Option<remanence_api::TapeUuid>,
+        label: &str,
+        unknown: Option<remanence_api::TapeUuid>,
+    ) -> Result<Option<remanence_state::InitializationGuard>, String> {
+        let _ = (previous, label, unknown);
+        Ok(None)
+    }
+    fn record_replacement(
+        &mut self,
+        guard: Option<remanence_state::InitializationGuard>,
+    ) -> Result<Option<remanence_api::TapeUuid>, String> {
+        let _ = guard;
+        Ok(None)
+    }
+
     fn project_catalog_inputs(
         &mut self,
         voltag: &str,
@@ -9062,6 +9189,29 @@ trait TapeInitStateOps {
 }
 
 impl TapeInitStateOps for remanence_state::StateHandle {
+    fn motion_authority(&self) -> Option<remanence_state::library_runtime::LibraryRuntime> {
+        Some(self.library_runtime())
+    }
+    fn prepare_initialization(
+        &mut self,
+        previous: Option<remanence_api::TapeUuid>,
+        label: &str,
+        unknown: Option<remanence_api::TapeUuid>,
+    ) -> Result<Option<remanence_state::InitializationGuard>, String> {
+        self.prepare_tape_initialization(previous, label, unknown)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+    fn record_replacement(
+        &mut self,
+        guard: Option<remanence_state::InitializationGuard>,
+    ) -> Result<Option<remanence_api::TapeUuid>, String> {
+        self.record_initialization_replacement(
+            guard.ok_or("initialization lost typed preflight guard")?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     fn project_catalog_inputs(
         &mut self,
         voltag: &str,
@@ -9096,7 +9246,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
                 provenance: remanence_state::LabelProvenance::Changer,
                 observation,
                 explicit_pool: None,
-                previous_uuid: None,
+                previous_uuid: authority.previous_uuid,
                 clobbered_unknown_uuid: authority.clobbered_unknown_uuid,
             },
         )
@@ -9160,10 +9310,17 @@ struct ProvisioningContext<'a> {
 }
 fn provision_initialized_tape_with_media(
     state: &mut remanence_state::StateHandle,
-    config: &remanence_state::RemConfig,
+    _config: &remanence_state::RemConfig,
     input: remanence_state::ProvisionTapeInput,
     context: ProvisioningContext<'_>,
 ) -> Result<(), String> {
+    // Unknown BOT destruction is rejected by admission; keep this producer
+    // from silently dropping that fact if a caller violates the precondition.
+    if context.clobbered_unknown_uuid.is_some() {
+        return Err(
+            "unknown prior tape identity cannot be preserved by initialization authority".into(),
+        );
+    }
     let remanence_state::ProvisionTapeInput {
         tape_uuid,
         voltag,
@@ -9173,7 +9330,7 @@ fn provision_initialized_tape_with_media(
     } = input;
     // Drive IO and the state owner append under the same exclusive invocation lock.
     state
-        .refresh_audit_append_cursor()
+        .catch_up_authority_projection()
         .map_err(|e| e.to_string())?;
     state
         .provision_replacing_media(
@@ -9189,143 +9346,27 @@ fn provision_initialized_tape_with_media(
             context.previous_uuid,
         )
         .map_err(|e| format!("provision catalog tape row: {e}"))?;
-    if context.explicit_pool.is_none() {
-        state
-            .write_handle()
-            .reconcile_tape_pool_projection_from_rules(
-                &pool_projection_inputs(config),
-                &config.tape_pool_rules,
-            )
-            .map_err(|e| format!("project tape pool membership: {e}"))?;
-    }
-    let pool_id = state
-        .catalog()
-        .get_tape_pool_membership(&tape_uuid)
-        .map_err(|e| e.to_string())?;
-    append_tape_provisioned_audit_event(
-        state,
-        &remanence_state::ProvisionTapeInput {
-            tape_uuid,
-            voltag,
-            block_size,
-            parity,
-            force,
-        },
-        pool_id.as_deref(),
-        &context,
-    )
-}
-
-fn append_tape_provisioned_audit_event(
-    state: &mut remanence_state::StateHandle,
-    input: &remanence_state::ProvisionTapeInput,
-    pool_id: Option<&str>,
-    context: &ProvisioningContext<'_>,
-) -> Result<(), String> {
-    use ciborium::value::Value as CborValue;
-
-    let tape_uuid = input.tape_uuid;
-    let voltag = &input.voltag;
-    let block_size = input.block_size;
-    let parity = &input.parity;
-    let forced = input.force;
-    let geometry = match parity {
-        remanence_api::ParityConfig::None => "no-parity".to_string(),
-        remanence_api::ParityConfig::Scheme(scheme) => format!(
-            "scheme={} data={} parity={} stripes={}",
-            scheme.id.as_str(),
-            scheme.data_blocks_per_stripe,
-            scheme.parity_blocks_per_stripe,
-            scheme.stripes_per_neighborhood
-        ),
-    };
-    let assignment_generation = state
-        .catalog()
-        .get_tape_assignment_snapshot(&tape_uuid)
-        .map_err(|error| format!("read provisioning assignment generation: {error}"))?
-        .ok_or_else(|| "provisioned tape has no assignment snapshot".to_string())?
-        .assignment_generation;
-    let mut detail = std::collections::BTreeMap::from([
-        ("voltag".to_string(), CborValue::Text(voltag.to_string())),
-        (
-            "block_size".to_string(),
-            CborValue::Integer(block_size.into()),
-        ),
-        ("geometry".to_string(), CborValue::Text(geometry)),
-        ("forced".to_string(), CborValue::Bool(forced)),
-        (
-            "assignment_source".into(),
-            CborValue::Text(
-                if context.explicit_pool.is_some() {
-                    "operator"
-                } else {
-                    "rule"
-                }
-                .into(),
-            ),
-        ),
-        (
-            "assignment_generation".into(),
-            CborValue::Integer(assignment_generation.into()),
-        ),
-        (
-            "voltag_source".into(),
-            CborValue::Text(context.provenance.as_str().into()),
-        ),
-    ]);
-    detail.insert("media_observation_recorded".into(), CborValue::Bool(true));
-    if let Some(observation) = context.observation {
-        detail.insert(
-            "cartridge_generation".into(),
-            CborValue::Text(observation.generation.media_code().into()),
-        );
-        detail.insert(
-            "generation_source".into(),
-            CborValue::Text(observation.source.as_str().into()),
-        );
-    }
-    if let Some(pool_id) = pool_id {
-        detail.insert("pool_id".to_string(), CborValue::Text(pool_id.to_string()));
-    }
-    if let Some(clobbered_uuid) = context.clobbered_unknown_uuid {
-        detail.insert(
-            "clobbered_identity".into(),
-            CborValue::Text("unknown-to-catalog".into()),
-        );
-        detail.insert(
-            "clobbered_uuid".into(),
-            CborValue::Text(bytes_to_hex(&clobbered_uuid)),
-        );
-    }
-    state
-        .audit()
-        .append(remanence_state::AuditEventRecord {
-            actor: remanence_state::AuditActor::local_user(),
-            source_layer: remanence_state::SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: remanence_state::AuditEvent::TapeProvisioned,
-            subject: remanence_state::AuditSubject {
-                kind: "tape".to_string(),
-                id: Some(bytes_to_hex(&tape_uuid)),
-            },
-            detail,
-        })
-        .map_err(|error| format!("append tape provisioning audit record: {error}"))?;
+    let assignment = state
+        .library_runtime()
+        .tape_state(tape_uuid)
+        .ok_or_else(|| "initialized tape has no typed identity".to_string())?;
     if let Some(pool) = context.explicit_pool {
         state
-            .assign_tape_pool(tape_uuid, assignment_generation, Some(pool))
+            .assign_tape_pool(tape_uuid, assignment.assignment_generation, Some(pool))
             .map_err(|error| format!("assign initialized tape: {error}"))?;
-    } else if pool_id.is_some() {
+    } else {
         state
             .record_rule_tape_pool_assignment(tape_uuid)
-            .map_err(|error| format!("append tape pool assignment audit record: {error}"))?;
+            .map_err(|error| format!("validate initialized tape rule assignment: {error}"))?;
     }
     Ok(())
 }
 
 impl TapeInitStateOps for remanence_state::CatalogIndex {
+    fn motion_authority(&self) -> Option<remanence_state::library_runtime::LibraryRuntime> {
+        self.library_runtime()
+    }
+
     fn project_catalog_inputs(
         &mut self,
         voltag: &str,
@@ -9879,62 +9920,72 @@ fn run_tape_wait_ready_hardware(
     };
     let initial = drive.probe_media_readiness(family);
     let poll = drive
-        .wait_for_media_readiness_with_initializing_load(
-            family,
-            Some(initial),
-            MediaReadinessWaitOptions {
-                wait: args.wait,
-                timeout: args.timeout,
-                poll_interval: args.poll,
-            },
-            load_budget,
-            || signal_guard.requested_signal_name().map(ToOwned::to_owned),
-            |event| match event {
-                MediaReadinessWaitEvent::Poll(observed) => {
-                    let observed = MediaReadinessPoll {
-                        readiness: observed.readiness.clone(),
-                        attempts: observed.attempts,
-                        timed_out: observed.timed_out,
-                    };
-                    TapeInitStateOps::record_media_readiness_transition(
-                        catalog,
-                        media_readiness_transition_input(operation_id, "wait_ready_tur", &observed),
-                    )
-                }
-                MediaReadinessWaitEvent::InitializingLoad(observed) => {
-                    TapeInitStateOps::record_media_readiness_transition(
-                        catalog,
-                        media_readiness_initializing_load_transition(
+        .with_readiness_operation(*operation_id.as_bytes(), |drive| {
+            drive.wait_for_media_readiness_with_initializing_load(
+                family,
+                Some(initial),
+                MediaReadinessWaitOptions {
+                    wait: args.wait,
+                    timeout: args.timeout,
+                    poll_interval: args.poll,
+                },
+                load_budget,
+                || signal_guard.requested_signal_name().map(ToOwned::to_owned),
+                |event| match event {
+                    MediaReadinessWaitEvent::Poll(observed) => {
+                        let observed = MediaReadinessPoll {
+                            readiness: observed.readiness.clone(),
+                            attempts: observed.attempts,
+                            timed_out: observed.timed_out,
+                        };
+                        TapeInitStateOps::record_media_readiness_transition(
+                            catalog,
+                            media_readiness_transition_input(
+                                operation_id,
+                                "wait_ready_tur",
+                                &observed,
+                            ),
+                        )
+                    }
+                    MediaReadinessWaitEvent::InitializingLoad(observed) => {
+                        if catalog.library_runtime().is_some() {
+                            return Ok(());
+                        }
+
+                        TapeInitStateOps::record_media_readiness_transition(
+                            catalog,
+                            media_readiness_initializing_load_transition(
+                                operation_id,
+                                &observed.readiness,
+                            ),
+                        )
+                    }
+                    MediaReadinessWaitEvent::InitializingLoadFailed { readiness, detail } => {
+                        let failed = MediaReadinessPoll {
+                            readiness: readiness.clone(),
+                            attempts: 0,
+                            timed_out: false,
+                        };
+                        let mut transition = media_readiness_transition_input(
                             operation_id,
-                            &observed.readiness,
-                        ),
-                    )
-                }
-                MediaReadinessWaitEvent::InitializingLoadFailed { readiness, detail } => {
-                    let failed = MediaReadinessPoll {
-                        readiness: readiness.clone(),
-                        attempts: 0,
-                        timed_out: false,
-                    };
-                    let mut transition = media_readiness_transition_input(
-                        operation_id,
-                        INITIALIZING_LOAD_PHASE,
-                        &failed,
-                    );
-                    transition.last_cdb_opcode = Some(0x1b);
-                    transition.last_error_json = Some(json!({ "detail": detail }).to_string());
-                    TapeInitStateOps::record_media_readiness_transition(catalog, transition)
-                }
-                MediaReadinessWaitEvent::Cancelled(signal) => {
-                    record_media_readiness_signal_transition(
-                        catalog,
-                        operation_id,
-                        "wait_ready_tur",
-                        signal,
-                    )
-                }
-            },
-        )
+                            INITIALIZING_LOAD_PHASE,
+                            &failed,
+                        );
+                        transition.last_cdb_opcode = Some(0x1b);
+                        transition.last_error_json = Some(json!({ "detail": detail }).to_string());
+                        TapeInitStateOps::record_media_readiness_transition(catalog, transition)
+                    }
+                    MediaReadinessWaitEvent::Cancelled(signal) => {
+                        record_media_readiness_signal_transition(
+                            catalog,
+                            operation_id,
+                            "wait_ready_tur",
+                            signal,
+                        )
+                    }
+                },
+            )
+        })
         .map_err(|message| {
             let message = if message.starts_with("media readiness interrupted by SIG") {
                 format!("{message}; recorded aborted_unknown fence")
@@ -10048,33 +10099,42 @@ fn resolve_wait_ready_operation(
         .drive_bays
         .iter()
         .find(|bay| bay.element_address == drive_element);
-    catalog
-        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-            operation_id,
-            run_id: None,
-            endpoint: remanence_state::DriveKey::new(library.serial.clone(), drive_element),
-            changer_sg: Some(library.changer_sg.display().to_string()),
-            drive_sg: drive_bay
-                .and_then(|bay| bay.installed.as_ref())
-                .and_then(|drive| drive.sg_path.as_ref())
-                .map(|path| path.display().to_string()),
-            drive_serial: drive_bay
-                .and_then(|bay| bay.installed.as_ref())
-                .map(|drive| drive.serial.clone()),
-            barcode: barcode.clone(),
-            source_slot: drive_bay.and_then(|bay| bay.source_slot),
-            media_generation: catalog
-                .readiness_media_observation(barcode.as_deref())
-                .map_err(|e| e.to_string())?
-                .map(|observation| observation.generation)
-                .map(|generation| generation.generation_number()),
-            phase: "readiness_poll".to_string(),
-            state: "planned".to_string(),
-            dirty_scope: Some("drive+tape".to_string()),
-            deadline_at_utc: args.wait.then(|| deadline_after(args.timeout)).flatten(),
-            evidence_path: None,
-        })
-        .map_err(|error| format!("record media readiness operation: {error}"))?;
+    let input = remanence_state::MediaReadinessOperationInput {
+        operation_id,
+        run_id: None,
+        endpoint: remanence_state::DriveKey::new(library.serial.clone(), drive_element),
+        changer_sg: Some(library.changer_sg.display().to_string()),
+        drive_sg: drive_bay
+            .and_then(|bay| bay.installed.as_ref())
+            .and_then(|drive| drive.sg_path.as_ref())
+            .map(|path| path.display().to_string()),
+        drive_serial: drive_bay
+            .and_then(|bay| bay.installed.as_ref())
+            .map(|drive| drive.serial.clone()),
+        barcode: barcode.clone(),
+        source_slot: drive_bay.and_then(|bay| bay.source_slot),
+        media_generation: catalog
+            .readiness_media_observation(barcode.as_deref())
+            .map_err(|e| e.to_string())?
+            .map(|observation| observation.generation)
+            .map(|generation| generation.generation_number()),
+        media_family: catalog
+            .readiness_media_observation(barcode.as_deref())
+            .map_err(|e| e.to_string())?
+            .map(|o| o.generation),
+        phase: "readiness_poll".to_string(),
+        state: "planned".to_string(),
+        dirty_scope: Some("drive+tape".to_string()),
+        deadline_at_utc: args.wait.then(|| deadline_after(args.timeout)).flatten(),
+        evidence_path: None,
+    };
+    let owner = if args.wait && catalog.library_runtime().is_some() {
+        catalog.begin_typed_media_readiness_operation(input)
+    } else {
+        catalog.record_media_readiness_operation(input)
+    }
+    .map_err(|error| format!("record media readiness operation: {error}"))?;
+    let operation_id = Uuid::parse_str(&owner.operation_id).map_err(|error| error.to_string())?;
     Ok((operation_id, drive_element, barcode))
 }
 
@@ -10374,13 +10434,15 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                 "before_conditional_immediate_load",
                 &mut signal,
             )?;
-            state.record_media_readiness_transition(media_readiness_mechanical_transition(
-                operation_id,
-                "conditional_immediate_load",
-                "pre_ready_loading",
-                Some(0x1b),
-                None,
-            ))?;
+            if state.motion_authority().is_none() {
+                state.record_media_readiness_transition(media_readiness_mechanical_transition(
+                    operation_id,
+                    "conditional_immediate_load",
+                    "pre_ready_loading",
+                    Some(0x1b),
+                    None,
+                ))?;
+            }
             media_readiness_sleep(CONDITIONAL_LOAD_SETTLE);
             if let Err(error) = drive.load_immediate() {
                 if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
@@ -10477,14 +10539,11 @@ fn media_readiness_transition_input(
     let quarantine_id = media_readiness_state_requires_release(state.as_str())
         .then(|| media_readiness_quarantine_id_for_operation(operation_id));
     remanence_state::MediaReadinessTransitionInput {
+        completion_evidence: Some((&poll.readiness.outcome().evidence).into()),
         operation_id,
         phase: Some(phase.to_string()),
         state,
-        dirty_scope: Some(if poll.readiness.is_ready() {
-            "none".to_string()
-        } else {
-            "drive+tape".to_string()
-        }),
+        dirty_scope: poll.readiness.is_ready().then(|| "none".into()),
         last_cdb_opcode: Some(0x00),
         last_sense_raw: sense_raw,
         last_sense_key: sense_key,
@@ -10542,6 +10601,7 @@ fn media_readiness_mechanical_transition(
     error: Option<String>,
 ) -> remanence_state::MediaReadinessTransitionInput {
     remanence_state::MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some(phase.to_string()),
         state: state.to_string(),
@@ -10570,6 +10630,7 @@ fn media_readiness_signal_transition(
     signal: &str,
 ) -> remanence_state::MediaReadinessTransitionInput {
     remanence_state::MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some(phase.to_string()),
         state: "aborted_unknown".to_string(),
@@ -10737,6 +10798,7 @@ fn media_readiness_release_transition(
     ack: &str,
 ) -> remanence_state::MediaReadinessTransitionInput {
     remanence_state::MediaReadinessTransitionInput {
+        completion_evidence: None,
         operation_id,
         phase: Some("quarantine_release".to_string()),
         state: "released".to_string(),
@@ -11373,6 +11435,11 @@ fn run_tape_bot_probe(
         Ok(config) => config,
         Err(error) => return print_command_error(error.to_string(), report, err),
     };
+    let paths = remanence_state::StatePaths::from_config(&args.config, &config);
+    let state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
+        Ok(state) => state,
+        Err(error) => return print_command_error(error.to_string(), report, err),
+    };
     let fresh_report = match fresh_bot_identity_discovery() {
         Ok(report) => report,
         Err(error) => return print_command_error(error, report, err),
@@ -11409,6 +11476,7 @@ fn run_tape_bot_probe(
     match run_bot_identity_hardware(
         library,
         &policy,
+        state.library_runtime(),
         candidate,
         drive_element,
         BotIdentityReadMode::Probe,
@@ -11494,6 +11562,7 @@ fn run_tape_adopt_bootstrap(
     let physical = match run_bot_identity_hardware(
         library,
         &policy,
+        state.library_runtime(),
         candidate,
         drive_element,
         BotIdentityReadMode::Adoption,
@@ -12339,6 +12408,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             drive_bay.and_then(|bay| bay.source_slot)
         },
         media_generation: Some(generation.generation_number()),
+        media_family: Some(generation),
         phase: "planned".to_string(),
         state: "planned".to_string(),
         dirty_scope: Some("drive+tape".to_string()),
@@ -12365,6 +12435,12 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             return Err(format!("opening library: {error}"));
         }
     };
+    if let Some(authority) = state.motion_authority() {
+        handle.set_motion_authority(Arc::new(authority));
+        handle
+            .reconcile_startup_motion()
+            .map_err(|e| format!("initialization motion reconciliation: {e}"))?;
+    }
     record_media_readiness_signal_if_requested(state, operation_id, "after_open_library", || {
         signal_guard.requested_signal_name()
     })?;
@@ -12696,6 +12772,15 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     drive
         .bind_identity_generation(identity_generation)
         .map_err(|error| error.to_string())?;
+    let initialization_guard = if args.dry_run {
+        None
+    } else {
+        state.prepare_initialization(
+            remanence_api::bot_classification_uuid(&bot_projection.classification),
+            &voltag,
+            clobber_unknown_tape.map(|v| v.bot_uuid()),
+        )?
+    };
     let action_result = {
         remanence_api::maybe_write_tape_init_bootstrap_on_drive(
             &mut drive,
@@ -12758,6 +12843,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         _ => None,
     };
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
+        let previous_uuid = state.record_replacement(initialization_guard)?;
         state.provision_initialized_tape(
             config,
             planned_uuid,
@@ -12767,6 +12853,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             TapeInitProvisionAuthority {
                 force: args.force || clobber_data_confirmed,
                 clobbered_unknown_uuid,
+                previous_uuid,
             },
         )?;
     }
@@ -13056,22 +13143,6 @@ fn planned_init_geometry(
         }
     }
     (*Uuid::new_v4().as_bytes(), fresh_block_size, fresh_parity)
-}
-
-fn pool_projection_inputs(
-    config: &remanence_state::RemConfig,
-) -> Vec<remanence_state::TapePoolProjectionInput> {
-    config
-        .tape_pools
-        .iter()
-        .map(|pool| remanence_state::TapePoolProjectionInput {
-            pool_id: pool.id.clone(),
-            display_name: pool.display_name.clone(),
-            copy_class: pool.copy_class.clone(),
-            content_class: pool.content_class.clone(),
-            created_at_utc: None,
-        })
-        .collect()
 }
 
 fn print_tape_init_result(result: &TapeInitRunResult, out: &mut dyn Write) {
@@ -16433,6 +16504,35 @@ where
         &dyn remanence_library::AccessPolicy,
     ) -> Result<String, String>,
 {
+    run_state_change_with_config(
+        report,
+        serial,
+        Path::new("/etc/rem/config.toml"),
+        allow,
+        allow_derived,
+        out,
+        err,
+        op,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_state_change_with_config<F>(
+    report: &DiscoveryReport,
+    serial: &str,
+    config_path: &Path,
+    allow: &[String],
+    allow_derived: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    op: F,
+) -> ExitCode
+where
+    F: FnOnce(
+        &mut remanence_library::LibraryHandle,
+        &dyn remanence_library::AccessPolicy,
+    ) -> Result<String, String>,
+{
     let lib = match report.library(serial) {
         Some(l) => l,
         None => {
@@ -16453,7 +16553,7 @@ where
         policy = policy.with_derived_allowed(s.clone());
     }
 
-    open_and_run(lib, &policy, out, err, op, report)
+    open_and_run(lib, &policy, out, err, op, report, config_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -16464,6 +16564,7 @@ fn open_and_run<F>(
     err: &mut dyn Write,
     op: F,
     report: &DiscoveryReport,
+    config_path: &Path,
 ) -> ExitCode
 where
     F: FnOnce(
@@ -16481,6 +16582,12 @@ where
             return ExitCode::from(1);
         }
     };
+    if let Err(error) =
+        remanence_api::mount_support::bind_library_motion_authority(&mut handle, Some(config_path))
+    {
+        let _ = writeln!(err, "error: motion authority: {error}");
+        return ExitCode::FAILURE;
+    }
     match op(&mut handle, policy) {
         Ok(summary) => {
             let _ = writeln!(out, "ok: {summary}");
@@ -16623,6 +16730,7 @@ fn open_and_run<F>(
     err: &mut dyn Write,
     _op: F,
     report: &DiscoveryReport,
+    config_path: &Path,
 ) -> ExitCode
 where
     F: FnOnce(
@@ -18074,6 +18182,7 @@ mod tests {
                 barcode: Some(barcode.to_string()),
                 source_slot: Some(0x03eb),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: state.to_string(),
                 dirty_scope: dirty_scope.map(ToOwned::to_owned),
@@ -19217,6 +19326,7 @@ mod tests {
             assert_eq!(json[key], drive[key]);
         }
         let response = pb::GetLiveStatusResponse {
+            library_authority_health: None,
             closeout_debt: vec![tape],
             ..Default::default()
         };
@@ -20227,6 +20337,7 @@ mod tests {
 
     fn sample_live_status_response() -> pb::GetLiveStatusResponse {
         pb::GetLiveStatusResponse {
+            library_authority_health: None,
             closeout_debt: Vec::new(),
             active_tape_io_fence_count: 0,
             active_tape_io_fences: Vec::new(),
@@ -20349,6 +20460,30 @@ mod tests {
             serde_json::from_slice::<Value>(&out).unwrap(),
             serde_json::from_slice::<Value>(&std::fs::read(fixture).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn live_status_renders_process_motion_fence_without_alarm() {
+        let mut response = sample_live_status_response();
+        response.alarms.clear();
+        response.library_authority_health = Some(pb::ComponentHealth {
+            component: "library_authority".into(),
+            status: pb::component_health::Status::ReadOnly as i32,
+            other_status: String::new(),
+        });
+        let mut text = Vec::new();
+        print_live_status_text(&response, &mut text).unwrap();
+        assert!(String::from_utf8(text)
+            .unwrap()
+            .contains("library authority: read_only (motion fenced)"));
+        let mut json = Vec::new();
+        print_live_status_json(&response, &mut json).unwrap();
+        let value: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            value["data"]["library_authority_health"]["status"],
+            "read_only"
+        );
+        assert!(value["data"]["alarms"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -20583,6 +20718,7 @@ mod tests {
                 barcode: None,
                 source_slot: None,
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "media_initializing".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -20838,6 +20974,7 @@ mod tests {
                 barcode: Some("AOX030L9".to_string()),
                 source_slot: Some(0x03eb),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "media_initializing".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -20897,6 +21034,7 @@ mod tests {
                 barcode: Some("AOX030L9".to_string()),
                 source_slot: Some(0x03eb),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "readiness_poll".to_string(),
                 state: "media_initializing".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -23700,7 +23838,7 @@ tape_catalog_dir = "{0}/cache/tapes"
 
     /// Exercise the exact harness CLI route using only the injected model transport.
     #[test]
-    fn plain_debug_unload_without_config_uses_no_allow() {
+    fn plain_debug_unload_uses_bound_authority_without_allow_removal() {
         use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
         use std::sync::Mutex;
         let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
@@ -23723,9 +23861,13 @@ tape_catalog_dir = "{0}/cache/tapes"
                 Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
             }));
         });
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
         let cli = DebugCli::try_parse_from([
             "rem-debug",
             "unload",
+            "--config",
+            config.to_str().unwrap(),
             "--allow",
             "UNLOAD-LIB",
             "--bay",
@@ -23765,7 +23907,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     }
 
     #[test]
-    fn unload_stranded_lock_recovers_during_interrupted_reset_without_sqlite() {
+    fn unload_stranded_lock_refuses_interrupted_reset_without_sqlite() {
         use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
         use std::sync::Mutex;
         let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
@@ -23783,7 +23925,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             b"interrupted reset",
         )
         .unwrap();
-        // An unusable catalog proves recovery never opens SQLite.
+        // Reset refusal must precede SQLite and the ALLOW/retry recovery sequence.
         fs::create_dir_all(root.path().join("index/rem-state.sqlite")).unwrap();
         world
             .lock()
@@ -23837,7 +23979,9 @@ tape_catalog_dir = "{0}/cache/tapes"
         );
         TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
         TEST_CLI_DEVICE_LOCK_ROOT.with(|slot| slot.borrow_mut().take());
-        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(String::from_utf8_lossy(&err).contains("catalog reset in progress"));
+        assert!(out.is_empty());
         let controls: Vec<_> = world
             .lock()
             .unwrap()
@@ -23846,8 +23990,17 @@ tape_catalog_dir = "{0}/cache/tapes"
             .map(|c| c.opcode)
             .filter(|opcode| matches!(opcode, 0x1e | 0x1b | 0xa5))
             .collect();
-        assert_eq!(controls, [0x1b, 0x1e, 0x1b, 0xa5]);
-        assert!(root.path().join("catalog-reset.in-progress").exists());
+        assert!(
+            controls.is_empty(),
+            "reset must refuse before the first UNLOAD: {controls:?}"
+        );
+        assert!(world.lock().unwrap().drive_states[&256].removal_prevented);
+        assert_eq!(
+            fs::read(root.path().join("catalog-reset.in-progress")).unwrap(),
+            b"interrupted reset"
+        );
+        assert!(root.path().join("index/rem-state.sqlite").is_dir());
+        assert!(!root.path().join("audit").exists());
     }
 
     #[test]
@@ -24154,7 +24307,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         server.join().unwrap();
     }
 
-    fn write_retire_test_config(root: &Path) -> PathBuf {
+    pub(super) fn write_retire_test_config(root: &Path) -> PathBuf {
         let config_path = root.join("config.toml");
         let toml = format!(
             r#"
@@ -24579,6 +24732,7 @@ tape_catalog_dir = "{0}/cache/tapes"
                 barcode: Some("AOX031L9".to_string()),
                 source_slot: Some(0x03ec),
                 media_generation: Some(9),
+                media_family: None,
                 phase: "planned".to_string(),
                 state: "planned".to_string(),
                 dirty_scope: Some("drive+tape".to_string()),
@@ -28323,6 +28477,219 @@ mod tape_log_cli_tests {
         );
         assert!(out.is_empty());
         assert!(!config.exists());
+    }
+    /// BOT content is read-only, but its mount and return are real robotics and
+    /// use the same typed authority before the first command.
+    #[test]
+    fn bot_identity_mount_uses_typed_motion_and_reset_preflight() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use remanence_state::library_log as lib;
+        use std::sync::Mutex;
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::tests::write_retire_test_config(root.path());
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        let paths = state.paths().clone();
+        let runtime = state.library_runtime();
+        let library_uuid = runtime.manifest().library_uuid();
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "BOT-MODEL",
+            0x100,
+            "BOT-DRIVE",
+            0x400,
+            1,
+        )));
+        let mut library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_slot(0x400, "BOT001L9", VirtualTape::default());
+            world.library_snapshot()
+        };
+        // Match the model transport's actual standard INQUIRY, as discovery does.
+        let inquiry = include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin");
+        let product = String::from_utf8_lossy(&inquiry[16..32]).trim().to_owned();
+        library.drive_bays[0].installed.as_mut().unwrap().product = Some(product.clone());
+        let factory_world = world.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            }));
+        });
+        let result = with_bot_identity_drive(
+            &library,
+            &StaticAllowlist::new(["BOT-MODEL"]),
+            runtime.clone(),
+            BotMountPlan {
+                candidate: TapeInitCandidate {
+                    library_serial: "BOT-MODEL".into(),
+                    element_address: 0x400,
+                    location: TapeInitLocation::Slot,
+                    voltag: Some("BOT001L9".into()),
+                },
+                drive_element: 0x100,
+                expected_home_slot: 0x400,
+                wait: MediaReadinessWaitOptions {
+                    wait: true,
+                    timeout: StdDuration::ZERO,
+                    poll_interval: StdDuration::ZERO,
+                },
+            },
+            |_, identity| Ok(identity.voltag),
+        )
+        .unwrap();
+        assert_eq!(result, "BOT001L9");
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+        let controls: Vec<_> = world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .filter(|c| matches!(c.opcode, 0xa5 | 0x1b))
+            .map(|c| c.opcode)
+            .collect();
+        assert_eq!(controls, [0xa5, 0x1b, 0xa5]);
+        {
+            let mut world = world.lock().unwrap();
+            world.slots[0].full = false;
+            world.slots[0].barcode = None;
+            world.put_tape_in_drive(0x100, "OTHER1L9", Some(0x400), VirtualTape::default());
+            world.leave_cartridge_unthreaded(0x100);
+            world.command_log.clear();
+        }
+        let mut unthreaded = world.lock().unwrap().library_snapshot();
+        unthreaded.drive_bays[0].installed.as_mut().unwrap().product = Some(product);
+        let factory_world = world.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            }))
+        });
+        let refusal = with_bot_identity_drive(
+            &unthreaded,
+            &StaticAllowlist::new(["BOT-MODEL"]),
+            runtime.clone(),
+            BotMountPlan {
+                candidate: TapeInitCandidate {
+                    library_serial: "BOT-MODEL".into(),
+                    element_address: 0x100,
+                    location: TapeInitLocation::Drive,
+                    voltag: Some("OTHER1L9".into()),
+                },
+                drive_element: 0x100,
+                expected_home_slot: 0x400,
+                wait: MediaReadinessWaitOptions {
+                    wait: true,
+                    timeout: StdDuration::ZERO,
+                    poll_interval: StdDuration::ZERO,
+                },
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(refusal.contains("not ready"), "{refusal}");
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+        // A return UNLOAD may occur, but the TUR-only wait never issues LOAD.
+        assert_eq!(
+            world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .filter(|command| matches!(command.opcode, 0x1b | 0xa5))
+                .map(|command| command.opcode)
+                .collect::<Vec<_>>(),
+            [0x1b, 0xa5]
+        );
+        drop(runtime);
+        drop(state);
+        // Direct CLI LOAD uses the selected configuration through the real
+        // constructor, independently of the BOT mount's already-held runtime.
+        let direct_report = DiscoveryReport {
+            libraries: vec![world.lock().unwrap().library_snapshot()],
+            unattached_drives: vec![],
+            complete: true,
+            incomplete_evidence: vec![],
+            warnings: vec![],
+        };
+        let factory_world = world.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            }))
+        });
+        let mut direct_out = Vec::new();
+        let mut direct_err = Vec::new();
+        assert_eq!(
+            run_state_change_with_config(
+                &direct_report,
+                "BOT-MODEL",
+                &config,
+                &["BOT-MODEL".into()],
+                &[],
+                &mut direct_out,
+                &mut direct_err,
+                |handle, policy| {
+                    handle
+                        .load(0x400, 0x100, policy)
+                        .map(|()| "loaded".into())
+                        .map_err(|e| e.to_string())
+                }
+            ),
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&direct_err)
+        );
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let mut intents = 0;
+        let mut done = 0;
+        lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+            if record.record().motion_intent().is_some() {
+                intents += 1;
+            }
+            if let Some(outcome) = record.record().motion_outcome() {
+                assert_eq!(outcome.result, lib::MotionResult::Done);
+                done += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((intents, done), (7, 7));
+        fs::write(
+            paths.state_dir.join("catalog-reset.in-progress"),
+            b"interrupted reset",
+        )
+        .unwrap();
+        world.lock().unwrap().command_log.clear();
+        let args = TapeBotProbeArgs {
+            target: "BOT001L9".into(),
+            config,
+            library: "BOT-MODEL".into(),
+            expected_home_slot: 0x400,
+            json: true,
+        };
+        let report = DiscoveryReport {
+            libraries: vec![library],
+            unattached_drives: vec![],
+            complete: true,
+            incomplete_evidence: vec![],
+            warnings: vec![],
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_ne!(
+            run_tape_bot_probe(&report, &args, &mut out, &mut err),
+            ExitCode::SUCCESS
+        );
+        assert!(String::from_utf8_lossy(&err).contains("reset"));
+        assert!(world.lock().unwrap().command_log.is_empty());
     }
 }
 

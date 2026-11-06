@@ -229,3 +229,47 @@ fn c3_open_requires_serial_or_explicit_ephemeral_allowance() {
     assert_eq!(drive.drive().product.as_deref(), Some("Ultrium 7-SCSI"));
     assert_eq!(drive.drive().revision.as_deref(), Some("Q387"));
 }
+
+/// Ruling 3 excludes unserialized endpoints from every LOAD/UNLOAD entry point:
+/// there is no persistent identity with which to write the required intent.
+#[test]
+fn ephemeral_handles_refuse_motion_before_callbacks_or_dispatch() {
+    const PATH: &str = "/fixture/ephemeral-motion";
+    let policy = StaticAllowlist::new([PATH]).with_unserialized_device_allowed(Path::new(PATH));
+    let (transport, log) = RecordingTransport::new(
+        FixtureTransport::new().with_responses([INQUIRY.to_vec(), Vec::new()]),
+    );
+    let mut drive =
+        DriveHandle::open_standalone_with_transport(Path::new(PATH), Box::new(transport), &policy)
+            .unwrap();
+    log.borrow_mut().clear();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = calls.clone();
+    drive.set_audit_hook(move |_| {
+        hook.fetch_add(1, Ordering::SeqCst);
+    });
+    for operation in [
+        DriveHandle::load,
+        DriveHandle::load_immediate,
+        DriveHandle::unload,
+    ] {
+        let error = operation(&mut drive).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("ephemeral endpoint is read-only"));
+        assert!(!error.is_medium_removal_prevented());
+    }
+    let mut admitted = false;
+    let mut admit = || {
+        admitted = true;
+        Ok(())
+    };
+    assert!(drive.load_immediate_with_admission(&mut admit).is_err());
+    assert!(drive.unload_with_admission(&mut admit).is_err());
+    assert!(!admitted);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        log.borrow().is_empty(),
+        "no CDB may reach an ephemeral motion transport"
+    );
+}

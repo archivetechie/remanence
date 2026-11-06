@@ -61,47 +61,97 @@ pub(crate) enum ManualFinalizeTapeResult {
     Accepted(ManualFinalizeTapeActorReply),
 }
 
-/// Filesystem and audit authority needed by the no-motion manual-finalize
-/// preflight. Keeping this smaller than `WriteOwnerConfig` makes it explicit
-/// that admission has no drive or changer capability.
-pub(crate) struct ManualFinalizePreflightConfig<'a> {
-    /// Preserve local causes through host-only mounted recovery as well as media work.
-    pub(crate) mounted_endpoint: Option<&'a remanence_library::DriveKey>,
-    pub(crate) checkpoint_journal_dir: &'a Path,
-    pub(crate) audit_dir: &'a Path,
-    pub(crate) audit_fsync: bool,
-    pub(crate) audit_append_lock: &'a Arc<std::sync::Mutex<()>>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct TerminalFinalizeAuditConfig<'a> {
-    pub(super) audit_dir: &'a Path,
-    pub(super) audit_fsync: bool,
-    pub(super) audit_append_lock: &'a Arc<std::sync::Mutex<()>>,
-}
-
-impl<'a> From<&'a WriteOwnerConfig> for TerminalFinalizeAuditConfig<'a> {
-    fn from(cfg: &'a WriteOwnerConfig) -> Self {
-        Self {
-            audit_dir: cfg.audit_dir.as_path(),
-            audit_fsync: cfg.audit_fsync,
-            audit_append_lock: &cfg.audit_append_lock,
-        }
-    }
-}
-
-/// Persistence-only context shared by actor and standalone terminal writers.
-/// It carries persistence settings, the shared I/O memory budget, and optional local error identity.
+/// Terminal producers carry the process's typed authority capability. Historical
+/// audit fixtures exist only in unit-test builds and cannot be selected by a
+/// production constructor.
 #[derive(Clone)]
-pub(crate) struct TerminalWriteConfig {
-    /// Shared manager for checked open-epoch rebuilds.
-    pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
-    /// Local mounted ownership carries typed causes even for an actual library bay.
-    pub mounted_endpoint: Option<remanence_library::DriveKey>,
-    pub checkpoint_journal_dir: std::path::PathBuf,
+pub(crate) enum TerminalAuthority {
+    Typed(remanence_state::library_runtime::LibraryRuntime),
+    #[cfg(test)]
+    HistoricalFixture(FixtureTerminalAudit),
+}
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct FixtureTerminalAudit {
     pub audit_dir: std::path::PathBuf,
     pub audit_fsync: bool,
     pub audit_append_lock: Arc<std::sync::Mutex<()>>,
+}
+impl TerminalAuthority {
+    pub(crate) fn runtime(&self) -> Option<&remanence_state::library_runtime::LibraryRuntime> {
+        match self {
+            Self::Typed(runtime) => Some(runtime),
+            #[cfg(test)]
+            Self::HistoricalFixture(_) => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        library: Option<remanence_state::library_runtime::LibraryRuntime>,
+        dir: impl AsRef<Path>,
+        fsync: bool,
+        lock: &Arc<std::sync::Mutex<()>>,
+    ) -> Self {
+        library.map(Self::Typed).unwrap_or_else(|| {
+            Self::HistoricalFixture(FixtureTerminalAudit {
+                audit_dir: dir.as_ref().to_path_buf(),
+                audit_fsync: fsync,
+                audit_append_lock: lock.clone(),
+            })
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn historical_fixture(&self) -> Option<&FixtureTerminalAudit> {
+        match self {
+            Self::HistoricalFixture(f) => Some(f),
+            _ => None,
+        }
+    }
+    pub(crate) fn from_api(state: &crate::ApiState) -> Result<Self, Status> {
+        if let Some(runtime) = state.catalog.library_runtime() {
+            return Ok(Self::Typed(runtime));
+        }
+        #[cfg(test)]
+        {
+            Ok(Self::fixture(
+                None,
+                state.audit_dir.as_path(),
+                state.audit_fsync,
+                &state.audit_append_lock,
+            ))
+        }
+        #[cfg(not(test))]
+        {
+            Err(Status::failed_precondition(
+                "terminal work requires shared typed authority",
+            ))
+        }
+    }
+}
+impl From<&WriteOwnerConfig> for TerminalAuthority {
+    fn from(cfg: &WriteOwnerConfig) -> Self {
+        cfg.authority.clone()
+    }
+}
+impl From<&TerminalWriteConfig> for TerminalAuthority {
+    fn from(cfg: &TerminalWriteConfig) -> Self {
+        cfg.authority.clone()
+    }
+}
+
+/// No-motion preflight has source ownership and native storage, but no drive.
+pub(crate) struct ManualFinalizePreflightConfig<'a> {
+    pub(crate) authority: TerminalAuthority,
+    pub(crate) mounted_endpoint: Option<&'a remanence_library::DriveKey>,
+    pub(crate) checkpoint_journal_dir: &'a Path,
+}
+/// Persistence context shared by actor and standalone terminal writers.
+#[derive(Clone)]
+pub(crate) struct TerminalWriteConfig {
+    pub authority: TerminalAuthority,
+    pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
+    pub mounted_endpoint: Option<remanence_library::DriveKey>,
+    pub checkpoint_journal_dir: std::path::PathBuf,
 }
 pub(crate) trait TerminalConfig {
     fn terminal_config(&self) -> TerminalWriteConfig;
@@ -114,21 +164,10 @@ impl TerminalConfig for TerminalWriteConfig {
 impl TerminalConfig for WriteOwnerConfig {
     fn terminal_config(&self) -> TerminalWriteConfig {
         TerminalWriteConfig {
-            io_memory: Arc::clone(&self.io_memory),
+            authority: TerminalAuthority::from(self),
+            io_memory: self.io_memory.clone(),
             mounted_endpoint: self.mounted().map(|m| m.endpoint.clone()),
             checkpoint_journal_dir: self.checkpoint_journal_dir.clone(),
-            audit_dir: self.audit_dir.clone(),
-            audit_fsync: self.audit_fsync,
-            audit_append_lock: Arc::clone(&self.audit_append_lock),
-        }
-    }
-}
-impl<'a> From<&'a TerminalWriteConfig> for TerminalFinalizeAuditConfig<'a> {
-    fn from(cfg: &'a TerminalWriteConfig) -> Self {
-        Self {
-            audit_dir: &cfg.audit_dir,
-            audit_fsync: cfg.audit_fsync,
-            audit_append_lock: &cfg.audit_append_lock,
         }
     }
 }

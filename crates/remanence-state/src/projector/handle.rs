@@ -26,31 +26,100 @@ impl CatalogIndex {
         &mut self,
         input: MediaReadinessOperationInput,
     ) -> Result<MediaReadinessOperationRecord, StateError> {
-        self.with_core(|core| {
-            core.record_media_readiness_operation(self.readiness_observer.as_deref(), input)
-        })
+        if let Some(runtime) = self.library_runtime() {
+            let operation = runtime
+                .begin_owned_readiness(&input)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+            if let Some(observer) = self.readiness_observer.as_deref() {
+                observer.changed();
+            }
+            return self.media_readiness_operation(operation)?.ok_or_else(|| {
+                StateError::IndexCorrupt("typed readiness projection missing".into())
+            });
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            self.with_core(|core| {
+                core.record_media_readiness_operation(self.readiness_observer.as_deref(), input)
+            })
+        }
+        #[cfg(not(any(test, feature = "fixtures")))]
+        Err(StateError::ConfigInvalid(
+            "readiness requires shared LibraryAuthority".into(),
+        ))
+    }
+    /// Begin typed readiness and return its writer-minted identity. The caller
+    /// must carry the returned id into its registry, LOAD context and polls.
+    pub fn begin_typed_media_readiness_operation(
+        &mut self,
+        input: MediaReadinessOperationInput,
+    ) -> Result<MediaReadinessOperationRecord, StateError> {
+        let runtime = self.library_runtime().ok_or_else(|| {
+            StateError::ConfigInvalid(
+                "typed readiness requires the shared authority runtime".into(),
+            )
+        })?;
+        let operation = runtime
+            .begin_readiness(&input)
+            .map_err(|error| StateError::JournalReplayFailed(error.to_string()))?;
+        if let Some(observer) = self.readiness_observer.as_deref() {
+            observer.changed();
+        }
+        self.media_readiness_operation(operation)?
+            .ok_or_else(|| StateError::IndexCorrupt("typed readiness projection missing".into()))
     }
     /// Record a durable transition for an existing media-readiness operation.
     pub fn record_media_readiness_transition(
         &mut self,
         input: MediaReadinessTransitionInput,
     ) -> Result<MediaReadinessOperationRecord, StateError> {
-        self.with_core(|core| {
-            core.record_media_readiness_transition(self.readiness_observer.as_deref(), input)
-        })
+        if let Some(runtime) = self.library_runtime() {
+            runtime
+                .transition_readiness(&input)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+            if let Some(observer) = self.readiness_observer.as_deref() {
+                observer.changed();
+            }
+            return self
+                .media_readiness_operation(input.operation_id)?
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt("typed readiness projection missing".into())
+                });
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            self.with_core(|core| {
+                core.record_media_readiness_transition(self.readiness_observer.as_deref(), input)
+            })
+        }
+        #[cfg(not(any(test, feature = "fixtures")))]
+        Err(StateError::ConfigInvalid(
+            "readiness requires shared LibraryAuthority".into(),
+        ))
     }
     /// Count the SSC LOAD attempts recorded for a media-readiness operation
     /// since its most recent `ready` transition.
     ///
-    /// Every path that sends LOAD on behalf of an operation first records a
-    /// `pre_ready_loading` transition carrying opcode `1Bh`; this counts those
-    /// write-ahead rows. Readiness waits use it to bound the LOADs one
+    /// Production counts authenticated MotionIntent admissions since the latest
+    /// Ready observation. Historical fixtures count their pre-ready rows. Readiness waits use it to bound the LOADs one
     /// operation sends, so a resumed or restarted wait does not repeat one.
     pub fn media_readiness_load_attempts_since_ready(
         &self,
         operation_id: Uuid,
     ) -> Result<u32, StateError> {
-        self.with_core(|core| core.media_readiness_load_attempts_since_ready(operation_id))
+        if let Some(runtime) = self.library_runtime() {
+            return runtime
+                .readiness_load_attempts(*operation_id.as_bytes())
+                .map_err(|error| StateError::JournalReplayFailed(error.to_string()));
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            self.with_core(|core| core.media_readiness_load_attempts_since_ready(operation_id))
+        }
+        #[cfg(not(any(test, feature = "fixtures")))]
+        Err(StateError::ConfigInvalid(
+            "readiness budget requires shared LibraryAuthority".into(),
+        ))
     }
     /// Fetch a durable media-readiness operation by id.
     pub fn media_readiness_operation(
@@ -179,11 +248,7 @@ impl CatalogIndex {
     pub fn quick_check(&self) -> Result<String, StateError> {
         self.with_core(|core| core.quick_check())
     }
-    /// Checkpoint every WAL frame into the main database and switch to a
-    /// single-file journal mode before an atomic catalog-reset swap.
-    pub(crate) fn prepare_catalog_reset_atomic_swap(&mut self) -> Result<(), StateError> {
-        self.with_core(|core| core.prepare_catalog_reset_atomic_swap())
-    }
+
     /// Index one fully replayed 3c committed state.
     pub fn index_structural_authority(
         &mut self,
@@ -270,15 +335,6 @@ impl CatalogIndex {
             core.provision_replacing_media(input, provenance, observation, previous_uuid, preview)
         })
     }
-    /// Validate the compare-and-swap before the state owner appends rebind authority.
-    pub(crate) fn preview_label_rebind(
-        &self,
-        tape_uuid: [u8; 16],
-        label: &str,
-        previous_uuid: [u8; 16],
-    ) -> Result<(), StateError> {
-        self.with_core(|core| core.preview_label_rebind(tape_uuid, label, previous_uuid))
-    }
     /// Persist an explicit generation assertion for an already proven tape UUID.
     /// The caller owns the device/BOT proof; this updates no identity or capacity counters.
     pub fn set_tape_generation(
@@ -287,73 +343,6 @@ impl CatalogIndex {
         observation: MediaObservation,
     ) -> Result<(), StateError> {
         self.with_core(|core| core.set_tape_generation(tape_uuid, observation))
-    }
-    /// Adopt one checksum-validated Bootstrap as identity-only catalog state.
-    ///
-    /// This never manufactures tape-file, Object, extent, wrap-map, or
-    /// finalization authority. UUID and barcode conflicts are checked across
-    /// all tape kinds in the same transaction that inserts the row and its
-    /// pool assignment with its provenance.
-    pub(crate) fn adopt_bootstrap_identity(
-        &mut self,
-        input: AdoptBootstrapIdentityInput,
-        pool_id: &str,
-        state: AdoptedTapeState,
-        request_fingerprint: [u8; 32],
-    ) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
-        self.with_core(|core| {
-            core.adopt_bootstrap_identity(input, pool_id, state, request_fingerprint)
-        })
-    }
-    /// Validate a Bootstrap identity adoption without changing catalog state.
-    ///
-    /// The state owner uses this before durably appending adoption evidence;
-    /// the mutating transaction repeats the same checks before insertion.
-    pub(crate) fn preview_bootstrap_identity_adoption(
-        &self,
-        input: &AdoptBootstrapIdentityInput,
-        pool_id: &str,
-        state: AdoptedTapeState,
-        request_fingerprint: [u8; 32],
-    ) -> Result<Option<AdoptBootstrapIdentityOutcome>, StateError> {
-        self.with_core(|core| {
-            core.preview_bootstrap_identity_adoption(input, pool_id, state, request_fingerprint)
-        })
-    }
-    /// Capture exactly one valid tape identity for every exact voltag selector.
-    ///
-    /// The caller must hold the state-owner lock. This read-only pass is
-    /// deliberately separate from reset mutation so every selector and every
-    /// source row is validated before audit, journal, cache, or SQLite state is
-    /// archived or removed.
-    pub(crate) fn capture_catalog_reset_tapes(
-        &self,
-        voltags: &[String],
-        pool_rules: &[TapePoolRuleConfig],
-    ) -> Result<Vec<CatalogResetPreservedTape>, StateError> {
-        self.with_core(|core| core.capture_catalog_reset_tapes(voltags, pool_rules))
-    }
-    /// Whether every authority/cache table that reset promises to clear is
-    /// empty. Used only to recognize the exact post-swap crash-resume state.
-    pub(crate) fn catalog_reset_output_is_clean(&self) -> Result<bool, StateError> {
-        self.with_core(|core| core.catalog_reset_output_is_clean())
-    }
-    /// Restore previously validated reset rows into a newly created empty
-    /// catalog. All counters and write/finalization projections remain clear.
-    pub(crate) fn restore_catalog_reset_tapes(
-        &mut self,
-        tapes: &[CatalogResetPreservedTape],
-    ) -> Result<(), StateError> {
-        self.with_core(|core| core.restore_catalog_reset_tapes(tapes))
-    }
-    /// Update the existing append-recovery projection without creating an I/O fence.
-    /// Sealed, retired, and terminal-finalizing tapes cannot be reopened here.
-    pub fn set_append_recovery_required(
-        &mut self,
-        tape_uuid: [u8; 16],
-        required: bool,
-    ) -> Result<(), StateError> {
-        self.with_core(|core| core.set_append_recovery_required(tape_uuid, required))
     }
     /// Mark a tape closed to future writes while preserving its catalog rows.
     /// The pool selector treats any non-`ready` tape as unwritable, so this
@@ -378,6 +367,15 @@ impl CatalogIndex {
         &mut self,
         input: DriveObservationInput,
     ) -> Result<DriveObservationOutcome, StateError> {
+        if let Some(runtime) = self.library_runtime() {
+            return runtime
+                .observe_drives(vec![input])
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
+                .pop()
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt("drive observation omitted result".into())
+                });
+        }
         self.with_core(|core| core.observe_drive(input))
     }
     /// Reconcile a whole inventory snapshot so duplicate serial claims seen in
@@ -386,6 +384,11 @@ impl CatalogIndex {
         &mut self,
         inputs: Vec<DriveObservationInput>,
     ) -> Result<Vec<DriveObservationOutcome>, StateError> {
+        if let Some(runtime) = self.library_runtime() {
+            return runtime
+                .observe_drives(inputs)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()));
+        }
         self.with_core(|core| core.observe_drive_inventory_snapshot(inputs))
     }
     /// List authoritative drive rows.
@@ -825,8 +828,8 @@ impl CatalogIndex {
             )
         })
     }
-    /// State-owner hook inside the existing assignment transaction: validate and
-    /// project first, persist authority before committing the rebuildable cache.
+    /// List configured tape pools.
+    #[cfg(test)]
     pub(crate) fn compare_and_set_tape_pool_assignment_with_audit(
         &mut self,
         tape_uuid: [u8; 16],
@@ -1143,7 +1146,14 @@ impl CatalogIndex {
     }
     /// Project all new closed groups from one immutable, validated snapshot.
     pub fn project_tape_log(&mut self, snapshot: &AuthoritySnapshot) -> Result<(), StateError> {
-        self.with_core(|core| core.project_tape_log(snapshot))
+        if let Some(library) = self.library.clone() {
+            library
+                .project_native(self, snapshot, super::apply::ApplyPath::Live)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+            return Ok(());
+        }
+        self.with_core(|core| core.project_tape_log(snapshot))?;
+        Ok(())
     }
     /// Projection-only rebuild: this entry point has no filesystem reset access.
     pub fn rebuild_tape_log_projection(
@@ -1152,6 +1162,25 @@ impl CatalogIndex {
         snapshots: &[AuthoritySnapshot],
     ) -> Result<RebuildReport, StateError> {
         self.with_core(|core| core.rebuild_tape_log_projection(audit, snapshots))
+    }
+    /// Full typed replacement retains its single writer lease and rollback scope.
+    pub(crate) fn rebuild_typed_sources(
+        &mut self,
+        replay: impl FnOnce(
+            &mut dyn FnMut(
+                crate::library_log::AppliedLibraryRecord,
+            ) -> Result<(), crate::library_log::store::StoreError>,
+        ) -> Result<
+            crate::library_log::store::Replay,
+            crate::library_log::store::StoreError,
+        >,
+        snapshots: &[AuthoritySnapshot],
+    ) -> Result<RebuildReport, super::apply::ApplyError> {
+        self.with_core(|core| Ok(core.rebuild_typed_sources(replay, snapshots)))?
+    }
+    /// Typed replay counts for the compatibility report type.
+    pub(crate) fn typed_replay_report(&self) -> Result<AuditReplayReport, StateError> {
+        self.with_core(|core| core.typed_replay_report())
     }
     /// A repair cannot erase accepted terminal obligations recorded in SQLite,
     /// including surviving idempotency/operation rows. Forensic recovery is a

@@ -1,4 +1,5 @@
 //! Changer/catalog reconciliation and its operation lifecycle projections.
+use remanence_state::library_log as lib;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -7,12 +8,16 @@ use remanence_parity::{
     scan_reconstruct_filemark_map_with_report_mode, DriveHandleRawSource, FilemarkMap,
     TapeFileEntry, TapeFileKind,
 };
-use remanence_state::{AuditActor, AuditEvent, CatalogIndex};
+#[cfg(test)]
+use remanence_state::AuditEvent;
+use remanence_state::{AuditActor, CatalogIndex};
 use tonic::Status;
+#[cfg(test)]
 use uuid::Uuid;
 
 use super::actor_runtime::WriteOwnerConfig;
 use super::terminal_inventory::prepare_catalog_recovery_read;
+#[cfg(test)]
 use crate::audit_projection::{append_operation_audit, OperationAuditInput};
 use crate::pb;
 
@@ -27,12 +32,12 @@ pub(crate) fn handle_reconcile(
         return;
     }
     publish_running(&handle, &[("phase", "mount")]);
-    if let Err(err) = record_reconcile_event(
+    if let Err(err) = record_reconcile_operation(
         index,
         cfg,
         &handle,
         &tape_uuid,
-        AuditEvent::OperationStarted,
+        lib::OperationEvent::Started(lib::Unit),
         BTreeMap::new(),
     ) {
         fail_operation(
@@ -192,12 +197,14 @@ pub(crate) fn reconcile_loaded_tape(
                 );
             }
             detail.insert("tape_files".to_string(), CborValue::Text(rebuilt.clone()));
-            if let Err(err) = record_reconcile_event(
+            if let Err(err) = record_reconcile_operation(
                 index,
                 cfg,
                 &handle,
                 &tape_uuid,
-                AuditEvent::OperationFinished,
+                lib::OperationEvent::Finished(lib::Response {
+                    response_fingerprint: None,
+                }),
                 detail,
             ) {
                 fail_operation(
@@ -296,12 +303,16 @@ pub(crate) fn fail_operation(
         "error_summary".to_string(),
         CborValue::Text(error_summary.to_string()),
     );
-    if let Err(err) = record_reconcile_event(
+    if let Err(err) = record_reconcile_operation(
         index,
         cfg,
         handle,
         tape_uuid,
-        AuditEvent::OperationFailed,
+        lib::OperationEvent::Failed(lib::Failed {
+            retry: None,
+            refusal_code: None,
+            summary: error_summary.into(),
+        }),
         detail,
     ) {
         let audit_error = format!("{error_summary}; audit record failed: {err}");
@@ -323,12 +334,12 @@ pub(crate) fn cancel_operation(
         "cancel_detail".to_string(),
         CborValue::Text(detail_message.to_string()),
     );
-    if let Err(err) = record_reconcile_event(
+    if let Err(err) = record_reconcile_operation(
         index,
         cfg,
         handle,
         tape_uuid,
-        AuditEvent::CancelledBeforeDispatch,
+        lib::OperationEvent::CancelledBeforeDispatch(lib::Unit),
         detail,
     ) {
         let audit_error = format!("{detail_message}; audit record failed: {err}");
@@ -348,6 +359,43 @@ pub(crate) fn publish_running(
     handle.publish_state(pb::OperationState::Running, progress);
 }
 
+pub(crate) fn record_reconcile_operation(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    tape_uuid: &[u8; 16],
+    event: lib::OperationEvent,
+    detail: BTreeMap<String, CborValue>,
+) -> Result<(), Status> {
+    if let Some(runtime) = cfg.authority.runtime() {
+        return runtime
+            .record_operation_event(
+                *handle.op_id_uuid().as_bytes(),
+                crate::operation_source::kind(handle.operation_kind())?,
+                event,
+                AuditActor::System,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()));
+    }
+    #[cfg(test)]
+    {
+        record_reconcile_event(
+            index,
+            cfg,
+            handle,
+            tape_uuid,
+            crate::operation_source::fixture_event(&event),
+            detail,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (index, tape_uuid, detail);
+        unreachable!("only typed authority exists in production")
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn record_reconcile_event(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -374,9 +422,9 @@ pub(crate) fn record_reconcile_event(
     };
     append_operation_audit(
         index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
+        cfg.fixture_audit().audit_dir.as_path(),
+        cfg.fixture_audit().audit_fsync,
+        &cfg.fixture_audit().audit_append_lock,
         OperationAuditInput {
             actor: AuditActor::System,
             operation_id: handle.op_id_uuid(),

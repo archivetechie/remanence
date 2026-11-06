@@ -365,6 +365,18 @@ impl DrivePoolLifecycle {
         })
     }
 
+    /// Return an already moved cartridge after its healthy LOAD intent refusal.
+    /// The coordinator carries that typed proof; shutdown still waits for the
+    /// admitted UNLOAD/MOVE pair through this retained guard.
+    pub(crate) fn begin_continuation_return(&self, key: &DriveKey) -> DismountGuard {
+        let mut active = self.dismounts.lock().unwrap();
+        *active.entry(key.clone()).or_default() += 1;
+        DismountGuard {
+            active: self.dismounts.clone(),
+            key: key.clone(),
+        }
+    }
+
     /// Admit the start of a new composed motion using the pool's common gate.
     pub(crate) fn begin_motion(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
         begin_motion(&self.dismounts, &self.shutting_down, key)

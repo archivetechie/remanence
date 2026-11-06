@@ -345,7 +345,7 @@ async fn shutdown_round1_debt_eviction_preserves_retry_evidence() {
         .await
         .unwrap()
         .unwrap();
-    let DriveCommand::Unload { reply } = command else {
+    let DriveCommand::Unload { reply, .. } = command else {
         panic!("expected debt eviction UNLOAD");
     };
     let armed = Arc::new(AtomicBool::new(false));

@@ -44,18 +44,15 @@ impl TapeReadRateArgs {
     }
 }
 
-/// Acquire only the state lock; opening a state handle would also open journals.
+/// Own configured authority before the mount/return robotics of this read-only measurement.
 pub(super) fn run(args: &TapeReadRateArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let result = (|| {
         let config = remanence_state::authority_layout::load_runtime_config(&args.address.config)
             .map_err(|e| e.to_string())?;
         let paths = remanence_state::StatePaths::from_config(&args.address.config, &config);
-        let _lock = remanence_state::StateLockGuard::acquire(&paths.state_dir)
+        let state = remanence_state::StateHandle::open_with_config(paths, config.clone())
             .map_err(|e| e.to_string())?;
-        // The first validation is lock-free; repeat it under the lock.
-        remanence_state::authority_layout::validate_owned_config_layout(&config)
-            .map_err(|e| e.to_string())?;
-        run_locked(args, &config)
+        run_locked(args, &config, state.library_runtime())
     })();
     write_report(result, out, err)
 }
@@ -91,6 +88,7 @@ fn write_report(
 fn run_locked(
     _args: &TapeReadRateArgs,
     _config: &remanence_state::RemConfig,
+    _authority: remanence_state::library_runtime::LibraryRuntime,
 ) -> Result<Value, String> {
     Err("tape read-rate requires Linux SG_IO access".into())
 }
@@ -99,6 +97,7 @@ fn run_locked(
 fn run_locked(
     args: &TapeReadRateArgs,
     config: &remanence_state::RemConfig,
+    authority: remanence_state::library_runtime::LibraryRuntime,
 ) -> Result<Value, String> {
     let report = fresh_bot_identity_discovery()?;
     let (candidate, library) = resolve_bot_identity_command(
@@ -118,9 +117,17 @@ fn run_locked(
     let result = with_bot_identity_drive(
         library,
         &configured_library_policy(config),
-        candidate,
-        bay,
-        args.address.expected_home_slot,
+        authority,
+        BotMountPlan {
+            candidate,
+            drive_element: bay,
+            expected_home_slot: args.address.expected_home_slot,
+            wait: MediaReadinessWaitOptions {
+                wait: true,
+                timeout: MEDIA_CONDITIONING_TIMEOUT,
+                poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
+            },
+        },
         |drive, identity| {
             with_temporary_bot_read_config(drive, |drive| {
                 let classification =

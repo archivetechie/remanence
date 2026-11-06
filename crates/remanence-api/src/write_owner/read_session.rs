@@ -2,15 +2,15 @@
 
 use crate::closeout_obligation::RetryCauseExt as _;
 use remanence_library::DriveHandle;
-use remanence_state::{AuditEvent, CatalogIndex};
+use remanence_state::CatalogIndex;
 use tokio::sync::mpsc;
 use tonic::Status;
 use uuid::Uuid;
 
 use super::actor_protocol::DriveCommand;
 use super::actor_runtime::{
-    record_session_close_snapshot, record_session_event, record_session_snapshot,
-    OpenReadActorRequest, SessionAuditInput, WriteOwnerConfig,
+    record_read_session, record_session_close_snapshot, record_session_snapshot,
+    OpenReadActorRequest, ReadSessionInput, WriteOwnerConfig,
 };
 use super::readiness::session_open_short_probe_or_load;
 use super::restore::{
@@ -136,19 +136,23 @@ pub(super) fn handle_drive_open_read(
         run_load_calibration_harvest(index, drive, cfg, &tape_uuid, barcode.as_deref());
     }
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-    if let Err(status) = record_session_event(
+    if let Err(status) = record_read_session(
         index,
         cfg,
-        SessionAuditInput {
+        ReadSessionInput {
             session_id,
-            session_kind: "read",
-            event: AuditEvent::SessionOpened,
-            tape_uuid: Some(tape_uuid),
-            library_serial: Some(library_serial.clone()),
-            drive_bay: Some(bay),
+            event: remanence_state::library_log::SessionEvent::Opened,
+            tape_uuid,
+            endpoint: cfg
+                .mounted()
+                .map(|m| m.endpoint.clone())
+                .unwrap_or_else(|| remanence_library::DriveKey::Bay {
+                    library_serial: library_serial.clone(),
+                    bay,
+                }),
             drive_uuid: drive_uuid.clone(),
             drive_serial: drive_serial.clone(),
-            abort_reason: None,
+            reason: None,
         },
     ) {
         let _ = reply.send(Err(status));
@@ -175,19 +179,23 @@ pub(super) fn handle_drive_open_read(
             tape_uuid,
             snapshot_misses,
         );
-        if let Err(error) = record_session_event(
+        if let Err(error) = record_read_session(
             index,
             cfg,
-            SessionAuditInput {
+            ReadSessionInput {
                 session_id,
-                session_kind: "read",
-                event: AuditEvent::SessionClosed,
-                tape_uuid: Some(tape_uuid),
-                library_serial: Some(library_serial.clone()),
-                drive_bay: Some(bay),
+                event: remanence_state::library_log::SessionEvent::Closed,
+                tape_uuid,
+                endpoint: cfg
+                    .mounted()
+                    .map(|m| m.endpoint.clone())
+                    .unwrap_or_else(|| remanence_library::DriveKey::Bay {
+                        library_serial: library_serial.clone(),
+                        bay,
+                    }),
                 drive_uuid,
                 drive_serial,
-                abort_reason: Some("read open reply receiver disappeared".into()),
+                reason: Some("read open reply receiver disappeared".into()),
             },
         ) {
             tracing::error!(bay, %error, "failed to audit cancelled read open close");
@@ -347,19 +355,22 @@ pub(super) fn handle_drive_open_read(
                     Err(Status::not_found("read session not found"))
                 };
                 if status.is_ok() {
-                    if let Err(err) = record_session_event(
+                    if let Err(err) = record_read_session(
                         index,
                         cfg,
-                        SessionAuditInput {
+                        ReadSessionInput {
                             session_id,
-                            session_kind: "read",
-                            event: AuditEvent::SessionClosed,
-                            tape_uuid: Some(tape_uuid),
-                            library_serial: Some(library_serial.clone()),
-                            drive_bay: Some(bay),
+                            event: remanence_state::library_log::SessionEvent::Closed,
+                            tape_uuid,
+                            endpoint: cfg.mounted().map(|m| m.endpoint.clone()).unwrap_or_else(
+                                || remanence_library::DriveKey::Bay {
+                                    library_serial: library_serial.clone(),
+                                    bay,
+                                },
+                            ),
                             drive_uuid: drive_uuid.clone(),
                             drive_serial: drive_serial.clone(),
-                            abort_reason: None,
+                            reason: None,
                         },
                     ) {
                         let _ = reply.send(Err(err));
@@ -456,7 +467,7 @@ pub(super) fn handle_drive_open_read(
                     "drive has an active session",
                 )));
             }
-            DriveCommand::Unload { reply } => {
+            DriveCommand::Unload { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "read session already active",
                 )));

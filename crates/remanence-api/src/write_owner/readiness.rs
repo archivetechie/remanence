@@ -229,8 +229,8 @@ pub(crate) struct DriveReadinessPoll<'a> {
 /// The LOAD budget comes from the operation's durable history, so a resumed
 /// wait (a client's `ResumeMediaReadiness` after startup reconciliation, or
 /// a second resume) does not repeat a LOAD the operation already sent; a
-/// `ready` observation re-arms it. The attempt is recorded as a
-/// `pre_ready_loading` transition before the LOAD reaches the drive.
+/// `ready` observation re-arms it. Only the dispatch gate's durable MotionIntent
+/// consumes the attempt; a pre-intent refusal consumes no budget.
 pub(crate) fn poll_drive_media_readiness(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
@@ -262,8 +262,9 @@ pub(crate) fn poll_drive_media_readiness(
     let mut interruption = None;
     let mut load_admission = None;
     let refused = std::cell::Cell::new(false);
+    #[cfg(test)]
     let mut attempted_readiness = None;
-    let result = drive.wait_for_media_readiness_with_load_admission(
+    let result = drive.with_readiness_operation(*operation_id.as_bytes(), |drive| drive.wait_for_media_readiness_with_load_admission(
         family,
         None,
         options,
@@ -317,6 +318,10 @@ pub(crate) fn poll_drive_media_readiness(
                 Ok(())
             }
             MediaReadinessWaitEvent::InitializingLoad(poll) => {
+                // The actual dispatch gate publishes MotionIntent and owns
+                // its budget. Historical fixtures alone retain the old row.
+                #[cfg(test)]
+                if index.library_runtime().is_none() {
                 attempted_readiness = Some(poll.readiness.clone());
                 index
                     .record_media_readiness_transition(
@@ -326,6 +331,7 @@ pub(crate) fn poll_drive_media_readiness(
                         ),
                     )
                     .map_err(|error| format!("record media readiness LOAD attempt: {error}"))?;
+                }
                 tracing::warn!(
                     operation_id = %operation_id,
                     endpoint = endpoint.as_str(),
@@ -386,15 +392,18 @@ pub(crate) fn poll_drive_media_readiness(
             })?;
             Ok(())
         },
-    );
+    ));
     if refused.get() {
-        record_refused_load(
-            index,
-            operation_id,
-            attempted_readiness
-                .as_ref()
-                .expect("LOAD write-ahead precedes admission"),
-        )?;
+        #[cfg(test)]
+        if index.library_runtime().is_none() {
+            record_refused_load(
+                index,
+                operation_id,
+                attempted_readiness
+                    .as_ref()
+                    .expect("LOAD write-ahead precedes admission"),
+            )?;
+        }
         return Err(DriveReadinessError::Shutdown);
     }
     result.map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
@@ -402,6 +411,7 @@ pub(crate) fn poll_drive_media_readiness(
 
 /// Append proof that the immediately preceding LOAD write-ahead sent no command.
 /// A crash or persistence failure leaves the write-ahead counted conservatively.
+#[cfg(test)]
 fn record_refused_load(
     index: &mut CatalogIndex,
     operation_id: Uuid,
@@ -496,7 +506,7 @@ pub(crate) fn session_open_immediate_load_then_probe(
     ctx: SessionOpenReadinessContext<'_>,
     family: MediaFamily,
     detail_prefix: &str,
-    observed: &MediaReadiness,
+    _observed: &MediaReadiness,
 ) -> Result<(), Status> {
     let operation_id = Uuid::new_v4();
     if let Err(err) = record_session_open_readiness_operation(index, operation_id, &ctx) {
@@ -507,20 +517,23 @@ pub(crate) fn session_open_immediate_load_then_probe(
             &err,
         ));
     }
-    if let Err(err) = record_session_open_mechanical_transition(
-        index,
-        operation_id,
-        "session_open_immediate_load",
-        "pre_ready_loading",
-        Some(0x1b),
-        None,
-    ) {
-        return Err(session_open_recording_failure_status(
-            &ctx,
-            Some(operation_id),
-            "record_media_readiness_transition",
-            &err,
-        ));
+    #[cfg(test)]
+    if index.library_runtime().is_none() {
+        if let Err(err) = record_session_open_mechanical_transition(
+            index,
+            operation_id,
+            "session_open_immediate_load",
+            "pre_ready_loading",
+            Some(0x1b),
+            None,
+        ) {
+            return Err(session_open_recording_failure_status(
+                &ctx,
+                Some(operation_id),
+                "record_media_readiness_transition",
+                &err,
+            ));
+        }
     }
     std::thread::sleep(SESSION_OPEN_CONDITIONAL_LOAD_SETTLE);
     let mut admission = None;
@@ -547,10 +560,16 @@ pub(crate) fn session_open_immediate_load_then_probe(
         Ok(())
     });
     if let Some(status) = refusal {
-        record_refused_load(index, operation_id, observed).map_err(Status::internal)?;
+        #[cfg(test)]
+        if index.library_runtime().is_none() {
+            record_refused_load(index, operation_id, _observed).map_err(Status::internal)?;
+        }
         return Err(status);
     }
     if let Err(err) = result {
+        if let remanence_library::DriveOpErrorKind::MotionAuthority(error) = &err.kind {
+            return Err(crate::motion_status::status(error, ctx.load_continues_move));
+        }
         return Err(record_session_open_command_fence_on_operation(
             index,
             operation_id,
@@ -690,6 +709,7 @@ pub(crate) fn record_session_open_mechanical_transition(
 ) -> Result<(), remanence_state::StateError> {
     index
         .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+            completion_evidence: None,
             operation_id,
             phase: Some(phase.to_string()),
             state: state.to_string(),
@@ -808,14 +828,11 @@ pub(crate) fn record_session_open_readiness_poll_transition(
         session_open_readiness_evidence(readiness);
     index
         .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+            completion_evidence: Some((&readiness.outcome().evidence).into()),
             operation_id,
             phase: Some(phase.to_string()),
             state: state.to_string(),
-            dirty_scope: Some(if readiness.is_ready() {
-                "none".to_string()
-            } else {
-                "drive+tape".to_string()
-            }),
+            dirty_scope: readiness.is_ready().then(|| "none".into()),
             last_cdb_opcode: Some(0x00),
             last_sense_raw: sense_raw,
             last_sense_key: sense_key,
@@ -854,6 +871,9 @@ pub(crate) fn record_session_open_readiness_operation(
                 .readiness_media_observation(ctx.barcode)?
                 .map(|observation| observation.generation)
                 .map(|generation| generation.generation_number()),
+            media_family: index
+                .readiness_media_observation(ctx.barcode)?
+                .map(|o| o.generation),
             phase: "session_open_short_probe".to_string(),
             state: "planned".to_string(),
             dirty_scope: Some("drive+tape".to_string()),

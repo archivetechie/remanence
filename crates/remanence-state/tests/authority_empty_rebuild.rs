@@ -29,8 +29,8 @@ impl UuidSource for Fixed {
 }
 struct View;
 impl TapeView for View {
-    fn lookup(&self, _: &TapeAt) -> TapeLookup {
-        TapeLookup::NotYet
+    fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, remanence_state::library_log::FoldError> {
+        Ok(TapeLookup::NotYet)
     }
 }
 struct Free;
@@ -527,6 +527,26 @@ fn authority_empty_rebuild_clean_run_nonterminal_states_kept() {
     ] {
         let mut f = Fixture::new();
         f.drive();
+        let cartridge = cleaning_cartridge_ref(&"CLNPHASE".into());
+        let registration = f
+            .a()
+            .cleaning_recorded(
+                CleaningRecorded {
+                    run_id: "register-phase".into(),
+                    previous: None,
+                    drive_uuid: None,
+                    cartridge: Some(cartridge),
+                    action: CleaningAction::Register(Register {
+                        barcode: "CLNPHASE".into(),
+                        home_slot: 1,
+                    }),
+                },
+                actor(),
+                SourceLayer::Layer4,
+                &View,
+            )
+            .unwrap();
+        f.apply(registration);
         let r = f
             .a()
             .cleaning_recorded(
@@ -552,8 +572,11 @@ fn authority_empty_rebuild_clean_run_nonterminal_states_kept() {
                     run_id: "run-1".into(),
                     previous: Some(prior),
                     drive_uuid: Some([9; 16]),
-                    cartridge: None,
-                    action: CleaningAction::Advance(Advance { phase }),
+                    cartridge: (phase == CleanPhase::MovingIn).then_some(cartridge),
+                    action: CleaningAction::Advance(Advance {
+                        phase,
+                        home_slot: (phase == CleanPhase::MovingIn).then_some(1),
+                    }),
                 },
                 actor(),
                 SourceLayer::Layer4,
@@ -582,6 +605,8 @@ fn authority_empty_rebuild_readiness_operation_and_load_budget_kept() {
         .a()
         .begin_readiness(
             ReadinessObserved {
+                scope: ReadinessScope::Endpoint,
+                media: None,
                 operation,
                 endpoint: key(),
                 tape: None,
@@ -728,15 +753,20 @@ fn authority_empty_rebuild_repair_projection_floor_kept() {
     assert_eq!(f.sql().projected_through_sequence(id).unwrap(), 1);
     struct Retained([u8; 32]);
     impl TapeView for Retained {
-        fn lookup(&self, at: &TapeAt) -> TapeLookup {
-            assert_eq!(
-                (at.tape.uuid, at.sequence, at.record_digest),
-                ([0xa1; 16], 1, self.0)
-            );
-            TapeLookup::Present {
-                kind: tape_log::Tag::Initialized,
-                digest: self.0,
-            }
+        fn lookup(
+            &self,
+            at: &TapeAt,
+        ) -> Result<TapeLookup, remanence_state::library_log::FoldError> {
+            Ok({
+                assert_eq!(
+                    (at.tape.uuid, at.sequence, at.record_digest),
+                    ([0xa1; 16], 1, self.0)
+                );
+                TapeLookup::Present {
+                    kind: tape_log::Tag::Initialized,
+                    digest: self.0,
+                }
+            })
         }
     }
     let view = Retained(reference_digest);
@@ -1754,6 +1784,7 @@ fn authority_cleaning_late_drive_binding() {
                 cartridge: None,
                 action: CleaningAction::Advance(Advance {
                     phase: CleanPhase::Cleaning,
+                    home_slot: None,
                 }),
             },
             actor(),
@@ -1781,6 +1812,8 @@ fn authority_readiness_completion_evidence_kept() {
         .a()
         .begin_readiness(
             ReadinessObserved {
+                scope: ReadinessScope::Endpoint,
+                media: None,
                 operation: [0; 16],
                 endpoint: key(),
                 tape: None,
@@ -1944,4 +1977,93 @@ fn authority_occupied_tape_refuses_pool_changes_but_allows_retirement() {
         f.sql().get_tape(&[0xa1; 16]).unwrap().unwrap().state,
         "retired"
     );
+}
+
+/// Ruling 13: a physical suffix refusal is a Write fence, not a tape state.
+/// Lose SQL between the synced raise and its projection, then release exactly
+/// that fence after operator proof. Repeated replay must preserve both cuts.
+#[test]
+fn ruling13_suffix_fence_survives_unprojected_crash_and_explicit_release() {
+    let mut f = Fixture::new();
+    f.provision(1, "B1001L9");
+    let raised = f
+        .a()
+        .fence_raised(
+            FenceRaised {
+                kind: FenceKind::Write,
+                scope: FenceScope::Tape(tape(1)),
+                cause: FenceCause::SessionSuffixContradiction,
+                evidence: None,
+                at: None,
+                operation: None,
+            },
+            actor(),
+            SourceLayer::Layer5,
+            &View,
+        )
+        .unwrap();
+    let fence = raised.receipt.sequence;
+    // Simulate exit before delivering the application to SQL. The library log
+    // already carries the observation; no recovery_required flag is set.
+    drop(raised);
+    for _ in 0..2 {
+        f.rebuild();
+        let tape = f.sql().get_tape(&[1; 16]).unwrap().unwrap();
+        assert_eq!(tape.state, "ready");
+        let conflicts = f
+            .sql()
+            .tape_io_admission_conflicts(&[1; 16], Some("B1001L9"))
+            .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(f
+            .sql()
+            .tape_io_admission_conflicts(&[2; 16], Some("B1002L9"))
+            .unwrap()
+            .is_empty());
+    }
+    // A refused release must leave the fence; the valid proof is durable
+    // before its effect is delivered. No automatic release follows a reopen.
+    assert!(f
+        .a()
+        .fence_released(
+            FenceReleased {
+                fence: 0,
+                evidence: "wrong fence identity".into(),
+                forced: false
+            },
+            actor(),
+            SourceLayer::Layer5,
+            &View,
+        )
+        .is_err());
+    let released = f
+        .a()
+        .fence_released(
+            FenceReleased {
+                fence,
+                evidence: "operator proved and superseded the physical suffix".into(),
+                forced: false,
+            },
+            actor(),
+            SourceLayer::Layer5,
+            &View,
+        )
+        .unwrap();
+    assert_eq!(
+        f.sql()
+            .tape_io_admission_conflicts(&[1; 16], Some("B1001L9"))
+            .unwrap()
+            .len(),
+        1
+    );
+    f.apply(released);
+    for _ in 0..2 {
+        assert!(f
+            .sql()
+            .tape_io_admission_conflicts(&[1; 16], Some("B1001L9"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(f.sql().get_tape(&[1; 16]).unwrap().unwrap().state, "ready");
+        f.rebuild();
+    }
 }

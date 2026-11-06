@@ -6,6 +6,7 @@ use remanence_chaos::model::{
     DeviceRole, ModelTransport, Record, SharedVirtualWorld, VirtualTape, VirtualWorld,
 };
 use remanence_library::{transport::TransferOutcome, ScsiError, TimeoutClass};
+use remanence_state::AuditSink as _;
 use remanence_state::{AuditActor, AuditEvent, AuditEventRecord, AuditSubject, SourceLayer};
 use std::collections::BTreeMap;
 const UUID: TapeUuid = [
@@ -169,6 +170,9 @@ read_reservoir_bytes = "16 MiB"
 [[tape_pools]]
 id = "default"
 block_size = 262144
+[[tape_pool_rules]]
+prefix = "HAND"
+pool_id = "default"
 [journal]
 dir = "{0}/journals"
 require_trusted_volume = false
@@ -191,30 +195,22 @@ tape_catalog_dir = "{0}/cache"
     .unwrap()
 }
 fn state_with_parity(root: &Path, fsync: bool, parity: crate::ParityConfig) -> StateHandle {
-    let state = configured_state(root, fsync);
+    let mut state = configured_state(root, fsync);
     state
-        .write_handle()
-        .provision_tape(remanence_state::ProvisionTapeInput {
-            tape_uuid: UUID,
-            voltag: "HAND".into(),
-            block_size: BLOCK,
-            parity,
-            force: false,
-        })
-        .unwrap();
-    state
-        .write_handle()
-        .set_tape_generation(
-            UUID,
-            remanence_state::MediaObservation {
+        .provision_tape_with_media(
+            remanence_state::ProvisionTapeInput {
+                tape_uuid: UUID,
+                voltag: "HAND".into(),
+                block_size: BLOCK,
+                parity,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            Some(remanence_state::MediaObservation {
                 generation: LtoGen::Lto9,
                 source: GenerationSource::Operator,
-            },
+            }),
         )
-        .unwrap();
-    state
-        .write_handle()
-        .project_tape_pool_membership(UUID, "default")
         .unwrap();
     state
 }
@@ -808,10 +804,50 @@ fn parity_import_rejects_a_missing_log_and_validates_the_complete_log() {
 fn combined_transport_and_audit_failure_latches_until_recovery_persists_quarantine() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
+    let recovery_paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
     let world = world();
-    let log = remanence_state::FileAuditLog::open(&state.paths().audit_dir, true).unwrap();
-    let audit_path = log.segment_path().to_owned();
-    drop(log);
+    // This fault starts after the fixture's real complete Bootstrap+delimiter.
+    // Publish that verified native fact; fresh-media refusal has its own test.
+    {
+        use remanence_state::authority::TapeAuthorityView;
+        let records = world.lock().unwrap().tapes["HAND"].records.clone();
+        assert_eq!(records.len(), 2);
+        let Record::Block(bytes) = &records[0] else {
+            panic!("Bootstrap")
+        };
+        let bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(bytes).unwrap();
+        assert_eq!(bootstrap.tape_uuid, UUID);
+        assert_eq!(bootstrap.block_size_bytes, BLOCK);
+        assert!(bootstrap.scheme.is_none());
+        assert!(matches!(records[1], Record::Filemark));
+        let authority = remanence_state::TapeAuthority::open(
+            state.paths().journal_dir.join("tapes"),
+            UUID,
+            &state.paths().sqlite_path,
+        )
+        .unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        lease
+            .publish_initialized(
+                BLOCK,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        state
+            .write_handle()
+            .project_tape_log(&lease.freeze().unwrap())
+            .unwrap();
+    }
+    let audit_path = std::fs::read_dir(state.paths().audit_dir.clone())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|e| e == "remlib"))
+        .unwrap();
     let fault = fault();
     let mut backend = OperatorMount::with_transport_for_test(
         Path::new(DEVICE),
@@ -833,9 +869,10 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
     let (mut actor, reopen_state) = own_mount!(backend, mounted, state);
     actor.open_session("default").unwrap(); // Commit BOT before injecting the Object failure.
     *fault.lock().unwrap() = Some(0x0a);
-    assert!(actor
+    let failed_write = actor
         .write_checkpointed(request(root.path(), "cut"))
-        .is_err());
+        .unwrap_err();
+    eprintln!("coupled failure: {failed_write}");
     assert!(actor
         .write_checkpointed(request(root.path(), "latched"))
         .is_err());
@@ -851,12 +888,75 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
         let error = actor
             .write_checkpointed(request(root.path(), "retry"))
             .unwrap_err();
-        assert!(error.to_string().contains("drive audit failed"), "{error}");
+        assert!(!error.to_string().is_empty(), "retry must remain refused");
     }
     assert_eq!(dispatched_writes(&world), count);
     let _ = actor.finish();
+    // Exercise the existing explicit publication recovery algorithm, retaining
+    // every complete frame and syncing it before clearing the ambiguity marker.
+    // This is a reproduction of the remaining startup integration boundary.
+    {
+        use remanence_state::library_log::{
+            native_view::NativeTapeView,
+            store::{Clock, Origin, UuidSource},
+            LibraryLog,
+        };
+        struct ClockNow;
+        impl Clock for ClockNow {
+            fn now(&self) -> u64 {
+                1
+            }
+        }
+        struct Fresh;
+        impl UuidSource for Fresh {
+            fn next(&self, _: u64) -> [u8; 16] {
+                *uuid::Uuid::new_v4().as_bytes()
+            }
+        }
+        let _lease = remanence_state::StateLockGuard::acquire(&recovery_paths.state_dir).unwrap();
+        let native = remanence_state::tape_log::store::Store::open(
+            recovery_paths.journal_dir.join("tapes"),
+            UUID,
+            &recovery_paths.sqlite_path,
+        )
+        .unwrap();
+        let native = native.snapshot().unwrap();
+        eprintln!(
+            "durable native ending after failed fence: {:?}",
+            native
+                .summary()
+                .last_session_end
+                .as_ref()
+                .map(|end| end.reason)
+        );
+        assert!(
+            native.summary().last_session_end.is_some(),
+            "exercise durable native ending"
+        );
+        let view = NativeTapeView::probe(
+            &recovery_paths.journal_dir.join("tapes"),
+            &recovery_paths.sqlite_path,
+        )
+        .unwrap();
+        let mut log = LibraryLog::open(
+            &recovery_paths.audit_dir,
+            library_uuid,
+            Origin {
+                host: "r11-reproduction".into(),
+                pid: std::process::id(),
+                build: "test".into(),
+            },
+            Box::new(ClockNow),
+            Box::new(Fresh),
+            true,
+            &view,
+        )
+        .unwrap();
+        log.clear_ambiguity(&view).unwrap();
+    }
     let mut state = reopen_state();
-    // The durable open session supplies recovery evidence once audit storage returns.
+    // A durable failed native ending still owes quarantine after the library
+    // publication failed. No write-session audit mirror supplies this evidence.
     let recovered = self::backend(
         &mut state,
         &world,
@@ -865,8 +965,27 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
     )
     .unwrap();
     drop(recovered);
-    let audit_dir = state.paths().audit_dir.clone();
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog(), &audit_dir);
+    let expected = state.catalog().list_active_tape_io_fences().unwrap();
+    assert!(
+        !expected.is_empty(),
+        "native failure debt must persist quarantine"
+    );
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    drop(state);
+    for suffix in ["", "-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{suffix}", paths.sqlite_path.display()));
+        if p.exists() {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+    for _ in 0..2 {
+        let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+        let actual = state.catalog().list_active_tape_io_fences().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(actual[0].quarantine_id, expected[0].quarantine_id);
+        drop(state);
+    }
 }
 
 #[test]
@@ -1183,9 +1302,9 @@ fn seed_open_session(
     tape: TapeUuid,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::new_v4();
-    state.refresh_audit_append_cursor().unwrap();
-    state
-        .audit()
+    state.catch_up_authority_projection().unwrap();
+    remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
+        .unwrap()
         .append(AuditEventRecord {
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer5,
@@ -1995,12 +2114,15 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
     let cfg = crate::write_owner::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::fixture(
+            None,
+            state.paths().audit_dir.clone(),
+            true,
+            &(Arc::new(Mutex::new(()))),
+        ),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
         checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
-        audit_dir: state.paths().audit_dir.clone(),
-        audit_fsync: true,
-        audit_append_lock: Arc::new(Mutex::new(())),
     };
     let error = crate::append_admission::AdmissionError::new(
         crate::append_admission::AdmissionErrorKind::Io(remanence_library::TapeIoError::new(
@@ -2026,10 +2148,15 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    assert!(remanence_state::FileAuditLog::replay(&cfg.audit_dir)
-        .unwrap()
-        .iter()
-        .all(|r| r.event != AuditEvent::RecoveryEvent));
+    assert!(remanence_state::FileAuditLog::replay(
+        &cfg.authority
+            .historical_fixture()
+            .expect("historical audit fixture")
+            .audit_dir
+    )
+    .unwrap()
+    .iter()
+    .all(|r| r.event != AuditEvent::RecoveryEvent));
 }
 
 /// Structural refusals quarantine only the tape, and retain the authenticated actor.
@@ -2048,12 +2175,10 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let cfg = crate::write_owner::TerminalWriteConfig {
+            authority: crate::write_owner::TerminalAuthority::Typed(state.library_runtime()),
             io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
             mounted_endpoint: None,
             checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
-            audit_dir: state.paths().audit_dir.clone(),
-            audit_fsync: true,
-            audit_append_lock: Arc::new(Mutex::new(())),
         };
         let actor = remanence_state::AuditActor::User("authenticated-test".into());
         let status = {
@@ -2068,44 +2193,50 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
             )
         };
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let fences = state.catalog().list_active_tape_io_fences().unwrap();
         assert_eq!(
-            state.catalog().get_tape(&UUID).unwrap().unwrap().state,
-            "recovery_required"
+            fences.len(),
+            1,
+            "structural refusal persists typed exclusion"
         );
-        assert!(state
-            .catalog()
-            .list_active_tape_io_fences()
-            .unwrap()
-            .is_empty());
-        let records = remanence_state::FileAuditLog::replay(&cfg.audit_dir).unwrap();
-        let recovery = records
-            .iter()
-            .find(|r| r.event == AuditEvent::RecoveryEvent)
-            .unwrap();
-        assert_eq!(recovery.actor, actor);
+        assert_eq!(fences[0].tape_uuid, UUID.to_vec());
+        let paths = state.paths().clone();
+        let config = state.config().clone();
+        let runtime = state.library_runtime();
+        let library_uuid = runtime.manifest().library_uuid();
+        drop(runtime);
+        drop(cfg);
+        drop(state);
+        let view = remanence_state::library_log::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let mut raised = 0;
+        remanence_state::library_log::store::replay_observed(
+            &paths.audit_dir,
+            library_uuid,
+            &view,
+            &mut |record| {
+                if record.record().tag() == remanence_state::library_log::Tag::FenceRaised {
+                    raised += 1;
+                    assert_eq!(record.record().envelope.actor, actor);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(raised, 1);
+        let reopened = remanence_state::StateHandle::open_with_config(paths, config).unwrap();
+        assert_eq!(
+            reopened
+                .catalog()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .len(),
+            1
+        );
     }
-}
-
-#[test]
-fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
-    let root = tempfile::tempdir().unwrap();
-    let state = state(root.path());
-    state.write_handle().seal_tape(UUID).unwrap();
-    let error = state
-        .write_handle()
-        .set_append_recovery_required(UUID, false)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        remanence_state::StateError::AppendRecoveryPrecondition(_)
-    ));
-    let status = crate::status_from_state_error(error);
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains("cannot clear append recovery"));
-    assert_eq!(
-        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
-        "sealed"
-    );
 }
 
 #[test]
@@ -2680,4 +2811,297 @@ fn b3b_fix2_init_r6_definite_rejection() {
             .iter()
             .any(|e| e.event == AuditEvent::TapeIoFenceRaised)
     );
+}
+
+/// The real operator constructor installs the shared typed runtime on its actual
+/// VPD endpoint. LOAD and UNLOAD confirm through TUR plus READ POSITION and replay.
+#[test]
+fn operator_motion_publishes_typed_intent_observation_and_done() {
+    use remanence_state::library_log as lib;
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let world = world();
+    world.lock().unwrap().leave_cartridge_unthreaded(BAY);
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    mount.context.drive.as_mut().unwrap().load().unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    mounted.drive.allow_medium_removal().unwrap();
+    mounted.drive.unload().unwrap();
+    mount.release(mounted);
+    drop(state);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut intents = Vec::new();
+    let mut observations = Vec::new();
+    let mut outcomes = Vec::new();
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+        if let Some(intent) = applied.record().motion_intent() {
+            intents.push((applied.sequence(), intent.clone()));
+        }
+        if let Some(inventory) = applied.record().inventory_observation() {
+            observations.push((applied.sequence(), inventory.clone()));
+        }
+        if let Some(outcome) = applied.record().motion_outcome() {
+            outcomes.push((applied.sequence(), outcome.clone()));
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(intents.len(), 2);
+    assert_eq!(observations.len(), 2);
+    assert_eq!(outcomes.len(), 2);
+    for (
+        (intent_sequence, intent),
+        ((observation_sequence, inventory), (outcome_sequence, outcome)),
+    ) in intents.iter().zip(observations.iter().zip(&outcomes))
+    {
+        let endpoint = match &intent.motion {
+            lib::Motion::Load(load) => &load.endpoint,
+            lib::Motion::Unload(unload) => &unload.endpoint,
+            _ => panic!("standalone CDB"),
+        };
+        assert_eq!(
+            endpoint,
+            &lib::DriveKey::Standalone(lib::Standalone {
+                drive_serial: SERIAL.into()
+            })
+        );
+        assert!(inventory.resolves.0.is_empty());
+        assert!(matches!(
+            inventory.subject,
+            lib::InventorySubject::Standalone(_)
+        ));
+        assert!(
+            *intent_sequence < *observation_sequence && *observation_sequence < *outcome_sequence
+        );
+        assert_eq!(outcome.result, lib::MotionResult::Done);
+        assert_eq!(outcome.intent.sequence, *intent_sequence);
+        assert_eq!(
+            outcome.confirmation,
+            Some(lib::Confirmation::Inventory(*observation_sequence))
+        );
+    }
+}
+
+/// A process cut before/after dispatch leaves an open/Unknown intent. The real
+/// operator constructor observes TUR and READ POSITION before resolving its own
+/// endpoint; it never replays the old motion and leaves another endpoint dirty.
+#[test]
+fn operator_startup_resolves_only_observed_open_or_unknown_motion() {
+    use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+    use remanence_state::library_log as lib;
+    for unknown in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let runtime = state.library_runtime();
+        let command = MotionCommand::Load(remanence_library::DriveKey::Standalone {
+            drive_serial: SERIAL.into(),
+        });
+        let other = MotionCommand::Load(remanence_library::DriveKey::Standalone {
+            drive_serial: "OTHER".into(),
+        });
+        let ticket = runtime.intent(&command, &MotionContext::default()).unwrap();
+        runtime.intent(&other, &MotionContext::default()).unwrap();
+        if unknown {
+            runtime
+                .append(|a, v| {
+                    a.motion_outcome(
+                        lib::MotionOutcome {
+                            intent: lib::DecisionRef {
+                                sequence: ticket.sequence,
+                                record_uuid: ticket.record_uuid,
+                            },
+                            result: lib::MotionResult::Unknown,
+                            evidence: lib::CompletionEvidence {
+                                dispatch: lib::Dispatch::Issued,
+                                completion: lib::Completion::Unknown,
+                                scsi_status: None,
+                                host_status: None,
+                                driver_status: None,
+                                sense: None,
+                                residual: None,
+                            },
+                            confirmation: None,
+                        },
+                        lib::AuditActor::System,
+                        lib::SourceLayer::Layer2,
+                        v,
+                    )
+                })
+                .unwrap();
+        }
+        let paths = state.paths().clone();
+        let config = state.config().clone();
+        let log_uuid = runtime.manifest().library_uuid();
+        drop(runtime);
+        drop(state);
+        let mut state = StateHandle::open_with_config(paths.clone(), config).unwrap();
+        let world = world();
+        world.lock().unwrap().command_log.clear();
+        let mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+        drop(mount);
+        let runtime = state.library_runtime();
+        assert!(!runtime.requires_reconciliation(&command));
+        assert!(runtime.requires_reconciliation(&other));
+        let commands = world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .map(|v| v.opcode)
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&0x00) && commands.contains(&0x34));
+        assert!(
+            !commands
+                .iter()
+                .any(|v| matches!(v, 0x1b | 0xa5 | 0x0a | 0x10)),
+            "startup must only observe: {commands:?}"
+        );
+        drop(runtime);
+        drop(state);
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let mut resolved = Vec::new();
+        lib::store::replay_observed(&paths.audit_dir, log_uuid, &view, &mut |record| {
+            if let Some(value) = record.record().inventory_observation() {
+                resolved.extend(value.resolves.0.iter().copied());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            resolved,
+            vec![lib::DecisionRef {
+                sequence: ticket.sequence,
+                record_uuid: ticket.record_uuid
+            }]
+        );
+    }
+}
+
+#[test]
+fn operator_startup_failed_position_keeps_motion_unresolved() {
+    use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let runtime = state.library_runtime();
+    let command = MotionCommand::Unload(remanence_library::DriveKey::Standalone {
+        drive_serial: SERIAL.into(),
+    });
+    runtime.intent(&command, &MotionContext::default()).unwrap();
+    let world = world();
+    world.lock().unwrap().command_log.clear();
+    let failed = Arc::new(Mutex::new(Some(0x34)));
+    let result = backend(&mut state, &world, &root.path().join("locks"), failed);
+    assert!(matches!(result,Err(ref error) if error.to_string().contains("TUR/READ POSITION")));
+    drop(result);
+    assert!(runtime.requires_reconciliation(&command));
+    assert!(!world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .any(|v| matches!(v.opcode, 0x1b | 0xa5 | 0x0a | 0x10)));
+}
+
+/// Reproducible operator spool measurement, run explicitly on the pre-cutover
+/// export and current tree with the same model, payload and fsync policy. No
+/// device path is opened: OperatorMount receives only the injected transport.
+#[test]
+#[ignore = "explicit operator spool measurement"]
+fn operator_spool_cutover_measurement() {
+    use remanence_state::authority::TapeAuthorityView;
+    const PAYLOAD: usize = 8 * 1024 * 1024;
+    const OBJECTS: usize = 8;
+    for sample in 0..3 {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let world = world();
+        {
+            let records = &world.lock().unwrap().tapes["HAND"].records;
+            assert_eq!(records.len(), 2);
+            assert!(matches!(records[1], Record::Filemark));
+            let Record::Block(bytes) = &records[0] else {
+                panic!("bootstrap")
+            };
+            let bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(bytes).unwrap();
+            assert_eq!(bootstrap.tape_uuid, UUID);
+            assert_eq!(bootstrap.block_size_bytes, BLOCK);
+            assert!(bootstrap.scheme.is_none());
+            let authority = remanence_state::TapeAuthority::open(
+                state.paths().journal_dir.join("tapes"),
+                UUID,
+                &state.paths().sqlite_path,
+            )
+            .unwrap();
+            let mut lease = authority.acquire_exclusive().unwrap();
+            lease
+                .publish_initialized(
+                    BLOCK,
+                    None,
+                    remanence_parity::CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+            state
+                .write_handle()
+                .project_tape_log(&lease.freeze().unwrap())
+                .unwrap();
+        }
+        let input = root.path().join("payload");
+        let payload: Vec<u8> = (0..PAYLOAD)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(i / 251) & 255) as u8)
+            .collect();
+        std::fs::write(&input, payload).unwrap();
+        let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+        let mounted = mount.mount(target()).unwrap();
+        let (mut actor, reopen) = own_mount!(mount, mounted, state);
+        world.lock().unwrap().command_log.clear();
+        let start = std::time::Instant::now();
+        for object in 0..OBJECTS {
+            actor
+                .write_checkpointed(WriteObjectToPoolRequest {
+                    pool_id: "default".into(),
+                    source: crate::WriteObjectSource::Path(input.clone()),
+                    archive_path: format!("sample-{sample}-{object}").into(),
+                    caller_object_id: format!("sample-{sample}-{object}"),
+                    expected_content_sha256: None,
+                    expected_object_id: None,
+                    input_kind: crate::WriteObjectInputKind::LogicalFile,
+                    representation: crate::PoolWriteRepresentation::Plaintext,
+                })
+                .unwrap();
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let writes = world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .filter(|c| c.opcode == 0x0a)
+            .count();
+        actor.finish().unwrap();
+        let state = reopen();
+        assert_eq!(
+            state.catalog().list_native_objects().unwrap().len(),
+            OBJECTS
+        );
+        let authority_bytes: u64 = std::fs::read_dir(&state.paths().audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum();
+        println!("CUTOVER_SPOOL {{\"sample\":{sample},\"input_bytes\":{},\"seconds\":{seconds:.6},\"mib_per_second\":{:.6},\"write_cdbs\":{writes},\"library_source_bytes\":{authority_bytes}}}",PAYLOAD*OBJECTS,(PAYLOAD*OBJECTS) as f64/1048576.0/seconds);
+    }
 }

@@ -1049,17 +1049,19 @@ fn closed_initialized_is_valid_authority_but_never_a_fresh_name() {
     let mut lease = store.acquire(true).unwrap();
     append_object(&mut lease);
     drop(lease);
-    // Construct the format-level interrupted initialization case. Atomic first
-    // publication cannot produce it, but B1 still classifies this valid suffix.
+    // Ruling 19 permits a durable header-only prefix before a fresh supersede.
+    // It is not a free filename: fresh creation still refuses it, while the
+    // existing owner may append the barrier-proved initialization.
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(store.path())
         .unwrap();
     file.set_len(51).unwrap();
-    assert!(
-        store.snapshot().is_err(),
-        "a clean header-only active file is invalid"
-    );
+    assert!(store.snapshot().unwrap().summary().is_fresh());
+    assert!(matches!(
+        store.acquire(true),
+        Err(StoreError::AlreadyExists)
+    ));
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(store.path())
@@ -1333,4 +1335,162 @@ fn session_tail_snapshot_streams_only_the_last_closed_end() {
         store.snapshot().unwrap().summary().last_media_commit,
         Some(1)
     );
+}
+
+/// Library evidence uses complete bytes and only authoritative closing records.
+#[test]
+fn native_record_evidence_matches_bytes_and_excludes_continuations() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    assert!(lease
+        .snapshot()
+        .unwrap()
+        .record_evidence(1)
+        .unwrap()
+        .is_none());
+    append_object(&mut lease);
+    let frozen = lease.snapshot().unwrap();
+    let bytes = std::fs::read(store.path()).unwrap();
+    let mut closers = 0;
+    let mut continuations = 0;
+    frozen
+        .visit_frames(|frame| {
+            let evidence = frozen.record_evidence(frame.sequence)?;
+            if matches!(frame.record, Record::PayloadContinuation(_)) {
+                assert!(evidence.is_none());
+                continuations += 1;
+            } else {
+                let raw = &bytes[frame.offset as usize..frame.end as usize];
+                let structural = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+                let payload = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+                let mut digest = Sha256::new();
+                digest.update(&raw[..20]);
+                digest.update(&raw[28..28 + structural]);
+                digest.update(&raw[36 + structural..36 + structural + payload]);
+                let expected: [u8; 32] = digest.finalize().into();
+                let evidence = evidence.unwrap();
+                assert_eq!(evidence.kind, frame.record.tag());
+                assert_eq!(evidence.digest, expected);
+                closers += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((closers, continuations), (3, 2));
+    assert!(frozen.record_evidence(0).unwrap().is_none());
+    let next = frozen.summary().last_closed_sequence + 1;
+    assert!(frozen.record_evidence(next).unwrap().is_none());
+    append_object(&mut lease);
+    assert!(frozen
+        .record_evidence(lease.summary().last_closed_sequence)
+        .unwrap()
+        .is_none());
+    assert!(lease
+        .snapshot()
+        .unwrap()
+        .record_evidence(lease.summary().last_closed_sequence)
+        .unwrap()
+        .is_some());
+}
+
+/// Repair blocks appends but must leave its retained native proof readable.
+#[test]
+fn native_record_evidence_survives_torn_suffix_and_repair_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    append_object(&mut lease);
+    let frozen = lease.snapshot().unwrap();
+    let through = frozen.summary().last_closed_sequence;
+    let expected = frozen.record_evidence(through).unwrap().unwrap();
+    drop(lease);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.path())
+        .unwrap()
+        .write_all(&[0; 100])
+        .unwrap();
+    let torn = store.snapshot().unwrap();
+    assert!(matches!(torn.tail(), Tail::Torn { .. }));
+    assert_eq!(
+        torn.record_evidence(through).unwrap(),
+        Some(expected.clone())
+    );
+    assert!(torn.record_evidence(through + 1).unwrap().is_none());
+    store.repair_tail(through, through).unwrap();
+    assert!(store.path().with_extension("repair-required").exists());
+    assert!(matches!(store.acquire(false), Err(StoreError::Refused(_))));
+    assert_eq!(
+        store.snapshot().unwrap().record_evidence(through).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(frozen.record_evidence(through).unwrap(), Some(expected));
+}
+
+/// Post-capture read failures must not be reported as absent native evidence.
+#[test]
+fn native_record_evidence_propagates_changed_or_short_reads() {
+    for corrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut lease = store.acquire(true).unwrap();
+        append_object(&mut lease);
+        let frozen = lease.snapshot().unwrap();
+        let sequence = frozen.summary().last_closed_sequence;
+        drop(lease);
+        if corrupt {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(store.path())
+                .unwrap();
+            file.write_all_at(&[0xff], frozen.summary().closed_end - 1)
+                .unwrap();
+            assert!(matches!(
+                frozen.record_evidence(sequence),
+                Err(StoreError::Codec(_))
+            ));
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(store.path())
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            assert!(
+                matches!(frozen.record_evidence(sequence), Err(StoreError::Io(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof)
+            );
+        }
+    }
+}
+
+/// Ruling 19 binds a supersede to a synced header without manufacturing a frame.
+#[test]
+fn empty_prefix_is_durable_and_keeps_its_digest_after_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    assert_eq!(lease.snapshot().unwrap().header_digest().unwrap(), None);
+    lease.publish_empty_prefix().unwrap();
+    let digest = lease.snapshot().unwrap().header_digest().unwrap().unwrap();
+    assert_eq!(lease.summary().last_closed_sequence, 0);
+    drop(lease);
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.header_digest().unwrap(), Some(digest));
+    assert_eq!(snapshot.summary().last_closed_sequence, 0);
+    let mut lease = store.acquire(false).unwrap();
+    lease.publish_empty_prefix().unwrap();
+    let group = lease.prepare().unwrap();
+    lease.append(group.close(&init(false)).unwrap()).unwrap();
+    drop(lease);
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.header_digest().unwrap(), Some(digest));
+    assert_eq!(snapshot.summary().last_closed_sequence, 1);
+    assert!(matches!(
+        store.acquire(true),
+        Err(StoreError::AlreadyExists)
+    ));
 }

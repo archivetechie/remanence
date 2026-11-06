@@ -1,9 +1,13 @@
 //! Drive-cleaning orchestration, frequency admission, retry, and alarm helpers.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use ciborium::value::Value as CborValue;
-use remanence_state::{AuditEvent, CatalogIndex};
+#[cfg(test)]
+use remanence_state::AuditEvent;
+use remanence_state::CatalogIndex;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tonic::Status;
@@ -11,10 +15,30 @@ use tonic::Status;
 use super::actor_runtime::{
     clear_alarm_with_evidence, raise_alarm_with_evidence, WriteOwnerConfig,
 };
+use super::cleaning_source as source;
+#[cfg(test)]
 use super::robotics::record_library_event;
 use crate::status_from_state_error;
+use remanence_state::library_log::CleanPhase;
 
 pub(crate) fn run_cleaning_sequence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library: &mut remanence_library::LibraryHandle,
+    drive_uuid: &[u8],
+    trigger: &str,
+) -> Result<(), Status> {
+    library.with_motion_context(
+        remanence_library::motion::MotionContext {
+            parent_operation: Some(*handle.op_id_uuid().as_bytes()),
+            ..Default::default()
+        },
+        |library| run_cleaning_sequence_owned(index, cfg, handle, library, drive_uuid, trigger),
+    )
+}
+
+fn run_cleaning_sequence_owned(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
     handle: &crate::operations::OperationHandle,
@@ -99,9 +123,7 @@ pub(crate) fn run_cleaning_sequence(
     if drive.fenced {
         return Err(Status::failed_precondition("drive is already fenced"));
     }
-    let run = index
-        .begin_clean_run(drive_uuid, library_serial.as_str(), trigger, None)
-        .map_err(status_from_state_error)?;
+    let run = source::begin(index, cfg, drive_uuid, library_serial.as_str(), trigger)?;
     let fence_detail = format!(
         "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"recovery_step\":\"fence\"}}",
         json_escape_text(&run.run_id),
@@ -115,31 +137,44 @@ pub(crate) fn run_cleaning_sequence(
         "warning",
         Some(fence_detail.as_str()),
     ) {
-        let _ =
-            index.terminalize_clean_run(run.run_id.as_str(), "failed", Some(fence_detail.as_str()));
+        let _ = source::advance(
+            index,
+            cfg,
+            run.run_id.as_str(),
+            CleanPhase::Failed,
+            Some(fence_detail.as_str()),
+        );
         return Err(err);
     }
-    index
-        .set_drive_fenced(drive_uuid, true)
-        .map_err(status_from_state_error)?;
-    if let Err(err) = record_library_event(
+    let owned_fence = source::fence(
         index,
         cfg,
         handle,
+        drive_uuid,
         library_serial.as_str(),
-        AuditEvent::DriveFenced,
-        BTreeMap::from([
-            (
-                "drive_uuid".to_string(),
-                CborValue::Bytes(drive_uuid.to_vec()),
-            ),
-            (
-                "component".to_string(),
-                CborValue::Text("cleaning".to_string()),
-            ),
-        ]),
-    ) {
-        tracing::warn!("failed to append cleaning fence audit: {err}");
+        drive_bay,
+    )?;
+    #[cfg(test)]
+    if cfg.authority.runtime().is_none() {
+        if let Err(err) = record_library_event(
+            index,
+            cfg,
+            handle,
+            library_serial.as_str(),
+            AuditEvent::DriveFenced,
+            BTreeMap::from([
+                (
+                    "drive_uuid".to_string(),
+                    CborValue::Bytes(drive_uuid.to_vec()),
+                ),
+                (
+                    "component".to_string(),
+                    CborValue::Text("cleaning".to_string()),
+                ),
+            ]),
+        ) {
+            tracing::warn!("failed to append cleaning fence audit: {err}");
+        }
     }
     let tape_prefixes = clean_cfg
         .voltag_prefixes
@@ -161,7 +196,7 @@ pub(crate) fn run_cleaning_sequence(
             continue;
         }
         prefix_matches = prefix_matches.saturating_add(1);
-        let tape = match index.ensure_cleaning_cartridge(voltag) {
+        let tape = match source::register(index, cfg, voltag, slot.element_address) {
             Ok(tape) => tape,
             Err(err) => {
                 rejected_carts.push(format!(
@@ -217,7 +252,14 @@ pub(crate) fn run_cleaning_sequence(
             cfg,
             format!("cleaning-needs-operator:{}", run.run_id).as_str(),
         );
-        let _ = index.set_drive_fenced(drive_uuid, false);
+        let _ = source::release(
+            index,
+            cfg,
+            drive_uuid,
+            owned_fence,
+            "cleaning run released its drive obligation",
+        );
+        #[cfg(test)]
         let _ = record_library_event(
             index,
             cfg,
@@ -243,20 +285,24 @@ pub(crate) fn run_cleaning_sequence(
             "critical",
             Some(detail.as_str()),
         );
-        let _ = index.terminalize_clean_run(run.run_id.as_str(), "failed", Some(detail.as_str()));
+        let _ = source::advance(
+            index,
+            cfg,
+            run.run_id.as_str(),
+            CleanPhase::Failed,
+            Some(detail.as_str()),
+        );
         return Err(Status::failed_precondition(reason));
     }
     eligible_carts.sort_by_key(|(slot, _, _)| *slot);
     let (slot_address, voltag, tape_row) = eligible_carts.remove(0);
-    let selected = index
-        .select_clean_run_cart(
-            run.run_id.as_str(),
-            tape_row.tape_uuid.as_slice(),
-            i64::from(slot_address),
-            Some("{\"phase\":\"selecting\"}"),
-        )
-        .map_err(status_from_state_error)?;
-    let selected = selected.ok_or_else(|| Status::internal("selected clean run disappeared"))?;
+    let selected = source::select(
+        index,
+        cfg,
+        run.run_id.as_str(),
+        tape_row.tape_uuid.as_slice(),
+        slot_address,
+    )?;
     let run_id = selected.run_id.clone();
     let complete_timeout = parse_duration_or(&clean_cfg.complete_timeout, Duration::minutes(10));
     let drive_bay = drive
@@ -265,31 +311,123 @@ pub(crate) fn run_cleaning_sequence(
         .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
     let mut motion =
         crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(drive_bay));
-    let loaded = retry_cleaning_move(index, cfg, run_id.as_str(), drive_uuid, "moving-in", || {
-        library
-            .load_with_admission(slot_address, drive_bay, &cfg.policy, &mut || motion.admit())
-            .map_err(|err| {
-                motion
-                    .refusal
-                    .take()
-                    .unwrap_or_else(|| Status::internal(format!("load cleaning cartridge: {err}")))
-            })
-    });
+    let mut failed_load_after_completed_move = false;
+    let loaded = retry_cleaning_move(
+        index,
+        cfg,
+        run_id.as_str(),
+        drive_uuid,
+        "moving-in",
+        true,
+        || {
+            library
+                .load_with_admission(slot_address, drive_bay, &cfg.policy, &mut || motion.admit())
+                .map_err(|err| {
+                    motion.refusal.take().unwrap_or_else(|| match &err {
+                        remanence_library::LoadError::DriveLoad(error)
+                            if matches!(
+                                error.kind,
+                                remanence_library::DriveOpErrorKind::MotionAuthority(_)
+                            ) =>
+                        {
+                            failed_load_after_completed_move = true;
+                            let remanence_library::DriveOpErrorKind::MotionAuthority(error) =
+                                &error.kind
+                            else {
+                                unreachable!()
+                            };
+                            crate::motion_status::status(error, false)
+                        }
+                        remanence_library::LoadError::Move(error)
+                            if matches!(
+                                error.kind,
+                                remanence_library::MoveErrorKind::MotionAuthority(_)
+                            ) =>
+                        {
+                            let remanence_library::MoveErrorKind::MotionAuthority(error) =
+                                &error.kind
+                            else {
+                                unreachable!()
+                            };
+                            crate::motion_status::status(error, false)
+                        }
+                        _ => Status::internal(format!("load cleaning cartridge: {err}")),
+                    })
+                })
+        },
+    );
     if let Err(error) = loaded {
+        // A cleaning cartridge may eject as soon as MOVE seats it, before LOAD
+        // admission can confirm the bay. Preserve that actual read-only eject
+        // observation; never retry the already completed MOVE from an empty slot.
+        if failed_load_after_completed_move
+            && crate::motion_status::classified(&error)
+                == Some(remanence_library::motion::MotionAuthorityFailure::EvidenceFailure)
+            && cfg
+                .authority
+                .runtime()
+                .is_some_and(|r| r.ensure_motion_allowed().is_ok())
+            && observed_empty_cleaning_bay(library, drive_bay)?
+        {
+            source::cartridge_failed(
+                index,
+                cfg,
+                &run_id,
+                &tape_row.tape_uuid,
+                true,
+                "fast-eject before LOAD admission",
+            )?;
+            source::advance(
+                index,
+                cfg,
+                &run_id,
+                CleanPhase::Failed,
+                Some("{\"reason\":\"fast-eject\"}"),
+            )?;
+            raise_alarm_with_evidence(
+                index,
+                cfg,
+                &format!("cln-cart-expired:{voltag}"),
+                "cln-cart-expired",
+                "warning",
+                Some("{\"reason\":\"fast-eject\"}"),
+            )?;
+            return Err(Status::failed_precondition(
+                "cleaning cartridge fast-ejected before LOAD admission",
+            ));
+        }
+        if crate::motion_status::classified(&error)
+            == Some(remanence_library::motion::MotionAuthorityFailure::EvidenceFailure)
+        {
+            let detail = format!("{{\"reason\":\"{}\"}}", json_escape_text(error.message()));
+            source::advance(index, cfg, &run_id, CleanPhase::Failed, Some(&detail))?;
+            raise_alarm_with_evidence(
+                index,
+                cfg,
+                &format!("cleaning-needs-operator:{run_id}"),
+                "cleaning-needs-operator",
+                "warning",
+                Some(&detail),
+            )?;
+        }
         if crate::drive_pool::DaemonShuttingDown::is_status(&error) && !motion.dispatched {
             // This run owns this unique alarm and raised the fence only after
             // rejecting a pre-existing fence. No physical command was sent.
-            index
-                .terminalize_clean_run(
-                    run_id.as_str(),
-                    "failed",
-                    Some("{\"outcome\":\"cancelled\",\"reason\":\"daemon shutting down\"}"),
-                )
-                .map_err(status_from_state_error)?;
+            source::advance(
+                index,
+                cfg,
+                run_id.as_str(),
+                CleanPhase::Failed,
+                Some("{\"outcome\":\"cancelled\",\"reason\":\"daemon shutting down\"}"),
+            )?;
             if !drive.fenced {
-                index
-                    .set_drive_fenced(drive_uuid, false)
-                    .map_err(status_from_state_error)?;
+                source::release(
+                    index,
+                    cfg,
+                    drive_uuid,
+                    owned_fence,
+                    "cleaning run released its drive obligation",
+                )?;
             }
             clear_alarm_with_evidence(
                 index,
@@ -301,20 +439,13 @@ pub(crate) fn run_cleaning_sequence(
     }
     drop(motion);
     let load_completed = std::time::Instant::now();
-    let _ = index
-        .advance_clean_run(
-            run_id.as_str(),
-            "moving-in",
-            Some("{\"phase\":\"moving-in\"}"),
-        )
-        .map_err(status_from_state_error)?;
-    let _ = index
-        .advance_clean_run(
-            run_id.as_str(),
-            "cleaning",
-            Some("{\"phase\":\"cleaning\"}"),
-        )
-        .map_err(status_from_state_error)?;
+    source::advance(
+        index,
+        cfg,
+        run_id.as_str(),
+        CleanPhase::Cleaning,
+        Some("{\"phase\":\"cleaning\"}"),
+    )?;
     let min_cycle = parse_duration_or(&clean_cfg.min_cycle_duration, Duration::minutes(1));
     if load_completed.elapsed()
         > std::time::Duration::from_millis(complete_timeout.whole_milliseconds().max(0) as u64)
@@ -325,7 +456,13 @@ pub(crate) fn run_cleaning_sequence(
             json_escape_text(&crate::bytes_to_hex(drive_uuid)),
             json_escape_text(&voltag),
         );
-        let _ = index.mark_clean_run_needs_operator(run_id.as_str(), Some(detail.as_str()));
+        let _ = source::advance(
+            index,
+            cfg,
+            run_id.as_str(),
+            CleanPhase::NeedsOperator,
+            Some(detail.as_str()),
+        );
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
@@ -337,16 +474,21 @@ pub(crate) fn run_cleaning_sequence(
         return Err(Status::deadline_exceeded("cleaning timeout exceeded"));
     }
     if cleaning_drive_is_idle(library, drive_bay)? {
-        let _ = index
-            .set_tape_cleaning_state(tape_row.tape_uuid.as_slice(), "expired")
-            .map_err(status_from_state_error)?;
-        let _ = index
-            .advance_clean_run(
-                run_id.as_str(),
-                "failed",
-                Some("{\"reason\":\"fast-eject\"}"),
-            )
-            .map_err(status_from_state_error)?;
+        source::cartridge_failed(
+            index,
+            cfg,
+            run_id.as_str(),
+            tape_row.tape_uuid.as_slice(),
+            true,
+            "fast-eject",
+        )?;
+        source::advance(
+            index,
+            cfg,
+            run_id.as_str(),
+            CleanPhase::Failed,
+            Some("{\"reason\":\"fast-eject\"}"),
+        )?;
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
@@ -374,21 +516,32 @@ pub(crate) fn run_cleaning_sequence(
         )
         .map_err(|err| Status::internal(format!("open drive for cleaning verify: {err}")))?;
     let alerts = drive_handle.read_tape_alerts().map_err(|err| {
-        let _ = index.terminalize_clean_run(
+        let _ = source::advance(
+            index,
+            cfg,
             run_id.as_str(),
-            "failed",
+            CleanPhase::Failed,
             Some("{\"reason\":\"verify-read-failed\"}"),
         );
         Status::unavailable(format!("read TapeAlert page: {err}"))
     })?;
     let active_alerts = alerts.active();
     if alerts.is_set(22) {
-        let _ = index
-            .set_tape_cleaning_state(tape_row.tape_uuid.as_slice(), "expired")
-            .map_err(status_from_state_error)?;
-        let _ = index
-            .advance_clean_run(run_id.as_str(), "failed", Some("{\"reason\":\"flag-22\"}"))
-            .map_err(status_from_state_error)?;
+        source::cartridge_failed(
+            index,
+            cfg,
+            run_id.as_str(),
+            tape_row.tape_uuid.as_slice(),
+            true,
+            "flag-22",
+        )?;
+        source::advance(
+            index,
+            cfg,
+            run_id.as_str(),
+            CleanPhase::Failed,
+            Some("{\"reason\":\"flag-22\"}"),
+        )?;
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
@@ -402,16 +555,21 @@ pub(crate) fn run_cleaning_sequence(
         ));
     }
     if alerts.is_set(20) || alerts.is_set(21) {
-        let _ = index
-            .set_tape_cleaning_state(tape_row.tape_uuid.as_slice(), "rejected")
-            .map_err(status_from_state_error)?;
-        let _ = index
-            .advance_clean_run(
-                run_id.as_str(),
-                "failed",
-                Some("{\"reason\":\"corroboration\"}"),
-            )
-            .map_err(status_from_state_error)?;
+        source::cartridge_failed(
+            index,
+            cfg,
+            run_id.as_str(),
+            tape_row.tape_uuid.as_slice(),
+            false,
+            "corroboration",
+        )?;
+        source::advance(
+            index,
+            cfg,
+            run_id.as_str(),
+            CleanPhase::Failed,
+            Some("{\"reason\":\"corroboration\"}"),
+        )?;
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
@@ -424,13 +582,13 @@ pub(crate) fn run_cleaning_sequence(
             "cleaning cartridge behaved like data media",
         ));
     }
-    let _ = index
-        .advance_clean_run(
-            run_id.as_str(),
-            "moving-back",
-            Some("{\"phase\":\"moving-back\"}"),
-        )
-        .map_err(status_from_state_error)?;
+    source::advance(
+        index,
+        cfg,
+        run_id.as_str(),
+        CleanPhase::MovingBack,
+        Some("{\"phase\":\"moving-back\"}"),
+    )?;
     // Admission happens at physical UNLOAD dispatch. Retain it across both
     // retries and MOVE so shutdown cannot strand the unthreaded cartridge.
     let mut dismount = None;
@@ -457,6 +615,7 @@ pub(crate) fn run_cleaning_sequence(
         run_id.as_str(),
         drive_uuid,
         "moving-back",
+        false,
         || {
             crate::mount_support::unload_library_bay_with_admission(
                 library,
@@ -480,16 +639,21 @@ pub(crate) fn run_cleaning_sequence(
     if eject_observed.duration_since(load_completed)
         < std::time::Duration::from_millis(min_cycle_millis)
     {
-        let _ = index
-            .set_tape_cleaning_state(tape_row.tape_uuid.as_slice(), "expired")
-            .map_err(status_from_state_error)?;
-        let _ = index
-            .advance_clean_run(
-                run_id.as_str(),
-                "failed",
-                Some("{\"reason\":\"fast-eject\"}"),
-            )
-            .map_err(status_from_state_error)?;
+        source::cartridge_failed(
+            index,
+            cfg,
+            run_id.as_str(),
+            tape_row.tape_uuid.as_slice(),
+            true,
+            "fast-eject",
+        )?;
+        source::advance(
+            index,
+            cfg,
+            run_id.as_str(),
+            CleanPhase::Failed,
+            Some("{\"reason\":\"fast-eject\"}"),
+        )?;
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
@@ -508,21 +672,28 @@ pub(crate) fn run_cleaning_sequence(
         json_escape_text(&crate::bytes_to_hex(drive_uuid)),
         json_escape_text(&voltag),
     );
-    let _ = index
-        .advance_clean_run(
-            run_id.as_str(),
-            "verifying",
-            Some("{\"phase\":\"verifying\"}"),
-        )
-        .map_err(status_from_state_error)?;
-    index
-        .finalize_verified_clean_run(
-            run_id.as_str(),
-            drive_uuid,
-            Some(tape_row.tape_uuid.as_slice()),
-            Some(detail.as_str()),
-        )
-        .map_err(status_from_state_error)?;
+    source::advance(
+        index,
+        cfg,
+        run_id.as_str(),
+        CleanPhase::Verifying,
+        Some("{\"phase\":\"verifying\"}"),
+    )?;
+    source::finish_verified(
+        index,
+        cfg,
+        run_id.as_str(),
+        drive_uuid,
+        tape_row.tape_uuid.as_slice(),
+        detail.as_str(),
+    )?;
+    source::release(
+        index,
+        cfg,
+        drive_uuid,
+        owned_fence,
+        "cleaning verified and cartridge returned to its observed home slot",
+    )?;
     let _ = clear_alarm_with_evidence(
         index,
         cfg,
@@ -544,6 +715,7 @@ pub(crate) fn run_cleaning_sequence(
         format!("cart-not-cleaning-behavior:{}", voltag).as_str(),
     );
     let _ = active_alerts;
+    #[cfg(test)]
     let _ = record_library_event(
         index,
         cfg,
@@ -561,6 +733,7 @@ pub(crate) fn run_cleaning_sequence(
             ),
         ]),
     );
+    #[cfg(test)]
     let _ = record_library_event(
         index,
         cfg,
@@ -658,6 +831,22 @@ pub(crate) fn json_escape_text(value: &str) -> String {
     out
 }
 
+/// Missing bay evidence cannot prove an eject.
+fn observed_empty_cleaning_bay(
+    library: &mut remanence_library::LibraryHandle,
+    bay: u16,
+) -> Result<bool, Status> {
+    library
+        .refresh()
+        .map_err(|e| Status::unavailable(format!("observe cleaning eject: {e}")))?;
+    Ok(library
+        .library()
+        .drive_bays
+        .iter()
+        .find(|v| v.element_address == bay)
+        .is_some_and(|v| !v.loaded))
+}
+
 pub(crate) fn cleaning_drive_is_idle(
     library: &mut remanence_library::LibraryHandle,
     drive_bay: u16,
@@ -680,22 +869,40 @@ pub(crate) fn retry_cleaning_move(
     run_id: &str,
     drive_uuid: &[u8],
     label: &str,
+    defer_load_evidence: bool,
     mut op: impl FnMut() -> Result<(), Status>,
 ) -> Result<(), Status> {
     let mut last_err = None;
+    let mut first_err = None;
+    let mut authority_refusal = None;
     for attempt in 0..2 {
         match op() {
             Ok(()) => return Ok(()),
             Err(err) if crate::drive_pool::DaemonShuttingDown::is_status(&err) => return Err(err),
             Err(err) => {
+                if defer_load_evidence
+                    && crate::motion_status::classified(&err)
+                        == Some(remanence_library::motion::MotionAuthorityFailure::EvidenceFailure)
+                {
+                    return Err(err);
+                }
+                first_err.get_or_insert_with(|| err.message().to_string());
                 last_err = Some(err.message().to_string());
+                if crate::motion_status::classified(&err).is_some() {
+                    authority_refusal = Some(err);
+                    break;
+                }
                 if attempt == 0 {
                     tracing::warn!("{label} failed once during cleaning; retrying");
                 }
             }
         }
     }
-    let err = last_err.unwrap_or_else(|| "move failed".to_string());
+    let last = last_err.unwrap_or_else(|| "move failed".to_string());
+    let err = match first_err {
+        Some(first) if first != last => format!("{first}; retry: {last}"),
+        _ => last,
+    };
     let detail = format!(
         "{{\"run_id\":\"{}\",\"drive_uuid\":\"{}\",\"recovery_step\":\"{}\",\"error\":\"{}\"}}",
         json_escape_text(run_id),
@@ -703,7 +910,13 @@ pub(crate) fn retry_cleaning_move(
         json_escape_text(label),
         json_escape_text(&err),
     );
-    let _ = index.terminalize_clean_run(run_id, "failed", Some(detail.as_str()));
+    let _ = source::advance(
+        index,
+        cfg,
+        run_id,
+        CleanPhase::Failed,
+        Some(detail.as_str()),
+    );
     let _ = raise_alarm_with_evidence(
         index,
         cfg,
@@ -712,5 +925,5 @@ pub(crate) fn retry_cleaning_move(
         "warning",
         Some(detail.as_str()),
     );
-    Err(Status::internal(err))
+    Err(authority_refusal.unwrap_or_else(|| Status::internal(err)))
 }

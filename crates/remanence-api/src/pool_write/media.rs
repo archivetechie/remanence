@@ -12,19 +12,6 @@ use super::capacity::{
 };
 use super::model::WritabilityError;
 
-const LTO_RAW_CAPACITY_BYTES: &[(LtoGen, u64)] = &[
-    (LtoGen::Lto1, 100_000_000_000),
-    (LtoGen::Lto2, 200_000_000_000),
-    (LtoGen::Lto3, 400_000_000_000),
-    (LtoGen::Lto4, 800_000_000_000),
-    (LtoGen::Lto5, 1_500_000_000_000),
-    (LtoGen::Lto6, 2_500_000_000_000),
-    (LtoGen::Lto7, 6_000_000_000_000),
-    (LtoGen::M8, 9_000_000_000_000),
-    (LtoGen::Lto8, 12_000_000_000_000),
-    (LtoGen::Lto9, 18_000_000_000_000),
-];
-
 /// Parse a drive LTO generation from common INQUIRY product strings.
 pub fn lto_generation_from_drive_product(product: &str) -> Option<LtoGen> {
     let product = product.to_ascii_uppercase();
@@ -97,10 +84,7 @@ pub fn can_write(drive: LtoGen, tape: LtoGen) -> bool {
 
 /// Native/raw cartridge capacity in bytes for one LTO generation.
 pub fn raw_capacity_bytes(generation: LtoGen) -> u64 {
-    LTO_RAW_CAPACITY_BYTES
-        .iter()
-        .find_map(|(candidate, bytes)| (*candidate == generation).then_some(*bytes))
-        .expect("all LTO generations have a raw capacity entry")
+    generation.raw_capacity_bytes()
 }
 
 /// Check that a catalog tape row is a hard-valid target for `object_size`.

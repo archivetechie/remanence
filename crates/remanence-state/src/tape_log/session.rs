@@ -107,7 +107,9 @@ pub struct SessionEnded {
     pub tail: GroupRef,
     /// Number of TailFile chunks in that group.
     pub tail_file_count: u64,
-    /// Optional operator acknowledgement audit reference for crash recovery.
+    /// Optional SupersedeTail library sequence for crash recovery. Cross-source
+    /// replay validates its type, tape/session and exact preview. The field name
+    /// is retained for the existing native wire shape.
     pub crash_ack_audit_sequence: Option<u64>,
     /// Physical lower bound on the suffix, relative to cursor.lba.
     pub synchronized_tail_blocks: u64,

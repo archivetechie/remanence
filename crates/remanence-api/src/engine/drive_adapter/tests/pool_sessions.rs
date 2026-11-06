@@ -5,6 +5,7 @@ use crate::pool_write::*;
 use remanence_parity::{ParityScheme, SchemeId, TapeFileKind, TapeReportPublisher};
 use remanence_state::authority::row_fixtures::RowAuthority as TapeRowAuthority;
 use remanence_state::authority::TapeAuthorityView;
+use remanence_state::AuditSink as _;
 use remanence_state::{TapeAuthority, TerminalFinalizationProgress};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -142,6 +143,7 @@ fn configured_owner_and_memory(
                 fault: f.fault.clone(),
                 evidence: Some(f.config.audit.dir.clone()),
                 last_opcode: None,
+                empty_prefix_recovery: None,
             },
             replica_attempts: replicas,
             misdirect_locate: misdirect,
@@ -527,10 +529,10 @@ fn watermark_seal_journals_exact_terminal_authority_and_host_suffix() {
             assert!(actor.open_session("default").is_err());
         }
         actor.finish().unwrap();
-        let mut state = f.reopen().unwrap();
+        let state = f.reopen().unwrap();
         let session_id = uuid::Uuid::from_u128(0x9901);
-        state
-            .audit()
+        remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
+            .unwrap()
             .append(remanence_state::AuditEventRecord {
                 actor: remanence_state::AuditActor::System,
                 source_layer: remanence_state::SourceLayer::Layer5,
@@ -1073,6 +1075,7 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
                     fault: f.fault.clone(),
                     evidence: None,
                     last_opcode: None,
+                    empty_prefix_recovery: None,
                 }),
                 &mut state,
                 f.root.path(),
@@ -1092,5 +1095,218 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
             drop(state);
             std::fs::remove_dir_all(&config.daemon.state_dir).unwrap();
         }
+    }
+}
+/// Item 5 equivalence: real mounted writes create the facts; deleting SQLite
+/// preserves native session/seal decisions and the physical append refusal.
+#[test]
+fn b4b2b_tape_owned_decisions_survive_empty_catalog_rebuild() {
+    use remanence_state::tape_log::Record as Native;
+
+    fn records(f: &Fixture) -> Vec<Native> {
+        let path = TapeAuthority::list_entries(f.config.journal.dir.join("tapes"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
+        remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+        let offset = std::io::Seek::stream_position(&mut file).unwrap();
+        let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+        let mut records = Vec::new();
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            records.push(frame.record);
+        }
+        records
+    }
+    fn decisions(f: &Fixture, phase: &str) -> (String, Vec<(Uuid, String)>, bool, bool, u64) {
+        let index = f.index();
+        let snapshot = TapeAuthority::open(f.config.journal.dir.join("tapes"), UUID, index.path())
+            .unwrap()
+            .freeze()
+            .unwrap();
+        let mut sessions: Vec<_> = records(f)
+            .into_iter()
+            .filter_map(|record| match record {
+                Native::SessionOpened(open) => {
+                    let id = Uuid::from_bytes(open.session_id);
+                    Some((
+                        id,
+                        index.session_state(id).unwrap().unwrap_or_else(|| {
+                            panic!("{phase}: native session {id} has no projection")
+                        }),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        sessions.sort();
+        let summary = snapshot.tape_summary();
+        (
+            index.get_tape(&UUID).unwrap().unwrap().state,
+            sessions,
+            summary.sealed,
+            summary.open_session.is_some(),
+            summary
+                .last_session_end
+                .as_ref()
+                .map_or(0, |end| end.possible_tail_blocks),
+        )
+    }
+    fn admission(f: &Fixture) -> bool {
+        let mut owner = f.owner(f.reopen().unwrap());
+        let admitted = owner.open_session("default").is_ok();
+        if admitted {
+            owner.close_session().unwrap();
+        }
+        owner.finish().unwrap();
+        admitted
+    }
+    for case in ["closed", "sealed", "retired", "crashed_tail"] {
+        let (mut f, mut state) = Fixture::initialized(false);
+        // Persist the existing non-tape facts through their production facade.
+        state.record_rule_tape_pool_assignment(UUID).unwrap();
+        state
+            .set_tape_generation(
+                UUID,
+                remanence_state::MediaObservation {
+                    generation: crate::LtoGen::Lto9,
+                    source: remanence_state::GenerationSource::Operator,
+                },
+            )
+            .unwrap();
+        drop(state);
+        if case == "sealed" {
+            f.config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
+            f.config.tape_pools[0].watermark_low = 0.000001;
+            f.config.tape_pools[0].watermark_high = 0.25;
+        }
+        let mut owner = f.owner(f.reopen().unwrap());
+        owner.write_checkpointed(f.request("retained")).unwrap();
+        owner.finish().unwrap();
+        if case == "retired" {
+            f.reopen()
+                .unwrap()
+                .retire_tape(remanence_state::RetireTapeInput {
+                    tape_uuid: UUID,
+                    reason: "equivalence retirement".into(),
+                })
+                .unwrap();
+        }
+        if case == "crashed_tail" {
+            // Save the complete host state at C, write a real later Object on
+            // the model tape, then restore only the host cut and leave media.
+            let log = TapeAuthority::list_entries(f.config.journal.dir.join("tapes"))
+                .unwrap()
+                .pop()
+                .unwrap();
+            let prefix = std::fs::read(&log).unwrap();
+            let saved = f.root.path().join("before-later-object.sqlite");
+            rusqlite::Connection::open(&f.config.index.sqlite_path)
+                .unwrap()
+                .execute("vacuum into ?1", [saved.to_str().unwrap()])
+                .unwrap();
+            let mut owner = f.owner(f.reopen().unwrap());
+            owner.write_checkpointed(f.request("later-object")).unwrap();
+            owner.finish().unwrap();
+            std::fs::write(&log, prefix).unwrap();
+            for suffix in ["", "-wal", "-shm"] {
+                let path =
+                    PathBuf::from(format!("{}{suffix}", f.config.index.sqlite_path.display()));
+                if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            std::fs::rename(saved, &f.config.index.sqlite_path).unwrap();
+            let authority = TapeAuthority::open(
+                f.config.journal.dir.join("tapes"),
+                UUID,
+                &f.config.index.sqlite_path,
+            )
+            .unwrap();
+            let mut lease = authority.acquire_exclusive().unwrap();
+            lease
+                .open_session([0xda; 16], "2026-11-05T00:00:00Z".into())
+                .unwrap();
+            f.index()
+                .project_tape_log(&lease.freeze().unwrap())
+                .unwrap();
+        }
+        let admitted = admission(&f);
+        assert_eq!(admitted, case == "closed", "{case}");
+        let before = decisions(&f, &format!("{case} before rebuild"));
+        assert_eq!(before.2, case == "sealed");
+        if case == "crashed_tail" {
+            assert!(before.3);
+        }
+        let native_before = std::fs::read(
+            TapeAuthority::list_entries(f.config.journal.dir.join("tapes"))
+                .unwrap()
+                .pop()
+                .unwrap(),
+        )
+        .unwrap();
+        let audit_before = FileAuditLog::replay(&f.config.audit.dir).unwrap();
+        assert!(audit_before
+            .iter()
+            .all(|record| record.event != AuditEvent::TapeSealed));
+        assert!(audit_before.iter().all(|record| record.detail.get("action")
+            != Some(&ciborium::Value::Text("append_recovery_required".into()))));
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", f.config.index.sqlite_path.display()));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let mut rebuilt = f.reopen().unwrap();
+        rebuilt.rebuild_projection_from_tape_logs().unwrap();
+        drop(rebuilt);
+        assert_eq!(
+            decisions(&f, &format!("{case} after rebuild")),
+            before,
+            "{case}"
+        );
+        assert_eq!(
+            std::fs::read(
+                TapeAuthority::list_entries(f.config.journal.dir.join("tapes"))
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            )
+            .unwrap(),
+            native_before
+        );
+        assert_eq!(
+            FileAuditLog::replay(&f.config.audit.dir).unwrap(),
+            audit_before
+        );
+        assert_eq!(admission(&f), admitted, "{case}");
+        let seals = records(&f)
+            .iter()
+            .filter(|record| matches!(record, Native::Sealed { .. }))
+            .count();
+        assert_eq!(seals, usize::from(case == "sealed"));
+    }
+}
+
+/// The missing precommit session source cannot be hidden by either writer's
+/// Bootstrap constructor. Both real mounted paths refuse before media mutation.
+#[test]
+fn typed_fresh_session_refuses_before_parity_or_plain_bootstrap() {
+    for parity in [false, true] {
+        let (f, state) = Fixture::new(parity);
+        let mut owner = f.owner(state);
+        let before = command_count(&f);
+        let error = owner.open_session("default").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pre-Bootstrap session authority"),
+            "{error:?}"
+        );
+        no_modifications(&f, before);
+        owner.finish().unwrap();
+        let reopened = f.reopen().unwrap();
+        assert!(!reopened.library_runtime().motion_fenced());
+        drop(reopened);
     }
 }

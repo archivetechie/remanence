@@ -289,7 +289,7 @@ fn config(root: &Path, library: &remanence_library::LibraryHandle) -> WriteOwner
     cfg.calibration_store = CalibrationControlStore::open(root.join("calibration")).unwrap();
     cfg.checkpoint_max_objects = 100;
     cfg.checkpoint_max_age_seconds = 3600;
-    cfg.audit_fsync = true;
+    cfg.fixture_audit_mut().audit_fsync = true;
     cfg
 }
 

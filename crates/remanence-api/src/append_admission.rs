@@ -682,37 +682,38 @@ pub(crate) fn daemon_admission_error(
     if !outcome.recovery_required {
         return outcome.retry.attach(tonic::Status::unavailable(detail));
     }
-    if let Err(e) = index.set_append_recovery_required(tape_uuid, true) {
-        return crate::status_from_state_error(e);
-    }
-    let audit = crate::audit_projection::append_and_project_audit(
-        index,
-        &cfg.audit_dir,
-        true,
-        &cfg.audit_append_lock,
-        crate::audit_projection::ProjectedAuditInput {
+    use remanence_state::library_log as lib;
+    let Some(library) = cfg.authority.runtime() else {
+        return tonic::Status::failed_precondition(
+            "append refusal cannot be durably fenced: shared library authority is missing",
+        );
+    };
+    let Some(tape) = library.tape_state(tape_uuid) else {
+        return tonic::Status::failed_precondition(
+            "append refusal cannot be durably fenced: tape has no Reprovision authority",
+        );
+    };
+    match library.append(|authority, view| {
+        authority.fence_raised(
+            lib::FenceRaised {
+                kind: lib::FenceKind::Write,
+                scope: lib::FenceScope::Tape(tape.tape),
+                cause: lib::FenceCause::SessionSuffixContradiction,
+                evidence: None,
+                at: None,
+                operation: None,
+            },
             actor,
-            source_layer: remanence_state::SourceLayer::Layer5,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: remanence_state::AuditEvent::RecoveryEvent,
-            subject_kind: "tape",
-            subject_id: Some(uuid::Uuid::from_bytes(tape_uuid).to_string()),
-            detail: std::collections::BTreeMap::from([
-                (
-                    "action".into(),
-                    ciborium::Value::Text("append_recovery_required".into()),
-                ),
-                ("error".into(), ciborium::Value::Text(detail.clone())),
-            ]),
-        },
-    );
-    match audit {
+            remanence_state::SourceLayer::Layer5,
+            view,
+        )
+    }) {
         Ok(_) => outcome
             .retry
             .attach(tonic::Status::failed_precondition(detail)),
-        Err(e) => e,
+        Err(error) => tonic::Status::failed_precondition(format!(
+            "{detail}; durable library fence failed: {error}"
+        )),
     }
 }
 

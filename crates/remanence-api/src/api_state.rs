@@ -164,8 +164,19 @@ impl ApiState {
         remanence_state::state::recover_library_sessions_after_restart(&mut index, config)
             .map_err(status_from_state_error)?;
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
-        remanence_state::fence::reconcile(&mut index, &config.audit.dir)
-            .map_err(status_from_state_error)?;
+        if let Some(runtime) = index.library_runtime() {
+            runtime
+                .catch_up()
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        } else {
+            #[cfg(test)]
+            remanence_state::fence::reconcile(&mut index, &config.audit.dir)
+                .map_err(status_from_state_error)?;
+            #[cfg(not(test))]
+            return Err(Status::failed_precondition(
+                "configured service requires shared LibraryAuthority",
+            ));
+        }
         reject_active_tape_io_fences_on_startup(&index)?;
         replay_checkpoint_journal_projections_with_audit(
             &mut index,
@@ -345,6 +356,22 @@ impl ApiState {
         )
             -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>,
     ) -> Result<Self, Status> {
+        let authority = match catalog.library_runtime() {
+            Some(runtime) => crate::write_owner::TerminalAuthority::Typed(runtime),
+            #[cfg(test)]
+            None => crate::write_owner::TerminalAuthority::fixture(
+                None,
+                &config.audit.dir,
+                config.audit.fsync,
+                &Arc::new(std::sync::Mutex::new(())),
+            ),
+            #[cfg(not(test))]
+            None => {
+                return Err(Status::failed_precondition(
+                    "drive-pool ownership requires shared LibraryAuthority",
+                ))
+            }
+        };
         let mut index = catalog.write_handle();
         let index_path = catalog.path().to_path_buf();
         // The daemon retains state ownership across this constructor and serve.
@@ -363,8 +390,16 @@ impl ApiState {
             _ => None,
         };
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
-        remanence_state::fence::reconcile(&mut index, &config.audit.dir)
-            .map_err(status_from_state_error)?;
+        if let Some(runtime) = authority.runtime() {
+            runtime
+                .catch_up()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
+        #[cfg(test)]
+        if authority.runtime().is_none() {
+            remanence_state::fence::reconcile(&mut index, &config.audit.dir)
+                .map_err(status_from_state_error)?;
+        }
         reject_active_tape_io_fences_on_startup(&index)?;
         let library_snapshot = Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
             report: report.clone(),
@@ -395,6 +430,12 @@ impl ApiState {
             let mut library = open(discovered, &policy)
                 .map_err(|err| Status::internal(format!("open library {library_serial}: {err}")))?;
             library.set_changer_ready_wait(changer_ready_wait.clone());
+            if let Some(runtime) = index.library_runtime() {
+                library.set_motion_authority(Arc::new(runtime));
+                library.reconcile_startup_motion().map_err(|e| {
+                    Status::failed_precondition(format!("startup motion reconciliation: {e}"))
+                })?;
+            }
             let mut opened_drives = Vec::new();
             for bay in library.library().drive_bays.clone() {
                 let Some(installed) = bay.installed.as_ref() else {
@@ -453,13 +494,11 @@ impl ApiState {
             .map_err(Status::invalid_argument)?;
         let calibration_store = open_calibration_store_for_config(config)?;
         let base_cfg = crate::write_owner::WriteOwnerConfig {
+            authority,
             catalog: catalog.clone(),
             index_path: index_path.clone(),
             report: report.clone(),
             policy,
-            audit_dir: config.audit.dir.clone(),
-            audit_fsync: config.audit.fsync,
-            audit_append_lock: audit_append_lock.clone(),
             reservations: reservations.clone(),
             placement: crate::write_owner::ActorPlacement::Library(
                 crate::write_owner::LibraryActorContext {
@@ -783,6 +822,22 @@ impl ApiState {
             .map_err(|e| Status::internal(format!("live status task: {e}")))?
     }
 
+    /// Read the shared authority latch without attempting another source append.
+    /// Both Health and live status use this view, including cached status replies.
+    pub(crate) fn library_authority_health(&self) -> Option<pb::ComponentHealth> {
+        self.catalog
+            .library_runtime()
+            .map(|runtime| pb::ComponentHealth {
+                component: "library_authority".into(),
+                status: if runtime.motion_fenced() {
+                    pb::component_health::Status::ReadOnly as i32
+                } else {
+                    pb::component_health::Status::Healthy as i32
+                },
+                other_status: String::new(),
+            })
+    }
+
     pub(crate) fn live_status_response_inner(
         &self,
         allow_cached: bool,
@@ -798,6 +853,7 @@ impl ApiState {
             {
                 if snapshot_at - cached.0 < self.live_status.min_poll_interval {
                     let mut response = cached.1;
+                    response.library_authority_health = self.library_authority_health();
                     self.refresh_live_observations(&mut response);
                     response.active_tape_io_fences = self
                         .index()?
@@ -947,6 +1003,7 @@ impl ApiState {
             .list_active_tape_io_fences()
             .map_err(status_from_state_error)?;
         let response = pb::GetLiveStatusResponse {
+            library_authority_health: self.library_authority_health(),
             active_tape_io_fence_count: fences.len() as u64,
             active_tape_io_fences: fences
                 .into_iter()
@@ -1233,6 +1290,64 @@ impl ApiState {
         Ok(())
     }
 
+    /// Accept an actual owner request with its caller-computed fingerprint.
+    /// The returned writer identity is threaded into registry and actor dispatch.
+    pub(crate) fn accept_owner_request(
+        &self,
+        actor: AuditActor,
+        operation_kind: &str,
+        subject_kind: &str,
+        subject: String,
+        fingerprint: [u8; 32],
+    ) -> Result<Uuid, Status> {
+        if let Some(runtime) = self.catalog.library_runtime() {
+            use remanence_state::library_log as lib;
+            let actor_fingerprint = crate::catalog_conversion::audit_actor_fingerprint(&actor);
+            let (id, _) = runtime
+                .accept_operation(
+                    crate::operation_source::kind(operation_kind)?,
+                    lib::Accepted {
+                        actor_fingerprint: actor_fingerprint.as_str().into(),
+                        idempotency_key: None,
+                        request_fingerprint: fingerprint,
+                        subject: Some(subject.as_str().into()),
+                    },
+                    actor,
+                )
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            return Ok(Uuid::from_bytes(id));
+        }
+        #[cfg(test)]
+        {
+            let id = Uuid::new_v4();
+            let mut index = self.catalog.write_handle();
+            append_operation_audit(
+                &mut index,
+                self.audit_dir.as_ref(),
+                self.audit_fsync,
+                &self.audit_append_lock,
+                OperationAuditInput {
+                    actor,
+                    operation_id: id,
+                    operation_kind,
+                    event: AuditEvent::RequestReceived,
+                    subject_kind,
+                    subject_id: Some(subject),
+                    idempotency_key: None,
+                    detail: BTreeMap::new(),
+                },
+            )?;
+            Ok(id)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = subject_kind;
+            Err(Status::failed_precondition(
+                "operation owner requires shared LibraryAuthority",
+            ))
+        }
+    }
+
     pub(crate) fn record_request_received(
         &self,
         actor: AuditActor,
@@ -1265,6 +1380,7 @@ impl ApiState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn record_library_request_received(
         &self,
         actor: AuditActor,
@@ -1330,6 +1446,21 @@ impl ApiState {
         operation_kind: &str,
         error_summary: &str,
     ) -> Result<(), Status> {
+        if let Some(runtime) = self.catalog.library_runtime() {
+            use remanence_state::library_log as lib;
+            return runtime
+                .record_operation_event(
+                    *operation_id.as_bytes(),
+                    crate::operation_source::kind(operation_kind)?,
+                    lib::OperationEvent::Failed(lib::Failed {
+                        retry: None,
+                        refusal_code: None,
+                        summary: error_summary.into(),
+                    }),
+                    AuditActor::System,
+                )
+                .map_err(|e| Status::failed_precondition(e.to_string()));
+        }
         let mut index = self.catalog.write_handle();
         let mut detail = BTreeMap::new();
         detail.insert(

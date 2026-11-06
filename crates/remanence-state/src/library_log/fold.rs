@@ -16,6 +16,11 @@ pub enum TapeLookup {
         /// Digest over prefix, structural and payload bytes.
         digest: Hash,
     },
+    /// The immutable header of an existing log, with no invented record kind.
+    EmptyPrefix {
+        /// SHA-256 of the exact immutable header bytes.
+        digest: Hash,
+    },
     /// Absent or below the requested closed sequence.
     NotYet,
     /// Identity or content contradiction.
@@ -23,8 +28,9 @@ pub enum TapeLookup {
 }
 /// Read-only native proof lookup supplied by the authority owner.
 pub trait TapeView {
-    /// Look up immutable native evidence.
-    fn lookup(&self, at: &TapeAt) -> TapeLookup;
+    /// Look up immutable native evidence. Read failures must fail the operation,
+    /// not become an absent proof or a persistent tape contradiction.
+    fn lookup(&self, at: &TapeAt) -> Result<TapeLookup, FoldError>;
 }
 /// Read-only historical records. DecisionRef absence includes a UUID mismatch. Implementations
 /// may read storage but must never mutate authority or retain a decoded history.
@@ -109,6 +115,9 @@ pub enum FoldError {
     /// Historical storage could not be read; never treat I/O failure as absence.
     #[error("HistoryUnavailable")]
     HistoryUnavailable,
+    /// Native evidence could not be read; retry only after restoring access.
+    #[error("native tape evidence unavailable: {0}")]
+    TapeUnavailable(String),
     /// Refuse without dropping pending authority when either global cap is exceeded.
     #[error("PendingLimitExceeded {{ scope: {scope:?}, records: {records}, bytes: {bytes} }}")]
     PendingLimitExceeded {
@@ -128,6 +137,9 @@ pub enum FoldError {
     /// Refuses the `UnknownTape` history violation.
     #[error("UnknownTape")]
     UnknownTape,
+    /// A data-tape decision cannot name an inventory-only cleaning cartridge.
+    #[error("WrongMediumKind")]
+    WrongMediumKind,
     /// Refuses the `IncarnationMismatch` history violation.
     #[error("IncarnationMismatch")]
     IncarnationMismatch,
@@ -272,6 +284,18 @@ pub struct TapeState {
     /// Opaque map digest only; projectors read descriptors from the record.
     pub wrap_digest: Option<Hash>,
 }
+/// Inventory-only identity: no BOT, data geometry or incarnation history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleaningCartridgeState {
+    /// Barcode is the sole physical identity.
+    pub barcode: LabelText,
+    /// Last registered home slot.
+    pub home_slot: u16,
+    /// Expiry is permanent; the identity remains reserved.
+    pub expired: bool,
+    /// Failed corroboration permanently prevents selection, but permits run closure.
+    pub rejected: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     sequence: u64,
@@ -334,6 +358,8 @@ pub struct LibraryFold {
     pub(crate) non_applications: u64,
     /// Current tape identities.
     pub tapes: BTreeMap<Id, TapeState>,
+    /// Cleaning identities are separate from data tapes and retain no MediumSpec.
+    pub cleaning_cartridges: BTreeMap<Id, CleaningCartridgeState>,
     /// Pending records in source sequence order.
     pub pending: Vec<PendingRecord>,
     /// Per-tape summaries, including tapes with matching or pending references.
@@ -347,15 +373,17 @@ pub struct LibraryFold {
     pub pending_rejection: Option<(u64, Id)>,
     latest: Index<(Tag, Scope, Option<Id>), Held>,
     fences: Index<u64, Held>,
-    supersedes: Index<(TapeRef, Id), Held>,
-    supersede_sequences: Index<u64, (TapeRef, Id)>,
+    supersedes: Index<(TapeRef, Option<Id>), Held>,
+    supersede_sequences: Index<u64, (TapeRef, Option<Id>)>,
     unprotected: Index<(TapeRef, Id), Held>,
     intents: Index<u64, Held>,
     uncertain: BTreeSet<u64>,
     loads: Index<(Id, DriveKey), u32>,
-    inventories: Index<Text, u64>,
+    inventories: Index<InventorySubject, u64>,
     drives: Index<Id, (u64, bool)>,
     readiness: Index<DriveKey, u64>,
+    // Retained across Refresh so a second acknowledgement stays forbidden.
+    alarm_acknowledgers: BTreeMap<Text, AuditActor>,
     idempotency: Index<Hash, (Id, Hash)>,
     by_sequence: Index<u64, (Tag, Scope, Option<Id>)>,
     operation_slots: Index<Id, BTreeSet<(Tag, Scope, Option<Id>)>>,
@@ -366,6 +394,9 @@ pub struct LibraryFold {
     intent_scopes: Index<Scope, usize>,
     cleaning_drives: Index<Id, Text>,
     cleaning_tapes: Index<Id, Text>,
+    // Active runs retain their selected cartridge when later records omit it.
+    cleaning_run_cartridges: Index<Text, TapeRef>,
+    cleaning_run_homes: Index<Text, u16>,
     lookup_count: ProbeCounter,
 }
 impl Record {
@@ -380,7 +411,7 @@ impl Record {
 impl Body {
     pub(super) fn operation(&self) -> Option<Id> {
         match self {
-            Self::SupersedeTail(v) => Some(v.operation),
+            Self::SupersedeTail(v) => v.operation,
             Self::AcceptUnprotectedFinalization(v) => Some(v.operation),
             Self::VerificationProgress(v) => Some(v.operation),
             Self::VerificationVerdict(v) => Some(v.operation),
@@ -436,7 +467,14 @@ impl Body {
             Self::VerificationVerdict(v) => v.progress.into_iter().collect(),
             Self::ReadinessObserved(v) => v.previous.into_iter().chain(v.load_intent).collect(),
             Self::CleaningRecorded(v) => v.previous.into_iter().collect(),
-            Self::AlarmChanged(v) => v.cause.into_iter().collect(),
+            Self::AlarmChanged(v) => v
+                .cause
+                .into_iter()
+                .chain(match &v.action {
+                    AlarmAction::Refresh(a) => a.cause,
+                    _ => None,
+                })
+                .collect(),
             Self::OperationRecorded(v) => v.previous.into_iter().collect(),
             Self::SessionObserved(v) => v.previous.into_iter().collect(),
             Self::RecoveryRecorded(v) => v.prior.into_iter().collect(),
@@ -476,13 +514,18 @@ impl Body {
                 }
             }
             Self::InventoryReconciled(v) => {
-                s.insert(Scope::Library(v.library_serial.clone()));
+                s.insert(inventory_scope(&v.subject));
             }
             Self::ConfigurationAccepted(_) => {
                 s.insert(Scope::Config);
             }
             Self::ReadinessObserved(v) => {
                 s.insert(Scope::Endpoint(v.endpoint.clone()));
+                if v.scope == ReadinessScope::Library {
+                    if let DriveKey::Bay(bay) = &v.endpoint {
+                        s.insert(Scope::Library(bay.library_serial.clone()));
+                    }
+                }
             }
             Self::DriveObserved(v) => {
                 s.insert(Scope::Drive(v.drive_uuid));
@@ -539,7 +582,9 @@ impl Body {
             Self::CleaningRecorded(v) => {
                 if matches!(
                     v.action,
-                    CleaningAction::Register(_) | CleaningAction::Expire(_)
+                    CleaningAction::Register(_)
+                        | CleaningAction::Expire(_)
+                        | CleaningAction::Reject(_)
                 ) {
                     v.cartridge.map(|tape| Scope::Tape(tape.uuid))
                 } else {
@@ -586,6 +631,9 @@ fn terminal(e: &OperationEvent) -> bool {
 impl LibraryFold {
     fn tape(&self, t: TapeRef) -> Result<&TapeState, FoldError> {
         self.probe();
+        if self.cleaning_cartridges.contains_key(&t.uuid) {
+            return Err(FoldError::WrongMediumKind);
+        }
         let v = self.tapes.get(&t.uuid).ok_or(FoldError::UnknownTape)?;
         if v.tape != t {
             return Err(FoldError::IncarnationMismatch);
@@ -594,6 +642,20 @@ impl LibraryFold {
             return Err(FoldError::RetiredIdentity);
         }
         Ok(v)
+    }
+    /// Motion, cleaning and health may name inventory media without data geometry.
+    fn inventory_medium(&self, t: TapeRef) -> Result<(), FoldError> {
+        if let Some(c) = self.cleaning_cartridges.get(&t.uuid) {
+            if t.incarnation != 1 {
+                return Err(FoldError::IncarnationMismatch);
+            }
+            if c.expired {
+                return Err(FoldError::RetiredIdentity);
+            }
+            Ok(())
+        } else {
+            self.tape(t).map(|_| ())
+        }
     }
     /// Keyed reads/updates in retained-state indexes, plus public tape-state probes.
     /// Hash collision and allocator costs are excluded; indexes expose no iteration.
@@ -619,6 +681,7 @@ impl LibraryFold {
             + self.intent_scopes.probes()
             + self.cleaning_drives.probes()
             + self.cleaning_tapes.probes()
+            + self.cleaning_run_cartridges.probes()
     }
     /// Fixed key/value payload retained for lifetime idempotency.
     pub fn idempotency_bytes(&self) -> usize {
@@ -816,6 +879,26 @@ impl LibraryFold {
         Ok(())
     }
     fn check_dependent_identity(&self, b: &Body) -> Result<(), FoldError> {
+        // Medium kind is decided before queueing and before native proof lookup.
+        // A cleaning cartridge can never acquire data geometry through a queued record.
+        if !matches!(
+            b,
+            Body::CleaningRecorded(_) | Body::MotionIntent(_) | Body::DriveHealthObserved(_)
+        ) {
+            for t in b.tapes() {
+                if self.cleaning_cartridges.contains_key(&t.uuid) {
+                    return Err(FoldError::WrongMediumKind);
+                }
+            }
+        }
+        if let Body::Reprovision(v) = b {
+            if self.cleaning_cartridges.contains_key(&v.tape.uuid)
+                || v.predecessor
+                    .is_some_and(|p| self.cleaning_cartridges.contains_key(&p.uuid))
+            {
+                return Err(FoldError::WrongMediumKind);
+            }
+        }
         if b.at().is_some() {
             for tape in b.tapes() {
                 self.tape(tape)?;
@@ -833,10 +916,18 @@ impl LibraryFold {
     }
     fn check_tape(&self, b: &Body, view: &dyn TapeView) -> Result<(), FoldError> {
         if let Some(at) = b.at() {
-            match view.lookup(at) {
+            match view.lookup(at)? {
                 TapeLookup::NotYet => return Err(FoldError::Unresolved),
                 TapeLookup::Contradiction => return Err(FoldError::TapeContradiction),
+                TapeLookup::EmptyPrefix { digest } => {
+                    if at.sequence != 0 || digest != at.record_digest {
+                        return Err(FoldError::TapeContradiction);
+                    }
+                }
                 TapeLookup::Present { kind, digest } => {
+                    if at.sequence == 0 {
+                        return Err(FoldError::CounterpartKind);
+                    }
                     if digest != at.record_digest {
                         return Err(FoldError::TapeContradiction);
                     }
@@ -858,6 +949,12 @@ impl LibraryFold {
         history: &dyn LibraryHistory,
     ) -> Result<Validated, FoldError> {
         self.validate_shape(self.received_through + 1, r)?;
+        if let Body::FenceRaised(FenceRaised { at: Some(at), .. }) = &r.body {
+            // Evidential references may be missing or mismatched without
+            // blocking a safety fence. An unreadable view is different: catch
+            // that before publication, including the deferred-fence fast path.
+            view.lookup(at)?;
+        }
         let history = &HistoryPrefix {
             history,
             before: self.received_through + 1,
@@ -879,6 +976,30 @@ impl LibraryFold {
     }
     fn validate_shape(&self, sequence: u64, r: &Record) -> Result<(), FoldError> {
         let b = &r.body;
+        if let Body::InventoryReconciled(v) = b {
+            if matches!(v.subject, InventorySubject::Standalone(_))
+                && (!v.complete || !v.elements.0.is_empty())
+            {
+                return Err(FoldError::InvalidSchema);
+            }
+        }
+        if let Body::ReadinessObserved(v) = b {
+            if v.tape.is_some() && v.media.is_some() {
+                return Err(FoldError::InvalidSchema);
+            }
+            if v.scope == ReadinessScope::Library && !matches!(v.endpoint, DriveKey::Bay(_)) {
+                return Err(FoldError::InvalidSchema);
+            }
+        }
+        if let Body::CleaningRecorded(v) = b {
+            if let CleaningAction::Advance(a) = &v.action {
+                if (a.phase == CleanPhase::MovingIn) != a.home_slot.is_some()
+                    || (a.phase == CleanPhase::MovingIn && v.cartridge.is_none())
+                {
+                    return Err(FoldError::InvalidSchema);
+                }
+            }
+        }
         if matches!(b, Body::FenceRaised(v) if v.cause == FenceCause::ContainerQuarantine
             || matches!(v.scope, FenceScope::Model { .. }))
         {
@@ -910,7 +1031,9 @@ impl LibraryFold {
             Body::FenceRaised(v) => v.at.as_ref(),
             _ => None,
         });
-        if at.is_some_and(|at| at.sequence == 0 || at.tape.incarnation == 0) {
+        if at.is_some_and(|at| {
+            (at.sequence == 0 && !matches!(b, Body::SupersedeTail(_))) || at.tape.incarnation == 0
+        }) {
             return Err(FoldError::InvalidSchema);
         }
         if matches!(b, Body::RecoveryRecorded(v) if matches!(&v.action,
@@ -960,11 +1083,61 @@ impl LibraryFold {
             if t.incarnation == 0 {
                 return Err(FoldError::InvalidSchema);
             }
-            self.tape(t)?;
+            match b {
+                Body::CleaningRecorded(v) if matches!(v.action, CleaningAction::Register(_)) => {}
+                Body::CleaningRecorded(_)
+                | Body::MotionIntent(_)
+                | Body::DriveHealthObserved(_) => self.inventory_medium(t)?,
+                _ => {
+                    self.tape(t)?;
+                }
+            }
         }
-        if let Some(at) = b.at() {
-            if at.sequence == 0 {
-                return Err(FoldError::InvalidSchema);
+        // Rejection is cartridge authority, not a run transition. Failed closure and
+        // return motion remain possible after Reject; selection and credit do not.
+        if let Body::CleaningRecorded(v) = b {
+            if let Some(t) = v.cartridge {
+                if matches!(v.action, CleaningAction::Reject(_))
+                    && !self.cleaning_cartridges.contains_key(&t.uuid)
+                {
+                    return Err(FoldError::WrongMediumKind);
+                }
+                if self
+                    .cleaning_cartridges
+                    .get(&t.uuid)
+                    .is_some_and(|c| c.rejected)
+                    && matches!(
+                        v.action,
+                        CleaningAction::Reject(_)
+                            | CleaningAction::Begin(_)
+                            | CleaningAction::Advance(_)
+                            | CleaningAction::Finish(Finish {
+                                verified_credit: true,
+                                ..
+                            })
+                    )
+                {
+                    return Err(FoldError::RetiredIdentity);
+                }
+            }
+        }
+        // Registration is identity creation, including on an identical retry.
+        // Ruling 17 permits Retire then Register when a data UUID collides with
+        // the barcode UUID. The retired data identity remains historical.
+        if let Body::CleaningRecorded(v) = b {
+            if let CleaningAction::Register(a) = &v.action {
+                let t = v.cartridge.ok_or(FoldError::Chain)?;
+                if self.tapes.get(&t.uuid).is_some_and(|data| !data.retired)
+                    || self.cleaning_cartridges.contains_key(&t.uuid)
+                {
+                    return Err(FoldError::ConflictingDuplicate);
+                }
+                if a.barcode.is_empty()
+                    || a.barcode.as_str().trim() != a.barcode.as_str()
+                    || t != cleaning_cartridge_ref(&a.barcode)
+                {
+                    return Err(FoldError::InvalidSchema);
+                }
             }
         }
         self.check_tape(b, view)?;
@@ -1009,6 +1182,12 @@ impl LibraryFold {
         use Body::*;
         match b {
             Reprovision(v) => {
+                if self.cleaning_cartridges.contains_key(&v.tape.uuid)
+                    || v.predecessor
+                        .is_some_and(|p| self.cleaning_cartridges.contains_key(&p.uuid))
+                {
+                    return Err(FoldError::WrongMediumKind);
+                }
                 if self.tapes.contains_key(&v.tape.uuid) || v.tape.incarnation != 1 {
                     return Err(FoldError::ConflictingDuplicate);
                 }
@@ -1237,11 +1416,13 @@ impl LibraryFold {
                 if v.result == MotionResult::Done
                     && !matches!(
                         (&i.motion, &v.confirmation),
-                        (Motion::Load(_), Some(Confirmation::Readiness(_)))
-                            | (
-                                Motion::Move(_) | Motion::Unload(_),
-                                Some(Confirmation::Inventory(_))
-                            )
+                        (
+                            Motion::Load(_),
+                            Some(Confirmation::Readiness(_) | Confirmation::Inventory(_))
+                        ) | (
+                            Motion::Move(_) | Motion::Unload(_),
+                            Some(Confirmation::Inventory(_))
+                        )
                     )
                 {
                     return Err(FoldError::Confirmation);
@@ -1249,11 +1430,7 @@ impl LibraryFold {
             }
             InventoryReconciled(v) => {
                 if v.observation_generation
-                    <= self
-                        .inventories
-                        .get(&v.library_serial)
-                        .copied()
-                        .unwrap_or(0)
+                    <= self.inventories.get(&v.subject).copied().unwrap_or(0)
                 {
                     return Err(FoldError::InventoryGeneration);
                 }
@@ -1271,8 +1448,7 @@ impl LibraryFold {
                     let Body::MotionIntent(i) = &h.record.body else {
                         unreachable!()
                     };
-                    if !motion_scopes(&i.motion).contains(&Scope::Library(v.library_serial.clone()))
-                    {
+                    if !motion_scopes(&i.motion).contains(&inventory_scope(&v.subject)) {
                         return Err(FoldError::InventoryScope);
                     }
                     if !v.complete {
@@ -1408,7 +1584,9 @@ impl LibraryFold {
             CleaningRecorded(v) => {
                 if matches!(
                     v.action,
-                    CleaningAction::Register(_) | CleaningAction::Expire(_)
+                    CleaningAction::Register(_)
+                        | CleaningAction::Expire(_)
+                        | CleaningAction::Reject(_)
                 ) {
                     if v.cartridge.is_none() || v.previous.is_some() {
                         return Err(FoldError::Chain);
@@ -1419,6 +1597,24 @@ impl LibraryFold {
                         Scope::CleaningRun(v.run_id.clone()),
                         v.previous,
                     )?;
+                    // An omitted cartridge inherits the existing run binding in SQL.
+                    // Do not let that spelling bypass permanent rejection or expiry.
+                    let bound_cartridge = v
+                        .cartridge
+                        .or_else(|| self.cleaning_run_cartridges.get(&v.run_id).copied());
+                    if bound_cartridge
+                        .and_then(|t| self.cleaning_cartridges.get(&t.uuid))
+                        .is_some_and(|c| c.rejected || c.expired)
+                        && !matches!(
+                            v.action,
+                            CleaningAction::Finish(Finish {
+                                verified_credit: false,
+                                ..
+                            })
+                        )
+                    {
+                        return Err(FoldError::RetiredIdentity);
+                    }
                     let begins = matches!(v.action, CleaningAction::Begin(_));
                     if begins {
                         if last.is_some() { return Err(FoldError::Chain); }
@@ -1457,18 +1653,22 @@ impl LibraryFold {
                 match &v.action {
                     AlarmAction::Raise(_) if raised => return Err(FoldError::AlarmState),
                     AlarmAction::Acknowledge(_)
-                        if !raised
-                            || old.is_some_and(|a| {
-                                matches!(a.action, AlarmAction::Acknowledge(_))
-                            }) =>
+                        if !raised || self.alarm_acknowledgers.contains_key(&v.condition_key) =>
                     {
                         return Err(FoldError::AlarmState)
                     }
                     AlarmAction::Acknowledge(_) if r.envelope.actor == AuditActor::System => {
                         return Err(FoldError::SystemAcknowledgement)
                     }
+                    AlarmAction::Refresh(_) if !raised => return Err(FoldError::AlarmState),
                     AlarmAction::Clear(_) if !raised => return Err(FoldError::AlarmState),
                     _ => {}
+                }
+                if let AlarmAction::Refresh(a) = &v.action {
+                    if let Some(d) = a.cause {
+                        self.historical(d, history)?
+                            .ok_or(FoldError::WrongCounterpart)?;
+                    }
                 }
                 if let Some(d) = v.cause {
                     self.historical(d, history)?
@@ -1692,7 +1892,7 @@ impl LibraryFold {
             }
             FenceRaised(v) => {
                 if let Some(at) = &v.at {
-                    if !matches!(view.lookup(at),TapeLookup::Present{digest,..} if digest==at.record_digest)
+                    if !matches!(view.lookup(at)?,TapeLookup::Present{digest,..} if digest==at.record_digest)
                     {
                         self.unresolved_fence_evidence.insert(sequence);
                     }
@@ -1757,7 +1957,7 @@ impl LibraryFold {
             }
             InventoryReconciled(v) => {
                 self.inventories
-                    .insert(v.library_serial.clone(), v.observation_generation);
+                    .insert(v.subject.clone(), v.observation_generation);
                 for d in &v.resolves.0 {
                     self.remove_intent(d.sequence);
                     self.uncertain.remove(&d.sequence);
@@ -1802,10 +2002,50 @@ impl LibraryFold {
                     _ => None,
                 };
             }
+            AlarmChanged(v) => match &v.action {
+                AlarmAction::Acknowledge(_) => {
+                    self.alarm_acknowledgers
+                        .insert(v.condition_key.clone(), record.envelope.actor.clone());
+                }
+                AlarmAction::Raise(_) | AlarmAction::Clear(_) => {
+                    self.alarm_acknowledgers.remove(&v.condition_key);
+                }
+                AlarmAction::Refresh(_) => {}
+            },
+            CleaningRecorded(v) if matches!(v.action, CleaningAction::Register(_)) => {
+                let CleaningAction::Register(a) = &v.action else {
+                    unreachable!()
+                };
+                self.cleaning_cartridges.insert(
+                    v.cartridge.unwrap().uuid,
+                    CleaningCartridgeState {
+                        barcode: a.barcode.clone(),
+                        home_slot: a.home_slot,
+                        expired: false,
+                        rejected: false,
+                    },
+                );
+            }
+            CleaningRecorded(v) if matches!(v.action, CleaningAction::Reject(_)) => {
+                self.cleaning_cartridges
+                    .get_mut(&v.cartridge.unwrap().uuid)
+                    .unwrap()
+                    .rejected = true;
+            }
+            CleaningRecorded(v) if matches!(v.action, CleaningAction::Expire(_)) => {
+                if let Some(c) = v
+                    .cartridge
+                    .and_then(|t| self.cleaning_cartridges.get_mut(&t.uuid))
+                {
+                    c.expired = true;
+                }
+            }
             CleaningRecorded(v)
                 if !matches!(
                     v.action,
-                    CleaningAction::Register(_) | CleaningAction::Expire(_)
+                    CleaningAction::Register(_)
+                        | CleaningAction::Expire(_)
+                        | CleaningAction::Reject(_)
                 ) =>
             {
                 let key = (
@@ -1818,10 +2058,18 @@ impl LibraryFold {
                         if let Some(id) = old.drive_uuid {
                             self.cleaning_drives.remove(&id);
                         }
-                        if let Some(t) = old.cartridge {
-                            self.cleaning_tapes.remove(&t.uuid);
-                        }
                     }
+                }
+                if let CleaningAction::Advance(Advance {
+                    home_slot: Some(home),
+                    ..
+                }) = &v.action
+                {
+                    self.cleaning_run_homes.insert(v.run_id.clone(), *home);
+                }
+                let old_cartridge = self.cleaning_run_cartridges.remove(&v.run_id);
+                if let Some(t) = old_cartridge {
+                    self.cleaning_tapes.remove(&t.uuid);
                 }
                 if !matches!(
                     v.action,
@@ -1832,9 +2080,17 @@ impl LibraryFold {
                     if let Some(id) = v.drive_uuid {
                         self.cleaning_drives.insert(id, v.run_id.clone());
                     }
-                    if let Some(t) = v.cartridge {
+                    if let Some(t) = v.cartridge.or(old_cartridge) {
+                        if let Some(home) = self.cleaning_run_homes.get(&v.run_id) {
+                            if let Some(c) = self.cleaning_cartridges.get_mut(&t.uuid) {
+                                c.home_slot = *home;
+                            }
+                        }
                         self.cleaning_tapes.insert(t.uuid, v.run_id.clone());
+                        self.cleaning_run_cartridges.insert(v.run_id.clone(), t);
                     }
+                } else {
+                    self.cleaning_run_homes.remove(&v.run_id);
                 }
             }
             _ => {}
@@ -2192,6 +2448,100 @@ impl LibraryFold {
         }
         Ok(())
     }
+    /// Last accepted configuration, used for exact reset retry without another
+    /// source append. It is read from the fold, never from SQL.
+    pub fn configuration(&self) -> Option<&ConfigurationAccepted> {
+        let held = self.last(Tag::ConfigurationAccepted, Scope::Config)?;
+        match &held.record.body {
+            Body::ConfigurationAccepted(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Open operation identity retained by authenticated operation history.
+    /// Closed operations are not eligible to begin new readiness work.
+    pub(crate) fn open_operation_kind(&self, operation: Id) -> Option<OperationKind> {
+        let held = self.last(Tag::OperationRecorded, Scope::Operation(operation))?;
+        match &held.record.body {
+            Body::OperationRecorded(value) if !terminal(&value.event) => Some(value.kind),
+            _ => None,
+        }
+    }
+    /// Current pending readiness chain; terminal chains are archived in source.
+    pub fn readiness_head(&self, operation: Id) -> Option<(DecisionRef, &ReadinessObserved)> {
+        let held = self.last(Tag::ReadinessObserved, Scope::Operation(operation))?;
+        match &held.record.body {
+            Body::ReadinessObserved(value) => Some((
+                DecisionRef {
+                    sequence: held.sequence,
+                    record_uuid: held.record.envelope.record_uuid,
+                },
+                value,
+            )),
+            _ => None,
+        }
+    }
+    /// Next physical endpoint readiness generation.
+    pub fn next_readiness_generation(&self, endpoint: &DriveKey) -> Result<u64, FoldError> {
+        self.readiness
+            .get(endpoint)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(FoldError::GenerationMismatch)
+    }
+    /// Open or Unknown command on an affected physical scope blocks dispatch.
+    pub fn motion_requires_reconciliation(&self, motion: &Motion) -> bool {
+        motion_scopes(motion)
+            .iter()
+            .any(|scope| self.inventory_unknown(scope))
+    }
+    /// Strictly next observation generation for the actual physical subject.
+    pub fn next_inventory_generation(&self, subject: &InventorySubject) -> Result<u64, FoldError> {
+        self.inventories
+            .get(subject)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(FoldError::InventoryGeneration)
+    }
+    /// Count actual admitted LOAD intents for this operation, never SQL
+    /// write-ahead rows. Terminal readiness closes this counter in the fold.
+    pub fn readiness_load_attempts(&self, operation: Id) -> Result<u32, FoldError> {
+        self.load_endpoints
+            .get(&operation)
+            .into_iter()
+            .flatten()
+            .try_fold(0u32, |sum, key| {
+                sum.checked_add(
+                    self.loads
+                        .get(&(operation, key.clone()))
+                        .copied()
+                        .unwrap_or(0),
+                )
+                .ok_or(FoldError::Sequence)
+            })
+    }
+    /// Next per-operation LOAD number; independent composers without a parent
+    /// each start a new single-command attempt sequence.
+    pub fn next_load_attempt(
+        &self,
+        operation: Option<Id>,
+        endpoint: &DriveKey,
+    ) -> Result<u32, FoldError> {
+        operation
+            .and_then(|operation| self.loads.get(&(operation, endpoint.clone())).copied())
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(FoldError::LoadAttempt)
+    }
+    /// Resolve an active raise. SQL may locate it but never supplies scope or cause.
+    pub fn active_fence(&self, sequence: u64) -> Option<&FenceRaised> {
+        match &self.fences.get(&sequence)?.record.body {
+            Body::FenceRaised(raise) => Some(raise),
+            _ => None,
+        }
+    }
+
     /// Open fences, individually identified by their raise sequence.
     pub fn open_fences(&self) -> usize {
         self.fences.len()
@@ -2225,7 +2575,7 @@ fn duplicate_key(a: &Body, b: &Body) -> bool {
         (Body::CleaningRecorded(a), Body::CleaningRecorded(b)) => {
             !matches!(
                 b.action,
-                CleaningAction::Register(_) | CleaningAction::Expire(_)
+                CleaningAction::Register(_) | CleaningAction::Expire(_) | CleaningAction::Reject(_)
             ) && a.previous == b.previous
                 && std::mem::discriminant(&a.action) == std::mem::discriminant(&b.action)
         }
@@ -2246,6 +2596,16 @@ fn duplicate_key(a: &Body, b: &Body) -> bool {
     }
 }
 
+/// Reconciliation orders and resolves within the observed physical subject only.
+fn inventory_scope(subject: &InventorySubject) -> Scope {
+    match subject {
+        InventorySubject::Library(serial) => Scope::Library(serial.clone()),
+        InventorySubject::Standalone(endpoint) => {
+            Scope::Endpoint(DriveKey::Standalone(endpoint.clone()))
+        }
+    }
+}
+
 /// Length-prefix the text component to make the lifetime idempotency scope unambiguous.
 fn idempotency_digest(actor: &Text, kind: OperationKind, key: Id) -> Hash {
     let mut hash = Sha256::new();
@@ -2260,6 +2620,7 @@ fn idempotency_digest(actor: &Text, kind: OperationKind, key: Id) -> Hash {
 impl LibraryFold {
     /// Compare authority and lookup indexes, excluding replay diagnostics and probe instrumentation.
     pub(super) fn assert_same_state(&self, other: &Self) {
+        assert_eq!(self.cleaning_cartridges, other.cleaning_cartridges);
         macro_rules! same { ($($field:ident),+ $(,)?) => { $(assert_eq!(self.$field, other.$field, stringify!($field));)+ }; }
         same!(
             received_through,
@@ -2287,6 +2648,9 @@ impl LibraryFold {
             intent_scopes,
             cleaning_drives,
             cleaning_tapes,
+            cleaning_run_cartridges,
+            cleaning_run_homes,
+            alarm_acknowledgers,
             supersedes,
             supersede_sequences,
             unprotected
@@ -2402,6 +2766,8 @@ mod retention_tests {
         feed(
             &mut fold,
             Body::ReadinessObserved(ReadinessObserved {
+                scope: ReadinessScope::Endpoint,
+                media: None,
                 operation: [8; 16],
                 endpoint,
                 tape: None,

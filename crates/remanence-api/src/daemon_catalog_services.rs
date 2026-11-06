@@ -41,7 +41,13 @@ impl pb::daemon_server::Daemon for DaemonService {
             .index()?
             .quick_check()
             .map_err(|err| Status::internal(err.to_string()))?;
-        let status = if quick_check == "ok" {
+        let authority_health = self.state.library_authority_health();
+        let motion_fenced = authority_health
+            .as_ref()
+            .is_some_and(|health| health.status == pb::component_health::Status::ReadOnly as i32);
+        let status = if motion_fenced {
+            pb::health_response::Status::ReadOnly
+        } else if quick_check == "ok" {
             pb::health_response::Status::Healthy
         } else {
             pb::health_response::Status::Degraded
@@ -53,7 +59,7 @@ impl pb::daemon_server::Daemon for DaemonService {
         } else {
             pb::component_health::Status::Other
         };
-        let component_health = vec![pb::ComponentHealth {
+        let mut component_health = vec![pb::ComponentHealth {
             component: "sqlite_index".to_string(),
             status: component_status as i32,
             other_status: if component_status == pb::component_health::Status::Other {
@@ -62,6 +68,18 @@ impl pb::daemon_server::Daemon for DaemonService {
                 String::new()
             },
         }];
+        if let Some(health) = authority_health {
+            components.insert(
+                "library_authority".into(),
+                if motion_fenced {
+                    "motion_fenced"
+                } else {
+                    "healthy"
+                }
+                .into(),
+            );
+            component_health.push(health);
+        }
         let fences = self
             .state
             .index()?
@@ -72,7 +90,11 @@ impl pb::daemon_server::Daemon for DaemonService {
             active_tape_io_fences: fences.into_iter().map(tape_io_fence_to_proto).collect(),
             status: status as i32,
             components,
-            detail: format!("sqlite quick_check={quick_check}"),
+            detail: if motion_fenced {
+                format!("motion fenced after authority/projection/evidence failure; sqlite quick_check={quick_check}")
+            } else {
+                format!("sqlite quick_check={quick_check}")
+            },
             component_health,
             supported_endpoint_kinds: vec!["library".into(), "standalone".into()],
             daemon_capabilities: self.state.daemon_capabilities(),
@@ -484,18 +506,23 @@ impl pb::catalog_server::Catalog for CatalogService {
             crate::mount::resolve_tape_library_serial(&self.state, &pool, &tape_uuid)?;
         let changer = pool.changer_tx(&library_serial)?;
         pool.reserve_library_exclusive(&library_serial)?;
-        let operation_id = Uuid::new_v4();
-        pool.set_library_holder(&library_serial, "reconcile_tape", operation_id);
-        if let Err(err) = self.state.record_request_received(
+        use prost::Message;
+        use sha2::Digest;
+        let fingerprint = sha2::Sha256::digest(request.encode_to_vec()).into();
+        let operation_id = match self.state.accept_owner_request(
             actor,
-            operation_id,
             "reconcile_tape",
-            &tape_uuid,
-            None,
+            "tape",
+            Uuid::from_bytes(tape_uuid).to_string(),
+            fingerprint,
         ) {
-            pool.release_library(&library_serial);
-            return Err(err);
-        }
+            Ok(id) => id,
+            Err(error) => {
+                pool.release_library(&library_serial);
+                return Err(error);
+            }
+        };
+        pool.set_library_holder(&library_serial, "reconcile_tape", operation_id);
         let handle = self
             .state
             .operations

@@ -1570,12 +1570,15 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
                 "{mutation}: {error}"
             );
             let cfg = crate::write_owner::TerminalWriteConfig {
+                authority: crate::write_owner::TerminalAuthority::fixture(
+                    None,
+                    root.path().join("audit"),
+                    true,
+                    &(Arc::new(Mutex::new(()))),
+                ),
                 io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
                 mounted_endpoint: None,
                 checkpoint_journal_dir: root.path().join("tapes"),
-                audit_dir: root.path().join("audit"),
-                audit_fsync: true,
-                audit_append_lock: Arc::new(Mutex::new(())),
             };
             let status = {
                 let outcome = crate::append_admission::admission_error_outcome(&error);
@@ -1654,12 +1657,15 @@ fn b3b_admission_carrier_and_renderer_census() {
         .map(|catalog| catalog.write_handle())
         .unwrap();
     let cfg = crate::write_owner::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::fixture(
+            None,
+            root.path().join("audit"),
+            true,
+            &(Arc::new(Mutex::new(()))),
+        ),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
         mounted_endpoint: None,
         checkpoint_journal_dir: root.path().join("tapes"),
-        audit_dir: root.path().join("audit"),
-        audit_fsync: true,
-        audit_append_lock: Arc::new(Mutex::new(())),
     };
     let before = (census::total(), census::normalizations());
     assert_eq!(admission_error_outcome(&error), outcome);
@@ -1863,12 +1869,15 @@ fn b3b_fix1_admission_suffix_position_drift_is_transient() {
         })
         .unwrap();
     let cfg = crate::write_owner::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::fixture(
+            None,
+            root.path().join("audit"),
+            true,
+            &(Arc::new(Mutex::new(()))),
+        ),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
         mounted_endpoint: None,
         checkpoint_journal_dir: root.path().join("tapes"),
-        audit_dir: root.path().join("audit"),
-        audit_fsync: true,
-        audit_append_lock: Arc::new(Mutex::new(())),
     };
     let status = daemon_admission_error(
         remanence_state::AuditActor::System,
@@ -1885,7 +1894,12 @@ fn b3b_fix1_admission_suffix_position_drift_is_transient() {
     );
     assert!(index.list_active_tape_io_fences().unwrap().is_empty());
     assert_eq!(index.get_tape(&UUID).unwrap().unwrap().state, "ready");
-    assert!(!cfg.audit_dir.exists());
+    assert!(!cfg
+        .authority
+        .historical_fixture()
+        .expect("historical audit fixture")
+        .audit_dir
+        .exists());
     assert_eq!(f.drive.media_write_dispatch_count(), 0);
 }
 
@@ -2063,12 +2077,15 @@ pub(crate) fn golden_production_admission_rows() {
             })
             .unwrap();
         let cfg = crate::write_owner::TerminalWriteConfig {
+            authority: crate::write_owner::TerminalAuthority::fixture(
+                None,
+                root.path().join("audit"),
+                true,
+                &(Arc::new(Mutex::new(()))),
+            ),
             io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
             mounted_endpoint: None,
             checkpoint_journal_dir: root.path().join("tapes"),
-            audit_dir: root.path().join("audit"),
-            audit_fsync: true,
-            audit_append_lock: Arc::new(Mutex::new(())),
         };
         let outcome = admission_error_outcome(&error);
         daemon_admission_error(

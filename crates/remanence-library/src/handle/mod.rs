@@ -235,6 +235,8 @@ fn effective_batch_blocks_from_reserved(
 /// dirty-state cell cloned into drive handles opened by the
 /// [`LibraryHandle`] facade.
 pub struct ChangerHandle {
+    motion_context: crate::motion::MotionContext,
+    pending_motion: Vec<crate::motion::PendingMotion>,
     /// Snapshot of the library at the time of `open()`. Re-validated
     /// before this value is constructed; safe to read for operator
     /// display, allowlist comparisons, etc.
@@ -328,6 +330,7 @@ impl DirtyState {
 #[derive(Default)]
 pub(crate) struct DriveShared {
     pub(crate) audit_hook: Option<AuditHook>,
+    motion_authority: Option<Arc<dyn crate::motion::MotionAuthority>>,
     pub(crate) dirty: DirtyState,
     inventory: Option<Library>,
     changer_transport: Option<Arc<Mutex<Box<dyn SgTransport>>>>,
@@ -393,6 +396,27 @@ impl std::fmt::Debug for ChangerHandle {
 }
 
 impl ChangerHandle {
+    /// Install the shared runtime before admitting production motion.
+    pub fn set_motion_authority(&mut self, authority: Arc<dyn crate::motion::MotionAuthority>) {
+        lock_drive_shared(&self.shared).motion_authority = Some(authority);
+    }
+    /// Scope immutable context to this handle and restore it after the call.
+    /// Other handles sharing the changer cannot change this dispatch's parent.
+    pub fn with_motion_context<T>(
+        &mut self,
+        context: crate::motion::MotionContext,
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.motion_context, context);
+        let result = run(self);
+        self.motion_context = previous;
+        result
+    }
+    /// Transfer this handle's successful commands to their confirmation owner.
+    pub fn take_pending_motion(&mut self) -> Vec<crate::motion::PendingMotion> {
+        std::mem::take(&mut self.pending_motion)
+    }
+
     /// Adopt element observations made by a drive handle sharing this changer.
     fn adopt_observed_inventory(&mut self) {
         if let Some(library) = &lock_drive_shared(&self.shared).inventory {
@@ -1006,6 +1030,14 @@ impl ChangerHandle {
         // down by the SG_IO timeout (which would then look like an
         // unknown-completion transport failure to us).
 
+        let command = crate::motion::MotionCommand::Move {
+            library_serial: self.library.serial.clone(),
+            source: src,
+            destination: dst,
+        };
+        let authority = lock_drive_shared(&self.shared).motion_authority.clone();
+        let context = self.motion_context.clone();
+        let mut ticket = None;
         let started = Instant::now();
         let result = {
             let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
@@ -1021,6 +1053,14 @@ impl ChangerHandle {
                 );
                 return Err(error);
             }
+            if let Some(authority) = &authority {
+                authority.ensure_motion_allowed().map_err(|error| {
+                    MoveError::new(crate::MoveErrorKind::MotionAuthority(error))
+                })?;
+                ticket = Some(authority.intent(&command, &context).map_err(|error| {
+                    MoveError::new(crate::MoveErrorKind::MotionAuthority(error))
+                })?);
+            }
             transport.execute_none(&cdb)
         };
         let classified = crate::outcome::finish_control(
@@ -1035,6 +1075,22 @@ impl ChangerHandle {
             cdb[0],
             result.as_ref().err(),
         );
+        if let (Some(authority), Some(ticket)) = (&authority, ticket) {
+            if result.is_err() {
+                authority
+                    .failed(ticket, &classified.evidence)
+                    .map_err(|error| {
+                        MoveError::new(crate::MoveErrorKind::MotionAuthority(error))
+                    })?;
+            } else {
+                self.pending_motion.push(crate::motion::PendingMotion {
+                    command,
+                    context,
+                    ticket,
+                    evidence: classified.evidence.clone(),
+                });
+            }
+        }
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
@@ -1055,6 +1111,44 @@ impl ChangerHandle {
                     .any(|p| p.element_address == src || p.element_address == dst);
                 if touches_ie {
                     self.mark_dirty(DirtyCause::VendorSemantics);
+                }
+                if let (Some(authority), Some(ticket)) = (&authority, ticket) {
+                    // A patched cache is not confirmation. Read physical elements
+                    // after the command, then persist observation before Done.
+                    if let Err(observation_error) = self.refresh() {
+                        let pending = self
+                            .pending_motion
+                            .iter()
+                            .find(|pending| pending.ticket == ticket)
+                            .expect("unconfirmed command retains its source");
+                        let failure = match authority.unconfirmed(pending) {
+                            Ok(()) => {
+                                self.pending_motion
+                                    .retain(|pending| pending.ticket != ticket);
+                                crate::motion::MotionAuthorityError {
+                                    message: format!("MOVE completed but physical confirmation failed: {observation_error}"),
+                                    kind: crate::motion::MotionAuthorityFailure::EvidenceFailure,
+                                }
+                            }
+                            Err(error) => error,
+                        };
+                        let mut error =
+                            MoveError::pending(crate::MoveErrorKind::MotionAuthority(failure));
+                        error.set_outcome(classified.clone());
+                        return Err(error);
+                    }
+                    let pending = self
+                        .pending_motion
+                        .iter()
+                        .find(|pending| pending.ticket == ticket)
+                        .expect("successful motion retains its confirmation owner");
+                    authority
+                        .confirm_inventory(pending, &self.library)
+                        .map_err(|error| {
+                            MoveError::new(crate::MoveErrorKind::MotionAuthority(error))
+                        })?;
+                    self.pending_motion
+                        .retain(|pending| pending.ticket != ticket);
                 }
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
@@ -1111,6 +1205,58 @@ impl std::fmt::Debug for LibraryHandle {
 }
 
 impl LibraryHandle {
+    /// Observe the complete changer after restart before permitting new motion.
+    /// Resolving this scope never dispatches MOVE/LOAD/UNLOAD or an old outcome.
+    pub fn reconcile_startup_motion(&mut self) -> Result<(), String> {
+        let authority = lock_drive_shared(&self.changer.shared)
+            .motion_authority
+            .clone();
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        let command = crate::motion::MotionCommand::Move {
+            library_serial: self.library().serial.clone(),
+            source: 0,
+            destination: 0,
+        };
+        if !authority.requires_reconciliation(&command) {
+            return Ok(());
+        }
+        self.refresh().map_err(|e| e.to_string())?;
+        authority
+            .reconcile_inventory(self.library())
+            .map_err(|e| e.to_string())
+    }
+    /// Install shared typed authority on the changer and all opened drive peers.
+    pub fn set_motion_authority(&mut self, authority: Arc<dyn crate::motion::MotionAuthority>) {
+        self.changer.set_motion_authority(authority);
+    }
+    /// Identify the runtime already installed by this process owner.
+    pub fn motion_authority_identity(&self) -> Option<crate::motion::MotionAuthorityIdentity> {
+        lock_drive_shared(&self.changer.shared)
+            .motion_authority
+            .as_ref()
+            .and_then(|a| a.identity())
+    }
+    /// Whether the process owner has installed typed motion authority.
+    pub fn has_motion_authority(&self) -> bool {
+        lock_drive_shared(&self.changer.shared)
+            .motion_authority
+            .is_some()
+    }
+
+    /// Scope one composer's immutable motion context, including newly opened drives.
+    pub fn with_motion_context<T>(
+        &mut self,
+        context: crate::motion::MotionContext,
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.changer.motion_context, context);
+        let result = run(self);
+        self.changer.motion_context = previous;
+        result
+    }
+
     /// Borrow the pure-changer core behind this facade.
     pub fn changer(&self) -> &ChangerHandle {
         &self.changer
@@ -1345,6 +1491,8 @@ impl LibraryHandle {
             transport
         };
         Ok(DriveHandle {
+            motion_context: self.changer.motion_context.clone(),
+            pending_motion: Vec::new(),
             endpoint: MountEndpoint::Durable(DriveKey::Bay {
                 library_serial,
                 bay: bay_address,
@@ -1454,11 +1602,37 @@ impl LibraryHandle {
         //  - Everything else (open_drive failed, drive returned
         //    CHECK CONDITION, etc.): the MOVE succeeded but the
         //    LOAD didn't — classic post-MOVE partial failure.
+        let mut compensated = false;
         let result = match self.open_drive(bay, policy) {
-            Ok(mut drive) => drive.load_as(op).map_err(LoadError::DriveLoad),
+            Ok(mut drive) => {
+                let result = drive.load_as(op);
+                let semantic_refusal=result.as_ref().err().is_some_and(|error|matches!(&error.kind,
+                    crate::DriveOpErrorKind::MotionAuthority(error) if error.kind==crate::motion::MotionAuthorityFailure::SemanticRefusal));
+                if semantic_refusal {
+                    let authority = lock_drive_shared(&self.changer.shared)
+                        .motion_authority
+                        .clone();
+                    if authority
+                        .as_ref()
+                        .is_some_and(|a| a.ensure_motion_allowed().is_ok())
+                        && drive.unload().is_ok()
+                    {
+                        // Return the already admitted MOVE's cartridge. Every
+                        // command still passes its own typed intent gate.
+                        compensated = self
+                            .changer
+                            .move_medium_as_with_admission(bay, slot, policy, op, &mut || Ok(()))
+                            .is_ok();
+                    }
+                }
+                result.map_err(LoadError::DriveLoad)
+            }
             Err(e) => Err(LoadError::OpenDrive(e)),
         };
         if let Err(ref err) = result {
+            if compensated {
+                return result;
+            }
             let cause = match err {
                 LoadError::DriveLoad(error) if drive_completion_unknown(error) => {
                     DirtyCause::CompletionUnknown
@@ -1929,6 +2103,8 @@ impl<'a> Drop for RemovalLockGuard<'a> {
 /// `LibraryHandle::load` operations (which will tag their CDBs with
 /// the composed op's variant once §7.7 lands).
 pub struct DriveHandle {
+    motion_context: crate::motion::MotionContext,
+    pending_motion: Vec<crate::motion::PendingMotion>,
     /// Persistent endpoint or explicitly permitted ephemeral read-only path.
     endpoint: MountEndpoint,
     /// Snapshot of device metadata at open.
@@ -2032,6 +2208,71 @@ impl std::fmt::Debug for DriveHandle {
 }
 
 impl DriveHandle {
+    /// Resolve this standalone endpoint's interrupted motion from two real
+    /// observations. A failed or inconsistent probe leaves its intent unresolved.
+    pub fn reconcile_startup_motion(&mut self) -> Result<(), String> {
+        let Some(key) = self.endpoint.durable_key().cloned() else {
+            return Ok(());
+        };
+        if !matches!(key, DriveKey::Standalone { .. }) {
+            return Ok(());
+        }
+        let authority = lock_drive_shared(&self.shared).motion_authority.clone();
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        if !authority.requires_reconciliation(&crate::motion::MotionCommand::Load(key.clone())) {
+            return Ok(());
+        }
+        let ready = self.test_unit_ready();
+        let position = self.position_report();
+        match (&ready, &position) {
+            (Ok(()), Ok(position)) if !position.logical_object_number_unknown => (),
+            (Err(ready), Err(position))
+                if matches!(ready.kind, crate::TapeIoErrorKind::NoMedium)
+                    && matches!(position.kind, crate::TapeIoErrorKind::NoMedium) => {}
+            _ => {
+                return Err(format!(
+                "startup TUR/READ POSITION did not establish inventory: {ready:?}; {position:?}"
+            ))
+            }
+        }
+        authority
+            .reconcile_standalone(&key)
+            .map_err(|e| e.to_string())
+    }
+    /// Install the shared runtime before admitting production motion.
+    pub fn set_motion_authority(&mut self, authority: Arc<dyn crate::motion::MotionAuthority>) {
+        lock_drive_shared(&self.shared).motion_authority = Some(authority);
+    }
+    /// Scope immutable context to this handle and restore it after the call.
+    /// Other handles sharing the changer cannot change this dispatch's parent.
+    pub fn with_motion_context<T>(
+        &mut self,
+        context: crate::motion::MotionContext,
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.motion_context, context);
+        let result = run(self);
+        self.motion_context = previous;
+        result
+    }
+    /// Use the same owner identity throughout this readiness wait. Other known
+    /// tape and generation facts remain attached to this physical handle.
+    pub fn with_readiness_operation<T>(
+        &mut self,
+        operation: [u8; 16],
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let mut context = self.motion_context.clone();
+        context.parent_operation = Some(operation);
+        context.load_confirmation = crate::motion::LoadConfirmation::Readiness;
+        self.with_motion_context(context, run)
+    }
+    /// Transfer this handle's successful commands to their confirmation owner.
+    pub fn take_pending_motion(&mut self) -> Vec<crate::motion::PendingMotion> {
+        std::mem::take(&mut self.pending_motion)
+    }
     /// Open an explicitly allowed Linux SG tape drive without a changer handle.
     /// The policy must allow its VPD 0x80 serial or exact path. Missing serials
     /// require an additional unserialized allowance and yield a read-only
@@ -2119,6 +2360,8 @@ impl DriveHandle {
             transport.field_identity = serde_json::json!({"serial":serial,"firmware":inquiry.revision_str(),"endpoint":format!("{endpoint:?}")});
         }
         Ok(Self {
+            motion_context: Default::default(),
+            pending_motion: Vec::new(),
             endpoint,
             drive: InstalledDrive {
                 serial: serial.unwrap_or_default(),
@@ -2422,6 +2665,17 @@ impl DriveHandle {
         admit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), DriveOpError> {
         use remanence_scsi::load_unload as lu;
+        // Ruling 3: an ephemeral read-only handle has no durable identity for a
+        // motion intent. Refuse before callbacks, inventory or physical dispatch.
+        if self.endpoint.durable_key().is_none() {
+            let reason =
+                "ephemeral endpoint is read-only; motion requires a VPD serial".to_string();
+            return Err(crate::DriveOpError::new(if load {
+                crate::DriveOpErrorKind::LoadAdmission(reason)
+            } else {
+                crate::DriveOpErrorKind::UnloadAdmission(reason)
+            }));
+        }
         if !load {
             if let MountEndpoint::Durable(DriveKey::Bay { bay, .. }) = &self.endpoint {
                 check_shared_elements(&self.shared, &[*bay]).map_err(|value| {
@@ -2446,16 +2700,157 @@ impl DriveHandle {
         }
         let cdb = lu::build_cdb_with_immed(load, immed);
 
-        // The dispatch gate invalidates load identity only after admission.
-        self.issue_drive_control_with_admission(&cdb, op, TimeoutClass::LoadUnload, &mut || {
-            admit().map_err(|error| {
-                if load {
-                    crate::DriveOpErrorKind::LoadAdmission(error)
-                } else {
-                    crate::DriveOpErrorKind::UnloadAdmission(error)
+        let command = if load {
+            crate::motion::MotionCommand::Load(self.endpoint.durable_key().unwrap().clone())
+        } else {
+            crate::motion::MotionCommand::Unload(self.endpoint.durable_key().unwrap().clone())
+        };
+        let authority = lock_drive_shared(&self.shared).motion_authority.clone();
+        let context = self.motion_context.clone();
+        let mut ticket = None;
+        let admission_error = |error: String| {
+            if load {
+                crate::DriveOpErrorKind::LoadAdmission(error)
+            } else {
+                crate::DriveOpErrorKind::UnloadAdmission(error)
+            }
+        };
+        let result = self.issue_drive_control_with_admission(
+            &cdb,
+            op,
+            TimeoutClass::LoadUnload,
+            &mut || {
+                admit().map_err(&admission_error)?;
+                if let Some(authority) = &authority {
+                    authority
+                        .ensure_motion_allowed()
+                        .map_err(crate::DriveOpErrorKind::MotionAuthority)?;
+                    ticket = Some(
+                        authority
+                            .intent(&command, &context)
+                            .map_err(crate::DriveOpErrorKind::MotionAuthority)?,
+                    );
                 }
+                Ok(())
+            },
+        );
+        if let (Some(authority), Some(ticket)) = (&authority, ticket) {
+            if let Err(error) = &result {
+                authority
+                    .failed(ticket, &error.completion_evidence())
+                    .map_err(|error| {
+                        DriveOpError::new(crate::DriveOpErrorKind::MotionAuthority(error))
+                    })?;
+            } else {
+                let readiness_owned =
+                    load && context.load_confirmation == crate::motion::LoadConfirmation::Readiness;
+                self.pending_motion.push(crate::motion::PendingMotion {
+                    command,
+                    context,
+                    ticket,
+                    evidence: crate::outcome::CompletionEvidence::success(),
+                });
+                if !readiness_owned {
+                    self.confirm_pending_motion(ticket)?;
+                }
+            }
+        }
+        result
+    }
+
+    /// Close this readiness owner's successful LOADs using the actual probe.
+    /// The pending immutable context supplies the same operation as the intent.
+    pub fn complete_readiness_loads(
+        &mut self,
+        observed: &crate::MediaReadiness,
+        limit: std::time::Duration,
+    ) -> Result<(), crate::motion::MotionAuthorityError> {
+        if !observed.is_ready() {
+            return Ok(());
+        }
+        let Some(authority) = lock_drive_shared(&self.shared).motion_authority.clone() else {
+            return Ok(());
+        };
+        let pending: Vec<_> = self
+            .pending_motion
+            .iter()
+            .filter(|pending| {
+                pending.context.load_confirmation == crate::motion::LoadConfirmation::Readiness
+                    && matches!(pending.command, crate::motion::MotionCommand::Load(_))
             })
-        })
+            .cloned()
+            .collect();
+        for pending in pending {
+            authority.confirm_readiness(&pending, observed, limit)?;
+            self.pending_motion
+                .retain(|candidate| candidate.ticket != pending.ticket);
+        }
+        Ok(())
+    }
+
+    /// Read the actual endpoint after a successful LOAD/UNLOAD. Bay observations
+    /// use the shared changer transport; standalone observations require both
+    /// TUR and READ POSITION, including matching no-medium responses.
+    fn confirm_pending_motion(
+        &mut self,
+        ticket: crate::motion::MotionTicket,
+    ) -> Result<(), DriveOpError> {
+        let authority = lock_drive_shared(&self.shared)
+            .motion_authority
+            .clone()
+            .expect("pending motion has an authority owner");
+        let pending = self
+            .pending_motion
+            .iter()
+            .find(|pending| pending.ticket == ticket)
+            .expect("pending command exists")
+            .clone();
+        let observation = match self.endpoint.durable_key().expect("durable motion") {
+            DriveKey::Bay { bay, .. } => {
+                let bay = *bay;
+                check_shared_elements(&self.shared, &[bay])
+                    .map_err(|error| error.to_string())
+                    .map(|()| lock_drive_shared(&self.shared).inventory.clone())
+            }
+            DriveKey::Standalone { .. } => {
+                let ready = self.test_unit_ready();
+                let position = self.position_report();
+                match (&ready, &position) {
+                    (Ok(()), Ok(position)) if !position.logical_object_number_unknown => Ok(None),
+                    (Err(ready), Err(position)) if matches!(ready.kind, crate::TapeIoErrorKind::NoMedium)
+                        && matches!(position.kind, crate::TapeIoErrorKind::NoMedium) => Ok(None),
+                    _ => Err(format!("standalone TUR/READ POSITION did not establish inventory: {ready:?}; {position:?}")),
+                }
+            }
+        };
+        match observation {
+            Ok(inventory) => {
+                let result = if let Some(inventory) = inventory {
+                    authority.confirm_inventory(&pending, &inventory)
+                } else {
+                    authority.confirm_standalone(&pending)
+                };
+                result.map_err(|error| {
+                    DriveOpError::new(crate::DriveOpErrorKind::MotionAuthority(error))
+                })?;
+                self.pending_motion
+                    .retain(|pending| pending.ticket != ticket);
+                Ok(())
+            }
+            Err(message) => {
+                authority.unconfirmed(&pending).map_err(|error| {
+                    DriveOpError::new(crate::DriveOpErrorKind::MotionAuthority(error))
+                })?;
+                self.pending_motion
+                    .retain(|pending| pending.ticket != ticket);
+                Err(DriveOpError::new(crate::DriveOpErrorKind::MotionAuthority(
+                    crate::motion::MotionAuthorityError {
+                        message,
+                        kind: crate::motion::MotionAuthorityFailure::EvidenceFailure,
+                    },
+                )))
+            }
+        }
     }
 
     fn issue_drive_control(
@@ -2684,7 +3079,7 @@ fn drive_completion_unknown(error: &DriveOpError) -> bool {
 fn fire_refused(hook: &mut Option<AuditHook>, library_serial: &str, op: AuditOp, err: &MoveError) {
     let reason: &'static str = match err {
         crate::MoveError {
-            kind: crate::MoveErrorKind::Admission(_),
+            kind: crate::MoveErrorKind::Admission(_) | crate::MoveErrorKind::MotionAuthority(_),
             ..
         } => "Admission",
         crate::MoveError {
@@ -2846,6 +3241,8 @@ impl Library {
             ..DriveShared::default()
         }));
         let changer = ChangerHandle {
+            motion_context: Default::default(),
+            pending_motion: Vec::new(),
             library: self.clone(),
             transport,
             shared,

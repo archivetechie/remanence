@@ -823,7 +823,7 @@ async fn overlap_append_gate_counts_bootstrap_and_committed_trailing_filemark() 
 #[test]
 /// Both append admission and the byte writer refuse an Object before bootstrap.
 fn batched_object_before_bootstrap_is_refused_without_media_commands() {
-    let (temp, mut state, mut selected) = fence_test_fixture();
+    let (temp, mut state, mut selected, _owner) = fence_test_fixture();
     selected.block_size = 4096;
     let error = first_batched_append_context(&state, &selected, &[]).unwrap_err();
     assert!(error
@@ -2495,24 +2495,53 @@ fn l3_sink_error_with_queued_buffers_drains_and_poisons_filemark() {
     );
 }
 
-fn fence_test_fixture() -> (tempfile::TempDir, CatalogIndex, SelectedTape) {
+fn fence_test_fixture() -> (
+    tempfile::TempDir,
+    CatalogIndex,
+    SelectedTape,
+    remanence_state::StateHandle,
+) {
     let temp = tempfile::Builder::new()
         .prefix("remanence-transfer-fence-")
         .tempdir()
         .expect("tempdir");
-    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[daemon]
+state_dir="{0}"
+default_idle_timeout_seconds=1800
+[journal]
+dir="{0}/journals"
+require_trusted_volume=false
+[audit]
+dir="{0}/audit"
+[index]
+sqlite_path="{0}/rem-state.sqlite"
+[cache]
+tape_catalog_dir="{0}/cache"
+"#,
+            temp.path().display()
+        ),
+    )
+    .unwrap();
+    let mut owner = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
     let tape_uuid = [0x5a; 16];
-    state
-        .provision_tape(remanence_state::ProvisionTapeInput {
-            tape_uuid,
-            voltag: "FENCE1L9".into(),
-            block_size: 4,
-            parity: ParityConfig::None,
-            force: false,
-        })
-        .expect("provision tape");
+    owner
+        .provision_tape_with_media(
+            remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "FENCE1L9".into(),
+                block_size: 4,
+                parity: ParityConfig::None,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            remanence_state::MediaObservation::label_hint("FENCE1L9"),
+        )
+        .unwrap();
+    let state = owner.projection_client().write_handle();
     (
         temp,
         state,
@@ -2523,14 +2552,18 @@ fn fence_test_fixture() -> (tempfile::TempDir, CatalogIndex, SelectedTape) {
             block_size: 4,
             parity_config: ParityConfig::None,
         },
+        owner,
     )
 }
 
-fn assert_one_transfer_fence(state: &CatalogIndex, expected_error: &str) {
-    crate::tests::assert_fences_survive_empty_rebuild(
-        state,
-        &state.path().parent().unwrap().join("audit"),
-    );
+fn assert_one_transfer_fence(
+    state: &CatalogIndex,
+    owner: &mut remanence_state::StateHandle,
+    expected_error: &str,
+) {
+    let expected = state.list_active_tape_io_fences().unwrap();
+    owner.rebuild_index_from_journals().unwrap();
+    assert_eq!(state.list_active_tape_io_fences().unwrap(), expected);
     let fences = state
         .list_active_tape_io_fences()
         .expect("list active tape-I/O fences");
@@ -2556,7 +2589,7 @@ fn overlap_recovery_cut_matrix_never_projects_partial_object() {
         "finish-validation",
         "filemark",
     ] {
-        let (temp, mut state, selected) = fence_test_fixture();
+        let (temp, mut state, selected, _owner) = fence_test_fixture();
         let mut sink = StagedTestSink::new(2);
         if cut == "filemark" {
             sink.fail_filemark = true;
@@ -2687,7 +2720,8 @@ fn overlap_recovery_cut_matrix_never_projects_partial_object() {
 
 #[test]
 fn overlap_staged_only_failure_does_not_raise_a_false_tape_fence() {
-    let (_temp, mut state, selected) = fence_test_fixture();
+    let (_temp, mut state, selected, mut owner) = fence_test_fixture();
+    let _ = &mut owner;
     let mut sink = StagedTestSink::new(2);
     let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
     let manager = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
@@ -2723,7 +2757,8 @@ fn overlap_staged_only_failure_does_not_raise_a_false_tape_fence() {
 
 #[test]
 fn producer_error_after_committed_window_records_tape_io_fence() {
-    let (_temp, mut state, selected) = fence_test_fixture();
+    let (_temp, mut state, selected, mut owner) = fence_test_fixture();
+    let _ = &mut owner;
     let mut sink = StagedTestSink::with_ring(2, 2);
     let error = run_fenced_staged_transfer(&mut state, &selected, &mut sink, 4, |staged| {
         for value in 0..4u8 {
@@ -2737,12 +2772,13 @@ fn producer_error_after_committed_window_records_tape_io_fence() {
     .expect_err("producer failure stops transfer");
     assert!(error.to_string().contains("producer source read failed"));
     assert_eq!(sink.batch_calls, 2, "one full ring window reached tape");
-    assert_one_transfer_fence(&state, "producer source read failed");
+    assert_one_transfer_fence(&state, &mut owner, "producer source read failed");
 }
 
 #[test]
 fn space_to_eod_error_records_tape_io_fence() {
-    let (_temp, mut state, selected) = fence_test_fixture();
+    let (_temp, mut state, selected, mut owner) = fence_test_fixture();
+    let _ = &mut owner;
     let mut sink = StagedTestSink::new(2);
     sink.fail_space_to_eod = true;
     let error = run_fenced_staged_transfer(&mut state, &selected, &mut sink, 4, |staged| {
@@ -2750,12 +2786,13 @@ fn space_to_eod_error_records_tape_io_fence() {
     })
     .expect_err("SPACE(EOD) failure stops transfer");
     assert!(error.to_string().contains("space-to-EOD failure"));
-    assert_one_transfer_fence(&state, "space-to-EOD failure");
+    assert_one_transfer_fence(&state, &mut owner, "space-to-EOD failure");
 }
 
 #[test]
 fn position_error_records_tape_io_fence() {
-    let (_temp, mut state, selected) = fence_test_fixture();
+    let (_temp, mut state, selected, mut owner) = fence_test_fixture();
+    let _ = &mut owner;
     let mut sink = StagedTestSink::new(2);
     sink.fail_position = true;
     let error = run_fenced_staged_transfer(&mut state, &selected, &mut sink, 4, |staged| {
@@ -2763,7 +2800,7 @@ fn position_error_records_tape_io_fence() {
     })
     .expect_err("READ POSITION failure stops transfer");
     assert!(error.to_string().contains("READ POSITION failure"));
-    assert_one_transfer_fence(&state, "READ POSITION failure");
+    assert_one_transfer_fence(&state, &mut owner, "READ POSITION failure");
 }
 
 #[test]

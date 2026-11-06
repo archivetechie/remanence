@@ -337,8 +337,8 @@ fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing(
     let fixture = fixture();
     let mut state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
     let session_id = uuid::Uuid::new_v4();
-    state
-        .audit()
+    remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
+        .unwrap()
         .append(remanence_state::AuditEventRecord {
             actor: remanence_state::AuditActor::System,
             source_layer: remanence_state::SourceLayer::Layer5,
@@ -582,3 +582,4 @@ fn typed_write_error_keeps_appended_fence_abandonment_and_checkpoint_context() {
         leading
     );
 }
+use remanence_state::AuditSink as _;

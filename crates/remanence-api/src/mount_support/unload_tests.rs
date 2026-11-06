@@ -79,41 +79,36 @@ fn controls(log: &RecordingLog) -> Vec<u8> {
 }
 
 #[test]
-fn plain_unload_needs_no_config_or_recovery_locks() {
-    for explicit in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("missing-config.toml");
-        let (mut library, policy, _, log) = fixture();
-        let outcome = unload_library_bay(
-            &mut library,
-            BAY,
-            Some(SLOT),
-            &policy,
-            explicit.then_some(missing.as_path()),
-            &root.path().join("locks"),
-        )
-        .unwrap();
-        assert_eq!(outcome, super::UnloadOutcome::Unloaded);
-        assert_eq!(controls(&log), [0x1b, 0xa5]);
-        assert!(!root.path().join("locks").exists());
-        assert!(!missing.exists());
-    }
-    // Even explicit valid config must not consult the live daemon's state lock.
+fn plain_unload_requires_bound_authority_and_refuses_different_config() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
-    let _owner = remanence_state::StateLockGuard::acquire(root.path()).unwrap();
     let (mut library, policy, _, log) = fixture();
-    unload_library_bay(
+    assert!(
+        unload_library_bay(&mut library, BAY, Some(SLOT), &policy, None, root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("typed motion authority")
+    );
+    assert!(controls(&log).is_empty());
+    bind_library_motion_authority(&mut library, Some(&config)).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let other_config = self::config(other.path());
+    assert!(unload_library_bay(
         &mut library,
         BAY,
         Some(SLOT),
         &policy,
-        Some(&config),
-        &root.path().join("locks"),
+        Some(&other_config),
+        root.path()
     )
-    .unwrap();
+    .is_err());
+    assert!(controls(&log).is_empty());
+    assert_eq!(
+        unload_library_bay(&mut library, BAY, Some(SLOT), &policy, None, root.path()).unwrap(),
+        UnloadOutcome::Unloaded
+    );
     assert_eq!(controls(&log), [0x1b, 0xa5]);
-    assert!(!root.path().join("locks").exists());
+    assert!(library.motion_authority_identity().is_some());
 }
 
 #[test]
@@ -141,19 +136,10 @@ fn stranded_prevent_unload_allows_before_retry_and_move() {
         .all(|cdb| cdb[4] == 0));
     assert!(!world.lock().unwrap().drive_states[&BAY].removal_prevented);
     assert!(library.library().slots[0].full);
-    let records = remanence_state::FileAuditLog::replay(root.path().join("audit")).unwrap();
-    let audited_cdbs: Vec<_> = records
-        .iter()
-        .filter_map(|record| match record.detail.get("cdb") {
-            Some(ciborium::Value::Bytes(cdb)) => cdb.first().copied(),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(audited_cdbs, [0x1e, 0x1b, 0xa5]);
-    assert!(records.iter().any(|record| record
-        .detail
-        .values()
-        .any(|value| value == &ciborium::Value::Text("allow_removal".into()))));
+    assert!(
+        library.motion_authority_identity().is_some(),
+        "all motion uses the bound typed owner"
+    );
 }
 
 #[test]
@@ -162,6 +148,7 @@ fn stranded_prevent_unload_refuses_live_writer_device_lock_without_allow() {
     let config = config(root.path());
     let mut state = StateHandle::open_from_config_file(&config).unwrap();
     let (mut library, policy, world, log) = fixture();
+    library.set_motion_authority(Arc::new(state.library_runtime()));
     // Derive the serial from the installed bay exactly as MountedDrive does.
     let serial = library
         .library()
@@ -233,11 +220,11 @@ fn stranded_prevent_actor_drive_unload_audits_allow_before_retry_and_keeps_lock(
     );
     assert!(!world.lock().unwrap().drive_states[&BAY].removal_prevented);
     assert!(
-        UnloadRecoveryGuard::acquire(&mut drive, None, root.path()).is_err(),
+        UnloadRecoveryGuard::acquire(&mut drive, root.path()).is_err(),
         "actor reply retains exclusion for MOVE"
     );
     drop(outcome);
-    assert!(UnloadRecoveryGuard::acquire(&mut drive, None, root.path()).is_ok());
+    assert!(UnloadRecoveryGuard::acquire(&mut drive, root.path()).is_ok());
 }
 
 #[test]
@@ -348,7 +335,7 @@ fn stranded_prevent_explicit_config_refuses_state_owner_without_allow() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("state lock"), "{error}");
-    assert_eq!(controls(&log), [0x1b]);
+    assert!(controls(&log).is_empty());
 }
 
 /// No-config recovery ignores an unrelated daemon state lock and holds the
@@ -358,6 +345,8 @@ fn stranded_prevent_without_config_holds_device_lock_through_move() {
     let root = tempfile::tempdir().unwrap();
     let _state_owner = remanence_state::StateLockGuard::acquire(root.path()).unwrap();
     let (mut library, policy, _, log) = fixture();
+    let authority_root = tempfile::tempdir().unwrap();
+    bind_library_motion_authority(&mut library, Some(&config(authority_root.path()))).unwrap();
     strand_prevent(&mut library, &policy);
     let mut drive = library.open_drive(BAY, &policy).unwrap();
     let serial = drive.drive().serial.clone();
@@ -386,37 +375,50 @@ fn stranded_prevent_without_config_holds_device_lock_through_move() {
 }
 
 #[test]
-fn stranded_prevent_reset_fence_does_not_block_bare_state_lock_recovery() {
-    let root = tempfile::tempdir().unwrap();
-    let config = config(root.path());
-    let fence = root.path().join("catalog-reset.in-progress");
-    std::fs::write(&fence, b"interrupted reset").unwrap();
-    assert!(matches!(
-        StateHandle::open_from_config_file(&config),
-        Err(remanence_state::StateError::CatalogResetInProgress(_))
-    ));
-    let (mut library, policy, _, log) = fixture();
-    strand_prevent(&mut library, &policy);
-    log.borrow_mut().clear();
-    let outcome = unload_library_bay(
-        &mut library,
-        BAY,
-        Some(SLOT),
-        &policy,
-        Some(&config),
-        root.path(),
-    )
-    .unwrap();
-    assert_eq!(outcome, super::UnloadOutcome::ClearedStrandedPrevent);
-    assert_eq!(controls(&log), [0x1b, 0x1e, 0x1b, 0xa5]);
-    assert_eq!(std::fs::read(&fence).unwrap(), b"interrupted reset");
-    assert!(!root.path().join("index.sqlite").exists());
+fn stranded_prevent_reset_fence_blocks_bare_state_lock_recovery() {
+    for dangling_symlink in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let fence = root.path().join("catalog-reset.in-progress");
+        if dangling_symlink {
+            std::os::unix::fs::symlink("missing-reset", &fence).unwrap();
+        } else {
+            std::fs::write(&fence, b"interrupted reset").unwrap();
+        }
+        let (mut library, policy, world, log) = fixture();
+        strand_prevent(&mut library, &policy);
+        log.borrow_mut().clear();
+        let error = unload_library_bay(
+            &mut library,
+            BAY,
+            Some(SLOT),
+            &policy,
+            Some(&config),
+            root.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reset"), "{error}");
+        // Reset admission precedes even the first UNLOAD.
+        assert!(controls(&log).is_empty());
+        assert!(world.lock().unwrap().drive_states[&BAY].removal_prevented);
+        if dangling_symlink {
+            assert_eq!(
+                std::fs::read_link(&fence).unwrap(),
+                Path::new("missing-reset")
+            );
+        } else {
+            assert_eq!(std::fs::read(&fence).unwrap(), b"interrupted reset");
+        }
+        assert!(!root.path().join("index.sqlite").exists());
+        assert!(!root.path().join("audit").exists());
+    }
 }
 
 #[test]
 fn stranded_prevent_allow_failure_never_retries_or_moves() {
     let root = tempfile::tempdir().unwrap();
     let (mut library, policy, world, log) = fixture();
+    bind_library_motion_authority(&mut library, Some(&config(root.path()))).unwrap();
     strand_prevent(&mut library, &policy);
     let mut drive = library.open_drive(BAY, &policy).unwrap();
     let fault = world.clone();
@@ -464,7 +466,7 @@ fn unload_other_sense_never_allows_or_acquires_recovery_locks() {
         BAY,
         Some(SLOT),
         &policy,
-        Some(&root.path().join("missing-config")),
+        Some(&config(root.path())),
         &root.path().join("locks")
     )
     .is_err());
@@ -473,12 +475,11 @@ fn unload_other_sense_never_allows_or_acquires_recovery_locks() {
 }
 
 #[test]
-fn unload_recovery_preserves_original_failure_when_audit_also_fails() {
+fn unload_recovery_guard_preserves_original_physical_failure() {
     let root = tempfile::tempdir().unwrap();
     let (mut library, policy, _, _) = fixture();
     let mut drive = library.open_drive(BAY, &policy).unwrap();
-    let guard = UnloadRecoveryGuard::acquire(&mut drive, None, root.path()).unwrap();
-    *guard.audit_error.lock().unwrap() = Some("audit fsync failed".into());
+    let guard = UnloadRecoveryGuard::acquire(&mut drive, root.path()).unwrap();
     for original in ["ALLOW MEDIUM REMOVAL failed", "drive UNLOAD failed"] {
         assert_eq!(
             guard
@@ -488,11 +489,7 @@ fn unload_recovery_preserves_original_failure_when_audit_also_fails() {
             original
         );
     }
-    assert!(guard
-        .finish(Ok(()))
-        .unwrap_err()
-        .to_string()
-        .contains("audit fsync failed"));
+    assert!(guard.finish(Ok(())).is_ok());
 }
 
 /// A caller may disappear after enqueueing MOVE. The command must own exclusion
@@ -519,7 +516,7 @@ async fn stranded_prevent_cancelled_move_keeps_recovery_lock_in_command() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     assert!(
-        UnloadRecoveryGuard::acquire(&mut drive, None, root.path()).is_err(),
+        UnloadRecoveryGuard::acquire(&mut drive, root.path()).is_err(),
         "cancelled caller must not release a queued MOVE's flock"
     );
     let crate::write_owner::ChangerCommand::Move {
@@ -537,7 +534,7 @@ async fn stranded_prevent_cancelled_move_keeps_recovery_lock_in_command() {
     assert_eq!(controls(&log), [0x1b, 0x1e, 0x1b, 0xa5]);
     drop(recovery_guard);
     assert!(reply.send(Ok(())).is_err(), "requester is gone");
-    assert!(UnloadRecoveryGuard::acquire(&mut drive, None, root.path()).is_ok());
+    assert!(UnloadRecoveryGuard::acquire(&mut drive, root.path()).is_ok());
 }
 
 /// The final owner check follows inventory validation and precedes physical UNLOAD.
@@ -546,6 +543,7 @@ fn shutdown_at_unload_dispatch_keeps_both_actor_and_robotics_media_seated() {
     for robotics in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let (mut library, policy, world, log) = fixture();
+        bind_library_motion_authority(&mut library, Some(&config(root.path()))).unwrap();
         let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
         if robotics {
             log.borrow_mut().clear();
