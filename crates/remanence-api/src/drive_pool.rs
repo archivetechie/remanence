@@ -1119,6 +1119,49 @@ impl DrivePool {
         }
     }
 
+    /// Resolve once shutdown has begun. The wake is created before the flag is read, so a
+    /// `begin_shutdown` between the two is not missed.
+    pub(crate) async fn wait_shutdown(&self) {
+        let notified = self.shutdown_notify.notified();
+        if !self.is_shutting_down() {
+            notified.await;
+        }
+    }
+
+    /// Sleep the calling std thread for up to `duration`, ending early when shutdown begins.
+    /// Returns true when shutdown has begun. The thread-side twin of [`Self::wait_shutdown`],
+    /// for workers that are not Tokio tasks; both wait on the one flag and notifier above.
+    pub(crate) fn sleep_unless_shutdown(&self, duration: std::time::Duration) -> bool {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let deadline = std::time::Instant::now().checked_add(duration);
+        let mut notified = std::pin::pin!(self.shutdown_notify.notified());
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut context = std::task::Context::from_waker(&waker);
+        loop {
+            // `notified` exists before the flag is read, so a wake cannot fall between them.
+            if self.is_shutting_down()
+                || std::future::Future::poll(notified.as_mut(), &mut context).is_ready()
+            {
+                return true;
+            }
+            match deadline {
+                None => std::thread::park(),
+                Some(deadline) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return false;
+                    }
+                    std::thread::park_timeout(deadline - now);
+                }
+            }
+        }
+    }
+
     /// Commit a new MOVE only after obtaining channel capacity. A return MOVE
     /// already owns the guard from UNLOAD and must not seek new admission.
     pub(crate) fn begin_motion(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
@@ -1129,6 +1172,9 @@ impl DrivePool {
         let _motion = self.dismounts.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
         self.cut_changer_wait.store(true, Ordering::SeqCst);
+        // Wake every worker asleep on the shutdown state ([`Self::wait_shutdown`] and
+        // [`Self::sleep_unless_shutdown`]); each re-reads the flag set above.
+        self.shutdown_notify.notify_waiters();
     }
 
     pub(crate) fn dismount_in_progress(&self, key: &DriveKey) -> bool {
@@ -1287,6 +1333,64 @@ pub(crate) fn release_library_reservations(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn actorless_pool() -> DrivePool {
+        DrivePool::new_with_lifecycle(
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(HashMap::new()),
+            DrivePoolLifecycle::default(),
+        )
+    }
+
+    /// The thread sleep runs its interval, ends at once on a shutting-down pool, and is cut
+    /// short, not merely noticed at its end, by `begin_shutdown` from another thread.
+    #[test]
+    fn thread_sleep_is_cut_short_by_shutdown() {
+        let pool = actorless_pool();
+        let started = std::time::Instant::now();
+        assert!(!pool.sleep_unless_shutdown(std::time::Duration::from_millis(80)));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(80));
+
+        let (done, ended) = std::sync::mpsc::channel();
+        let sleeper = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                let cut = pool.sleep_unless_shutdown(std::time::Duration::from_secs(600));
+                let _ = done.send(cut);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        pool.begin_shutdown();
+        let cut = ended
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("shutdown must end a 600 s sleep within 2 s");
+        assert!(cut, "shutdown ends the sleep");
+        sleeper.join().unwrap();
+
+        assert!(pool.sleep_unless_shutdown(std::time::Duration::from_secs(600)));
+        assert!(pool.sleep_unless_shutdown(std::time::Duration::MAX));
+    }
+
+    /// The task wait stays pending until the pool itself begins shutdown, then resolves.
+    #[tokio::test]
+    async fn task_wait_resolves_when_the_pool_begins_shutdown() {
+        let pool = actorless_pool();
+        let waiting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.wait_shutdown().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        pool.begin_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("shutdown wakes the waiter")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), pool.wait_shutdown())
+            .await
+            .expect("a later wait returns at once");
+    }
 
     /// Reserve an available library drive for reservation tests.
     pub(crate) trait ReserveFreeDrive {

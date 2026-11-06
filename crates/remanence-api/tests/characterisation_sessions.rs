@@ -49,9 +49,11 @@ fn state_paths(config: &RemConfig) -> StatePaths {
 }
 
 /// The catalog the daemon builds: the library runtime over the state root, installed on the
-/// projection client. The runtime holds the state lock until every clone of it is dropped, and
-/// the drive-collection heartbeat worker keeps a clone for the life of the process
-/// (`drive_collection.rs`), so a second start in one process cannot take the lock again.
+/// projection client. The runtime holds the state lock until every clone of it is dropped. The
+/// drive-collection heartbeat, the idle-unload timers and the timer-park listener drop theirs
+/// when shutdown begins; the library's drive actor thread keeps one for the life of the process
+/// (`drive_loop` holds a sender to its own mailbox, so the mailbox never closes), so a second
+/// start in one process still cannot take the lock again.
 fn open_runtime_catalog(config: &RemConfig) -> remanence_state::ProjectionClient {
     let paths = state_paths(config);
     let lock = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());

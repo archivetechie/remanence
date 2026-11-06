@@ -17,22 +17,30 @@ use crate::audit_projection::{
 use crate::hex_encoding::bytes_to_hex;
 use crate::startup_media_readiness::status_from_state_error;
 
+/// Start the heartbeat and foreign-poll threads. The daemon lets them run; the handles are
+/// returned so a test can wait for the exit that shutdown causes.
 pub(crate) fn spawn_drive_collection_workers(
     catalog: remanence_state::ProjectionClient,
     report: remanence_library::DiscoveryReport,
     config: &RemConfig,
     drive_pool: crate::write_owner::DrivePool,
     audit_append_lock: Arc<std::sync::Mutex<()>>,
-) {
+) -> [std::thread::JoinHandle<()>; 2] {
     let heartbeat = parse_duration_or(&config.drives.heartbeat, Duration::from_secs(60 * 60));
     let heartbeat_catalog = catalog.clone();
     let heartbeat_pool = drive_pool.clone();
-    std::thread::Builder::new()
+    // The thread holds a catalog clone (and through it the library runtime and the state
+    // lock) and a pool clone, so it ends, and drops both, once the pool begins shutdown.
+    // The sleep is the pool's own, which shutdown wakes.
+    let heartbeat_thread = std::thread::Builder::new()
         .name("rem-drive-heartbeat".to_string())
-        .spawn(move || loop {
-            std::thread::sleep(heartbeat);
-            if let Err(err) = touch_managed_drive_heartbeats(&heartbeat_catalog, &heartbeat_pool) {
-                tracing::warn!("managed drive heartbeat failed: {err}");
+        .spawn(move || {
+            while !heartbeat_pool.sleep_unless_shutdown(heartbeat) {
+                if let Err(err) =
+                    touch_managed_drive_heartbeats(&heartbeat_catalog, &heartbeat_pool)
+                {
+                    tracing::warn!("managed drive heartbeat failed: {err}");
+                }
             }
         })
         .expect("spawn managed drive heartbeat worker");
@@ -53,7 +61,7 @@ pub(crate) fn spawn_drive_collection_workers(
         .map(|library| library.serial.trim().to_string())
         .filter(|serial| !serial.is_empty())
         .collect::<std::collections::HashSet<_>>();
-    std::thread::Builder::new()
+    let foreign_poll_thread = std::thread::Builder::new()
         .name("rem-foreign-drive-poll".to_string())
         .spawn(move || {
             foreign_drive_poll_loop(
@@ -66,6 +74,7 @@ pub(crate) fn spawn_drive_collection_workers(
             )
         })
         .expect("spawn foreign drive poll worker");
+    [heartbeat_thread, foreign_poll_thread]
 }
 
 #[derive(Clone)]

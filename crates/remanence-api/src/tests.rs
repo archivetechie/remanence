@@ -3761,6 +3761,81 @@ fn foreign_poll_typed_is_disabled_before_any_poll() {
     );
 }
 
+/// Daemon shutdown ends the drive-collection threads and, with them, releases the clones of
+/// the catalog they hold. The heartbeat sleeps for an hour by default and holds a catalog clone,
+/// so one that shutdown does not wake keeps the library runtime, and the state lock it carries,
+/// for the life of the process: a start in the same process then fails with `StateLockHeld`.
+/// The pool here has no actors, so the only holders are this fixture, the state, and the
+/// worker threads.
+#[test]
+fn drive_collection_workers_exit_on_shutdown_and_release_the_state_lock() {
+    let within = std::time::Duration::from_secs(2);
+    let mut root = TypedRoot::open();
+    let config = root.config();
+    let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        Arc::new(std::collections::HashMap::new()),
+        crate::drive_pool::DrivePoolLifecycle::default(),
+    );
+    let mut state = root.api_state();
+    state.drive_pool = Some(pool.clone());
+    let report = DiscoveryReport {
+        unattached_drives: Vec::new(),
+        complete: true,
+        incomplete_evidence: Vec::new(),
+        libraries: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let [heartbeat, foreign_poll] = spawn_drive_collection_workers(
+        state.catalog.clone(),
+        report,
+        &config,
+        pool.clone(),
+        Arc::clone(&state.audit_append_lock),
+    );
+    let finished = |thread: &std::thread::JoinHandle<()>| {
+        let deadline = std::time::Instant::now() + within;
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        thread.is_finished()
+    };
+    assert!(
+        finished(&foreign_poll),
+        "with a runtime the foreign poll returns at once"
+    );
+    assert!(
+        !heartbeat.is_finished(),
+        "the heartbeat sleeps until shutdown"
+    );
+
+    // The daemon's own call; it reaches the pool, whose wake the thread sleeps on.
+    state.begin_shutdown();
+    drop(pool);
+    drop(state);
+    root.release();
+    assert!(
+        finished(&heartbeat),
+        "the heartbeat thread did not exit within 2 s of shutdown"
+    );
+    heartbeat.join().expect("heartbeat thread joined");
+
+    // A restart in this process opens the same root again.
+    let deadline = std::time::Instant::now() + within;
+    let lock = loop {
+        match remanence_state::StateLockGuard::acquire(&root.paths().state_dir) {
+            Ok(lock) => break lock,
+            Err(error) if error.is_state_lock_held() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("the state root was still locked 2 s after shutdown: {error}"),
+        }
+    };
+    remanence_state::library_runtime::LibraryRuntime::open(root.paths(), true, Arc::new(lock))
+        .expect("a new runtime opens over the same state root");
+}
+
 #[test]
 fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
     let temp = tempfile::Builder::new()
@@ -10663,29 +10738,7 @@ impl TypedRoot {
             calibration_dir: root.path().join("calibration"),
         };
         if !tapes.is_empty() {
-            let config = remanence_state::parse_config_toml(&format!(
-                r#"
-[daemon]
-state_dir = "{0}/state"
-default_idle_timeout_seconds = 1800
-io_memory_ceiling = "64 MiB"
-append_ring_bytes = "16 MiB"
-[tape_io]
-read_reservoir_bytes = "16 MiB"
-[journal]
-dir = "{0}/native"
-require_trusted_volume = false
-[audit]
-dir = "{0}/library"
-fsync = true
-[index]
-sqlite_path = "{0}/catalog.sqlite"
-[cache]
-tape_catalog_dir = "{0}/cache"
-"#,
-                root.path().display()
-            ))
-            .unwrap();
+            let config = Self::config_for(root.path());
             let mut state =
                 remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
             for (tape_uuid, label) in tapes {
@@ -10727,6 +10780,44 @@ tape_catalog_dir = "{0}/cache"
         &self.paths
     }
 
+    /// The daemon configuration whose paths are this root's, with no library or pool.
+    pub(crate) fn config(&self) -> remanence_state::RemConfig {
+        Self::config_for(self._root.path())
+    }
+
+    fn config_for(root: &Path) -> remanence_state::RemConfig {
+        remanence_state::parse_config_toml(&format!(
+            r#"
+[daemon]
+state_dir = "{0}/state"
+default_idle_timeout_seconds = 1800
+io_memory_ceiling = "64 MiB"
+append_ring_bytes = "16 MiB"
+[tape_io]
+read_reservoir_bytes = "16 MiB"
+[journal]
+dir = "{0}/native"
+require_trusted_volume = false
+[audit]
+dir = "{0}/library"
+fsync = true
+[index]
+sqlite_path = "{0}/catalog.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+"#,
+            root.display()
+        ))
+        .unwrap()
+    }
+
+    /// Drop the fixture's own catalog and runtime handles. The state lock is free again once
+    /// every other clone of the runtime is gone too.
+    pub(crate) fn release(&mut self) {
+        self.catalog = None;
+        self.runtime = None;
+    }
+
     /// Service state over this runtime. The legacy audit directory is created up front, so
     /// `assert_no_legacy_audit_records` checks a directory that exists and must stay empty.
     pub(crate) fn api_state(&self) -> ApiState {
@@ -10757,8 +10848,7 @@ tape_catalog_dir = "{0}/cache"
         &mut self,
         mut pick: impl FnMut(&remanence_state::library_log::Record) -> Option<T>,
     ) -> Vec<T> {
-        self.catalog = None;
-        self.runtime = None;
+        self.release();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match self.read_records(&mut pick) {

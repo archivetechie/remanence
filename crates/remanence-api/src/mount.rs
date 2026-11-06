@@ -2883,7 +2883,9 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
             Ok(pool) => pool.clone(),
             Err(_) => return,
         };
-        tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+        if idle_interval_cut_by_shutdown(&pool, timeout_seconds).await {
+            return;
+        }
         loop {
             if pool.is_shutting_down() || !pool.parked_is_current(&parked) {
                 return;
@@ -2901,7 +2903,9 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
                 })
                 .unwrap_or(true)
             {
-                tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+                if idle_interval_cut_by_shutdown(&pool, timeout_seconds).await {
+                    return;
+                }
                 continue;
             }
             let reservation = match pool.reserve_drive(&parked.seated.drive_key()) {
@@ -2950,10 +2954,25 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
                     "idle drive unload failed; retrying after the configured timeout"
                 ),
             }
-            tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+            if idle_interval_cut_by_shutdown(&pool, timeout_seconds).await {
+                return;
+            }
         }
     });
     timers.idle_timers.insert(key, task.abort_handle());
+}
+
+/// Wait out one idle-unload interval. True when shutdown began first, which ends the timer:
+/// its loop returns on a shutting-down pool anyway, but only at its next wake, an interval
+/// later, and the task holds the service state (catalog, library runtime, pool) until then.
+async fn idle_interval_cut_by_shutdown(
+    pool: &crate::write_owner::DrivePool,
+    timeout_seconds: u64,
+) -> bool {
+    tokio::select! {
+        () = pool.wait_shutdown() => true,
+        () = tokio::time::sleep(Duration::from_secs(timeout_seconds)) => false,
+    }
 }
 
 pub(crate) fn spawn_timer_idle_dismount_listener(
@@ -2965,8 +2984,30 @@ pub(crate) fn spawn_timer_idle_dismount_listener(
         return;
     };
     runtime.spawn(async move {
-        while let Some(parked) = parked_rx.recv().await {
-            schedule_idle_dismount(state.clone(), parked);
+        // The listener is a loop that holds the service state (catalog, library runtime, drive
+        // pool) and so, through the pool, the actors' senders, while the actors hold the
+        // senders this receiver waits on. Once shutdown begins it arms nothing (an idle timer
+        // returns at once on a shutting-down pool), so it lets go of both there. It keeps
+        // receiving, and discarding, so a session that closes during shutdown can still send.
+        let mut pool = state.drive_pool().ok().cloned();
+        let mut state = Some(state);
+        loop {
+            tokio::select! {
+                parked = parked_rx.recv() => match (parked, &state) {
+                    (None, _) => break,
+                    (Some(parked), Some(state)) => schedule_idle_dismount(state.clone(), parked),
+                    (Some(_), None) => {}
+                },
+                () = async {
+                    match &pool {
+                        Some(pool) => pool.wait_shutdown().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    pool = None;
+                    state = None;
+                }
+            }
         }
     });
 }
@@ -5674,6 +5715,90 @@ mod tests {
         assert!(harness.pool.parked_is_current(&parked));
         assert!(harness.drive_rx.try_recv().is_err());
         assert!(harness.changer_rx.try_recv().is_err());
+    }
+
+    /// An idle timer asleep on a long interval ends when shutdown begins and drops the service
+    /// state it holds, rather than waiting out the interval to see the flag. It dispatches nothing.
+    #[tokio::test]
+    async fn idle_timer_ends_when_shutdown_begins_during_its_interval() {
+        let mut harness = dismount_harness(3600);
+        let key = harness.seated.drive_key();
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        let held = std::sync::Arc::strong_count(&harness.state.index_path);
+        schedule_idle_dismount(harness.state.clone(), parked);
+        let timer = harness
+            .pool
+            .parked
+            .lock()
+            .unwrap()
+            .idle_timers
+            .get(&key)
+            .cloned()
+            .expect("the idle timer is armed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!timer.is_finished(), "the timer sleeps its interval");
+        assert_eq!(
+            std::sync::Arc::strong_count(&harness.state.index_path),
+            held + 1,
+            "the sleeping timer holds a clone of the service state"
+        );
+
+        harness.state.begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !timer.is_finished()
+                || std::sync::Arc::strong_count(&harness.state.index_path) != held
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the idle timer must end, and drop its state clone, within 2 s of shutdown");
+        assert!(harness.drive_rx.try_recv().is_err());
+        assert!(harness.changer_rx.try_recv().is_err());
+    }
+
+    /// The timer-park listener holds the service state and a pool clone only until shutdown
+    /// begins. It keeps receiving, so a timer-closed session that closes during shutdown can
+    /// still send its parked cartridge.
+    #[tokio::test]
+    async fn timer_park_listener_lets_go_of_the_state_at_shutdown_and_keeps_receiving() {
+        let harness = dismount_harness(3600);
+        let state_held = std::sync::Arc::strong_count(&harness.state.index_path);
+        let pool_held = std::sync::Arc::strong_count(&harness.pool.shutdown_notify);
+        let (park_tx, park_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_timer_idle_dismount_listener(harness.state.clone(), park_rx);
+        assert_eq!(
+            std::sync::Arc::strong_count(&harness.state.index_path),
+            state_held + 1,
+            "the listener holds a clone of the service state"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            std::sync::Arc::strong_count(&harness.pool.shutdown_notify) > pool_held,
+            "and, through it, of the pool"
+        );
+
+        harness.state.begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::sync::Arc::strong_count(&harness.state.index_path) != state_held
+                || std::sync::Arc::strong_count(&harness.pool.shutdown_notify) != pool_held
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the listener must drop its state and pool clones within 2 s of shutdown");
+
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        park_tx
+            .send(parked)
+            .expect("the listener still receives after shutdown");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!park_tx.is_closed(), "the listener is still receiving");
+        assert!(
+            harness.pool.parked.lock().unwrap().idle_timers.is_empty(),
+            "a cartridge parked during shutdown arms no idle timer"
+        );
     }
 
     /// A refused changer move names the tape without claiming its location.
