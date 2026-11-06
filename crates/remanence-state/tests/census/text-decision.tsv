@@ -371,7 +371,7 @@ crates/remanence-state/src/index.rs::provision_tape_tx::text-equality	1
 crates/remanence-state/src/index.rs::read_legacy_catalog_reset_erase_source::text-contains	1
 crates/remanence-state/src/index.rs::reconcile_clean_runs_against_library::text-equality	1
 crates/remanence-state/src/index.rs::record_media_readiness_transition::text-equality	1
-crates/remanence-state/src/index.rs::recover_imported_append_authority::text-equality	2
+crates/remanence-state/src/index.rs::recover_imported_append_authority::text-equality	1
 crates/remanence-state/src/index.rs::recover_imported_append_authority::text-matches	1
 crates/remanence-state/src/index.rs::reinstate_drive::text-equality	1
 crates/remanence-state/src/index.rs::replay_assignment::text-equality	1

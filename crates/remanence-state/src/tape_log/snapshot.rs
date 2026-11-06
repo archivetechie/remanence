@@ -211,6 +211,8 @@ impl Captured {
         let end = summary.closed_end;
         Ok((summary, end))
     }
+    // Only the L2 repair path (ruling 32) calls this in production; test-only until then.
+    #[cfg(test)]
     pub(super) fn repair_prefix(
         mut self,
         through: u64,

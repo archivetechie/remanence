@@ -21,10 +21,8 @@ crates/remanence-api/src/calibration.rs	harvest_and_install_calibration	upsert_w
 crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	append_and_project_audit	2	unreachable-at-runtime	L2
 crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	observe_foreign_drive_tapealert_advisory	1	unreachable-at-runtime	L2
 crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	record_drive_health_snapshot	1	unreachable-at-runtime	L2
-crates/remanence-api/src/mount_support.rs	import_journals	recover_imported_append_authority	1	pending-order	R3d-L1
 crates/remanence-api/src/terminal_fault.rs	clear_assignment_at_cut	compare_and_set_tape_pool_assignment	1	pending-order	row-12 hook deletion
 crates/remanence-api/src/write_owner/reconcile.rs	reconcile_tape_files	reconcile_tape_files_projection	1	unreachable-at-runtime	L2
-crates/remanence-state/src/library_runtime.rs	repair_native	mark_repaired_tape	1	pending-order	R3d-L1
 #
 # Outside the projector: projection, apply and wrapper sites (D-5-1)
 #
@@ -43,7 +41,6 @@ crates/remanence-cli/src/lib.rs	run_drive_client_command	retire_drive	1	name-col
 # P1: Applies a tape-log or typed-rebuild record into SQL.
 crates/remanence-api/src/closeout_obligation.rs	retry_projection	project_tape_log	1	applies-authority	permanent
 crates/remanence-api/src/mount.rs	service_closeout_obligation	project_tape_log	1	applies-authority	permanent
-crates/remanence-api/src/mount_support.rs	import_journals	project_tape_log	1	applies-authority	permanent
 crates/remanence-api/src/startup_checkpoint.rs	replay_checkpoint_journal_projections_with_audit	project_tape_log	3	applies-authority	permanent
 crates/remanence-api/src/write_owner/checkpoint.rs	perform_checkpoint_barrier_with_rows	project_tape_log	1	applies-authority	permanent
 crates/remanence-api/src/write_owner/checkpoint.rs	project_checkpoint_authority_bounded	project_tape_log	1	applies-authority	permanent
@@ -62,7 +59,6 @@ crates/remanence-api/src/write_owner/terminal_types.rs	reconcile_terminal_compon
 crates/remanence-api/src/write_owner/write_session.rs	handle_drive_open_write	project_terminal_finalization	1	applies-authority	permanent
 crates/remanence-state/src/library_runtime.rs	project_native_before_apply	apply_frozen	1	applies-authority	permanent
 crates/remanence-state/src/library_runtime.rs	rebuild_projection	rebuild_typed_sources	1	applies-authority	permanent
-crates/remanence-state/src/library_runtime.rs	repair_native	rebuild_repaired_tape_projection	1	applies-authority	permanent
 crates/remanence-state/src/state.rs	ingest_tape_journal	mark_tape_journal_ingestion_pending	1	pending-order	L3 dead-code deletion
 crates/remanence-state/src/state.rs	ingest_tape_journal	project_tape_log	1	applies-authority	permanent
 crates/remanence-state/src/state.rs	rebuild_projection_inputs	rebuild_typed_sources	1	applies-authority	permanent
@@ -127,7 +123,6 @@ crates/remanence-state/src/projector/handle.rs	finalize_verified_clean_run	final
 crates/remanence-state/src/projector/handle.rs	index_structural_authority	index_structural_authority	1	applies-authority	permanent
 crates/remanence-state/src/projector/handle.rs	mark_clean_run_failed	mark_clean_run_failed	1	applies-authority	permanent
 crates/remanence-state/src/projector/handle.rs	mark_clean_run_needs_operator	mark_clean_run_needs_operator	1	applies-authority	permanent
-crates/remanence-state/src/projector/handle.rs	mark_repaired_tape	mark_repaired_tape	1	applies-authority	permanent
 crates/remanence-state/src/projector/handle.rs	mark_tape_journal_ingestion_pending	mark_tape_journal_ingestion_pending	1	applies-authority	permanent
 crates/remanence-state/src/projector/handle.rs	observe_drive	observe_drive	1	unreachable-at-runtime	L3 (gate the fallback like the readiness methods)
 crates/remanence-state/src/projector/handle.rs	observe_drive_inventory_snapshot	observe_drive_inventory_snapshot	1	unreachable-at-runtime	L3 (gate the fallback like the readiness methods)

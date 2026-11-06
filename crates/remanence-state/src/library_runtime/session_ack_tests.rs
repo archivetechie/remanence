@@ -216,10 +216,10 @@ fn native_crash_ack_checks_type_tape_session_and_preview_before_projection() {
     }
 }
 
-/// The public repair entry point enforces received dependency floors even when
-/// SQL is empty, then publishes a genuinely shorter frozen native prefix.
+/// Ruling 32-L1: the public repair entry point refuses before it reads the library floor,
+/// archives, cuts or replaces anything, whether or not the tape is referenced.
 #[test]
-fn native_repair_uses_received_reference_floor_and_replaces_cached_prefix() {
+fn native_repair_refuses_before_any_effect_with_or_without_a_received_floor() {
     for referenced in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config.toml");
@@ -314,6 +314,8 @@ tape_catalog_dir="{0}/cache"
             .journal_dir
             .join("tapes")
             .join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
+        // A damaged log cannot be read for its reference; compare it where the log is intact.
+        let reference_before = referenced.then(|| runtime.current_native_reference(id).unwrap());
         if !referenced {
             use std::io::{Seek, Write};
             let mut offset = None;
@@ -333,39 +335,33 @@ tape_catalog_dir="{0}/cache"
             file.sync_all().unwrap();
         }
         let before = std::fs::read(&path).unwrap();
-        let result = state.repair_tape_log_tail(id, 1, true);
-        if referenced {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("RepairBelowReference"));
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        } else {
-            result.unwrap();
+        let mut tree_before = Vec::new();
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            tree_before.push(entry.unwrap().file_name());
+        }
+        tree_before.sort();
+        let error = state.repair_tape_log_tail(id, 1, true).unwrap_err();
+        assert!(error.to_string().contains("TailRepairDeferred"), "{error}");
+        assert!(
+            !error.to_string().contains("RepairBelowReference"),
+            "the refusal comes before the floor is read: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        if let Some(reference_before) = reference_before {
             assert_eq!(
-                runtime
-                    .current_native_reference(id)
-                    .unwrap()
-                    .unwrap()
-                    .sequence,
-                1
-            );
-            assert!(runtime.refresh_native(&frozen).is_err());
-            let mut index = state.write_handle();
-            assert!(runtime
-                .project_native(&mut index, &frozen, ApplyPath::Live)
-                .unwrap_err()
-                .to_string()
-                .contains("replaced repair source"));
-            state.rebuild_projection_from_tape_logs().unwrap();
-            assert_eq!(
-                runtime
-                    .current_native_reference(id)
-                    .unwrap()
-                    .unwrap()
-                    .sequence,
-                1
+                runtime.current_native_reference(id).unwrap(),
+                reference_before
             );
         }
+        assert!(!path.with_extension("repair-required").exists());
+        let mut tree_after = Vec::new();
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            tree_after.push(entry.unwrap().file_name());
+        }
+        tree_after.sort();
+        assert_eq!(
+            tree_after, tree_before,
+            "no archive or reconciliation record"
+        );
     }
 }

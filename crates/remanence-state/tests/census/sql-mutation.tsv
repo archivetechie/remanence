@@ -165,8 +165,6 @@ crates/remanence-state/src/projector/index.rs::record_media_readiness_transition
 crates/remanence-state/src/projector/index.rs::record_media_readiness_transition::mutating-sql	2
 crates/remanence-state/src/projector/index.rs::record_tape_io_fence_at_endpoint::execute	1
 crates/remanence-state/src/projector/index.rs::record_tape_io_fence_at_endpoint::mutating-sql	1
-crates/remanence-state/src/projector/index.rs::recover_imported_append_authority::execute	1
-crates/remanence-state/src/projector/index.rs::recover_imported_append_authority::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::reinstate_drive::execute	1
 crates/remanence-state/src/projector/index.rs::reinstate_drive::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::remember_audit_intent::execute	1
@@ -204,8 +202,6 @@ crates/remanence-state/src/projector/index.rs::upsert_tape_pool_projection_tx::m
 crates/remanence-state/src/projector/index.rs::upsert_wrap_map::execute	1
 crates/remanence-state/src/projector/index.rs::upsert_wrap_map::mutating-sql	1
 crates/remanence-state/src/projector/tape_log_projection.rs::<module>::mutating-sql	1
-crates/remanence-state/src/projector/tape_log_projection.rs::mark_repaired_tape::execute	1
-crates/remanence-state/src/projector/tape_log_projection.rs::mark_repaired_tape::mutating-sql	1
 crates/remanence-state/src/projector/tape_log_projection.rs::project_checkpoint_record::execute	1
 crates/remanence-state/src/projector/tape_log_projection.rs::project_checkpoint_record::mutating-sql	1
 crates/remanence-state/src/projector/tape_log_projection.rs::project_snapshot_rows::execute	8
@@ -213,9 +209,9 @@ crates/remanence-state/src/projector/tape_log_projection.rs::project_snapshot_ro
 crates/remanence-state/src/projector/tape_log_projection.rs::project_tape_log_bounded::execute	3
 crates/remanence-state/src/projector/tape_log_projection.rs::project_tape_log_bounded::execute_batch	1
 crates/remanence-state/src/projector/tape_log_projection.rs::project_tape_log_bounded::mutating-sql	3
-crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_repaired_tape_projection::execute	6
+crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_repaired_tape_projection::execute	5
 crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_repaired_tape_projection::execute_batch	2
-crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_repaired_tape_projection::mutating-sql	8
+crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_repaired_tape_projection::mutating-sql	7
 crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_tape_log_projection::execute	1
 crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_tape_log_projection::mutating-sql	1
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::execute	2

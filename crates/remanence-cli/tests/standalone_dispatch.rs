@@ -3877,6 +3877,328 @@ fn current_declared_reset_archives_authority_then_admits_fresh_write_and_read() 
     );
 }
 
+/// Every file and directory below `root`, as relative paths, sorted.
+fn state_tree(root: &Path) -> Vec<std::path::PathBuf> {
+    fn visit(root: &Path, path: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap().path();
+            out.push(entry.strip_prefix(root).unwrap().to_path_buf());
+            if entry.is_dir() {
+                visit(root, &entry, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Every row of every table, sorted: the logical content of a catalog. Opening state rewrites
+/// pages without changing a row, so the file bytes are not the measure after an open.
+fn sql_content(path: &Path) -> Vec<(String, Vec<String>)> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    let tables: Vec<String> = connection
+        .prepare("select name from sqlite_master where type = 'table' order by name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("select * from \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{:?}",
+                        (0..columns)
+                            .map(|i| row.get::<_, rusqlite::types::Value>(i).unwrap())
+                            .collect::<Vec<_>>()
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+/// Test 32L(1), ruling 32-L1: `rem-debug tape-log repair-tail` on a tape with a damaged suffix
+/// refuses with `TailRepairDeferred`, with and without `--confirm-discard-corrupt-tail`, before
+/// it opens state. The configuration differs from the last accepted one, so an open would append
+/// `ConfigurationAccepted` to the library log. SQL, the logs, the tree and the audit are unchanged.
+#[test]
+fn repair_tail_refuses_before_any_effect_with_and_without_confirmation() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let toml = format!(
+        r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "{0}/audit"
+fsync = true
+
+[index]
+sqlite_path = "{0}/index.sqlite"
+
+[cache]
+tape_catalog_dir = "{0}/cache"
+"#,
+        root.path().display()
+    );
+    std::fs::write(&config_path, &toml).unwrap();
+    // The first open accepts the configuration into the library log.
+    drop(remanence_state::StateHandle::open_from_config_file(&config_path).unwrap());
+    let config = remanence_state::load_config(&config_path).unwrap();
+    let id = [0x5a; 16];
+    let directory = config.journal.dir.join("tapes");
+    let authority =
+        remanence_state::TapeAuthority::open(&directory, id, &config.index.sqlite_path).unwrap();
+    {
+        let mut lease = authority.acquire_exclusive().unwrap();
+        lease
+            .publish_initialized(
+                262144,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+    }
+    drop(authority);
+    let log = directory.join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(&[0xff; 28])
+        .unwrap();
+    let report =
+        remanence_state::tape_log::store::Store::open(&directory, id, &config.index.sqlite_path)
+            .unwrap()
+            .inspect_tail()
+            .unwrap();
+    assert!(report.damage.is_some(), "the suffix is damaged");
+    let through = report.through_sequence;
+    // A configuration that differs from the last accepted one.
+    std::fs::write(
+        &config_path,
+        format!("{toml}\n[cleaning]\nvoltag_prefixes = [\"CLN\", \"CLX\"]\n"),
+    )
+    .unwrap();
+    let snapshot = || {
+        (
+            std::fs::read(&config.index.sqlite_path).unwrap(),
+            authority_hashes(&config),
+            state_tree(root.path()),
+        )
+    };
+    let before = snapshot();
+    let uuid = uuid::Uuid::from_bytes(id).to_string();
+    let through = through.to_string();
+    for confirm in [false, true] {
+        for rebuild in [false, true] {
+            let mut args = vec![
+                "rem-debug",
+                "tape-log",
+                "repair-tail",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--tape-uuid",
+                &uuid,
+                "--through-sequence",
+                &through,
+            ];
+            if confirm {
+                args.push("--confirm-discard-corrupt-tail");
+            }
+            if rebuild {
+                args.push("--rebuild-projection");
+            }
+            let (code, out, error) = offline_catalog_cli(&args);
+            assert_eq!(code, ExitCode::FAILURE, "{args:?}");
+            assert!(out.is_empty(), "{args:?}: {out}");
+            assert!(error.starts_with("TailRepairDeferred"), "{args:?}: {error}");
+            assert!(
+                !error.contains("requires --confirm-discard-corrupt-tail"),
+                "the refusal does not depend on the flags: {error}"
+            );
+            assert!(
+                snapshot() == before,
+                "{args:?}: state, logs or tree changed"
+            );
+        }
+    }
+    let names: Vec<_> = state_tree(root.path())
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.contains("repair") && !n.contains("archive")),
+        "no archive and no .repair-required: {names:?}"
+    );
+}
+
+/// Test 32L(2), ruling 32-L1: `rem tape import-journals --from DIR` refuses with
+/// `JournalImportDeferred` before it enumerates or opens any device, with and without an active
+/// fence on the tape. The transport factory records zero calls, nothing appears under the
+/// journal directory, and SQL is unchanged.
+#[test]
+fn import_journals_refuses_before_enumerating_or_opening_any_device() {
+    let root = tempfile::tempdir().unwrap();
+    let xdg = root.path().join("state");
+    let run = |extra: &[&str], calls: &std::cell::Cell<usize>| {
+        let mut args = vec!["rem", "--allow-untrusted-state-volume", "--json"];
+        args.extend_from_slice(extra);
+        let (mut out, mut errors) = (Vec::new(), Vec::new());
+        let code = remanence_cli::run_with_standalone_test_io(
+            &args,
+            root.path(),
+            &xdg,
+            &root.path().join("absent"),
+            &root.path().join("locks"),
+            vec![remanence_library::DeviceAttachment {
+                sg_path: "/dev/home-model".into(),
+                sysfs_path: "/sys/home-model".into(),
+            }],
+            |_: &Path| {
+                calls.set(calls.get() + 1);
+                Err(remanence_library::IoErrorKind::from(&std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                )))
+            },
+            &mut out,
+            &mut errors,
+        );
+        let response: serde_json::Value = serde_json::from_slice(
+            out.split(|b| *b == b'\n')
+                .rfind(|line| !line.is_empty())
+                .expect("response envelope"),
+        )
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&errors)));
+        (code, response)
+    };
+    let calls = std::cell::Cell::new(0);
+    // A configuration exists after the first standalone command; the factory is not needed for it.
+    let (code, response) = run(&["pool", "new", "archive", "--scheme", "none"], &calls);
+    assert_eq!(code, ExitCode::SUCCESS, "{response}");
+    let config_path = xdg.join("rem/config.toml");
+    let config = remanence_state::load_config(&config_path).unwrap();
+    let id = [0x41; 16];
+    {
+        let mut state = remanence_state::StateHandle::open_from_config_file(&config_path).unwrap();
+        state
+            .provision_tape_with_media(
+                remanence_state::ProvisionTapeInput {
+                    tape_uuid: id,
+                    voltag: "IMPORT1L9".into(),
+                    block_size: 262144,
+                    parity: remanence_parity::ParityConfig::None,
+                    force: false,
+                },
+                remanence_state::LabelProvenance::Operator,
+                remanence_state::MediaObservation::label_hint("IMPORT1L9"),
+            )
+            .unwrap();
+    }
+    // A source journal a previous host left: what a non-refusing import would publish.
+    let from = root.path().join("backup");
+    std::fs::create_dir_all(from.join("tapes")).unwrap();
+    {
+        let authority =
+            remanence_state::TapeAuthority::open_fixture(from.join("tapes"), id).unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        lease
+            .publish_initialized(
+                262144,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+    }
+    let from = from.to_str().unwrap().to_owned();
+    let journal_dir = config.journal.dir.clone();
+    for fenced in [false, true] {
+        if fenced {
+            remanence_state::projector::open(&config.index.sqlite_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap()
+                .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                    tape_uuid: id,
+                    barcode: Some("IMPORT1L9".into()),
+                    reason: "partial_batch".into(),
+                    evidence_json: None,
+                })
+                .unwrap();
+        }
+        let tree = state_tree(&journal_dir);
+        let sql = sql_content(&config.index.sqlite_path);
+        let hashes = authority_hashes(&config);
+        let (code, response) = run(
+            &[
+                "--device",
+                "/dev/home-model",
+                "--allow-device",
+                "HOME-DRIVE",
+                "tape",
+                "import-journals",
+                "--from",
+                &from,
+            ],
+            &calls,
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "fenced={fenced}: a device was opened: {response}"
+        );
+        assert_ne!(code, ExitCode::SUCCESS, "fenced={fenced}: {response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("JournalImportDeferred"),
+            "fenced={fenced}: {response}"
+        );
+        assert_eq!(state_tree(&journal_dir), tree, "fenced={fenced}");
+        assert_eq!(authority_hashes(&config), hashes, "fenced={fenced}");
+        assert!(
+            !remanence_state::TapeAuthority::exists(journal_dir.join("tapes"), id).unwrap(),
+            "fenced={fenced}: nothing was published"
+        );
+        assert!(
+            sql_content(&config.index.sqlite_path) == sql,
+            "fenced={fenced}: SQL changed"
+        );
+    }
+}
+
 #[test]
 fn corrupt_seal_or_decision_cannot_be_repaired_or_superseded_to_writable() {
     use remanence_state::tape_log::{
@@ -3943,10 +4265,7 @@ fn corrupt_seal_or_decision_cannot_be_repaired_or_superseded_to_writable() {
             "--rebuild-projection",
         ]);
         assert_ne!(code, ExitCode::SUCCESS);
-        assert!(
-            error.contains("separate explicit forensic recovery path"),
-            "{error}"
-        );
+        assert!(error.starts_with("TailRepairDeferred"), "{error}");
         let writes = f.writes();
         let (code, _, _) = f.run(
             &[

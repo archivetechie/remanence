@@ -586,22 +586,112 @@ fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
     );
     mount.release(mounted);
 }
-/// Idle removal preserves the absent journal so adoption can import its authority.
+/// Every file and directory below `path`, as relative paths, sorted.
+fn journal_tree(path: &Path) -> Vec<PathBuf> {
+    fn visit(root: &Path, path: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap().path();
+            out.push(entry.strip_prefix(root).unwrap().to_path_buf());
+            if entry.is_dir() {
+                visit(root, &entry, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(path, path, &mut out);
+    out.sort();
+    out
+}
+/// A source journal directory as a previous host leaves it: one initialized native log for the
+/// model tape. The import is refused before it is read; this is what a non-refusing import would
+/// have staged and published.
+fn source_journal(root: &Path, parity: crate::ParityConfig) -> PathBuf {
+    let source = state_with_parity(root, true, parity.clone());
+    let scheme = match parity {
+        crate::ParityConfig::Scheme(scheme) => Some(scheme),
+        _ => None,
+    };
+    let authority = remanence_state::TapeAuthority::open(
+        source.paths().journal_dir.join("tapes"),
+        UUID,
+        &source.paths().sqlite_path,
+    )
+    .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    lease
+        .publish_initialized(
+            BLOCK,
+            scheme,
+            remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    drop(lease);
+    source.paths().journal_dir.clone()
+}
+/// Ruling 32-L1: the import refuses before it checks, stages, publishes or writes anything,
+/// whatever the source or the tape's restrictions are.
+fn assert_import_refused(
+    mount: &mut OperatorMount<'_>,
+    mounted: &mut MountedTape,
+    from: &Path,
+    world: &SharedVirtualWorld,
+) {
+    let journal_dir = mount.state.paths().journal_dir.clone();
+    let sqlite = mount.state.paths().sqlite_path.clone();
+    let commands = world.lock().unwrap().command_log.len();
+    let tree = journal_tree(&journal_dir);
+    let sql = std::fs::read(&sqlite).unwrap();
+    let tape_state = mount
+        .state
+        .catalog()
+        .get_tape(&UUID)
+        .unwrap()
+        .unwrap()
+        .state;
+    let error = mount
+        .import_journals(mounted, from)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("JournalImportDeferred"), "{error}");
+    assert_eq!(
+        world.lock().unwrap().command_log.len(),
+        commands,
+        "the refusal sends no SCSI command"
+    );
+    assert_eq!(
+        journal_tree(&journal_dir),
+        tree,
+        "no staging directory and no publication"
+    );
+    assert!(!remanence_state::TapeAuthority::exists(journal_dir.join("tapes"), UUID).unwrap());
+    assert_eq!(
+        std::fs::read(&sqlite).unwrap(),
+        sql,
+        "SQL is byte-identical"
+    );
+    assert_eq!(
+        mount
+            .state
+            .catalog()
+            .get_tape(&UUID)
+            .unwrap()
+            .unwrap()
+            .state,
+        tape_state
+    );
+}
+
+/// Idle removal leaves the adopted tape without a journal, and ruling 32-L1 then refuses the
+/// import of any journal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adopted_idle_unload_preserves_journal_import() {
+async fn adopted_idle_unload_leaves_the_journal_absent_and_import_is_refused() {
     let root = tempfile::tempdir().unwrap();
-    let mut original = state(&root.path().join("original"));
+    let from = source_journal(&root.path().join("original"), crate::ParityConfig::None);
     let world = world();
     let lock = root.path().join("locks");
-    let from = original.paths().journal_dir.clone();
-    let mut mount = backend(&mut original, &world, &lock, fault()).unwrap();
-    let mounted = mount.mount(target()).unwrap();
-    let (mut actor, reopen_state) = own_mount!(mount, mounted, original);
-    actor
-        .write_checkpointed(request(root.path(), "first"))
-        .unwrap();
-    let _ = actor.finish();
-    drop(reopen_state());
     let mut adopted = adopted_state(&root.path().join("new-host"), crate::ParityConfig::None);
     crate::write_owner::tests::unload_adopted_cartridge(&adopted, world.clone(), UUID).await;
     {
@@ -612,65 +702,28 @@ async fn adopted_idle_unload_preserves_journal_import() {
     }
     let mut mount = backend(&mut adopted, &world, &lock, fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
-    mount.import_journals(&mut mounted, &from).unwrap();
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
     mount.release(mounted);
 }
 
+/// Ruling 32-L1: a journal import, repeated or not, is refused before any effect and grants no
+/// append authority, so the adopted tape stays `recovery_required`.
 #[test]
-fn imported_checkpoint_authorizes_append_and_conflicting_import_is_refused() {
+fn journal_import_is_refused_before_any_effect_and_authorizes_no_append() {
     let root = tempfile::tempdir().unwrap();
-    let mut state = state(&root.path().join("original"));
+    let from = source_journal(&root.path().join("original"), crate::ParityConfig::None);
     let world = world();
     let lock = root.path().join("locks");
-    let from = state.paths().journal_dir.clone();
-    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mounted = mount.mount(target()).unwrap();
-    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
-    actor
-        .write_checkpointed(request(root.path(), "first"))
-        .unwrap();
-    let _ = actor.finish();
-    let state = reopen_state();
-    drop(state);
     let mut state = adopted_state(&root.path().join("new-host"), crate::ParityConfig::None);
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
-    mount.import_journals(&mut mounted, &from).unwrap();
-    mount.import_journals(&mut mounted, &from).unwrap();
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
     mount.release(mounted);
-    let paths = state.paths().clone();
-    let config = state.config().clone();
-    drop(state);
-    let mut state = StateHandle::open_with_config(paths, config).unwrap();
-    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mounted = mount.mount(target()).unwrap();
-    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
-    actor
-        .write_checkpointed(request(root.path(), "second"))
-        .unwrap();
-    let _ = actor.finish();
-    let mut state = reopen_state();
-    let mut mount = self::backend(
-        &mut state,
-        &world,
-        &root.path().join("locks"),
-        self::fault(),
-    )
-    .unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    assert!(mount.import_journals(&mut mounted, &from).is_err());
-    let output = root.path().join("restored");
-    let report = crate::scan_and_restore(&mut mounted.drive, &output, None).unwrap();
     assert_eq!(
-        report["candidates"].as_array().unwrap().len(),
-        2,
-        "{report}"
+        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
+        "recovery_required"
     );
-    assert_eq!(
-        std::fs::read(output.join("candidate-2/second")).unwrap(),
-        b"second"
-    );
-    mount.release(mounted);
 }
 
 #[test]
@@ -744,8 +797,10 @@ fn position_overflow_refuses_without_motion_and_reservation_is_opt_in() {
         .any(|value| value == &ciborium::Value::Text("release_drive".into()))));
 }
 
+/// Ruling 32-L1: the refusal does not look at the source, so a missing log and a complete one are
+/// refused alike and nothing is published to the destination.
 #[test]
-fn parity_import_rejects_a_missing_log_and_validates_the_complete_log() {
+fn parity_import_is_refused_whether_or_not_the_source_log_is_present() {
     let root = tempfile::tempdir().unwrap();
     let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
         id: remanence_parity::SchemeId::new_static("p4-import"),
@@ -753,7 +808,6 @@ fn parity_import_rejects_a_missing_log_and_validates_the_complete_log() {
         parity_blocks_per_stripe: 1,
         stripes_per_neighborhood: 1,
     });
-    let mut state = state_with_parity(&root.path().join("original"), true, parity.clone());
     let world = world();
     let bootstrap =
         crate::build_tape_bootstrap(UUID, BLOCK, parity.clone(), "2026-10-15T00:00:00Z", "P4");
@@ -761,43 +815,20 @@ fn parity_import_rejects_a_missing_log_and_validates_the_complete_log() {
     remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut block).unwrap();
     world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(block);
     let lock = root.path().join("locks");
-    let from = state.paths().journal_dir.clone();
-    let partner = state
-        .paths()
-        .journal_dir
+    let from = source_journal(&root.path().join("original"), parity.clone());
+    let partner = from
         .join("tapes")
         .join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()));
-    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mounted = mount.mount(target()).unwrap();
-    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
-    actor
-        .write_checkpointed(request(root.path(), "first"))
-        .unwrap();
-    let _ = actor.finish();
-    let state = reopen_state();
-    drop(state);
     let mut state = adopted_state(&root.path().join("new-host"), parity);
     let destination = state.paths().journal_dir.join("tapes");
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
     let hidden = remanence_state::authority::row_fixtures::hide_authority(&partner).unwrap();
-    assert!(mount.import_journals(&mut mounted, &from).is_err());
-    assert!(!remanence_state::TapeAuthority::exists(&destination, UUID).unwrap());
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
     hidden.restore().unwrap();
-    mount.import_journals(&mut mounted, &from).unwrap();
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
+    assert!(!remanence_state::TapeAuthority::exists(&destination, UUID).unwrap());
     mount.release(mounted);
-    let paths = state.paths().clone();
-    let config = state.config().clone();
-    drop(state);
-    let mut state = StateHandle::open_with_config(paths, config).unwrap();
-    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mounted = mount.mount(target()).unwrap();
-    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
-    actor
-        .write_checkpointed(request(root.path(), "second"))
-        .unwrap();
-    let _ = actor.finish();
-    drop(reopen_state());
 }
 
 #[test]
@@ -1373,21 +1404,13 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
     assert!(state.calibration_control().row(library_tape).write_epoch > before);
 }
 
+/// Ruling 32-L1: the refusal does not depend on the tape's fence or seal, and an import that is
+/// refused leaves the quarantine and terminal restrictions exactly as they were.
 #[test]
 fn imported_authority_preserves_quarantine_and_terminal_restrictions() {
     let root = tempfile::tempdir().unwrap();
-    let mut state = state(&root.path().join("source"));
+    let from = source_journal(&root.path().join("source"), crate::ParityConfig::None);
     let world = world();
-    let from = state.paths().journal_dir.clone();
-    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-    let mounted = mount.mount(target()).unwrap();
-    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
-    actor
-        .write_checkpointed(request(root.path(), "first"))
-        .unwrap();
-    let _ = actor.finish();
-    let state = reopen_state();
-    drop(state);
     for restricted in ["fence", "sealed"] {
         let mut state = adopted_state(&root.path().join(restricted), crate::ParityConfig::None);
         let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
@@ -1406,7 +1429,7 @@ fn imported_authority_preserves_quarantine_and_terminal_restrictions() {
         } else {
             mount.state.write_handle().seal_tape(UUID).unwrap();
         }
-        assert!(mount.import_journals(&mut mounted, &from).is_err());
+        assert_import_refused(&mut mount, &mut mounted, &from, &world);
         let tape = mount.state.catalog().get_tape(&UUID).unwrap().unwrap();
         assert_eq!(
             tape.state,
@@ -1922,7 +1945,7 @@ fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_object
             .import_journals(&mut mounted, &backup.join("journals"))
             .unwrap_err()
             .to_string();
-        assert!(error.contains(&id), "{error}");
+        assert!(error.starts_with("JournalImportDeferred"), "{error}");
         mount.release(mounted);
         assert!(!remanence_state::TapeAuthority::exists(destination.join("tapes"), UUID).unwrap());
         drop(new_host);

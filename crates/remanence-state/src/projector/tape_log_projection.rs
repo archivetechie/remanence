@@ -358,21 +358,15 @@ impl CatalogCore {
         }
         Ok(())
     }
-    /// Make the physical repair requirement visible even without a SQL rebuild.
-    pub(crate) fn mark_repaired_tape(&mut self, uuid: [u8; 16]) -> Result<(), StateError> {
-        self.conn.execute("update tapes set state = case when state in ('sealed', 'retired') then state else 'recovery_required' end where tape_uuid = ?1", params![uuid.as_slice()]).map_err(|e| sqlite_error("fence repaired tape projection", e))?;
-        Ok(())
-    }
     /// Replace only a repaired tape's derived rows; authority was archived and
     /// remains physically fenced until the operator proves its append tail.
     ///
     /// This explicit rebuild is the one projection that may lower the written
     /// extent: it re-derives every row of the tape from the retained prefix
-    /// alone. The tape is left `recovery_required` and admits no append until
-    /// supersede-tail proves the physical tail, which supersedes everything
-    /// beyond the retained cursor; appends then resume there and the extent
-    /// grows monotonically again. A full catalog rebuild likewise has no prior
-    /// extent and derives it from each log.
+    /// alone. It does not change the tape's state. Ruling 32-L1 refuses tail
+    /// repair before any effect, so no production path calls it until the library
+    /// log records repairs. A full catalog rebuild likewise has no prior extent
+    /// and derives it from each log.
     pub fn rebuild_repaired_tape_projection(
         &mut self,
         snapshot: &AuthoritySnapshot,
@@ -407,7 +401,6 @@ impl CatalogCore {
         }
         tx.execute("update tapes set highest_protected_ordinal = ?2, total_committed_ordinals = ?2, last_committed_tape_file = null, written_extent_lba = null, finalization_progress = null, finalization_trigger = null, finalization_operation_id = null, finalization_edition_digest = null, finalization_layout_digest = null, finalization_outcome = null, completed_replicas = null, seal_due = null where tape_uuid = ?1", params![uuid.as_slice(), SqliteU64::new(0)]).map_err(|e| sqlite_error("reset repaired tape counters", e))?;
         project_snapshot(&tx, snapshot)?;
-        tx.execute("update tapes set state = case when state in ('sealed', 'retired') then state else 'recovery_required' end where tape_uuid = ?1", params![uuid.as_slice()]).map_err(|e| sqlite_error("fence repaired tape projection", e))?;
         tx.execute("delete from object_files where object_id in (select object_id from repaired_objects) and object_id not in (select object_id from object_instances)", []).map_err(|e| sqlite_error("remove repaired orphan members", e))?;
         tx.execute("delete from objects where object_id in (select object_id from repaired_objects) and object_id not in (select object_id from object_instances)", []).map_err(|e| sqlite_error("remove repaired orphan objects", e))?;
         tx.execute_batch("drop table repaired_objects")

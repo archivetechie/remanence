@@ -1427,50 +1427,19 @@ fn run_tape_log(command: &TapeLogCommand, out: &mut dyn Write, err: &mut dyn Wri
             }
         };
     }
-    let TapeLogCommand::RepairTail {
-        config,
-        tape_uuid,
-        through_sequence,
-        confirm_discard_corrupt_tail,
-        rebuild_projection,
-    } = command
-    else {
+    let TapeLogCommand::RepairTail { .. } = command else {
         unreachable!("inspection handled above")
     };
-    if !confirm_discard_corrupt_tail {
-        let _ = writeln!(err, "repair-tail requires --confirm-discard-corrupt-tail");
-        return ExitCode::FAILURE;
-    }
-    let result =
-        remanence_state::StateHandle::open_from_config_file(config).and_then(|mut state| {
-            state.repair_tape_log_tail(
-                *tape_uuid.as_bytes(),
-                *through_sequence,
-                *rebuild_projection,
-            )
-        });
-    match result {
-        Ok(evidence) => {
-            let _ = writeln!(
-                out,
-                "{}",
-                serde_json::json!({
-                    "tape_uuid": tape_uuid.to_string(), "tape_incarnation": 1,
-                    "through_sequence": evidence.through_sequence.to_string(),
-                    "archive": evidence.archive, "archive_sha256": bytes_to_hex(&evidence.digest),
-                    "reconciliation_record": evidence.reconciliation_record,
-                    "original_bytes": evidence.original_len.to_string(), "retained_bytes": evidence.retained_end.to_string(),
-                    "projection_rebuilt": rebuild_projection,
-                    "physical_tail_reconciliation_required": true,
-                })
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            let _ = writeln!(err, "repair-tail: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    // Ruling 32-L1: the library log does not yet record a tail repair, so the command refuses
+    // here, first, before the confirmation flag is read and before any state is opened (an
+    // open replays, projects and may append `ConfigurationAccepted`). The refusal does not
+    // depend on the flags.
+    let _ = writeln!(
+        err,
+        "{}",
+        remanence_state::library_runtime::TAIL_REPAIR_DEFERRED
+    );
+    ExitCode::FAILURE
 }
 
 #[derive(Subcommand, Debug)]
@@ -28453,30 +28422,33 @@ fn proto_fence_json(record: &pb::TapeIoFence) -> serde_json::Value {
 #[cfg(test)]
 mod tape_log_cli_tests {
     use super::*;
+    /// Ruling 32-L1: repair-tail refuses first, whatever the flags: it does not read the
+    /// confirmation flag and does not open state.
     #[test]
-    fn repair_tail_requires_confirmation_before_opening_state() {
+    fn repair_tail_refuses_before_reading_the_flags_or_opening_state() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("absent.toml");
-        let mut out = Vec::new();
-        let mut error = Vec::new();
-        let result = run_tape_log(
-            &TapeLogCommand::RepairTail {
-                config: config.clone(),
-                tape_uuid: uuid::Uuid::from_bytes([0x77; 16]),
-                through_sequence: 4,
-                confirm_discard_corrupt_tail: false,
-                rebuild_projection: true,
-            },
-            &mut out,
-            &mut error,
-        );
-        assert_eq!(result, ExitCode::FAILURE);
-        assert_eq!(
-            String::from_utf8(error).unwrap(),
-            "repair-tail requires --confirm-discard-corrupt-tail\n"
-        );
-        assert!(out.is_empty());
-        assert!(!config.exists());
+        for confirm_discard_corrupt_tail in [false, true] {
+            let mut out = Vec::new();
+            let mut error = Vec::new();
+            let result = run_tape_log(
+                &TapeLogCommand::RepairTail {
+                    config: config.clone(),
+                    tape_uuid: uuid::Uuid::from_bytes([0x77; 16]),
+                    through_sequence: 4,
+                    confirm_discard_corrupt_tail,
+                    rebuild_projection: true,
+                },
+                &mut out,
+                &mut error,
+            );
+            assert_eq!(result, ExitCode::FAILURE);
+            let error = String::from_utf8(error).unwrap();
+            assert!(error.starts_with("TailRepairDeferred"), "{error}");
+            assert!(!error.contains("--confirm-discard-corrupt-tail"));
+            assert!(out.is_empty());
+            assert!(!config.exists());
+        }
     }
     /// BOT content is read-only, but its mount and return are real robotics and
     /// use the same typed authority before the first command.

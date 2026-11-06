@@ -39,7 +39,6 @@ crates/remanence-api/src/mount.rs::recover_automatic_terminal_tape::write_handle
 # Existing service closeout obligation writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/mount.rs::service_closeout_obligation::write_handle	1
 # Standalone recovery and tape-log projection require writer capabilities.
-crates/remanence-api/src/mount_support.rs::import_journals::write_handle	2
 # Persist the existing standalone fence through the state owner.
 crates/remanence-api/src/mount_support.rs::raise_standalone_fence::write_handle	1
 # Replay existing checkpoint authority through the state owner.

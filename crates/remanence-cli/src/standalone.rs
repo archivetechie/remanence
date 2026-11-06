@@ -1211,6 +1211,16 @@ where
         )?;
         return Ok(json!({"tape":uuid,"pool":pool}));
     }
+    // Ruling 32-L1: the library log does not yet record an authority import. Refuse here, beside
+    // the `--tape` assignment above, before device enumeration, any transport, the backend and
+    // the mount, so no device is opened and no SCSI command is sent. The refusal does not
+    // depend on the fence state.
+    if let Command::Tape {
+        command: Tape::ImportJournals { .. },
+    } = &cli.command
+    {
+        return Err(remanence_api::mount_support::JOURNAL_IMPORT_DEFERRED.into());
+    }
     let mut health = matches!(cli.command, Command::Setup { .. } | Command::Doctor)
         .then(|| doctor(env, &config));
     let enumeration = enumeration().map_err(err)?;
@@ -1903,10 +1913,7 @@ where
                     })
                     .map_err(err),
                 Tape::SupersedeTail { .. } => unreachable!("actor dispatch"),
-                Tape::ImportJournals { from } => {
-                    backend.import_journals(&mut mounted, from).map_err(err)?;
-                    Ok(json!({"imported_from":from}))
-                }
+                Tape::ImportJournals { .. } => unreachable!("refused before enumeration"),
                 Tape::Finalize { .. } => unreachable!("actor dispatch"),
                 _ => unreachable!("pre-mount command"),
             }

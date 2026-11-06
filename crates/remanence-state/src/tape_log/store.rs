@@ -489,6 +489,8 @@ impl Store {
     }
     /// Validate the proposed retained prefix without archiving or replacing any
     /// bytes, so the state owner can protect accepted terminal obligations first.
+    // Only the L2 repair path (ruling 32) calls this in production; test-only until then.
+    #[cfg(test)]
     pub(crate) fn preview_repair(
         &self,
         through: u64,

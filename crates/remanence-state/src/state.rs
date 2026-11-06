@@ -5318,8 +5318,10 @@ mod cutover_tests {
         }
     }
 
+    /// Ruling 32-L1: tail repair refuses before it reads, replays, archives or writes anything, so
+    /// a torn tail on a projected tape is left exactly as found, with and without a rebuild.
     #[test]
-    fn repair_without_rebuild_marks_ready_projection_recovery_required() {
+    fn repair_is_refused_before_any_effect_and_leaves_the_projection_ready() {
         use crate::authority::{TapeAuthorityView, TapeAuthorityWriter};
         use std::io::Write;
         let (_root, config) = setup();
@@ -5339,20 +5341,39 @@ mod cutover_tests {
         let path = directory.join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
         std::fs::OpenOptions::new()
             .append(true)
-            .open(path)
+            .open(&path)
             .unwrap()
             .write_all(b"torn")
             .unwrap();
         drop(state);
         let mut state = StateHandle::open_from_config_file(&config).unwrap();
-        state.repair_tape_log_tail(id, through, false).unwrap();
-        assert_eq!(
-            state.index.get_tape(&id).unwrap().unwrap().state,
-            "recovery_required"
-        );
-        assert!(authority.acquire_exclusive().is_err());
+        let tape_state = state.index.get_tape(&id).unwrap().unwrap().state;
+        assert_eq!(tape_state, "ready");
+        let mut before = BTreeMap::new();
+        for root in [&state.paths.journal_dir, &state.paths.audit_dir] {
+            hash_files(root, &mut before);
+        }
+        for rebuild in [false, true] {
+            let error = state
+                .repair_tape_log_tail(id, through, rebuild)
+                .unwrap_err();
+            assert!(error.to_string().contains("TailRepairDeferred"), "{error}");
+            let mut after = BTreeMap::new();
+            for root in [&state.paths.journal_dir, &state.paths.audit_dir] {
+                hash_files(root, &mut after);
+            }
+            assert_eq!(after, before, "no archive, fence or byte changed");
+            assert!(!path.with_extension("repair-required").exists());
+            assert_eq!(
+                state.index.get_tape(&id).unwrap().unwrap().state,
+                tape_state
+            );
+            assert_eq!(state.index.projected_through_sequence(id).unwrap(), through);
+        }
     }
 
+    /// Ruling 32-L1: a log whose seal or decision is corrupt is not repaired either; the refusal
+    /// comes before any authority or catalog row is touched.
     #[test]
     fn repair_refuses_corrupt_seal_or_decision_before_changing_authority() {
         use crate::authority::{TapeAuthorityView, TapeAuthorityWriter};
@@ -5398,13 +5419,13 @@ mod cutover_tests {
                 crate::tape_log::store::Store::open(&directory, id, &state.paths.sqlite_path)
                     .unwrap();
             let through = store.inspect_tail().unwrap().through_sequence;
+            let mut before = BTreeMap::new();
+            hash_files(&state.paths.journal_dir, &mut before);
             let error = state.repair_tape_log_tail(id, through, true).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("separate explicit forensic recovery path"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("TailRepairDeferred"), "{error}");
+            let mut after = BTreeMap::new();
+            hash_files(&state.paths.journal_dir, &mut after);
+            assert_eq!(after, before, "no archive, fence or byte changed");
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert_eq!(state.index.get_tape(&id).unwrap().unwrap().state, "sealed");
             assert!(authority.acquire_for_tail_reconciliation().is_err());

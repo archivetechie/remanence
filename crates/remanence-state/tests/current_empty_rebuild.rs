@@ -299,8 +299,11 @@ fn current_empty_rebuild_readiness_operation_and_load_budget_lost() {
         .is_empty());
 }
 
+/// Ruling 32-L1: tail repair is refused before any effect, so a damaged tail is never cut and the
+/// projection floor stays where the log put it. (A repair that lowers the floor, and the empty
+/// rebuild that must then keep it, return with the library log's repair record.)
 #[test]
-fn current_empty_rebuild_repair_projection_floor_kept() {
+fn current_empty_rebuild_repair_is_refused_and_leaves_the_projection_floor() {
     let mut s = State::new();
     let id = [0xa1; 16];
     let path = s
@@ -315,7 +318,8 @@ fn current_empty_rebuild_repair_projection_floor_kept() {
     )
     .unwrap();
     s.state().startup_replay().unwrap();
-    assert!(s.index().projected_through_sequence(id).unwrap() > 1);
+    let floor = s.index().projected_through_sequence(id).unwrap();
+    assert!(floor > 1);
     let mut bytes = fs::read(&path).unwrap();
     let mut cursor = std::io::Cursor::new(&bytes);
     tape_log::store::Header::decode(&mut cursor, id).unwrap();
@@ -323,11 +327,16 @@ fn current_empty_rebuild_repair_projection_floor_kept() {
     let mut decoder = tape_log::codec::Decoder::at(cursor, 1, offset);
     let next = decoder.next_frame().unwrap().unwrap().end as usize;
     bytes[next + tape_log::PREFIX_LEN] ^= 0x80;
-    fs::write(&path, bytes).unwrap();
-    s.state().repair_tape_log_tail(id, 1, true).unwrap();
-    assert_eq!(s.index().projected_through_sequence(id).unwrap(), 1);
-    s.empty_rebuild();
-    assert_eq!(s.index().projected_through_sequence(id).unwrap(), 1);
+    fs::write(&path, &bytes).unwrap();
+    let error = s.state().repair_tape_log_tail(id, 1, true).unwrap_err();
+    assert!(error.to_string().contains("TailRepairDeferred"), "{error}");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the damaged log is untouched"
+    );
+    assert!(!path.with_extension("repair-required").exists());
+    assert_eq!(s.index().projected_through_sequence(id).unwrap(), floor);
 }
 
 /// Retirement wins over an older native seal, even with an empty projection.

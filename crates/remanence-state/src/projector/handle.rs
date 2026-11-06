@@ -711,7 +711,9 @@ impl CatalogIndex {
             core.project_native_object_append_commit(object, files, instances, tape_input, bundle)
         })
     }
-    /// Clear only append recovery after replaying the imported authority pair.
+    /// Replay the imported authority pair and check its restrictions. It writes
+    /// nothing: ruling 32-L1 removed the SQL clear of append recovery, because
+    /// journal import refuses before any effect until the library log records it.
     /// An active quarantine or any terminal-finalization state remains a refusal.
     pub fn recover_imported_append_authority(
         &mut self,
@@ -1178,26 +1180,23 @@ impl CatalogIndex {
     /// A repair cannot erase accepted terminal obligations recorded in SQLite,
     /// including surviving idempotency/operation rows. Forensic recovery is a
     /// separate operator decision outside the step-2 repair/supersede paths.
+    // Only the L2 repair path (ruling 32) calls this in production; test-only until then.
+    #[cfg(test)]
     pub(crate) fn validate_repair_prefix(
         &self,
         snapshot: &AuthoritySnapshot,
     ) -> Result<(), StateError> {
         self.with_core(|core| core.validate_repair_prefix(snapshot))
     }
-    /// Make the physical repair requirement visible even without a SQL rebuild.
-    pub(crate) fn mark_repaired_tape(&mut self, uuid: [u8; 16]) -> Result<(), StateError> {
-        self.with_core(|core| core.mark_repaired_tape(uuid))
-    }
     /// Replace only a repaired tape's derived rows; authority was archived and
     /// remains physically fenced until the operator proves its append tail.
     ///
     /// This explicit rebuild is the one projection that may lower the written
     /// extent: it re-derives every row of the tape from the retained prefix
-    /// alone. The tape is left `recovery_required` and admits no append until
-    /// supersede-tail proves the physical tail, which supersedes everything
-    /// beyond the retained cursor; appends then resume there and the extent
-    /// grows monotonically again. A full catalog rebuild likewise has no prior
-    /// extent and derives it from each log.
+    /// alone. It does not change the tape's state. Ruling 32-L1 refuses tail
+    /// repair before any effect, so no production path calls it until the library
+    /// log records repairs. A full catalog rebuild likewise has no prior extent
+    /// and derives it from each log.
     pub fn rebuild_repaired_tape_projection(
         &mut self,
         snapshot: &AuthoritySnapshot,

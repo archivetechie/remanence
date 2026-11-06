@@ -6,7 +6,6 @@ use remanence_library::{
     AccessPolicy, DriveHandle, DriveHandleSource, DriveKey, LibraryHandle, MediaFamily,
     MediaReadinessWaitOptions, SgTransport, StaticAllowlist,
 };
-use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{CatalogIndex, GenerationSource, LabelProvenance, StateHandle};
 use std::{
     fs::{File, OpenOptions},
@@ -963,135 +962,21 @@ impl MountBackend for ChangerMount<'_> {
 }
 
 impl OperatorMount<'_> {
-    /// Import append authority only after replay validates the checkpoint and
-    /// parity journals together. Publish parity first and checkpoint last so a
-    /// crash can leave only an incomplete (therefore refused) authority pair.
+    /// Ruling 32-L1: the library log does not yet record an authority import, so
+    /// import refuses before it checks, stages, publishes or writes anything. The
+    /// CLI refuses earlier, before it enumerates or opens a device; this is the
+    /// second line of defence and is unreachable from any production caller.
     pub fn import_journals(
         &mut self,
-        mounted: &mut MountedTape,
-        from: &Path,
+        _mounted: &mut MountedTape,
+        _from: &Path,
     ) -> Result<(), MountError> {
-        self.require_durable_mount(mounted)?;
-        standalone_fence_policy(
-            self.state.catalog(),
-            Some(mounted.tape_uuid),
-            mounted.endpoint.durable_key(),
-            true,
-        )?;
-        mounted.drive.rewind().map_err(refusal)?;
-        crate::verify_tape_identity(
-            &mut DriveHandleSource(&mut mounted.drive),
-            &mounted.tape_uuid,
-        )
-        .map_err(refusal)?;
-        let tape = self
-            .state
-            .catalog()
-            .get_tape(&mounted.tape_uuid)
-            .map_err(refusal)?
-            .ok_or_else(|| refusal("adopt this tape before importing journals"))?;
-        let (block_size, parity) = crate::pool_write::selected_tape_geometry(
-            &tape,
-            tape.pool_id.as_deref().unwrap_or("(unpooled)"),
-        )
-        .map_err(refusal)?;
-        let source_dir = from.join("tapes");
-        if !source_dir.is_dir() {
-            return Err(refusal("import source has no checkpoints directory"));
-        }
-        let source = remanence_state::TapeAuthority::open(
-            source_dir,
-            mounted.tape_uuid,
-            &self.state.paths().sqlite_path,
-        )
-        .map_err(refusal)?;
-        if !source.is_regular_import_source().map_err(refusal)? {
-            return Err(refusal(
-                "import checkpoint must be an existing regular file",
-            ));
-        }
-        let _source_lease = source.acquire_exclusive().map_err(refusal)?;
-        if _source_lease
-            .pending_finalization()
-            .map_err(refusal)?
-            .is_some()
-        {
-            return Err(refusal("pending terminal intent requires complete state recovery, not append journal import"));
-        }
-        let journal_dir = self.state.paths().journal_dir.clone();
-        let staging = tempfile::tempdir_in(&journal_dir).map_err(refusal)?;
-        let checkpoints = staging.path().join("tapes");
-        std::fs::create_dir(&checkpoints).map_err(refusal)?;
-        let checkpoint_publication = source
-            .stage_import_member(&checkpoints, &journal_dir.join("tapes"))
-            .map_err(refusal)?;
-        let staged = remanence_state::TapeAuthority::open(
-            &checkpoints,
-            mounted.tape_uuid,
-            &self.state.paths().sqlite_path,
-        )
-        .map_err(refusal)?;
-        let lease = staged.acquire_exclusive().map_err(refusal)?;
-        let last = lease
-            .latest_commit()
-            .map_err(refusal)?
-            .ok_or_else(|| refusal("import requires a nonempty checkpoint journal"))?;
-
-        let mut publications = Vec::new();
-        if let remanence_parity::ParityConfig::Scheme(ref scheme) = parity {
-            let journal = lease
-                .open_structural(block_size, scheme.clone())
-                .map_err(refusal)?;
-            let snapshot = journal.freeze().map_err(refusal)?;
-            let summary =
-                remanence_parity::checked_bounded_resume_summary(&snapshot).map_err(refusal)?;
-            lease
-                .validate_resume_rows(&journal, false, summary.committed_tape_file_count)
-                .map_err(|e| refusal(format!("import journal authority: {e:?}")))?;
-        } else {
-            remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&lease)
-                .map_err(refusal)?;
-        }
-        let ctx = crate::append_admission::context(
-            mounted.tape_uuid,
-            block_size,
-            last.cursor.partition,
-            last.cursor.lba,
-        );
-        let _admission = crate::append_admission::admit_append_boundary(
-            &mut mounted.drive,
-            crate::append_admission::AppendAuthority::Checkpoint { eod: ctx.boundary },
-            ctx,
-        )
-        .map_err(refusal)?;
-        let destination = journal_dir.join("tapes");
-        std::fs::create_dir_all(&destination).map_err(refusal)?;
-        publications.push(checkpoint_publication);
-        remanence_state::authority::publish_import_authority(&publications).map_err(refusal)?;
-        let parity_journal = match &parity {
-            remanence_parity::ParityConfig::None => None,
-            remanence_parity::ParityConfig::Scheme(scheme) => Some(
-                lease
-                    .open_structural(block_size, scheme.clone())
-                    .map_err(refusal)?,
-            ),
-        };
-        self.state
-            .write_handle()
-            .recover_imported_append_authority(
-                &lease,
-                parity_journal.as_deref(),
-                mounted.endpoint.durable_key().expect("durable mount"),
-            )
-            .map_err(refusal)?;
-        self.state
-            .write_handle()
-            .project_tape_log(&lease.freeze().map_err(refusal)?)
-            .map_err(refusal)?;
-        self.flush_audit()?;
-        Ok(())
+        Err(refusal(JOURNAL_IMPORT_DEFERRED))
     }
 }
+/// Error text of the 32-L1 refusal of a journal import. The text starts with the code.
+pub const JOURNAL_IMPORT_DEFERRED: &str =
+    "JournalImportDeferred: importing checkpoint journals is deferred; nothing was imported or changed";
 /// Sync uncertainty evidence before projecting its tape and endpoint fence.
 pub(crate) fn raise_standalone_fence(
     state: &mut StateHandle,

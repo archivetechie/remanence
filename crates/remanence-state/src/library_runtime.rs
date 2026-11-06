@@ -22,6 +22,10 @@ use std::sync::{
     Arc, Mutex,
 };
 
+/// Error text of the 32-L1 refusal of a tape-log tail repair. The text starts with the code.
+pub const TAIL_REPAIR_DEFERRED: &str =
+    "TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed";
+
 /// Typed errors retain the distinction between semantic refusal and authority
 /// storage failure needed by continuation-LOAD compensation.
 #[derive(Debug, thiserror::Error)]
@@ -395,87 +399,23 @@ impl LibraryRuntime {
         Ok(report)
     }
 
-    /// Serialize explicit native repair with every library append. The floor
-    /// includes received pending dependencies, independent of SQL and current
-    /// application status. Replace the frozen view even when its prefix shrinks.
+    /// Ruling 32-L1: the library log does not yet record a tail repair, so native
+    /// repair refuses before it reads, replays, archives or writes anything. The
+    /// CLI refuses earlier, before it opens state; this is the second line of
+    /// defence and is unreachable from any production caller.
     pub(crate) fn repair_native(
         &self,
-        index: &mut crate::CatalogIndex,
-        tape: lib::TapeRef,
-        through: u64,
-        rebuild: bool,
+        _index: &mut crate::CatalogIndex,
+        _tape: lib::TapeRef,
+        _through: u64,
+        _rebuild: bool,
     ) -> Result<crate::tape_log::store::RepairEvidence, RuntimeError> {
-        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
-        let view = self
-            .0
-            .view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let replay = self
-            .0
-            .authority
-            .snapshot()?
-            .replay(&view, &mut |_| Ok(()))
-            .map_err(AuthorityError::Store)?;
-        if let Some(highest) = replay.fold.highest_reference(tape) {
-            if through < highest {
-                return Err(AuthorityError::Store(StoreError::Fold(
-                    lib::FoldError::RepairBelowReference { highest },
-                ))
-                .into());
-            }
-        }
-        if replay.refusal.is_some() {
-            return Err(StateError::JournalReplayFailed(
-                "library replay refuses native repair".into(),
-            )
-            .into());
-        }
-        let projected = index.projected_through_sequence(tape.uuid)?;
-        let store = crate::tape_log::store::Store::open(
-            self.0.manifest.tape_root(),
-            tape.uuid,
-            index.path(),
+        Err(
+            StateError::from(crate::tape_log::store::StoreError::Refused(
+                TAIL_REPAIR_DEFERRED,
+            ))
+            .into(),
         )
-        .map_err(StateError::from)?;
-        let retained = crate::tape_log::authority::AuthoritySnapshot::new(
-            store.preview_repair(through).map_err(StateError::from)?,
-        )?;
-        index.validate_repair_prefix(&retained)?;
-        let evidence = store
-            .repair_tail(through, if rebuild { 0 } else { projected })
-            .map_err(StateError::from)?;
-        // Physical repair is now durable. Publish the exact retained view before
-        // a fallible projector call, and prohibit further motion on any failure.
-        let result = (|| -> Result<(), RuntimeError> {
-            let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(
-                store.snapshot().map_err(StateError::from)?,
-            )?;
-            self.0
-                .view
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replace_authoritative(snapshot.raw.clone())
-                .map_err(StateError::from)?;
-            self.0
-                .ack_progress
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&tape.uuid);
-            self.0.projection_dirty.store(true, Ordering::Release);
-            if rebuild {
-                index.rebuild_repaired_tape_projection(&snapshot)?;
-            } else {
-                index.mark_repaired_tape(tape.uuid)?;
-            }
-            self.catch_up_locked()
-        })();
-        if result.is_err() {
-            self.0.motion_fenced.store(true, Ordering::Release);
-        }
-        result?;
-        Ok(evidence)
     }
 
     /// Motion admission must check this before any CDB, including compensation.

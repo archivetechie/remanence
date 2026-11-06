@@ -3606,7 +3606,9 @@ impl CatalogCore {
         Ok(report)
     }
 
-    /// Clear only append recovery after replaying the imported authority pair.
+    /// Replay the imported authority pair and check its restrictions. It writes
+    /// nothing: ruling 32-L1 removed the SQL clear of append recovery, because
+    /// journal import refuses before any effect until the library log records it.
     /// An active quarantine or any terminal-finalization state remains a refusal.
     pub fn recover_imported_append_authority(
         &mut self,
@@ -3655,21 +3657,6 @@ impl CatalogCore {
         {
             return Err(StateError::TapeProvisionConflict(
                 "import preserves quarantine and finalization restrictions".into(),
-            ));
-        }
-        let changed = self
-            .conn
-            .execute(
-                "update tapes set state = 'ready', updated_at_utc = ?2
-            where tape_uuid = ?1 and kind = 'data' and state = 'recovery_required'
-            and finalization_progress is null and finalization_trigger is null
-            and finalization_operation_id is null and finalization_outcome is null",
-                params![last.tape_uuid.as_slice(), now_utc()?],
-            )
-            .map_err(|e| sqlite_error("recover imported append authority", e))?;
-        if tape.state == "recovery_required" && changed != 1 {
-            return Err(StateError::TapeProvisionConflict(
-                "import preserves incomplete finalization restrictions".into(),
             ));
         }
         Ok(())

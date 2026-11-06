@@ -759,17 +759,15 @@ fn finish_reports_allow_failure_once_and_releases_device_and_state() {
     again.finish().unwrap();
 }
 
+/// Ruling 32-L1: tail repair is refused before any effect, so a damaged log is left as found and
+/// there is no repaired log, archive or reconciliation record for supersede-tail to confirm.
 #[test]
-fn repaired_log_requires_confirmed_physical_tail_reconciliation() {
+fn tail_repair_is_refused_and_leaves_the_log_without_a_reconciliation_record() {
     use remanence_state::authority::TapeAuthorityView;
     use std::io::Write as _;
     for parity in [false, true] {
-        let (fixture, state) = Fixture::new(parity);
-        let mut owner = fixture.owner(state);
-        owner
-            .write_checkpointed(fixture.request("before-repair"))
-            .unwrap();
-        owner.finish().unwrap();
+        let (fixture, state) = Fixture::initialized(parity);
+        drop(state);
         let directory = fixture.config.journal.dir.join("tapes");
         let authority = remanence_state::TapeAuthority::open(
             &directory,
@@ -779,34 +777,32 @@ fn repaired_log_requires_confirmed_physical_tail_reconciliation() {
         .unwrap();
         let through = authority.freeze().unwrap().log_reference().0;
         let path = directory.join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
-        let original = std::fs::read(&path).unwrap();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap()
             .write_all(&[0xff; 28])
             .unwrap();
+        let damaged = std::fs::read(&path).unwrap();
         let mut state = fixture.reopen().unwrap();
-        let repair = state.repair_tape_log_tail(UUID, through, true).unwrap();
-        let mut owner = fixture.owner(state);
-        assert!(owner.open_session("default").is_err());
-        assert!(owner
-            .supersede_tail_confirmed("HAND", |_, _| Err("operator declined".into()))
-            .is_err());
-        assert!(repair.reconciliation_record.exists());
-        owner
-            .supersede_tail_confirmed("HAND", |confirmation, _| {
-                assert_eq!(confirmation, "SUPERSEDE HAND");
-                Ok(())
-            })
-            .unwrap();
-        assert!(!repair.reconciliation_record.exists());
-        assert!(repair.archive.exists());
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        owner
-            .write_checkpointed(fixture.request("after-repair"))
-            .unwrap();
-        owner.finish().unwrap();
+        let names = |directory: &std::path::Path| {
+            let mut names: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = names(&directory);
+        let error = state.repair_tape_log_tail(UUID, through, true).unwrap_err();
+        assert!(error.to_string().contains("TailRepairDeferred"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        assert!(!path.with_extension("repair-required").exists());
+        assert_eq!(
+            names(&directory),
+            before,
+            "no archive or reconciliation record"
+        );
     }
 }
 
