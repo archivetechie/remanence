@@ -19,6 +19,7 @@ use crate::startup_media_readiness::status_from_state_error;
 
 pub(crate) const FINALIZE_TAPE_OPERATION_KIND: &str = "finalize_tape";
 
+#[cfg(test)]
 pub(crate) struct OperationAuditInput<'a> {
     pub(crate) actor: AuditActor,
     pub(crate) operation_id: Uuid,
@@ -518,6 +519,7 @@ pub(crate) fn alarm_audit_detail(alarm: &AlarmRecord) -> BTreeMap<String, CborVa
     detail
 }
 
+#[cfg(test)]
 pub(crate) fn append_operation_audit(
     index: &mut CatalogIndex,
     audit_dir: &Path,

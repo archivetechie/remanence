@@ -1,20 +1,28 @@
 //! Shared API state construction, service factories, and core catalog accessors.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+#[cfg(test)]
 use ciborium::value::Value as CborValue;
 use remanence_format_driver::ForeignFormatRegistry;
-use remanence_state::{AuditActor, AuditEvent, CalibrationControlStore, RemConfig, TapePoolConfig};
+#[cfg(test)]
+use remanence_state::AuditEvent;
+use remanence_state::{AuditActor, CalibrationControlStore, RemConfig, TapePoolConfig};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::audit_projection::{append_operation_audit, OperationAuditInput};
+#[cfg(test)]
+use crate::audit_projection::append_operation_audit;
+#[cfg(test)]
+use crate::audit_projection::OperationAuditInput;
 use crate::audit_query_service::AuditApi;
 use crate::catalog_conversion::alarm_record_to_proto;
 use crate::daemon_catalog_services::{CatalogService, DaemonService};
@@ -22,6 +30,7 @@ use crate::drive_collection::{
     drive_managed_library_serials, observe_drive_catalog_from_libraries,
     spawn_drive_collection_workers,
 };
+#[cfg(test)]
 use crate::hex_encoding::bytes_to_hex;
 use crate::library::LibraryServiceApi;
 use crate::live_status::{DriveByteCounters, LibrarySnapshot, LiveStatusState};
@@ -44,6 +53,8 @@ pub struct ApiState {
     pub(crate) catalog: remanence_state::ProjectionClient,
     pub(crate) index_path: Arc<PathBuf>,
     pub(crate) audit_dir: Arc<PathBuf>,
+    // Read only by the legacy audit funnel, now test-only; deleted with the funnel at L3.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) audit_fsync: bool,
     pub(crate) audit_append_lock: Arc<std::sync::Mutex<()>>,
     pub(crate) readiness_shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -585,7 +596,6 @@ impl ApiState {
         state.changer_waits = changer_waits;
         crate::mount::spawn_timer_idle_dismount_listener(state.clone(), timer_park_rx);
         state.reconcile_drive_catalog_from_report(config, &report)?;
-        state.reconcile_clean_runs_from_report(&report)?;
         crate::mount::register_startup_seated_cartridges(&state, &report);
         crate::readiness_wait::spawn_auto_resume(state.clone());
         crate::mount::spawn_startup_terminal_recoveries(state.clone());
@@ -1265,31 +1275,6 @@ impl ApiState {
         )
     }
 
-    pub(crate) fn reconcile_clean_runs_from_report(
-        &self,
-        report: &remanence_library::DiscoveryReport,
-    ) -> Result<(), Status> {
-        let mut index = {
-            let mut index = self.catalog.write_handle();
-            if let Some(pool) = &self.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        };
-        let mut reconciled = 0u64;
-        for library in &report.libraries {
-            reconciled = reconciled.saturating_add(
-                index
-                    .reconcile_clean_runs_against_library(library)
-                    .map_err(status_from_state_error)?,
-            );
-        }
-        if reconciled > 0 {
-            tracing::info!("reconciled {reconciled} clean run(s) during startup");
-        }
-        Ok(())
-    }
-
     /// Accept an actual owner request with its caller-computed fingerprint.
     /// The returned writer identity is threaded into registry and actor dispatch.
     pub(crate) fn accept_owner_request(
@@ -1537,6 +1522,7 @@ impl ApiState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn record_drive_audit(
         &self,
         actor: AuditActor,

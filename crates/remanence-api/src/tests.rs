@@ -1809,6 +1809,56 @@ async fn cancel_before_first_publish_records_typed_cancel_requested() {
     assert_eq!(chain[1].actor, AuditActor::Service("operator-a".into()));
 }
 
+/// With a library runtime, ReconcileTape is refused before the tape is resolved, a library
+/// is reserved, an operation is accepted or anything is loaded. This state has no drive
+/// pool, so a refusal that followed `drive_pool()?` would answer `Unavailable`.
+#[tokio::test]
+async fn reconcile_tape_typed_is_deferred_before_any_load() {
+    use crate::pb::catalog_server::Catalog;
+    use remanence_state::library_log as lib;
+
+    let mut typed = TypedRoot::open();
+    let state = typed.api_state();
+    let service = state.catalog_service();
+    let mut request = Request::new(pb::ReconcileTapeRequest {
+        tape_uuid: vec![0x5B; 16],
+        idempotency_key: None,
+    });
+    request
+        .metadata_mut()
+        .insert("x-remanence-actor", "operator-a".parse().unwrap());
+
+    let refused = Catalog::reconcile_tape(&service, request)
+        .await
+        .expect_err("a tape cannot be reconciled from a scan yet");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "ReconcileTapeDeferred: reconciling a tape from a physical scan is deferred; no tape was loaded or scanned"
+    );
+    assert!(
+        state.index().unwrap().list_operations().unwrap().is_empty(),
+        "the refusal accepted no operation"
+    );
+    assert_no_legacy_audit_records(&state);
+
+    drop((service, state));
+    let recorded = typed
+        .records(|record| {
+            matches!(
+                record.tag(),
+                lib::Tag::DriveDecision | lib::Tag::OperationRecorded
+            )
+            .then_some(())
+        })
+        .await;
+    assert!(
+        recorded.is_empty(),
+        "the refusal recorded {} typed record(s)",
+        recorded.len()
+    );
+}
+
 #[test]
 fn library_request_audit_records_request_actor() {
     let state = ApiState::new({

@@ -13,8 +13,8 @@ use std::pin::Pin;
 use ciborium::value::Value as CborValue;
 use remanence_library::{DriveBay, IePort, Library, Slot};
 use remanence_state::{
-    AlarmRecord, CatalogIndex, DriveAnnotationInput, DriveCorrelationRollupRecord,
-    DriveEventRecord, DriveHealthSnapshotRecord, DriveRecord,
+    AlarmRecord, CatalogIndex, DriveCorrelationRollupRecord, DriveEventRecord,
+    DriveHealthSnapshotRecord, DriveRecord,
 };
 use time::OffsetDateTime;
 use tokio_stream::Stream;
@@ -368,6 +368,14 @@ fn validate_iso_date(value: &str, field: &str) -> Result<(), Status> {
     )
     .map(|_| ())
     .map_err(|_| Status::invalid_argument(format!("{field} must be YYYY-MM-DD")))
+}
+
+/// The refusal every drive stewardship write answers while a library runtime is installed:
+/// annotate, retire and reinstate are SQL writes the library log does not record yet.
+fn drive_stewardship_deferred() -> Status {
+    Status::failed_precondition(
+        "DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded by the library log yet; the drive was not changed",
+    )
 }
 
 fn ensure_mutable_drive(record: &DriveRecord, allow_derived_identity: bool) -> Result<(), Status> {
@@ -838,54 +846,66 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         validate_iso_date(request.purchase_date.as_str(), "purchase_date")?;
         validate_iso_date(request.warranty_until.as_str(), "warranty_until")?;
-        let mut index = {
-            let mut index = self.state.catalog.write_handle();
-            if let Some(pool) = &self.state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        };
-        let drive = index
-            .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("drive not found"))?;
-        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
-        let drive_uuid = request.drive_uuid.clone();
-        let stored = index
-            .annotate_drive(DriveAnnotationInput {
-                drive_uuid: request.drive_uuid,
-                purchase_date: (!request.purchase_date.is_empty()).then_some(request.purchase_date),
-                warranty_until: (!request.warranty_until.is_empty())
-                    .then_some(request.warranty_until),
-                cost: (!request.cost.is_empty()).then_some(request.cost),
-                note: (!request.note.is_empty()).then_some(request.note),
-                notes_set: (!request.notes_set.is_empty()).then_some(request.notes_set),
-                annotated_at_utc: None,
-            })
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("drive not found"))?;
-        let mut detail = BTreeMap::new();
-        detail.insert(
-            "drive_uuid".to_string(),
-            CborValue::Bytes(drive_uuid.clone()),
-        );
-        for (key, value) in [
-            ("purchase_date", stored.purchase_date.as_ref()),
-            ("warranty_until", stored.warranty_until.as_ref()),
-            ("cost", stored.cost.as_ref()),
-            ("notes", stored.notes.as_ref()),
-        ] {
-            if let Some(value) = value {
-                detail.insert(key.to_string(), CborValue::Text(value.clone()));
-            }
+        if self.state.catalog.library_runtime().is_some() {
+            return Err(drive_stewardship_deferred());
         }
-        self.state.record_drive_audit(
-            actor,
-            remanence_state::AuditEvent::DriveAnnotated,
-            drive_uuid.as_slice(),
-            detail,
-        )?;
-        Ok(Response::new(drive_record_to_proto(stored)))
+        #[cfg(test)]
+        {
+            let mut index = {
+                let mut index = self.state.catalog.write_handle();
+                if let Some(pool) = &self.state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            };
+            let drive = index
+                .get_drive_by_uuid(&request.drive_uuid)
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("drive not found"))?;
+            ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+            let drive_uuid = request.drive_uuid.clone();
+            let stored = index
+                .annotate_drive(remanence_state::DriveAnnotationInput {
+                    drive_uuid: request.drive_uuid,
+                    purchase_date: (!request.purchase_date.is_empty())
+                        .then_some(request.purchase_date),
+                    warranty_until: (!request.warranty_until.is_empty())
+                        .then_some(request.warranty_until),
+                    cost: (!request.cost.is_empty()).then_some(request.cost),
+                    note: (!request.note.is_empty()).then_some(request.note),
+                    notes_set: (!request.notes_set.is_empty()).then_some(request.notes_set),
+                    annotated_at_utc: None,
+                })
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("drive not found"))?;
+            let mut detail = BTreeMap::new();
+            detail.insert(
+                "drive_uuid".to_string(),
+                CborValue::Bytes(drive_uuid.clone()),
+            );
+            for (key, value) in [
+                ("purchase_date", stored.purchase_date.as_ref()),
+                ("warranty_until", stored.warranty_until.as_ref()),
+                ("cost", stored.cost.as_ref()),
+                ("notes", stored.notes.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    detail.insert(key.to_string(), CborValue::Text(value.clone()));
+                }
+            }
+            self.state.record_drive_audit(
+                actor,
+                remanence_state::AuditEvent::DriveAnnotated,
+                drive_uuid.as_slice(),
+                detail,
+            )?;
+            Ok(Response::new(drive_record_to_proto(stored)))
+        }
+        #[cfg(not(test))]
+        {
+            let _ = actor;
+            Err(drive_stewardship_deferred())
+        }
     }
 
     async fn retire_drive(
@@ -902,54 +922,65 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
-        let mut index = {
-            let mut index = self.state.catalog.write_handle();
-            if let Some(pool) = &self.state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        };
-        let drive = index
-            .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("drive not found"))?;
-        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
-        if let Some(element) = drive
-            .last_element_address
-            .and_then(|value| u16::try_from(value).ok())
+        if self.state.catalog.library_runtime().is_some() {
+            return Err(drive_stewardship_deferred());
+        }
+        #[cfg(test)]
         {
-            if drive
-                .last_library_serial
-                .as_deref()
-                .is_some_and(|serial| self.state.busy_drive_bays(serial).contains(&element))
+            let mut index = {
+                let mut index = self.state.catalog.write_handle();
+                if let Some(pool) = &self.state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            };
+            let drive = index
+                .get_drive_by_uuid(&request.drive_uuid)
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("drive not found"))?;
+            ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+            if let Some(element) = drive
+                .last_element_address
+                .and_then(|value| u16::try_from(value).ok())
             {
-                return Err(Status::failed_precondition(
-                    "drive has an active session or reserved operation",
-                ));
+                if drive
+                    .last_library_serial
+                    .as_deref()
+                    .is_some_and(|serial| self.state.busy_drive_bays(serial).contains(&element))
+                {
+                    return Err(Status::failed_precondition(
+                        "drive has an active session or reserved operation",
+                    ));
+                }
             }
+            let outcome = index
+                .retire_drive(&request.drive_uuid, request.reason.as_str())
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("drive not found"))?;
+            if outcome.newly_retired {
+                let mut detail = BTreeMap::new();
+                detail.insert(
+                    "drive_uuid".to_string(),
+                    CborValue::Bytes(request.drive_uuid.clone()),
+                );
+                detail.insert("reason".to_string(), CborValue::Text(request.reason));
+                self.state.record_drive_audit(
+                    actor,
+                    remanence_state::AuditEvent::DriveRetired,
+                    request.drive_uuid.as_slice(),
+                    detail,
+                )?;
+            }
+            Ok(Response::new(pb::RetireDriveResponse {
+                drive: Some(drive_record_to_proto(outcome.drive)),
+                newly_retired: outcome.newly_retired,
+            }))
         }
-        let outcome = index
-            .retire_drive(&request.drive_uuid, request.reason.as_str())
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("drive not found"))?;
-        if outcome.newly_retired {
-            let mut detail = BTreeMap::new();
-            detail.insert(
-                "drive_uuid".to_string(),
-                CborValue::Bytes(request.drive_uuid.clone()),
-            );
-            detail.insert("reason".to_string(), CborValue::Text(request.reason));
-            self.state.record_drive_audit(
-                actor,
-                remanence_state::AuditEvent::DriveRetired,
-                request.drive_uuid.as_slice(),
-                detail,
-            )?;
+        #[cfg(not(test))]
+        {
+            let _ = actor;
+            Err(drive_stewardship_deferred())
         }
-        Ok(Response::new(pb::RetireDriveResponse {
-            drive: Some(drive_record_to_proto(outcome.drive)),
-            newly_retired: outcome.newly_retired,
-        }))
     }
 
     async fn reinstate_drive(
@@ -963,40 +994,51 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
-        let mut index = {
-            let mut index = self.state.catalog.write_handle();
-            if let Some(pool) = &self.state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        };
-        let drive = index
-            .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("drive not found"))?;
-        ensure_mutable_drive(&drive, request.allow_derived_identity)?;
-        let outcome = index
-            .reinstate_drive(&request.drive_uuid, request.reason.as_str())
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("drive not found"))?;
-        if outcome.newly_reinstated {
-            let mut detail = BTreeMap::new();
-            detail.insert(
-                "drive_uuid".to_string(),
-                CborValue::Bytes(request.drive_uuid.clone()),
-            );
-            detail.insert("reason".to_string(), CborValue::Text(request.reason));
-            self.state.record_drive_audit(
-                actor,
-                remanence_state::AuditEvent::DriveReinstated,
-                request.drive_uuid.as_slice(),
-                detail,
-            )?;
+        if self.state.catalog.library_runtime().is_some() {
+            return Err(drive_stewardship_deferred());
         }
-        Ok(Response::new(pb::ReinstateDriveResponse {
-            drive: Some(drive_record_to_proto(outcome.drive)),
-            newly_reinstated: outcome.newly_reinstated,
-        }))
+        #[cfg(test)]
+        {
+            let mut index = {
+                let mut index = self.state.catalog.write_handle();
+                if let Some(pool) = &self.state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            };
+            let drive = index
+                .get_drive_by_uuid(&request.drive_uuid)
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("drive not found"))?;
+            ensure_mutable_drive(&drive, request.allow_derived_identity)?;
+            let outcome = index
+                .reinstate_drive(&request.drive_uuid, request.reason.as_str())
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("drive not found"))?;
+            if outcome.newly_reinstated {
+                let mut detail = BTreeMap::new();
+                detail.insert(
+                    "drive_uuid".to_string(),
+                    CborValue::Bytes(request.drive_uuid.clone()),
+                );
+                detail.insert("reason".to_string(), CborValue::Text(request.reason));
+                self.state.record_drive_audit(
+                    actor,
+                    remanence_state::AuditEvent::DriveReinstated,
+                    request.drive_uuid.as_slice(),
+                    detail,
+                )?;
+            }
+            Ok(Response::new(pb::ReinstateDriveResponse {
+                drive: Some(drive_record_to_proto(outcome.drive)),
+                newly_reinstated: outcome.newly_reinstated,
+            }))
+        }
+        #[cfg(not(test))]
+        {
+            let _ = actor;
+            Err(drive_stewardship_deferred())
+        }
     }
 
     async fn poll_drive(
@@ -2783,6 +2825,162 @@ mod tests {
             ),
             "{records:?}"
         );
+    }
+
+    const STEWARDSHIP_DEFERRED: &str = "DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded by the library log yet; the drive was not changed";
+
+    /// Create the drive the way discovery does, through the production runtime, and return its UUID.
+    fn observe_typed_steward_drive(state: &ApiState) -> Vec<u8> {
+        let runtime = state
+            .catalog
+            .library_runtime()
+            .expect("the typed root installs a library runtime");
+        runtime
+            .observe_drives(vec![DriveObservationInput {
+                serial: "DRV-STEWARD".to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("HPE".to_string()),
+                product: Some("Ultrium 9-SCSI".to_string()),
+                firmware_rev: Some("R1.0".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some("LIB-STEWARD".to_string()),
+                element_address: Some(0x100),
+                observed_at_utc: None,
+            }])
+            .expect("observe the drive")
+            .remove(0)
+            .drive_uuid
+    }
+
+    /// The drive row as the projection holds it.
+    fn typed_steward_row(state: &ApiState, drive_uuid: &[u8]) -> DriveRecord {
+        state
+            .index()
+            .unwrap()
+            .get_drive_by_uuid(drive_uuid)
+            .unwrap()
+            .expect("the drive row")
+    }
+
+    /// Every drive decision and operation record in the library log. A deferred stewardship
+    /// request must leave none.
+    async fn typed_steward_decisions(typed: &mut crate::tests::TypedRoot) -> usize {
+        use remanence_state::library_log as lib;
+        typed
+            .records(|record| {
+                matches!(
+                    record.tag(),
+                    lib::Tag::DriveDecision | lib::Tag::OperationRecorded
+                )
+                .then_some(())
+            })
+            .await
+            .len()
+    }
+
+    #[tokio::test]
+    async fn stewardship_typed_annotate_is_deferred_before_any_write() {
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        let drive_uuid = observe_typed_steward_drive(&state);
+        let before = typed_steward_row(&state, &drive_uuid);
+        let service = state.library_service();
+        let annotate = |warranty_until: &str, note: &str| {
+            Request::new(pb::AnnotateDriveRequest {
+                drive_uuid: drive_uuid.clone(),
+                purchase_date: String::new(),
+                warranty_until: warranty_until.to_string(),
+                cost: String::new(),
+                note: note.to_string(),
+                notes_set: String::new(),
+                allow_derived_identity: false,
+            })
+        };
+
+        let malformed = service
+            .annotate_drive(annotate("not-a-date", ""))
+            .await
+            .expect_err("a malformed date is refused before anything else");
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+        assert!(
+            malformed.message().contains("warranty_until"),
+            "{}",
+            malformed.message()
+        );
+        let deferred = service
+            .annotate_drive(annotate("2031-01-31", "n"))
+            .await
+            .expect_err("a valid annotation is deferred");
+        assert_eq!(deferred.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(deferred.message(), STEWARDSHIP_DEFERRED);
+        assert_eq!(typed_steward_row(&state, &drive_uuid), before);
+        crate::tests::assert_no_legacy_audit_records(&state);
+
+        drop((service, state));
+        assert_eq!(typed_steward_decisions(&mut typed).await, 0);
+    }
+
+    #[tokio::test]
+    async fn stewardship_typed_retire_and_reinstate_are_deferred_before_any_write() {
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        let drive_uuid = observe_typed_steward_drive(&state);
+        let before = typed_steward_row(&state, &drive_uuid);
+        let service = state.library_service();
+        let retire = |reason: &str| {
+            Request::new(pb::RetireDriveRequest {
+                drive_uuid: drive_uuid.clone(),
+                reason: reason.to_string(),
+                allow_derived_identity: false,
+            })
+        };
+        let reinstate = |reason: &str| {
+            Request::new(pb::ReinstateDriveRequest {
+                drive_uuid: drive_uuid.clone(),
+                reason: reason.to_string(),
+                allow_derived_identity: false,
+            })
+        };
+
+        let blank_retire = service
+            .retire_drive(retire("   "))
+            .await
+            .expect_err("a blank reason is refused before anything else");
+        assert_eq!(blank_retire.code(), tonic::Code::InvalidArgument);
+        assert!(
+            blank_retire.message().contains("reason"),
+            "{}",
+            blank_retire.message()
+        );
+        let retired = service
+            .retire_drive(retire("removed from fleet"))
+            .await
+            .expect_err("a valid retirement is deferred");
+        assert_eq!(retired.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(retired.message(), STEWARDSHIP_DEFERRED);
+
+        let blank_reinstate = service
+            .reinstate_drive(reinstate(""))
+            .await
+            .expect_err("a blank reason is refused before anything else");
+        assert_eq!(blank_reinstate.code(), tonic::Code::InvalidArgument);
+        assert!(
+            blank_reinstate.message().contains("reason"),
+            "{}",
+            blank_reinstate.message()
+        );
+        let reinstated = service
+            .reinstate_drive(reinstate("returned"))
+            .await
+            .expect_err("a valid reinstatement is deferred");
+        assert_eq!(reinstated.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(reinstated.message(), STEWARDSHIP_DEFERRED);
+
+        assert_eq!(typed_steward_row(&state, &drive_uuid), before);
+        crate::tests::assert_no_legacy_audit_records(&state);
+
+        drop((service, state));
+        assert_eq!(typed_steward_decisions(&mut typed).await, 0);
     }
 
     #[tokio::test]

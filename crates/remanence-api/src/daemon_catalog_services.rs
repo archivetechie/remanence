@@ -506,6 +506,13 @@ impl pb::catalog_server::Catalog for CatalogService {
         let actor = authorize_request(&request, AuthPermission::OperationControl)?;
         let request = request.into_inner();
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "ReconcileTape")?;
+        // The scan and its SQL replace of the tape's files and state are not recorded by the
+        // library log. Refuse before anything is resolved, reserved, recorded or loaded.
+        if self.state.catalog.library_runtime().is_some() {
+            return Err(Status::failed_precondition(
+                "ReconcileTapeDeferred: reconciling a tape from a physical scan is deferred; no tape was loaded or scanned",
+            ));
+        }
         let tape_uuid = decode_uuid_bytes(request.tape_uuid.as_slice(), "tape_uuid")?;
         let pool = self.state.drive_pool()?.clone();
         let library_serial =

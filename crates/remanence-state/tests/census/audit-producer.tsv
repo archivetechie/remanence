@@ -4,7 +4,6 @@
 # Related deliverables: crates/remanence-state/tests/census/{mechanism-tests,w2-trace}.tsv
 crates/remanence-api/src/api_state.rs::record_cancel_requested::AuditEvent::CancelRequested	1
 crates/remanence-api/src/api_state.rs::record_cancel_requested::append_operation_audit	1
-crates/remanence-api/src/api_state.rs::record_drive_audit::append_operation_audit	1
 crates/remanence-api/src/api_state.rs::record_library_request_received::AuditEvent::RequestReceived	1
 crates/remanence-api/src/api_state.rs::record_library_request_received::append_operation_audit	1
 crates/remanence-api/src/api_state.rs::record_operation_failed::AuditEvent::OperationFailed	1
@@ -19,8 +18,6 @@ crates/remanence-api/src/audit_projection.rs::append_and_project_audit::audit-hu
 crates/remanence-api/src/audit_projection.rs::append_and_project_audit_locked::AuditEventRecord	1
 crates/remanence-api/src/audit_projection.rs::append_and_project_audit_locked::audit-append	1
 crates/remanence-api/src/audit_projection.rs::append_and_project_audit_locked::audit-hub	1
-crates/remanence-api/src/audit_projection.rs::append_operation_audit::append_and_project_audit	1
-crates/remanence-api/src/audit_projection.rs::append_operation_audit::audit-hub	1
 crates/remanence-api/src/audit_projection.rs::audit_subject_matches_tape::audit-hub	1
 crates/remanence-api/src/audit_projection.rs::drive_health_audit_detail::audit-hub	1
 crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_audit::AuditEvent::CancelledBeforeDispatch	1
@@ -88,9 +85,6 @@ crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_w
 crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_with_reader::AuditEvent::AlarmRaised	1
 crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_with_reader::AuditEvent::DriveHealthObserved	1
 crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_with_reader::append_and_project_audit	2
-crates/remanence-api/src/library.rs::annotate_drive::AuditEvent::DriveAnnotated	1
-crates/remanence-api/src/library.rs::reinstate_drive::AuditEvent::DriveReinstated	1
-crates/remanence-api/src/library.rs::retire_drive::AuditEvent::DriveRetired	1
 crates/remanence-api/src/mount.rs::closeout_tape_reserved::AuditEvent::OperationStarted	1
 crates/remanence-api/src/mount.rs::closeout_worker_attempt::AuditEvent::OperationFailed	1
 crates/remanence-api/src/mount.rs::closeout_worker_attempt::AuditEvent::OperationFinished	1
