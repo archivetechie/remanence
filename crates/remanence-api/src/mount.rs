@@ -8770,6 +8770,7 @@ mod tests {
             cartridge: None,
         }
     }
+    mod closed_retry_tests;
     mod finalization_publication_tests;
 }
 
