@@ -2457,6 +2457,11 @@ impl LibraryFold {
             _ => None,
         }
     }
+    /// Whether the active raise of this condition already has an acknowledger.
+    pub(crate) fn alarm_acknowledged(&self, condition_key: &str) -> bool {
+        self.alarm_acknowledgers
+            .contains_key(&Text::from(condition_key))
+    }
     /// Open operation identity retained by authenticated operation history.
     /// Closed operations are not eligible to begin new readiness work.
     pub(crate) fn open_operation_kind(&self, operation: Id) -> Option<OperationKind> {

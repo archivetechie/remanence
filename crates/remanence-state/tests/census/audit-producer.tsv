@@ -2,8 +2,6 @@
 # Every append is retained regardless of receiver name; non-audit candidates are labelled in the table.
 # Exact keys/counts and reader/non-audit labels: crates/remanence-state/tests/census/library-producers.tsv
 # Related deliverables: crates/remanence-state/tests/census/{mechanism-tests,w2-trace}.tsv
-crates/remanence-api/src/api_state.rs::record_alarm_acked::AuditEvent::AlarmAcked	1
-crates/remanence-api/src/api_state.rs::record_alarm_acked::append_operation_audit	1
 crates/remanence-api/src/api_state.rs::record_cancel_requested::AuditEvent::CancelRequested	1
 crates/remanence-api/src/api_state.rs::record_cancel_requested::append_operation_audit	1
 crates/remanence-api/src/api_state.rs::record_drive_audit::append_operation_audit	1
@@ -81,8 +79,6 @@ crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::T
 crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::TapeProvisioned	1
 crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::TapeRetired	1
 crates/remanence-api/src/audit_query_service.rs::audit_event_name::AuditEvent::TapeSealed	1
-crates/remanence-api/src/closeout_obligation.rs::alarm::AuditEvent::OperationFailed	1
-crates/remanence-api/src/closeout_obligation.rs::alarm::append_operation_audit	1
 crates/remanence-api/src/closeout_progress.rs::audit::AuditEvent::OperationFailed	1
 crates/remanence-api/src/closeout_progress.rs::audit::AuditEvent::OperationFinished	1
 crates/remanence-api/src/closeout_progress.rs::audit::AuditEvent::OperationStarted	1

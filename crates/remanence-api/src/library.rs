@@ -348,6 +348,7 @@ pub(crate) fn alarm_to_proto(record: AlarmRecord) -> pb::Alarm {
     }
 }
 
+#[cfg(test)]
 fn actor_label(actor: &remanence_state::AuditActor) -> String {
     match actor {
         remanence_state::AuditActor::System => "system".to_string(),
@@ -1117,20 +1118,46 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             request.idempotency_key.as_ref(),
             "AckAlarm",
         )?;
-        let mut index = {
-            let mut index = self.state.catalog.write_handle();
-            if let Some(pool) = &self.state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
+        if let Some(runtime) = self.state.catalog.library_runtime() {
+            if !runtime
+                .acknowledge_alarm(request.condition_key.as_str(), actor)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?
+            {
+                return Err(Status::not_found("alarm not found or already cleared"));
             }
-            index
-        };
-        let alarm = index
-            .ack_alarm(request.condition_key.as_str(), actor_label(&actor).as_str())
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("alarm not found or already cleared"))?;
-        self.state
-            .record_alarm_acked(actor, request.condition_key.as_str())?;
-        Ok(Response::new(alarm_to_proto(alarm)))
+            let row = self
+                .state
+                .index()?
+                .get_alarm(request.condition_key.as_str())
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| {
+                    Status::internal("acknowledged alarm is missing from the catalog")
+                })?;
+            return Ok(Response::new(alarm_to_proto(row)));
+        }
+        #[cfg(test)]
+        {
+            let mut index = {
+                let mut index = self.state.catalog.write_handle();
+                if let Some(pool) = &self.state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            };
+            let alarm = index
+                .ack_alarm(request.condition_key.as_str(), actor_label(&actor).as_str())
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
+                .ok_or_else(|| Status::not_found("alarm not found or already cleared"))?;
+            self.state
+                .record_alarm_acked(actor, request.condition_key.as_str())?;
+            Ok(Response::new(alarm_to_proto(alarm)))
+        }
+        #[cfg(not(test))]
+        {
+            Err(Status::failed_precondition(
+                "alarm acknowledgement requires shared LibraryAuthority",
+            ))
+        }
     }
 
     async fn get_live_status(
@@ -2525,6 +2552,236 @@ mod tests {
                 .iter()
                 .all(|record| record.event != remanence_state::AuditEvent::AlarmAcked),
             "cleared alarm ack must not append AlarmAcked audit: {audit_records:?}"
+        );
+    }
+
+    const TYPED_ALARM_KEY: &str = "no-cln-cart:mainlib";
+
+    fn typed_alarm_raise() -> remanence_state::library_log::AlarmRaise {
+        use remanence_state::library_log as lib;
+        lib::AlarmRaise {
+            kind: lib::AlarmKind::NoClnCart,
+            severity: lib::Severity::Critical,
+            reason: "no cleaning cartridge in the library".into(),
+        }
+    }
+
+    /// Raise through the production runtime, as the alarm producers do.
+    fn raise_typed_alarm(state: &ApiState) {
+        let runtime = state
+            .catalog
+            .library_runtime()
+            .expect("the typed root installs a library runtime");
+        assert!(runtime
+            .observe_alarm(TYPED_ALARM_KEY, Some(typed_alarm_raise()), "")
+            .expect("raise the alarm"));
+    }
+
+    fn clear_typed_alarm(state: &ApiState) {
+        let runtime = state
+            .catalog
+            .library_runtime()
+            .expect("the typed root installs a library runtime");
+        assert!(runtime
+            .observe_alarm(TYPED_ALARM_KEY, None, "cleared")
+            .expect("clear the alarm"));
+    }
+
+    fn typed_ack_request(actor: Option<&str>) -> Request<pb::AckAlarmRequest> {
+        let mut request = Request::new(pb::AckAlarmRequest {
+            condition_key: TYPED_ALARM_KEY.to_string(),
+            idempotency_key: None,
+        });
+        if let Some(actor) = actor {
+            request
+                .metadata_mut()
+                .insert("x-remanence-actor", actor.parse().unwrap());
+        }
+        request
+    }
+
+    /// Every `AlarmChanged` of the key as the library log recorded it: action, generation, actor.
+    async fn typed_alarm_records(
+        typed: &mut crate::tests::TypedRoot,
+    ) -> Vec<(
+        remanence_state::library_log::AlarmAction,
+        remanence_state::library_log::GenerationChange,
+        remanence_state::AuditActor,
+    )> {
+        typed
+            .records(|record| {
+                let value = record.alarm_changed()?;
+                (value.condition_key.as_str() == TYPED_ALARM_KEY).then(|| {
+                    (
+                        value.action.clone(),
+                        value.change,
+                        record.envelope.actor.clone(),
+                    )
+                })
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn ack_alarm_typed_records_acknowledge_with_request_actor() {
+        use remanence_state::library_log as lib;
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        raise_typed_alarm(&state);
+        let service = state.library_service();
+
+        let reply = service
+            .ack_alarm(typed_ack_request(Some("operator-a")))
+            .await
+            .expect("acknowledge")
+            .into_inner();
+        assert_eq!(reply.state, "acked");
+        assert_eq!(reply.acked_by, "service:operator-a");
+        assert!(reply.acked_at_utc.is_some());
+        let row = state
+            .index()
+            .unwrap()
+            .get_alarm(TYPED_ALARM_KEY)
+            .unwrap()
+            .expect("the alarm row");
+        assert_eq!(row.state, "acked");
+        assert_eq!(row.acked_by.as_deref(), Some("service:operator-a"));
+        assert!(row.acked_at_utc.is_some());
+        crate::tests::assert_no_legacy_audit_records(&state);
+
+        drop((service, state));
+        assert_eq!(
+            typed_alarm_records(&mut typed).await,
+            [
+                (
+                    lib::AlarmAction::Raise(typed_alarm_raise()),
+                    lib::GenerationChange {
+                        expected: 0,
+                        next: 1
+                    },
+                    remanence_state::AuditActor::System,
+                ),
+                (
+                    lib::AlarmAction::Acknowledge(lib::Unit),
+                    lib::GenerationChange {
+                        expected: 1,
+                        next: 2
+                    },
+                    remanence_state::AuditActor::Service("operator-a".into()),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_alarm_typed_repeat_keeps_first_acknowledgement() {
+        use remanence_state::library_log as lib;
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        raise_typed_alarm(&state);
+        let service = state.library_service();
+
+        let first = service
+            .ack_alarm(typed_ack_request(Some("operator-a")))
+            .await
+            .expect("first acknowledgement")
+            .into_inner();
+        assert_eq!(first.acked_by, "service:operator-a");
+        let second = service
+            .ack_alarm(typed_ack_request(Some("operator-b")))
+            .await
+            .expect("a repeated acknowledgement is accepted")
+            .into_inner();
+        assert_eq!(second.state, "acked");
+        assert_eq!(second.acked_by, "service:operator-a");
+
+        drop((service, state));
+        let records = typed_alarm_records(&mut typed).await;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(action, _, _)| matches!(action, lib::AlarmAction::Acknowledge(_)))
+                .count(),
+            1,
+            "the repeat appended nothing: {records:?}"
+        );
+        assert_eq!(records.len(), 2, "{records:?}");
+    }
+
+    #[tokio::test]
+    async fn ack_alarm_typed_absent_or_cleared_is_not_found() {
+        use remanence_state::library_log as lib;
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        let service = state.library_service();
+
+        let absent = service
+            .ack_alarm(typed_ack_request(Some("operator-a")))
+            .await
+            .expect_err("a key never raised cannot be acknowledged");
+        assert_eq!(absent.code(), tonic::Code::NotFound);
+        assert_eq!(absent.message(), "alarm not found or already cleared");
+
+        raise_typed_alarm(&state);
+        clear_typed_alarm(&state);
+        let cleared = service
+            .ack_alarm(typed_ack_request(Some("operator-a")))
+            .await
+            .expect_err("a cleared alarm cannot be acknowledged");
+        assert_eq!(cleared.code(), tonic::Code::NotFound);
+        assert_eq!(cleared.message(), "alarm not found or already cleared");
+
+        drop((service, state));
+        let records = typed_alarm_records(&mut typed).await;
+        assert!(
+            matches!(
+                records
+                    .iter()
+                    .map(|(action, _, _)| action)
+                    .collect::<Vec<_>>()[..],
+                [lib::AlarmAction::Raise(_), lib::AlarmAction::Clear(_)]
+            ),
+            "{records:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_alarm_typed_system_actor_is_refused() {
+        use remanence_state::library_log as lib;
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        raise_typed_alarm(&state);
+        let service = state.library_service();
+
+        let refused = service
+            .ack_alarm(typed_ack_request(None))
+            .await
+            .expect_err("a System acknowledgement must be refused");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("SystemAcknowledgement"),
+            "{}",
+            refused.message()
+        );
+        let row = state
+            .index()
+            .unwrap()
+            .get_alarm(TYPED_ALARM_KEY)
+            .unwrap()
+            .expect("the alarm row");
+        assert_eq!(row.state, "open");
+
+        drop((service, state));
+        let records = typed_alarm_records(&mut typed).await;
+        assert!(
+            matches!(
+                records
+                    .iter()
+                    .map(|(action, _, _)| action)
+                    .collect::<Vec<_>>()[..],
+                [lib::AlarmAction::Raise(_)]
+            ),
+            "{records:?}"
         );
     }
 

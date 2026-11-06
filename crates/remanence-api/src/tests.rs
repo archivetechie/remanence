@@ -10531,7 +10531,7 @@ pub(crate) struct ChainEvent {
 
 /// A library runtime over a fresh state root, with the catalog that projects it.
 /// The library log is exclusively locked while any clone of the runtime is alive, so
-/// `operation_chain` is called only after every state built from this fixture is dropped.
+/// `records` and `operation_chain` are called only after every state built from this fixture is dropped.
 pub(crate) struct TypedRoot {
     paths: remanence_state::StatePaths,
     library_uuid: [u8; 16],
@@ -10583,16 +10583,33 @@ impl TypedRoot {
     }
 
     /// Release the fixture's own handles, then read every typed record of `operation` back
-    /// from the library log in sequence order. A state built from this fixture may still be
-    /// finishing its last poll on another thread, so a read refused because a competing
-    /// owner holds the log is retried every 10 ms for up to 5 s. Any other error fails at once.
+    /// from the library log in sequence order.
     pub(crate) async fn operation_chain(&mut self, operation: Uuid) -> Vec<ChainEvent> {
+        self.records(|record| {
+            let value = record.operation_recorded()?;
+            (value.operation == *operation.as_bytes()).then(|| ChainEvent {
+                kind: value.kind,
+                event: value.event.clone(),
+                actor: record.envelope.actor.clone(),
+            })
+        })
+        .await
+    }
+
+    /// Release the fixture's own handles, then collect `pick` over every typed record of the
+    /// library log in sequence order. A state built from this fixture may still be finishing
+    /// its last poll on another thread, so a read refused because a competing owner holds the
+    /// log is retried every 10 ms for up to 5 s. Any other error fails at once.
+    pub(crate) async fn records<T>(
+        &mut self,
+        mut pick: impl FnMut(&remanence_state::library_log::Record) -> Option<T>,
+    ) -> Vec<T> {
         self.catalog = None;
         self.runtime = None;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match self.read_chain(operation) {
-                Ok(chain) => return chain,
+            match self.read_records(&mut pick) {
+                Ok(records) => return records,
                 Err(ChainRead::Busy(_)) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
@@ -10605,7 +10622,10 @@ impl TypedRoot {
         }
     }
 
-    fn read_chain(&self, operation: Uuid) -> Result<Vec<ChainEvent>, ChainRead> {
+    fn read_records<T>(
+        &self,
+        pick: &mut impl FnMut(&remanence_state::library_log::Record) -> Option<T>,
+    ) -> Result<Vec<T>, ChainRead> {
         use nix::errno::Errno;
         use remanence_state::library_log::{native_view::NativeTapeView, store};
         use remanence_state::tape_log::store::StoreError as TapeStoreError;
@@ -10617,20 +10637,14 @@ impl TypedRoot {
             TapeStoreError::Locked(errno) if errno == Errno::EWOULDBLOCK => ChainRead::Busy(errno),
             other => ChainRead::Failed(format!("probe the native tape logs: {other:?}")),
         })?;
-        let mut chain = Vec::new();
+        let mut picked = Vec::new();
         store::replay_observed(
             &self.paths.audit_dir,
             self.library_uuid,
             &view,
             &mut |record| {
-                if let Some(value) = record.record().operation_recorded() {
-                    if value.operation == *operation.as_bytes() {
-                        chain.push(ChainEvent {
-                            kind: value.kind,
-                            event: value.event.clone(),
-                            actor: record.record().envelope.actor.clone(),
-                        });
-                    }
+                if let Some(value) = pick(record.record()) {
+                    picked.push(value);
                 }
                 Ok(())
             },
@@ -10641,7 +10655,7 @@ impl TypedRoot {
             }
             other => ChainRead::Failed(format!("replay the library log: {other:?}")),
         })?;
-        Ok(chain)
+        Ok(picked)
     }
 }
 

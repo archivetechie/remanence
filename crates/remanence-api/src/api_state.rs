@@ -1512,6 +1512,7 @@ impl ApiState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_alarm_acked(
         &self,
         actor: AuditActor,

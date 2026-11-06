@@ -138,4 +138,69 @@ impl LibraryRuntime {
         })?;
         Ok(true)
     }
+
+    /// Acknowledge the active raise of a condition for `actor`. Returns false,
+    /// appending nothing, when the condition is absent or cleared. A raise that
+    /// is already acknowledged also appends nothing and returns true: the first
+    /// acknowledger stands. A System actor is refused by the fold.
+    pub fn acknowledge_alarm(
+        &self,
+        condition: &str,
+        actor: lib::AuditActor,
+    ) -> Result<bool, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let view = self
+            .0
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut head = None;
+        let replay = self
+            .0
+            .authority
+            .snapshot()?
+            .replay(&view, &mut |applied| {
+                if let lib::BodyView::AlarmChanged(value) = applied.record().body_view() {
+                    if value.condition_key.as_str() == condition {
+                        head = Some(value.clone());
+                    }
+                }
+                Ok(())
+            })
+            .map_err(AuthorityError::Store)?;
+        if replay.refusal.is_some() || !replay.fold.pending.is_empty() {
+            return Err(StateError::JournalReplayFailed(
+                "alarm acknowledgement needs resolved authority".into(),
+            )
+            .into());
+        }
+        let Some(head) = head.filter(|v| !matches!(v.action, lib::AlarmAction::Clear(_))) else {
+            self.catch_up_locked()?;
+            return Ok(false);
+        };
+        if replay.fold.alarm_acknowledged(condition) {
+            self.catch_up_locked()?;
+            return Ok(true);
+        }
+        let expected = head.change.next;
+        self.append_locked(|a, v| {
+            a.alarm_changed(
+                lib::AlarmChanged {
+                    condition_key: condition.into(),
+                    change: lib::GenerationChange {
+                        expected,
+                        next: expected,
+                    },
+                    action: lib::AlarmAction::Acknowledge(lib::Unit),
+                    cause: None,
+                },
+                expected,
+                actor,
+                lib::SourceLayer::Layer5,
+                v,
+            )
+        })?;
+        Ok(true)
+    }
 }

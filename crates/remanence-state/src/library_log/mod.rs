@@ -1891,6 +1891,13 @@ mod library_log_b2_fix2;
 mod library_log_memory;
 
 impl Record {
+    /// Read the typed alarm body without permitting record construction.
+    pub fn alarm_changed(&self) -> Option<&AlarmChanged> {
+        match &self.body {
+            Body::AlarmChanged(value) => Some(value),
+            _ => None,
+        }
+    }
     /// Read the typed operation body without permitting record construction.
     pub fn operation_recorded(&self) -> Option<&OperationRecorded> {
         match &self.body {

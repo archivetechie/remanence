@@ -735,31 +735,67 @@ fn alarm(state: &ApiState, key: Key, s: &TapeSummary) -> Result<(), Status> {
     if state.readiness_shutdown.load(Ordering::Acquire) {
         return Ok(());
     }
-    crate::audit_projection::append_operation_audit(
-        &mut {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        },
-        &state.audit_dir,
-        state.audit_fsync,
-        &state.audit_append_lock,
-        crate::audit_projection::OperationAuditInput {
-            actor: remanence_state::AuditActor::System,
-            operation_id: Uuid::new_v4(),
-            operation_kind: "closeout_overdue",
-            event: remanence_state::AuditEvent::OperationFailed,
-            subject_kind: "tape",
-            subject_id: Some(Uuid::from_bytes(key.0).to_string()),
-            idempotency_key: None,
-            detail: fields
-                .into_iter()
-                .map(|(k, v)| (k.into(), ciborium::Value::Text(v)))
-                .collect(),
-        },
-    )
+    if state.catalog.library_runtime().is_some() {
+        // The summary keeps every debt field in one record; nothing runs, so
+        // there is no Started.
+        let summary = fields
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fingerprint: [u8; 32] = {
+            use sha2::Digest;
+            let age = s.unprotected_since.as_deref().expect("debt validated age");
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"closeout_overdue\0");
+            hasher.update(key.0);
+            hasher.update(key.1.to_be_bytes());
+            hasher.update(age.as_bytes());
+            hasher.finalize().into()
+        };
+        let id = state.accept_owner_request(
+            remanence_state::AuditActor::System,
+            "closeout_overdue",
+            "tape",
+            Uuid::from_bytes(key.0).to_string(),
+            fingerprint,
+        )?;
+        return state.record_operation_failed(id, "closeout_overdue", &summary);
+    }
+    #[cfg(test)]
+    {
+        crate::audit_projection::append_operation_audit(
+            &mut {
+                let mut index = state.catalog.write_handle();
+                if let Some(pool) = &state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            },
+            &state.audit_dir,
+            state.audit_fsync,
+            &state.audit_append_lock,
+            crate::audit_projection::OperationAuditInput {
+                actor: remanence_state::AuditActor::System,
+                operation_id: Uuid::new_v4(),
+                operation_kind: "closeout_overdue",
+                event: remanence_state::AuditEvent::OperationFailed,
+                subject_kind: "tape",
+                subject_id: Some(Uuid::from_bytes(key.0).to_string()),
+                idempotency_key: None,
+                detail: fields
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), ciborium::Value::Text(v)))
+                    .collect(),
+            },
+        )
+    }
+    #[cfg(not(test))]
+    {
+        Err(Status::failed_precondition(
+            "closeout overdue record requires shared LibraryAuthority",
+        ))
+    }
 }
 
 /// Start after admission and ownership. Concurrent tape attempts retain the
@@ -1033,6 +1069,92 @@ mod tests {
             debt(&zero, 1, OffsetDateTime::now_utc()).unwrap(),
             (0, None, false)
         );
+    }
+
+    /// With a library runtime, the overdue notice is an operation in the typed log: Accepted
+    /// then Failed, the debt fields in the failure summary. The dedupe is per process, so a
+    /// second state (a restart) records the same age once more. The legacy audit is not written.
+    #[tokio::test]
+    async fn closeout_overdue_typed_once_per_age_and_again_after_restart() {
+        use remanence_state::library_log as lib;
+        const TAPE: &str = "01010101-0101-0101-0101-010101010101";
+        const SUMMARY: &str = "reason=CloseoutOverdue tape_uuid=01010101-0101-0101-0101-010101010101 tape_incarnation=1 tape_log_sequence=0 w=0 t=3 unprotected_bytes=786432 unprotected_since=2020-01-01T00:00:00Z alarm_after_secs=259200";
+        let mut typed = crate::tests::TypedRoot::open();
+        let state = typed.api_state();
+        let s = aged();
+        let key = ([1; 16], 1);
+        alarm(&state, key, &s).unwrap();
+        alarm(&state, key, &s).unwrap();
+        let restarted = typed.api_state();
+        alarm(&restarted, key, &s).unwrap();
+
+        let rows: Vec<_> = state
+            .index()
+            .unwrap()
+            .list_operations()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.operation_kind == "closeout_overdue")
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert_eq!(row.state, "failed", "{row:?}");
+            assert_eq!(row.subject.as_deref(), Some(TAPE), "{row:?}");
+            assert_eq!(row.error_summary.as_deref(), Some(SUMMARY), "{row:?}");
+        }
+        crate::tests::assert_no_legacy_audit_records(&state);
+        crate::tests::assert_no_legacy_audit_records(&restarted);
+
+        drop((state, restarted));
+        let fingerprint: [u8; 32] = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"closeout_overdue\0");
+            hasher.update([1u8; 16]);
+            hasher.update(1u64.to_be_bytes());
+            hasher.update(b"2020-01-01T00:00:00Z");
+            hasher.finalize().into()
+        };
+        let records = typed
+            .records(|record| {
+                let value = record.operation_recorded()?;
+                (value.kind == lib::OperationKind::CloseoutOverdue).then(|| {
+                    (
+                        value.operation,
+                        value.event.clone(),
+                        record.envelope.actor.clone(),
+                    )
+                })
+            })
+            .await;
+        let mut operations: Vec<(lib::Id, Vec<lib::OperationEvent>)> = Vec::new();
+        for (operation, event, actor) in records {
+            assert_eq!(actor, remanence_state::AuditActor::System);
+            match operations.last_mut() {
+                Some((last, events)) if *last == operation => events.push(event),
+                _ => operations.push((operation, vec![event])),
+            }
+        }
+        assert_eq!(operations.len(), 2, "{operations:?}");
+        assert_ne!(operations[0].0, operations[1].0);
+        for (_, events) in &operations {
+            assert_eq!(
+                events,
+                &[
+                    lib::OperationEvent::Accepted(lib::Accepted {
+                        actor_fingerprint: "system".into(),
+                        idempotency_key: None,
+                        request_fingerprint: fingerprint,
+                        subject: Some(TAPE.into()),
+                    }),
+                    lib::OperationEvent::Failed(lib::Failed {
+                        retry: None,
+                        refusal_code: None,
+                        summary: SUMMARY.into(),
+                    }),
+                ]
+            );
+        }
     }
 }
 

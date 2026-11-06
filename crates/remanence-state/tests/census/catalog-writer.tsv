@@ -6,7 +6,6 @@ crates/remanence-api/src/api_state.rs::reconcile_clean_runs_from_report::write_h
 # Existing reconcile drive catalog from report catalog reconciliation uses the retained client.
 crates/remanence-api/src/api_state.rs::reconcile_drive_catalog_from_report::write_handle	1
 # Persist alarm acked at the existing audit/projection point.
-crates/remanence-api/src/api_state.rs::record_alarm_acked::write_handle	1
 # Persist cancel requested at the existing audit/projection point.
 crates/remanence-api/src/api_state.rs::record_cancel_requested::write_handle	1
 # Persist drive audit at the existing audit/projection point.
@@ -20,13 +19,11 @@ crates/remanence-api/src/api_state.rs::record_request_received::write_handle	1
 # Startup recovery uses the same owner later handed to all actors.
 crates/remanence-api/src/api_state.rs::with_drive_pool_opener::write_handle	1
 # Existing alarm writes retain their scope and observer policy using the API owner client.
-crates/remanence-api/src/closeout_obligation.rs::alarm::write_handle	1
 # Existing retry projection writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/closeout_obligation.rs::retry_projection::write_handle	1
 # Foreign health observations use the client retained by the worker.
 crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_with_reader::write_handle	1
 # Existing ack alarm writes retain their scope and observer policy using the API owner client.
-crates/remanence-api/src/library.rs::ack_alarm::write_handle	1
 # Existing annotate drive writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/library.rs::annotate_drive::write_handle	1
 # Existing reinstate drive writes retain their scope and observer policy using the API owner client.
