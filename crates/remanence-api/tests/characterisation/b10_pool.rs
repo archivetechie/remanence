@@ -28,18 +28,14 @@ fn two_tapes(parity: bool) -> Harness {
             stripes_per_neighborhood: first.stripes_per_neighborhood.unwrap(),
         })
     });
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: SECOND,
-            voltag: "CHAR02L9".into(),
-            block_size: BLOCK,
-            parity: parity.clone(),
-            force: false,
-        })
-        .unwrap();
-    index
-        .project_tape_pool_membership(SECOND, "archive")
-        .unwrap();
+    drop(index);
+    provision_in_pool(
+        &fixture.config,
+        SECOND,
+        "CHAR02L9",
+        parity.clone(),
+        "archive",
+    );
     let bootstrap =
         remanence_api::build_tape_bootstrap(SECOND, BLOCK, parity, "2026-11-03T00:00:00Z", "b10");
     let mut block = vec![0; BLOCK as usize];
@@ -58,6 +54,23 @@ fn two_tapes(parity: bool) -> Harness {
         world.put_tape_in_drive(BAY + 1, "CHAR02L9", Some(0x401), tape);
     }
     fixture
+}
+
+/// Provisioning writes the tapes' native logs to disk before the file model is attached.
+/// The model starts with those files, as an engine attached to an existing state root would find them.
+fn seed_existing_files(
+    files: &remanence_chaos::file_model::MemoryDirectory,
+    dir: &std::path::Path,
+) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            seed_existing_files(files, &path);
+        } else {
+            let bytes = std::fs::read(&path).unwrap();
+            files.seed(path, bytes);
+        }
+    }
 }
 
 fn pool_request() -> pb::OpenWriteSessionRequest {
@@ -118,6 +131,7 @@ async fn three_pool_sessions(policy: remanence_state::PoolSelectionPolicyName) {
     let mut fixture = two_tapes(false);
     fixture.config.tape_pools[0].selection_policy = policy;
     let files = MemoryDirectory::default();
+    seed_existing_files(&files, &fixture.config.journal.dir.join("tapes"));
     let _registration = register(
         fixture.config.journal.dir.join("tapes"),
         Arc::new(files.clone()),

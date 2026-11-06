@@ -10645,6 +10645,13 @@ pub(crate) struct TypedRoot {
 
 impl TypedRoot {
     pub(crate) fn open() -> Self {
+        Self::open_with_tapes(&[])
+    }
+
+    /// A root whose library log already holds a Reprovision for each `(tape_uuid, label)`. The
+    /// tapes are provisioned through `StateHandle::provision_tape`, the operator command's funnel,
+    /// before the runtime opens, so a typed write fence can name them.
+    pub(crate) fn open_with_tapes(tapes: &[([u8; 16], &str)]) -> Self {
         let root = tempfile::tempdir().unwrap();
         let paths = remanence_state::StatePaths {
             config_path: root.path().join("config"),
@@ -10655,6 +10662,44 @@ impl TypedRoot {
             tape_cache_dir: root.path().join("cache"),
             calibration_dir: root.path().join("calibration"),
         };
+        if !tapes.is_empty() {
+            let config = remanence_state::parse_config_toml(&format!(
+                r#"
+[daemon]
+state_dir = "{0}/state"
+default_idle_timeout_seconds = 1800
+io_memory_ceiling = "64 MiB"
+append_ring_bytes = "16 MiB"
+[tape_io]
+read_reservoir_bytes = "16 MiB"
+[journal]
+dir = "{0}/native"
+require_trusted_volume = false
+[audit]
+dir = "{0}/library"
+fsync = true
+[index]
+sqlite_path = "{0}/catalog.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+"#,
+                root.path().display()
+            ))
+            .unwrap();
+            let mut state =
+                remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
+            for (tape_uuid, label) in tapes {
+                state
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid: *tape_uuid,
+                        voltag: (*label).into(),
+                        block_size: 256 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .unwrap();
+            }
+        }
         let runtime = remanence_state::library_runtime::LibraryRuntime::open(
             &paths,
             true,
@@ -10675,6 +10720,11 @@ impl TypedRoot {
 
     pub(crate) fn catalog(&self) -> remanence_state::ProjectionClient {
         self.catalog.clone().expect("fixture still open")
+    }
+
+    /// The state paths of this root.
+    pub(crate) fn paths(&self) -> &remanence_state::StatePaths {
+        &self.paths
     }
 
     /// Service state over this runtime. The legacy audit directory is created up front, so

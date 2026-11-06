@@ -32,7 +32,8 @@ use remanence_chaos::model::{
 use remanence_library::transport::TransferOutcome;
 use remanence_library::{DiscoveryReport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass};
 use remanence_parity::{bootstrap::write_bootstrap_block, ParityConfig};
-use remanence_state::{ProvisionTapeInput, RemConfig};
+use remanence_state::library_runtime::LibraryRuntime;
+use remanence_state::{ProvisionTapeInput, RemConfig, StateHandle, StateLockGuard, StatePaths};
 use sha2::{Digest, Sha256};
 use tonic::transport::{Channel, Endpoint, Server};
 
@@ -41,6 +42,53 @@ const BLOCK: u32 = 262144;
 const LIBRARY: &str = "CHARACTERISATION-LIBRARY";
 const BAY: u16 = 0x100;
 const BARCODE: &str = "CHAR01L9";
+
+/// The state paths of a fixture root, as the daemon resolves them from its configuration.
+fn state_paths(config: &RemConfig) -> StatePaths {
+    StatePaths::from_config(config.daemon.state_dir.join("config.toml"), config)
+}
+
+/// The catalog the daemon builds: the library runtime over the state root, installed on the
+/// projection client. The runtime holds the state lock until every clone of it is dropped, and
+/// the drive-collection heartbeat worker keeps a clone for the life of the process
+/// (`drive_collection.rs`), so a second start in one process cannot take the lock again.
+fn open_runtime_catalog(config: &RemConfig) -> remanence_state::ProjectionClient {
+    let paths = state_paths(config);
+    let lock = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, config.audit.fsync, lock).unwrap();
+    remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime)
+}
+
+/// Provision a tape and assign it to a pool through the typed library authority, as the
+/// operator commands do, and release the state again.
+fn provision_in_pool(
+    config: &RemConfig,
+    tape_uuid: [u8; 16],
+    voltag: &str,
+    parity: ParityConfig,
+    pool: &str,
+) {
+    let mut state = StateHandle::open_with_config(state_paths(config), config.clone()).unwrap();
+    state
+        .provision_tape(ProvisionTapeInput {
+            tape_uuid,
+            voltag: voltag.into(),
+            block_size: BLOCK,
+            parity,
+            force: false,
+        })
+        .unwrap();
+    let generation = state
+        .library_runtime()
+        .tape_state(tape_uuid)
+        .unwrap()
+        .assignment_generation;
+    state
+        .assign_tape_pool(tape_uuid, generation, Some(pool))
+        .unwrap();
+}
 
 struct Harness {
     root: std::path::PathBuf,
@@ -106,19 +154,7 @@ tape_catalog_dir = "{path}/cache"
                 remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
             remanence_state::authority_layout::admit_owned_config(&config).unwrap();
         }
-        let mut index = remanence_state::projector::open(&config.index.sqlite_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: UUID,
-                voltag: BARCODE.into(),
-                block_size: BLOCK,
-                parity: parity.clone(),
-                force: false,
-            })
-            .unwrap();
-        index.project_tape_pool_membership(UUID, "archive").unwrap();
+        provision_in_pool(&config, UUID, BARCODE, parity.clone(), "archive");
         let bootstrap = remanence_api::build_tape_bootstrap(
             UUID,
             BLOCK,
@@ -156,7 +192,7 @@ tape_catalog_dir = "{path}/cache"
         let spool = self.root.join("spool");
         std::fs::create_dir_all(&spool).unwrap();
         let state = ApiState::with_drive_pool_opener(
-            remanence_state::projector::open(&self.config.index.sqlite_path).unwrap(),
+            open_runtime_catalog(&self.config),
             &self.config,
             report,
             StaticAllowlist::new([LIBRARY]),
@@ -1817,19 +1853,7 @@ async fn post_reply_closeout_holds_drive_and_log_until_end() {
         if access == "eviction" {
             let other = [0x36; 16];
             let parity = ParityConfig::None;
-            let mut index = remanence_state::projector::open(&fixture.config.index.sqlite_path)
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
-            index
-                .provision_tape(ProvisionTapeInput {
-                    tape_uuid: other,
-                    voltag: "CHAR02L9".into(),
-                    block_size: BLOCK,
-                    parity: parity.clone(),
-                    force: false,
-                })
-                .unwrap();
-            index.project_tape_pool_membership(other, "other").unwrap();
+            provision_in_pool(&fixture.config, other, "CHAR02L9", parity.clone(), "other");
             let payload = remanence_api::build_tape_bootstrap(
                 other,
                 BLOCK,

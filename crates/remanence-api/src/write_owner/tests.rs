@@ -4192,6 +4192,29 @@ fn test_write_owner_config(
     }
 }
 
+/// `test_write_owner_config` over a typed root: the terminal authority is the root's library
+/// runtime, the catalog is the projection that runtime feeds, and the checkpoint journals are the
+/// root's native tape logs. Everything else is the shared constructor's.
+fn test_typed_write_owner_config(
+    typed: &crate::tests::TypedRoot,
+    library: &remanence_library::LibraryHandle,
+    library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
+) -> WriteOwnerConfig {
+    let catalog = typed.catalog();
+    let mut cfg = test_write_owner_config(
+        typed.paths().sqlite_path.clone(),
+        typed.paths().audit_dir.clone(),
+        library,
+        library_snapshot,
+    );
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(
+        catalog.library_runtime().expect("typed root has a runtime"),
+    );
+    cfg.catalog = catalog;
+    cfg.checkpoint_journal_dir = typed.paths().journal_dir.join("tapes");
+    cfg
+}
+
 fn test_io_memory() -> Arc<crate::io_memory::IoMemoryReservation> {
     crate::io_memory::IoMemoryReservation::new(remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES)
         .expect("test I/O memory manager")

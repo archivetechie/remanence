@@ -318,18 +318,14 @@ fn b3b_mounted_abandoned_after_applied_outcome_one_fence() {
 fn check_settle_audit(scenario: &str) {
     let post_write = matches!(scenario, "overlap" | "parity-size" | "parity-poisoned");
     let abandoned = post_write || matches!(scenario, "abandoned" | "abandoned-after-applied");
-    let root = tempfile::tempdir().unwrap();
-    let index_path = root.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let mut typed = crate::tests::TypedRoot::open_with_tapes(&[([94; 16], "SETTLE94L9")]);
+    let mut index = typed.catalog().write_handle();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C6", 0x100, "C6D", 0x400, 1,
     )));
     let library = open_model_library(world);
     let snapshot = library_snapshot_cell(library.library().clone());
-    let mut cfg =
-        test_write_owner_config(index_path, root.path().join("audit"), &library, snapshot);
+    let mut cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let mut drive = if scenario != "device" {
         let (mut drive, _) = drive(255);
         drive.write_block_unpositioned(&[0; 512]).unwrap();
@@ -414,14 +410,6 @@ fn check_settle_audit(scenario: &str) {
     let fences = index.list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "transfer_error");
-    let records = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).unwrap();
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| r.event == AuditEvent::TapeIoFenceRaised)
-            .count(),
-        1
-    );
     let before = counters();
     crate::write_owner::mounted_commands::settle_audit(
         &mut index,
@@ -432,6 +420,16 @@ fn check_settle_audit(scenario: &str) {
     .unwrap();
     assert_eq!(counters(), before);
     assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
+    // The typed fence record is the audit: one across both settlements.
+    drop((index, cfg));
+    let raised = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(typed.records(|record| {
+            (record.tag() == remanence_state::library_log::Tag::FenceRaised).then_some(())
+        }));
+    assert_eq!(raised.len(), 1);
 }
 
 /// Two successful mounted WRITEs followed by unknown completion leave one transfer_error fence and one audit.
