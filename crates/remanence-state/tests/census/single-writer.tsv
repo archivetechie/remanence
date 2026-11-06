@@ -1,0 +1,196 @@
+# I1 single-writer allowlist: every production site that may call the legacy audit funnel or a
+# mutating method of the projector's SQL layer. Read by single_writer.rs.
+#
+# Columns (tab-separated): file, enclosing_fn, callee, count, reason, removed_by.
+#   file          workspace-relative path
+#   enclosing_fn  the innermost fn containing the call (bare name)
+#   callee        the called function or method name
+#   count         the exact number of calls to callee inside enclosing_fn
+#   reason        applies-authority | unreachable-at-runtime | cache | pending-order |
+#                 routes-to-runtime | name-collision
+#   removed_by    the order that deletes the site, or `permanent`
+# routes-to-runtime: a handle method whose body appends through the runtime rather than writing
+#   SQL first.
+# name-collision: a callee that only shares a name with a mutator, such as a gRPC client method.
+# The test fails on a site that is not listed, on a count that differs from the code in either
+# direction, and on a row whose site no longer exists, so this file only shrinks, deliberately.
+# The projector's own modules are listed by function, not by directory.
+#
+# Outside the projector: sites a later order removes, or that never write SQL authority (D4)
+crates/remanence-api/src/calibration.rs	harvest_and_install_calibration	upsert_wrap_map	1	cache	permanent
+crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	append_and_project_audit	2	unreachable-at-runtime	L2
+crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	observe_foreign_drive_tapealert_advisory	1	unreachable-at-runtime	L2
+crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	record_drive_health_snapshot	1	unreachable-at-runtime	L2
+crates/remanence-api/src/mount_support.rs	import_journals	recover_imported_append_authority	1	pending-order	R3d-L1
+crates/remanence-api/src/terminal_fault.rs	clear_assignment_at_cut	compare_and_set_tape_pool_assignment	1	pending-order	row-12 hook deletion
+crates/remanence-api/src/write_owner/reconcile.rs	reconcile_tape_files	reconcile_tape_files_projection	1	unreachable-at-runtime	L2
+crates/remanence-state/src/library_runtime.rs	repair_native	mark_repaired_tape	1	pending-order	R3d-L1
+#
+# Outside the projector: projection, apply and wrapper sites (D-5-1)
+#
+# A1: The legacy funnel's own body; it refuses once the library runtime is installed.
+crates/remanence-api/src/audit_projection.rs	append_and_project_audit	append_and_project_audit_locked	1	unreachable-at-runtime	L3
+crates/remanence-api/src/audit_projection.rs	append_and_project_audit_locked	append_and_return_record	1	unreachable-at-runtime	L3
+crates/remanence-api/src/audit_projection.rs	append_and_project_audit_locked	project_audit_record	1	unreachable-at-runtime	L3
+#
+# D1: A gRPC client method that only shares a name with a mutator; no SQL is touched.
+crates/remanence-cli/src/lib.rs	release_fence_on_channel	release_tape_io_fence	1	name-collision	permanent
+crates/remanence-cli/src/lib.rs	run_alarms_client_command	ack_alarm	1	name-collision	permanent
+crates/remanence-cli/src/lib.rs	run_drive_client_command	annotate_drive	1	name-collision	permanent
+crates/remanence-cli/src/lib.rs	run_drive_client_command	reinstate_drive	1	name-collision	permanent
+crates/remanence-cli/src/lib.rs	run_drive_client_command	retire_drive	1	name-collision	permanent
+#
+# P1: Applies a tape-log or typed-rebuild record into SQL.
+crates/remanence-api/src/closeout_obligation.rs	retry_projection	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/mount.rs	service_closeout_obligation	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/mount_support.rs	import_journals	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/startup_checkpoint.rs	replay_checkpoint_journal_projections_with_audit	project_tape_log	3	applies-authority	permanent
+crates/remanence-api/src/write_owner/checkpoint.rs	perform_checkpoint_barrier_with_rows	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/checkpoint.rs	project_checkpoint_authority_bounded	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/checkpoint.rs	write_closeout	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/tail_recovery.rs	supersede_mounted_tail	project_tape_log	2	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	complete_terminal_finalization_host_only	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	finalize_terminal_with_parity_journal	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	finish_terminal_tail	project_terminal_finalization	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	preflight_automatic_terminal_completion	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	preflight_manual_finalize_cancellable	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	project_sealed_checkpoint_then_retire_terminal_intent	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_finalize.rs	publish_terminal_intent	project_terminal_finalization	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_types.rs	commit_after_barrier	project_tape_log	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_types.rs	persist_terminal_recovery_required	project_terminal_finalization	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/terminal_types.rs	reconcile_terminal_component_host_authority	project_terminal_finalization	1	applies-authority	permanent
+crates/remanence-api/src/write_owner/write_session.rs	handle_drive_open_write	project_terminal_finalization	1	applies-authority	permanent
+crates/remanence-state/src/library_runtime.rs	project_native_before_apply	apply_frozen	1	applies-authority	permanent
+crates/remanence-state/src/library_runtime.rs	rebuild_projection	rebuild_typed_sources	1	applies-authority	permanent
+crates/remanence-state/src/library_runtime.rs	repair_native	rebuild_repaired_tape_projection	1	applies-authority	permanent
+crates/remanence-state/src/state.rs	ingest_tape_journal	mark_tape_journal_ingestion_pending	1	pending-order	L3 dead-code deletion
+crates/remanence-state/src/state.rs	ingest_tape_journal	project_tape_log	1	applies-authority	permanent
+crates/remanence-state/src/state.rs	rebuild_projection_inputs	rebuild_typed_sources	1	applies-authority	permanent
+#
+# P2: A handle or StateHandle method whose body goes through the runtime rather than writing SQL first.
+crates/remanence-api/src/drive_collection.rs	observe_drive_catalog_from_libraries	observe_drive_inventory_snapshot	1	routes-to-runtime	permanent
+crates/remanence-api/src/startup_media_readiness.rs	reconcile_library_media_readiness_records_on_startup	record_media_readiness_transition	3	routes-to-runtime	permanent
+crates/remanence-api/src/startup_media_readiness.rs	startup_media_readiness_initializing_load	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-api/src/write_owner/readiness.rs	poll_drive_media_readiness	record_media_readiness_transition	2	routes-to-runtime	permanent
+crates/remanence-api/src/write_owner/readiness.rs	record_session_open_mechanical_transition	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-api/src/write_owner/readiness.rs	record_session_open_readiness_operation	record_media_readiness_operation	1	routes-to-runtime	permanent
+crates/remanence-api/src/write_owner/readiness.rs	record_session_open_readiness_poll_transition	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-api/src/write_owner/robotics.rs	run_load_sequence_owned	record_media_readiness_operation	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	apply_tape_retire	retire_tape	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	poll_already_observed_media_readiness	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	poll_media_readiness_after_initial_probe	record_media_readiness_transition	2	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	provision_initialized_tape_with_media	provision_replacing_media	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_command_failure	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_operation	record_media_readiness_operation	2	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_signal_or_mechanical_failure	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_signal_transition	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_transition	record_media_readiness_transition	2	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	resolve_wait_ready_operation	begin_typed_media_readiness_operation	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	resolve_wait_ready_operation	record_media_readiness_operation	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	run_tape_init_hardware	record_media_readiness_operation	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	run_tape_init_hardware	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	run_tape_quarantine	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	run_tape_quarantine	release_tape_io_fence	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	run_tape_wait_ready_hardware	record_media_readiness_transition	3	routes-to-runtime	permanent
+crates/remanence-cli/src/standalone.rs	dispatch	release_tape_io_fence	1	routes-to-runtime	permanent
+crates/remanence-cli/src/standalone.rs	dispatch	set_tape_generation	1	routes-to-runtime	permanent
+crates/remanence-state/src/state.rs	provision_tape	provision_tape_with_media	1	routes-to-runtime	permanent
+crates/remanence-state/src/state.rs	provision_tape_with_media	provision_replacing_media	1	routes-to-runtime	permanent
+#
+# The projector's apply sites
+crates/remanence-state/src/projector/apply.rs	apply_authority	project_tape_log_bounded	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	advance_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	complete_tape_io_fence_release	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	delete_wrap_map	3	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	record_media_readiness_operation	2	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	reinstate_drive	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	retire_tape	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	set_tape_cleaning_state	2	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	terminalize_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	upsert_wrap_map	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	library_readiness_transition	record_media_readiness_transition	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	project_library_cleaning_selection	select_clean_run_cart	1	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	project_library_drive_fences	set_drive_fenced	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	accept_manual_terminal_finalization_with	accept_manual_terminal_finalization_with	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	ack_alarm	ack_alarm	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	advance_clean_run	advance_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	annotate_drive	annotate_drive	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	begin_clean_run	begin_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	clear_alarm	clear_alarm	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	clear_tape_pool_membership	clear_tape_pool_membership	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	compare_and_set_tape_pool_assignment	compare_and_set_tape_pool_assignment	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	compare_and_set_tape_pool_assignment_as	compare_and_set_tape_pool_assignment_as	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	complete_tape_io_fence_release	complete_tape_io_fence_release	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	delete_wrap_map	delete_wrap_map	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	ensure_cleaning_cartridge	ensure_cleaning_cartridge	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	finalize_verified_clean_run	finalize_verified_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	index_structural_authority	index_structural_authority	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	mark_clean_run_failed	mark_clean_run_failed	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	mark_clean_run_needs_operator	mark_clean_run_needs_operator	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	mark_repaired_tape	mark_repaired_tape	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	mark_tape_journal_ingestion_pending	mark_tape_journal_ingestion_pending	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	observe_drive	observe_drive	1	unreachable-at-runtime	L3 (gate the fallback like the readiness methods)
+crates/remanence-state/src/projector/handle.rs	observe_drive_inventory_snapshot	observe_drive_inventory_snapshot	1	unreachable-at-runtime	L3 (gate the fallback like the readiness methods)
+crates/remanence-state/src/projector/handle.rs	observe_foreign_drive_tapealert_advisory	observe_foreign_drive_tapealert_advisory	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	observe_managed_drive_cleaning_due	observe_managed_drive_cleaning_due	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	project_audit_record	project_audit_record	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	project_native_object_and_committed_tape_file_bundle	project_native_object_and_committed_tape_file_bundle	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	project_native_object_append_commit	project_native_object_append_commit	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	project_tape_log	project_tape_log	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	project_tape_pool_membership	project_tape_pool_membership	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	project_terminal_finalization	project_terminal_finalization	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	provision_replacing_media	provision_replacing_media	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	provision_tape	provision_tape	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	provision_tape_with_media	provision_tape_with_media	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	raise_alarm	raise_alarm	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	rebuild_from_authoritative_sources	rebuild_from_authoritative_sources	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	rebuild_repaired_tape_projection	rebuild_repaired_tape_projection	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	rebuild_tape_log_projection	rebuild_tape_log_projection	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	rebuild_typed_sources	rebuild_typed_sources	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	reconcile_clean_runs_against_library	reconcile_clean_runs_against_library	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	reconcile_cleaning_prefixes	reconcile_cleaning_prefixes	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	reconcile_tape_files_projection	reconcile_tape_files_projection	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	reconcile_tape_pool_projection_from_rules	reconcile_tape_pool_projection_from_rules	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	record_drive_health_snapshot	record_drive_health_snapshot	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	record_tape_io_fence	record_tape_io_fence	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	record_tape_io_fence_at_endpoint	record_tape_io_fence_at_endpoint	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	recover_imported_append_authority	recover_imported_append_authority	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	register_idempotency_request	register_idempotency_request	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	reinstate_drive	reinstate_drive	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	release_tape_io_fence	release_tape_io_fence	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	replay_audit_records	replay_audit_records	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	retire_drive	retire_drive	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	retire_tape	retire_tape	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	seal_tape	seal_tape	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	select_clean_run_cart	select_clean_run_cart	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	set_drive_fenced	set_drive_fenced	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	set_tape_cleaning_state	set_tape_cleaning_state	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	set_tape_generation	set_tape_generation	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	set_tape_kind	set_tape_kind	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	terminalize_clean_run	terminalize_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	upsert_native_object_projection	upsert_native_object_projection	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	upsert_tape_pool_projection	upsert_tape_pool_projection	1	applies-authority	permanent
+crates/remanence-state/src/projector/handle.rs	upsert_wrap_map	upsert_wrap_map	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	clear_tape_pool_membership	compare_and_set_tape_pool_assignment	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	compare_and_set_tape_pool_assignment	compare_and_set_tape_pool_assignment_as	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	compare_and_set_tape_pool_assignment_as	compare_and_set_tape_pool_assignment_with_audit	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	ensure_cleaning_cartridge	set_tape_kind	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	mark_clean_run_failed	advance_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	mark_clean_run_needs_operator	advance_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	observe_foreign_drive_tapealert_advisory	clear_alarm	3	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	observe_foreign_drive_tapealert_advisory	raise_alarm	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	project_tape_pool_membership	compare_and_set_tape_pool_assignment	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	provision_tape	provision_tape_with_media	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	provision_tape_with_media	provision_replacing_media	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	reconcile_clean_runs_against_library	advance_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	reconcile_clean_runs_against_library	clear_alarm	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	reconcile_clean_runs_against_library	finalize_verified_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	reconcile_clean_runs_against_library	mark_clean_run_needs_operator	2	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	reconcile_clean_runs_against_library	raise_alarm	3	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	reconcile_clean_runs_against_library	set_drive_fenced	2	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	record_tape_io_fence	record_tape_io_fence_at_endpoint	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	release_tape_io_fence	complete_tape_io_fence_release	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	set_tape_kind	raise_alarm	1	applies-authority	permanent
+crates/remanence-state/src/projector/index.rs	terminalize_clean_run	advance_clean_run	1	applies-authority	permanent
+crates/remanence-state/src/projector/tape_log_projection.rs	rebuild_typed_sources	clear_typed_projection	1	applies-authority	permanent
+crates/remanence-state/src/projector/thread.rs	apply	apply_frozen	1	applies-authority	permanent

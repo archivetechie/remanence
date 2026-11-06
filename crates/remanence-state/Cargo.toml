@@ -35,6 +35,8 @@ remanence-library = { path = "../remanence-library", features = ["test-support"]
 remanence-state = { path = ".", features = ["fixtures"] }
 remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
 tempfile = { workspace = true }
+# The I1 single-writer census parses the workspace sources (tests/single_writer.rs).
+syn = { version = "2", features = ["full", "visit"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
