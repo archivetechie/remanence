@@ -1310,6 +1310,13 @@ pub(crate) fn preflight_manual_finalize_cancellable(
     checkpoint
         .accept_preparation()
         .map_err(crate::status_from_state_error)?;
+    // `accept_preparation` appended Decided to the lease but projected nothing, and the typed
+    // branch refreshed the runtime's native view while only Prepared was durable. Project the
+    // lease's Decided snapshot through the same funnel the retry path uses, so the terminal
+    // finalization row exists before the runtime's `catch_up` below replays that older view
+    // and before the caller reads the row.
+    project_checkpoint_authority_bounded(index, &checkpoint)
+        .map_err(crate::status_from_state_error)?;
     // A crash after acceptance but before this append is repaired from the
     // accepted companion before any physical dispatch.
     record_manual_finalize_request_with(index, &cfg.authority, request)?;

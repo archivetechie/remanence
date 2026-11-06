@@ -727,7 +727,9 @@ fn seal_tail(
 /// Where the first incarnation is killed.
 #[derive(Clone, Copy, Debug)]
 enum KillAt {
-    /// The first RPC answered with an error after the acceptance was durable; no worker ran.
+    /// The first RPC was accepted and the incarnation was killed as soon as it answered. The
+    /// attempt's `Started` is already durable, because admission records it before it answers;
+    /// whether the worker had reached its drive dispatch is not waited for.
     Accepted,
     /// The worker dispatched its `FinalizeTape` command and the drive did nothing.
     Dispatched,
@@ -763,41 +765,33 @@ fn sql_files(paths: &remanence_state::StatePaths) -> BTreeMap<PathBuf, Vec<u8>> 
     files
 }
 
-/// The answer the first `FinalizeTape` RPC gets over a typed library runtime, observed at this
-/// tree. The acceptance is durable (Prepared, `ManualFinalizationAccepted`, Decided), but the
-/// admission path then finds no SQL finalization projection and answers `Internal`. The
-/// projection appears only when the next preflight projects the Decided group, so the same-key
-/// RPC that follows is accepted.
-const FIRST_RPC_REFUSAL: &str = "durably accepted FinalizeTape has no finalization projection";
-
 /// Run the original request through the `FinalizeTape` RPC and the real worker up to its drive
 /// dispatch, let the model drive actor do what `kill_at` says, and kill the incarnation with the
-/// actor's reply unanswered.
+/// actor's reply unanswered. For a kill straight after the answer the dead incarnation still holds
+/// the pool's command channels, so its worker finds a live drive actor and records nothing.
 fn first_incarnation(typed: &mut TypedRoot, key: Uuid, kill_at: KillAt) -> Killed {
     let tapes = typed.paths().journal_dir.join("tapes");
     let paths = typed.paths().clone();
     let catalog = typed.catalog();
     let incarnation = runtime();
-    let (before_seal, unanswered) = incarnation.block_on(async move {
+    let (before_seal, held) = incarnation.block_on(async move {
         let mut state = ApiState::new(catalog);
         state.checkpoint_journal_dir = Arc::new(tapes);
         let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
-        let refusal = finalize_rpc(&state, key)
-            .await
-            .expect_err("the first RPC over a typed runtime is refused");
-        assert_eq!(refusal.code(), tonic::Code::Internal);
-        assert_eq!(refusal.message(), FIRST_RPC_REFUSAL);
-        if matches!(kill_at, KillAt::Accepted) {
-            return (None, None);
-        }
         let first = finalize_rpc(&state, key)
             .await
-            .expect("the same-key RPC after it is accepted");
+            .expect("the first RPC over a typed runtime is accepted");
         assert_eq!(
             first.outcome,
             pb::TapeFinalizationOutcome::Finalizing as i32
         );
         let operation = Uuid::from_slice(first.operation_id.as_deref().unwrap()).unwrap();
+        if matches!(kill_at, KillAt::Accepted) {
+            return (
+                None,
+                Box::new((drive_rx, changer_rx)) as Box<dyn std::any::Any>,
+            );
+        }
         let command = tokio::time::timeout(Duration::from_secs(5), drive_rx.recv())
             .await
             .expect("the worker dispatches to the drive")
@@ -831,11 +825,11 @@ fn first_incarnation(typed: &mut TypedRoot, key: Uuid, kill_at: KillAt) -> Kille
             changer_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        (before_seal, Some(reply))
+        (before_seal, Box::new(reply) as Box<dyn std::any::Any>)
     });
     // The kill: the worker is dropped where it awaits the actor's reply. No failure handler runs.
     drop(incarnation);
-    drop(unanswered);
+    drop(held);
     let operations = runtime().block_on(typed.records(|record| {
         let value = record.operation_recorded()?;
         (value.kind == lib::OperationKind::FinalizeTape).then_some(value.operation)
@@ -916,10 +910,7 @@ fn check_open_retry_completes(kill_at: KillAt) {
         // Nothing has closed the operation; the retry is the first thing the new incarnation sees.
         assert_eq!(
             operation_state(&state, operation).await,
-            match kill_at {
-                KillAt::Accepted => pb::OperationState::Queued,
-                _ => pb::OperationState::Running,
-            } as i32,
+            pb::OperationState::Running as i32,
             "{kill_at:?}: nothing closed the operation, so GetOperation still reports it open"
         );
         let retry = finalize_rpc(&state, key)
@@ -1027,8 +1018,8 @@ fn check_open_retry_completes(kill_at: KillAt) {
     );
 }
 
-/// The first RPC was answered with an error after the acceptance was durable, then the process
-/// was killed. The same-key retry after the restart completes and seals once.
+/// The first RPC was accepted and the process was killed as soon as it answered. The same-key
+/// retry after the restart completes and seals once.
 #[test]
 fn open_finalize_cut_after_acceptance_same_key_retry_completes_and_seals_once() {
     check_open_retry_completes(KillAt::Accepted);
@@ -1078,6 +1069,49 @@ enum SealCut {
     Stale,
     /// The SQL catalog is stale and startup repair does not run, so only the retry can repair.
     StaleNoStartupRepair,
+    /// The SQL catalog already projects the seal, and only the operation's `Finished` is missing;
+    /// startup finishes the operation.
+    Current,
+    /// The SQL catalog already projects the seal, only `Finished` is missing, and startup repair
+    /// does not run, so only the retry can finish the operation.
+    CurrentNoStartupRepair,
+}
+
+/// What the production tail does between the native seal and the operation's `Finished`: project
+/// the sealed native log into the SQL catalog. Run on the files after `cut_back_to` has restored
+/// the catalog as it stood before the seal.
+fn project_native_seal_into_sql(paths: &remanence_state::StatePaths) {
+    let catalog = remanence_state::projector::open(&paths.sqlite_path).expect("reopen the catalog");
+    let mut index = catalog.write_handle();
+    let lease = remanence_state::TapeAuthority::open(
+        paths.journal_dir.join("tapes"),
+        TAPE,
+        &paths.sqlite_path,
+    )
+    .expect("open the native tape log")
+    .acquire_exclusive()
+    .expect("lease the native tape log");
+    let predates_the_seal = index
+        .terminal_finalization(&TAPE)
+        .expect("read the finalization row")
+        .expect("the restored catalog holds the in-progress row");
+    assert_ne!(
+        predates_the_seal.outcome,
+        remanence_state::TerminalFinalizationOutcome::Finalized,
+        "the restored catalog predates the seal"
+    );
+    index
+        .project_tape_log(&lease.freeze().expect("freeze the sealed log"))
+        .expect("project the seal");
+    let row = index
+        .terminal_finalization(&TAPE)
+        .expect("read the finalization row")
+        .expect("the catalog holds the finalization row");
+    assert_eq!(
+        row.outcome,
+        remanence_state::TerminalFinalizationOutcome::Finalized,
+        "the catalog is current: it projects the seal"
+    );
 }
 
 /// The first incarnation is killed after the native seal was written and before the operation's
@@ -1108,6 +1142,9 @@ fn check_seal_written_then_retry(cut: SealCut) {
         "{events:?}"
     );
     cut_back_to(typed.paths(), &before_seal, !matches!(cut, SealCut::Lost));
+    if matches!(cut, SealCut::Current | SealCut::CurrentNoStartupRepair) {
+        project_native_seal_into_sql(typed.paths());
+    }
     let events = incarnation.block_on(events_of(&mut typed, operation));
     assert!(
         matches!(
@@ -1131,7 +1168,10 @@ fn check_seal_written_then_retry(cut: SealCut) {
         "the seal is durable"
     );
 
-    let repaired_at_startup = !matches!(cut, SealCut::StaleNoStartupRepair);
+    let repaired_at_startup = !matches!(
+        cut,
+        SealCut::StaleNoStartupRepair | SealCut::CurrentNoStartupRepair
+    );
     let (state, mut drive_rx, mut changer_rx) = second_incarnation(&typed, repaired_at_startup);
     incarnation.block_on(async {
         assert_eq!(
@@ -1203,4 +1243,371 @@ fn same_key_retry_after_restart_with_stale_sql_seals_once() {
 #[test]
 fn same_key_retry_repairs_the_open_operation_of_a_sealed_tape_without_sealing_again() {
     check_seal_written_then_retry(SealCut::StaleNoStartupRepair);
+}
+
+/// The SQL catalog already projects the seal and `Finished` is absent: startup finishes the
+/// operation, and the retry then finds it finished and does not seal again.
+#[test]
+fn same_key_retry_after_restart_with_current_sql_and_no_finished_seals_once() {
+    check_seal_written_then_retry(SealCut::Current);
+}
+
+/// The SQL catalog already projects the seal, `Finished` is absent and startup repair does not
+/// run: the retry itself finishes the operation and does not seal again.
+#[test]
+fn same_key_retry_finishes_a_sealed_tape_with_current_sql_without_sealing_again() {
+    check_seal_written_then_retry(SealCut::CurrentNoStartupRepair);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The first request over a typed runtime (trial rung F1)
+// ---------------------------------------------------------------------------------------------
+
+/// The first `FinalizeTape` over a typed library runtime is accepted. Its preflight publishes the
+/// native Prepared frame and the typed acceptance, then appends Decided. The admission path then
+/// reads the tape's SQL finalization row to build its answer, so that row must exist when the
+/// preflight returns: the lease's Decided snapshot has to be projected before the runtime's
+/// `catch_up`, which replays only the Prepared view the acceptance refreshed.
+///
+/// The caller gets an operation and `GetTapeFinalization` shows the tape finalizing, where the
+/// tree before this rung answered `Internal` ("durably accepted FinalizeTape has no
+/// finalization projection") and made the operator retry.
+#[test]
+fn the_first_finalize_over_a_typed_runtime_is_accepted_and_reports_finalizing() {
+    let mut typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    install_checkpoint(&typed);
+    let key = Uuid::from_u128(0xF1);
+    let tapes = typed.paths().journal_dir.join("tapes");
+    let catalog = typed.catalog();
+    let incarnation = runtime();
+    let (operation, unanswered) = incarnation.block_on(async move {
+        let mut state = ApiState::new(catalog);
+        state.checkpoint_journal_dir = Arc::new(tapes);
+        let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+        let first = finalize_rpc(&state, key)
+            .await
+            .expect("the first FinalizeTape over a typed runtime is accepted");
+        assert_eq!(
+            first.outcome,
+            pb::TapeFinalizationOutcome::Finalizing as i32
+        );
+        let operation =
+            Uuid::from_slice(first.operation_id.as_deref().expect("an operation id")).unwrap();
+
+        // What the caller polls.
+        let polled = tape_finalization(&state).await;
+        assert_eq!(
+            polled.outcome,
+            pb::TapeFinalizationOutcome::Finalizing as i32
+        );
+        assert_eq!(polled.operation_id, first.operation_id);
+        assert_eq!(
+            operation_state(&state, operation).await,
+            pb::OperationState::Running as i32
+        );
+
+        // The worker dispatches the one finalize command, for that operation.
+        let command = tokio::time::timeout(Duration::from_secs(5), drive_rx.recv())
+            .await
+            .expect("the worker dispatches to the drive")
+            .expect("a drive command");
+        let crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } = command else {
+            panic!("the first drive command is the finalize");
+        };
+        assert_eq!(request.candidate_operation_id, operation);
+        assert!(matches!(
+            drive_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            changer_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        (operation, reply)
+    });
+    drop(incarnation);
+    drop(unanswered);
+    assert_eq!(
+        native_finalization(typed.paths()),
+        NativeFinalization {
+            prepared: 1,
+            decided: 1,
+            retired: 0,
+            sealed: 0,
+        }
+    );
+    let events = runtime().block_on(events_of(&mut typed, operation));
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                lib::OperationEvent::Accepted(_),
+                lib::OperationEvent::Started(_)
+            ]
+        ),
+        "{events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two resumers of one open operation (trial rung F1)
+//
+// The first incarnation is killed with the operation open and the drive command unanswered. In
+// the second, two paths can resume it: startup recovery (`service_closeout_obligation`) and the
+// operator's same-key `FinalizeTape`. Each order must leave one owner, one drive command, one
+// native seal and the chain `[Accepted, Started, Finished]`.
+// ---------------------------------------------------------------------------------------------
+
+/// Which resumer reaches the open operation first.
+#[derive(Clone, Copy, Debug)]
+enum FirstResumer {
+    /// Startup recovery is held after its tape reservation, while it owns the tape-log lease, when
+    /// the operator's same-key request arrives.
+    Recovery,
+    /// The operator's same-key request owns the tape's worker when recovery runs.
+    Retry,
+}
+
+/// Take the one finalize command off the drive channel.
+async fn take_finalize_command(
+    drive_rx: &mut tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
+    operation: Uuid,
+) -> (
+    crate::write_owner::ManualFinalizeTapeActorRequest,
+    tokio::sync::oneshot::Sender<Result<crate::write_owner::ManualFinalizeTapeActorReply, Status>>,
+) {
+    let command = tokio::time::timeout(Duration::from_secs(30), drive_rx.recv())
+        .await
+        .expect("a resumer dispatches to the drive")
+        .expect("a drive command");
+    let crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } = command else {
+        panic!("the drive command is the finalize");
+    };
+    assert_eq!(request.candidate_operation_id, operation);
+    (request, reply)
+}
+
+/// The model drive actor finishes the finalize it was sent: the five progress steps, the seal,
+/// the reply.
+fn finish_finalize_command(
+    state: &ApiState,
+    operation: Uuid,
+    mut request: crate::write_owner::ManualFinalizeTapeActorRequest,
+    reply: tokio::sync::oneshot::Sender<
+        Result<crate::write_owner::ManualFinalizeTapeActorReply, Status>,
+    >,
+) {
+    assert_eq!(advance_tail(state, operation, 5), 5);
+    let completed = seal_tail(state, &mut request);
+    assert_eq!(
+        completed.projection.outcome,
+        remanence_state::TerminalFinalizationOutcome::Finalized
+    );
+    reply.send(Ok(completed)).unwrap();
+}
+
+/// Hold the next startup recovery of `TAPE` after its tape reservation, with the tape-log lease
+/// taken. Returns the signal that it is held and the key that lets it go on.
+fn hold_startup_recovery() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    *STARTUP_TERMINAL_LEASE_HOOK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((
+        TAPE,
+        Box::new(move || {
+            let _ = held_tx.send(());
+            let _ = resume_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    ));
+    (held_rx, resume_tx)
+}
+
+fn check_two_resumers(first: FirstResumer) {
+    let mut typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    install_checkpoint(&typed);
+    let key = Uuid::from_u128(0xC3);
+    let Killed { operation, .. } = first_incarnation(&mut typed, key, KillAt::Dispatched);
+    let (state, mut drive_rx, mut changer_rx) = second_incarnation(&typed, true);
+    let incarnation = runtime();
+    incarnation.block_on(async {
+        assert_eq!(
+            operation_state(&state, operation).await,
+            pb::OperationState::Running as i32,
+            "{first:?}: nothing closed the operation"
+        );
+        match first {
+            FirstResumer::Recovery => {
+                let (held_rx, resume_tx) = hold_startup_recovery();
+                let recovery = tokio::spawn({
+                    let state = state.clone();
+                    async move { crate::mount::service_closeout_obligation(&state, TAPE, 1).await }
+                });
+                tokio::time::timeout(Duration::from_secs(5), held_rx)
+                    .await
+                    .expect("startup recovery takes the tape-log lease")
+                    .expect("the hook reports");
+
+                // The operator's same-key request meets recovery while it holds the lease: it
+                // rejoins the operation or is told Busy by it, and starts nothing.
+                let before = durable_bytes(typed.paths());
+                let retry = tokio::time::timeout(Duration::from_secs(5), finalize_rpc(&state, key))
+                    .await
+                    .expect("the same-key request returns while recovery is held")
+                    .expect("the same-key request is not refused");
+                let rejoined = retry.outcome == pb::TapeFinalizationOutcome::Finalizing as i32
+                    && retry.operation_id.as_deref() == Some(operation.as_bytes().as_slice());
+                let busy_by_it = retry.outcome == pb::TapeFinalizationOutcome::Busy as i32
+                    && retry.detail.contains(&operation.to_string());
+                assert!(
+                    rejoined || busy_by_it,
+                    "the retry rejoins operation {operation} or is Busy by it: {retry:?}"
+                );
+                assert_eq!(
+                    durable_bytes(typed.paths()),
+                    before,
+                    "the retry appended no record while recovery held the tape"
+                );
+                assert!(matches!(
+                    drive_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+
+                resume_tx.send(()).expect("recovery is still held");
+                let (request, reply) = take_finalize_command(&mut drive_rx, operation).await;
+                finish_finalize_command(&state, operation, request, reply);
+                recovery
+                    .await
+                    .expect("recovery task")
+                    .expect("recovery completes");
+            }
+            FirstResumer::Retry => {
+                let retry = finalize_rpc(&state, key)
+                    .await
+                    .expect("the same-key request is admitted");
+                assert_eq!(
+                    retry.outcome,
+                    pb::TapeFinalizationOutcome::Finalizing as i32
+                );
+                assert_eq!(
+                    retry.operation_id.as_deref(),
+                    Some(operation.as_bytes().as_slice())
+                );
+                let (request, reply) = take_finalize_command(&mut drive_rx, operation).await;
+
+                // Recovery runs while the retry's worker owns the tape: it is refused at its
+                // reservation, before any read or write, and exits.
+                let before = durable_bytes(typed.paths());
+                let refused = crate::mount::service_closeout_obligation(&state, TAPE, 1).await;
+                let refusal =
+                    refused.expect_err("recovery is refused while the retry owns the tape");
+                assert!(
+                    crate::drive_pool::TapeBusy::from_status(&refusal).is_some(),
+                    "recovery is refused as busy: {refusal}"
+                );
+                assert_eq!(
+                    durable_bytes(typed.paths()),
+                    before,
+                    "the refused recovery appended no record"
+                );
+                assert!(matches!(
+                    drive_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+
+                finish_finalize_command(&state, operation, request, reply);
+                wait_for_state(&state, operation, pb::OperationState::Succeeded).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while state
+                        .drive_pool()
+                        .unwrap()
+                        .mounted_tape_uuids()
+                        .contains(&TAPE)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the retry's worker releases the tape");
+
+                // Recovery runs once more, after the seal: it finds the tape sealed and exits.
+                let before = durable_bytes(typed.paths());
+                crate::mount::service_closeout_obligation(&state, TAPE, 1)
+                    .await
+                    .expect("recovery of a sealed tape ends cleanly");
+                assert_eq!(
+                    durable_bytes(typed.paths()),
+                    before,
+                    "recovery of a sealed tape appended no record"
+                );
+            }
+        }
+        wait_for_state(&state, operation, pb::OperationState::Succeeded).await;
+        assert_eq!(
+            operation_state(&state, operation).await,
+            pb::OperationState::Succeeded as i32
+        );
+        let finalization = tape_finalization(&state).await;
+        assert_eq!(
+            finalization.outcome,
+            pb::TapeFinalizationOutcome::Finalized as i32
+        );
+        assert_eq!(
+            finalization.operation_id.as_deref(),
+            Some(operation.as_bytes().as_slice())
+        );
+
+        // One drive command across both resumers, no changer command, one of each native frame.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), drive_rx.recv())
+                .await
+                .is_err(),
+            "{first:?}: a second drive command reached the pool"
+        );
+        assert!(matches!(
+            changer_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            native_finalization(typed.paths()),
+            NativeFinalization {
+                prepared: 1,
+                decided: 1,
+                retired: 0,
+                sealed: 1,
+            },
+            "{first:?}: one seal"
+        );
+    });
+    drop((state, drive_rx, changer_rx));
+    let events = incarnation.block_on(events_of(&mut typed, operation));
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                lib::OperationEvent::Accepted(_),
+                lib::OperationEvent::Started(_),
+                lib::OperationEvent::Finished(_),
+            ]
+        ),
+        "{first:?}: {events:?}"
+    );
+}
+
+/// Startup recovery owns the tape, held after its reservation, when the operator's same-key
+/// request arrives. The request rejoins the operation or is told Busy by it, recovery dispatches
+/// the one tail, and the tape is sealed once.
+#[test]
+fn a_same_key_retry_during_startup_recovery_joins_it_and_the_tape_is_sealed_once() {
+    check_two_resumers(FirstResumer::Recovery);
+}
+
+/// The operator's same-key request owns the tape's worker when recovery runs. Recovery is refused
+/// while the worker runs and finds the tape sealed after it, and the tape is sealed once.
+#[test]
+fn startup_recovery_after_a_same_key_retry_is_refused_or_finds_the_tape_sealed() {
+    check_two_resumers(FirstResumer::Retry);
 }
