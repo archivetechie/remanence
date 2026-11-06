@@ -92,7 +92,7 @@ pub(crate) fn touch_managed_drive_heartbeats(
                 continue;
             };
             let drive_key = crate::drive_pool::DriveKey::new(library_serial.to_string(), bay);
-            if let Err(err) = drive_pool.heartbeat_drive(&drive_key, drive.drive_uuid.clone()) {
+            if let Err(err) = drive_pool.heartbeat_drive(&drive_key) {
                 if crate::drive_pool::DaemonShuttingDown::is_status(&err) {
                     return Ok(());
                 }
@@ -106,6 +106,10 @@ pub(crate) fn touch_managed_drive_heartbeats(
     Ok(())
 }
 
+/// Logged once at daemon start while the library log has no record for foreign
+/// drive health; the poll thread then ends before any SCSI command or SQL write.
+pub(crate) const FOREIGN_DRIVE_POLL_DISABLED: &str = "ForeignDrivePollDisabled: foreign drive health polling is off until the library log records it; no foreign drive was polled";
+
 pub(crate) fn foreign_drive_poll_loop(
     catalog: remanence_state::ProjectionClient,
     report: remanence_library::DiscoveryReport,
@@ -114,6 +118,10 @@ pub(crate) fn foreign_drive_poll_loop(
     audit: AuditAppendContext,
     base_cadence: Duration,
 ) {
+    if catalog.library_runtime().is_some() {
+        tracing::warn!("{FOREIGN_DRIVE_POLL_DISABLED}");
+        return;
+    }
     let mut backoff = Duration::from_secs(0);
     loop {
         let delay = if backoff.is_zero() {
@@ -279,9 +287,6 @@ pub(crate) fn poll_foreign_drive_counters_once_with_reader(
                 )
                 .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
             }
-            index
-                .touch_drive_last_seen(&drive.drive_uuid)
-                .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
         }
     }
     Ok(())

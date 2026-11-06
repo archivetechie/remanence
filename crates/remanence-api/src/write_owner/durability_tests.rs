@@ -435,13 +435,17 @@ async fn open_writer_configured(
         drive_serial: Some(DRIVE.into()),
         reply,
     };
+    // The actor's log lines reach the caller's subscriber, when it has one.
+    let dispatch = tracing::dispatcher::get_default(|current| current.clone());
     let thread = std::thread::spawn(move || {
-        let mut index = remanence_state::projector::open(&cfg.index_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        handle_drive_open_write(
-            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
-        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            let mut index = remanence_state::projector::open(&cfg.index_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
+            handle_drive_open_write(
+                BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
+            );
+        });
     });
     let opened = received
         .await

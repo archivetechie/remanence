@@ -3091,24 +3091,6 @@ impl CatalogCore {
             .map_err(|err| sqlite_error("query drive snapshot id lookup", err))
     }
 
-    /// Touch `last_seen_utc` for one active drive without recording a snapshot.
-    pub fn touch_drive_last_seen(
-        &mut self,
-        drive_uuid: &[u8],
-    ) -> Result<Option<DriveRecord>, StateError> {
-        let now = now_utc()?;
-        self.conn
-            .execute(
-                "update drives
-                 set last_seen_utc = ?2
-                 where drive_uuid = ?1
-                   and state = 'active'",
-                params![drive_uuid, now],
-            )
-            .map_err(|err| sqlite_error("touch drive last_seen", err))?;
-        self.get_drive_by_uuid(drive_uuid)
-    }
-
     /// Persist a managed drive cleaning-due observation monotonically.
     pub fn observe_managed_drive_cleaning_due(
         &mut self,

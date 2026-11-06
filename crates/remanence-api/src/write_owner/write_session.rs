@@ -40,6 +40,10 @@ use crate::{
     pb, status_from_state_error, verify_tape_identity, PoolWriteError, WriteObjectToPoolRequest,
 };
 
+/// Logged in place of the `checkpoint-barrier-overdue` SQL alarm, which has no library-log
+/// record yet; the barrier, its timing and the idle-close arming are unchanged.
+pub(super) const CHECKPOINT_BARRIER_ALARM_UNRECORDED: &str = "CheckpointBarrierAlarmUnrecorded: the checkpoint-barrier-overdue alarm is not recorded until the library log records it; no alarm was raised";
+
 pub(super) struct CloseWriteActorInput<'a> {
     index: &'a mut CatalogIndex,
     cfg: &'a WriteOwnerConfig,
@@ -1427,20 +1431,14 @@ impl WriteSessionState<'_> {
         if trigger == CheckpointTrigger::Timer
             && Instant::now() > batch.deadline + StdDuration::from_secs(1)
         {
-            let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
-            let detail = serde_json::json!({
-                "session_id": session_id.to_string(),
-                "batch_id": batch.batch_id.to_string(),
-                "deadline_overrun_seconds": Instant::now()
+            tracing::warn!(
+                session_id = %session_id,
+                batch_id = %batch.batch_id,
+                cause = "deadline_overrun",
+                deadline_overrun_seconds = Instant::now()
                     .saturating_duration_since(batch.deadline)
                     .as_secs(),
-            })
-            .to_string();
-            let _ = self.index.raise_alarm(
-                condition_key.as_str(),
-                "checkpoint-barrier-overdue",
-                "warning",
-                Some(detail.as_str()),
+                "{CHECKPOINT_BARRIER_ALARM_UNRECORDED}"
             );
         }
         match perform_checkpoint_barrier(
@@ -1502,8 +1500,6 @@ impl WriteSessionState<'_> {
                     self.next_batched_append = Some(checkpoint_context);
                 }
                 self.pending_batch = None;
-                let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
-                let _ = self.index.clear_alarm(condition_key.as_str());
                 if trigger == CheckpointTrigger::Timer {
                     self.timer_checkpoint_waiting = Some(timer_batch_id);
                     if let Err(err) = arm_checkpoint_idle_close(
@@ -1513,24 +1509,12 @@ impl WriteSessionState<'_> {
                         timer_batch_id,
                         StdDuration::from_secs(cfg.session_idle_seconds),
                     ) {
-                        let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
-                        let detail = serde_json::json!({
-                            "session_id": session_id.to_string(),
-                            "batch_id": timer_batch_id.to_string(),
-                            "error": format!("idle close timer spawn failed: {err}"),
-                        })
-                        .to_string();
-                        let _ = self.index.raise_alarm(
-                            condition_key.as_str(),
-                            "checkpoint-barrier-overdue",
-                            "error",
-                            Some(detail.as_str()),
-                        );
                         tracing::error!(
                             session_id = %session_id,
                             batch_id = %timer_batch_id,
+                            cause = "idle_close_timer",
                             error = %err,
-                            "checkpoint idle-close timer could not start"
+                            "{CHECKPOINT_BARRIER_ALARM_UNRECORDED}"
                         );
                     }
                 }

@@ -125,11 +125,10 @@ async fn b9_fix_live_session_refuses_robotics_and_health_promptly() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(error.message(), "write session already active");
     let heartbeat_pool = pool.clone();
-    let error =
-        tokio::task::spawn_blocking(move || heartbeat_pool.heartbeat_drive(&key, vec![1; 16]))
-            .await
-            .unwrap()
-            .unwrap_err();
+    let error = tokio::task::spawn_blocking(move || heartbeat_pool.heartbeat_drive(&key))
+        .await
+        .unwrap()
+        .unwrap_err();
     assert_eq!(error.message(), "write session already active");
     state.shutdown_drive_pool().await.unwrap();
 }

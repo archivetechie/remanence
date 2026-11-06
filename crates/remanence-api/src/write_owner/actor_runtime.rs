@@ -36,7 +36,7 @@ use super::{DriveKey, ExclusiveGuard, SelectedTape, WriteAdmissionCoordinator};
 use crate::audit_projection::{
     alarm_audit_detail, append_and_project_audit, drive_health_audit_detail, ProjectedAuditInput,
 };
-use crate::{pb, status_from_state_error};
+use crate::pb;
 use remanence_state::TapePoolConfig;
 
 #[derive(Clone)]
@@ -861,18 +861,12 @@ pub(super) fn drive_loop(
             }
             DriveCommand::Heartbeat {
                 ownership: _ownership,
-                drive_uuid,
                 reply,
             } => {
                 let result = drive
                     .test_unit_ready()
-                    .map_err(|err| Status::unavailable(format!("drive heartbeat: {err}")))
-                    .and_then(|_| {
-                        index
-                            .touch_drive_last_seen(&drive_uuid)
-                            .map(|_| ())
-                            .map_err(status_from_state_error)
-                    });
+                    .map(|_| ())
+                    .map_err(|err| Status::unavailable(format!("drive heartbeat: {err}")));
                 let _ = reply.send(result);
             }
             DriveCommand::AppendFinish {
@@ -1379,10 +1373,6 @@ pub(super) fn collect_drive_health_snapshot(
             let due = if alerts.is_set(20) { "now" } else { "periodic" };
             index
                 .observe_managed_drive_cleaning_due(&request.drive_uuid, due)
-                .map_err(crate::status_from_state_error)?;
-        } else {
-            index
-                .touch_drive_last_seen(&request.drive_uuid)
                 .map_err(crate::status_from_state_error)?;
         }
         append_drive_health_evidence(index, cfg, &snapshot)?;

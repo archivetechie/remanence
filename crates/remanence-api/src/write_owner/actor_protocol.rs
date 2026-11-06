@@ -217,7 +217,6 @@ pub(crate) enum DriveCommand {
     },
     Heartbeat {
         ownership: Option<crate::drive_pool::ClosingGuard>,
-        drive_uuid: Vec<u8>,
         reply: oneshot::Sender<Result<(), Status>>,
     },
     AppendFinish {

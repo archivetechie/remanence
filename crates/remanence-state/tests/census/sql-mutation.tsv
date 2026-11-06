@@ -193,8 +193,6 @@ crates/remanence-state/src/projector/index.rs::set_append_recovery_required::exe
 crates/remanence-state/src/projector/index.rs::set_append_recovery_required::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::set_tape_generation_at::execute	1
 crates/remanence-state/src/projector/index.rs::set_tape_generation_at::mutating-sql	1
-crates/remanence-state/src/projector/index.rs::touch_drive_last_seen::execute	1
-crates/remanence-state/src/projector/index.rs::touch_drive_last_seen::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::update_provisioned_tape_voltag_tx::execute	1
 crates/remanence-state/src/projector/index.rs::update_provisioned_tape_voltag_tx::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::upsert_idempotency_request::execute	1

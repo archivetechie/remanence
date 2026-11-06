@@ -402,7 +402,6 @@ async fn fresh_maintenance_settlement(kind: &str) {
     let command = match kind {
         "heartbeat" => DriveCommand::Heartbeat {
             ownership: None,
-            drive_uuid: vec![1; 16],
             reply,
         },
         "closeout" => DriveCommand::CloseoutTape {
@@ -531,7 +530,6 @@ async fn fresh_maintenance_settlement(kind: &str) {
     let (reply, received) = oneshot::channel();
     tx.send(DriveCommand::Heartbeat {
         ownership: None,
-        drive_uuid: vec![1; 16],
         reply,
     })
     .await
@@ -629,4 +627,100 @@ async fn b9_queued_health_work_outlives_cancelled_requester() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A timer checkpoint that reaches the actor more than a second past its batch deadline logs
+/// the stand-in code with its cause and records no `checkpoint-barrier-overdue` alarm in SQL.
+/// The second append is held in the transport past the one-second timer, so the timer's
+/// checkpoint queues behind it and runs late.
+#[tokio::test]
+async fn b9_overdue_timer_checkpoint_logs_code_without_sql_alarm() {
+    use super::b6c_tests::{CommandGate, GatedTransport};
+    use crate::write_owner::write_session::CHECKPOINT_BARRIER_ALARM_UNRECORDED;
+    let root = tempfile::tempdir().unwrap();
+    let log_path = root.path().join("actor.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || log.try_clone().unwrap())
+            .finish(),
+    );
+    let world = setup(root.path());
+    let (entered, reached) = oneshot::channel();
+    let gate = Arc::new(CommandGate {
+        armed: AtomicBool::new(false),
+        entered: Mutex::new(Some(entered)),
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+        sidecar: true,
+        opcode: None,
+        lost: false,
+    });
+    let model = world.lock().unwrap().library_snapshot();
+    let w = world.clone();
+    let g = gate.clone();
+    let library = model
+        .open_with(
+            &remanence_library::StaticAllowlist::new([LIBRARY]),
+            move |path| {
+                let role = w.lock().unwrap().role_for_path(path).unwrap();
+                Ok::<Box<dyn SgTransport>, remanence_library::IoErrorKind>(Box::new(
+                    GatedTransport {
+                        inner: ModelTransport::new(w.clone(), role),
+                        gate: g.clone(),
+                    },
+                ))
+            },
+        )
+        .unwrap();
+    let (tx, opened, thread) =
+        open_writer_configured(root.path(), library, selected(), |cfg, _| {
+            cfg.checkpoint_max_age_seconds = 1;
+        })
+        .await;
+    let id = opened.unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.path().join("first"),
+        "first",
+        "first",
+        b"first object",
+    )
+    .await;
+    gate.armed.store(true, Ordering::SeqCst);
+    let second = {
+        let tx = tx.clone();
+        let source = root.path().join("second");
+        tokio::spawn(async move {
+            append_actor_test_file(&tx, id, source, "second", "second", b"second object").await
+        })
+    };
+    tokio::time::timeout(StdDuration::from_secs(5), reached)
+        .await
+        .expect("the second append reached the transport")
+        .unwrap();
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
+    gate.release();
+    second.await.unwrap();
+    close_writer(&tx, id, thread).await;
+
+    let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
+    let alarms = index.list_alarms(true).unwrap();
+    assert!(
+        !alarms.iter().any(|alarm| alarm
+            .condition_key
+            .starts_with("checkpoint-barrier-overdue")),
+        "the overdue checkpoint raised no SQL alarm: {alarms:?}"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(
+        log.matches(CHECKPOINT_BARRIER_ALARM_UNRECORDED).count(),
+        1,
+        "one stand-in line for the one overdue checkpoint: {log}"
+    );
+    assert!(log.contains("cause=\"deadline_overrun\""), "{log}");
 }

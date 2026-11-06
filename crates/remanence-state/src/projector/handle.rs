@@ -565,13 +565,6 @@ impl CatalogIndex {
     ) -> Result<DriveHealthSnapshotRecord, StateError> {
         self.with_core(|core| core.record_drive_health_snapshot(input))
     }
-    /// Touch `last_seen_utc` for one active drive without recording a snapshot.
-    pub fn touch_drive_last_seen(
-        &mut self,
-        drive_uuid: &[u8],
-    ) -> Result<Option<DriveRecord>, StateError> {
-        self.with_core(|core| core.touch_drive_last_seen(drive_uuid))
-    }
     /// Persist a managed drive cleaning-due observation monotonically.
     pub fn observe_managed_drive_cleaning_due(
         &mut self,

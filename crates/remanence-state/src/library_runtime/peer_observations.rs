@@ -42,19 +42,6 @@ impl LibraryRuntime {
             .into());
         }
         if existing.is_some() {
-            let rank = |mask: u64| {
-                if mask & (1 << 19) != 0 {
-                    2
-                } else if mask & (1 << 20) != 0 {
-                    1
-                } else {
-                    0
-                }
-            };
-            if rank(value.tape_alert_flags) > 0 {
-                self.0.motion_fenced.store(true, Ordering::Release);
-                return Err(StateError::JournalReplayFailed("repeated health sample observes a cleaning obligation that cannot be durably recorded for this session; motion is fenced".into()).into());
-            }
             self.catch_up_locked()?;
             return Ok(());
         }

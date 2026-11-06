@@ -15108,10 +15108,10 @@ tape_catalog_dir="{0}/cache"
         &mut misses,
     );
     assert_eq!(
-        misses, 1,
-        "C8-G9 repeated sample must refuse rather than silently discard new cleaning duty"
+        misses, 0,
+        "a repeated positive cleaning sample is dropped; the session's first sample wins"
     );
-    assert!(runtime.motion_fenced());
+    assert!(!runtime.motion_fenced());
     assert_eq!(
         index
             .get_drive_by_uuid(&drive_uuid)

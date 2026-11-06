@@ -3708,6 +3708,59 @@ fn foreign_counter_snapshot(tape_alert_flags: Option<&str>) -> ForeignDriveSnaps
     }
 }
 
+/// With a library runtime the foreign-drive poll thread logs `FOREIGN_DRIVE_POLL_DISABLED`
+/// once and returns before its first sleep, so no LOG SENSE and no SQL write can follow.
+/// The loop sleeps before its first pass, so a missing guard shows as a thread that never
+/// returns within the timeout.
+#[test]
+fn foreign_poll_typed_is_disabled_before_any_poll() {
+    let root = TypedRoot::open();
+    let catalog = root.catalog();
+    assert!(catalog.library_runtime().is_some());
+    let report = DiscoveryReport {
+        unattached_drives: Vec::new(),
+        complete: true,
+        incomplete_evidence: Vec::new(),
+        libraries: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let audit_dir = tempfile::tempdir().expect("audit tempdir");
+    let audit = AuditAppendContext {
+        dir: audit_dir.path().to_path_buf(),
+        fsync: false,
+        lock: Arc::new(std::sync::Mutex::new(())),
+    };
+    let warnings = capture_warnings(|| {
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                foreign_drive_poll_loop(
+                    catalog,
+                    report,
+                    remanence_state::DrivesConfig::default(),
+                    HashSet::new(),
+                    audit,
+                    std::time::Duration::from_millis(50),
+                );
+            });
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the foreign drive poll thread did not return within 5 s");
+        worker.join().expect("foreign drive poll thread joined");
+    });
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|message| message.as_str() == FOREIGN_DRIVE_POLL_DISABLED)
+            .count(),
+        1,
+        "one start-up warning with the stand-in code: {warnings:?}"
+    );
+}
+
 #[test]
 fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
     let temp = tempfile::Builder::new()

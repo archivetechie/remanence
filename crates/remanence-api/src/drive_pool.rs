@@ -1171,11 +1171,7 @@ impl DrivePool {
             .map_err(|_| Status::unavailable("drive actor stopped"))?
     }
 
-    pub(crate) fn heartbeat_drive(
-        &self,
-        drive: &DriveKey,
-        drive_uuid: Vec<u8>,
-    ) -> Result<(), Status> {
+    pub(crate) fn heartbeat_drive(&self, drive: &DriveKey) -> Result<(), Status> {
         if self.drive_is_closing(drive) {
             return Ok(());
         }
@@ -1187,7 +1183,6 @@ impl DrivePool {
         let (reply, rx) = oneshot::channel();
         tx.blocking_send(DriveCommand::Heartbeat {
             ownership: Some(work),
-            drive_uuid,
             reply,
         })
         .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
