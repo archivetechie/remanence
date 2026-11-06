@@ -6,11 +6,15 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 use remanence_library::verification_io::VerificationPhase;
-use remanence_state::{AuditActor, AuditEvent};
+use remanence_state::library_log as lib;
+use remanence_state::AuditActor;
+#[cfg(test)]
+use remanence_state::AuditEvent;
 use tokio::sync::oneshot;
 use tonic::Status;
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::audit_projection::{append_operation_audit, OperationAuditInput};
 use crate::operations::OperationHandle;
 use crate::{pb, ApiState};
@@ -25,8 +29,20 @@ pub(crate) fn start(
     tape_uuid: [u8; 16],
     ready_wait: Duration,
 ) -> Result<(pb::OperationRef, oneshot::Receiver<Verdict>), Status> {
-    let id = Uuid::new_v4();
-    state.record_request_received(actor, id, KIND, &tape_uuid, None)?;
+    let fingerprint: [u8; 32] = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"tape_verification\0");
+        hasher.update(tape_uuid);
+        hasher.finalize().into()
+    };
+    let id = state.accept_owner_request(
+        actor,
+        KIND,
+        "tape",
+        Uuid::from_bytes(tape_uuid).to_string(),
+        fingerprint,
+    )?;
     let handle = state.operations.register(id, KIND);
     let progress = Progress::new(handle.clone(), tape_uuid);
     progress.route(remanence_parity::VerificationRouteStatus {
@@ -38,13 +54,15 @@ pub(crate) fn start(
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
         let result: Verdict = async {
-            record(
-                &state,
-                &handle,
-                tape_uuid,
-                AuditEvent::OperationStarted,
-                BTreeMap::new(),
-            )?;
+            record_started(&handle, || {
+                record(
+                    &state,
+                    &handle,
+                    tape_uuid,
+                    lib::OperationEvent::Started(lib::Unit),
+                    BTreeMap::new(),
+                )
+            })?;
             check_cancelled(&handle)?;
             let mut deadline = None;
             loop {
@@ -79,18 +97,18 @@ pub(crate) fn start(
         });
         let result = match result {
             Ok(verdict) => {
-                let mut detail = BTreeMap::from([(
-                    "verification_state".into(),
-                    Value::Integer(verdict.state.into()),
-                )]);
-                if let Some(digest) = &verdict.edition_digest {
-                    detail.insert("edition_digest".into(), Value::Bytes(digest.clone()));
-                }
+                // Rung 2: the verdict (state, edition digest) becomes a durable VerificationVerdict record.
+                #[cfg(test)]
+                let detail = legacy_verdict_detail(&verdict);
+                #[cfg(not(test))]
+                let detail = BTreeMap::new();
                 match record(
                     &state,
                     &handle,
                     tape_uuid,
-                    AuditEvent::OperationFinished,
+                    lib::OperationEvent::Finished(lib::Response {
+                        response_fingerprint: None,
+                    }),
                     detail,
                 ) {
                     Ok(()) => {
@@ -106,12 +124,19 @@ pub(crate) fn start(
             Err(error) => {
                 let cancelled = error.code() == tonic::Code::Cancelled;
                 let event = if cancelled {
-                    AuditEvent::CancelledBeforeDispatch
+                    lib::OperationEvent::CancelledBeforeDispatch(lib::Unit)
                 } else {
-                    AuditEvent::OperationFailed
+                    lib::OperationEvent::Failed(lib::Failed {
+                        retry: None,
+                        refusal_code: None,
+                        summary: error.message().into(),
+                    })
                 };
+                #[cfg(test)]
                 let detail =
                     BTreeMap::from([("error_summary".into(), Value::Text(error.message().into()))]);
+                #[cfg(not(test))]
+                let detail = BTreeMap::new();
                 if let Err(audit_error) = record(&state, &handle, tape_uuid, event, detail) {
                     tracing::error!(%audit_error, "record verification termination");
                 }
@@ -133,36 +158,103 @@ pub(crate) fn start(
     ))
 }
 
+/// Verdict fields of the legacy audit record, read back by the legacy projection.
+#[cfg(test)]
+fn legacy_verdict_detail(verdict: &pb::TapeIndexVerification) -> BTreeMap<String, Value> {
+    let mut detail = BTreeMap::from([(
+        "verification_state".into(),
+        Value::Integer(verdict.state.into()),
+    )]);
+    if let Some(digest) = &verdict.edition_digest {
+        detail.insert("edition_digest".into(), Value::Bytes(digest.clone()));
+    }
+    detail
+}
+
+/// Append one lifecycle event. With a library runtime the typed `event` is the
+/// record; `legacy_detail` feeds only the test-only legacy audit arm.
 fn record(
     state: &ApiState,
     handle: &OperationHandle,
     tape_uuid: [u8; 16],
-    event: AuditEvent,
-    mut detail: BTreeMap<String, Value>,
+    event: lib::OperationEvent,
+    legacy_detail: BTreeMap<String, Value>,
 ) -> Result<(), Status> {
-    detail.insert("tape_uuid".into(), Value::Bytes(tape_uuid.to_vec()));
-    append_operation_audit(
-        &mut {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
+    if let Some(runtime) = state.catalog.library_runtime() {
+        return runtime
+            .record_operation_event(
+                *handle.op_id_uuid().as_bytes(),
+                lib::OperationKind::TapeVerification,
+                event,
+                AuditActor::System,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()));
+    }
+    #[cfg(test)]
+    {
+        let event = match event {
+            lib::OperationEvent::Started(_) => AuditEvent::OperationStarted,
+            lib::OperationEvent::Finished(_) => AuditEvent::OperationFinished,
+            lib::OperationEvent::Failed(_) => AuditEvent::OperationFailed,
+            lib::OperationEvent::CancelledBeforeDispatch(_) => AuditEvent::CancelledBeforeDispatch,
+            other => {
+                return Err(Status::internal(format!(
+                    "tape verification does not record {other:?}"
+                )))
             }
-            index
-        },
-        state.audit_dir.as_ref(),
-        state.audit_fsync,
-        &state.audit_append_lock,
-        OperationAuditInput {
-            actor: AuditActor::System,
-            operation_id: handle.op_id_uuid(),
-            operation_kind: KIND,
-            event,
-            subject_kind: "tape",
-            subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
-            idempotency_key: None,
-            detail,
-        },
-    )
+        };
+        let mut detail = legacy_detail;
+        detail.insert("tape_uuid".into(), Value::Bytes(tape_uuid.to_vec()));
+        append_operation_audit(
+            &mut {
+                let mut index = state.catalog.write_handle();
+                if let Some(pool) = &state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            },
+            state.audit_dir.as_ref(),
+            state.audit_fsync,
+            &state.audit_append_lock,
+            OperationAuditInput {
+                actor: AuditActor::System,
+                operation_id: handle.op_id_uuid(),
+                operation_kind: KIND,
+                event,
+                subject_kind: "tape",
+                subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
+                idempotency_key: None,
+                detail,
+            },
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (tape_uuid, legacy_detail);
+        Err(Status::failed_precondition(
+            "tape verification requires shared LibraryAuthority",
+        ))
+    }
+}
+
+/// Run the step that records `Started`. There are three outcomes: `Ok(())` when it was
+/// recorded; an error with code `Cancelled` when the handle is cancelled, which the caller
+/// returns to take the cancelled branch; and the record error, unchanged, when it is not.
+///
+/// A cancel can land after `start` returns but before the task runs. The typed log then
+/// holds Accepted, CancelRequested and refuses Started, so the check comes first and
+/// `Started` is not recorded. A cancel can still land between that check and the record, so
+/// a failed record is checked again before its error is returned.
+fn record_started(
+    handle: &OperationHandle,
+    append: impl FnOnce() -> Result<(), Status>,
+) -> Result<(), Status> {
+    check_cancelled(handle)?;
+    if let Err(error) = append() {
+        check_cancelled(handle)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(crate) fn check_cancelled(handle: &OperationHandle) -> Result<(), Status> {
@@ -262,6 +354,51 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Started` is appended once, and nothing else happens, when no cancel is pending.
+    #[test]
+    fn record_started_returns_ok_when_the_record_succeeds() {
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), KIND);
+        let mut calls = 0;
+        let outcome = record_started(&handle, || {
+            calls += 1;
+            Ok(())
+        });
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(calls, 1);
+    }
+
+    /// A cancel that lands between the first check and the record turns the record's
+    /// refusal into a cancellation, not a failure. The closure plays that cancel: it sets
+    /// the flag, as `Daemon::cancel_operation` does, and then reports the refusal the typed
+    /// log gives `Started` after `CancelRequested`.
+    #[test]
+    fn record_started_cancelled_during_the_record_is_cancelled_not_failed() {
+        let registry = crate::operations::OperationRegistry::default();
+        let id = Uuid::new_v4();
+        let handle = registry.register(id, KIND);
+        let outcome = record_started(&handle, || {
+            registry.request_cancel(&id).unwrap();
+            Err(Status::failed_precondition(
+                "Started follows nothing or Accepted",
+            ))
+        });
+        let error = outcome.expect_err("the record was refused");
+        assert_eq!(error.code(), tonic::Code::Cancelled, "{error:?}");
+        assert_eq!(error.message(), "tape verification cancelled");
+    }
+
+    /// A refused record with no cancel pending is a failure, returned unchanged.
+    #[test]
+    fn record_started_returns_the_record_error_when_not_cancelled() {
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(Uuid::new_v4(), KIND);
+        let outcome = record_started(&handle, || Err(Status::internal("store unavailable")));
+        let error = outcome.expect_err("the record was refused");
+        assert_eq!(error.code(), tonic::Code::Internal, "{error:?}");
+        assert_eq!(error.message(), "store unavailable");
+    }
 
     /// Route changes bypass throttling and persist with ordinary phase progress.
     #[tokio::test]

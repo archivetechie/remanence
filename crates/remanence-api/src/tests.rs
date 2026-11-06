@@ -1736,13 +1736,77 @@ fn cancel_audit_records_request_actor() {
     let actor = AuditActor::Service("operator-a".to_string());
 
     state
-        .record_cancel_requested(actor.clone(), operation_id, None, false)
+        .record_cancel_requested(actor.clone(), operation_id, "tape_verification")
         .expect("record cancel");
 
     let records = FileAuditLog::replay(state.audit_dir.as_ref()).expect("replay audit");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].actor, actor);
     assert_eq!(records[0].event, AuditEvent::CancelRequested);
+}
+
+/// With a library runtime, a cancel that lands before the operation publishes its first
+/// status still reaches the typed log, under the kind it was registered with and the actor
+/// of the cancelling request. The legacy audit log is not written.
+#[tokio::test]
+async fn cancel_before_first_publish_records_typed_cancel_requested() {
+    use crate::pb::daemon_server::Daemon;
+    use remanence_state::library_log as lib;
+
+    let mut typed = TypedRoot::open();
+    let state = typed.api_state();
+    let id = state
+        .accept_owner_request(
+            AuditActor::Service("submitter".into()),
+            "reconcile_tape",
+            "tape",
+            Uuid::from_bytes([0x5A; 16]).to_string(),
+            [0x44; 32],
+        )
+        .expect("accept reconcile_tape");
+    let handle = state.operations.register(id, "reconcile_tape");
+    assert!(
+        state.operations.latest(&id).is_none(),
+        "the operation has published nothing yet"
+    );
+    let daemon = state.daemon_service();
+    let cancel = || {
+        let mut request = Request::new(pb::CancelOperationRequest {
+            operation_id: id.as_bytes().to_vec(),
+            idempotency_key: None,
+            force: false,
+        });
+        request
+            .metadata_mut()
+            .insert("x-remanence-actor", "operator-a".parse().unwrap());
+        request
+    };
+
+    let first = Daemon::cancel_operation(&daemon, cancel())
+        .await
+        .expect("first cancel")
+        .into_inner();
+    assert_eq!(first.detail, "cancellation requested");
+    assert!(handle.is_cancelled());
+    Daemon::cancel_operation(&daemon, cancel())
+        .await
+        .expect("a repeated cancel is accepted");
+
+    assert_no_legacy_audit_records(&state);
+    drop((daemon, handle, state));
+    let chain = typed.operation_chain(id).await;
+    assert_eq!(
+        chain.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [lib::OperationKind::ReconcileTape; 2],
+    );
+    assert_eq!(chain.len(), 2, "the repeat appended nothing: {chain:?}");
+    assert!(matches!(chain[0].event, lib::OperationEvent::Accepted(_)));
+    assert_eq!(chain[0].actor, AuditActor::Service("submitter".into()));
+    assert_eq!(
+        chain[1].event,
+        lib::OperationEvent::CancelRequested(lib::Unit)
+    );
+    assert_eq!(chain[1].actor, AuditActor::Service("operator-a".into()));
 }
 
 #[test]
@@ -10455,4 +10519,146 @@ pub(crate) fn assert_one_native_seal(directory: &Path, tape_uuid: [u8; 16]) {
         seals, 1,
         "one native seal across retries and startup replay"
     );
+}
+
+/// One operation event as the library log recorded it.
+#[derive(Debug)]
+pub(crate) struct ChainEvent {
+    pub(crate) kind: remanence_state::library_log::OperationKind,
+    pub(crate) event: remanence_state::library_log::OperationEvent,
+    pub(crate) actor: AuditActor,
+}
+
+/// A library runtime over a fresh state root, with the catalog that projects it.
+/// The library log is exclusively locked while any clone of the runtime is alive, so
+/// `operation_chain` is called only after every state built from this fixture is dropped.
+pub(crate) struct TypedRoot {
+    paths: remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+    runtime: Option<remanence_state::library_runtime::LibraryRuntime>,
+    catalog: Option<remanence_state::ProjectionClient>,
+    _root: tempfile::TempDir,
+}
+
+impl TypedRoot {
+    pub(crate) fn open() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let paths = remanence_state::StatePaths {
+            config_path: root.path().join("config"),
+            state_dir: root.path().join("state"),
+            audit_dir: root.path().join("library"),
+            journal_dir: root.path().join("native"),
+            sqlite_path: root.path().join("catalog.sqlite"),
+            tape_cache_dir: root.path().join("cache"),
+            calibration_dir: root.path().join("calibration"),
+        };
+        let runtime = remanence_state::library_runtime::LibraryRuntime::open(
+            &paths,
+            true,
+            Arc::new(remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap()),
+        )
+        .unwrap();
+        let catalog = remanence_state::projector::open(&paths.sqlite_path)
+            .unwrap()
+            .with_library_runtime(runtime.clone());
+        Self {
+            library_uuid: runtime.manifest().library_uuid(),
+            paths,
+            runtime: Some(runtime),
+            catalog: Some(catalog),
+            _root: root,
+        }
+    }
+
+    pub(crate) fn catalog(&self) -> remanence_state::ProjectionClient {
+        self.catalog.clone().expect("fixture still open")
+    }
+
+    /// Service state over this runtime. The legacy audit directory is created up front, so
+    /// `assert_no_legacy_audit_records` checks a directory that exists and must stay empty.
+    pub(crate) fn api_state(&self) -> ApiState {
+        let state = ApiState::new(self.catalog());
+        std::fs::create_dir_all(state.audit_dir.as_ref()).unwrap();
+        state
+    }
+
+    /// Release the fixture's own handles, then read every typed record of `operation` back
+    /// from the library log in sequence order. A state built from this fixture may still be
+    /// finishing its last poll on another thread, so a read refused because a competing
+    /// owner holds the log is retried every 10 ms for up to 5 s. Any other error fails at once.
+    pub(crate) async fn operation_chain(&mut self, operation: Uuid) -> Vec<ChainEvent> {
+        self.catalog = None;
+        self.runtime = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.read_chain(operation) {
+                Ok(chain) => return chain,
+                Err(ChainRead::Busy(_)) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(ChainRead::Busy(errno)) => panic!(
+                    "the library log was still locked ({errno}) 5 s after the test dropped its \
+                     states: a clone of the runtime outlived them"
+                ),
+                Err(ChainRead::Failed(message)) => panic!("{message}"),
+            }
+        }
+    }
+
+    fn read_chain(&self, operation: Uuid) -> Result<Vec<ChainEvent>, ChainRead> {
+        use nix::errno::Errno;
+        use remanence_state::library_log::{native_view::NativeTapeView, store};
+        use remanence_state::tape_log::store::StoreError as TapeStoreError;
+        let view = NativeTapeView::probe(
+            &self.paths.journal_dir.join("tapes"),
+            &self.paths.sqlite_path,
+        )
+        .map_err(|error| match error {
+            TapeStoreError::Locked(errno) if errno == Errno::EWOULDBLOCK => ChainRead::Busy(errno),
+            other => ChainRead::Failed(format!("probe the native tape logs: {other:?}")),
+        })?;
+        let mut chain = Vec::new();
+        store::replay_observed(
+            &self.paths.audit_dir,
+            self.library_uuid,
+            &view,
+            &mut |record| {
+                if let Some(value) = record.record().operation_recorded() {
+                    if value.operation == *operation.as_bytes() {
+                        chain.push(ChainEvent {
+                            kind: value.kind,
+                            event: value.event.clone(),
+                            actor: record.record().envelope.actor.clone(),
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| match error {
+            store::StoreError::Locked(errno) if errno == Errno::EWOULDBLOCK => {
+                ChainRead::Busy(errno)
+            }
+            other => ChainRead::Failed(format!("replay the library log: {other:?}")),
+        })?;
+        Ok(chain)
+    }
+}
+
+/// Why one attempt to read the library log failed. The two stores report a competing owner
+/// through different error types; both map to `Busy`.
+enum ChainRead {
+    Busy(nix::errno::Errno),
+    Failed(String),
+}
+
+/// The typed arm is the only record: the legacy audit directory exists and holds nothing.
+pub(crate) fn assert_no_legacy_audit_records(state: &ApiState) {
+    assert!(
+        state.audit_dir.is_dir(),
+        "the legacy audit directory must exist, or an empty replay proves nothing"
+    );
+    assert!(FileAuditLog::replay(state.audit_dir.as_ref())
+        .expect("replay legacy audit")
+        .is_empty());
 }

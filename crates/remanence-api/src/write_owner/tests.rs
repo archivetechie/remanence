@@ -10722,6 +10722,341 @@ async fn verification_concurrent_cancel_preserves_readiness_refusal_and_transpor
     }
 }
 
+/// Tape verification over a library runtime. The drive actor is replaced by a channel the
+/// test answers, so the test decides when `Started` is durable, when a cancel lands and
+/// what the reply is. No spawned actor keeps a clone of the runtime, so the library log
+/// can be read back once the harness's states are dropped.
+struct TypedVerificationHarness {
+    typed: crate::tests::TypedRoot,
+    state: crate::ApiState,
+    tape_uuid: [u8; 16],
+    drive_rx: mpsc::Receiver<DriveCommand>,
+    _changer_rx: mpsc::Receiver<ChangerCommand>,
+}
+impl TypedVerificationHarness {
+    fn new() -> Self {
+        let typed = crate::tests::TypedRoot::open();
+        let tape_uuid = [0xB7; 16];
+        let mut index = typed.catalog().write_handle();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "VERIFY001L9".into(),
+                block_size: 256 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        drop(index);
+        let mut world = VirtualWorld::single_drive("LIB-VERIFY", 0x100, "DRV-VERIFY", 0x400, 1);
+        world.put_tape_in_drive(0x100, "VERIFY001L9", None, VirtualTape::default());
+        let mut state = typed.api_state();
+        state.library_snapshot = Some(library_snapshot_cell(world.library_snapshot()));
+        state.default_library_serial = Some(Arc::new("LIB-VERIFY".into()));
+        state.drive_idle_unload_seconds = 0;
+        let (drive_tx, drive_rx) = mpsc::channel(1);
+        let (changer_tx, changer_rx) = mpsc::channel(1);
+        let key = DriveKey::new("LIB-VERIFY", 0x100);
+        state.drive_pool = Some(DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB-VERIFY".into(), changer_tx)]),
+            HashMap::from([(key.clone(), drive_tx)]),
+            Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+            DrivePoolLifecycle::default(),
+        ));
+        Self {
+            typed,
+            state,
+            tape_uuid,
+            drive_rx,
+            _changer_rx: changer_rx,
+        }
+    }
+
+    /// Start a verification and wait for the drive command. `Started` is durable by then.
+    async fn start_until_drive_command(
+        &mut self,
+    ) -> (
+        Uuid,
+        oneshot::Receiver<Result<pb::TapeIndexVerification, Status>>,
+        oneshot::Sender<Result<pb::TapeIndexVerification, Status>>,
+    ) {
+        let (operation, result) = crate::tape_verification::start(
+            &self.state,
+            AuditActor::Service("submitter".into()),
+            self.tape_uuid,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        let command = within("the VerifyTapeIndex drive command", self.drive_rx.recv())
+            .await
+            .expect("the drive channel closed before the verification command");
+        let DriveCommand::VerifyTapeIndex { reply, .. } = command else {
+            panic!("expected a verification command")
+        };
+        (
+            Uuid::from_slice(&operation.operation_id).unwrap(),
+            result,
+            reply,
+        )
+    }
+
+    fn verdict(&self) -> pb::TapeIndexVerification {
+        pb::TapeIndexVerification {
+            tape_uuid: self.tape_uuid.to_vec(),
+            state: pb::TapeIndexVerificationState::VerifiedComplete as i32,
+            edition_digest: Some(vec![7; 32]),
+            ..Default::default()
+        }
+    }
+
+    /// The legacy audit log stays empty: the typed arm is the only record.
+    fn assert_no_legacy_records(&self) {
+        crate::tests::assert_no_legacy_audit_records(&self.state);
+    }
+
+    /// Drop every state built on this runtime, then read the operation's typed chain.
+    async fn into_chain(self, operation: Uuid) -> Vec<crate::tests::ChainEvent> {
+        let Self {
+            mut typed,
+            state,
+            drive_rx,
+            _changer_rx,
+            ..
+        } = self;
+        drop((state, drive_rx, _changer_rx));
+        typed.operation_chain(operation).await
+    }
+}
+
+/// Bound a wait on a channel, oneshot or watch, so a regression fails with the name of what
+/// never arrived instead of hanging the test.
+async fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after 10 s waiting for {what}"))
+}
+
+fn cancel_request(operation: Uuid) -> tonic::Request<pb::CancelOperationRequest> {
+    let mut request = tonic::Request::new(pb::CancelOperationRequest {
+        operation_id: operation.as_bytes().to_vec(),
+        idempotency_key: None,
+        force: false,
+    });
+    request
+        .metadata_mut()
+        .insert("x-remanence-actor", "operator-a".parse().unwrap());
+    request
+}
+
+/// Every record of a verification chain carries the verification kind.
+fn assert_tape_verification_chain(chain: &[crate::tests::ChainEvent]) {
+    use remanence_state::library_log as lib;
+    for record in chain {
+        assert_eq!(record.kind, lib::OperationKind::TapeVerification);
+    }
+}
+
+/// The production arm records `Accepted, Started, Finished` and nothing in the legacy log.
+#[tokio::test]
+async fn typed_verification_success_records_accepted_started_finished() {
+    use crate::pb::catalog_server::Catalog;
+    use remanence_state::library_log as lib;
+    let mut harness = TypedVerificationHarness::new();
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let expected = harness.verdict();
+    reply.send(Ok(expected.clone())).unwrap();
+    assert_eq!(
+        within("the verification result (success)", result)
+            .await
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Succeeded as i32
+    );
+    let fetched = harness
+        .state
+        .catalog_service()
+        .get_tape_verification(tonic::Request::new(pb::GetOperationRequest {
+            operation_id: id.as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fetched, expected);
+    harness.assert_no_legacy_records();
+    let tape_uuid = harness.tape_uuid;
+    let chain = harness.into_chain(id).await;
+    assert_eq!(chain.len(), 3, "{chain:?}");
+    assert_tape_verification_chain(&chain);
+    let lib::OperationEvent::Accepted(accepted) = &chain[0].event else {
+        panic!("first record is Accepted: {chain:?}")
+    };
+    assert_eq!(
+        accepted.subject.as_ref().map(|s| s.as_str()),
+        Some(Uuid::from_bytes(tape_uuid).to_string().as_str())
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"tape_verification\0");
+    hasher.update(tape_uuid);
+    assert_eq!(
+        accepted.request_fingerprint,
+        <[u8; 32]>::from(hasher.finalize())
+    );
+    assert_eq!(accepted.idempotency_key, None);
+    assert_eq!(chain[0].actor, AuditActor::Service("submitter".into()));
+    assert_eq!(chain[1].event, lib::OperationEvent::Started(lib::Unit));
+    assert_eq!(
+        chain[2].event,
+        lib::OperationEvent::Finished(lib::Response {
+            response_fingerprint: None
+        })
+    );
+    assert_eq!(chain[1].actor, AuditActor::System);
+    assert_eq!(chain[2].actor, AuditActor::System);
+}
+
+/// A non-cancel error from the drive ends the typed chain in `Failed` with its message.
+#[tokio::test]
+async fn typed_verification_failure_records_failed_with_the_error_message() {
+    use remanence_state::library_log as lib;
+    let mut harness = TypedVerificationHarness::new();
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    reply
+        .send(Err(Status::internal("injected drive failure")))
+        .unwrap();
+    let error = within("the verification result (failure)", result)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(error.message(), "injected drive failure");
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Failed as i32
+    );
+    harness.assert_no_legacy_records();
+    let chain = harness.into_chain(id).await;
+    assert_eq!(chain.len(), 3, "{chain:?}");
+    assert_tape_verification_chain(&chain);
+    assert!(matches!(chain[0].event, lib::OperationEvent::Accepted(_)));
+    assert_eq!(chain[1].event, lib::OperationEvent::Started(lib::Unit));
+    assert_eq!(
+        chain[2].event,
+        lib::OperationEvent::Failed(lib::Failed {
+            retry: None,
+            refusal_code: None,
+            summary: error.message().into(),
+        })
+    );
+    assert_eq!(chain[2].actor, AuditActor::System);
+}
+
+/// A cancel through `CancelOperation` after `Started` is durable ends `Cancelled`, even when
+/// the drive's verdict arrives afterwards.
+#[tokio::test]
+async fn typed_verification_cancel_after_started_records_cancelled() {
+    use crate::pb::daemon_server::Daemon;
+    use remanence_state::library_log as lib;
+    let mut harness = TypedVerificationHarness::new();
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    Daemon::cancel_operation(&harness.state.daemon_service(), cancel_request(id))
+        .await
+        .expect("cancel after Started");
+    reply.send(Ok(harness.verdict())).unwrap();
+    assert_eq!(
+        within("the verification result (cancel after Started)", result)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        tonic::Code::Cancelled
+    );
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Cancelled as i32
+    );
+    harness.assert_no_legacy_records();
+    let chain = harness.into_chain(id).await;
+    assert_eq!(chain.len(), 4, "{chain:?}");
+    assert_tape_verification_chain(&chain);
+    assert!(matches!(chain[0].event, lib::OperationEvent::Accepted(_)));
+    assert_eq!(chain[1].event, lib::OperationEvent::Started(lib::Unit));
+    assert_eq!(
+        chain[2].event,
+        lib::OperationEvent::CancelRequested(lib::Unit)
+    );
+    assert_eq!(chain[2].actor, AuditActor::Service("operator-a".into()));
+    assert_eq!(
+        chain[3].event,
+        lib::OperationEvent::CancelledBeforeDispatch(lib::Unit)
+    );
+}
+
+/// A cancel that lands after `start` returns but before the spawned task runs must end
+/// `Cancelled`. The typed log then holds `Accepted, CancelRequested`, which refuses
+/// `Started`, so recording it would turn an operator's cancel into a `Failed` record.
+/// A current-thread runtime makes the order deterministic: the task cannot run until the
+/// test first awaits something that pends.
+#[tokio::test]
+async fn typed_verification_cancel_before_started_records_cancelled_not_failed() {
+    use crate::pb::catalog_server::Catalog;
+    use crate::pb::daemon_server::Daemon;
+    use remanence_state::library_log as lib;
+    use tokio_stream::StreamExt;
+    let mut harness = TypedVerificationHarness::new();
+    let operation = harness
+        .state
+        .catalog_service()
+        .start_tape_verification(tonic::Request::new(pb::StartTapeVerificationRequest {
+            tape_uuid: harness.tape_uuid.to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = Uuid::from_slice(&operation.operation_id).unwrap();
+    Daemon::cancel_operation(&harness.state.daemon_service(), cancel_request(id))
+        .await
+        .expect("cancel before Started");
+    let mut watch = harness.state.operations.watch(&id).unwrap();
+    let terminal = loop {
+        let status = within("a status from the operation watch", watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if crate::operations::is_terminal(&status) {
+            break status;
+        }
+    };
+    drop(watch);
+    assert_eq!(
+        pb::OperationState::try_from(terminal.state).unwrap(),
+        pb::OperationState::Cancelled
+    );
+    assert!(harness.drive_rx.try_recv().is_err(), "no drive command");
+    harness.assert_no_legacy_records();
+    let chain = harness.into_chain(id).await;
+    assert_tape_verification_chain(&chain);
+    assert!(
+        !chain
+            .iter()
+            .any(|r| matches!(r.event, lib::OperationEvent::Started(_))),
+        "Started must not be recorded after a cancel: {chain:?}"
+    );
+    assert_eq!(chain.len(), 3, "{chain:?}");
+    assert!(matches!(chain[0].event, lib::OperationEvent::Accepted(_)));
+    assert_eq!(
+        chain[1].event,
+        lib::OperationEvent::CancelRequested(lib::Unit)
+    );
+    assert_eq!(
+        chain[2].event,
+        lib::OperationEvent::CancelledBeforeDispatch(lib::Unit)
+    );
+}
+
 /// The drive actor clears a load transient without any client resumption.
 #[tokio::test]
 async fn detached_verification_auto_resumes_fresh_load() {

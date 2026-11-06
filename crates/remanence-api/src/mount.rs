@@ -5225,7 +5225,11 @@ mod tests {
             assert!(harness.pool.busy_bays("LIB001").is_empty());
             harness
                 .state
-                .record_cancel_requested(remanence_state::AuditActor::System, id, None, true)
+                .record_cancel_requested(
+                    remanence_state::AuditActor::System,
+                    id,
+                    "tape_verification",
+                )
                 .unwrap();
             let durable = harness
                 .state

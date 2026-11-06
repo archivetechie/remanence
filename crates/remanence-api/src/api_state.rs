@@ -1348,6 +1348,7 @@ impl ApiState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_request_received(
         &self,
         actor: AuditActor,
@@ -1416,28 +1417,45 @@ impl ApiState {
         &self,
         actor: AuditActor,
         operation_id: Uuid,
-        idempotency_key: Option<Uuid>,
-        force: bool,
+        operation_kind: &str,
     ) -> Result<(), Status> {
-        let mut index = self.catalog.write_handle();
-        let mut detail = BTreeMap::new();
-        detail.insert("force".to_string(), CborValue::Bool(force));
-        append_operation_audit(
-            &mut index,
-            self.audit_dir.as_ref(),
-            self.audit_fsync,
-            &self.audit_append_lock,
-            OperationAuditInput {
-                actor,
-                operation_id,
-                operation_kind: "unknown",
-                event: AuditEvent::CancelRequested,
-                subject_kind: "operation",
-                subject_id: Some(operation_id.to_string()),
-                idempotency_key,
-                detail,
-            },
-        )
+        if let Some(runtime) = self.catalog.library_runtime() {
+            use remanence_state::library_log as lib;
+            return runtime
+                .record_operation_event(
+                    *operation_id.as_bytes(),
+                    crate::operation_source::kind(operation_kind)?,
+                    lib::OperationEvent::CancelRequested(lib::Unit),
+                    actor,
+                )
+                .map_err(|e| Status::failed_precondition(e.to_string()));
+        }
+        #[cfg(test)]
+        {
+            let mut index = self.catalog.write_handle();
+            append_operation_audit(
+                &mut index,
+                self.audit_dir.as_ref(),
+                self.audit_fsync,
+                &self.audit_append_lock,
+                OperationAuditInput {
+                    actor,
+                    operation_id,
+                    operation_kind,
+                    event: AuditEvent::CancelRequested,
+                    subject_kind: "operation",
+                    subject_id: Some(operation_id.to_string()),
+                    idempotency_key: None,
+                    detail: BTreeMap::new(),
+                },
+            )
+        }
+        #[cfg(not(test))]
+        {
+            Err(Status::failed_precondition(
+                "operation cancellation requires shared LibraryAuthority",
+            ))
+        }
     }
 
     pub(crate) fn record_operation_failed(
@@ -1461,28 +1479,37 @@ impl ApiState {
                 )
                 .map_err(|e| Status::failed_precondition(e.to_string()));
         }
-        let mut index = self.catalog.write_handle();
-        let mut detail = BTreeMap::new();
-        detail.insert(
-            "error_summary".to_string(),
-            CborValue::Text(error_summary.to_string()),
-        );
-        append_operation_audit(
-            &mut index,
-            self.audit_dir.as_ref(),
-            self.audit_fsync,
-            &self.audit_append_lock,
-            OperationAuditInput {
-                actor: AuditActor::System,
-                operation_id,
-                operation_kind,
-                event: AuditEvent::OperationFailed,
-                subject_kind: "operation",
-                subject_id: Some(operation_id.to_string()),
-                idempotency_key: None,
-                detail,
-            },
-        )
+        #[cfg(test)]
+        {
+            let mut index = self.catalog.write_handle();
+            let mut detail = BTreeMap::new();
+            detail.insert(
+                "error_summary".to_string(),
+                CborValue::Text(error_summary.to_string()),
+            );
+            append_operation_audit(
+                &mut index,
+                self.audit_dir.as_ref(),
+                self.audit_fsync,
+                &self.audit_append_lock,
+                OperationAuditInput {
+                    actor: AuditActor::System,
+                    operation_id,
+                    operation_kind,
+                    event: AuditEvent::OperationFailed,
+                    subject_kind: "operation",
+                    subject_id: Some(operation_id.to_string()),
+                    idempotency_key: None,
+                    detail,
+                },
+            )
+        }
+        #[cfg(not(test))]
+        {
+            Err(Status::failed_precondition(
+                "operation failure requires shared LibraryAuthority",
+            ))
+        }
     }
 
     pub(crate) fn record_alarm_acked(

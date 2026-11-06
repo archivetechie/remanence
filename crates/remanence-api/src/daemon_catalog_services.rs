@@ -210,8 +210,14 @@ impl pb::daemon_server::Daemon for DaemonService {
                 detail: "operation is already terminal".to_string(),
             }));
         }
+        let operation_kind = self
+            .state
+            .operations
+            .kind_of(&operation_id)
+            .ok_or_else(|| Status::not_found("operation not found"))?;
+        // `request.force` is not recorded: the typed CancelRequested record has no force.
         self.state
-            .record_cancel_requested(actor, operation_id, None, request.force)?;
+            .record_cancel_requested(actor, operation_id, &operation_kind)?;
         Ok(Response::new(pb::CancelOperationResponse {
             resulting_state: resulting_state as i32,
             detail: "cancellation requested".to_string(),

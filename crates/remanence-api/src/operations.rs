@@ -27,6 +27,7 @@ pub(crate) type OperationStatusStream =
     Pin<Box<dyn Stream<Item = Result<pb::OperationStatus, Status>> + Send + 'static>>;
 
 struct OpEntry {
+    operation_kind: String,
     created_at: prost_types::Timestamp,
     ring: VecDeque<pb::OperationStatus>,
     tx: broadcast::Sender<pb::OperationStatus>,
@@ -110,6 +111,7 @@ impl OperationRegistry {
         ops.insert(
             op_id,
             OpEntry {
+                operation_kind: operation_kind.clone(),
                 created_at: timestamp_now(),
                 verification: None,
                 ring: VecDeque::new(),
@@ -142,6 +144,16 @@ impl OperationRegistry {
             .expect("ops lock")
             .get(id)
             .is_some_and(|entry| entry.ring.back().is_none_or(|status| !is_terminal(status)))
+    }
+
+    /// The kind a registered operation was registered under. Unlike `latest`, this
+    /// answers before the operation has published its first status.
+    pub(crate) fn kind_of(&self, id: &Uuid) -> Option<String> {
+        self.ops
+            .lock()
+            .expect("ops lock")
+            .get(id)
+            .map(|entry| entry.operation_kind.clone())
     }
 
     pub(crate) fn latest(&self, id: &Uuid) -> Option<pb::OperationStatus> {
