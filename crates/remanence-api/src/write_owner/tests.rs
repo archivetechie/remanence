@@ -2054,6 +2054,75 @@ fn a_grpc_wait_ready_records_the_wait_ready_poll_and_keeps_its_spelling() {
     );
 }
 
+/// An initializing LOAD that ends in CHECK CONDITION with sense, through the readiness wait's
+/// production recorder on a runtime-backed state: the failure is recorded with the LOAD's
+/// completion (its status and sense), so the typed runtime accepts it and the operation ends in
+/// the failure's state, not in a recording failure.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_initializing_load_with_sense_is_recorded_with_its_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    let operation_id = typed_wait_owner(&runtime, &mut index);
+    let (mut drive, log) = open_test_drive_with_scripts(
+        "DEC418146K_LL02",
+        vec![Some(readiness_fixed_sense(0x02, 0x04, 0x02))],
+        Some(readiness_fixed_sense(0x03, 0x11, 0x00)),
+    );
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation_id, "media_readiness_wait");
+
+    handle_drive_wait_ready(
+        &mut index,
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family: MediaFamily::Lto9OrLater,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: StdDuration::from_secs(9_000),
+                poll_interval: StdDuration::from_secs(30),
+            },
+            cartridge_in_drive: true,
+            phase: "grpc_wait_ready",
+        },
+        &handle,
+    );
+
+    let loads = log
+        .borrow()
+        .iter()
+        .filter(|cdb| cdb.first() == Some(&0x1b))
+        .count();
+    assert_eq!(loads, 1, "exactly one SSC LOAD");
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.phase, "initializing_command_load", "{row:?}");
+    assert_eq!(row.state, "terminal_error", "{row:?}");
+    assert_eq!(row.last_cdb_opcode, Some(0x1b));
+    // The typed projection derives the sense and the status from the evidence the log holds.
+    let load_sense: String = readiness_fixed_sense(0x03, 0x11, 0x00)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        row.last_sense_raw.as_deref(),
+        Some(load_sense.as_str()),
+        "the LOAD's own sense is recorded"
+    );
+    assert_eq!(row.target_status, Some(0x02), "CHECK CONDITION");
+    let latest = registry.latest(&operation_id).expect("operation progress");
+    assert_ne!(
+        latest.progress.get("state").map(String::as_str),
+        Some("recording_failed"),
+        "{latest:?}"
+    );
+}
+
 /// The completion of a drive LOAD that a retryable CHECK CONDITION ends is recorded by the
 /// production helper under `load_drive_completion` with the LOAD's opcode, and the typed
 /// runtime accepts it.
@@ -2241,6 +2310,588 @@ fn startup_records_an_unresolved_readiness_owner_under_the_typed_runtime() {
     assert_eq!(
         row.quarantine_id.as_deref(),
         Some(format!("mrq-{operation_id}").as_str())
+    );
+}
+
+/// The operator's release of a readiness fence, as `rem tape quarantine release` builds it.
+fn operator_release(operation_id: Uuid) -> remanence_state::MediaReadinessTransitionInput {
+    remanence_state::MediaReadinessTransitionInput {
+        completion_evidence: None,
+        operation_id,
+        phase: Some("quarantine_release".into()),
+        state: "released".into(),
+        dirty_scope: Some("none".into()),
+        last_cdb_opcode: None,
+        last_sense_raw: None,
+        last_sense_key: None,
+        last_asc: None,
+        last_ascq: None,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: None,
+        cancel_source: Some("operator".into()),
+        signal: None,
+        evidence_path: None,
+        last_error_json: Some("{\"ack\":\"checked\"}".into()),
+        quarantine_id: Some(format!("mrq-{operation_id}")),
+    }
+}
+
+/// The readiness records of `operation` in the library log, in order, read once the state that
+/// wrote them is dropped.
+#[cfg(target_os = "linux")]
+fn readiness_records_of(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+    operation: Uuid,
+) -> Vec<remanence_state::library_log::ReadinessObserved> {
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    loop {
+        let read = crate::tests::read_library_records(paths, library_uuid, &mut |record| {
+            record
+                .readiness_observation()
+                .filter(|value| value.operation == *operation.as_bytes())
+                .cloned()
+        });
+        match read {
+            Ok(records) => return records,
+            Err(crate::tests::ChainRead::Busy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(StdDuration::from_millis(10));
+            }
+            Err(crate::tests::ChainRead::Busy(errno)) => {
+                panic!("the library log was still locked ({errno})")
+            }
+            Err(crate::tests::ChainRead::Failed(message)) => panic!("{message}"),
+        }
+    }
+}
+
+/// A readiness owner whose id the runtime mints, as every production owner's is (session open,
+/// the CLI, startup): no typed operation exists for it.
+#[cfg(target_os = "linux")]
+fn minted_wait_owner(index: &mut CatalogIndex) -> Uuid {
+    minted_wait_owner_with_scope(index, "drive+tape")
+}
+
+/// As [`minted_wait_owner`], with the scope the owner is begun in.
+#[cfg(target_os = "linux")]
+fn minted_wait_owner_with_scope(index: &mut CatalogIndex, dirty_scope: &str) -> Uuid {
+    let record = index
+        .begin_typed_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: Uuid::new_v4(),
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: Some("AOX030L9".to_string()),
+            source_slot: Some(0x03eb),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "readiness_poll".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some(dirty_scope.to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    Uuid::parse_str(&record.operation_id).unwrap()
+}
+
+/// The context a session open on `DEC418146K_LL02` bay `0x0100` records its fences under.
+#[cfg(target_os = "linux")]
+fn session_open_test_context() -> SessionOpenReadinessContext<'static> {
+    SessionOpenReadinessContext {
+        action: "open write session",
+        bay: 0x0100,
+        library_serial: "DEC418146K_LL02",
+        barcode: Some("AOX030L9"),
+        source_slot: Some(0x03eb),
+        drive_serial: None,
+        needs_drive_load: false,
+        load_continues_move: false,
+        lifecycle: None,
+    }
+}
+
+/// A fence recorded by a production producer, then three daemon restarts (a fresh runtime over
+/// the same state, each running the startup reconcile that both the daemon's start and the CLI's
+/// tape init run per library), then the operator's release.
+///
+/// No start aborts, every readiness record is `Pending` (the fence leaves its operation open), the
+/// starts find the fence and write nothing for it (`first_start_records`: only startup's own
+/// unresolved record changes state, once), and the release then ends it, which a fence that ended
+/// its own operation could not do.
+#[cfg(target_os = "linux")]
+fn assert_a_fence_survives_every_later_start(
+    produce: impl FnOnce(&mut CatalogIndex) -> Uuid,
+    expected_state: &str,
+    first_start_records: bool,
+) {
+    use remanence_state::library_log as lib;
+    let root = tempfile::tempdir().unwrap();
+    let paths = runtime_state_paths(root.path());
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let library_uuid = runtime.manifest().library_uuid();
+    let mut index = catalog.write_handle();
+    let operation_id = produce(&mut index);
+    drop((index, catalog, runtime));
+    let produced = readiness_records_of(&paths, library_uuid, operation_id).len();
+    let library = test_changer_library("DEC418146K_LL02");
+
+    for start in 1..=3 {
+        let (runtime, catalog) = runtime_backed_catalog(root.path());
+        let mut index = catalog.write_handle();
+        let found = crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
+            &mut index,
+            &library,
+            &mut [],
+        )
+        .unwrap_or_else(|error| panic!("start {start} aborted on the fence: {error}"));
+        assert_eq!(found, 1, "start {start} finds the one fence");
+        let row = index
+            .media_readiness_operation(operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, expected_state, "start {start}");
+        drop((index, catalog, runtime));
+        let records = readiness_records_of(&paths, library_uuid, operation_id);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.result == lib::ReadinessResult::Pending),
+            "a fence leaves its operation open (start {start}): {records:?}"
+        );
+        assert_eq!(
+            records.len(),
+            produced + usize::from(first_start_records),
+            "start {start} wrote a readiness record for an unchanged fence"
+        );
+    }
+
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    index
+        .record_media_readiness_transition(operator_release(operation_id))
+        .expect("an open fence can be released");
+    assert_eq!(
+        index
+            .media_readiness_operation(operation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "released"
+    );
+    assert_eq!(
+        crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
+            &mut index,
+            &library,
+            &mut [],
+        )
+        .unwrap(),
+        0,
+        "a released fence is not found again"
+    );
+    drop((index, catalog, runtime));
+    let records = readiness_records_of(&paths, library_uuid, operation_id);
+    assert_eq!(
+        records.last().map(|record| record.result),
+        Some(lib::ReadinessResult::Released)
+    );
+}
+
+/// Startup's own unresolved record (an owner it cannot reverify) is the one write startup makes
+/// for a fence; the next starts find it unchanged and write nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_startup_unresolved_fence_survives_every_later_start() {
+    assert_a_fence_survives_every_later_start(
+        |index| {
+            let runtime = index.library_runtime().unwrap();
+            typed_wait_owner(&runtime, index)
+        },
+        "aborted_unknown",
+        true,
+    );
+}
+
+/// A session open's CHECK CONDITION fence, a `terminal_error` that carries the TUR's completion
+/// evidence: the case the evidence guard refused first.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_open_check_condition_fence_survives_every_later_start() {
+    assert_a_fence_survives_every_later_start(
+        |index| {
+            let (mut drive, _log) = open_test_drive_with_tur_script(
+                "DEC418146K_LL02",
+                vec![Some(readiness_fixed_sense(4, 0x44, 0))],
+            );
+            let status =
+                session_open_short_probe_or_load(index, &mut drive, session_open_test_context())
+                    .expect_err("a hardware error is a fence");
+            crate::readiness_wait::ReadinessFence::from_status(&status)
+                .expect("the refusal names the fence")
+                .0
+        },
+        "terminal_error",
+        false,
+    );
+}
+
+/// A session open's mechanical command fence: a `transport_unknown` with no completion evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_open_command_fence_survives_every_later_start() {
+    assert_a_fence_survives_every_later_start(
+        |index| {
+            let ctx = session_open_test_context();
+            let operation_id =
+                record_session_open_readiness_operation(index, Uuid::new_v4(), &ctx).unwrap();
+            record_session_open_command_fence_on_operation(
+                index,
+                operation_id,
+                &ctx,
+                Some(0x1b),
+                "drive LOAD IMMED failed".to_string(),
+            );
+            operation_id
+        },
+        "transport_unknown",
+        false,
+    );
+}
+
+/// A daemon wait that times out: a `timeout_unknown` that carries the last poll's evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_timed_out_wait_fence_survives_every_later_start() {
+    assert_a_fence_survives_every_later_start(
+        |index| {
+            let operation_id = minted_wait_owner(index);
+            let (mut drive, _log) = open_test_drive_with_tur_script(
+                "DEC418146K_LL02",
+                vec![Some(readiness_fixed_sense(2, 4, 1)); 4],
+            );
+            let registry = crate::operations::OperationRegistry::default();
+            let handle = registry.register(operation_id, "media_readiness_wait");
+            let poll = poll_drive_media_readiness(
+                index,
+                &mut drive,
+                DriveReadinessPoll {
+                    bay: 0x0100,
+                    operation_id,
+                    family: MediaFamily::Lto9OrLater,
+                    options: remanence_library::MediaReadinessWaitOptions {
+                        wait: true,
+                        timeout: StdDuration::ZERO,
+                        poll_interval: StdDuration::ZERO,
+                    },
+                    cartridge_in_drive: false,
+                    phase: "readiness_poll",
+                },
+                &handle,
+            )
+            .expect("the wait ends at its timeout");
+            assert!(poll.timed_out);
+            operation_id
+        },
+        "timeout_unknown",
+        false,
+    );
+}
+
+/// The sense columns, statuses and opcode a readiness row shows, as one tuple, so a test can say
+/// "none of the evidence-derived columns".
+#[cfg(target_os = "linux")]
+type EvidenceColumns = (
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+#[cfg(target_os = "linux")]
+fn evidence_columns(row: &remanence_state::MediaReadinessOperationRecord) -> EvidenceColumns {
+    (
+        row.last_sense_raw.clone(),
+        row.last_sense_key,
+        row.last_asc,
+        row.last_ascq,
+        row.last_host_status,
+        row.last_driver_status,
+        row.target_status,
+        row.last_cdb_opcode,
+    )
+}
+
+/// D4: an operator cancel of a daemon readiness wait, through the wait's own recorder, on a
+/// runtime-backed state whose first poll recorded sense. The cancel is an open observation: the
+/// row keeps its state and takes phase `cancelled` and `cancel_source` operator, and carries no
+/// completion and none of the evidence-derived columns (the old copy of the poll's sense was
+/// refused by the evidence guard, so the wait ended in a recording failure). Nothing in the log
+/// ends the operation.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_operator_cancel_of_a_readiness_wait_is_an_open_observation_without_evidence() {
+    use remanence_state::library_log as lib;
+    let mut typed = crate::tests::TypedRoot::open();
+    let sqlite_path = typed.paths().sqlite_path.clone();
+    let catalog = typed.catalog();
+    let mut index = catalog.write_handle();
+    let operation_id = minted_wait_owner(&mut index);
+    let (mut drive, _log) = open_test_drive_with_tur_script(
+        "DEC418146K_LL02",
+        vec![Some(readiness_fixed_sense(2, 4, 1)); 20],
+    );
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation_id, "media_readiness_wait");
+    // The operator's cancel arrives once the first poll is recorded.
+    let canceller = std::thread::spawn({
+        let registry = registry.clone();
+        move || {
+            let reader = remanence_state::CatalogReader::open(&sqlite_path).unwrap();
+            let deadline = std::time::Instant::now() + StdDuration::from_secs(10);
+            loop {
+                let polled = reader
+                    .media_readiness_operation(operation_id)
+                    .unwrap()
+                    .is_some_and(|row| row.phase == "wait_ready_tur");
+                if polled {
+                    registry.request_cancel(&operation_id).unwrap();
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "no poll was recorded");
+                std::thread::sleep(StdDuration::from_millis(5));
+            }
+        }
+    });
+    handle_drive_wait_ready(
+        &mut index,
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family: MediaFamily::Lto9OrLater,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: StdDuration::from_secs(9_000),
+                poll_interval: StdDuration::from_secs(30),
+            },
+            cartridge_in_drive: true,
+            phase: "grpc_wait_ready",
+        },
+        &handle,
+    );
+    canceller.join().unwrap();
+
+    let latest = registry.latest(&operation_id).expect("operation progress");
+    assert_eq!(
+        latest.state,
+        pb::OperationState::Cancelled as i32,
+        "{latest:?}"
+    );
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.phase, "cancelled", "{row:?}");
+    assert_eq!(row.state, "media_initializing", "{row:?}");
+    assert_eq!(row.cancel_source.as_deref(), Some("operator"), "{row:?}");
+    assert_eq!(
+        evidence_columns(&row),
+        (None, None, None, None, None, None, None, None),
+        "a cancel issues no command, so it copies no poll evidence: {row:?}"
+    );
+    drop((index, catalog, drive, handle, registry));
+    let records = typed
+        .records(|record| {
+            record
+                .readiness_observation()
+                .filter(|value| value.operation == *operation_id.as_bytes())
+                .cloned()
+        })
+        .await;
+    let cancel = records.last().expect("the cancel is recorded");
+    assert_eq!(cancel.result, lib::ReadinessResult::Pending, "{cancel:?}");
+    assert_eq!(cancel.state, lib::ReadinessState::MediaInitializing);
+    assert_eq!(cancel.phase, lib::ReadinessPhase::Cancelled);
+    assert_eq!(cancel.cancel_source, Some(lib::CancelSource::Operator));
+    assert_eq!(cancel.evidence, None, "no completion evidence");
+    assert!(
+        records
+            .iter()
+            .all(|record| record.result == lib::ReadinessResult::Pending),
+        "a cancel is not an end: {records:?}"
+    );
+}
+
+/// D4, the RPC (refinement 2): `CancelOperation` of a daemon readiness wait answers success and
+/// appends the `Pending` cancel observation itself, so an accepted cancel is durable although no
+/// wait is running to record it. The wait's id is minted by the readiness begin, so no typed
+/// operation exists for it: the RPC records no typed `CancelRequested` (which would answer
+/// `FailedPrecondition` although the cancel takes effect). A repeat is accepted and appends
+/// nothing; a wait that then exits at its first boundary records the same observation as an exact
+/// retry, so the log holds exactly one cancel record.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_cancel_rpc_makes_a_readiness_wait_cancel_durable_before_the_wait_exits() {
+    use crate::pb::daemon_server::Daemon;
+    use remanence_state::library_log as lib;
+    let mut typed = crate::tests::TypedRoot::open();
+    let state = typed.api_state();
+    let mut index = state.catalog.write_handle();
+    let operation_id = minted_wait_owner(&mut index);
+    // The poll the wait recorded before the operator cancelled: it carries sense.
+    let (mut drive, _log) = open_test_drive_with_tur_script(
+        "DEC418146K_LL02",
+        vec![Some(readiness_fixed_sense(2, 4, 1)); 4],
+    );
+    let polled = drive.probe_media_readiness(MediaFamily::Lto9OrLater);
+    record_session_open_readiness_transition(&mut index, operation_id, "wait_ready_tur", &polled)
+        .unwrap();
+    let before = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.state, "media_initializing", "{before:?}");
+    assert!(before.last_sense_raw.is_some(), "the poll recorded sense");
+    let handle = state
+        .operations
+        .register(operation_id, "media_readiness_wait");
+    handle.publish_state(
+        pb::OperationState::Running,
+        &[("state", "media_initializing")],
+    );
+
+    let daemon = state.daemon_service();
+    let first = Daemon::cancel_operation(&daemon, cancel_request(operation_id))
+        .await
+        .expect("an accepted cancel of a readiness wait answers success")
+        .into_inner();
+    assert_eq!(first.detail, "cancellation requested");
+    assert!(handle.is_cancelled());
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.phase, "cancelled",
+        "durable with no wait running: {row:?}"
+    );
+    assert_eq!(row.state, "media_initializing", "{row:?}");
+    assert_eq!(row.cancel_source.as_deref(), Some("operator"), "{row:?}");
+    assert_eq!(
+        evidence_columns(&row),
+        (None, None, None, None, None, None, None, None),
+        "{row:?}"
+    );
+    Daemon::cancel_operation(&daemon, cancel_request(operation_id))
+        .await
+        .expect("a repeated cancel is accepted");
+
+    // The wait that was running exits at its first boundary and records the same observation.
+    handle_drive_wait_ready(
+        &mut index,
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family: MediaFamily::Lto9OrLater,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: StdDuration::from_secs(9_000),
+                poll_interval: StdDuration::from_secs(30),
+            },
+            cartridge_in_drive: true,
+            phase: "grpc_wait_ready",
+        },
+        &handle,
+    );
+    let latest = state.operations.latest(&operation_id).unwrap();
+    assert_eq!(
+        latest.state,
+        pb::OperationState::Cancelled as i32,
+        "{latest:?}"
+    );
+    drop((index, drive, handle, daemon, state));
+    let records = typed
+        .records(|record| {
+            record
+                .readiness_observation()
+                .filter(|value| value.operation == *operation_id.as_bytes())
+                .cloned()
+        })
+        .await;
+    let cancels = records
+        .iter()
+        .filter(|record| record.phase == lib::ReadinessPhase::Cancelled)
+        .count();
+    assert_eq!(
+        cancels, 1,
+        "the RPC records the cancel once; the repeat and the wait's own record append nothing: {records:?}"
+    );
+    assert!(records
+        .iter()
+        .all(|record| record.result == lib::ReadinessResult::Pending));
+    let chain = typed.operation_chain(operation_id).await;
+    assert!(
+        chain.is_empty(),
+        "no typed operation exists for a readiness wait's id: {chain:?}"
+    );
+}
+
+/// D4 on a Library-scoped row: the cancel observation names the row's own scope
+/// (`selected-library-snapshot`, as the projection spells it), so the runtime's scope guard
+/// accepts it and the row stays Library-scoped; a cancel that named `drive+tape` would narrow an
+/// unresolved scope and be refused. Through the RPC, the production path.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_operator_cancel_is_accepted_on_a_library_scoped_wait() {
+    use crate::pb::daemon_server::Daemon;
+    let typed = crate::tests::TypedRoot::open();
+    let state = typed.api_state();
+    let mut index = state.catalog.write_handle();
+    let operation_id = minted_wait_owner_with_scope(&mut index, "selected-library-snapshot");
+    let before = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.dirty_scope.as_deref(),
+        Some("selected-library-snapshot"),
+        "{before:?}"
+    );
+    let transition = crate::startup_media_readiness::operator_cancel_readiness_transition(
+        &before,
+        operation_id,
+        None,
+    );
+    assert_eq!(
+        transition.dirty_scope.as_deref(),
+        Some("selected-library-snapshot")
+    );
+    let handle = state
+        .operations
+        .register(operation_id, "media_readiness_wait");
+    handle.publish_state(pb::OperationState::Running, &[("state", "planned")]);
+    Daemon::cancel_operation(&state.daemon_service(), cancel_request(operation_id))
+        .await
+        .expect("a cancel of a Library-scoped wait is accepted");
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.phase, "cancelled", "{row:?}");
+    assert_eq!(row.cancel_source.as_deref(), Some("operator"), "{row:?}");
+    assert_eq!(
+        row.dirty_scope.as_deref(),
+        Some("selected-library-snapshot"),
+        "{row:?}"
     );
 }
 
@@ -4679,6 +5330,17 @@ fn open_test_drive_with_tur_script(
     library_serial: &str,
     tur_senses: Vec<Option<Vec<u8>>>,
 ) -> (DriveHandle, RecordingLog) {
+    open_test_drive_with_scripts(library_serial, tur_senses, None)
+}
+
+/// A drive whose TEST UNIT READY answers follow `tur_senses` and whose SSC LOAD, when
+/// `load_sense` is set, ends in CHECK CONDITION with that sense.
+#[cfg(target_os = "linux")]
+fn open_test_drive_with_scripts(
+    library_serial: &str,
+    tur_senses: Vec<Option<Vec<u8>>>,
+    load_sense: Option<Vec<u8>>,
+) -> (DriveHandle, RecordingLog) {
     let library = test_changer_library(library_serial);
     let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
     let log = RecordingLog::new();
@@ -4693,6 +5355,7 @@ fn open_test_drive_with_tur_script(
         vpd80_response("DRV_MOVE_OBS"),
     ]);
     let mut tur_senses = Some(tur_senses);
+    let mut load_sense = Some(load_sense);
     let mut handle = library
         .open_with(&policy, move |path| {
             if path == Path::new("/dev/sg-mock") {
@@ -4706,11 +5369,13 @@ fn open_test_drive_with_tur_script(
             } else if path == Path::new("/dev/sg-drive-mock") {
                 let responses = drive_responses.take().expect("drive opened once in test");
                 let inner = FixtureTransport::new().with_responses(responses);
+                let mut script = TurScriptTransport::new(
+                    inner,
+                    tur_senses.take().expect("TUR script consumed once"),
+                );
+                script.load_sense = load_sense.take().expect("load script consumed once");
                 Ok::<_, remanence_library::IoErrorKind>(Box::new(RecordingTransport::with_log(
-                    TurScriptTransport::new(
-                        inner,
-                        tur_senses.take().expect("TUR script consumed once"),
-                    ),
+                    script,
                     log_for_factory.clone(),
                 )) as Box<dyn SgTransport>)
             } else {
@@ -4732,6 +5397,8 @@ fn open_test_drive_with_tur_script(
 struct TurScriptTransport<T> {
     inner: T,
     tur_senses: std::collections::VecDeque<Option<Vec<u8>>>,
+    /// The sense an SSC LOAD ends in, when it is to fail.
+    load_sense: Option<Vec<u8>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -4740,6 +5407,7 @@ impl<T> TurScriptTransport<T> {
         Self {
             inner,
             tur_senses: tur_senses.into(),
+            load_sense: None,
         }
     }
 }
@@ -4758,6 +5426,14 @@ impl<T: SgTransport> SgTransport for TurScriptTransport<T> {
         self.inner.execute_none(cdb)?;
         if cdb == [0, 0, 0, 0, 0, 0] {
             if let Some(Some(sense)) = self.tur_senses.pop_front() {
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                });
+            }
+        }
+        if cdb.first() == Some(&0x1b) {
+            if let Some(sense) = self.load_sense.clone() {
                 return Err(remanence_library::ScsiError::CheckCondition {
                     sense,
                     bytes_transferred: 0,
@@ -15725,9 +16401,17 @@ fn run_typed_readiness_owner_source_case(with_legacy_metadata: bool, failed_load
         &handle,
     );
     if failed_load {
-        assert!(
-            poll.is_err(),
-            "actual LOAD refusal must fail this poll: {poll:?}"
+        // The failure is recorded with the LOAD's own completion, so the wait ends `Ok` on a
+        // not-ready reading and the row holds the failure's fence state.
+        let poll = poll.expect("the failed initializing LOAD is recorded, not refused");
+        assert!(!poll.readiness.is_ready(), "{poll:?}");
+        assert_eq!(
+            index
+                .media_readiness_operation(operation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "terminal_error"
         );
         assert_eq!(failed_dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(drive_load_commands(&world), 0);
@@ -15761,6 +16445,23 @@ fn run_typed_readiness_owner_source_case(with_legacy_metadata: bool, failed_load
         .unwrap();
     if failed_load {
         assert_ne!(row.state, "ready");
+        // The budget is a pure function of the log: the fence keeps the operation open, so the
+        // LOAD it sent still counts after an empty-SQL rebuild, until the operator releases it.
+        assert_eq!(
+            runtime
+                .readiness_load_attempts(*operation_id.as_bytes())
+                .unwrap(),
+            1
+        );
+        runtime
+            .transition_readiness(&operator_release(operation_id))
+            .expect("the operator can release the fence");
+        assert_eq!(
+            runtime
+                .readiness_load_attempts(*operation_id.as_bytes())
+                .unwrap(),
+            0
+        );
     } else {
         assert_eq!(row.state, "ready");
     }

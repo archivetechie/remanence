@@ -304,7 +304,13 @@ impl MotionAuthority for LibraryRuntime {
                     })?;
                     if let MotionCommand::Load(key) = command {
                         let (owner, _) = authority.readiness_context(operation, &endpoint(key))?;
-                        if owner.is_none() {
+                        // A readiness-confirmed LOAD needs an open head that is not a
+                        // fence: only a release may follow one, so no LOAD may be sent
+                        // for it and no Ready could confirm it.
+                        if owner
+                            .as_ref()
+                            .is_none_or(|(_, head)| super::readiness::is_fence_state(head.state))
+                        {
                             return Err(lib::store::StoreError::Fold(
                                 lib::FoldError::WrongCounterpart,
                             )
@@ -548,6 +554,15 @@ impl MotionAuthority for LibraryRuntime {
                 return Err(self.motion_error(
                     StateError::JournalReplayFailed(
                         "LOAD readiness owner is terminal without ready proof".into(),
+                    )
+                    .into(),
+                ));
+            }
+            // Only a release may follow a fence head, so Ready cannot.
+            if super::readiness::is_fence_state(owner.state) {
+                return Err(self.motion_error(
+                    StateError::JournalReplayFailed(
+                        "LOAD readiness owner is fenced; only a release may follow it".into(),
                     )
                     .into(),
                 ));

@@ -64,6 +64,7 @@ crates/remanence-state/src/state.rs	ingest_tape_journal	project_tape_log	1	appli
 crates/remanence-state/src/state.rs	rebuild_projection_inputs	rebuild_typed_sources	1	applies-authority	permanent
 #
 # P2: A handle or StateHandle method whose body goes through the runtime rather than writing SQL first.
+crates/remanence-api/src/api_state.rs	record_readiness_wait_cancel	record_media_readiness_transition	1	routes-to-runtime	permanent
 crates/remanence-api/src/drive_collection.rs	observe_drive_catalog_from_libraries	observe_drive_inventory_snapshot	1	routes-to-runtime	permanent
 crates/remanence-api/src/startup_media_readiness.rs	reconcile_library_media_readiness_records_on_startup	record_media_readiness_transition	3	routes-to-runtime	permanent
 crates/remanence-api/src/startup_media_readiness.rs	startup_media_readiness_initializing_load	record_media_readiness_transition	1	routes-to-runtime	permanent

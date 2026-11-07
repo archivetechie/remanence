@@ -169,7 +169,9 @@ pub(crate) fn media_readiness_initializing_load_transition(
 
 /// Transition recorded when the initializing SSC LOAD fails. The state
 /// follows the failure's readiness classification, so a completion-unknown
-/// or refused LOAD fences for operator release.
+/// or refused LOAD fences for operator release. The failure carries the LOAD's
+/// own completion, which is the evidence the typed runtime requires before it
+/// records the decoded sense and status beside it.
 pub(crate) fn media_readiness_initializing_load_failed_transition(
     operation_id: Uuid,
     failure: &MediaReadiness,
@@ -179,7 +181,7 @@ pub(crate) fn media_readiness_initializing_load_failed_transition(
     let quarantine_id = media_readiness_state_requires_release(state.as_str())
         .then(|| media_readiness_quarantine_id_for_operation(operation_id));
     MediaReadinessTransitionInput {
-        completion_evidence: None,
+        completion_evidence: Some((&failure.outcome().evidence).into()),
         operation_id,
         phase: Some(INITIALIZING_LOAD_PHASE.to_string()),
         state,
@@ -320,6 +322,10 @@ fn media_readiness_fence_names_target(
 /// Reconcile active media-readiness fences against the current selected-library
 /// discovery snapshot using TEST UNIT READY probes. It may send one initializing
 /// SSC LOAD per operation when inventory places the cartridge in the drive.
+///
+/// The count returned is the number of active fences found and accounted for (probed, kept, or
+/// marked unresolved), not the number of records written: an unchanged requires-release fence is
+/// counted and writes nothing under the typed runtime.
 pub fn reconcile_media_readiness_on_startup(
     index: &mut CatalogIndex,
     report: &remanence_library::DiscoveryReport,
@@ -327,7 +333,7 @@ pub fn reconcile_media_readiness_on_startup(
 ) -> Result<usize, Status> {
     use remanence_library::AccessPolicy as _;
 
-    let mut reconciled = 0usize;
+    let mut found = 0usize;
     for library in &report.libraries {
         if !policy.allows(library.serial.as_str()) {
             continue;
@@ -373,17 +379,18 @@ pub fn reconcile_media_readiness_on_startup(
             })?;
             opened_drives.push((bay_addr, drive));
         }
-        reconciled =
-            reconciled.saturating_add(reconcile_library_media_readiness_records_on_startup(
-                index,
-                library,
-                &mut opened_drives,
-                active,
-            )?);
+        found = found.saturating_add(reconcile_library_media_readiness_records_on_startup(
+            index,
+            library,
+            &mut opened_drives,
+            active,
+        )?);
     }
-    Ok(reconciled)
+    Ok(found)
 }
 
+/// One library's startup reconcile. Returns the number of active fences found, as
+/// [`reconcile_media_readiness_on_startup`] does, not the number of records written.
 pub(crate) fn reconcile_library_media_readiness_on_startup(
     index: &mut CatalogIndex,
     library: &remanence_library::Library,
@@ -401,7 +408,7 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
     opened_drives: &mut [(u16, remanence_library::DriveHandle)],
     records: Vec<MediaReadinessOperationRecord>,
 ) -> Result<usize, Status> {
-    let mut reconciled = 0usize;
+    let mut found = 0usize;
     for record in records {
         if index
             .tape_io_is_fenced(None, record.barcode.as_deref(), Some(&record.endpoint))
@@ -430,7 +437,7 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                     index
                         .record_media_readiness_transition(transition)
                         .map_err(status_from_state_error)?;
-                    reconciled = reconciled.saturating_add(1);
+                    found = found.saturating_add(1);
                     continue;
                 };
                 let observed = drive.probe_media_readiness(family);
@@ -471,24 +478,34 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                         &readiness,
                     );
                 }
-                reconciled = reconciled.saturating_add(1);
+                found = found.saturating_add(1);
             }
             StartupReadinessPlan::KeepFenced { transition } => {
-                index
-                    .record_media_readiness_transition(*transition)
-                    .map_err(status_from_state_error)?;
-                reconciled = reconciled.saturating_add(1);
+                // Under the typed runtime a requires-release fence is already durable and
+                // nothing has changed it: startup deliberately does not probe one, so
+                // re-recording it would write a non-observation, which the runtime refuses
+                // (only a release may follow a fence). It is found and counted, and nothing is
+                // appended. A record startup cannot reverify still records its unresolved
+                // transition, since that changes the state.
+                let unchanged_fence = index.library_runtime().is_some()
+                    && media_readiness_state_requires_release(record.state.trim());
+                if !unchanged_fence {
+                    index
+                        .record_media_readiness_transition(*transition)
+                        .map_err(status_from_state_error)?;
+                }
+                found = found.saturating_add(1);
             }
         }
     }
-    if reconciled > 0 {
+    if found > 0 {
         tracing::info!(
             library_serial = library.serial.as_str(),
-            count = reconciled,
-            "reconciled active media-readiness fence(s) during startup"
+            fences_found = found,
+            "found active media-readiness fence(s) during startup; an unchanged requires-release fence is already durable and writes no record"
         );
     }
-    Ok(reconciled)
+    Ok(found)
 }
 
 /// Send the startup reconcile's one SSC LOAD to a drive that asks for an
@@ -809,6 +826,58 @@ pub(crate) fn startup_media_readiness_requires_release_transition(
             .quarantine_id
             .clone()
             .or_else(|| Some(media_readiness_quarantine_id_for_operation(operation_id))),
+    }
+}
+
+/// An operator's cancel of a readiness wait, as an open observation. A cancel is a pause, not an
+/// end: the row keeps its state, scope and quarantine, takes phase `cancelled` and `cancel_source`
+/// `operator`, and an explicit resume continues it with its retained LOAD budget. It issues no
+/// command, so it carries no completion evidence and none of the evidence-derived columns (sense,
+/// statuses, transport class): the row's sense reads empty until the next poll, and every reader
+/// of it is display only. The daemon's wait and the cancel RPC both build it through here, so
+/// whichever records second is an exact retry of the first, but only when no poll lands between
+/// the two records: the RPC reads the row before it appends, so a poll in between can leave its
+/// cancel naming the older waiting state (display only; no deciding reader tells the six waiting
+/// states apart).
+pub(crate) fn operator_cancel_readiness_transition(
+    record: &MediaReadinessOperationRecord,
+    operation_id: Uuid,
+    cancelled_by: Option<&str>,
+) -> MediaReadinessTransitionInput {
+    let detail = match cancelled_by {
+        Some(actor) => {
+            format!("operator {actor} cancels readiness wait; explicit resume continues it")
+        }
+        None => "operator cancels readiness wait; explicit resume continues it".to_string(),
+    };
+    MediaReadinessTransitionInput {
+        completion_evidence: None,
+        operation_id,
+        phase: Some("cancelled".to_string()),
+        state: record.state.trim().to_string(),
+        dirty_scope: Some(
+            record
+                .dirty_scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .unwrap_or("drive+tape")
+                .to_string(),
+        ),
+        last_cdb_opcode: None,
+        last_sense_raw: None,
+        last_sense_key: None,
+        last_asc: None,
+        last_ascq: None,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: None,
+        cancel_source: Some("operator".to_string()),
+        signal: None,
+        evidence_path: None,
+        last_error_json: Some(json_detail("cancelled", detail.as_str())),
+        quarantine_id: record.quarantine_id.clone(),
     }
 }
 

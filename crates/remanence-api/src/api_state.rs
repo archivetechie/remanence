@@ -1406,6 +1406,12 @@ impl ApiState {
     ) -> Result<(), Status> {
         if let Some(runtime) = self.catalog.library_runtime() {
             use remanence_state::library_log as lib;
+            // A daemon readiness wait runs under its readiness operation's id, and no typed
+            // operation exists for that id, so a typed `CancelRequested` has nothing to attach
+            // to. The cancel is recorded on the readiness chain, which is where it is durable.
+            if operation_kind == "media_readiness_wait" {
+                return self.record_readiness_wait_cancel(&actor, operation_id);
+            }
             return runtime
                 .record_operation_event(
                     *operation_id.as_bytes(),
@@ -1440,6 +1446,54 @@ impl ApiState {
             Err(Status::failed_precondition(
                 "operation cancellation requires shared LibraryAuthority",
             ))
+        }
+    }
+
+    /// Record an accepted operator cancel of a daemon readiness wait as an open observation on the
+    /// wait's readiness chain, so the cancel is durable even when the wait exits before its next
+    /// boundary. The wait records the same observation itself, which is then an exact retry.
+    ///
+    /// A cancel is a pause: only a row still waiting has one to take. A row the wait has already
+    /// settled (a fence, Ready or Released) has nothing to pause, so the cancel records nothing
+    /// and the request still succeeds: the flag is set and the wait is ending.
+    fn record_readiness_wait_cancel(
+        &self,
+        actor: &AuditActor,
+        operation_id: Uuid,
+    ) -> Result<(), Status> {
+        let mut index = self.catalog.write_handle();
+        let record = index
+            .media_readiness_operation(operation_id)
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("media-readiness operation not found"))?;
+        if !crate::readiness_wait::is_resumable(&record.state) {
+            return Ok(());
+        }
+        let who = match actor {
+            AuditActor::System => "system",
+            AuditActor::User(name) | AuditActor::Service(name) => name.as_str(),
+        };
+        let transition = crate::startup_media_readiness::operator_cancel_readiness_transition(
+            &record,
+            operation_id,
+            Some(who),
+        );
+        match index.record_media_readiness_transition(transition) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // The wait may have settled the row between the read and the append; then
+                // there is nothing left to pause.
+                let settled = index
+                    .media_readiness_operation(operation_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| !crate::readiness_wait::is_resumable(&row.state));
+                if settled {
+                    Ok(())
+                } else {
+                    Err(Status::failed_precondition(error.to_string()))
+                }
+            }
         }
     }
 

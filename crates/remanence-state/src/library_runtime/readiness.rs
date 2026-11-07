@@ -105,15 +105,7 @@ impl LibraryRuntime {
                 ));
             }
         }
-        let result = match state {
-            lib::ReadinessState::Ready => lib::ReadinessResult::Ready,
-            lib::ReadinessState::Released => lib::ReadinessResult::Released,
-            lib::ReadinessState::Cancelled => lib::ReadinessResult::Cancelled,
-            lib::ReadinessState::AbortedUnknown => lib::ReadinessResult::AbortedUnknown,
-            lib::ReadinessState::TerminalError => lib::ReadinessResult::Failed,
-            // Nonterminal uncertainty remains an admission obligation.
-            _ => lib::ReadinessResult::Pending,
-        };
+        let result = readiness_result(state);
         if let Some((_, owner)) = &prior_source {
             // A deadline is an immutable creation fact and matches as an `Option`: finite
             // against finite within 1 ms, none against none, and never one against the other.
@@ -146,6 +138,7 @@ impl LibraryRuntime {
             if owner.result != lib::ReadinessResult::Pending {
                 return Err(invalid("readiness operation is already terminal"));
             }
+            refuse_after_fence(owner.state, state)?;
         }
         let mut operation = *input.operation_id.as_bytes();
         self.append_locked(|authority, view| {
@@ -445,16 +438,23 @@ impl LibraryRuntime {
                 "ready observation requires an actual successful readiness probe",
             ));
         }
+        // The scope of an unresolved operation never narrows. An observation that ends the
+        // operation, or that raises a fence, does not ask the row to narrow: it is accepted and
+        // the row keeps its own scope, which is the broader one. A fence is open (`Pending`)
+        // since M-1, but refusing its record would leave unrecorded the very uncertainty it
+        // reports, and its producer names `drive+tape` without knowing whether the row is
+        // Library-scoped. Any other observation that names a narrower scope is still refused.
+        let keeps_row_scope =
+            next_result != lib::ReadinessResult::Pending || is_fence_state(next_state);
         let next_scope = match input.dirty_scope.as_deref() {
             None => value.scope,
             Some("selected-library-snapshot") => lib::ReadinessScope::Library,
             Some("drive+tape" | "drive")
-                if value.scope == lib::ReadinessScope::Endpoint
-                    || next_result != lib::ReadinessResult::Pending =>
+                if value.scope == lib::ReadinessScope::Endpoint || keeps_row_scope =>
             {
                 value.scope
             }
-            Some("none") if next_result != lib::ReadinessResult::Pending => value.scope,
+            Some("none") if keeps_row_scope => value.scope,
             _ => {
                 return Err(invalid(
                     "readiness transition cannot narrow unresolved scope",
@@ -490,6 +490,7 @@ impl LibraryRuntime {
         if value.result != lib::ReadinessResult::Pending {
             return Err(invalid("readiness operation is already terminal"));
         }
+        refuse_after_fence(value.state, next_state)?;
         value.scope = next_scope;
         // Every observation states its cancel source; none clears an earlier one, as every
         // legacy transition without one did.
@@ -605,15 +606,60 @@ pub(crate) fn phase_opcode(phase: lib::ReadinessPhase) -> Option<u8> {
     }
 }
 
+/// The result a readiness observation of `state` records, at both producers' sites (begin and
+/// transition).
+///
+/// A readiness operation ends only at Ready (a TEST UNIT READY that returned GOOD) or at Released
+/// (an operator's release). Every other state leaves it open as `Pending`, the five fence states
+/// included, so the fold keeps the operation's head and its LOAD budget until the operator
+/// releases it. `Failed`, `Cancelled` and `AbortedUnknown` stay valid on the wire and are no
+/// longer written.
+///
+/// Precondition: a log written before this mapping holds fences recorded as `Failed` or
+/// `AbortedUnknown`, whose operations the fold has already ended. They cannot be released and
+/// cannot be repaired by this mapping; the whole-state reset (ruling 9) discards them before
+/// anything runs on the branch.
 fn readiness_result(state: lib::ReadinessState) -> lib::ReadinessResult {
     match state {
         lib::ReadinessState::Ready => lib::ReadinessResult::Ready,
         lib::ReadinessState::Released => lib::ReadinessResult::Released,
-        lib::ReadinessState::Cancelled => lib::ReadinessResult::Cancelled,
-        lib::ReadinessState::AbortedUnknown => lib::ReadinessResult::AbortedUnknown,
-        lib::ReadinessState::TerminalError => lib::ReadinessResult::Failed,
         _ => lib::ReadinessResult::Pending,
     }
+}
+
+/// The five requires-release states, enumerated by name: the same five the API's startup
+/// reconcile, the CLI's quarantine release and the projector's fence set name. An open readiness
+/// operation in one of them is a fence, and only `released` may follow it.
+pub(crate) fn is_fence_state(state: lib::ReadinessState) -> bool {
+    matches!(
+        state,
+        lib::ReadinessState::AbortedUnknown
+            | lib::ReadinessState::TimeoutUnknown
+            | lib::ReadinessState::TransportUnknown
+            | lib::ReadinessState::TerminalError
+            | lib::ReadinessState::ReservationConflict
+    )
+}
+
+/// Refuse any successor of a fence head but `released`. An exact retry of the fence never reaches
+/// here: both producers return before it.
+///
+/// This is the backstop that keeps a fence from being followed by another state, not a claim that
+/// no producer tries. At R1c-a two CLI producers do: tape init from a slot records a NO MEDIUM
+/// answer as `terminal_error` and then sends its conditional LOAD and polls again, and the signal
+/// helpers record after a poll that may already have fenced. This refuses those records (before
+/// R1c-a the same flows ended their operation instead, which could not be released); R1c-a2
+/// corrects the producers.
+fn refuse_after_fence(
+    head: lib::ReadinessState,
+    next: lib::ReadinessState,
+) -> Result<(), RuntimeError> {
+    if is_fence_state(head) && next != lib::ReadinessState::Released {
+        return Err(invalid(
+            "readiness operation is fenced; only a release may follow a fence state",
+        ));
+    }
+    Ok(())
 }
 
 /// The daemon's gRPC wait-ready spelling. It is the same TEST UNIT READY poll as `wait_ready_tur`,

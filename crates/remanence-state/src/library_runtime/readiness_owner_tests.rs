@@ -692,7 +692,8 @@ fn the_cli_signal_spelling_records_no_key_and_is_named_in_a_diagnostic() {
     let observed = f.observations(&input);
     assert_eq!(observed.len(), 2);
     assert_eq!(observed[1].cancel_source, None);
-    assert_eq!(observed[1].result, lib::ReadinessResult::AbortedUnknown);
+    // A fence leaves the operation open: only Ready and Released end a readiness operation.
+    assert_eq!(observed[1].result, lib::ReadinessResult::Pending);
     assert_eq!(
         f.progress(),
         vec![(
@@ -1183,4 +1184,330 @@ fn a_ready_is_accepted_only_on_a_test_unit_ready_phase() {
             );
         }
     }
+}
+
+/// The five requires-release states of P27, by name.
+const FENCE_STATES: [&str; 5] = [
+    "aborted_unknown",
+    "timeout_unknown",
+    "transport_unknown",
+    "terminal_error",
+    "reservation_conflict",
+];
+
+/// The six states a readiness operation waits in.
+const WAITING_STATES: [&str; 6] = [
+    "planned",
+    "pre_ready_loading",
+    "media_initializing",
+    "becoming_ready",
+    "unit_attention",
+    "target_busy",
+];
+
+/// A transition of `input`'s operation into `state`, with the quarantine identity a fence names.
+fn transition_to(
+    input: &MediaReadinessOperationInput,
+    state: &str,
+) -> MediaReadinessTransitionInput {
+    let mut next = transition(input);
+    next.state = state.into();
+    if FENCE_STATES.contains(&state) {
+        next.quarantine_id = Some(format!("mrq-{}", input.operation_id));
+    }
+    next
+}
+
+/// The operator's release, as `rem tape quarantine release` builds it.
+fn release_of(input: &MediaReadinessOperationInput) -> MediaReadinessTransitionInput {
+    let mut release = transition(input);
+    release.phase = Some("quarantine_release".into());
+    release.state = "released".into();
+    release.dirty_scope = Some("none".into());
+    release.cancel_source = Some("operator".into());
+    release.quarantine_id = Some(format!("mrq-{}", input.operation_id));
+    release
+}
+
+/// A TEST UNIT READY that returned GOOD, as a Ready transition.
+fn ready_of(input: &MediaReadinessOperationInput) -> MediaReadinessTransitionInput {
+    let mut ready = transition(input);
+    ready.phase = Some("wait_ready_tur".into());
+    ready.state = "ready".into();
+    ready.dirty_scope = Some("none".into());
+    ready.last_cdb_opcode = Some(0x00);
+    ready.completion_evidence =
+        Some((&remanence_library::outcome::CompletionEvidence::success()).into());
+    ready
+}
+
+fn load_command(
+    input: &MediaReadinessOperationInput,
+) -> (
+    remanence_library::motion::MotionCommand,
+    remanence_library::motion::MotionContext,
+) {
+    use remanence_library::motion::{LoadConfirmation, MotionCommand, MotionContext};
+    (
+        MotionCommand::Load(input.endpoint.clone()),
+        MotionContext {
+            parent_operation: Some(*input.operation_id.as_bytes()),
+            load_confirmation: LoadConfirmation::Readiness,
+            ..Default::default()
+        },
+    )
+}
+
+/// The model, from every starting state: a fence observed from each waiting state leaves the
+/// operation open (`Pending`) with its LOAD budget, an exact retry of the fence is a no-op, any
+/// other successor of it (another waiting or fence state, the same fence at another phase, a
+/// Ready) is refused without a record, and a later `released` ends the operation and its budget.
+/// The refusals name the fence rule, not "already terminal": the operation is still open.
+#[test]
+fn a_fence_leaves_the_operation_open_and_only_a_release_ends_it() {
+    use remanence_library::motion::MotionAuthority;
+    for fence in FENCE_STATES {
+        for start in WAITING_STATES {
+            let case = format!("{start} -> {fence}");
+            let f = open();
+            let mut input = f.owner();
+            input.state = start.into();
+            f.runtime.begin_owned_readiness(&input).unwrap();
+            let (command, context) = load_command(&input);
+            f.runtime.intent(&command, &context).unwrap();
+            let operation = *input.operation_id.as_bytes();
+
+            let fenced = transition_to(&input, fence);
+            f.runtime.transition_readiness(&fenced).unwrap();
+            let head = f.observations(&input).pop().unwrap();
+            assert_eq!(head.result, lib::ReadinessResult::Pending, "{case}");
+            assert_eq!(
+                f.runtime.readiness_load_attempts(operation).unwrap(),
+                1,
+                "{case}"
+            );
+
+            let before = f.runtime.test_source_records().len();
+            // An exact retry appends nothing.
+            f.runtime.transition_readiness(&fenced).unwrap();
+            // Every other successor is refused, and none appends.
+            let mut successors = Vec::new();
+            for next in WAITING_STATES.iter().chain(FENCE_STATES.iter()) {
+                successors.push(transition_to(&input, next));
+            }
+            let mut other_phase = fenced.clone();
+            other_phase.phase = Some("startup_reconcile_requires_release".into());
+            other_phase.cancel_source = Some("startup_reconcile".into());
+            successors.push(other_phase);
+            successors.push(ready_of(&input));
+            for successor in successors {
+                if successor.state == fence && successor.phase.is_none() {
+                    continue; // the exact retry above
+                }
+                refused(
+                    f.runtime.transition_readiness(&successor).unwrap_err(),
+                    "only a release may follow a fence state",
+                );
+            }
+            assert_eq!(f.runtime.test_source_records().len(), before, "{case}");
+            assert_eq!(
+                f.runtime.readiness_load_attempts(operation).unwrap(),
+                1,
+                "{case}"
+            );
+
+            f.runtime.transition_readiness(&release_of(&input)).unwrap();
+            let head = f.observations(&input).pop().unwrap();
+            assert_eq!(head.result, lib::ReadinessResult::Released, "{case}");
+            assert_eq!(
+                f.runtime.readiness_load_attempts(operation).unwrap(),
+                0,
+                "{case}"
+            );
+            refused(
+                f.runtime
+                    .transition_readiness(&transition_to(&input, start))
+                    .unwrap_err(),
+                "already terminal",
+            );
+        }
+    }
+}
+
+/// An owner begun directly in a fence state (the begin path's own mapping) is open too: its
+/// record is `Pending`, an exact refresh is a no-op, a refresh at another phase or a successor in
+/// another state is refused, and only a release follows. Ready is not a state to begin in.
+#[test]
+fn an_owner_begun_in_a_fence_state_is_open_and_only_a_release_follows() {
+    for fence in FENCE_STATES {
+        let f = open();
+        let mut input = f.owner();
+        input.state = fence.into();
+        f.runtime.begin_owned_readiness(&input).unwrap();
+        let head = f.observations(&input).pop().unwrap();
+        assert_eq!(head.result, lib::ReadinessResult::Pending, "{fence}");
+
+        let before = f.runtime.test_source_records().len();
+        f.runtime.begin_owned_readiness(&input).unwrap();
+        let mut moved = input.clone();
+        moved.phase = "wait_ready_tur".into();
+        refused(
+            f.runtime.begin_owned_readiness(&moved).unwrap_err(),
+            "only a release may follow a fence state",
+        );
+        let mut waiting = input.clone();
+        waiting.state = "becoming_ready".into();
+        refused(
+            f.runtime.begin_owned_readiness(&waiting).unwrap_err(),
+            "only a release may follow a fence state",
+        );
+        refused(
+            f.runtime
+                .transition_readiness(&transition_to(&input, "becoming_ready"))
+                .unwrap_err(),
+            "only a release may follow a fence state",
+        );
+        assert_eq!(f.runtime.test_source_records().len(), before, "{fence}");
+
+        f.runtime.transition_readiness(&release_of(&input)).unwrap();
+        let head = f.observations(&input).pop().unwrap();
+        assert_eq!(head.result, lib::ReadinessResult::Released, "{fence}");
+    }
+}
+
+/// D2, the motion side: a readiness-confirmed LOAD is refused while the readiness head is in a
+/// fence state, whether the fence was begun or observed, and appends nothing. A Ready confirmation
+/// of a LOAD that was sent before the fence is refused too: only a release may follow it.
+#[test]
+fn a_readiness_confirmed_load_is_refused_while_the_head_is_in_a_fence_state() {
+    use remanence_library::motion::{MotionAuthority, PendingMotion};
+    for fence in FENCE_STATES {
+        // Begun in the fence state.
+        let f = open();
+        let mut input = f.owner();
+        input.state = fence.into();
+        f.runtime.begin_owned_readiness(&input).unwrap();
+        let (command, context) = load_command(&input);
+        let before = f.runtime.test_source_records().len();
+        assert!(
+            f.runtime.intent(&command, &context).is_err(),
+            "{fence}: begun"
+        );
+        assert_eq!(f.runtime.test_source_records().len(), before, "{fence}");
+
+        // Observed after a LOAD was admitted from a waiting head.
+        let f = open();
+        let input = f.owner();
+        f.runtime.begin_owned_readiness(&input).unwrap();
+        let (command, context) = load_command(&input);
+        let ticket = f.runtime.intent(&command, &context).unwrap();
+        f.runtime
+            .transition_readiness(&transition_to(&input, fence))
+            .unwrap();
+        let before = f.runtime.test_source_records().len();
+        let confirmation = f
+            .runtime
+            .confirm_readiness(
+                &PendingMotion {
+                    command: command.clone(),
+                    context: context.clone(),
+                    ticket,
+                    evidence: remanence_library::outcome::CompletionEvidence::success(),
+                },
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::Ready,
+                ),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(
+            confirmation.to_string().contains("fenced"),
+            "{fence}: {confirmation}"
+        );
+        assert_eq!(f.runtime.test_source_records().len(), before, "{fence}");
+        // A second LOAD is refused as well, then the release ends the operation.
+        assert!(
+            f.runtime.intent(&command, &context).is_err(),
+            "{fence}: observed"
+        );
+        f.runtime.transition_readiness(&release_of(&input)).unwrap();
+    }
+}
+
+/// A waiting owner begun with the Library scope (`selected-library-snapshot`), on its own
+/// operation.
+fn library_scoped_owner(f: &Fixture, state: &str) -> MediaReadinessOperationInput {
+    let mut input = f.owner();
+    input.dirty_scope = Some("selected-library-snapshot".into());
+    input.state = state.into();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    input
+}
+
+/// The scope guard accepts a fence and keeps the row's scope. On a Library-scoped open row each of
+/// the five fence states records whether its producer names `drive+tape` (as every poll and
+/// mechanical fence does) or `none`, and the row keeps the Library scope: the broader one, so
+/// nothing narrows. Refusing the record would leave the fence unrecorded.
+#[test]
+fn a_fence_on_a_library_scoped_row_records_and_keeps_the_row_scope() {
+    let f = open();
+    for fence in FENCE_STATES {
+        for named in ["drive+tape", "drive", "none"] {
+            let case = format!("{fence} naming {named}");
+            let input = library_scoped_owner(&f, "becoming_ready");
+            let mut fenced = transition_to(&input, fence);
+            fenced.dirty_scope = Some(named.into());
+            f.runtime
+                .transition_readiness(&fenced)
+                .unwrap_or_else(|error| panic!("{case} is refused: {error}"));
+            let head = f.observations(&input).pop().unwrap();
+            assert_eq!(head.state, state(fence).unwrap(), "{case}");
+            assert_eq!(head.result, lib::ReadinessResult::Pending, "{case}");
+            assert_eq!(head.scope, lib::ReadinessScope::Library, "{case}");
+            assert_eq!(
+                f.projected(&input).dirty_scope.as_deref(),
+                Some("selected-library-snapshot"),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// The guard is unchanged for what is not a fence: a waiting or cancelled observation that names
+/// a narrower scope than a Library-scoped open row is still refused, with no record, whether it
+/// names `drive+tape`, `drive` or `none`. The same request on an Endpoint-scoped row narrows
+/// nothing and is accepted (`none` excepted).
+#[test]
+fn a_non_fence_observation_cannot_narrow_a_library_scoped_row() {
+    let f = open();
+    for next in WAITING_STATES.iter().copied().chain(["cancelled"]) {
+        for named in ["drive+tape", "drive", "none"] {
+            let input = library_scoped_owner(&f, "becoming_ready");
+            let mut observation = transition_to(&input, next);
+            observation.dirty_scope = Some(named.into());
+            // The same state and scope as the owner is an exact retry; only a changed
+            // observation reaches the guard's refusal.
+            observation.phase = Some("wait_ready_tur".into());
+            let before = f.observations(&input).len();
+            refused(
+                f.runtime.transition_readiness(&observation).unwrap_err(),
+                "cannot narrow unresolved scope",
+            );
+            assert_eq!(
+                f.observations(&input).len(),
+                before,
+                "{next} naming {named} appended"
+            );
+        }
+    }
+    // The control: an Endpoint-scoped row accepts `drive+tape` and keeps its scope.
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    let mut observation = transition_to(&input, "becoming_ready");
+    observation.phase = Some("wait_ready_tur".into());
+    f.runtime.transition_readiness(&observation).unwrap();
+    assert_eq!(
+        f.observations(&input).pop().unwrap().scope,
+        lib::ReadinessScope::Endpoint
+    );
 }

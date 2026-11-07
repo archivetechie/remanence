@@ -374,12 +374,15 @@ pub(crate) fn poll_drive_media_readiness(
                     interruption = Some(DriveReadinessError::Shutdown);
                     return Ok(());
                 }
+                // The cancel RPC records this same observation itself, so an accepted cancel is
+                // durable even if this wait exits first; recording it again here is an exact
+                // retry, and appends nothing when the RPC already did.
                 let record = index.media_readiness_operation(operation_id).map_err(|e| format!("operator cancel is not recorded: {e}"))?.ok_or("operator cancel is not recorded: readiness operation missing")?;
-                let mut transition = crate::startup_media_readiness::startup_media_readiness_requires_release_transition(&record, operation_id);
-                transition.phase = Some("cancelled".into());
-                transition.cancel_source = Some("operator".into());
-                transition.last_error_json = Some(session_open_json_detail("cancelled", "operator cancels readiness wait; explicit resume continues it"));
-                transition.quarantine_id = record.quarantine_id;
+                let transition = crate::startup_media_readiness::operator_cancel_readiness_transition(
+                    &record,
+                    operation_id,
+                    None,
+                );
                 index.record_media_readiness_transition(transition).map_err(|e| format!("operator cancel is not recorded: {e}"))?;
                 interruption = Some(DriveReadinessError::CancelRecorded);
                 Ok(())
