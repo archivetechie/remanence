@@ -987,7 +987,7 @@ block_size = 262144
             .append(|a, v| {
                 a.reprovision(
                     lib::Reprovision {
-                        pool_source: None,
+                        pool_source: Some(lib::PoolSource::Operator(lib::Unit)),
                         operation: None,
                         replaced_bot: None,
                         tape: lib::TapeRef {

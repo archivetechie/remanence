@@ -18,7 +18,7 @@ fn paths(root: &Path) -> StatePaths {
 }
 fn provision() -> Reprovision {
     Reprovision {
-        pool_source: None,
+        pool_source: Some(PoolSource::Operator(Unit)),
         operation: None,
         replaced_bot: None,
         tape: TapeRef {

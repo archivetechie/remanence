@@ -6,14 +6,28 @@ use super::*;
 impl LibraryRuntime {
     /// Adopt once, or prove an unchanged identity-only retry. A fresh invocation
     /// UUID may reuse identical physical facts without appending another source.
+    ///
+    /// `rule_pool` marks a pool derived from the configuration's rules: the caller leaves
+    /// `value.pool_source` empty and this method stamps it with the latest configuration's
+    /// reference, read under the dispatch lock (see `configuration_reference` for why that is
+    /// the reference the fold checks).
     pub(crate) fn adopt_identity(
         &self,
-        value: lib::Reprovision,
+        mut value: lib::Reprovision,
+        rule_pool: bool,
         fresh_request_matches: impl FnOnce(&lib::Reprovision) -> bool,
     ) -> Result<bool, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         let conflict =
             |message: &str| RuntimeError::State(StateError::TapeProvisionConflict(message.into()));
+        if rule_pool {
+            let (reference, _) = self
+                .0
+                .authority
+                .configuration_reference()
+                .ok_or_else(|| conflict("rule pool requires an accepted configuration"))?;
+            value.pool_source = Some(lib::PoolSource::Rule(reference));
+        }
         let adoption = value
             .adoption
             .as_ref()
@@ -97,7 +111,19 @@ impl LibraryRuntime {
                 ));
             };
             let same_operation = prior_adoption.operation == adoption.operation;
-            if same_operation && original != value
+            // A rule reference names the configuration current when each append was made, not a
+            // fact of the adoption: a retry after a configuration change keeps its source.
+            let mut expected = value.clone();
+            if matches!(
+                (&original.pool_source, &expected.pool_source),
+                (
+                    Some(lib::PoolSource::Rule(_)),
+                    Some(lib::PoolSource::Rule(_))
+                )
+            ) {
+                expected.pool_source = original.pool_source.clone();
+            }
+            if same_operation && original != expected
                 || !same_operation && !fresh_request_matches(&original)
             {
                 return Err(conflict("Bootstrap adoption changed immutable facts"));

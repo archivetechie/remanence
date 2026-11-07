@@ -149,7 +149,9 @@ rejected/replaced-bot-adopt	*	*	Present	FinalizationPrepared	echo
 rejected/replaced-bot-predecessor	*	*	Present	FinalizationPrepared	echo
 rejected/replaced-bot-short	*	*	Present	FinalizationPrepared	echo
 rejected/reprovision-operation-short	*	*	Present	FinalizationPrepared	echo
+rejected/reprovision-pool-without-source	*	*	Present	FinalizationPrepared	echo
 rejected/reprovision-source-two	*	*	Present	FinalizationPrepared	echo
+rejected/reprovision-source-without-pool	*	*	Present	FinalizationPrepared	echo
 rejected/reprovision-stale-rule	*	*	Present	FinalizationPrepared	echo
 rejected/reprovision-wrong-rule	*	*	Present	FinalizationPrepared	echo
 rejected/reserved-container-quarantine	*	*	Present	FinalizationPrepared	echo

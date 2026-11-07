@@ -244,7 +244,19 @@ mod tests {
             assert_eq!(record.mode, lib::ProvisionMode::Initialize);
             assert_eq!(record.predecessor, None);
             assert_eq!(record.replaced_bot, Some(unknown));
-            assert_eq!(record.pool_source, None);
+            // The pool is derived from the rules, so its source is the latest configuration.
+            let configuration = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.tag() == lib::Tag::ConfigurationAccepted)
+                .map(|(i, r)| r.reference(i as u64 + 1))
+                .next_back()
+                .unwrap();
+            assert!(record.pool.is_some());
+            assert_eq!(
+                record.pool_source,
+                Some(lib::PoolSource::Rule(configuration))
+            );
             assert_eq!(record.operation, None);
             assert!(records.iter().all(|r| r.tag() != lib::Tag::Retire));
             assert!(state.library.tape_state(unknown).is_none());

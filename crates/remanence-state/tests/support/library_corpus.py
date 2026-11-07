@@ -108,6 +108,12 @@ def detail(entries):
             raise ValueError("invalid detail null")
 
 
+POOL_SOURCE_VIOLATIONS = {
+    "rejected/reprovision-pool-without-source",
+    "rejected/reprovision-source-without-pool",
+}
+
+
 def main(root):
     seen = set()
     count = 0
@@ -144,6 +150,11 @@ def main(root):
             if tag != "Reprovision":
                 raise ValueError("Reprovision tag mismatch")
             keys(body, 13)
+            # A pool names the decision that set it, and only a pool does. The final frame of
+            # each case in POOL_SOURCE_VIOLATIONS is the record the fold refuses for breaking it.
+            coupled = (body[7] is not None) == (body[10] is not None)
+            if coupled == (case in POOL_SOURCE_VIOLATIONS and int(sequence) == 3):
+                raise ValueError("pool source presence must match pool")
             if body[10] is not None:
                 source = body[10]
                 if not (type(source) is list and len(source) == 2 and type(source[0]) is int and source[0] in (0, 1)):

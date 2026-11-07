@@ -45,13 +45,13 @@ Authoritative prefix end: 980 bytes; tail Complete.
 
 Tail: `Some(Complete)`. Authoritative sequence 139; applied 139; pending 0; tapes 9; fences 0; duplicates 0.
 
-`00000000000000000001-2026-11-03.remlib`: 35509 bytes, SHA-256 `9f6465f7d77c078c9502af597bb6372f85e47cccc5b168ef518416937ae9ea04`.
+`00000000000000000001-2026-11-03.remlib`: 35515 bytes, SHA-256 `914955528fd5b2d823a9dd4e2ad481a9ca0998544dbbc1b32a9a27bc139b9d22`.
 
 Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
 
 Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
 
-Authoritative prefix end: 35509 bytes; tail Complete.
+Authoritative prefix end: 35515 bytes; tail Complete.
 
 | Sequence | Tag | Segment | Offset | End | Record hash |
 |---:|---|---|---:|---:|---|
@@ -177,23 +177,23 @@ Authoritative prefix end: 35509 bytes; tail Complete.
 | 120 | Diagnostic | 00000000000000000001-2026-11-03.remlib | 30697 | 30872 | `f36a624c4f18e3590746e5615856d7be4f9bcffe87c1c2aa499a482665471d51` |
 | 121 | Diagnostic | 00000000000000000001-2026-11-03.remlib | 30872 | 31047 | `c2c42457b440bc07dd06b7d1a05eb25d598219cc523d82ba40f9b0ef66eb1e16` |
 | 122 | Diagnostic | 00000000000000000001-2026-11-03.remlib | 31047 | 31237 | `6b65fb6f944219f9f83f0d417cb63bbd2506bddc4998c3c46df8a30eb316e794` |
-| 123 | Reprovision | 00000000000000000001-2026-11-03.remlib | 31237 | 31528 | `302beb09690c934b1048e6895ae9c353a5ccc06d8c3d563140824196f5f018b4` |
-| 124 | Reprovision | 00000000000000000001-2026-11-03.remlib | 31528 | 31921 | `1659de0dfc5f971cb3f9fc723a48302e5c1fd1043bb42f90dd2e58aed402e697` |
-| 125 | DriveObserved | 00000000000000000001-2026-11-03.remlib | 31921 | 32133 | `a51043db35ade859757b5f298452a3edffd40bf94a0eb4b75e2a3d3770f73f98` |
-| 126 | DriveDecision | 00000000000000000001-2026-11-03.remlib | 32133 | 32346 | `7c9451ba9917eb79805faf40754b95c50d5acdb021afa3f58022e0270fad476f` |
-| 127 | DriveHealthObserved | 00000000000000000001-2026-11-03.remlib | 32346 | 32586 | `e99bb649c9180da11b1a8527efb973d7973bbb42d332c655088e1345458f4076` |
-| 128 | InventoryReconciled | 00000000000000000001-2026-11-03.remlib | 32586 | 32783 | `d77f0caf76a72e77a4fb24b9f0668ea2fb3b7c36f64a1bee55b2a63949642603` |
-| 129 | CleaningRecorded | 00000000000000000001-2026-11-03.remlib | 32783 | 32993 | `774d699ea7e78aafea3aef6da62873dd8ff15b5cc448d1a372b37f337fc770eb` |
-| 130 | CleaningRecorded | 00000000000000000001-2026-11-03.remlib | 32993 | 33226 | `f5c336b79be5e8bc0aeb411cd67699ab5c482748dbdbdec2860eb217b4ba6af3` |
-| 131 | AlarmChanged | 00000000000000000001-2026-11-03.remlib | 33226 | 33453 | `26d05ee19d4b79524ad655a5fa8035fc02bdd8f3a7c21f157ae4f62ecef908dd` |
-| 132 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 33453 | 33709 | `c64492531e245a888c3dd43f982f7977c656239b68dd428809db8fd0685381b4` |
-| 133 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 33709 | 33952 | `4225dba446e37cc3a0fb2e5fbb0a2678a94ba5e65931753df0e270b0d68bba17` |
-| 134 | SessionObserved | 00000000000000000001-2026-11-03.remlib | 33952 | 34180 | `227844a83cea84693fe56b975e2fe2852c83c9fc790b0aada5804cd54087bfc0` |
-| 135 | SessionObserved | 00000000000000000001-2026-11-03.remlib | 34180 | 34429 | `b9e76be855ecc861af27f71561e9809f07a781f911db93286a6a85d515c699e2` |
-| 136 | Retire | 00000000000000000001-2026-11-03.remlib | 34429 | 34627 | `b6986a787c6554ff921728b3f0f9375a77229c8a1d05c686bdda1b212184b840` |
-| 137 | Retire | 00000000000000000001-2026-11-03.remlib | 34627 | 34855 | `65a21e6d7e11ce0c91d90eedde4f31556f2ea83ce81d30e755d465852c55ca96` |
-| 138 | Reprovision | 00000000000000000001-2026-11-03.remlib | 34855 | 35118 | `e149902d15def3b1f04761eb18c92b10afb1bf1106766c971917f3260aee8570` |
-| 139 | Reprovision | 00000000000000000001-2026-11-03.remlib | 35118 | 35509 | `d398a988653eb6359b9d8f27c5121f473afa2cf88f98ce57bc3b5e2326103626` |
+| 123 | Reprovision | 00000000000000000001-2026-11-03.remlib | 31237 | 31530 | `25acbe8ef71273d52b9323a4c823f1eaa3bea7f496f1bffa83fe417ecfcf26fd` |
+| 124 | Reprovision | 00000000000000000001-2026-11-03.remlib | 31530 | 31925 | `5facd0416fad2357611ce89b7372f29f53d8deb934c7350e5e5ca61f03c2f08b` |
+| 125 | DriveObserved | 00000000000000000001-2026-11-03.remlib | 31925 | 32137 | `7fcfe67dc90656dfdebce8a3b3b3710230c4476042ac611313cf27b5a04776ea` |
+| 126 | DriveDecision | 00000000000000000001-2026-11-03.remlib | 32137 | 32350 | `afee4f53981aaf524b94cb7e377d3f3d741e8c4323129f8f344759be9dc76055` |
+| 127 | DriveHealthObserved | 00000000000000000001-2026-11-03.remlib | 32350 | 32590 | `056e17dbe18456ebbbab013e020596b42515b73fbd75ce8bf66543dbf69c51b6` |
+| 128 | InventoryReconciled | 00000000000000000001-2026-11-03.remlib | 32590 | 32787 | `1d05bab89fc7204f404571a7a97ace48a9e32195efe29ddaa55c9a74b5604af4` |
+| 129 | CleaningRecorded | 00000000000000000001-2026-11-03.remlib | 32787 | 32997 | `d8a1a028038a57c997a1a8076b32f33051bfd4b816d330c92a328bd7692561bc` |
+| 130 | CleaningRecorded | 00000000000000000001-2026-11-03.remlib | 32997 | 33230 | `bebecc5f4836e3150d4185efed9e949b8b4c856da078d45f3b443a28a3a8f8ba` |
+| 131 | AlarmChanged | 00000000000000000001-2026-11-03.remlib | 33230 | 33457 | `d1f2028173b87e389b7f6c6dbd63ec881c054632bd9f7513ace6eb3b4119bfa5` |
+| 132 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 33457 | 33713 | `eb6e597378b583a40f98ab54a8522aa7fb0eb2d4b9cd5512c53654f7443f0b46` |
+| 133 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 33713 | 33956 | `957d26d7be94c20bc3c81b8d92f70251c79103b8d96a10d7e1918e4ab869149a` |
+| 134 | SessionObserved | 00000000000000000001-2026-11-03.remlib | 33956 | 34184 | `4627ed95cec49e851e23b3473b7b36076b4474c635a88b38345d6baa4b167a77` |
+| 135 | SessionObserved | 00000000000000000001-2026-11-03.remlib | 34184 | 34433 | `684f9bf08f7f1d5d374443ba5f022c531357ff518a5460e22b94a971333b3fd5` |
+| 136 | Retire | 00000000000000000001-2026-11-03.remlib | 34433 | 34631 | `520a9b5895356e4d307a23914ad1cca0abbd14a4236f3dbd0b5fd21dd35100a9` |
+| 137 | Retire | 00000000000000000001-2026-11-03.remlib | 34631 | 34859 | `c753f32697f9c4061e3e2d77cb4e67975dbd0be8b520f1ca9c88d26f675ebe4e` |
+| 138 | Reprovision | 00000000000000000001-2026-11-03.remlib | 34859 | 35122 | `abcb498f02b9b0e955efaf96a90cf2d29c9fb4ca849726f1759fb84672d39432` |
+| 139 | Reprovision | 00000000000000000001-2026-11-03.remlib | 35122 | 35515 | `93e65e63616e7014437ac6017a9c803c2332ce6497b5c5fa3109d36d8913a0f6` |
 ## assign-pool-held-by-current-label
 
 Tail: `Some(Complete)`. Authoritative sequence 6; applied 2; pending 4; tapes 2; fences 0; duplicates 0.
@@ -6532,7 +6532,7 @@ Authoritative prefix end: 324 bytes; tail Complete.
 
 Tail: `00000000000000000001-2026-11-03.remlib@566:Some(3):InvalidSchema`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
 
-`00000000000000000001-2026-11-03.remlib`: 930 bytes, SHA-256 `fc4d611f6160619354036a7ab9d498c8057eaea863bd0fe7b56ccff8403828da`.
+`00000000000000000001-2026-11-03.remlib`: 932 bytes, SHA-256 `8de86a8d6880bc374a163a1c28ec99d5f90101289eb9cc16742e99337ec7ec5e`.
 
 Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
 
@@ -6544,7 +6544,7 @@ Authoritative prefix end: 566 bytes; tail Complete.
 |---:|---|---|---:|---:|---|
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
-| 3 | Reprovision | 00000000000000000001-2026-11-03.remlib | 566 | 930 | `d73b6090321a6a83c377b996565d662801c89f0f8f059b95d39f03af88734a8c` |
+| 3 | Reprovision | 00000000000000000001-2026-11-03.remlib | 566 | 932 | `02df50e48c1ee3259ec66e93a4f7d6051c5b51aa03288078dfd61993d61d9ce8` |
 ## rejected/replaced-bot-predecessor
 
 Tail: `00000000000000000001-2026-11-03.remlib@566:Some(3):InvalidSchema`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
@@ -6592,6 +6592,23 @@ Authoritative prefix end: 324 bytes; tail Complete.
 | Sequence | Tag | Segment | Offset | End | Record hash |
 |---:|---|---|---:|---:|---|
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 324 | `6454efbb71f12d98b931398275d958c5e93c724deac5e890e9a97b0af504dec4` |
+## rejected/reprovision-pool-without-source
+
+Tail: `00000000000000000001-2026-11-03.remlib@566:Some(3):InvalidSchema`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 804 bytes, SHA-256 `c7b0144004478f57bdfaec4f859f6aac7e038dd56a47470b07520726485632a1`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 566 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | Reprovision | 00000000000000000001-2026-11-03.remlib | 566 | 804 | `4c9dba5d72f2d591ed79fddf93c88256c53f547ee1252ba2076d2391842a7b0a` |
 ## rejected/reprovision-source-two
 
 Tail: `00000000000000000001-2026-11-03.remlib@324:Some(2):NoncanonicalCbor`. Authoritative sequence 1; applied 1; pending 0; tapes 1; fences 0; duplicates 0.
@@ -6607,11 +6624,28 @@ Authoritative prefix end: 324 bytes; tail Complete.
 | Sequence | Tag | Segment | Offset | End | Record hash |
 |---:|---|---|---:|---:|---|
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 324 | `6454efbb71f12d98b931398275d958c5e93c724deac5e890e9a97b0af504dec4` |
+## rejected/reprovision-source-without-pool
+
+Tail: `00000000000000000001-2026-11-03.remlib@566:Some(3):InvalidSchema`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 800 bytes, SHA-256 `57f9fa55f2516e9f7464db9881e75eb614580e9f222457a5d0aacfdd52314d2b`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 566 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | Reprovision | 00000000000000000001-2026-11-03.remlib | 566 | 800 | `5565c756e1c7703a27f055a09aa8100795cd5ec66e36c213fcb6ce4b42dc43b5` |
 ## rejected/reprovision-stale-rule
 
 Tail: `00000000000000000001-2026-11-03.remlib@992:Some(5):StaleConfiguration`. Authoritative sequence 4; applied 4; pending 0; tapes 2; fences 0; duplicates 0.
 
-`00000000000000000001-2026-11-03.remlib`: 1246 bytes, SHA-256 `3894657a895ad5f3411f4a9ec1abb47c157f768b6a2a5187ace1075871a91d52`.
+`00000000000000000001-2026-11-03.remlib`: 1252 bytes, SHA-256 `672f8103d3251f2abb824242a639673a2467c769fe64a443e7598aba681cb954`.
 
 Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
 
@@ -6625,12 +6659,12 @@ Authoritative prefix end: 992 bytes; tail Complete.
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
 | 3 | ConfigurationAccepted | 00000000000000000001-2026-11-03.remlib | 566 | 779 | `c6bf7af420ed2979b77aceb24931d0ddec5bad86a93bc9116d87d624a29365f9` |
 | 4 | ConfigurationAccepted | 00000000000000000001-2026-11-03.remlib | 779 | 992 | `4b81694a9f5dfa672689417f77501d481e197537097449b433a2dbc926b6076e` |
-| 5 | Reprovision | 00000000000000000001-2026-11-03.remlib | 992 | 1246 | `939cb77fce6c7d00f9341374752adc7d27780552a797a6f674c66ba314d0e095` |
+| 5 | Reprovision | 00000000000000000001-2026-11-03.remlib | 992 | 1252 | `55675074bd14b41141b4e7b9ae1953815a7eac7eb713ddb043da5eb36612a76d` |
 ## rejected/reprovision-wrong-rule
 
 Tail: `00000000000000000001-2026-11-03.remlib@749:Some(4):WrongCounterpart`. Authoritative sequence 3; applied 3; pending 0; tapes 2; fences 0; duplicates 0.
 
-`00000000000000000001-2026-11-03.remlib`: 1003 bytes, SHA-256 `3db7a05753ee9bb6aca4ebcd080ce6458cd5244dffc1db5e6d1a9dbc328bf4d5`.
+`00000000000000000001-2026-11-03.remlib`: 1009 bytes, SHA-256 `23786a878b97aa58b84b97d26a803d30ed9edd00fab96c1b0d12c7beba5facc4`.
 
 Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
 
@@ -6643,7 +6677,7 @@ Authoritative prefix end: 749 bytes; tail Complete.
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
 | 3 | Diagnostic | 00000000000000000001-2026-11-03.remlib | 566 | 749 | `73f8cfb1b4032d84dd0709fe08f2a4288a1db3fa9966f0f90763068d20c3ddda` |
-| 4 | Reprovision | 00000000000000000001-2026-11-03.remlib | 749 | 1003 | `ccc494c5e7db8496129e1528b605f7bbc7b5dd3cf6cfcb53fb98d4f50e9b64ab` |
+| 4 | Reprovision | 00000000000000000001-2026-11-03.remlib | 749 | 1009 | `8406978d2b49cc26e9717434859b7080bb2b6b3003dcea9f405ec650b97fb512` |
 ## rejected/reserved-container-quarantine
 
 Tail: `00000000000000000001-2026-11-03.remlib@566:Some(3):ReservedNotYetUsed`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
@@ -8215,7 +8249,15 @@ Default: Present(FinalizationPrepared, reference digest).
 
 Default: Present(FinalizationPrepared, reference digest).
 
+### rejected/reprovision-pool-without-source
+
+Default: Present(FinalizationPrepared, reference digest).
+
 ### rejected/reprovision-source-two
+
+Default: Present(FinalizationPrepared, reference digest).
+
+### rejected/reprovision-source-without-pool
 
 Default: Present(FinalizationPrepared, reference digest).
 

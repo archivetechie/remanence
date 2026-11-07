@@ -279,6 +279,9 @@ pub struct TapeState {
     pub label: Option<LabelText>,
     /// Current pool.
     pub pool: Option<Text>,
+    /// Who decided the current pool, from the latest `Reprovision` or `AssignPool`; `None` until a
+    /// pool decision is recorded.
+    pub pool_source: Option<PoolSource>,
     /// Current calibration generation.
     pub calibration_generation: u64,
     /// Opaque map digest only; projectors read descriptors from the record.
@@ -1017,6 +1020,11 @@ impl LibraryFold {
         if matches!(b, Body::Reprovision(v) if v.replaced_bot.is_some()
             && (v.mode != ProvisionMode::Initialize || v.predecessor.is_some()))
         {
+            return Err(FoldError::InvalidSchema);
+        }
+        // A pool names the decision that set it, and only a pool does. `operation` has no
+        // presence rule yet.
+        if matches!(b, Body::Reprovision(v) if v.pool.is_some() != v.pool_source.is_some()) {
             return Err(FoldError::InvalidSchema);
         }
         if let Body::ReadinessObserved(v) = b {
@@ -1904,6 +1912,7 @@ impl LibraryFold {
                         ever_measured: v.medium.source == GenerationSource::Measured,
                         label: v.label.clone(),
                         pool: v.pool.clone(),
+                        pool_source: v.pool_source.clone(),
                         calibration_generation: 0,
                         wrap_digest: None,
                     },
@@ -1913,6 +1922,11 @@ impl LibraryFold {
                 let t = self.tapes.get_mut(&v.tape.uuid).unwrap();
                 t.assignment_generation = v.change.next;
                 t.pool = v.pool.clone();
+                t.pool_source = match v.source {
+                    AssignmentSource::Operator => Some(PoolSource::Operator(Unit)),
+                    // Validation refuses a Rule assignment without its configuration reference.
+                    AssignmentSource::Rule => v.configuration.map(PoolSource::Rule),
+                };
             }
             Label(v) => {
                 if let Some(l) = &self.tapes[&v.tape.uuid].label {
@@ -1937,6 +1951,7 @@ impl LibraryFold {
                 let t = self.tapes.get_mut(&v.tape.uuid).unwrap();
                 t.retired = true;
                 t.pool = None;
+                t.pool_source = None;
                 t.label = None;
             }
             MediumSpecSet(v) => {
@@ -2512,9 +2527,16 @@ impl LibraryFold {
     /// Last accepted configuration, used for exact reset retry without another
     /// source append. It is read from the fold, never from SQL.
     pub fn configuration(&self) -> Option<&ConfigurationAccepted> {
+        self.configuration_head().map(|(_, value)| value)
+    }
+    /// The latest retained configuration with the reference a Rule pool source must carry. This is
+    /// the same record the fold compares a Rule reference against.
+    pub fn configuration_head(&self) -> Option<(DecisionRef, &ConfigurationAccepted)> {
         let held = self.last(Tag::ConfigurationAccepted, Scope::Config)?;
         match &held.record.body {
-            Body::ConfigurationAccepted(value) => Some(value),
+            Body::ConfigurationAccepted(value) => {
+                Some((held.record.reference(held.sequence), value))
+            }
             _ => None,
         }
     }

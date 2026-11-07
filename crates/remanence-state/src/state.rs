@@ -653,9 +653,24 @@ impl StateHandle {
         };
         self.library
             .append(|authority, view| {
+                // A derived pool names the configuration that derived it. The dispatch lock is
+                // held, and configuration is appended only at open and reset under the exclusive
+                // state lock, so this is the latest reference. A stale one would be refused as
+                // `StaleConfiguration`, never recorded wrong.
+                let pool_source = match &pool {
+                    Some(_) => {
+                        let (reference, _) = authority.configuration_reference().ok_or(
+                            lib::AuthorityError::Store(lib::store::StoreError::Fold(
+                                lib::FoldError::WrongCounterpart,
+                            )),
+                        )?;
+                        Some(lib::PoolSource::Rule(reference))
+                    }
+                    None => None,
+                };
                 authority.reprovision(
                     lib::Reprovision {
-                        pool_source: None,
+                        pool_source,
                         operation: None,
                         replaced_bot,
                         tape: lib::TapeRef {
@@ -749,9 +764,15 @@ impl StateHandle {
         &mut self,
         tape_uuid: [u8; 16],
     ) -> Result<(), StateError> {
+        use crate::library_log as lib;
         let tape = self.library.tape_state(tape_uuid).ok_or_else(|| {
             StateError::TapePoolAssignmentConflict("tape has no Reprovision authority".into())
         })?;
+        // A rule never overrides an operator's decision, so the rule check does not apply to a
+        // pool the operator set.
+        if matches!(tape.pool_source, Some(lib::PoolSource::Operator(_))) {
+            return Ok(());
+        }
         let expected = tape.label.as_ref().and_then(|label| {
             derive_tape_pool_from_voltag(label.as_str(), &self.config.tape_pool_rules)
         });
@@ -995,7 +1016,12 @@ impl StateHandle {
             .library
             .adopt_identity(
                 lib::Reprovision {
-                    pool_source: None,
+                    // An explicit pool is the operator's; a derived pool is stamped with the
+                    // configuration reference inside `adopt_identity`, under its dispatch lock.
+                    pool_source: input
+                        .pool_id
+                        .as_ref()
+                        .map(|_| lib::PoolSource::Operator(lib::Unit)),
                     operation: None,
                     replaced_bot: None,
                     tape: lib::TapeRef {
@@ -1052,6 +1078,7 @@ impl StateHandle {
                         configured_drive_compression: evidence.configured_drive_compression,
                     }),
                 },
+                input.pool_id.is_none(),
                 |original| {
                     let Some(prior) = &original.adoption else {
                         return false;
@@ -2425,6 +2452,234 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
             )
             .is_err());
+    }
+
+    /// The configuration rules that derive pool `rule_pool` for the `ACM` prefix, with a second
+    /// pool an operator may name instead.
+    fn two_pool_config(root: &Path, rule_pool: &str) -> String {
+        config_text(root).replace(
+            "prefix = \"ACM\"\npool_id = \"camera.copy-a\"",
+            &format!("prefix = \"ACM\"\npool_id = \"{rule_pool}\""),
+        ) + "\n[[tape_pools]]\nid = \"camera.copy-b\"\n"
+    }
+
+    /// Every `Reprovision` the library log holds, in order, with the log's own configuration
+    /// references: each `ConfigurationAccepted` as the `DecisionRef` a later record names it by.
+    fn recorded_provisions(
+        handle: &StateHandle,
+    ) -> (
+        Vec<crate::library_log::Reprovision>,
+        Vec<crate::library_log::DecisionRef>,
+    ) {
+        let records = handle.library_runtime().test_source_records();
+        let provisions = records
+            .iter()
+            .filter_map(|r| r.reprovision().cloned())
+            .collect();
+        let configurations = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.tag() == crate::library_log::Tag::ConfigurationAccepted)
+            .map(|(i, r)| r.reference(i as u64 + 1))
+            .collect();
+        (provisions, configurations)
+    }
+
+    /// D1, the provisioning producer: a pool the rules derive is recorded as `Rule`, naming the
+    /// latest `ConfigurationAccepted`; no pool records no source.
+    #[test]
+    fn provisioning_records_the_configuration_that_derived_its_pool() {
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        for (uuid, voltag) in [([0x61; 16], "ACM001L9"), ([0x62; 16], "OTHER01L9")] {
+            handle
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid: uuid,
+                    voltag: voltag.into(),
+                    block_size: 1024 * 1024,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .unwrap();
+        }
+        let (provisions, configurations) = recorded_provisions(&handle);
+        assert_eq!(configurations.len(), 1);
+        assert_eq!(provisions.len(), 2);
+        assert_eq!(
+            provisions[0].pool.as_ref().map(|p| p.as_str()),
+            Some("camera.copy-a")
+        );
+        assert_eq!(
+            provisions[0].pool_source,
+            Some(lib::PoolSource::Rule(configurations[0]))
+        );
+        assert_eq!(provisions[1].pool, None);
+        assert_eq!(provisions[1].pool_source, None);
+    }
+
+    /// D1, the adoption producer: an explicit pool is the operator's; a derived pool names the
+    /// configuration. A retry under the same operation after a configuration change is still the
+    /// same adoption, and keeps the reference it was recorded with.
+    #[test]
+    fn adoption_records_the_source_of_its_pool() {
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, two_pool_config(temp.path(), "camera.copy-a")).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let tail = BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod;
+        let derived = adoption_input(Uuid::new_v4());
+        let mut explicit = adoption_input(Uuid::new_v4());
+        explicit.tape_uuid[0] = 0x20;
+        explicit.voltag = Some("ACM902L9".into());
+        explicit.pool_id = Some("camera.copy-b".into());
+        for input in [&derived, &explicit] {
+            handle
+                .adopt_bootstrap_identity(input.clone(), adoption_evidence(tail))
+                .unwrap();
+        }
+        let (provisions, configurations) = recorded_provisions(&handle);
+        assert_eq!(provisions.len(), 2);
+        let by_tape = |uuid: [u8; 16]| provisions.iter().find(|p| p.tape.uuid == uuid).unwrap();
+        let rule = by_tape(derived.tape_uuid);
+        assert_eq!(
+            rule.pool.as_ref().map(|p| p.as_str()),
+            Some("camera.copy-a")
+        );
+        assert_eq!(
+            rule.pool_source,
+            Some(lib::PoolSource::Rule(configurations[0]))
+        );
+        let operator = by_tape(explicit.tape_uuid);
+        assert_eq!(
+            operator.pool.as_ref().map(|p| p.as_str()),
+            Some("camera.copy-b")
+        );
+        assert_eq!(
+            operator.pool_source,
+            Some(lib::PoolSource::Operator(lib::Unit))
+        );
+        // A changed configuration is a new latest reference; the same operation still retries.
+        drop(handle);
+        let changed = two_pool_config(temp.path(), "camera.copy-a")
+            + "\n[[tape_pools]]\nid = \"camera.copy-c\"\n";
+        fs::write(&config_path, changed).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert!(
+            !handle
+                .adopt_bootstrap_identity(derived.clone(), adoption_evidence(tail))
+                .unwrap()
+                .newly_adopted
+        );
+        let (provisions_after, configurations_after) = recorded_provisions(&handle);
+        assert_eq!(configurations_after.len(), 2);
+        assert_eq!(provisions_after, provisions);
+    }
+
+    /// `two_pool_config` with a third pool, which a changed rule can derive instead.
+    fn three_pool_config(root: &Path, rule_pool: &str) -> String {
+        two_pool_config(root, rule_pool) + "\n[[tape_pools]]\nid = \"camera.copy-c\"\n"
+    }
+
+    /// Two tapes under a rule deriving camera.copy-a for the `ACM` prefix: one the operator
+    /// adopted into camera.copy-b, which the rule would not derive for its label, and one the rule
+    /// placed in camera.copy-a. Returns `(operator tape, rule tape)`.
+    fn operator_and_rule_tapes(root: &Path, config_path: &Path) -> ([u8; 16], [u8; 16]) {
+        fs::write(config_path, two_pool_config(root, "camera.copy-a")).unwrap();
+        let mut handle = StateHandle::open_from_config_file(config_path).unwrap();
+        let mut operator = adoption_input(Uuid::new_v4());
+        operator.pool_id = Some("camera.copy-b".into());
+        handle
+            .adopt_bootstrap_identity(
+                operator.clone(),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .unwrap();
+        let rule_tape = [0x63; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: rule_tape,
+                voltag: "ACM002L9".into(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        (operator.tape_uuid, rule_tape)
+    }
+
+    fn catalog_pool(handle: &StateHandle, uuid: [u8; 16]) -> Option<String> {
+        handle
+            .catalog()
+            .get_tape(&uuid)
+            .unwrap()
+            .unwrap()
+            .pool_id
+            .clone()
+    }
+
+    /// D3, the ruling's own test: a rule never overrides an operator. After an empty-SQL rebuild,
+    /// an operator pool that differs from the rule passes the rule pass unchanged, and a rule
+    /// pool keeps its check.
+    #[test]
+    fn the_rule_pass_never_overrides_an_operator_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let (operator, rule_tape) = operator_and_rule_tapes(temp.path(), &config_path);
+        // Empty-SQL rebuild: only the typed authority survives.
+        fs::remove_dir_all(temp.path().join("index")).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert_eq!(
+            catalog_pool(&handle, operator).as_deref(),
+            Some("camera.copy-b")
+        );
+        assert_eq!(
+            catalog_pool(&handle, rule_tape).as_deref(),
+            Some("camera.copy-a")
+        );
+        handle.record_rule_tape_pool_assignment(operator).unwrap();
+        handle.record_rule_tape_pool_assignment(rule_tape).unwrap();
+        assert_eq!(
+            catalog_pool(&handle, operator).as_deref(),
+            Some("camera.copy-b")
+        );
+        assert_eq!(
+            catalog_pool(&handle, rule_tape).as_deref(),
+            Some("camera.copy-a")
+        );
+    }
+
+    /// The rules now derive a third pool that neither tape holds. The operator's tape is still not
+    /// the rule's to judge, and the rule's tape no longer matches what its rule derives. The
+    /// state is rebuilt from the typed authority under the changed rule.
+    #[test]
+    fn a_changed_rule_fails_a_rule_pool_and_leaves_an_operator_pool_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let (operator, rule_tape) = operator_and_rule_tapes(temp.path(), &config_path);
+        fs::remove_dir_all(temp.path().join("index")).unwrap();
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        handle.record_rule_tape_pool_assignment(operator).unwrap();
+        assert!(matches!(
+            handle.record_rule_tape_pool_assignment(rule_tape),
+            Err(StateError::TapePoolAssignmentConflict(_))
+        ));
+        assert_eq!(
+            catalog_pool(&handle, operator).as_deref(),
+            Some("camera.copy-b")
+        );
+        assert_eq!(
+            catalog_pool(&handle, rule_tape).as_deref(),
+            Some("camera.copy-a")
+        );
     }
 
     /// Code 7, at both sites, through the methods the operator commands call. A tape whose label

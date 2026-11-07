@@ -618,6 +618,20 @@ impl LibraryAuthority {
             .configuration()
             .cloned()
     }
+    /// The latest retained configuration and the reference a `Rule` pool source must carry.
+    /// Configuration is appended only when a state handle opens and when the catalog is reset,
+    /// both through the runtime's dispatch lock and under the exclusive state lock. A producer
+    /// that holds the dispatch lock therefore reads the reference its append is checked against.
+    /// A stale one would be refused by the fold as `StaleConfiguration`, never recorded wrong.
+    pub fn configuration_reference(&self) -> Option<(DecisionRef, ConfigurationAccepted)> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .configuration_head()
+            .map(|(reference, value)| (reference, value.clone()))
+    }
     /// Bounded active readiness lookup for the polling producer. Terminal
     /// chains require a separate authenticated historical retry lookup.
     pub(crate) fn active_readiness(

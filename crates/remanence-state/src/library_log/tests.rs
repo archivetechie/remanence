@@ -1565,6 +1565,56 @@ fn historical_references_use_memory_and_store_views() {
         assert!(r.refusal.is_none(), "{name}: {:?}", r.refusal);
     }
 }
+/// The fold keeps who decided each tape's pool: `Reprovision` sets it, every `AssignPool` replaces
+/// it from its own `source`, and `Retire` releases it with the pool. It also names the reference a
+/// `Rule` source must carry, which is the latest retained configuration.
+#[test]
+fn tape_pool_source_follows_the_latest_pool_decision() {
+    let mut f = initialized();
+    assert_eq!(f.tapes[&[1; 16]].pool_source, None);
+    assert!(f.configuration_head().is_none());
+    feed(&mut f, configuration(1), &Present).unwrap();
+    assert_eq!(f.configuration_head().map(|(r, _)| r), Some(decision(3)));
+    feed(&mut f, pool(1, 1), &Present).unwrap();
+    assert_eq!(
+        f.tapes[&[1; 16]].pool_source,
+        Some(PoolSource::Operator(Unit))
+    );
+    let mut rule = pool(1, 2);
+    if let Body::AssignPool(v) = &mut rule {
+        v.source = AssignmentSource::Rule;
+        v.configuration = Some(decision(3));
+    }
+    feed(&mut f, rule, &Present).unwrap();
+    assert_eq!(
+        f.tapes[&[1; 16]].pool_source,
+        Some(PoolSource::Rule(decision(3)))
+    );
+    // A later operator assignment, even an unassignment, is the operator's decision.
+    let mut unassign = pool(1, 3);
+    if let Body::AssignPool(v) = &mut unassign {
+        v.pool = None;
+    }
+    feed(&mut f, unassign, &Present).unwrap();
+    assert_eq!(f.tapes[&[1; 16]].pool, None);
+    assert_eq!(
+        f.tapes[&[1; 16]].pool_source,
+        Some(PoolSource::Operator(Unit))
+    );
+    feed(
+        &mut f,
+        Body::Retire(Retire {
+            tape: tape(1),
+            reason: RetireReason::OperatorRequested,
+            observed_tape_sequence: None,
+            assignment_generation: 4,
+            detail: None,
+        }),
+        &Present,
+    )
+    .unwrap();
+    assert_eq!(f.tapes[&[1; 16]].pool_source, None);
+}
 /// Rule references distinguish superseded configurations from unrelated records.
 #[test]
 fn rule_configuration_classifies_historical_kind() {

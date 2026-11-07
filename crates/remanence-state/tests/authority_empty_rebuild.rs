@@ -131,7 +131,7 @@ impl Fixture {
             .a()
             .reprovision(
                 Reprovision {
-                    pool_source: None,
+                    pool_source: Some(PoolSource::Operator(Unit)),
                     operation: None,
                     replaced_bot: None,
                     tape: tape(id),
@@ -1706,7 +1706,7 @@ fn authority_adoption_recovery_state_and_request_binding() {
             .a()
             .reprovision(
                 Reprovision {
-                    pool_source: None,
+                    pool_source: Some(PoolSource::Operator(Unit)),
                     operation: None,
                     replaced_bot: None,
                     tape: TapeRef {
