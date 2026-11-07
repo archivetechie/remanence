@@ -407,6 +407,13 @@ pub struct VirtualDriveState {
     pub initializing_command_required: bool,
     /// Opt in to SSC UNLOAD leaving a seated cartridge unthreaded.
     pub unload_leaves_unthreaded: bool,
+    /// Opt in (default 0, off): a cartridge seated in this bay answers NOT READY /
+    /// MEDIUM NOT PRESENT (`02/3A/00`) to TEST UNIT READY and to media commands until this
+    /// many SSC LOADs have arrived, as a drive that did not thread a cartridge after MOVE
+    /// MEDIUM does. Each SSC LOAD takes one off, so `1` answers NO MEDIUM until the first
+    /// LOAD and `2` answers it again after that LOAD. Moving the cartridge out of the bay
+    /// clears it.
+    pub no_medium_until_loads: u32,
     /// Reset unit attention remains pending until an eligible command consumes it.
     pub reset_unit_attention: bool,
     /// Reset destroys position knowledge until LOAD, REWIND, or LOCATE completes.
@@ -582,6 +589,14 @@ impl VirtualWorld {
                 .drive_states
                 .get(&bay)
                 .is_some_and(|state| state.initializing_command_required)
+    }
+
+    fn answers_no_medium_until_load(&self, bay: u16) -> bool {
+        self.drive_bays.get(&bay).is_some_and(Option::is_some)
+            && self
+                .drive_states
+                .get(&bay)
+                .is_some_and(|state| state.no_medium_until_loads > 0)
     }
 
     /// Loaded barcode in `bay`, if any.
@@ -968,6 +983,9 @@ impl ModelTransport {
         if world.awaits_initializing_command(bay) {
             return Err(check_condition(initializing_command_required_sense(), 0));
         }
+        if world.answers_no_medium_until_load(bay) {
+            return Err(check_condition(no_medium_sense(), 0));
+        }
         let barcode = world
             .drive_bays
             .get(&bay)
@@ -1169,6 +1187,9 @@ impl ModelTransport {
         let world = self.world.lock().expect("virtual world lock");
         if world.awaits_initializing_command(bay) {
             return Err(check_condition(initializing_command_required_sense(), 0));
+        }
+        if world.answers_no_medium_until_load(bay) {
+            return Err(check_condition(no_medium_sense(), 0));
         }
         match world.drive_bays.get(&bay) {
             Some(Some(barcode)) if world.tapes.contains_key(barcode) => Ok(()),
@@ -1437,11 +1458,11 @@ impl ModelTransport {
             let Some(barcode) = world.drive_bays[&bay].clone() else {
                 return Err(ScsiError::InvalidInput("load requested with empty bay"));
             };
-            world
-                .drive_states
-                .entry(bay)
-                .or_default()
-                .initializing_command_required = false;
+            {
+                let state = world.drive_states.entry(bay).or_default();
+                state.initializing_command_required = false;
+                state.no_medium_until_loads = state.no_medium_until_loads.saturating_sub(1);
+            }
             let expired = world
                 .tapes
                 .get(&barcode)
@@ -1929,6 +1950,7 @@ fn take_from_element(world: &mut VirtualWorld, element: u16) -> Result<String, S
         world.drive_source_slots.insert(element, None);
         if let Some(state) = world.drive_states.get_mut(&element) {
             state.initializing_command_required = false;
+            state.no_medium_until_loads = 0;
         }
         return Ok(barcode);
     }

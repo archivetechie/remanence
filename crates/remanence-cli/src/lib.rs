@@ -9154,6 +9154,14 @@ trait TapeInitStateOps {
         Ok(())
     }
 
+    /// The state the operation's head records now, or `None` when there is no such operation
+    /// (or no readback, as in a dry run). A signal reads it to see whether a fence is already
+    /// the operation's head.
+    fn media_readiness_head_state(&mut self, operation_id: Uuid) -> Result<Option<String>, String> {
+        let _ = operation_id;
+        Ok(None)
+    }
+
     fn media_readiness_admission_conflicts(
         &mut self,
         library_serial: &str,
@@ -9258,6 +9266,13 @@ impl TapeInitStateOps for remanence_state::StateHandle {
             .record_media_readiness_transition(input)
             .map(|_| ())
             .map_err(|error| format!("record media readiness transition: {error}"))
+    }
+
+    fn media_readiness_head_state(&mut self, operation_id: Uuid) -> Result<Option<String>, String> {
+        self.catalog()
+            .media_readiness_operation(operation_id)
+            .map(|record| record.map(|record| record.state))
+            .map_err(|error| format!("read media readiness operation: {error}"))
     }
 
     fn media_readiness_admission_conflicts(
@@ -9394,6 +9409,12 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
         remanence_state::CatalogIndex::record_media_readiness_transition(self, input)
             .map(|_| ())
             .map_err(|error| format!("record media readiness transition: {error}"))
+    }
+
+    fn media_readiness_head_state(&mut self, operation_id: Uuid) -> Result<Option<String>, String> {
+        remanence_state::CatalogIndex::media_readiness_operation(self, operation_id)
+            .map(|record| record.map(|record| record.state))
+            .map_err(|error| format!("read media readiness operation: {error}"))
     }
 
     fn media_readiness_admission_conflicts(
@@ -10316,22 +10337,29 @@ fn media_readiness_sleep(duration: StdDuration) {
 #[cfg(all(target_os = "linux", test))]
 fn media_readiness_sleep(_duration: StdDuration) {}
 
+/// Record tape init's first TEST UNIT READY. Tape init waits and has sent no LOAD yet, so the
+/// poll is one its conditional LOAD acts on when `conditional_load_on_no_medium` holds and the
+/// drive answers NO MEDIUM.
 #[cfg(target_os = "linux")]
 fn poll_already_observed_media_readiness(
     readiness: MediaReadiness,
     phase: &str,
     operation_id: Uuid,
     state: &mut impl TapeInitStateOps,
+    conditional_load_on_no_medium: bool,
 ) -> Result<MediaReadinessPoll, String> {
+    let conditional_load_pending =
+        readiness_requires_conditional_load(&readiness, conditional_load_on_no_medium);
     let poll = MediaReadinessPoll {
         readiness,
         attempts: 1,
         timed_out: false,
     };
-    state.record_media_readiness_transition(media_readiness_transition_input(
+    state.record_media_readiness_transition(tape_init_poll_transition_input(
         operation_id,
         phase,
         &poll,
+        conditional_load_pending,
     ))?;
     Ok(poll)
 }
@@ -10402,16 +10430,19 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                 || !wait
                 || !(readiness.is_retryable_wait() || can_conditionally_load);
             let elapsed = started.elapsed();
-            let timed_out = !terminal && elapsed >= timeout;
+            // A poll that triggers the conditional LOAD cannot time out, as in the library's wait:
+            // the LOAD is sent next, and the poll after it can still end the wait at the deadline.
+            let timed_out = !terminal && !can_conditionally_load && elapsed >= timeout;
             let poll = MediaReadinessPoll {
                 readiness,
                 attempts,
                 timed_out,
             };
-            state.record_media_readiness_transition(media_readiness_transition_input(
+            state.record_media_readiness_transition(tape_init_poll_transition_input(
                 operation_id,
                 "readiness_poll",
                 &poll,
+                can_conditionally_load,
             ))?;
             poll
         };
@@ -10538,9 +10569,54 @@ fn media_readiness_transition_input(
     phase: &str,
     poll: &MediaReadinessPoll,
 ) -> remanence_state::MediaReadinessTransitionInput {
+    media_readiness_transition_input_in_state(
+        operation_id,
+        phase,
+        poll,
+        media_readiness_durable_state(&poll.readiness, poll.timed_out),
+    )
+}
+
+/// The transition tape init records for one poll. A NO MEDIUM answer that tape init acts on with
+/// its conditional LOAD is a pre-ready condition, not an uncertain outcome: it records
+/// `pre_ready_loading`, a waiting state the next poll may follow, with the poll's completion
+/// evidence. `conditional_load_pending` is the loop's own condition for the LOAD (waiting, not yet
+/// sent, `readiness_requires_conditional_load`). A NO MEDIUM with no LOAD to follow (a loaded tape,
+/// or after the LOAD was sent) stays the fence `terminal_error`, and a poll that timed out stays
+/// `timeout_unknown`.
+#[cfg(target_os = "linux")]
+fn tape_init_poll_transition_input(
+    operation_id: Uuid,
+    phase: &str,
+    poll: &MediaReadinessPoll,
+    conditional_load_pending: bool,
+) -> remanence_state::MediaReadinessTransitionInput {
+    let acted_on_no_medium = conditional_load_pending
+        && !poll.timed_out
+        && matches!(
+            poll.readiness,
+            remanence_library::MediaReadiness {
+                kind: remanence_library::MediaReadinessKind::NoMedium { .. },
+                ..
+            }
+        );
+    let state = if acted_on_no_medium {
+        "pre_ready_loading"
+    } else {
+        media_readiness_durable_state(&poll.readiness, poll.timed_out)
+    };
+    media_readiness_transition_input_in_state(operation_id, phase, poll, state)
+}
+
+fn media_readiness_transition_input_in_state(
+    operation_id: Uuid,
+    phase: &str,
+    poll: &MediaReadinessPoll,
+    state: &str,
+) -> remanence_state::MediaReadinessTransitionInput {
     let (sense_key, asc, ascq, target_status, transport_class, last_error_json, sense_raw) =
         media_readiness_evidence_fields(&poll.readiness);
-    let state = media_readiness_durable_state(&poll.readiness, poll.timed_out).to_string();
+    let state = state.to_string();
     let quarantine_id = media_readiness_state_requires_release(state.as_str())
         .then(|| media_readiness_quarantine_id_for_operation(operation_id));
     remanence_state::MediaReadinessTransitionInput {
@@ -10663,12 +10739,22 @@ fn media_readiness_signal_transition(
     }
 }
 
+/// Record the `aborted_unknown` a signal leaves. When the operation's head is already a fence,
+/// that fence is the durable record of the uncertain outcome and a signal adds nothing to it (only
+/// a release may follow a fence), so nothing is recorded; the caller still returns the signal-abort
+/// message.
 fn record_media_readiness_signal_transition<S: TapeInitStateOps>(
     state: &mut S,
     operation_id: Uuid,
     phase: &str,
     signal: &str,
 ) -> Result<(), String> {
+    if state
+        .media_readiness_head_state(operation_id)?
+        .is_some_and(|head| media_readiness_state_requires_release(head.as_str()))
+    {
+        return Ok(());
+    }
     state.record_media_readiness_transition(media_readiness_signal_transition(
         operation_id,
         phase,
@@ -12528,8 +12614,13 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             || signal_guard.requested_signal_name(),
         )?;
         let initial = drive.probe_media_readiness(family);
-        let initial_poll =
-            poll_already_observed_media_readiness(initial, initial_phase, operation_id, state)?;
+        let initial_poll = poll_already_observed_media_readiness(
+            initial,
+            initial_phase,
+            operation_id,
+            state,
+            candidate.location == TapeInitLocation::Slot,
+        )?;
         let after_initial_phase = format!("after_{initial_phase}");
         record_media_readiness_signal_if_requested(
             state,
@@ -21099,8 +21190,14 @@ mod tests {
                 .expect("owner");
             let readiness = drive.probe_media_readiness(MediaFamily::Lto9OrLater);
             assert!(readiness.is_ready(), "the model drive is ready");
-            poll_already_observed_media_readiness(readiness, phase, operation_id, &mut state)
-                .unwrap_or_else(|e| panic!("a Ready on {phase} is refused: {e}"));
+            poll_already_observed_media_readiness(
+                readiness,
+                phase,
+                operation_id,
+                &mut state,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("a Ready on {phase} is refused: {e}"));
             let row = state
                 .write_handle()
                 .media_readiness_operation(operation_id)
@@ -21110,6 +21207,523 @@ mod tests {
             assert_eq!(row.phase, phase);
             assert_eq!(row.last_cdb_opcode, Some(0), "{phase}");
         }
+    }
+
+    /// Tape init's readiness flow on the typed runtime against a virtual drive that does not thread
+    /// the cartridge after MOVE MEDIUM: it answers NO MEDIUM to TEST UNIT READY until
+    /// `no_medium_until_loads` SSC LOADs have arrived. The drive handle carries the runtime's motion
+    /// authority, as tape init's does.
+    #[cfg(target_os = "linux")]
+    struct VirtualTapeInit {
+        temp: tempfile::TempDir,
+        state: remanence_state::StateHandle,
+        world: std::sync::Arc<std::sync::Mutex<remanence_chaos::model::VirtualWorld>>,
+        _handle: remanence_library::LibraryHandle,
+        drive: DriveHandle,
+        operation_id: Uuid,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn virtual_tape_init(no_medium_until_loads: u32) -> VirtualTapeInit {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, mut state) = runtime_backed_state(temp.path());
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-A",
+            0x0100,
+            "DRV-UA-test",
+            0x0400,
+            1,
+        )));
+        let library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(0x0100, "AOX030L9", Some(0x0400), VirtualTape::default());
+            world
+                .drive_states
+                .entry(0x0100)
+                .or_default()
+                .no_medium_until_loads = no_medium_until_loads;
+            world.library_snapshot()
+        };
+        let factory_world = Arc::clone(&world);
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world
+                    .lock()
+                    .unwrap()
+                    .role_for_path(path)
+                    .expect("model path");
+                Ok(Box::new(ModelTransport::new(
+                    Arc::clone(&factory_world),
+                    role,
+                )))
+            }));
+        });
+        let policy = StaticAllowlist::new(["LIB-A"]);
+        state
+            .observe_library_drives(&library, &config)
+            .expect("observe the library's drives");
+        let operation_id = state
+            .record_media_readiness_operation(lto9_library_owner(Uuid::new_v4()))
+            .expect("owner");
+        let mut handle = open_library_handle(&library, &policy).expect("open the model library");
+        handle.set_motion_authority(Arc::new(
+            state.motion_authority().expect("the typed runtime"),
+        ));
+        handle
+            .reconcile_startup_motion()
+            .expect("startup motion reconciliation");
+        let drive = handle.open_drive(0x0100, &policy).expect("open the drive");
+        VirtualTapeInit {
+            temp,
+            state,
+            world,
+            _handle: handle,
+            drive,
+            operation_id,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl VirtualTapeInit {
+        /// The operation's recorded transitions in order, from its begin: (phase, state, opcode). The
+        /// projection keeps no phase for a transition that the typed runtime recorded.
+        fn history(&self) -> Vec<(Option<String>, String, Option<i64>)> {
+            let conn = rusqlite::Connection::open(self.temp.path().join("index/rem-state.sqlite"))
+                .expect("open the projection");
+            let mut statement = conn
+                .prepare(
+                    "select phase, state, last_cdb_opcode from media_readiness_transitions
+                     where operation_id = ?1 order by transition_id",
+                )
+                .expect("prepare");
+            let rows = statement
+                .query_map([self.operation_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })
+                .expect("query");
+            rows.map(|row| row.expect("row")).collect()
+        }
+
+        /// The states of the motions the runtime recorded, in order: tape init's conditional
+        /// LOAD, under the drive handle's motion authority.
+        fn motion_states(&self) -> Vec<String> {
+            let conn = rusqlite::Connection::open(self.temp.path().join("index/rem-state.sqlite"))
+                .expect("open the projection");
+            let mut statement = conn
+                .prepare("select state from library_motion order by sequence")
+                .expect("prepare");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            rows.map(|row| row.expect("row")).collect()
+        }
+
+        /// The TEST UNIT READY and SSC LOAD commands the drive received, in order.
+        fn tur_and_load_opcodes(&self) -> Vec<u8> {
+            self.world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .map(|command| command.opcode)
+                .filter(|opcode| matches!(opcode, 0x00 | 0x1b))
+                .collect()
+        }
+
+        fn row(&self) -> remanence_state::MediaReadinessOperationRecord {
+            self.state
+                .write_handle()
+                .media_readiness_operation(self.operation_id)
+                .unwrap()
+                .unwrap()
+        }
+
+        /// Tape init's loop from a first poll that is a unit attention (`06/29/00`, as after a
+        /// reset), with a long deadline. The first poll cannot ask for the LOAD; the drive does not
+        /// thread the cartridge, so a later poll of the loop answers NO MEDIUM.
+        fn poll_after_a_unit_attention(&mut self) -> Result<MediaReadinessPoll, String> {
+            let initial_poll = poll_already_observed_media_readiness(
+                remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::UnitAttention {
+                        asc: 0x29,
+                        ascq: 0x00,
+                    },
+                ),
+                "pre_load_tur",
+                self.operation_id,
+                &mut self.state,
+                true,
+            )?;
+            poll_tape_init_readiness_after_initial_probe(
+                &mut self.drive,
+                MediaFamily::Lto9OrLater,
+                self.operation_id,
+                &mut self.state,
+                0x0100,
+                MediaReadinessInitialProbeInput {
+                    initial_poll,
+                    wait: true,
+                    timeout: StdDuration::from_secs(60),
+                    poll_interval: StdDuration::ZERO,
+                    conditional_load_on_no_medium: true,
+                },
+                || None,
+            )
+        }
+
+        /// Tape init's loop from a first poll that is merely becoming ready (no LOAD asked), with a
+        /// deadline of zero: the next poll is at the deadline. The drive is left unthreaded, so
+        /// that poll answers `02/04/02` and asks for the conditional LOAD.
+        fn poll_at_the_deadline(
+            &mut self,
+            signal: impl FnMut() -> Option<&'static str>,
+        ) -> Result<MediaReadinessPoll, String> {
+            self.world
+                .lock()
+                .unwrap()
+                .leave_cartridge_unthreaded(0x0100);
+            let initial_poll = poll_already_observed_media_readiness(
+                remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 0x01,
+                        media_initializing: false,
+                    },
+                ),
+                "pre_load_tur",
+                self.operation_id,
+                &mut self.state,
+                true,
+            )?;
+            poll_tape_init_readiness_after_initial_probe(
+                &mut self.drive,
+                MediaFamily::Lto9OrLater,
+                self.operation_id,
+                &mut self.state,
+                0x0100,
+                MediaReadinessInitialProbeInput {
+                    initial_poll,
+                    wait: true,
+                    timeout: StdDuration::ZERO,
+                    poll_interval: StdDuration::ZERO,
+                    conditional_load_on_no_medium: true,
+                },
+                signal,
+            )
+        }
+
+        /// Tape init's first probe, recorded as it records it, and then its loop.
+        fn probe_and_poll(
+            &mut self,
+            initial_phase: &str,
+            conditional_load_on_no_medium: bool,
+            signal: impl FnMut() -> Option<&'static str>,
+        ) -> Result<MediaReadinessPoll, String> {
+            let initial = self.drive.probe_media_readiness(MediaFamily::Lto9OrLater);
+            assert!(
+                matches!(
+                    initial.kind,
+                    remanence_library::MediaReadinessKind::NoMedium { .. }
+                ),
+                "the virtual drive answers NO MEDIUM first: {initial:?}"
+            );
+            let initial_poll = poll_already_observed_media_readiness(
+                initial,
+                initial_phase,
+                self.operation_id,
+                &mut self.state,
+                conditional_load_on_no_medium,
+            )?;
+            poll_tape_init_readiness_after_initial_probe(
+                &mut self.drive,
+                MediaFamily::Lto9OrLater,
+                self.operation_id,
+                &mut self.state,
+                0x0100,
+                MediaReadinessInitialProbeInput {
+                    initial_poll,
+                    wait: true,
+                    timeout: StdDuration::from_secs(60),
+                    poll_interval: StdDuration::ZERO,
+                    conditional_load_on_no_medium,
+                },
+                signal,
+            )
+        }
+    }
+
+    /// The loop's own polls follow the same rule as the first probe: a NO MEDIUM that a later
+    /// poll answers (here after a first poll that was a unit attention) is acted on with the
+    /// conditional LOAD, so it records `pre_ready_loading` and tape init succeeds after the LOAD.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_no_medium_that_a_later_poll_answers_is_acted_on_like_the_first() {
+        let mut init = virtual_tape_init(1);
+        let poll = init
+            .poll_after_a_unit_attention()
+            .expect("tape init survives a NO MEDIUM that the loop itself acts on");
+        assert!(poll.readiness.is_ready());
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "unit_attention".into(), Some(0)),
+                (None, "pre_ready_loading".into(), Some(0)),
+                (None, "ready".into(), Some(0)),
+            ]
+        );
+        // TEST UNIT READY (NO MEDIUM), the conditional LOAD, TEST UNIT READY (ready).
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        assert_eq!(init.motion_states(), vec!["done".to_string()]);
+        assert_eq!(init.row().state, "ready");
+    }
+
+    /// A poll that asks for the conditional LOAD at the deadline cannot time out: the LOAD is
+    /// sent, and when the drive is then ready the operation records `ready`. Recorded as the fence
+    /// `timeout_unknown`, that poll was followed by the LOAD and a refused record.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_poll_that_asks_for_the_conditional_load_at_the_deadline_sends_it() {
+        let mut init = virtual_tape_init(0);
+        let poll = init
+            .poll_at_the_deadline(|| None)
+            .expect("tape init survives a LOAD-requesting poll at the deadline");
+        assert!(poll.readiness.is_ready());
+        assert!(!poll.timed_out);
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "becoming_ready".into(), Some(0)),
+                (None, "media_initializing".into(), Some(0)),
+                (None, "ready".into(), Some(0)),
+            ]
+        );
+        // TEST UNIT READY (`02/04/02`), the conditional LOAD, TEST UNIT READY (ready).
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        assert_eq!(init.motion_states(), vec!["done".to_string()]);
+        assert_eq!(init.row().state, "ready");
+    }
+
+    /// The deadline still bounds the wait: when the drive is not ready after that LOAD, the next
+    /// poll records `timeout_unknown` and tape init fails with its timeout error, with no refused
+    /// record. (The drive is unthreaded again as the LOAD returns, through the loop's signal check.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_poll_after_the_conditional_load_still_times_out_at_the_deadline() {
+        let mut init = virtual_tape_init(0);
+        let world = std::sync::Arc::clone(&init.world);
+        let mut unthreaded_again = false;
+        let poll = init
+            .poll_at_the_deadline(move || {
+                let mut world = world.lock().unwrap();
+                if !unthreaded_again && world.command_log.iter().any(|c| c.opcode == 0x1b) {
+                    unthreaded_again = true;
+                    world.leave_cartridge_unthreaded(0x0100);
+                }
+                None
+            })
+            .expect("the loop returns the poll that timed out");
+        assert!(poll.timed_out);
+        assert!(!poll.readiness.is_ready());
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "becoming_ready".into(), Some(0)),
+                (None, "media_initializing".into(), Some(0)),
+                (None, "timeout_unknown".into(), Some(0)),
+            ]
+        );
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        assert_eq!(init.row().state, "timeout_unknown");
+        // Tape init's `!is_ready()` return: the timeout error and its exit code.
+        let message = tape_init_readiness_error("AOX030L9", 0x0100, &poll);
+        assert!(
+            message.contains("media_readiness_state=timeout_unknown"),
+            "{message}"
+        );
+        assert_eq!(tape_init_failure_exit_code(&message), Some(20), "{message}");
+    }
+
+    /// The defect: tape init from a slot, the drive answering NO MEDIUM after the move. Tape init
+    /// sends its conditional LOAD and polls again, so the NO MEDIUM is a pre-ready condition it
+    /// acts on, not a fence: the operation is `pre_ready_loading` while the LOAD goes out and ends
+    /// `ready`. Recorded as the fence `terminal_error`, the next poll was refused and tape init
+    /// failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_from_a_slot_waits_through_no_medium_and_its_conditional_load() {
+        let mut init = virtual_tape_init(1);
+        let poll = init
+            .probe_and_poll("pre_load_tur", true, || None)
+            .expect("tape init survives the NO MEDIUM its conditional LOAD answers");
+        assert!(poll.readiness.is_ready(), "{:?}", poll.readiness);
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "pre_ready_loading".into(), Some(0)),
+                (None, "ready".into(), Some(0)),
+            ]
+        );
+        // TEST UNIT READY (NO MEDIUM), the conditional LOAD, TEST UNIT READY (ready), and the
+        // LOAD is one recorded motion.
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        assert_eq!(init.motion_states(), vec!["done".to_string()]);
+        assert_eq!(init.row().state, "ready");
+    }
+
+    /// The fence that stays: NO MEDIUM again after the conditional LOAD was sent is the fence
+    /// `terminal_error`, and tape init fails with its readiness error. The LOAD is not sent twice.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_fences_a_no_medium_that_follows_its_conditional_load() {
+        let mut init = virtual_tape_init(2);
+        let poll = init
+            .probe_and_poll("pre_load_tur", true, || None)
+            .expect("the loop returns the poll that ended the wait");
+        assert!(!poll.readiness.is_ready());
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "pre_ready_loading".into(), Some(0)),
+                (None, "terminal_error".into(), Some(0)),
+            ]
+        );
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        assert_eq!(init.motion_states(), vec!["done".to_string()]);
+        let row = init.row();
+        assert_eq!(row.state, "terminal_error");
+        assert_eq!(
+            row.quarantine_id.as_deref(),
+            Some(format!("mrq-{}", init.operation_id).as_str())
+        );
+        // Tape init's `!is_ready()` return: the readiness error and its NO MEDIUM exit code.
+        let message = tape_init_readiness_error("AOX030L9", 0x0100, &poll);
+        assert!(
+            message.contains("media_readiness_state=no_medium"),
+            "{message}"
+        );
+        assert_eq!(tape_init_failure_exit_code(&message), Some(30), "{message}");
+    }
+
+    /// No conditional LOAD applies to a loaded tape (`already_loaded_tur`): its NO MEDIUM is the
+    /// fence `terminal_error`, and no LOAD is sent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_fences_a_no_medium_on_a_loaded_tape_without_a_load() {
+        let mut init = virtual_tape_init(1);
+        let poll = init
+            .probe_and_poll("already_loaded_tur", false, || None)
+            .expect("the loop returns the NO MEDIUM poll");
+        assert!(!poll.readiness.is_ready());
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "terminal_error".into(), Some(0)),
+            ]
+        );
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00]);
+        assert!(init.motion_states().is_empty(), "no LOAD motion");
+        assert_eq!(init.row().state, "terminal_error");
+    }
+
+    /// A signal after a poll that recorded a fence adds nothing to it: nothing more is recorded,
+    /// the signal-abort message is returned, and wait-ready's exit-code mapping gives 130. (A
+    /// signal on an open head still records `aborted_unknown`:
+    /// `a_signal_abort_is_recorded_under_the_typed_runtime`.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_signal_after_a_fence_poll_records_nothing_and_still_aborts() {
+        let mut init = virtual_tape_init(1);
+        let message = init
+            .probe_and_poll("already_loaded_tur", false, || Some("SIGINT"))
+            .err()
+            .expect("a signal aborts the readiness flow");
+        assert!(media_readiness_error_is_signal_abort(&message), "{message}");
+        assert_eq!(message, media_readiness_signal_abort_message("SIGINT"));
+        assert_eq!(
+            tape_wait_ready_failure_from_poll_error(message).exit_code,
+            130
+        );
+        assert_eq!(
+            init.history(),
+            vec![
+                (None, "planned".into(), None),
+                (None, "terminal_error".into(), Some(0)),
+            ],
+            "the fence the poll recorded is the whole record"
+        );
+        let row = init.row();
+        assert_eq!(row.state, "terminal_error");
+        assert_eq!(row.phase, "already_loaded_tur");
+        assert_eq!(row.signal, None);
+    }
+
+    /// The classification of one tape-init poll, on its own: only a NO MEDIUM that tape init acts
+    /// on with its conditional LOAD is the waiting state `pre_ready_loading` (keeping the poll's
+    /// evidence and carrying no quarantine identity); a NO MEDIUM with no LOAD to follow, and a
+    /// poll that timed out, keep their fence states; every other poll is classified as before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tape_init_poll_is_pre_ready_loading_only_when_its_no_medium_is_acted_on() {
+        let operation_id = Uuid::new_v4();
+        let poll = |kind, timed_out| MediaReadinessPoll {
+            readiness: remanence_library::MediaReadiness::new(kind),
+            attempts: 1,
+            timed_out,
+        };
+        let no_medium = || remanence_library::MediaReadinessKind::NoMedium { ascq: 0x00 };
+        let classify = |poll: &MediaReadinessPoll, pending| {
+            tape_init_poll_transition_input(operation_id, "readiness_poll", poll, pending)
+        };
+
+        let acted_on = poll(no_medium(), false);
+        let transition = classify(&acted_on, true);
+        let recorded_as_before =
+            media_readiness_transition_input(operation_id, "readiness_poll", &acted_on);
+        assert_eq!(transition.state, "pre_ready_loading");
+        assert_eq!(transition.quarantine_id, None);
+        assert_eq!(transition.phase, recorded_as_before.phase);
+        assert_eq!(transition.last_cdb_opcode, Some(0x00));
+        assert_eq!(transition.last_sense_key, Some(0x02));
+        assert_eq!(transition.last_asc, Some(0x3a));
+        assert_eq!(transition.last_ascq, Some(0x00));
+        assert!(transition.completion_evidence.is_some());
+        assert_eq!(
+            transition.completion_evidence.is_some(),
+            recorded_as_before.completion_evidence.is_some()
+        );
+
+        let transition = classify(&acted_on, false);
+        assert_eq!(transition.state, "terminal_error");
+        assert_eq!(
+            transition.quarantine_id.as_deref(),
+            Some(format!("mrq-{operation_id}").as_str())
+        );
+
+        let timed_out = poll(no_medium(), true);
+        let transition = classify(&timed_out, true);
+        assert_eq!(transition.state, "timeout_unknown");
+        assert!(transition.quarantine_id.is_some());
+
+        let initializing = poll(
+            remanence_library::MediaReadinessKind::BecomingReady {
+                ascq: 0x02,
+                media_initializing: false,
+            },
+            false,
+        );
+        assert_eq!(classify(&initializing, true).state, "becoming_ready");
     }
 
     /// The command phases tape init records with an opcode, through its production recorders on a

@@ -644,12 +644,9 @@ pub(crate) fn is_fence_state(state: lib::ReadinessState) -> bool {
 /// Refuse any successor of a fence head but `released`. An exact retry of the fence never reaches
 /// here: both producers return before it.
 ///
-/// This is the backstop that keeps a fence from being followed by another state, not a claim that
-/// no producer tries. At R1c-a two CLI producers do: tape init from a slot records a NO MEDIUM
-/// answer as `terminal_error` and then sends its conditional LOAD and polls again, and the signal
-/// helpers record after a poll that may already have fenced. This refuses those records (before
-/// R1c-a the same flows ended their operation instead, which could not be released); R1c-a2
-/// corrects the producers.
+/// No producer records after a fence, with one exception: the operator cancel RPC reads the head
+/// before it appends, so it can race a poll that fences. Its append is refused here, which keeps the
+/// fence, and the RPC reads the row as settled. Otherwise this refusal is only the backstop.
 fn refuse_after_fence(
     head: lib::ReadinessState,
     next: lib::ReadinessState,
