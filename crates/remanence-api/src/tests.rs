@@ -430,6 +430,7 @@ fn media_readiness_admission_helper_blocks_active_fence() {
 
     let err = ensure_media_readiness_admitted(
         &index,
+        None,
         "open session",
         "LIB-A",
         Some(0x0002),
@@ -449,6 +450,7 @@ fn media_readiness_admission_helper_blocks_active_fence() {
 
     ensure_media_readiness_admitted(
         &index,
+        None,
         "open session",
         "LIB-B",
         Some(0x0002),
@@ -10208,12 +10210,13 @@ fn startup_fence_scope_and_readiness_recovery() {
         before.len()
     );
     assert!(
-        ensure_media_readiness_admitted(&index, "open", "LIB-A", Some(1), None, false).is_err()
+        ensure_media_readiness_admitted(&index, None, "open", "LIB-A", Some(1), None, false)
+            .is_err()
     );
     index
         .release_tape_io_fence(&fence.quarantine_id, "checked")
         .unwrap();
-    ensure_media_readiness_admitted(&index, "open", "LIB-A", Some(1), None, false).unwrap();
+    ensure_media_readiness_admitted(&index, None, "open", "LIB-A", Some(1), None, false).unwrap();
     let unscoped = index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
             tape_uuid: [0; 16],

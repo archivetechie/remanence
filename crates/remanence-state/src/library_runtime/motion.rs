@@ -225,6 +225,17 @@ impl LibraryRuntime {
         }
     }
 }
+impl LibraryRuntime {
+    /// Whether this endpoint has an open or Unknown motion intent of its own. Write admission
+    /// asks this, not [`MotionAuthority::requires_reconciliation`]: that one also answers yes for
+    /// any bay of a library with an unresolved MOVE, which would stop healthy writes on every
+    /// other bay. While a library-scope intent is unresolved, motion dispatch already refuses
+    /// every further MOVE, LOAD and UNLOAD in that library, so no new cartridge reaches an
+    /// endpoint this answers no for.
+    pub fn endpoint_motion_unresolved(&self, key: &remanence_library::DriveKey) -> bool {
+        self.0.authority.endpoint_motion_unresolved(&endpoint(key))
+    }
+}
 impl MotionAuthority for LibraryRuntime {
     fn identity(&self) -> Option<remanence_library::motion::MotionAuthorityIdentity> {
         Some(remanence_library::motion::MotionAuthorityIdentity {

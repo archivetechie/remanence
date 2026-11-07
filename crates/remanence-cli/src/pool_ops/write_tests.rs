@@ -13,8 +13,17 @@ struct Fixture {
     world: remanence_chaos::model::SharedVirtualWorld,
     report: remanence_library::DiscoveryReport,
 }
+/// Where the model cartridge starts: already in the drive, or in a storage slot.
+#[derive(Clone, Copy, PartialEq)]
+enum Seat {
+    Drive,
+    Slot,
+}
 /// One seated model cartridge and real state, shared by archive CLI regressions.
 fn fixture() -> Fixture {
+    fixture_seated(Seat::Drive)
+}
+fn fixture_seated(seat: Seat) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let config_path = root.path().join("config.toml");
     let text = format!(
@@ -71,8 +80,12 @@ tape_catalog_dir = "{0}/cache"
     let mut tape = VirtualTape::empty(3 * 1024 * 1024 * 1024, BLOCK);
     tape.records = vec![Record::Block(block), Record::Filemark];
     tape.written_bytes = u64::from(BLOCK);
-    let mut world = VirtualWorld::single_drive(LIBRARY, BAY, "POOL-DRIVE", 0x400, 0);
-    world.put_tape_in_drive(BAY, "POOL001L9", None, tape);
+    let slots = u16::from(seat == Seat::Slot);
+    let mut world = VirtualWorld::single_drive(LIBRARY, BAY, "POOL-DRIVE", 0x400, slots);
+    match seat {
+        Seat::Drive => world.put_tape_in_drive(BAY, "POOL001L9", None, tape),
+        Seat::Slot => world.put_tape_in_slot(0x400, "POOL001L9", tape),
+    }
     let report = remanence_library::DiscoveryReport {
         libraries: vec![world.library_snapshot()],
         unattached_drives: vec![],
@@ -583,3 +596,433 @@ fn typed_write_error_keeps_appended_fence_abandonment_and_checkpoint_context() {
     );
 }
 use remanence_state::AuditSink as _;
+
+// ---------------------------------------------------------------------------
+//  Decisions R1c-2 and R1c-3 on the production path
+// ---------------------------------------------------------------------------
+
+fn bay_key() -> remanence_library::DriveKey {
+    remanence_library::DriveKey::new(LIBRARY, BAY)
+}
+
+/// What an interrupted earlier process leaves in the library log: a LOAD intent on the bay
+/// with no outcome, or with an `Unknown` one.
+fn leave_load(fx: &Fixture, unknown: bool) {
+    use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext, PendingMotion};
+    let state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
+    let runtime = state.library_runtime();
+    let command = MotionCommand::Load(bay_key());
+    let ticket = MotionAuthority::intent(&runtime, &command, &MotionContext::default()).unwrap();
+    if unknown {
+        runtime
+            .unconfirmed(&PendingMotion {
+                command,
+                context: MotionContext::default(),
+                ticket,
+                evidence: remanence_library::outcome::CompletionEvidence::success(),
+            })
+            .unwrap();
+    }
+}
+
+fn load_unresolved(fx: &Fixture) -> bool {
+    let state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
+    state
+        .library_runtime()
+        .endpoint_motion_unresolved(&bay_key())
+}
+
+fn opcodes(fx: &Fixture) -> Vec<u8> {
+    fx.world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .map(|command| command.opcode)
+        .collect()
+}
+
+/// Run the writer with a transport factory of the test's own, and clear whatever the writer
+/// left unconsumed (a run refused before any library open never takes it).
+fn run_with_factory(
+    fx: &Fixture,
+    factory: crate::CliTransportFactory,
+) -> (ExitCode, Vec<u8>, Vec<u8>) {
+    crate::TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(factory);
+    });
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_archive_write_with_lock_root(
+        &fx.report,
+        &fx.args(),
+        &[LIBRARY.into()],
+        &[],
+        &mut out,
+        &mut err,
+        &fx.root.path().join("locks"),
+    );
+    crate::TEST_CLI_TRANSPORT_FACTORY.with(|slot| slot.borrow_mut().take());
+    (code, out, err)
+}
+
+fn model_factory(fx: &Fixture) -> crate::CliTransportFactory {
+    let shared = fx.world.clone();
+    Box::new(move |path| {
+        let role = shared.lock().unwrap().role_for_path(path).unwrap();
+        Ok(super::mounted_tests::library_transport(
+            ModelTransport::new(shared.clone(), role),
+        ))
+    })
+}
+
+/// Start the daemon's real constructor over the writer's state, as the rehearsal's restart did.
+/// The returned state handle owns the state lease for as long as the daemon lives, and the
+/// runtime carries the daemon's background tasks.
+fn start_daemon(
+    fx: &Fixture,
+) -> Result<
+    (
+        StateHandle,
+        remanence_api::ApiState,
+        tokio::runtime::Runtime,
+    ),
+    String,
+> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let state = StateHandle::open_from_config_file(&fx.config_path).map_err(|e| e.to_string())?;
+    let mut config = state.config().clone();
+    config.libraries = vec![remanence_state::LibraryConfig {
+        serial: LIBRARY.into(),
+        allow_derived_drive_identity: false,
+    }];
+    let spool = fx.root.path().join("spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let world = fx.world.clone();
+    let report = remanence_library::DiscoveryReport {
+        libraries: vec![world.lock().unwrap().library_snapshot()],
+        unattached_drives: vec![],
+        complete: true,
+        incomplete_evidence: vec![],
+        warnings: vec![],
+    };
+    let api = remanence_api::ApiState::with_drive_pool_opener(
+        state.projection_client(),
+        &config,
+        report,
+        StaticAllowlist::new([LIBRARY]),
+        spool,
+        16 * 1024 * 1024,
+        move |library, policy| {
+            let world = world.clone();
+            library.open_with(policy, move |path| {
+                let role = world
+                    .lock()
+                    .unwrap()
+                    .role_for_path(path)
+                    .expect("model device");
+                Ok(Box::new(ModelTransport::new(world.clone(), role)))
+            })
+        },
+    )
+    .map_err(|status| status.message().to_string())?;
+    Ok((state, api, runtime))
+}
+
+/// The rehearsal's sequence on the production path. The archive writer loads the cartridge from
+/// a slot with a LOAD that has no readiness owner; that must not leave a readiness row, the
+/// write must succeed, and the daemon's constructor must start over the same state.
+#[test]
+fn archive_write_from_a_slot_leaves_no_readiness_row_and_the_daemon_starts() {
+    let fx = fixture_seated(Seat::Slot);
+    let (code, out, err) = fx.run(&fx.args(), false);
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    assert!(!out.is_empty());
+    let log = opcodes(&fx);
+    assert!(
+        log.contains(&0xa5) && log.contains(&0x1b),
+        "MOVE and LOAD: {log:?}"
+    );
+    {
+        let state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
+        assert!(state
+            .catalog()
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .is_empty());
+        assert!(!state
+            .library_runtime()
+            .endpoint_motion_unresolved(&bay_key()));
+    }
+    let (state, _api, _runtime) =
+        start_daemon(&fx).unwrap_or_else(|error| panic!("daemon start: {error}"));
+    assert!(state
+        .catalog()
+        .list_active_media_readiness_operations(None)
+        .unwrap()
+        .is_empty());
+}
+
+/// An earlier process left a LOAD with no outcome (or an Unknown one) on the bay where the
+/// cartridge now sits. The writer reconciles the library first, sends no motion of its own,
+/// then admits and writes; the daemon then starts over the same state.
+#[test]
+fn archive_write_reconciles_an_earlier_processs_unresolved_load_before_admitting() {
+    for unknown in [false, true] {
+        let fx = fixture();
+        leave_load(&fx, unknown);
+        assert!(load_unresolved(&fx), "setup: the bay's LOAD is unresolved");
+        let (code, out, err) = fx.run(&fx.args(), false);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "unknown={unknown}: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(!out.is_empty());
+        let log = opcodes(&fx);
+        assert!(
+            log.contains(&0xb8),
+            "the reconcile read the changer: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|op| matches!(op, 0x1b | 0xa5)),
+            "a seated cartridge sends no motion: {log:?}"
+        );
+        assert!(
+            !load_unresolved(&fx),
+            "the reconcile resolved the bay's intent"
+        );
+        let (state, _api, _runtime) =
+            start_daemon(&fx).unwrap_or_else(|error| panic!("daemon start: {error}"));
+        assert!(state
+            .catalog()
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+/// The reconcile does not vouch for the cartridge: with the unresolved LOAD reconciled, the
+/// writer still resolves the tape against the live inventory and refuses when it is nowhere.
+#[test]
+fn archive_write_refuses_after_the_reconcile_when_the_inventory_does_not_hold_the_tape() {
+    let fx = fixture();
+    leave_load(&fx, true);
+    fx.world.lock().unwrap().drive_bays.insert(BAY, None);
+    let (code, out, err) = fx.run(&fx.args(), false);
+    let text = String::from_utf8_lossy(&err).to_string();
+    assert_eq!(code, ExitCode::from(1), "{text}");
+    assert!(out.is_empty());
+    assert!(text.contains("error: load tape"), "{text}");
+    assert!(!opcodes(&fx)
+        .iter()
+        .any(|op| matches!(op, 0x0a | 0x1b | 0xa5)));
+    assert!(!load_unresolved(&fx), "the reconcile still ran first");
+}
+
+/// A changer that fails the reconcile's fresh READ ELEMENT STATUS: the writer reports that
+/// error as it is, behind one prefix, promises no remedy, and sends nothing to the tape.
+#[test]
+fn archive_write_shows_a_failing_reconcile_error_as_it_is() {
+    use remanence_library::{transport::TransferOutcome, ScsiError, SgTransport, TimeoutClass};
+    struct FailSecondElementStatus {
+        inner: Box<dyn SgTransport>,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SgTransport for FailSecondElementStatus {
+        fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+            if cdb[0] == 0xb8 && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                return Err(ScsiError::TransportError {
+                    status: 0,
+                    host_status: 3,
+                    driver_status: 0,
+                    info: 1,
+                    sense: vec![],
+                });
+            }
+            self.inner.execute_in(cdb, buf)
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+            self.inner.execute_none(cdb)
+        }
+        fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            self.inner.execute_out(cdb, buf)
+        }
+        fn set_timeout_for(&mut self, class: TimeoutClass) {
+            self.inner.set_timeout_for(class);
+        }
+    }
+    let fx = fixture();
+    leave_load(&fx, true);
+    let shared = fx.world.clone();
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (code, out, err) = run_with_factory(
+        &fx,
+        Box::new(move |path| {
+            let role = shared.lock().unwrap().role_for_path(path).unwrap();
+            Ok(Box::new(FailSecondElementStatus {
+                inner: super::mounted_tests::library_transport(ModelTransport::new(
+                    shared.clone(),
+                    role,
+                )),
+                seen: seen.clone(),
+            }))
+        }),
+    );
+    let text = String::from_utf8_lossy(&err).to_string();
+    assert_eq!(code, ExitCode::from(1), "{text}");
+    assert!(out.is_empty());
+    let (prefix, cause) = text
+        .trim_end()
+        .split_once("startup motion reconciliation: ")
+        .unwrap_or_else(|| panic!("the refusal names the reconcile: {text}"));
+    assert_eq!(prefix, "error: ", "{text}");
+    assert!(!cause.is_empty() && !cause.contains('\n'), "{text}");
+    assert!(
+        cause.contains("SG_IO transport error") && cause.contains("host_status=0x0003"),
+        "the injected failure, as the changer reported it: {text}"
+    );
+    assert!(
+        !text.contains("restart the daemon") && !text.contains("journal replay failed"),
+        "{text}"
+    );
+    assert!(!opcodes(&fx)
+        .iter()
+        .any(|op| matches!(op, 0x0a | 0x1b | 0xa5)));
+    assert!(load_unresolved(&fx), "a failed reconcile resolves nothing");
+}
+
+/// The state lock is what keeps the CLI from reconciling beside a running daemon: while another
+/// owner holds it, the writer is refused before it opens the library, and so is `rem load`'s
+/// motion-authority bind. Nothing reaches the changer.
+#[test]
+fn the_cli_cannot_reconcile_while_another_process_owns_the_state() {
+    let fx = fixture();
+    leave_load(&fx, true);
+    let owner = StateHandle::open_from_config_file(&fx.config_path).unwrap();
+    let (code, out, err) = run_with_factory(&fx, model_factory(&fx));
+    let text = String::from_utf8_lossy(&err).to_string();
+    assert_eq!(code, ExitCode::from(1), "{text}");
+    assert!(out.is_empty());
+    assert!(
+        text.contains("error: open state: state lock is already held"),
+        "{text}"
+    );
+    assert!(
+        opcodes(&fx).is_empty(),
+        "no command reached the model: {:?}",
+        opcodes(&fx)
+    );
+
+    let policy = StaticAllowlist::new([LIBRARY]);
+    crate::TEST_CLI_TRANSPORT_FACTORY.with(|slot| *slot.borrow_mut() = Some(model_factory(&fx)));
+    let mut handle =
+        crate::open_library_handle(fx.report.library(LIBRARY).unwrap(), &policy).unwrap();
+    let opened = opcodes(&fx).len();
+    let bind = remanence_api::mount_support::bind_library_motion_authority(
+        &mut handle,
+        Some(&fx.config_path),
+    );
+    let bind_error = bind.expect_err("the bind needs the state lock").to_string();
+    assert!(
+        bind_error.contains("state lock is already held"),
+        "{bind_error}"
+    );
+    assert_eq!(opcodes(&fx).len(), opened, "the refused bind sent nothing");
+    drop(owner);
+    assert!(load_unresolved(&fx), "nothing reconciled behind the owner");
+}
+
+/// `rem load` reconciles before it moves: an earlier process left a library-scope MOVE open,
+/// which refuses every new MOVE, and the load still succeeds because the bind reconciled first.
+#[test]
+fn rem_load_reconciles_the_library_before_its_first_motion() {
+    use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+    let fx = fixture_seated(Seat::Slot);
+    {
+        let state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
+        MotionAuthority::intent(
+            &state.library_runtime(),
+            &MotionCommand::Move {
+                library_serial: LIBRARY.into(),
+                source: 0x400,
+                destination: BAY,
+            },
+            &MotionContext::default(),
+        )
+        .unwrap();
+        assert!(state
+            .library_runtime()
+            .requires_reconciliation(&MotionCommand::Load(bay_key())));
+    }
+    crate::TEST_CLI_TRANSPORT_FACTORY.with(|slot| *slot.borrow_mut() = Some(model_factory(&fx)));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = crate::run_state_change_with_config(
+        &fx.report,
+        LIBRARY,
+        &fx.config_path,
+        &[LIBRARY.into()],
+        &[],
+        &mut out,
+        &mut err,
+        |handle, policy| {
+            handle
+                .load(0x400, BAY, policy)
+                .map(|()| "loaded".to_string())
+                .map_err(|error| error.to_string())
+        },
+    );
+    crate::TEST_CLI_TRANSPORT_FACTORY.with(|slot| slot.borrow_mut().take());
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    let log = opcodes(&fx);
+    assert!(log.contains(&0xa5) && log.contains(&0x1b), "{log:?}");
+    assert!(!load_unresolved(&fx));
+    // `rem load` is another LOAD with no readiness owner; it leaves no readiness row either.
+    let state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
+    assert!(state
+        .catalog()
+        .list_active_media_readiness_operations(None)
+        .unwrap()
+        .is_empty());
+}
+
+/// P6 of decision R1c-3, on the production path: the cartridge in the drive is read at BOT and
+/// must name the selected tape before the session's first write. A different cartridge in the
+/// bay is refused, and no WRITE or WRITE FILEMARKS reaches the drive.
+#[test]
+fn archive_write_verifies_the_tape_identity_before_its_first_write() {
+    let fx = fixture();
+    let other = [0x52; 16];
+    let bootstrap = remanence_api::build_tape_bootstrap(
+        other,
+        BLOCK,
+        remanence_parity::ParityConfig::None,
+        "2026-10-30T00:00:00Z",
+        "pool-write-test",
+    );
+    let mut block = vec![0; BLOCK as usize];
+    remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut block).unwrap();
+    fx.world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("POOL001L9")
+        .unwrap()
+        .records[0] = Record::Block(block);
+    let (code, out, err) = fx.run(&fx.args(), false);
+    let text = String::from_utf8_lossy(&err).to_string();
+    assert_eq!(code, ExitCode::from(1), "{text}");
+    assert!(out.is_empty());
+    assert!(text.contains("tape identity"), "{text}");
+    assert!(
+        !opcodes(&fx).iter().any(|op| matches!(op, 0x0a | 0x10)),
+        "nothing was written: {:?}",
+        opcodes(&fx)
+    );
+}

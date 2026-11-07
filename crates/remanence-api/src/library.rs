@@ -537,6 +537,7 @@ impl LibraryServiceApi {
         };
         if let Err(err) = crate::startup_media_readiness::ensure_media_readiness_admitted(
             &index,
+            self.state.catalog.library_runtime().as_ref(),
             operation_kind,
             &library_serial,
             None,
@@ -3682,6 +3683,7 @@ mod tests {
         assert!(
             crate::startup_media_readiness::ensure_media_readiness_admitted(
                 &state.index().unwrap(),
+                None,
                 "move",
                 "DEC418146K_LL02",
                 None,
@@ -3705,6 +3707,7 @@ mod tests {
         crate::write_owner::run_readiness_test_command(&state, command).await;
         crate::startup_media_readiness::ensure_media_readiness_admitted(
             &state.index().unwrap(),
+            None,
             "move",
             "DEC418146K_LL02",
             None,

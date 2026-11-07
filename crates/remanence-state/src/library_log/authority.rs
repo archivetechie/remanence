@@ -682,6 +682,15 @@ impl LibraryAuthority {
             .fold
             .motion_requires_reconciliation(motion)
     }
+    /// Write admission checks only the endpoint's own open/Unknown motion.
+    pub fn endpoint_motion_unresolved(&self, endpoint: &DriveKey) -> bool {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+            .fold
+            .endpoint_motion_unresolved(endpoint)
+    }
     /// Read the next observation generation while runtime dispatch is serialized.
     pub fn next_inventory_generation(
         &self,

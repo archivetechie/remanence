@@ -2833,6 +2833,7 @@ fn ensure_seated_cartridge_media_readiness_admitted(
         .map_err(|err| Status::internal(err.to_string()))?;
     crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
+        state.catalog.library_runtime().as_ref(),
         reason.as_str(),
         seated.library_serial.as_str(),
         Some(seated.bay),
@@ -3679,6 +3680,7 @@ fn resolve_actor_mount(
         .find(|bay| bay.loaded && bay.loaded_tape.as_deref() == Some(voltag.as_str()));
     crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
+        state.catalog.library_runtime().as_ref(),
         "open session",
         library_serial,
         seated.map(|bay| bay.element_address),
@@ -3804,6 +3806,7 @@ fn ensure_actor_mount_media_readiness_admitted(
         .map_err(|err| Status::internal(err.to_string()))?;
     crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
+        state.catalog.library_runtime().as_ref(),
         "open session",
         library_serial,
         Some(mount.bay),
@@ -3825,6 +3828,7 @@ fn ensure_mounted_session_media_readiness_admitted(
         .map_err(|err| Status::internal(err.to_string()))?;
     crate::startup_media_readiness::ensure_media_readiness_unconflicted(
         &index,
+        state.catalog.library_runtime().as_ref(),
         action,
         mounted.library_serial.as_str(),
         Some(mounted.bay),
@@ -9159,5 +9163,125 @@ tape_catalog_dir="{0}/cache"
                 lib::AuditActor::System
             )
             .is_err());
+    }
+
+    /// The daemon's own admission wrappers (open session, close session, seated-cartridge
+    /// dismount) hand the process's typed runtime to the endpoint check, so a bay whose LOAD is
+    /// open refuses all three while another bay does not.
+    #[test]
+    fn daemon_admission_wrappers_refuse_the_endpoints_own_unresolved_motion() {
+        use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+        const SERIAL: &str = "LIB-WRAP";
+        let root = crate::tests::TypedRoot::open();
+        let state = root.api_state();
+        let runtime = root.catalog().library_runtime().expect("typed runtime");
+        let mount = |bay| ActorMount {
+            bay,
+            barcode: None,
+            source_slot: None,
+            home_slot: None,
+            needs_drive_load: false,
+            library_serial: SERIAL.into(),
+            drive_uuid: None,
+            drive_serial: None,
+        };
+        let mounted = |bay| crate::write_owner::MountedSession {
+            bay,
+            library_serial: SERIAL.into(),
+            barcode: None,
+            home_slot: None,
+            tape_uuid: [0x77; 16],
+            drive_uuid: None,
+        };
+        let seated = |bay| crate::write_owner::SeatedCartridge {
+            bay,
+            library_serial: SERIAL.into(),
+            barcode: None,
+            home_slot: 0x400,
+            tape_uuid: None,
+            prior_session_id: None,
+        };
+        let all = |bay| {
+            [
+                ensure_actor_mount_media_readiness_admitted(&state, SERIAL, &mount(bay)),
+                ensure_mounted_session_media_readiness_admitted(
+                    &state,
+                    "close session",
+                    &mounted(bay),
+                ),
+                ensure_seated_cartridge_media_readiness_admitted(
+                    &state,
+                    &seated(bay),
+                    DismountReason::Evicted,
+                ),
+            ]
+        };
+        for result in all(0x100) {
+            result.unwrap();
+        }
+        MotionAuthority::intent(
+            &runtime,
+            &MotionCommand::Load(remanence_state::DriveKey::new(SERIAL, 0x100)),
+            &MotionContext::default(),
+        )
+        .unwrap();
+        for result in all(0x100) {
+            let refused = result.unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                refused.message().contains("LIB-WRAP drive bay 0x0100")
+                    && refused.message().contains("unresolved"),
+                "{refused}"
+            );
+        }
+        for result in all(0x101) {
+            result.unwrap();
+        }
+    }
+
+    /// The pool-mode open (`resolve_actor_mount`) admits through the same funnel: a cartridge
+    /// seated in a bay whose own LOAD is open is refused with the endpoint's unresolved-motion
+    /// text, and the same open on a library with no such intent resolves a plan.
+    #[test]
+    fn resolve_actor_mount_refuses_a_seated_cartridge_on_an_unresolved_bay() {
+        use remanence_chaos::model::{VirtualTape, VirtualWorld};
+        use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+        const SERIAL: &str = "LIB-RESOLVE";
+        const TAPE: [u8; 16] = [0x7a; 16];
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, "RSLV01L9")]);
+        let mut state = root.api_state();
+        let mut world = VirtualWorld::single_drive(SERIAL, 0x100, "DRV-RESOLVE", 0x400, 1);
+        world.put_tape_in_drive(0x100, "RSLV01L9", Some(0x400), VirtualTape::default());
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    libraries: vec![world.library_snapshot()],
+                    unattached_drives: vec![],
+                    complete: true,
+                    incomplete_evidence: vec![],
+                    warnings: vec![],
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        resolve_actor_mount(&state, SERIAL, &TAPE, &HashSet::new()).unwrap();
+        let runtime = root.catalog().library_runtime().expect("typed runtime");
+        MotionAuthority::intent(
+            &runtime,
+            &MotionCommand::Load(remanence_state::DriveKey::new(SERIAL, 0x100)),
+            &MotionContext::default(),
+        )
+        .unwrap();
+        let refused = match resolve_actor_mount(&state, SERIAL, &TAPE, &HashSet::new()) {
+            Err(refused) => refused,
+            Ok(_) => panic!("the seated bay's own LOAD is open"),
+        };
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            refused.message().contains("open session blocked")
+                && refused.message().contains("LIB-RESOLVE drive bay 0x0100")
+                && refused.message().contains("unresolved"),
+            "{refused}"
+        );
     }
 }

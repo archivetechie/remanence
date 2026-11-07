@@ -418,7 +418,12 @@ impl LibraryRuntime {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         let (previous, mut value) = self
             .readiness_source_locked(*input.operation_id.as_bytes())?
-            .ok_or_else(|| invalid("readiness transition has no authenticated owner"))?;
+            .ok_or_else(|| {
+                invalid(format!(
+                    "readiness transition has no authenticated owner for operation {}",
+                    input.operation_id
+                ))
+            })?;
         let next_state = state(&input.state)?;
         let next_phase = input
             .phase
@@ -639,6 +644,16 @@ pub(crate) fn is_fence_state(state: lib::ReadinessState) -> bool {
             | lib::ReadinessState::TerminalError
             | lib::ReadinessState::ReservationConflict
     )
+}
+
+/// Whether a projected readiness row whose state is spelled `head` may take a LOAD's
+/// `pre_ready_loading`: its head is `Pending` and not a fence state. A fenced row accepts only
+/// `released`, and the projector writes SQL directly, so it must not move one. A spelling this
+/// build does not know is not advanced either.
+pub(crate) fn load_may_advance_head(head: &str) -> bool {
+    state(head).is_ok_and(|head| {
+        readiness_result(head) == lib::ReadinessResult::Pending && !is_fence_state(head)
+    })
 }
 
 /// Refuse any successor of a fence head but `released`. An exact retry of the fence never reaches

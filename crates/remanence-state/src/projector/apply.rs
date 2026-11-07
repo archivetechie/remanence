@@ -1022,39 +1022,26 @@ impl CatalogCore {
                     )
                     .map_err(|e| sqlite_error("project motion intent", e))?;
                 if matches!(v.motion, lib::Motion::Load(_)) {
+                    // A LOAD is not a readiness operation. Only a row that a `ReadinessObserved`
+                    // created (this arm is the one creator in a log-driven projection), whose
+                    // head is open and not a fence, takes the LOAD's write-ahead transition. Any
+                    // other LOAD, with no parent or a parent no readiness record names, projects
+                    // into the motion table alone. The motion fold tracks its uncertainty.
                     let operation = v.parent_operation.unwrap_or(v.command);
                     if self
                         .media_readiness_operation(Uuid::from_bytes(operation))?
-                        .is_none()
+                        .is_some_and(|row| {
+                            crate::library_runtime::readiness::load_may_advance_head(&row.state)
+                        })
                     {
-                        self.record_media_readiness_operation(
+                        self.library_readiness_transition(
+                            operation,
+                            "pre_ready_loading",
+                            Some(0x1b),
                             None,
-                            MediaReadinessOperationInput {
-                                operation_id: Uuid::from_bytes(operation),
-                                run_id: None,
-                                endpoint: key.unwrap(),
-                                changer_sg: None,
-                                drive_sg: None,
-                                drive_serial: None,
-                                barcode: None,
-                                source_slot: None,
-                                media_generation: None,
-                                media_family: None,
-                                phase: "load".into(),
-                                state: "planned".into(),
-                                dirty_scope: Some("drive+tape".into()),
-                                deadline_at_utc: None,
-                                evidence_path: None,
-                            },
+                            None,
                         )?;
                     }
-                    self.library_readiness_transition(
-                        operation,
-                        "pre_ready_loading",
-                        Some(0x1b),
-                        None,
-                        None,
-                    )?;
                 }
             }
             Body::MotionOutcome(v) => {

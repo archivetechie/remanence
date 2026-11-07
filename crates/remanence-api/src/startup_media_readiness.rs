@@ -231,8 +231,42 @@ pub(crate) fn log_media_readiness_not_ready(
     );
 }
 
+/// The refusal for a write admitted on an endpoint whose own LOAD or UNLOAD the motion authority
+/// calls open or Unknown. It names the endpoint and the one remedy, a daemon restart, which
+/// reconciles every configured library at startup. It names no CLI command: none only
+/// reconciles (`rem load`, `rem move` and `rem unload` then move media, `rem tape init` writes a
+/// label). It does not promise the restart works: the reconcile reads the library's inventory
+/// and can itself fail, and that error is reported as it is.
+pub(crate) fn endpoint_motion_unresolved_status(
+    action: &str,
+    endpoint: &remanence_state::DriveKey,
+) -> Status {
+    Status::failed_precondition(format!(
+        "{action} blocked: motion on {} is unresolved, because a LOAD or UNLOAD there has no \
+         confirmed outcome; restart the daemon to reconcile library motion",
+        endpoint.label()
+    ))
+}
+
+/// Refuse a write on `endpoint` while the motion authority holds an open or Unknown intent for
+/// that endpoint itself. Motion on another endpoint, or a library-scope MOVE, does not count:
+/// motion dispatch already refuses every further MOVE, LOAD and UNLOAD while one is unresolved,
+/// and the writer's readiness probe and tape-identity check guard what is already loaded.
+/// `runtime` is `None` only in unit-test fixtures with no typed authority.
+pub(crate) fn ensure_endpoint_motion_resolved(
+    runtime: Option<&remanence_state::library_runtime::LibraryRuntime>,
+    action: &str,
+    endpoint: &remanence_state::DriveKey,
+) -> Result<(), Status> {
+    if runtime.is_some_and(|runtime| runtime.endpoint_motion_unresolved(endpoint)) {
+        return Err(endpoint_motion_unresolved_status(action, endpoint));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_media_readiness_admitted(
     index: &CatalogIndex,
+    motion: Option<&remanence_state::library_runtime::LibraryRuntime>,
     action: &str,
     library_serial: &str,
     drive_element: Option<u16>,
@@ -250,6 +284,7 @@ pub(crate) fn ensure_media_readiness_admitted(
     }
     ensure_media_readiness_unconflicted(
         index,
+        motion,
         action,
         library_serial,
         drive_element,
@@ -259,9 +294,11 @@ pub(crate) fn ensure_media_readiness_admitted(
 }
 
 /// The readiness half of [`ensure_media_readiness_admitted`], without the tape-I/O fence check. Ending a session
-/// uses it: a session on a tape fenced since it opened still closes and releases its drive.
+/// uses it: a session on a tape fenced since it opened still closes and releases its drive. It also refuses on
+/// the endpoint's own unresolved motion (`motion`), after the readiness conflicts.
 pub(crate) fn ensure_media_readiness_unconflicted(
     index: &CatalogIndex,
+    motion: Option<&remanence_state::library_runtime::LibraryRuntime>,
     action: &str,
     library_serial: &str,
     drive_element: Option<u16>,
@@ -277,7 +314,16 @@ pub(crate) fn ensure_media_readiness_unconflicted(
         )
         .map_err(status_from_state_error)?;
     let Some(first) = conflicts.first() else {
-        return Ok(());
+        // No readiness fence names the target. The endpoint's own unresolved motion is the
+        // other thing that must stop the work, and only the motion authority knows it.
+        return match drive_element {
+            Some(bay) => ensure_endpoint_motion_resolved(
+                motion,
+                action,
+                &remanence_state::DriveKey::new(library_serial, bay),
+            ),
+            None => Ok(()),
+        };
     };
     let status = media_readiness_conflict_status(action, &conflicts);
     if library_robotics

@@ -99,7 +99,7 @@ crates/remanence-state/src/projector/apply.rs	apply_authority	project_tape_log_b
 crates/remanence-state/src/projector/apply.rs	apply_library_body	advance_clean_run	1	applies-authority	permanent
 crates/remanence-state/src/projector/apply.rs	apply_library_body	complete_tape_io_fence_release	1	applies-authority	permanent
 crates/remanence-state/src/projector/apply.rs	apply_library_body	delete_wrap_map	3	applies-authority	permanent
-crates/remanence-state/src/projector/apply.rs	apply_library_body	record_media_readiness_operation	2	applies-authority	permanent
+crates/remanence-state/src/projector/apply.rs	apply_library_body	record_media_readiness_operation	1	applies-authority	permanent
 crates/remanence-state/src/projector/apply.rs	apply_library_body	reinstate_drive	1	applies-authority	permanent
 crates/remanence-state/src/projector/apply.rs	apply_library_body	retire_tape	1	applies-authority	permanent
 crates/remanence-state/src/projector/apply.rs	apply_library_body	set_tape_cleaning_state	2	applies-authority	permanent

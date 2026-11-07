@@ -168,7 +168,13 @@ impl super::WriteOwnerConfig {
                 "mounted endpoint blocked by active media-readiness operation",
             ));
         }
-        Ok(())
+        // The endpoint's own open or Unknown LOAD/UNLOAD refuses a write on it. The production
+        // authority is always typed; only the unit-test fixture has none.
+        crate::startup_media_readiness::ensure_endpoint_motion_resolved(
+            self.authority.runtime(),
+            "mounted write",
+            &mounted.endpoint,
+        )
     }
     pub(super) fn mounted_ready(
         &self,

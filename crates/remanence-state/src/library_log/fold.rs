@@ -2583,6 +2583,12 @@ impl LibraryFold {
             .iter()
             .any(|scope| self.inventory_unknown(scope))
     }
+    /// Whether an open or Unknown motion intent names exactly this endpoint. Unlike
+    /// [`Self::motion_requires_reconciliation`], this ignores the Library scope a bay shares
+    /// with its changer, so another bay's motion, or a library-scope MOVE, does not answer yes.
+    pub fn endpoint_motion_unresolved(&self, endpoint: &DriveKey) -> bool {
+        self.inventory_unknown(&Scope::Endpoint(endpoint.clone()))
+    }
     /// Strictly next observation generation for the actual physical subject.
     pub fn next_inventory_generation(&self, subject: &InventorySubject) -> Result<u64, FoldError> {
         self.inventories

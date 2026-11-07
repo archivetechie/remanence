@@ -12,6 +12,18 @@ use remanence_parity::{ParityScheme, TapeFileEntry};
 use std::ops::ControlFlow;
 use uuid::Uuid;
 
+/// A readiness refusal from the typed runtime, as the state error callers match on. The runtime
+/// already spells its refusals as `JournalReplayFailed`, so one is passed through; wrapping it
+/// again printed "journal replay failed" twice before the cause.
+fn readiness_error(error: crate::library_runtime::RuntimeError) -> StateError {
+    match error {
+        crate::library_runtime::RuntimeError::State(inner @ StateError::JournalReplayFailed(_)) => {
+            inner
+        }
+        other => StateError::JournalReplayFailed(other.to_string()),
+    }
+}
+
 impl CatalogIndex {
     /// SQLite `PRAGMA user_version` after migration.
     pub fn schema_version(&self) -> Result<u32, StateError> {
@@ -29,7 +41,7 @@ impl CatalogIndex {
         if let Some(runtime) = self.library_runtime() {
             let operation = runtime
                 .begin_owned_readiness(&input)
-                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+                .map_err(readiness_error)?;
             if let Some(observer) = self.readiness_observer.as_deref() {
                 observer.changed();
             }
@@ -59,9 +71,7 @@ impl CatalogIndex {
                 "typed readiness requires the shared authority runtime".into(),
             )
         })?;
-        let operation = runtime
-            .begin_readiness(&input)
-            .map_err(|error| StateError::JournalReplayFailed(error.to_string()))?;
+        let operation = runtime.begin_readiness(&input).map_err(readiness_error)?;
         if let Some(observer) = self.readiness_observer.as_deref() {
             observer.changed();
         }
@@ -76,7 +86,7 @@ impl CatalogIndex {
         if let Some(runtime) = self.library_runtime() {
             runtime
                 .transition_readiness(&input)
-                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+                .map_err(readiness_error)?;
             if let Some(observer) = self.readiness_observer.as_deref() {
                 observer.changed();
             }
@@ -110,7 +120,7 @@ impl CatalogIndex {
         if let Some(runtime) = self.library_runtime() {
             return runtime
                 .readiness_load_attempts(*operation_id.as_bytes())
-                .map_err(|error| StateError::JournalReplayFailed(error.to_string()));
+                .map_err(readiness_error);
         }
         #[cfg(any(test, feature = "fixtures"))]
         {

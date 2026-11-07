@@ -232,6 +232,18 @@ fn run_archive_write_with_lock_root(
         }
     };
 
+    // -- Reconcile interrupted motion before admitting a write -----------------
+    // The daemon resolves open or Unknown motion at startup and tape init at its start. This
+    // writer owns the state lock (`open_from_config_file`), so no daemon runs beside it, and an
+    // earlier process may have left a LOAD with no confirmed outcome. A tape already in the
+    // drive sends no motion of its own, so only this call resolves the bay's intent. The
+    // reconcile reads the library's inventory and can fail; its error is shown as it is.
+    library_handle.set_motion_authority(std::sync::Arc::new(state_handle.library_runtime()));
+    if let Err(error) = library_handle.reconcile_startup_motion() {
+        let _ = writeln!(err, "error: startup motion reconciliation: {error}");
+        return ExitCode::from(1);
+    }
+
     // -- Load tape by UUID ------------------------------------------------
     let drive = {
         let index = state_handle.catalog();

@@ -454,7 +454,13 @@ pub(crate) fn session_open_reject_admission_conflicts(
         .media_readiness_admission_conflicts(ctx.library_serial, Some(ctx.bay), ctx.barcode, false)
         .map_err(status_from_state_error)?;
     if conflicts.is_empty() {
-        return Ok(());
+        // No readiness fence names the drive. Its own unresolved LOAD or UNLOAD still stops a
+        // session from opening on it, as it stops every further motion in the library.
+        return crate::startup_media_readiness::ensure_endpoint_motion_resolved(
+            index.library_runtime().as_ref(),
+            ctx.action,
+            &endpoint,
+        );
     }
     Err(crate::readiness_wait::ReadinessFence(
         crate::startup_media_readiness::parse_media_readiness_operation_id(&conflicts[0])?,

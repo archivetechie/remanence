@@ -2,6 +2,8 @@
 mod b5_fix2_tests;
 #[path = "closeout_tests.rs"]
 mod closeout_tests;
+#[path = "r1c2_tests.rs"]
+mod r1c2_tests;
 use remanence_parity::authority::StructuralAuthority;
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::authority::TapeAuthorityWriter;
@@ -13030,6 +13032,7 @@ async fn detached_verification_auto_resumes_fresh_load() {
         .is_empty());
     crate::startup_media_readiness::ensure_media_readiness_admitted(
         &harness.state.index().unwrap(),
+        None,
         "move",
         "LIB-VERIFY",
         None,
@@ -13675,6 +13678,7 @@ fn readiness_admission_reports_invalid_stored_id() {
     for bay in [0x100, 0x101] {
         let error = crate::startup_media_readiness::ensure_media_readiness_admitted(
             &index,
+            None,
             "move",
             "LIB-BAD-ID",
             Some(bay),
