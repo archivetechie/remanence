@@ -14587,7 +14587,7 @@ fn run_typed_readiness_owner_source_case(with_legacy_metadata: bool, failed_load
     let (ready_seq, ready) = readiness.last().unwrap();
     assert_eq!(ready.started_unix_ns, start.started_unix_ns);
     assert_eq!(ready.limit_ms, start.limit_ms);
-    assert!(ready.limit_ms > 0);
+    assert!(ready.limit_ms.is_some_and(|ms| ms > 0));
     assert_eq!(ready.scope, lib::ReadinessScope::Library);
     assert_eq!(ready.media, Some(lib::MediumFamily::Lto(lib::LtoGen::Lto9)));
     assert_eq!(ready.barcode.as_ref().unwrap().as_str(), "UNT001L9");

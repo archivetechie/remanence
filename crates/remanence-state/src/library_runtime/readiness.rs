@@ -112,9 +112,12 @@ impl LibraryRuntime {
             _ => lib::ReadinessResult::Pending,
         };
         if let Some((_, owner)) = &prior_source {
+            let limit_ms = owner.limit_ms.ok_or_else(|| {
+                invalid("readiness owner refresh changed immutable creation facts")
+            })?;
             let represented_deadline = owner
                 .started_unix_ns
-                .checked_add(owner.limit_ms.saturating_mul(1_000_000))
+                .checked_add(limit_ms.saturating_mul(1_000_000))
                 .ok_or_else(|| invalid("readiness deadline overflow"))?;
             if owner.endpoint != endpoint
                 || owner.barcode.as_ref().map(|b| b.as_str()) != input.barcode.as_deref()
@@ -153,10 +156,13 @@ impl LibraryRuntime {
                     let duration = deadline_ns
                         .checked_sub(started_unix_ns)
                         .ok_or(lib::store::StoreError::Fold(lib::FoldError::InvalidSchema))?;
-                    (None, started_unix_ns, duration / 1_000_000)
+                    (None, started_unix_ns, Some(duration / 1_000_000))
                 }
             };
             let value = lib::ReadinessObserved {
+                source_slot: None,
+                run: None,
+                cancel_source: None,
                 operation: *input.operation_id.as_bytes(),
                 endpoint,
                 tape: None,

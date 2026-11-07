@@ -2883,6 +2883,7 @@ pub(crate) fn raise_tape_io_fence(
         .append(|authority, view| {
             authority.fence_raised(
                 lib::FenceRaised {
+                    detail: lib::Bounded(vec![]),
                     kind: lib::FenceKind::Write,
                     scope: lib::FenceScope::Tape(tape.tape),
                     cause,

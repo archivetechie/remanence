@@ -554,7 +554,7 @@ impl CatalogCore {
             )?,
             Body::VerificationVerdict(v) => project_verification_core(
                 &self.conn,
-                &v.at.tape.uuid,
+                &v.tape.uuid,
                 &at,
                 if !v.damaged.0.is_empty() {
                     3
@@ -915,14 +915,18 @@ impl CatalogCore {
                                 .into(),
                             )
                         },
-                        deadline_at_utc: Some(
-                            OffsetDateTime::from_unix_timestamp_nanos(
-                                i128::from(v.started_unix_ns) + i128::from(v.limit_ms) * 1_000_000,
-                            )
-                            .map_err(|e| StateError::IndexCorrupt(e.to_string()))?
-                            .format(&Rfc3339)
-                            .map_err(|e| StateError::IndexCorrupt(e.to_string()))?,
-                        ),
+                        deadline_at_utc: v
+                            .limit_ms
+                            .map(|limit_ms| {
+                                OffsetDateTime::from_unix_timestamp_nanos(
+                                    i128::from(v.started_unix_ns)
+                                        + i128::from(limit_ms) * 1_000_000,
+                                )
+                                .map_err(|e| StateError::IndexCorrupt(e.to_string()))?
+                                .format(&Rfc3339)
+                                .map_err(|e| StateError::IndexCorrupt(e.to_string()))
+                            })
+                            .transpose()?,
                         evidence_path: None,
                     },
                 )?;

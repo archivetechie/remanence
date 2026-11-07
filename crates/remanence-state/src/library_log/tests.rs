@@ -100,6 +100,9 @@ pub(super) fn evidence() -> CompletionEvidence {
 }
 pub(super) fn provision(n: u8, label: Option<&str>) -> Body {
     Body::Reprovision(Reprovision {
+        pool_source: None,
+        operation: None,
+        replaced_bot: None,
         tape: tape(n),
         predecessor: None,
         mode: ProvisionMode::Initialize,
@@ -248,8 +251,10 @@ pub(super) fn progress(n: u32) -> Body {
 }
 pub(super) fn verdict() -> Body {
     Body::VerificationVerdict(VerificationVerdict {
+        tape: tape(1),
+        outcome: VerificationOutcome::VerifiedComplete,
         operation: [7; 16],
-        at: at(1, 1),
+        at: Some(at(1, 1)),
         damaged: Bounded(vec![]),
         unprotected: None,
         modes: 1,
@@ -259,6 +264,7 @@ pub(super) fn verdict() -> Body {
 }
 pub(super) fn fence(n: u8) -> Body {
     Body::FenceRaised(FenceRaised {
+        detail: Bounded(vec![]),
         kind: FenceKind::Write,
         scope: FenceScope::Tape(tape(n)),
         cause: FenceCause::TransferError,
@@ -456,6 +462,7 @@ fn release_before_raise_is_refused() {
         feed(
             &mut f,
             Body::FenceReleased(FenceReleased {
+                detail: Bounded(vec![]),
                 fence: 1,
                 evidence: "proof".into(),
                 forced: true
@@ -469,6 +476,7 @@ fn release_before_raise_is_refused() {
         feed(
             &mut f,
             Body::FenceReleased(FenceReleased {
+                detail: Bounded(vec![]),
                 fence: 3,
                 evidence: "proof".into(),
                 forced: true
@@ -576,7 +584,11 @@ fn tape_owned_fact_cannot_be_expressed() {
     use crate::log_frame::cbor::Wire;
     assert!(SessionKind::get(&mut &[0u8][..]).is_err());
     assert!(RecoveryAction::get(&mut &[0x82, 0, 0xf6][..]).is_err());
-    assert!(DiagnosticEvent::get(&mut &[20u8][..]).is_err());
+    assert_eq!(
+        DiagnosticEvent::get(&mut &[20u8][..]).unwrap(),
+        DiagnosticEvent::RefusalRecorded
+    );
+    assert!(DiagnosticEvent::get(&mut &[21u8][..]).is_err());
 }
 /// The reserved unprotected pair round-trips and waits without any public constructor.
 #[test]
@@ -1112,6 +1124,9 @@ fn b4b0_d2_native_contradiction_precedes_library_rules() {
 fn readiness_chain_generation_and_terminal_rules() {
     let mut f = initialized();
     let mut v = ReadinessObserved {
+        source_slot: None,
+        run: None,
+        cancel_source: None,
         scope: ReadinessScope::Endpoint,
         media: None,
         operation: [90; 16],
@@ -1122,7 +1137,7 @@ fn readiness_chain_generation_and_terminal_rules() {
         state: ReadinessState::Planned,
         previous: None,
         started_unix_ns: 0,
-        limit_ms: 1,
+        limit_ms: Some(1),
         evidence: None,
         load_intent: None,
         ready_generation: 1,
@@ -1353,6 +1368,9 @@ pub(super) fn configuration(generation: u64) -> Body {
 /// Readiness can cite a LOAD after its outcome has removed the open intent.
 pub(super) fn readiness_for(reference: DecisionRef) -> Body {
     Body::ReadinessObserved(ReadinessObserved {
+        source_slot: None,
+        run: None,
+        cancel_source: None,
         scope: ReadinessScope::Endpoint,
         media: None,
         operation: [90; 16],
@@ -1363,7 +1381,7 @@ pub(super) fn readiness_for(reference: DecisionRef) -> Body {
         state: ReadinessState::Planned,
         previous: None,
         started_unix_ns: 0,
-        limit_ms: 1,
+        limit_ms: Some(1),
         evidence: None,
         load_intent: Some(reference),
         ready_generation: 1,
@@ -1756,6 +1774,7 @@ fn identical_rule_retry_under_superseded_configuration_is_stale() {
 /// A fence wire reference carries only the raise sequence.
 pub(super) fn release(sequence: u64) -> Body {
     Body::FenceReleased(FenceReleased {
+        detail: Bounded(vec![]),
         fence: sequence,
         evidence: "proof".into(),
         forced: false,
@@ -2016,6 +2035,7 @@ pub(super) fn medium_change(medium: MediumSpec, expected: u64) -> Body {
 /// Each reserved vocabulary item has an otherwise ordinary fence shape.
 pub(super) fn reserved_fence(model: bool) -> Body {
     Body::FenceRaised(FenceRaised {
+        detail: Bounded(vec![]),
         kind: if model {
             FenceKind::DriveFault
         } else {
@@ -2549,6 +2569,7 @@ pub(super) fn freeze_history(drive: bool) -> Vec<Body> {
         supersede(9, 3),
         supersede(10, 4),
         Body::FenceRaised(FenceRaised {
+            detail: Bounded(vec![]),
             kind: if drive {
                 FenceKind::DriveFault
             } else {
@@ -2856,6 +2877,7 @@ fn b4b0_d1_d8_drive_release_after_contradicted_motion() {
         verdict(),
         intent(1),
         Body::FenceRaised(FenceRaised {
+            detail: Bounded(vec![]),
             kind: FenceKind::DriveFault,
             scope: FenceScope::Drive(endpoint("LIBA0001")),
             cause: FenceCause::TransferError,
@@ -2941,7 +2963,8 @@ fn b4b0_d5_repair_received_reference_floor() {
         let mut h = History::default();
         let mut b = verdict();
         if let Body::VerificationVerdict(v) = &mut b {
-            v.at = at(1, 9);
+            v.at = Some(at(1, 9));
+            v.tape = tape(1);
         }
         b4b0_receive(&mut f, &mut h, b, view).unwrap();
         let r = record(b4b0_repair(8, 8), 4);
@@ -3020,7 +3043,8 @@ fn b4b0_d2_d3_d9_minimum_and_diagnostics_are_bounded() {
         )]));
         let mut b = verdict();
         if let Body::VerificationVerdict(v) = &mut b {
-            v.at = at(1, sequence);
+            v.at = Some(at(1, sequence));
+            v.tape = tape(1);
         }
         b4b0_receive(&mut f, &mut h, b, &view).unwrap();
     }
@@ -3056,7 +3080,8 @@ fn b4b0_d5_pending_repair_keeps_receipt_time_floor() {
     b4b0_receive(&mut f, &mut h, b4b0_repair(8, 8), &View::default()).unwrap();
     let mut b = verdict();
     if let Body::VerificationVerdict(v) = &mut b {
-        v.at = at(1, 9);
+        v.at = Some(at(1, 9));
+        v.tape = tape(1);
     }
     b4b0_receive(&mut f, &mut h, b, &Present).unwrap();
     assert_eq!(f.highest_reference(tape(1)), Some(9));
@@ -3320,7 +3345,8 @@ fn cleaning_identity_creation_expiry_and_data_kind_refusals() {
     }
     let mut dependent = verdict();
     if let Body::VerificationVerdict(v) = &mut dependent {
-        v.at.tape = cartridge;
+        v.at.as_mut().unwrap().tape = cartridge;
+        v.tape = cartridge;
     }
     let mut predecessor = provision(3, None);
     if let Body::Reprovision(v) = &mut predecessor {

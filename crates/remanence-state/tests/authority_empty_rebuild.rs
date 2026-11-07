@@ -131,6 +131,9 @@ impl Fixture {
             .a()
             .reprovision(
                 Reprovision {
+                    pool_source: None,
+                    operation: None,
+                    replaced_bot: None,
                     tape: tape(id),
                     predecessor: None,
                     mode: ProvisionMode::Initialize,
@@ -495,6 +498,7 @@ fn authority_empty_rebuild_drive_fence_kept() {
         .a()
         .fence_raised(
             FenceRaised {
+                detail: Bounded(vec![]),
                 kind: FenceKind::DriveFault,
                 scope: FenceScope::Drive(key()),
                 cause: FenceCause::TransferError,
@@ -605,6 +609,9 @@ fn authority_empty_rebuild_readiness_operation_and_load_budget_kept() {
         .a()
         .begin_readiness(
             ReadinessObserved {
+                source_slot: None,
+                run: None,
+                cancel_source: None,
                 scope: ReadinessScope::Endpoint,
                 media: None,
                 operation,
@@ -615,7 +622,7 @@ fn authority_empty_rebuild_readiness_operation_and_load_budget_kept() {
                 state: ReadinessState::Planned,
                 previous: None,
                 started_unix_ns: 1_793_664_000_000_000_000,
-                limit_ms: 1000,
+                limit_ms: Some(1000),
                 evidence: None,
                 load_intent: None,
                 ready_generation: 1,
@@ -984,6 +991,7 @@ fn authority_fence_refuses_dead_evidence_tape_and_stale_generation() {
     for scope in [FenceScope::Drive(key()), FenceScope::Tape(tape(1))] {
         let result = f.a().fence_raised(
             FenceRaised {
+                detail: Bounded(vec![]),
                 kind: if matches!(scope, FenceScope::Tape(_)) {
                     FenceKind::Write
                 } else {
@@ -1250,6 +1258,7 @@ fn authority_overlapping_drive_fences_and_late_identity() {
             .a()
             .fence_raised(
                 FenceRaised {
+                    detail: Bounded(vec![]),
                     kind: FenceKind::DriveFault,
                     scope: FenceScope::Drive(key()),
                     cause: FenceCause::TransferError,
@@ -1271,6 +1280,7 @@ fn authority_overlapping_drive_fences_and_late_identity() {
             .a()
             .fence_released(
                 FenceReleased {
+                    detail: Bounded(vec![]),
                     fence: sequence,
                     evidence: "verified".into(),
                     forced: false,
@@ -1696,6 +1706,9 @@ fn authority_adoption_recovery_state_and_request_binding() {
             .a()
             .reprovision(
                 Reprovision {
+                    pool_source: None,
+                    operation: None,
+                    replaced_bot: None,
                     tape: TapeRef {
                         uuid: id,
                         incarnation: 1,
@@ -1812,6 +1825,9 @@ fn authority_readiness_completion_evidence_kept() {
         .a()
         .begin_readiness(
             ReadinessObserved {
+                source_slot: None,
+                run: None,
+                cancel_source: None,
                 scope: ReadinessScope::Endpoint,
                 media: None,
                 operation: [0; 16],
@@ -1822,7 +1838,7 @@ fn authority_readiness_completion_evidence_kept() {
                 state: ReadinessState::Planned,
                 previous: None,
                 started_unix_ns: 1_793_664_000_000_000_000,
-                limit_ms: 1000,
+                limit_ms: Some(1000),
                 evidence: Some(CompletionEvidence {
                     dispatch: Dispatch::Issued,
                     completion: Completion::Unknown,
@@ -1990,6 +2006,7 @@ fn ruling13_suffix_fence_survives_unprojected_crash_and_explicit_release() {
         .a()
         .fence_raised(
             FenceRaised {
+                detail: Bounded(vec![]),
                 kind: FenceKind::Write,
                 scope: FenceScope::Tape(tape(1)),
                 cause: FenceCause::SessionSuffixContradiction,
@@ -2027,6 +2044,7 @@ fn ruling13_suffix_fence_survives_unprojected_crash_and_explicit_release() {
         .a()
         .fence_released(
             FenceReleased {
+                detail: Bounded(vec![]),
                 fence: 0,
                 evidence: "wrong fence identity".into(),
                 forced: false
@@ -2040,6 +2058,7 @@ fn ruling13_suffix_fence_survives_unprojected_crash_and_explicit_release() {
         .a()
         .fence_released(
             FenceReleased {
+                detail: Bounded(vec![]),
                 fence,
                 evidence: "operator proved and superseded the physical suffix".into(),
                 forced: false,

@@ -710,6 +710,7 @@ fn ready_only_gate_and_wrong_pool_refuse_before_write_motion() {
         .append(|a, v| {
             a.fence_raised(
                 lib::FenceRaised {
+                    detail: lib::Bounded(vec![]),
                     kind: lib::FenceKind::Write,
                     scope: lib::FenceScope::Tape(tape),
                     cause: lib::FenceCause::TransferError,
@@ -2095,6 +2096,7 @@ fn recovery_effect_cut_completes_initialization_without_rewriting() {
                     .append(|a, v| {
                         a.fence_raised(
                             lib::FenceRaised {
+                                detail: lib::Bounded(vec![]),
                                 kind: lib::FenceKind::Write,
                                 scope: lib::FenceScope::Tape(tape),
                                 cause: lib::FenceCause::SessionSuffixContradiction,
@@ -2233,6 +2235,7 @@ fn recovery_effect_retry_refuses_changed_bootstrap_geometry() {
         .append(|a, v| {
             a.fence_raised(
                 lib::FenceRaised {
+                    detail: lib::Bounded(vec![]),
                     kind: lib::FenceKind::Write,
                     scope: lib::FenceScope::Tape(tape),
                     cause: lib::FenceCause::SessionSuffixContradiction,
@@ -2303,6 +2306,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
             .append(|a, v| {
                 a.fence_raised(
                     lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
                         kind: lib::FenceKind::Write,
                         scope: lib::FenceScope::Tape(tape),
                         cause,
@@ -2435,6 +2439,7 @@ fn suffix_fence_release_requires_explicit_physical_recovery_and_replays() {
             .append(|a, v| {
                 a.fence_raised(
                     lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
                         kind: lib::FenceKind::Write,
                         scope: lib::FenceScope::Tape(tape),
                         cause: lib::FenceCause::SessionSuffixContradiction,

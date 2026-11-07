@@ -646,6 +646,9 @@ impl StateHandle {
             .append(|authority, view| {
                 authority.reprovision(
                     lib::Reprovision {
+                        pool_source: None,
+                        operation: None,
+                        replaced_bot: None,
                         tape: lib::TapeRef {
                             uuid: input.tape_uuid,
                             incarnation: 1,
@@ -976,6 +979,9 @@ impl StateHandle {
             .library
             .adopt_identity(
                 lib::Reprovision {
+                    pool_source: None,
+                    operation: None,
+                    replaced_bot: None,
                     tape: lib::TapeRef {
                         uuid: input.tape_uuid,
                         incarnation: 1,

@@ -152,6 +152,9 @@ fn motion_confirmation_requires_durable_record_of_matching_kind() {
             let observed = if readiness {
                 a.begin_readiness(
                     ReadinessObserved {
+                        source_slot: None,
+                        run: None,
+                        cancel_source: None,
                         scope: ReadinessScope::Endpoint,
                         media: None,
                         operation: [0; 16],
@@ -162,7 +165,7 @@ fn motion_confirmation_requires_durable_record_of_matching_kind() {
                         state: ReadinessState::Ready,
                         previous: None,
                         started_unix_ns: Fixed.now(),
-                        limit_ms: 1000,
+                        limit_ms: Some(1000),
                         evidence: None,
                         load_intent: Some(reference(&intent)),
                         ready_generation: generation,

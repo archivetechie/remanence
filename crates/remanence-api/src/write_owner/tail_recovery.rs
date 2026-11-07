@@ -284,6 +284,7 @@ pub(crate) fn supersede_mounted_tail(
                 .append(|authority, view| {
                     authority.fence_released(
                         lib::FenceReleased {
+                            detail: lib::Bounded(vec![]),
                             fence,
                             evidence:
                                 "operator acknowledgment and repeated physical boundary proof"
@@ -494,6 +495,7 @@ pub(crate) fn supersede_mounted_tail(
             .append(|authority, view| {
                 authority.fence_released(
                     lib::FenceReleased {
+                        detail: lib::Bounded(vec![]),
                         fence,
                         evidence: "operator acknowledgment and successful physical tail recovery"
                             .into(),

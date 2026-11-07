@@ -431,7 +431,7 @@ impl Body {
             Self::SupersedeTail(v) => Some(&v.at),
             Self::AcceptUnprotectedFinalization(v) => Some(&v.at),
             Self::VerificationProgress(v) => Some(&v.at),
-            Self::VerificationVerdict(v) => Some(&v.at),
+            Self::VerificationVerdict(v) => v.at.as_ref(),
             Self::ManualFinalizationAccepted(v) => Some(&v.at),
             Self::RecoveryRecorded(v) => Some(&v.at),
             _ => None,
@@ -440,6 +440,7 @@ impl Body {
     fn tapes(&self) -> Vec<TapeRef> {
         match self {
             Self::AssignPool(v) => vec![v.tape],
+            Self::VerificationVerdict(v) => vec![v.tape],
             Self::Label(v) => std::iter::once(v.tape)
                 .chain(v.prior_holder.as_ref().map(|x| x.tape))
                 .collect(),
@@ -462,6 +463,10 @@ impl Body {
     fn refs(&self) -> Vec<DecisionRef> {
         match self {
             Self::AssignPool(v) => v.configuration.into_iter().collect(),
+            Self::Reprovision(v) => match v.pool_source {
+                Some(PoolSource::Rule(reference)) => vec![reference],
+                _ => vec![],
+            },
             Self::MotionOutcome(v) => vec![v.intent],
             Self::InventoryReconciled(v) => v.resolves.0.clone(),
             Self::VerificationVerdict(v) => v.progress.into_iter().collect(),
@@ -976,12 +981,43 @@ impl LibraryFold {
     }
     fn validate_shape(&self, sequence: u64, r: &Record) -> Result<(), FoldError> {
         let b = &r.body;
+        let modes = match b {
+            Body::VerificationProgress(v) => Some(v.modes),
+            Body::VerificationVerdict(v) => {
+                if v.at.as_ref().is_some_and(|at| at.tape != v.tape)
+                    || (v.outcome == VerificationOutcome::VerifiedComplete
+                        && !v.damaged.0.is_empty())
+                {
+                    return Err(FoldError::InvalidSchema);
+                }
+                Some(v.modes)
+            }
+            _ => None,
+        };
+        if modes.is_some_and(|modes| modes == 0 || modes & !0x7f != 0) {
+            return Err(FoldError::InvalidSchema);
+        }
+        // Diagnostic and fence evidence share one canonical detail representation.
+        let detail = match b {
+            Body::FenceRaised(v) => Some(&v.detail),
+            Body::FenceReleased(v) => Some(&v.detail),
+            Body::Diagnostic(v) => Some(&v.detail),
+            _ => None,
+        };
+        if detail.is_some_and(|d| d.0.windows(2).any(|w| w[0].0 >= w[1].0)) {
+            return Err(FoldError::InvalidSchema);
+        }
         if let Body::InventoryReconciled(v) = b {
             if matches!(v.subject, InventorySubject::Standalone(_))
                 && (!v.complete || !v.elements.0.is_empty())
             {
                 return Err(FoldError::InvalidSchema);
             }
+        }
+        if matches!(b, Body::Reprovision(v) if v.replaced_bot.is_some()
+            && (v.mode != ProvisionMode::Initialize || v.predecessor.is_some()))
+        {
+            return Err(FoldError::InvalidSchema);
         }
         if let Body::ReadinessObserved(v) = b {
             if v.tape.is_some() && v.media.is_some() {
@@ -1058,24 +1094,31 @@ impl LibraryFold {
         let b = &r.body;
         // A retry computed under a superseded configuration is stale too.
         // This check intentionally precedes retained-body duplicate detection.
-        if let Body::AssignPool(v) = b {
-            if v.source == AssignmentSource::Rule {
-                let reference = v.configuration.ok_or(FoldError::WrongCounterpart)?;
-                let latest = self
-                    .last(Tag::ConfigurationAccepted, Scope::Config)
-                    .ok_or(FoldError::WrongCounterpart)?;
-                if latest.record.reference(latest.sequence) != reference {
-                    return Err(
-                        if self
-                            .historical(reference, history)?
-                            .is_some_and(|r| r.body.tag() == Tag::ConfigurationAccepted)
-                        {
-                            FoldError::StaleConfiguration
-                        } else {
-                            FoldError::WrongCounterpart
-                        },
-                    );
-                }
+        let rule_configuration = match b {
+            Body::AssignPool(v) if v.source == AssignmentSource::Rule => {
+                Some(v.configuration.ok_or(FoldError::WrongCounterpart)?)
+            }
+            Body::Reprovision(v) => match v.pool_source {
+                Some(PoolSource::Rule(reference)) => Some(reference),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(reference) = rule_configuration {
+            let latest = self
+                .last(Tag::ConfigurationAccepted, Scope::Config)
+                .ok_or(FoldError::WrongCounterpart)?;
+            if latest.record.reference(latest.sequence) != reference {
+                return Err(
+                    if self
+                        .historical(reference, history)?
+                        .is_some_and(|r| r.body.tag() == Tag::ConfigurationAccepted)
+                    {
+                        FoldError::StaleConfiguration
+                    } else {
+                        FoldError::WrongCounterpart
+                    },
+                );
             }
         }
         // Retirement dominates duplicate handling: an old decision cannot resurrect an identity.
@@ -1361,6 +1404,11 @@ impl LibraryFold {
                 if let Some(held) = self.fences.get(&v.fence) {
                     if let Body::FenceRaised(raised) = &held.record.body {
                         release_scope(&raised.scope)?;
+                        if !v.detail.0.is_empty()
+                            && (!v.forced || raised.cause != FenceCause::NativeLogBehindProjection)
+                        {
+                            return Err(FoldError::InvalidSchema);
+                        }
                     }
                 }
                 if !self.fences.contains_key(&v.fence) {
@@ -1504,7 +1552,7 @@ impl LibraryFold {
                     let Body::VerificationProgress(p) = &h.record.body else {
                         unreachable!()
                     };
-                    if p.at != v.at || p.modes != v.modes {
+                    if v.at.as_ref() != Some(&p.at) || p.modes != v.modes {
                         return Err(FoldError::VerdictWithoutCoverage);
                     }
                 }
@@ -1738,8 +1786,15 @@ impl LibraryFold {
                 }
             }
             Diagnostic(v) => {
-                if v.detail.0.windows(2).any(|w| w[0].0 >= w[1].0) {
-                    return Err(FoldError::InvalidSchema);
+                if v.event == DiagnosticEvent::RefusalRecorded {
+                    let code = v.detail.0.iter().find(|e| e.0.as_str() == "code");
+                    let name = v.detail.0.iter().find(|e| e.0.as_str() == "name");
+                    if !matches!(code, Some(DiagnosticEntry(_, DiagnosticValue::Unsigned(n)))
+                        if u32::try_from(*n).ok().and_then(RefusalCode::from_u32).is_some())
+                        || !matches!(name, Some(DiagnosticEntry(_, DiagnosticValue::Text(_))))
+                    {
+                        return Err(FoldError::InvalidSchema);
+                    }
                 }
             }
             SupersedeTail(_) => {}
@@ -2156,7 +2211,9 @@ impl LibraryFold {
         let mut s = self.fence_scopes(b);
         for d in b.refs() {
             // Rule configurations use only the retained latest configuration.
-            if matches!(b, Body::AssignPool(v) if v.source == AssignmentSource::Rule) {
+            if matches!(b, Body::AssignPool(v) if v.source == AssignmentSource::Rule)
+                || matches!(b, Body::Reprovision(v) if matches!(v.pool_source, Some(PoolSource::Rule(_))))
+            {
                 s.insert(Scope::Config);
             } else if let Some(h) = self.historical(d, history)? {
                 s.extend(h.body.scopes());
@@ -2179,6 +2236,10 @@ impl LibraryFold {
                 FenceScope::Tape(t) => BTreeSet::from([Scope::Tape(t.uuid)]),
                 FenceScope::Drive(_) | FenceScope::Model { .. } => BTreeSet::new(),
             };
+        }
+        // An unreferenced verdict orders only on its tape and operation, never labels.
+        if matches!(b, Body::VerificationVerdict(v) if v.at.is_none()) {
+            return b.scopes();
         }
         let mut scopes = b.scopes();
         for tape in b.tapes() {
@@ -2771,6 +2832,9 @@ mod retention_tests {
         feed(
             &mut fold,
             Body::ReadinessObserved(ReadinessObserved {
+                source_slot: None,
+                run: None,
+                cancel_source: None,
                 scope: ReadinessScope::Endpoint,
                 media: None,
                 operation: [8; 16],
@@ -2781,7 +2845,7 @@ mod retention_tests {
                 state: ReadinessState::Ready,
                 previous: None,
                 started_unix_ns: 0,
-                limit_ms: 1,
+                limit_ms: Some(1),
                 evidence: None,
                 load_intent: None,
                 ready_generation: 1,
@@ -2841,5 +2905,89 @@ mod contradiction_tests {
             assert!(f.fence_liveness_failures.is_empty());
             assert_eq!(f.open_fences(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod verdict_shape_tests {
+    use super::*;
+    use crate::library_log::tests::*;
+
+    /// Unreferenced verdicts never query native evidence, including behind scope blockers.
+    struct NoNative;
+    impl TapeView for NoNative {
+        fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+            panic!("unreferenced verdict consulted native evidence")
+        }
+    }
+
+    /// D-W-7 preserves tape/operation order, excludes labels and records no native floor.
+    #[test]
+    fn unreferenced_verdict_orders_without_native_evidence() {
+        let mut f = LibraryFold::default();
+        let mut h = History::default();
+        b4b0_receive(&mut f, &mut h, provision(1, Some("A")), &Present).unwrap();
+        b4b0_receive(&mut f, &mut h, provision(2, Some("B")), &Present).unwrap();
+        b4b0_receive(&mut f, &mut h, provision(3, Some("C")), &Present).unwrap();
+        b4b0_receive(&mut f, &mut h, verdict(), &View::default()).unwrap();
+        for (t, op, held) in [(1, 8, true), (2, 7, true), (3, 9, false)] {
+            let Body::VerificationVerdict(mut v) = verdict() else {
+                unreachable!()
+            };
+            v.at = None;
+            v.tape = tape(t);
+            v.operation = [op; 16];
+            let b = Body::VerificationVerdict(v);
+            assert_eq!(
+                f.scopes_for(&b, &h).unwrap(),
+                BTreeSet::from([Scope::Tape(tape(t).uuid), Scope::Operation([op; 16])])
+            );
+            let pending = f.pending.len();
+            b4b0_receive(&mut f, &mut h, b, &NoNative).unwrap();
+            assert_eq!(f.pending.len(), pending + usize::from(held));
+            assert_eq!(f.highest_reference(tape(2)), None);
+        }
+        // Replay resolution can gain native evidence without invalidating None verdicts.
+        f.resolve(&Present, &h).unwrap();
+        assert!(f.pending.is_empty());
+        assert_eq!(f.highest_reference(tape(1)), Some(1));
+        assert_eq!(f.highest_reference(tape(2)), None);
+    }
+
+    /// Verdict identity, outcome and both verification mode masks are shape constraints.
+    #[test]
+    fn verification_shape_precedes_native_lookup() {
+        let f = LibraryFold::default();
+        for modes in [0, 128, u32::MAX] {
+            for mut b in [verdict(), progress(1)] {
+                match &mut b {
+                    Body::VerificationVerdict(v) => v.modes = modes,
+                    Body::VerificationProgress(v) => v.modes = modes,
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    f.validate_shape(1, &record(b, 1)),
+                    Err(FoldError::InvalidSchema)
+                );
+            }
+        }
+        let Body::VerificationVerdict(mut v) = verdict() else {
+            unreachable!()
+        };
+        v.tape = tape(2);
+        assert_eq!(
+            f.validate_shape(1, &record(Body::VerificationVerdict(v.clone()), 1)),
+            Err(FoldError::InvalidSchema)
+        );
+        v.tape = tape(1);
+        v.damaged = Bounded(vec![DamagedRange {
+            partition: 0,
+            start_lba: 1,
+            end_lba: 2,
+        }]);
+        assert_eq!(
+            f.validate_shape(1, &record(Body::VerificationVerdict(v), 1)),
+            Err(FoldError::InvalidSchema)
+        );
     }
 }

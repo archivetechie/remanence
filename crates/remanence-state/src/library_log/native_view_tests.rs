@@ -229,7 +229,8 @@ fn fresh_supersede_uses_existing_header_and_rejects_replaced_identity() {
     let Body::VerificationVerdict(mut verdict) = verdict() else {
         unreachable!()
     };
-    verdict.at = at.clone();
+    verdict.at = Some(at.clone());
+    verdict.tape = at.tape;
     assert!(matches!(
         authority.verification_verdict(verdict, AuditActor::System, SourceLayer::Layer4, &view),
         Err(AuthorityError::Store(LibraryStoreError::Fold(

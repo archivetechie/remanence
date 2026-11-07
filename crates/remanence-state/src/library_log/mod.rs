@@ -421,6 +421,61 @@ pub struct Failed {
     /// CBOR key 2: `Text`.
     pub summary: Text,
 }
+/// Stable refusal codes shared by Failed and RefusalRecorded; zero is never emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RefusalCode {
+    /// Refusal code 1.
+    TapeLogBehindProjection = 1,
+    /// Refusal code 2.
+    ContradictedTapeAdmission = 2,
+    /// Refusal code 3.
+    ClosedOperationRetry = 3,
+    /// Refusal code 4.
+    RetainedIntentForeignOwner = 4,
+    /// Refusal code 5.
+    StandaloneFenceUnrecorded = 5,
+    /// Refusal code 6.
+    ReconcileTapeDeferred = 6,
+    /// Refusal code 7.
+    UnknownGenerationAdoption = 7,
+    /// Refusal code 8.
+    DriveIdentityConflictLatch = 8,
+    /// Refusal code 9.
+    ForeignDrivePollDisabled = 9,
+    /// Refusal code 10.
+    DriveStewardshipDeferred = 10,
+    /// Refusal code 11.
+    CheckpointBarrierAlarmUnrecorded = 11,
+    /// Refusal code 12.
+    DriveFenced = 12,
+    /// Refusal code 13.
+    TailRepairDeferred = 13,
+    /// Refusal code 14.
+    JournalImportDeferred = 14,
+}
+impl RefusalCode {
+    /// Decode an allocated refusal code.
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::TapeLogBehindProjection),
+            2 => Some(Self::ContradictedTapeAdmission),
+            3 => Some(Self::ClosedOperationRetry),
+            4 => Some(Self::RetainedIntentForeignOwner),
+            5 => Some(Self::StandaloneFenceUnrecorded),
+            6 => Some(Self::ReconcileTapeDeferred),
+            7 => Some(Self::UnknownGenerationAdoption),
+            8 => Some(Self::DriveIdentityConflictLatch),
+            9 => Some(Self::ForeignDrivePollDisabled),
+            10 => Some(Self::DriveStewardshipDeferred),
+            11 => Some(Self::CheckpointBarrierAlarmUnrecorded),
+            12 => Some(Self::DriveFenced),
+            13 => Some(Self::TailRepairDeferred),
+            14 => Some(Self::JournalImportDeferred),
+            _ => None,
+        }
+    }
+}
 /// Cache fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cache {
@@ -514,6 +569,12 @@ pub struct Reprovision {
     pub endpoint: Option<DriveKey>,
     /// CBOR key 9: `Option<Adoption>`.
     pub adoption: Option<Adoption>,
+    /// CBOR key 10: optional source of the pool assignment.
+    pub pool_source: Option<PoolSource>,
+    /// CBOR key 11: optional initialization operation.
+    pub operation: Option<Id>,
+    /// CBOR key 12: overwritten BOT identity; evidence only.
+    pub replaced_bot: Option<Id>,
 }
 /// MediumSpecSet fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -568,6 +629,8 @@ pub struct FenceRaised {
     pub at: Option<TapeAt>,
     /// CBOR key 5: `Option<Id>`.
     pub operation: Option<Id>,
+    /// CBOR key 6: presentation evidence in strictly ascending byte-key order.
+    pub detail: Bounded<DiagnosticEntry, 256>,
 }
 impl From<&remanence_library::outcome::CompletionEvidence> for CompletionEvidence {
     fn from(value: &remanence_library::outcome::CompletionEvidence) -> Self {
@@ -598,6 +661,8 @@ pub struct FenceReleased {
     pub evidence: Text,
     /// CBOR key 2: `bool`.
     pub forced: bool,
+    /// CBOR key 3: presentation evidence in strictly ascending byte-key order.
+    pub detail: Bounded<DiagnosticEntry, 256>,
 }
 /// MotionIntent fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -664,8 +729,8 @@ pub struct VerificationProgress {
 pub struct VerificationVerdict {
     /// CBOR key 0: `Id`.
     pub operation: Id,
-    /// CBOR key 1: `TapeAt`.
-    pub at: TapeAt,
+    /// CBOR key 1: native reference, absent when none existed at recording time.
+    pub at: Option<TapeAt>,
     /// CBOR key 2: `Bounded<DamagedRange, 4096>`.
     pub damaged: Bounded<DamagedRange, 4096>,
     /// CBOR key 3: `Option<Unprotected>`.
@@ -676,6 +741,10 @@ pub struct VerificationVerdict {
     pub edition_digest: Option<Hash>,
     /// CBOR key 6: `Option<DecisionRef>`.
     pub progress: Option<DecisionRef>,
+    /// CBOR key 7: verdict subject, including when no native reference exists.
+    pub tape: TapeRef,
+    /// CBOR key 8: terminal verification outcome.
+    pub outcome: VerificationOutcome,
 }
 /// ManualFinalizationAccepted fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -741,8 +810,8 @@ pub struct ReadinessObserved {
     pub previous: Option<DecisionRef>,
     /// CBOR key 7: `u64`.
     pub started_unix_ns: u64,
-    /// CBOR key 8: `u64`.
-    pub limit_ms: u64,
+    /// CBOR key 8: deadline duration, or no deadline.
+    pub limit_ms: Option<u64>,
     /// CBOR key 9: `Option<CompletionEvidence>`.
     pub evidence: Option<CompletionEvidence>,
     /// CBOR key 10: `Option<DecisionRef>`.
@@ -755,6 +824,12 @@ pub struct ReadinessObserved {
     pub scope: ReadinessScope,
     /// CBOR key 14: family before provisioning; forbidden with a tape identity.
     pub media: Option<MediumFamily>,
+    /// CBOR key 15: optional source slot.
+    pub source_slot: Option<u16>,
+    /// CBOR key 16: optional run identity.
+    pub run: Option<Id>,
+    /// CBOR key 17: optional cancellation source.
+    pub cancel_source: Option<CancelSource>,
 }
 /// DriveObserved fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -898,6 +973,36 @@ pub struct Diagnostic {
     /// CBOR key 3: `Bounded<DiagnosticEntry, 256>`.
     pub detail: Bounded<DiagnosticEntry, 256>,
 }
+/// Pool assignment source, encoded as `[code, payload]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PoolSource {
+    /// Wire code 0: operator assignment.
+    Operator(Unit),
+    /// Wire code 1: latest retained configuration.
+    Rule(DecisionRef),
+}
+/// Closed CancelSource wire vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum CancelSource {
+    /// Wire code 0.
+    Operator = 0,
+    /// Wire code 1.
+    Shutdown = 1,
+    /// Wire code 2.
+    StartupReconcile = 2,
+}
+/// Closed VerificationOutcome wire vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum VerificationOutcome {
+    /// Wire code 0.
+    VerifiedComplete = 0,
+    /// Wire code 1.
+    VerifiedDegraded = 1,
+    /// Wire code 2.
+    RecoveryRequired = 2,
+}
 /// Closed AssignmentSource wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
@@ -991,6 +1096,8 @@ pub enum FenceCause {
     ContainerQuarantine = 12,
     /// Wire code 13; a checkpoint durability barrier failed.
     CheckpointBarrierFailed = 13,
+    /// Wire code 14.
+    NativeLogBehindProjection = 14,
 }
 /// Closed MotionResult wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1151,6 +1258,10 @@ pub enum ReadinessPhase {
     BeforeAlreadyLoadedTur = 47,
     /// Wire code 48; production readiness phase.
     AfterAlreadyLoadedTur = 48,
+    /// Wire code 49.
+    LoadDriveReadiness = 49,
+    /// Wire code 50.
+    LoadDriveCompletion = 50,
 }
 /// Closed ReadinessState wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1314,6 +1425,10 @@ pub enum AlarmKind {
     ContradictedTape = 9,
     /// Wire code 10; a durable pending record failed resolution.
     PendingRecordRejected = 10,
+    /// Wire code 11.
+    DriveSerialCollision = 11,
+    /// Wire code 12.
+    RetiredDriveReappeared = 12,
 }
 /// Closed Severity wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1436,6 +1551,8 @@ pub enum DiagnosticEvent {
     ReadOnlyModeLeft = 18,
     /// Wire code 19.
     AuditWriteFailed = 19,
+    /// Wire code 20.
+    RefusalRecorded = 20,
 }
 /// DriveKey: each variant is encoded as `[code, payload]`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -213,6 +213,9 @@ fn readiness_scope_and_unprovisioned_family_survive() {
     let (id, receipt) = a
         .begin_readiness(
             ReadinessObserved {
+                source_slot: None,
+                run: None,
+                cancel_source: None,
                 scope: ReadinessScope::Library,
                 media: Some(MediumFamily::Lto(LtoGen::Lto9)),
                 operation: [0; 16],
@@ -226,7 +229,7 @@ fn readiness_scope_and_unprovisioned_family_survive() {
                 state: ReadinessState::AbortedUnknown,
                 previous: None,
                 started_unix_ns: 1_793_664_000_000_000_000,
-                limit_ms: 1000,
+                limit_ms: Some(1000),
                 evidence: None,
                 load_intent: None,
                 ready_generation: 1,
@@ -307,6 +310,9 @@ fn retired_data_cartridge_can_be_registered_after_crash() {
         &mut typed,
         a.reprovision(
             Reprovision {
+                pool_source: None,
+                operation: None,
+                replaced_bot: None,
                 tape,
                 predecessor: None,
                 mode: ProvisionMode::Initialize,
@@ -573,6 +579,9 @@ fn readiness_uses_provisioned_family_and_rejects_override() {
         &mut sql,
         a.reprovision(
             Reprovision {
+                pool_source: None,
+                operation: None,
+                replaced_bot: None,
                 tape,
                 predecessor: None,
                 mode: ProvisionMode::Initialize,
@@ -598,6 +607,9 @@ fn readiness_uses_provisioned_family_and_rejects_override() {
         .unwrap(),
     );
     let mut observation = ReadinessObserved {
+        source_slot: None,
+        run: None,
+        cancel_source: None,
         operation: [0; 16],
         endpoint: DriveKey::Bay(Bay {
             library_serial: "LIB".into(),
@@ -609,7 +621,7 @@ fn readiness_uses_provisioned_family_and_rejects_override() {
         state: ReadinessState::AbortedUnknown,
         previous: None,
         started_unix_ns: 1_793_664_000_000_000_000,
-        limit_ms: 1000,
+        limit_ms: Some(1000),
         evidence: None,
         load_intent: None,
         ready_generation: 1,

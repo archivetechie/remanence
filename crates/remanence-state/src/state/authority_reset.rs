@@ -987,6 +987,9 @@ block_size = 262144
             .append(|a, v| {
                 a.reprovision(
                     lib::Reprovision {
+                        pool_source: None,
+                        operation: None,
+                        replaced_bot: None,
                         tape: lib::TapeRef {
                             uuid: [0x71; 16],
                             incarnation: 1,

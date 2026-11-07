@@ -406,6 +406,9 @@ mod tests {
             .append(|a, v| {
                 a.reprovision(
                     lib::Reprovision {
+                        pool_source: None,
+                        operation: None,
+                        replaced_bot: None,
                         tape,
                         predecessor: None,
                         mode: lib::ProvisionMode::Initialize,

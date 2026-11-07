@@ -473,6 +473,7 @@ impl LibraryRuntime {
             self.append_locked(|a, v| {
                 a.fence_released(
                     lib::FenceReleased {
+                        detail: lib::Bounded(vec![]),
                         fence: sequence,
                         evidence: acknowledgment.into(),
                         forced: false,

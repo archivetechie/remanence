@@ -18,6 +18,9 @@ fn paths(root: &Path) -> StatePaths {
 }
 fn provision() -> Reprovision {
     Reprovision {
+        pool_source: None,
+        operation: None,
+        replaced_bot: None,
         tape: TapeRef {
             uuid: [0xa1; 16],
             incarnation: 1,
@@ -60,6 +63,7 @@ fn runtime_shares_real_identity_and_rebuilds_fence_after_sql_loss() {
         .append(|a, v| {
             a.fence_raised(
                 FenceRaised {
+                    detail: Bounded(vec![]),
                     kind: FenceKind::Write,
                     scope: FenceScope::Tape(provision().tape),
                     cause: FenceCause::SessionSuffixContradiction,
@@ -106,6 +110,7 @@ fn runtime_shares_real_identity_and_rebuilds_fence_after_sql_loss() {
         .append(|a, v| {
             a.fence_released(
                 FenceReleased {
+                    detail: Bounded(vec![]),
                     fence: raise.sequence,
                     evidence: "explicit physical tail proof".into(),
                     forced: false,
@@ -138,6 +143,7 @@ fn runtime_distinguishes_fold_refusal_from_sticky_store_failure() {
     assert!(runtime
         .append(|a, v| a.fence_raised(
             FenceRaised {
+                detail: Bounded(vec![]),
                 kind: FenceKind::Write,
                 scope: FenceScope::Tape(provision().tape),
                 cause: FenceCause::SessionSuffixContradiction,

@@ -83,6 +83,31 @@ def medium(value):
     return family_code
 
 
+def detail(entries):
+    # Ordering is a fold rule: shape-negative corpus entries still decode here.
+    if not (type(entries) is list and len(entries) <= 256):
+        raise ValueError("invalid detail array")
+    for entry in entries:
+        if not (type(entry) is list and len(entry) == 2 and type(entry[0]) is str and len(entry[0].encode()) <= 4096):
+            raise ValueError("invalid detail entry")
+        value = entry[1]
+        if not (type(value) is list and len(value) == 2 and type(value[0]) is int and value[0] in range(6)):
+            raise ValueError("invalid diagnostic value")
+        kind, payload = value
+        if kind == 0 and not (type(payload) is str and len(payload.encode()) <= 4096):
+            raise ValueError("invalid detail text")
+        if kind == 1:
+            uint(payload, 64)
+        if kind == 2 and not (type(payload) is int and -(1 << 63) <= payload < 0):
+            raise ValueError("invalid negative detail")
+        if kind == 3 and not (type(payload) is bytes and len(payload) <= 4194304):
+            raise ValueError("invalid detail bytes")
+        if kind == 4 and type(payload) is not bool:
+            raise ValueError("invalid detail bool")
+        if kind == 5 and payload is not None:
+            raise ValueError("invalid detail null")
+
+
 def main(root):
     seen = set()
     count = 0
@@ -118,7 +143,18 @@ def main(root):
         if code == 4:
             if tag != "Reprovision":
                 raise ValueError("Reprovision tag mismatch")
-            keys(body, 10)
+            keys(body, 13)
+            if body[10] is not None:
+                source = body[10]
+                if not (type(source) is list and len(source) == 2 and type(source[0]) is int and source[0] in (0, 1)):
+                    raise ValueError("invalid pool source")
+                if source[0] == 0 and source[1] is not None:
+                    raise ValueError("operator pool source requires null")
+                if source[0] == 1:
+                    keys(source[1], 2)
+            for key in (11, 12):
+                if body[key] is not None and not (type(body[key]) is bytes and len(body[key]) == 16):
+                    raise ValueError("invalid reprovision identity")
             seen.add(("family", medium(body[6])))
             count += 1
             medium_cases[case] = medium_cases.get(case, 0) + 1
@@ -132,7 +168,8 @@ def main(root):
             count += 1
             medium_cases[case] = medium_cases.get(case, 0) + 1
         elif code == 8:
-            keys(body, 6)
+            keys(body, 7)
+            detail(body[6])
             scope = body[1]
             if not (type(scope) is list and len(scope) == 2):
                 raise ValueError("expected two-element fence scope union")
@@ -140,7 +177,7 @@ def main(root):
             if scope[0] not in (0, 1, 2):
                 raise ValueError("invalid fence scope")
             uint(body[2], 8)
-            if body[2] > 13:
+            if body[2] > 14:
                 raise ValueError("invalid fence cause")
             if scope[0] == 2:
                 keys(scope[1], 2)
@@ -149,6 +186,17 @@ def main(root):
                 seen.add(("reserved", "model"))
             if body[2] == 12:
                 seen.add(("reserved", "quarantine"))
+        elif code == 9:
+            keys(body, 4)
+            detail(body[3])
+        elif code == 14:
+            keys(body, 9)
+            if body[1] is not None:
+                keys(body[1], 3)
+            keys(body[7], 2)
+            uint(body[8], 8)
+            if body[8] > 2:
+                raise ValueError("invalid verification outcome")
         elif code == 12:
             keys(body, 5)
             subject = body[0]
@@ -165,7 +213,20 @@ def main(root):
             uint(body[1], 64)
             seen.add(("inventory-subject", subject[0]))
         elif code == 17:
-            keys(body, 15)
+            keys(body, 18)
+            uint(body[4], 8)
+            if body[4] > 50:
+                raise ValueError("invalid readiness phase")
+            if body[8] is not None:
+                uint(body[8], 64)
+            if body[15] is not None:
+                uint(body[15], 16)
+            if body[16] is not None and not (type(body[16]) is bytes and len(body[16]) == 16):
+                raise ValueError("invalid readiness run")
+            if body[17] is not None:
+                uint(body[17], 8)
+                if body[17] > 2:
+                    raise ValueError("invalid cancellation source")
             if type(body[13]) is not int or body[13] not in (0, 1):
                 raise ValueError("invalid readiness scope")
             seen.add(("readiness-scope", body[13]))
@@ -194,12 +255,23 @@ def main(root):
             action, payload = body[2]
             if type(action) is not int or action not in range(4):
                 raise ValueError("invalid alarm action")
+            if action == 0:
+                keys(payload, 3)
+                uint(payload[0], 8)
+                if payload[0] > 12:
+                    raise ValueError("invalid alarm kind")
             if action == 3:
                 keys(payload, 3)
                 uint(payload[0], 8)
                 if payload[2] is not None:
                     keys(payload[2], 2)
                 seen.add(("alarm-refresh", True))
+        elif code == 32:
+            keys(body, 4)
+            uint(body[0], 8)
+            if body[0] > 20:
+                raise ValueError("invalid diagnostic event")
+            detail(body[3])
     required = {("empty-prefix", True), ("inventory-subject", 0), ("inventory-subject", 1), ("family", 0), ("family", 1), ("tag", 5),
                 ("reserved", "model"), ("reserved", "quarantine"),
                 ("readiness-scope", 0), ("readiness-scope", 1),

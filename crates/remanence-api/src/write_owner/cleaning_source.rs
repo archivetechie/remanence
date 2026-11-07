@@ -281,6 +281,7 @@ pub(super) fn fence(
 ) -> Result<Option<u64>, Status> {
     if let Some(runtime) = cfg.authority.runtime() {
         let value = lib::FenceRaised {
+            detail: lib::Bounded(vec![]),
             kind: lib::FenceKind::DriveFault,
             scope: lib::FenceScope::Drive(lib::DriveKey::Bay(lib::Bay {
                 library_serial: library.into(),
@@ -328,6 +329,7 @@ pub(super) fn release(
             .append(|a, v| {
                 a.fence_released(
                     lib::FenceReleased {
+                        detail: lib::Bounded(vec![]),
                         fence,
                         evidence: reason.into(),
                         forced: false,

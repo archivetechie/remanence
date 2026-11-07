@@ -56,6 +56,9 @@ fn tape(n: u8) -> TapeRef {
 }
 fn provision(n: u8) -> Body {
     Body::Reprovision(Reprovision {
+        pool_source: None,
+        operation: None,
+        replaced_bot: None,
         tape: tape(n),
         predecessor: None,
         mode: ProvisionMode::Initialize,
@@ -263,6 +266,9 @@ mod live_fences {
     }
     fn provision(n: u8, pred: Option<TapeRef>) -> Body {
         Body::Reprovision(Reprovision {
+            pool_source: None,
+            operation: None,
+            replaced_bot: None,
             tape: tape(n),
             predecessor: pred,
             mode: ProvisionMode::Initialize,
@@ -284,6 +290,7 @@ mod live_fences {
     }
     fn fence(t: TapeRef) -> Body {
         Body::FenceRaised(FenceRaised {
+            detail: Bounded(vec![]),
             kind: FenceKind::Write,
             scope: FenceScope::Tape(t),
             cause: FenceCause::TransferError,

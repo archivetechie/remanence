@@ -35,6 +35,9 @@ fn native_crash_ack_checks_type_tape_session_and_preview_before_projection() {
                 .append(|a, v| {
                     a.reprovision(
                         lib::Reprovision {
+                            pool_source: None,
+                            operation: None,
+                            replaced_bot: None,
                             tape: lib::TapeRef {
                                 uuid: id,
                                 incarnation: 1,

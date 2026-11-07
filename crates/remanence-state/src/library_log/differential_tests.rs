@@ -52,6 +52,7 @@ fn contradicted_fences_release_other_scopes_live_and_replay() {
                     tail_file_count: 1,
                 }),
                 Body::FenceRaised(FenceRaised {
+                    detail: Bounded(vec![]),
                     kind: FenceKind::Write,
                     scope: FenceScope::Tape(tape(scope_tape)),
                     cause: FenceCause::TransferError,

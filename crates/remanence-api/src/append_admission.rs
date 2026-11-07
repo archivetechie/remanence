@@ -696,6 +696,7 @@ pub(crate) fn daemon_admission_error(
     match library.append(|authority, view| {
         authority.fence_raised(
             lib::FenceRaised {
+                detail: lib::Bounded(vec![]),
                 kind: lib::FenceKind::Write,
                 scope: lib::FenceScope::Tape(tape.tape),
                 cause: lib::FenceCause::SessionSuffixContradiction,

@@ -62,6 +62,9 @@ fn tape(n: u8) -> TapeRef {
 }
 fn provision(n: u8, pred: Option<TapeRef>) -> Body {
     Body::Reprovision(Reprovision {
+        pool_source: None,
+        operation: None,
+        replaced_bot: None,
         tape: tape(n),
         predecessor: pred,
         mode: ProvisionMode::Initialize,
@@ -197,6 +200,7 @@ fn fence_on_tape_whose_provisioning_is_queued() {
     let r = recv(
         &mut f,
         Body::FenceRaised(FenceRaised {
+            detail: Bounded(vec![]),
             kind: FenceKind::Write,
             scope: FenceScope::Tape(tape(2)),
             cause: FenceCause::TransferError,
@@ -301,6 +305,7 @@ fn deferred_fence_liveness_failure_is_scoped() {
     recv(
         &mut f,
         Body::FenceRaised(FenceRaised {
+            detail: Bounded(vec![]),
             kind: FenceKind::Write,
             scope: FenceScope::Tape(tape(1)),
             cause: FenceCause::TransferError,

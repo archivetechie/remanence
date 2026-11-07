@@ -51,6 +51,9 @@ fn write(dir: &Path, count: u64) {
     for n in 1..=10 {
         l.fixture_append(
             Body::Reprovision(Reprovision {
+                pool_source: None,
+                operation: None,
+                replaced_bot: None,
                 tape: tape(n),
                 predecessor: None,
                 mode: ProvisionMode::Initialize,
@@ -306,6 +309,9 @@ fn write_operations(dir: &Path, count: u64) {
     };
     for n in 1..=100 {
         emit(Body::Reprovision(Reprovision {
+            pool_source: None,
+            operation: None,
+            replaced_bot: None,
             tape: tape(n),
             predecessor: None,
             mode: ProvisionMode::Initialize,
@@ -351,6 +357,9 @@ fn write_operations(dir: &Path, count: u64) {
             }),
         }));
         let ready = ReadinessObserved {
+            source_slot: None,
+            run: None,
+            cancel_source: None,
             scope: ReadinessScope::Endpoint,
             media: None,
             operation,
@@ -364,7 +373,7 @@ fn write_operations(dir: &Path, count: u64) {
             state: ReadinessState::Ready,
             previous: None,
             started_unix_ns: 1,
-            limit_ms: 1,
+            limit_ms: Some(1),
             evidence: None,
             load_intent: None,
             ready_generation: i * 2 - 1,

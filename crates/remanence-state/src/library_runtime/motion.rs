@@ -556,6 +556,9 @@ impl MotionAuthority for LibraryRuntime {
                 let (_, ready_generation) = authority.readiness_context(operation, &endpoint)?;
                 authority.readiness_observed(
                     lib::ReadinessObserved {
+                        source_slot: None,
+                        run: None,
+                        cancel_source: None,
                         operation,
                         endpoint,
                         tape: owner.tape,

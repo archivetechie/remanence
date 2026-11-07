@@ -126,6 +126,9 @@ fn inventory_only_cleaning_registration_survives_sql_loss() {
     let error = authority
         .reprovision(
             Reprovision {
+                pool_source: None,
+                operation: None,
+                replaced_bot: None,
                 tape,
                 predecessor: None,
                 mode: ProvisionMode::Initialize,
