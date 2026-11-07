@@ -5415,6 +5415,205 @@ mod tests {
         })
     }
 
+    /// What live status reports for the drive in `bay`, from the production
+    /// `GetLiveStatus` handler: the drive's status, the session id on the drive,
+    /// and the session id on that bay's assignment.
+    type LiveDrive = (i32, Option<Vec<u8>>, Option<Vec<u8>>);
+
+    const DRIVE_BUSY: i32 = pb::drive::Status::DriveStatusBusy as i32;
+    /// The harness seats a cartridge in bay 0x0101, so an idle drive reads Loaded.
+    const DRIVE_LOADED: i32 = pb::drive::Status::DriveStatusLoaded as i32;
+
+    async fn live_session_ids(state: &ApiState, bay: u16) -> LiveDrive {
+        use pb::library_service_server::LibraryService;
+        let status = state
+            .library_service()
+            .get_live_status(tonic::Request::new(pb::GetLiveStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let drive = status
+            .libraries
+            .iter()
+            .flat_map(|library| &library.drives)
+            .find(|drive| drive.element_address == Some(u32::from(bay)))
+            .expect("live status lists the drive");
+        let assignment = status
+            .drive_assignments
+            .iter()
+            .find(|assignment| assignment.bay == u32::from(bay))
+            .expect("live status lists the assignment");
+        (
+            drive.status,
+            drive.session_id.clone(),
+            assignment.current_session_id.clone(),
+        )
+    }
+
+    /// Open a session on bay 0x0101 through the production open path, with the
+    /// drive actor answering for itself, and return its id.
+    async fn open_session_on_first_bay(harness: &mut ThreeBayHarness, write: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        if write {
+            let caller = spawn_pool_open(&harness.state, POOL_A);
+            let (_, reply) = expect_open_write(harness.drive_rxs.get_mut(&0x0101).unwrap()).await;
+            reply.send(write_session_reply(id)).unwrap();
+            caller.await.unwrap().unwrap();
+        } else {
+            let state = harness.state.clone();
+            let caller = tokio::spawn(async move {
+                open_read_session(
+                    &state,
+                    ReadSessionTarget::Tape {
+                        tape_uuid: POOL_TAPE_A,
+                    },
+                    None,
+                )
+                .await
+            });
+            let command = tokio::time::timeout(
+                Duration::from_secs(5),
+                harness.drive_rxs.get_mut(&0x0101).unwrap().recv(),
+            )
+            .await
+            .expect("drive actor receives the open within five seconds")
+            .expect("drive command channel stays open");
+            let crate::write_owner::DriveCommand::OpenRead { reply, .. } = command else {
+                panic!("the drive actor must receive a read open");
+            };
+            reply
+                .send(Ok(pb::ReadSession {
+                    session_id: id.as_bytes().to_vec(),
+                    ..Default::default()
+                }))
+                .unwrap();
+            caller.await.unwrap().unwrap();
+        }
+        id
+    }
+
+    /// Close it. A read close is the production `close_read_session`. The
+    /// production write close sends `Close` and leaves the release to the drive
+    /// actor (`park_timer_closed_session`, after its reply), so the write close
+    /// here is `pool.finish_session` as a stand-in for that release. That the
+    /// real release empties the pool's session map is shown in
+    /// `write_owner::tests::durability_tests`.
+    async fn close_session_on_first_bay(harness: &mut ThreeBayHarness, write: bool, id: Uuid) {
+        if write {
+            let mounted = harness.pool.session(id).unwrap();
+            harness.pool.finish_session(id, mounted);
+        } else {
+            let state = harness.state.clone();
+            let caller = tokio::spawn(async move { close_read_session(&state, id).await });
+            let command = tokio::time::timeout(
+                Duration::from_secs(5),
+                harness.drive_rxs.get_mut(&0x0101).unwrap().recv(),
+            )
+            .await
+            .expect("drive actor receives the close within five seconds")
+            .expect("drive command channel stays open");
+            let crate::write_owner::DriveCommand::CloseRead { reply, .. } = command else {
+                panic!("the drive actor must receive a read close");
+            };
+            reply
+                .send(Ok(pb::ReadSession {
+                    session_id: id.as_bytes().to_vec(),
+                    ..Default::default()
+                }))
+                .unwrap();
+            caller.await.unwrap().unwrap();
+        }
+    }
+
+    fn live_status_harness(interval: &str) -> ThreeBayHarness {
+        let mut harness =
+            three_bay_two_pool_harness(vec![drive_bay(0x0101, true, Some("FTA001L9"))], vec![]);
+        harness.state.live_status = Arc::new(crate::live_status::LiveStatusState::new(
+            crate::startup_checkpoint::live_status_config_from(
+                &remanence_state::LiveStatusConfig {
+                    min_poll_interval: interval.to_string(),
+                    ..Default::default()
+                },
+            ),
+        ));
+        harness
+    }
+
+    /// A busy drive's live `session_id` is the open session's id, whether the
+    /// session is a write or a read. The drive's id and its assignment's id come
+    /// from one pool map and must agree, and the drive reads busy while it holds
+    /// the session.
+    ///
+    /// The drive actor is a stand-in, and so is the write close (see
+    /// `close_session_on_first_bay`). The opens and the read close run the
+    /// production `open_*_session` and `close_read_session` paths, and the status
+    /// is the production `GetLiveStatus` handler. The interval pins the
+    /// live-status cache: "0ms" makes every call a fresh build, "1h" lets a call
+    /// after the first be served from the cache unless the pool changed, so both
+    /// paths must answer from the pool, and `status` must change with it.
+    async fn assert_live_status_names_open_session(write: bool) {
+        for interval in ["0ms", "1h"] {
+            let mut harness = live_status_harness(interval);
+            // Warm the cache idle, so the open lands on a cached response.
+            assert_eq!(
+                live_session_ids(&harness.state, 0x0101).await,
+                (DRIVE_LOADED, None, None),
+                "write={write} {interval}: idle"
+            );
+            let id = open_session_on_first_bay(&mut harness, write).await;
+            let named = Some(id.as_bytes().to_vec());
+            assert_eq!(
+                live_session_ids(&harness.state, 0x0101).await,
+                (DRIVE_BUSY, named.clone(), named),
+                "write={write} {interval}: session open"
+            );
+        }
+    }
+
+    /// Once the session closes, the drive and its assignment show no session
+    /// and the drive is no longer busy, including after a cached response that
+    /// named the session.
+    async fn assert_live_status_drops_closed_session(write: bool) {
+        for interval in ["0ms", "1h"] {
+            let mut harness = live_status_harness(interval);
+            // The first call builds the response the cache keeps, and it names
+            // the session. The close must clear it.
+            let id = open_session_on_first_bay(&mut harness, write).await;
+            let named = Some(id.as_bytes().to_vec());
+            assert_eq!(
+                live_session_ids(&harness.state, 0x0101).await,
+                (DRIVE_BUSY, named.clone(), named),
+                "write={write} {interval}: session open"
+            );
+            close_session_on_first_bay(&mut harness, write, id).await;
+            assert_eq!(
+                live_session_ids(&harness.state, 0x0101).await,
+                (DRIVE_LOADED, None, None),
+                "write={write} {interval}: session closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_status_names_the_open_write_session_on_its_busy_drive() {
+        assert_live_status_names_open_session(true).await;
+    }
+
+    #[tokio::test]
+    async fn live_status_names_the_open_read_session_on_its_busy_drive() {
+        assert_live_status_names_open_session(false).await;
+    }
+
+    #[tokio::test]
+    async fn live_status_drops_the_session_id_when_a_write_session_closes() {
+        assert_live_status_drops_closed_session(true).await;
+    }
+
+    #[tokio::test]
+    async fn live_status_drops_the_session_id_when_a_read_session_closes() {
+        assert_live_status_drops_closed_session(false).await;
+    }
+
     /// A dropped handler cannot strand the session returned to its detached task.
     #[tokio::test]
     async fn cancelled_open_handler_dispatches_disconnect_after_actor_reply() {

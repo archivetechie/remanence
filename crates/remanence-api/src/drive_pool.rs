@@ -846,6 +846,19 @@ impl DrivePool {
             .collect()
     }
 
+    /// The open session's id on each bay of one library, from the same map
+    /// `sessions_by_drive` reads. Read and write sessions are both recorded here
+    /// before any byte moves, so this answers for either kind.
+    pub(crate) fn session_ids_by_bay(&self, library_serial: &str) -> HashMap<u16, Vec<u8>> {
+        self.sessions_by_drive()
+            .into_iter()
+            .filter(|(drive, _)| drive.library_serial() == Some(library_serial))
+            .filter_map(|(drive, (session_id, _))| {
+                Some((drive.bay()?, session_id.as_bytes().to_vec()))
+            })
+            .collect()
+    }
+
     pub(crate) fn sessions_by_drive(&self) -> HashMap<DriveKey, (Uuid, MountedSession)> {
         self.sessions
             .lock()

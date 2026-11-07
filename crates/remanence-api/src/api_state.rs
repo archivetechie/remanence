@@ -721,6 +721,37 @@ impl ApiState {
             .unwrap_or_default()
     }
 
+    /// What the drive pool holds now: its busy drives and its sessions.
+    pub(crate) fn pool_observation(&self) -> crate::live_status::PoolObservation {
+        let Some(pool) = self.drive_pool.as_ref() else {
+            return Default::default();
+        };
+        crate::live_status::PoolObservation {
+            busy: pool.busy_drives(),
+            sessions: pool
+                .sessions_by_drive()
+                .into_iter()
+                .map(|(drive, (session_id, _))| (drive, session_id))
+                .collect(),
+        }
+    }
+
+    /// The open session's id on each bay of a library, from the drive pool.
+    ///
+    /// A drive's live `session_id` comes from the pool's session map, the map
+    /// `drive_assignments` reads, not from the catalog's `sessions` rows: a write
+    /// session's row names no drive, because the native tape log records none.
+    /// Its `status` comes from the pool's reservation map. A cached response is
+    /// served only while neither map has changed since it was built, so the two
+    /// fields describe one moment. Both live-status paths call this, so a fresh
+    /// build and a cached refresh cannot answer differently.
+    pub(crate) fn open_session_ids_by_bay(&self, library_serial: &str) -> HashMap<u16, Vec<u8>> {
+        self.drive_pool
+            .as_ref()
+            .map(|pool| pool.session_ids_by_bay(library_serial))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn operates_library(&self, library_serial: &str) -> bool {
         if let Some(pool) = self.drive_pool.as_ref() {
             return pool.operates_library(library_serial);
@@ -861,7 +892,12 @@ impl ApiState {
                 .unwrap_or_else(|err| err.into_inner())
                 .clone()
             {
-                if snapshot_at - cached.0 < self.live_status.min_poll_interval {
+                // A change in the pool's busy drives or sessions is a miss: the
+                // cached `status` came from the first and `session_id` from the
+                // second, and a hit would pair a fresh one with a stale one.
+                if snapshot_at - cached.0 < self.live_status.min_poll_interval
+                    && cached.2 == self.pool_observation()
+                {
                     let mut response = cached.1;
                     response.library_authority_health = self.library_authority_health();
                     self.refresh_live_observations(&mut response);
@@ -881,6 +917,9 @@ impl ApiState {
             }
         }
 
+        // Observed before the build reads the pool, so a change during the build
+        // leaves the cached observation behind the pool and costs one rebuild.
+        let pool_observation = self.pool_observation();
         let snapshot = self
             .current_library_snapshot()
             .ok_or_else(|| Status::not_found("library not found"))?;
@@ -893,19 +932,11 @@ impl ApiState {
             .filter(|run| !matches!(run.phase.as_str(), "done" | "failed" | "needs-operator"))
             .map(|run| run.drive_uuid)
             .collect::<HashSet<_>>();
-        let open_session_by_drive = index
-            .non_terminal_sessions()
-            .map_err(status_from_state_error)?
-            .into_iter()
-            .filter_map(|session| {
-                let drive_uuid = session.drive_uuid?;
-                Some((drive_uuid, session.session_id.as_bytes().to_vec()))
-            })
-            .collect::<HashMap<Vec<u8>, Vec<u8>>>();
 
         let mut libraries = Vec::new();
         for library in &snapshot.report.libraries {
             let busy_bays = self.busy_drive_bays(&library.serial);
+            let session_ids = self.open_session_ids_by_bay(&library.serial);
             let mut state = crate::library::project_library_state(
                 library,
                 &snapshot.captured_at,
@@ -944,6 +975,8 @@ impl ApiState {
                             Status::invalid_argument("drive element address overflows u16")
                         })
                     })?;
+                // Absent means no open session, which is not session zero.
+                drive.session_id = session_ids.get(&bay).cloned();
                 // Every arm is handled explicitly. The bug this replaces was a
                 // missing `else`: an unresolved bay kept the zero-seeded row and
                 // reported an empty identity as though it were a value.
@@ -953,7 +986,6 @@ impl ApiState {
                             drive,
                             &record,
                             active_clean_run_drive_uuids.contains(&record.drive_uuid),
-                            open_session_by_drive.get(&record.drive_uuid),
                         );
                         drive.catalog_state = pb::DriveCatalogState::Cataloged as i32;
                     }
@@ -966,7 +998,6 @@ impl ApiState {
                             drive,
                             &record,
                             active_clean_run_drive_uuids.contains(&record.drive_uuid),
-                            open_session_by_drive.get(&record.drive_uuid),
                         );
                         drive.catalog_state = pb::DriveCatalogState::Retired as i32;
                     }
@@ -975,7 +1006,6 @@ impl ApiState {
                             drive,
                             &record,
                             active_clean_run_drive_uuids.contains(&record.drive_uuid),
-                            open_session_by_drive.get(&record.drive_uuid),
                         );
                         drive.catalog_state = pb::DriveCatalogState::Ambiguous as i32;
                     }
@@ -1033,7 +1063,8 @@ impl ApiState {
             .live_status
             .cache
             .write()
-            .unwrap_or_else(|err| err.into_inner()) = Some((snapshot_at, response.clone()));
+            .unwrap_or_else(|err| err.into_inner()) =
+            Some((snapshot_at, response.clone(), pool_observation));
         Ok(response)
     }
 
@@ -1045,7 +1076,14 @@ impl ApiState {
                 .map(|library| library.library_serial.as_str())
                 .unwrap_or_default();
             library_state.changer_wait = self.changer_waits.get(library_serial);
+            let session_ids = self.open_session_ids_by_bay(library_serial);
             for drive in &mut library_state.drives {
+                // Same source as the fresh build, so a cached response cannot
+                // keep naming a session the pool no longer holds.
+                drive.session_id = drive
+                    .element_address
+                    .and_then(|address| u16::try_from(address).ok())
+                    .and_then(|bay| session_ids.get(&bay).cloned());
                 self.live_status.observe_mount(library_serial, drive);
                 self.enrich_live_counters(drive);
             }
@@ -1118,7 +1156,6 @@ impl ApiState {
         drive: &mut pb::Drive,
         record: &remanence_state::DriveRecord,
         cleaning_active: bool,
-        open_session_id: Option<&Vec<u8>>,
     ) {
         let drive_uuid = record.drive_uuid.clone();
         drive.drive_uuid = Some(drive_uuid.clone());
@@ -1128,8 +1165,6 @@ impl ApiState {
             record.cleaning_due.clone()
         });
         drive.fenced = Some(record.fenced);
-        // Absent means no open session, which is not session zero.
-        drive.session_id = open_session_id.cloned();
         drive.active_alert_names = if cleaning_active {
             vec!["cleaning".to_string()]
         } else {

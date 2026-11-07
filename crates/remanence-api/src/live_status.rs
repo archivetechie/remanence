@@ -1,6 +1,6 @@
 //! Live drive-status snapshots, byte counters, and rolling transfer rates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -281,10 +281,20 @@ impl ChangerWaitBoard {
     }
 }
 
+/// What the drive pool held at one moment: which drives were busy and which
+/// session each held. A cached live-status response is served only while this
+/// is unchanged since the response was built, so `status` and `session_id`, which
+/// read the pool's two maps, always describe the same moment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PoolObservation {
+    pub(crate) busy: HashSet<remanence_state::DriveKey>,
+    pub(crate) sessions: HashMap<remanence_state::DriveKey, uuid::Uuid>,
+}
+
 #[derive(Debug)]
 pub(crate) struct LiveStatusState {
     pub(crate) min_poll_interval: Duration,
-    pub(crate) cache: RwLock<Option<(OffsetDateTime, pb::GetLiveStatusResponse)>>,
+    pub(crate) cache: RwLock<Option<(OffsetDateTime, pb::GetLiveStatusResponse, PoolObservation)>>,
     pub(crate) drive_counters: RwLock<HashMap<Vec<u8>, Arc<DriveByteCounters>>>,
     pub(crate) mount_observations: Mutex<HashMap<(String, u32), MountObservation>>,
 }

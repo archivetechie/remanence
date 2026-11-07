@@ -373,6 +373,60 @@ async fn disconnected_open_task_ends_the_session_and_releases_authority() {
     assert!(index.list_active_tape_io_fences().unwrap().is_empty());
 }
 
+/// A write session's close leaves the release to the actor, which removes the
+/// session from the pool's session map once the session has ended. That map is
+/// where live status reads a drive's `session_id`, so after a real write close a
+/// status names no session. The API records the session in the map when the open
+/// returns, so the test does the same on a pool that shares the actor's lifecycle.
+#[tokio::test]
+async fn write_close_release_empties_the_pools_session_map() {
+    let root = tempfile::tempdir().unwrap();
+    let world = setup(root.path());
+    let lifecycle = DrivePoolLifecycle::default();
+    let drive_key = DriveKey::new(LIBRARY, BAY);
+    let reservations = Arc::new(HashMap::from([(drive_key.clone(), AtomicBool::new(true))]));
+    let pool = DrivePool::new_with_lifecycle(
+        HashMap::new(),
+        HashMap::new(),
+        Arc::clone(&reservations),
+        lifecycle.clone(),
+    );
+    let (tx, opened, thread) = open_writer_configured(
+        root.path(),
+        open_model_library(world),
+        selected(),
+        |cfg, _| {
+            cfg.lifecycle = Some(lifecycle);
+            cfg.reservations = Arc::clone(&reservations);
+        },
+    )
+    .await;
+    let id = opened.unwrap();
+    pool.record_session(
+        id,
+        MountedSession {
+            bay: BAY,
+            library_serial: LIBRARY.to_string(),
+            barcode: Some(BARCODE.to_string()),
+            home_slot: None,
+            tape_uuid: TAPE,
+            drive_uuid: None,
+        },
+    );
+    assert_eq!(
+        pool.session_ids_by_bay(LIBRARY),
+        HashMap::from([(BAY, id.as_bytes().to_vec())]),
+        "the open session is in the pool's map"
+    );
+    close_writer(&tx, id, thread).await;
+    assert!(
+        pool.session_ids_by_bay(LIBRARY).is_empty(),
+        "the actor's release emptied the pool's session map"
+    );
+    assert!(pool.sessions_by_drive().is_empty());
+    assert!(!reservations[&drive_key].load(Ordering::SeqCst));
+}
+
 /// Run one session handler, joining its thread after close or refusal.
 async fn open_writer(
     root: &Path,
