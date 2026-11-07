@@ -558,7 +558,9 @@ impl MotionAuthority for LibraryRuntime {
                     lib::ReadinessObserved {
                         source_slot: owner.source_slot,
                         run: owner.run,
-                        cancel_source: owner.cancel_source,
+                        // A fresh observation of an actual probe: it names no cancel source, as
+                        // every observation states its own.
+                        cancel_source: None,
                         operation,
                         endpoint,
                         tape: owner.tape,

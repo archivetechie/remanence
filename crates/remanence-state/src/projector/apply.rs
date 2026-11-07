@@ -1302,6 +1302,11 @@ impl CatalogCore {
         evidence: Option<&lib::CompletionEvidence>,
         cancel_source: Option<String>,
     ) -> Result<(), StateError> {
+        // The decoded sense is a view of the evidence's raw sense, read by the decoder the
+        // producers classify a completion with, so it equals what they projected before.
+        let decoded = evidence
+            .and_then(|e| e.sense.as_ref())
+            .and_then(|b| remanence_library::scsi::decode_usable_sense(&b.0));
         self.record_media_readiness_transition(
             None,
             MediaReadinessTransitionInput {
@@ -1314,9 +1319,9 @@ impl CatalogCore {
                 last_sense_raw: evidence
                     .and_then(|e| e.sense.as_ref())
                     .map(|b| b.0.iter().map(|x| format!("{x:02x}")).collect()),
-                last_sense_key: None,
-                last_asc: None,
-                last_ascq: None,
+                last_sense_key: decoded.map(|sense| sense.key),
+                last_asc: decoded.map(|sense| sense.asc),
+                last_ascq: decoded.map(|sense| sense.ascq),
                 last_host_status: evidence.and_then(|e| e.host_status).map(i64::from),
                 last_driver_status: evidence.and_then(|e| e.driver_status).map(i64::from),
                 target_status: evidence.and_then(|e| e.scsi_status),

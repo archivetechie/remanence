@@ -500,6 +500,60 @@ fn the_ready_observation_that_closes_a_load_keeps_the_owners_creation_facts() {
     assert_eq!(row.run_id, Some(run.to_string()));
 }
 
+/// The Ready observation that closes a readiness-owned LOAD is a fresh observation of an actual
+/// probe, so it carries no cancel source even when the pending owner had one: a waiter decides on
+/// "cancelled" before it looks for "ready". `source_slot` and `run` stay carried.
+#[test]
+fn the_ready_observation_that_closes_a_load_carries_no_cancel_source() {
+    use remanence_library::motion::{
+        LoadConfirmation, MotionAuthority, MotionCommand, MotionContext, PendingMotion,
+    };
+    let f = open();
+    let run = uuid::Uuid::new_v4();
+    let mut input = f.owner();
+    input.source_slot = Some(0x0400);
+    input.run_id = Some(run.to_string());
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    // A pending owner that holds a cancel source: the same phase, state and scope as the
+    // owner, with only the cancel source new.
+    let mut cancelled = transition(&input);
+    cancelled.cancel_source = Some("operator".into());
+    f.runtime.transition_readiness(&cancelled).unwrap();
+    assert_eq!(
+        f.observations(&input).last().unwrap().cancel_source,
+        Some(lib::CancelSource::Operator),
+        "the owner holds a cancel source when the LOAD closes"
+    );
+
+    let command = MotionCommand::Load(input.endpoint.clone());
+    let context = MotionContext {
+        parent_operation: Some(*input.operation_id.as_bytes()),
+        load_confirmation: LoadConfirmation::Readiness,
+        ..Default::default()
+    };
+    let ticket = f.runtime.intent(&command, &context).unwrap();
+    f.runtime
+        .confirm_readiness(
+            &PendingMotion {
+                command,
+                context,
+                ticket,
+                evidence: remanence_library::outcome::CompletionEvidence::success(),
+            },
+            &remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+
+    let observed = f.observations(&input);
+    let ready = observed.last().unwrap();
+    assert_eq!(ready.result, lib::ReadinessResult::Ready);
+    assert_eq!(ready.cancel_source, None);
+    assert_eq!(ready.source_slot, Some(0x0400));
+    assert_eq!(ready.run, Some(*run.as_bytes()));
+    assert_eq!(f.projected(&input).cancel_source, None);
+}
+
 /// Key 17 projects as its legacy spelling when it is on an owner record. The owner input has no
 /// cancel source (only transitions carry one, tested above), so this record is appended through
 /// the authority's own owner writer.
@@ -766,6 +820,80 @@ fn load_check_condition() -> lib::CompletionEvidence {
     }
 }
 
+/// A TEST UNIT READY poll recorded with sense evidence projects the sense's decoded key, ASC and
+/// ASCQ beside the raw sense, as the producers' classification reads them from the same bytes; a
+/// poll whose evidence has no sense, or sense too short to decode, projects none.
+#[test]
+fn a_poll_recorded_with_sense_evidence_projects_the_decoded_sense() {
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    let poll = |sense: Option<Vec<u8>>, state: &str| {
+        let mut poll = transition(&input);
+        poll.phase = Some("wait_ready_tur".into());
+        poll.state = state.into();
+        poll.last_cdb_opcode = Some(0x00);
+        let mut evidence = load_check_condition();
+        evidence.sense = sense.map(lib::Blob);
+        poll.completion_evidence = Some(evidence);
+        poll
+    };
+
+    let mut sense = vec![0_u8; 32];
+    sense[0] = 0x70;
+    sense[2] = 0x06;
+    sense[7] = 24;
+    sense[12] = 0x29;
+    sense[13] = 0x00;
+    f.runtime
+        .transition_readiness(&poll(Some(sense), "unit_attention"))
+        .unwrap();
+    let row = f.projected(&input);
+    assert_eq!(
+        (row.last_sense_key, row.last_asc, row.last_ascq),
+        (Some(0x06), Some(0x29), Some(0x00)),
+        "{row:?}"
+    );
+    assert!(row.last_sense_raw.is_some());
+
+    // The sense of a later poll replaces it: a descriptor-format 02/04/02.
+    f.runtime
+        .transition_readiness(&poll(
+            Some(vec![0x72, 0x02, 0x04, 0x02, 0, 0, 0, 0]),
+            "media_initializing",
+        ))
+        .unwrap();
+    let row = f.projected(&input);
+    assert_eq!(
+        (row.last_sense_key, row.last_asc, row.last_ascq),
+        (Some(0x02), Some(0x04), Some(0x02)),
+        "{row:?}"
+    );
+
+    // Sense too short to decode is raw only.
+    f.runtime
+        .transition_readiness(&poll(Some(vec![0x70, 0, 0x02]), "becoming_ready"))
+        .unwrap();
+    let row = f.projected(&input);
+    assert_eq!(
+        (row.last_sense_key, row.last_asc, row.last_ascq),
+        (None, None, None),
+        "{row:?}"
+    );
+    assert_eq!(row.last_sense_raw.as_deref(), Some("700002"));
+
+    // No sense in the evidence: no decoded sense.
+    f.runtime
+        .transition_readiness(&poll(None, "target_busy"))
+        .unwrap();
+    let row = f.projected(&input);
+    assert_eq!(
+        (row.last_sense_key, row.last_asc, row.last_ascq),
+        (None, None, None),
+        "{row:?}"
+    );
+}
+
 /// `load_drive_completion` records the drive LOAD's completion, so its opcode is LOAD (0x1b): a
 /// transition carrying LOAD evidence and that opcode is accepted and the projection shows it. A
 /// TEST UNIT READY opcode on it, or a Ready, is refused, and is not recorded.
@@ -843,13 +971,127 @@ fn an_unproven_transport_class_is_presentation_and_a_proven_one_is_not_recorded(
     assert_eq!(f.progress().len(), 1, "no diagnostic for a proven class");
 }
 
+/// The daemon's gRPC wait-ready is the same TEST UNIT READY poll as `wait_ready_tur`: it records
+/// as that phase, the spelling it used goes to the operation's one `Diagnostic`, and the canonical
+/// spelling records no diagnostic.
+#[test]
+fn the_grpc_wait_ready_spelling_records_as_the_wait_ready_poll() {
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    let mut poll = transition(&input);
+    poll.phase = Some("grpc_wait_ready".into());
+    poll.state = "becoming_ready".into();
+    poll.last_cdb_opcode = Some(0x00);
+    f.runtime.transition_readiness(&poll).unwrap();
+    assert_eq!(
+        f.observations(&input).last().unwrap().phase,
+        lib::ReadinessPhase::WaitReadyTur
+    );
+    assert_eq!(
+        f.progress(),
+        vec![(
+            "operation".to_owned(),
+            Some(input.operation_id.to_string()),
+            vec![("phase_spelling".to_owned(), "grpc_wait_ready".to_owned())],
+        )]
+    );
+
+    let mut ready = transition(&input);
+    ready.phase = Some("grpc_wait_ready".into());
+    ready.state = "ready".into();
+    ready.dirty_scope = Some("none".into());
+    ready.last_cdb_opcode = Some(0x00);
+    ready.completion_evidence =
+        Some((&remanence_library::outcome::CompletionEvidence::success()).into());
+    f.runtime.transition_readiness(&ready).unwrap();
+    assert_eq!(f.projected(&input).phase, "wait_ready_tur");
+    assert_eq!(f.projected(&input).state, "ready");
+
+    let canonical = f.owner();
+    f.runtime.begin_owned_readiness(&canonical).unwrap();
+    let before = f.progress().len();
+    let mut poll = transition(&canonical);
+    poll.phase = Some("wait_ready_tur".into());
+    poll.state = "becoming_ready".into();
+    poll.last_cdb_opcode = Some(0x00);
+    f.runtime.transition_readiness(&poll).unwrap();
+    assert_eq!(
+        f.progress().len(),
+        before,
+        "the canonical spelling records no diagnostic"
+    );
+
+    // A producer that begins its owner under the spelling keeps it the same way.
+    let mut begun = f.owner();
+    begun.phase = "grpc_wait_ready".into();
+    f.runtime.begin_owned_readiness(&begun).unwrap();
+    assert_eq!(
+        f.observations(&begun).last().unwrap().phase,
+        lib::ReadinessPhase::WaitReadyTur
+    );
+    assert_eq!(
+        f.progress().last(),
+        Some(&(
+            "operation".to_owned(),
+            Some(begun.operation_id.to_string()),
+            vec![("phase_spelling".to_owned(), "grpc_wait_ready".to_owned())],
+        ))
+    );
+}
+
+/// The spelling of the aliased gRPC wait-ready phase is recorded when the operation enters the
+/// phase, not on every poll within it: two consecutive polls (the second a different observation,
+/// so not an exact retry) append one spelling diagnostic.
+#[test]
+fn the_grpc_wait_ready_spelling_is_recorded_once_per_entry_into_the_phase() {
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    let poll = |state: &str| {
+        let mut poll = transition(&input);
+        poll.phase = Some("grpc_wait_ready".into());
+        poll.state = state.into();
+        poll.last_cdb_opcode = Some(0x00);
+        poll
+    };
+    f.runtime
+        .transition_readiness(&poll("media_initializing"))
+        .unwrap();
+    f.runtime
+        .transition_readiness(&poll("becoming_ready"))
+        .unwrap();
+    f.runtime
+        .transition_readiness(&poll("unit_attention"))
+        .unwrap();
+    let observed = f.observations(&input);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|v| v.phase == lib::ReadinessPhase::WaitReadyTur)
+            .count(),
+        3,
+        "each poll is its own observation"
+    );
+    assert_eq!(
+        f.progress(),
+        vec![(
+            "operation".to_owned(),
+            Some(input.operation_id.to_string()),
+            vec![("phase_spelling".to_owned(), "grpc_wait_ready".to_owned())],
+        )],
+        "one spelling diagnostic for the entry into the phase"
+    );
+}
+
 /// Every (phase, opcode) pair production records with an opcode, from the producers of the CLI's
 /// tape init and wait-ready, the daemon's session open and load-drive, and startup: the pair is
 /// accepted and the opcode's command is the phase's. The `Before...`/`After...` phases issue no
 /// command and carry none.
-const PRODUCED_OPCODE_PAIRS: [(&str, u8); 15] = [
+const PRODUCED_OPCODE_PAIRS: [(&str, u8); 16] = [
     ("readiness_poll", 0x00),
     ("wait_ready_tur", 0x00),
+    ("grpc_wait_ready", 0x00),
     ("pre_load_tur", 0x00),
     ("already_loaded_tur", 0x00),
     ("startup_reconcile_tur", 0x00),

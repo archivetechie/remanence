@@ -508,15 +508,17 @@ pub(crate) fn session_open_immediate_load_then_probe(
     detail_prefix: &str,
     _observed: &MediaReadiness,
 ) -> Result<(), Status> {
-    let operation_id = Uuid::new_v4();
-    if let Err(err) = record_session_open_readiness_operation(index, operation_id, &ctx) {
-        return Err(session_open_recording_failure_status(
-            &ctx,
-            None,
-            "record_media_readiness_operation",
-            &err,
-        ));
-    }
+    let operation_id = match record_session_open_readiness_operation(index, Uuid::new_v4(), &ctx) {
+        Ok(operation_id) => operation_id,
+        Err(err) => {
+            return Err(session_open_recording_failure_status(
+                &ctx,
+                None,
+                "record_media_readiness_operation",
+                &err,
+            ));
+        }
+    };
     #[cfg(test)]
     if index.library_runtime().is_none() {
         if let Err(err) = record_session_open_mechanical_transition(
@@ -739,15 +741,17 @@ pub(crate) fn record_session_open_readiness_fence(
     phase: &str,
     readiness: &MediaReadiness,
 ) -> Status {
-    let operation_id = Uuid::new_v4();
-    if let Err(err) = record_session_open_readiness_operation(index, operation_id, ctx) {
-        return session_open_recording_failure_status(
-            ctx,
-            None,
-            "record_media_readiness_operation",
-            &err,
-        );
-    }
+    let operation_id = match record_session_open_readiness_operation(index, Uuid::new_v4(), ctx) {
+        Ok(operation_id) => operation_id,
+        Err(err) => {
+            return session_open_recording_failure_status(
+                ctx,
+                None,
+                "record_media_readiness_operation",
+                &err,
+            );
+        }
+    };
     record_session_open_readiness_fence_on_operation(index, operation_id, ctx, phase, readiness)
 }
 
@@ -859,35 +863,47 @@ pub(crate) fn record_session_open_readiness_poll_transition(
         .map(|_| ())
 }
 
+/// The one way a session-open path begins its readiness owner. Under the typed runtime the writer
+/// mints the operation (the id passed in is not used) and the caller carries the returned id into
+/// every later record; without a runtime (historical fixtures) the owner is recorded under the
+/// id passed in, which is returned.
 pub(crate) fn record_session_open_readiness_operation(
     index: &mut CatalogIndex,
     operation_id: Uuid,
     ctx: &SessionOpenReadinessContext<'_>,
-) -> Result<(), remanence_state::StateError> {
-    index
-        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-            operation_id,
-            run_id: None,
-            endpoint: remanence_state::DriveKey::new(ctx.library_serial.to_string(), ctx.bay),
-            changer_sg: None,
-            drive_sg: None,
-            drive_serial: ctx.drive_serial.map(ToOwned::to_owned),
-            barcode: ctx.barcode.map(ToOwned::to_owned),
-            source_slot: ctx.source_slot,
-            media_generation: index
-                .readiness_media_observation(ctx.barcode)?
-                .map(|observation| observation.generation)
-                .map(|generation| generation.generation_number()),
-            media_family: index
-                .readiness_media_observation(ctx.barcode)?
-                .map(|o| o.generation),
-            phase: "session_open_short_probe".to_string(),
-            state: "planned".to_string(),
-            dirty_scope: Some("drive+tape".to_string()),
-            deadline_at_utc: None,
-            evidence_path: None,
-        })
-        .map(|_| ())
+) -> Result<Uuid, remanence_state::StateError> {
+    let input = remanence_state::MediaReadinessOperationInput {
+        operation_id,
+        run_id: None,
+        endpoint: remanence_state::DriveKey::new(ctx.library_serial.to_string(), ctx.bay),
+        changer_sg: None,
+        drive_sg: None,
+        drive_serial: ctx.drive_serial.map(ToOwned::to_owned),
+        barcode: ctx.barcode.map(ToOwned::to_owned),
+        source_slot: ctx.source_slot,
+        media_generation: index
+            .readiness_media_observation(ctx.barcode)?
+            .map(|observation| observation.generation)
+            .map(|generation| generation.generation_number()),
+        media_family: index
+            .readiness_media_observation(ctx.barcode)?
+            .map(|o| o.generation),
+        phase: "session_open_short_probe".to_string(),
+        state: "planned".to_string(),
+        dirty_scope: Some("drive+tape".to_string()),
+        deadline_at_utc: None,
+        evidence_path: None,
+    };
+    let owner = if index.library_runtime().is_some() {
+        index.begin_typed_media_readiness_operation(input)
+    } else {
+        index.record_media_readiness_operation(input)
+    }?;
+    Uuid::parse_str(&owner.operation_id).map_err(|error| {
+        remanence_state::StateError::IndexCorrupt(format!(
+            "readiness operation id is not a UUID: {error}"
+        ))
+    })
 }
 
 pub(crate) fn session_open_readiness_state(readiness: &MediaReadiness) -> &'static str {

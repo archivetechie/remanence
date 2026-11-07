@@ -1,5 +1,6 @@
 # Final-result classification and raw-evidence normalization census.
 # Application consumers must not appear; named composite facts are finishing sites.
+# A projector may decode sense only to materialise a derived view of recorded evidence, never to make a decision.
 # finish_admission_refusal: Finishes one new non-device admission/refusal fact; device errors retain their own outcome.
 crates/remanence-api/src/append_admission.rs::finish_admission_refusal::classify	1
 # ambiguous_authority_outcome: Finishes the distinct unknown-authority-append fact.
@@ -83,3 +84,5 @@ crates/remanence-library/src/outcome/mod.rs::set_sense::decode_usable_sense	1
 crates/remanence-scsi/src/sense.rs::decode_usable_sense::decode_sense	1
 # finish_abandoned_write_with_retry: Finishes S15's abandoned-operation fact while retaining the independently typed retry.
 crates/remanence-library/src/outcome/mod.rs::finish_abandoned_write_with_retry::classify	1
+# library_readiness_transition: Materialises the decoded key, ASC and ASCQ of the recorded raw sense as a derived view for readers; no decision reads it.
+crates/remanence-state/src/projector/apply.rs::library_readiness_transition::decode_usable_sense	1

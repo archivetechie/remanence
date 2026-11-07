@@ -235,16 +235,17 @@ impl LibraryRuntime {
                 Ok(receipt)
             }
         })?;
-        // The evidence path is presentation: one `Diagnostic` naming the operation, recorded
-        // after the owner it describes. A failure to record it never changes the owner's
-        // outcome.
+        // The evidence path and the spelling of an aliased phase are presentation: one
+        // `Diagnostic` naming the operation, recorded after the owner it describes. A failure to
+        // record it never changes the owner's outcome.
+        let mut details = Vec::new();
         if let Some(path) = input.evidence_path.as_deref() {
-            self.record_operation_progress_locked(
-                operation,
-                &[("evidence_path", path)],
-                lib::AuditActor::System,
-            );
+            details.push(("evidence_path", path));
         }
+        if let Some(spelling) = aliased_phase_spelling(Some(&input.phase)) {
+            details.push(("phase_spelling", spelling));
+        }
+        self.record_operation_progress_locked(operation, &details, lib::AuditActor::System);
         Ok(uuid::Uuid::from_bytes(operation))
     }
     /// Serial is redundant only when the endpoint or discovery source proves
@@ -498,6 +499,9 @@ impl LibraryRuntime {
                 self.pending_readiness_load_locked(value.operation, &value.endpoint)?;
         }
         value.previous = Some(previous);
+        // The spelling of an aliased phase is recorded when the operation enters the phase, not on
+        // every poll within it.
+        let entered_phase = value.phase != next_phase;
         value.phase = next_phase;
         value.state = next_state;
         value.result = next_result;
@@ -514,6 +518,11 @@ impl LibraryRuntime {
         let mut details = Vec::new();
         if untyped_cancel {
             details.push(("cancel_source", "signal"));
+        }
+        if let Some(spelling) =
+            aliased_phase_spelling(input.phase.as_deref()).filter(|_| entered_phase)
+        {
+            details.push(("phase_spelling", spelling));
         }
         let (evidence_path, last_error_json, signal) = (
             input.evidence_path.as_deref(),
@@ -607,6 +616,16 @@ fn readiness_result(state: lib::ReadinessState) -> lib::ReadinessResult {
     }
 }
 
+/// The daemon's gRPC wait-ready spelling. It is the same TEST UNIT READY poll as `wait_ready_tur`,
+/// so it records as that phase; the spelling a producer used is presentation and goes to the
+/// operation's `Diagnostic`.
+const GRPC_WAIT_READY: &str = "grpc_wait_ready";
+
+/// The spelling of a phase that the typed phase does not keep, if `value` is one.
+fn aliased_phase_spelling(value: Option<&str>) -> Option<&str> {
+    value.filter(|spelling| *spelling == GRPC_WAIT_READY)
+}
+
 fn phase(value: &str) -> Result<lib::ReadinessPhase, RuntimeError> {
     Ok(match value {
         "planned" => lib::ReadinessPhase::Planned,
@@ -625,7 +644,7 @@ fn phase(value: &str) -> Result<lib::ReadinessPhase, RuntimeError> {
         }
         "quarantine_release" => lib::ReadinessPhase::QuarantineRelease,
         "released" => lib::ReadinessPhase::Released,
-        "wait_ready_tur" => lib::ReadinessPhase::WaitReadyTur,
+        "wait_ready_tur" | GRPC_WAIT_READY => lib::ReadinessPhase::WaitReadyTur,
         "after_wait_ready_tur" => lib::ReadinessPhase::AfterWaitReadyTur,
         "before_conditional_immediate_load" => lib::ReadinessPhase::BeforeConditionalImmediateLoad,
         "conditional_immediate_load" => lib::ReadinessPhase::ConditionalImmediateLoad,

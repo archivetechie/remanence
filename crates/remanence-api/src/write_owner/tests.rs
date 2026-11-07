@@ -1889,15 +1889,9 @@ fn load_wait_absorbs_only_retryable_drive_completions() {
     assert!(retryable_readiness_from_load_error(&medium_error, MediaFamily::Lto9OrLater).is_none());
 }
 
-/// A runtime-backed state under `root`, for the typed readiness paths.
-fn runtime_backed_catalog(
-    root: &Path,
-) -> (
-    remanence_state::library_runtime::LibraryRuntime,
-    remanence_state::projector::ProjectionClient,
-) {
-    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
-    let paths = StatePaths {
+/// The state paths of a runtime-backed state under `root`.
+fn runtime_state_paths(root: &Path) -> remanence_state::StatePaths {
+    remanence_state::StatePaths {
         config_path: root.join("config"),
         state_dir: root.join("state"),
         audit_dir: root.join("library"),
@@ -1905,13 +1899,159 @@ fn runtime_backed_catalog(
         sqlite_path: root.join("catalog.sqlite"),
         tape_cache_dir: root.join("cache"),
         calibration_dir: root.join("calibration"),
-    };
+    }
+}
+
+/// A runtime-backed state under `root`, for the typed readiness paths.
+fn runtime_backed_catalog(
+    root: &Path,
+) -> (
+    remanence_state::library_runtime::LibraryRuntime,
+    remanence_state::projector::ProjectionClient,
+) {
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard};
+    let paths = runtime_state_paths(root);
     let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
     let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
     let catalog = remanence_state::projector::open(&paths.sqlite_path)
         .unwrap()
         .with_library_runtime(runtime.clone());
     (runtime, catalog)
+}
+
+/// A readiness owner on `DEC418146K_LL02` bay `0x0100`, begun the way a started wait is: the
+/// operation is started on the runtime and the owner records under its id.
+#[cfg(target_os = "linux")]
+fn typed_wait_owner(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    index: &mut CatalogIndex,
+) -> Uuid {
+    let operation_id = Uuid::from_bytes(
+        runtime
+            .start_owned_operation(
+                remanence_state::library_log::OperationKind::MediaReadinessWait,
+                remanence_state::AuditActor::System,
+            )
+            .unwrap(),
+    );
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: Some("AOX030L9".to_string()),
+            source_slot: Some(0x03eb),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "readiness_poll".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    operation_id
+}
+
+/// The `OperationProgress` details recorded for `operation`, in log order, read from the library
+/// log once the state that wrote them is dropped.
+#[cfg(target_os = "linux")]
+fn operation_progress_details(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+    operation: Uuid,
+) -> Vec<Vec<(String, String)>> {
+    use remanence_state::library_log as lib;
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    loop {
+        let read = crate::tests::read_library_records(paths, library_uuid, &mut |record| {
+            let diagnostic = record.diagnostic()?;
+            (diagnostic.event == lib::DiagnosticEvent::OperationProgress
+                && diagnostic.subject_id.as_ref().map(|id| id.as_str())
+                    == Some(operation.to_string().as_str()))
+            .then(|| {
+                diagnostic
+                    .detail
+                    .0
+                    .iter()
+                    .map(|entry| {
+                        let lib::DiagnosticValue::Text(text) = &entry.1 else {
+                            panic!("a text detail: {entry:?}");
+                        };
+                        (entry.0.as_str().to_owned(), text.as_str().to_owned())
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        match read {
+            Ok(records) => return records,
+            Err(crate::tests::ChainRead::Busy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(StdDuration::from_millis(10));
+            }
+            Err(crate::tests::ChainRead::Busy(errno)) => {
+                panic!("the library log was still locked ({errno})")
+            }
+            Err(crate::tests::ChainRead::Failed(message)) => panic!("{message}"),
+        }
+    }
+}
+
+/// The daemon's gRPC wait-ready, through its production recorder on a runtime-backed state: the
+/// poll records as the `wait_ready_tur` phase (the spelling the typed phase does not know is
+/// refused otherwise, and the wait ends in a recording failure), and the spelling the daemon used
+/// is kept in the operation's progress diagnostic.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_grpc_wait_ready_records_the_wait_ready_poll_and_keeps_its_spelling() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = runtime_state_paths(root.path());
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let library_uuid = runtime.manifest().library_uuid();
+    let mut index = catalog.write_handle();
+    let operation_id = typed_wait_owner(&runtime, &mut index);
+    let (mut drive, _log) = open_test_drive_with_tur_script("DEC418146K_LL02", vec![None]);
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation_id, "media_readiness_wait");
+
+    handle_drive_wait_ready(
+        &mut index,
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family: MediaFamily::Lto9OrLater,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: StdDuration::from_secs(9_000),
+                poll_interval: StdDuration::from_secs(30),
+            },
+            cartridge_in_drive: true,
+            phase: "grpc_wait_ready",
+        },
+        &handle,
+    );
+
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.phase.as_str(), row.state.as_str()),
+        ("wait_ready_tur", "ready"),
+        "{row:?}"
+    );
+    assert_eq!(row.last_cdb_opcode, Some(0x00));
+    drop((index, catalog, runtime, drive, handle));
+    assert_eq!(
+        operation_progress_details(&paths, library_uuid, operation_id),
+        vec![vec![(
+            "phase_spelling".to_string(),
+            "grpc_wait_ready".to_string()
+        )]]
+    );
 }
 
 /// The completion of a drive LOAD that a retryable CHECK CONDITION ends is recorded by the
@@ -3662,6 +3802,188 @@ fn session_open_loads_immediate_after_unit_attention_then_load_required() {
             .expect("active fences")
             .is_empty(),
         "ready session-open probe must not leave an active fence"
+    );
+}
+
+/// A write session that needs an immediate load, opened through the production readiness path on
+/// a runtime-backed state: the readiness owner the session-open path begins is accepted by the
+/// typed runtime, the LOAD is issued, and the session reaches ready. (The owner was begun on a
+/// fresh id the typed runtime refuses as an owner never started, so the open failed with a
+/// recording-failure status before the LOAD.)
+#[cfg(target_os = "linux")]
+#[test]
+fn session_open_immediate_load_begins_its_owner_under_the_typed_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let (_runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    // The drive's source identity, as discovery records it before any session opens.
+    index
+        .observe_drive(remanence_state::DriveObservationInput {
+            serial: "DRV_MOVE_OBS".to_string(),
+            identity_source: "DvcidAndInquiry".to_string(),
+            vendor: Some("HPE".to_string()),
+            product: Some("Ultrium 9-SCSI".to_string()),
+            firmware_rev: Some("R1.0".to_string()),
+            managed: "rem".to_string(),
+            library_serial: Some("DEC418146K_LL02".to_string()),
+            element_address: Some(0x0100),
+            observed_at_utc: None,
+        })
+        .expect("discovery records the drive");
+    let (mut drive, log) = open_test_drive_with_tur_script(
+        "DEC418146K_LL02",
+        vec![
+            Some(readiness_fixed_sense(0x06, 0x29, 0x00)),
+            Some(readiness_fixed_sense(0x02, 0x04, 0x02)),
+            None,
+        ],
+    );
+    let ctx = SessionOpenReadinessContext {
+        action: "open write session",
+        bay: 0x0100,
+        library_serial: "DEC418146K_LL02",
+        barcode: Some("AOX030L9"),
+        source_slot: Some(0x03eb),
+        drive_serial: Some("DRV_MOVE_OBS"),
+        needs_drive_load: true,
+        load_continues_move: true,
+        lifecycle: None,
+    };
+
+    session_open_short_probe_or_load(&mut index, &mut drive, ctx)
+        .expect("the typed runtime accepts the session-open readiness owner");
+
+    let control_cdbs = log
+        .borrow()
+        .iter()
+        .filter(|cdb| matches!(cdb.first(), Some(0x00 | 0x1b)))
+        .map(|cdb| (cdb[0], cdb[1], cdb[4]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        control_cdbs,
+        vec![
+            (0x00, 0x00, 0x00),
+            (0x00, 0x00, 0x00),
+            (0x1b, 0x01, 0x01),
+            (0x00, 0x00, 0x00)
+        ]
+    );
+    assert!(
+        index
+            .list_active_media_readiness_operations(Some("DEC418146K_LL02"))
+            .expect("active fences")
+            .is_empty(),
+        "a ready session-open probe leaves no active fence"
+    );
+}
+
+/// The session-open fence for a drive that is not ready (the other of the two paths that begin
+/// their own readiness owner): on a runtime-backed state the owner is accepted and the fence is
+/// recorded and returned, not a recording-failure status.
+#[cfg(target_os = "linux")]
+#[test]
+fn session_open_fence_begins_its_owner_under_the_typed_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let (_runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    index
+        .observe_drive(remanence_state::DriveObservationInput {
+            serial: "DRV_MOVE_OBS".to_string(),
+            identity_source: "DvcidAndInquiry".to_string(),
+            vendor: Some("HPE".to_string()),
+            product: Some("Ultrium 9-SCSI".to_string()),
+            firmware_rev: Some("R1.0".to_string()),
+            managed: "rem".to_string(),
+            library_serial: Some("DEC418146K_LL02".to_string()),
+            element_address: Some(0x0100),
+            observed_at_utc: None,
+        })
+        .expect("discovery records the drive");
+    let (mut drive, _log) = open_test_drive_with_tur_script(
+        "DEC418146K_LL02",
+        vec![Some(readiness_fixed_sense(0x02, 0x04, 0x01))],
+    );
+    let ctx = SessionOpenReadinessContext {
+        action: "open write session",
+        bay: 0x0100,
+        library_serial: "DEC418146K_LL02",
+        barcode: Some("AOX030L9"),
+        source_slot: Some(0x03eb),
+        drive_serial: Some("DRV_MOVE_OBS"),
+        needs_drive_load: true,
+        load_continues_move: true,
+        lifecycle: None,
+    };
+
+    let status = session_open_short_probe_or_load(&mut index, &mut drive, ctx)
+        .expect_err("a drive that is becoming ready is fenced");
+
+    assert!(
+        status
+            .message()
+            .contains("media_readiness_state=media_initializing"),
+        "{status:?}"
+    );
+    assert!(
+        !status.message().contains("recording_failed"),
+        "the owner was refused: {status:?}"
+    );
+    let active = index
+        .list_active_media_readiness_operations(Some("DEC418146K_LL02"))
+        .expect("active fences");
+    assert_eq!(active.len(), 1, "the fence is recorded");
+    assert_eq!(active[0].state, "media_initializing");
+    assert_eq!(active[0].phase, "session_open_short_probe");
+}
+
+/// The sense a not-ready poll recorded reaches the admission reader: after a session open fences a
+/// drive that is becoming ready, the next open's refusal names the fence's sense, read back from
+/// the typed projection (the decoded key, ASC and ASCQ, which the fence message prints beside
+/// `state=`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fenced_session_open_shows_its_sense_to_the_next_admission_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let (_runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    index
+        .observe_drive(remanence_state::DriveObservationInput {
+            serial: "DRV_MOVE_OBS".to_string(),
+            identity_source: "DvcidAndInquiry".to_string(),
+            vendor: Some("HPE".to_string()),
+            product: Some("Ultrium 9-SCSI".to_string()),
+            firmware_rev: Some("R1.0".to_string()),
+            managed: "rem".to_string(),
+            library_serial: Some("DEC418146K_LL02".to_string()),
+            element_address: Some(0x0100),
+            observed_at_utc: None,
+        })
+        .expect("discovery records the drive");
+    let (mut drive, _log) = open_test_drive_with_tur_script(
+        "DEC418146K_LL02",
+        vec![Some(readiness_fixed_sense(0x02, 0x04, 0x01))],
+    );
+    let ctx = || SessionOpenReadinessContext {
+        action: "open write session",
+        bay: 0x0100,
+        library_serial: "DEC418146K_LL02",
+        barcode: Some("AOX030L9"),
+        source_slot: Some(0x03eb),
+        drive_serial: Some("DRV_MOVE_OBS"),
+        needs_drive_load: true,
+        load_continues_move: true,
+        lifecycle: None,
+    };
+    session_open_short_probe_or_load(&mut index, &mut drive, ctx())
+        .expect_err("a drive that is becoming ready is fenced");
+
+    let refusal = session_open_reject_admission_conflicts(&mut index, &ctx())
+        .expect_err("the fence blocks the next open");
+
+    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refusal.message().contains("sense=02/04/01"),
+        "the fence's recorded sense is read back: {refusal:?}"
     );
 }
 
@@ -12172,7 +12494,8 @@ async fn detached_verification_waits_for_another_drive_fence() {
         load_continues_move: false,
         lifecycle: None,
     };
-    record_session_open_readiness_operation(&mut index, readiness_id, &ctx).unwrap();
+    let readiness_id =
+        record_session_open_readiness_operation(&mut index, readiness_id, &ctx).unwrap();
     status(
         &mut index,
         readiness_id,
