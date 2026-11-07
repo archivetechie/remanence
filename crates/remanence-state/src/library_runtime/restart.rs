@@ -204,6 +204,47 @@ impl LibraryRuntime {
         })?;
         Ok(())
     }
+    /// Publish a tape verification's typed verdict (ruling 34). The tape's
+    /// incarnation is resolved under the dispatch lease. `at` is the native
+    /// reference the caller captured while the verification held the tape
+    /// (`facts.native_reference`), recorded as given and never read again here:
+    /// a write after the capture must not move the verdict onto a position the
+    /// verification never read. `at: None` therefore means no native reference
+    /// when the verification ran (D-W-7); the fold does not check that. The
+    /// caller records the operation's `Finished` after this returns, never
+    /// before. `damaged` stays empty and `progress` is `None` in L1.
+    pub fn record_verification_verdict(
+        &self,
+        operation: lib::Id,
+        tape: lib::Id,
+        facts: VerdictFacts,
+        actor: lib::AuditActor,
+    ) -> Result<lib::VerificationVerdict, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let tape = self
+            .0
+            .authority
+            .tape_state(tape)
+            .ok_or_else(|| {
+                StateError::JournalReplayFailed("verdict names a tape the library log lacks".into())
+            })?
+            .tape;
+        let verdict = lib::VerificationVerdict {
+            operation,
+            at: facts.native_reference,
+            damaged: lib::Bounded(vec![]),
+            unprotected: facts.unprotected,
+            modes: facts.modes,
+            edition_digest: facts.edition_digest,
+            progress: None,
+            tape,
+            outcome: facts.outcome,
+        };
+        self.append_locked(|a, v| {
+            a.verification_verdict(verdict.clone(), actor, lib::SourceLayer::Layer5, v)
+        })?;
+        Ok(verdict)
+    }
     /// Publish a non-write session selected by its owner. The immutable source
     /// head and tape incarnation are resolved under the same dispatch lease.
     #[allow(clippy::too_many_arguments)]

@@ -459,6 +459,9 @@ pub(crate) struct DrivePool {
     #[cfg(test)]
     pub(crate) motion_admission_hook: Arc<Mutex<Option<MotionAdmissionHook>>>,
 
+    /// Runs once between a verification's release of the tape and its verdict record.
+    #[cfg(test)]
+    pub(crate) verdict_window_hook: Arc<Mutex<Option<MotionAdmissionHook>>>,
     #[cfg(test)]
     pub(crate) mount_busy_snapshot_hook: Arc<Mutex<Option<ReservationHook>>>,
     #[cfg(test)]
@@ -617,6 +620,8 @@ impl DrivePool {
         Self {
             #[cfg(test)]
             motion_admission_hook: Arc::default(),
+            #[cfg(test)]
+            verdict_window_hook: Arc::default(),
             #[cfg(test)]
             mount_busy_snapshot_hook: Arc::default(),
             #[cfg(test)]

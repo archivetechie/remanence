@@ -1283,6 +1283,7 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
         }],
     };
     let protected = ProtectedContentVerification {
+        walk_performed: true,
         unprotected_ordinals: None,
         sidecars: vec![sidecar],
         parity_map_findings: vec![ParityMapFinding {
@@ -1511,6 +1512,145 @@ fn recovery_required_verification_projects_measured_bot_evidence() {
             .and_then(|row| row.incomplete_object_count),
         Some(1)
     );
+}
+
+/// A full-physical outcome over a clean tape: the walk's `walk_performed` decides bit 2.
+fn full_outcome_with(
+    protected: remanence_parity::ProtectedContentVerification,
+) -> TerminalIndexVerificationOutcome {
+    let counts = TapeIndexReplicaCounts {
+        structural_entry_count: 2,
+        object_row_count: 1,
+    };
+    let payload = converter_payload_summary(counts);
+    TerminalIndexVerificationOutcome::VerifiedComplete(Box::new(TerminalIndexVerification {
+        edition: converter_edition_plan(counts),
+        selected_payload: payload,
+        replicas: std::array::from_fn(|_| TerminalReplicaEvidence::Valid { summary: payload }),
+        separations: std::array::from_fn(|_| TerminalSeparationEvidence::Valid {
+            interior_record_count: 1,
+        }),
+        measured_eod: PhysicalPositionHint::new(40),
+        verified_prefix_tape_file_count: 2,
+        verified_prefix_record_count: 3,
+        measured_tape_file_count: 7,
+        protected,
+    }))
+}
+
+/// A BOT-recovery outcome whose replicas are `replicas`.
+fn recovery_outcome_with(
+    replicas: [TerminalReplicaEvidence; 3],
+    protected: remanence_parity::ProtectedContentVerification,
+) -> TerminalIndexVerificationOutcome {
+    TerminalIndexVerificationOutcome::RecoveryRequired(Box::new(
+        remanence_parity::TerminalIndexRecoveryRequired {
+            measured_eod: remanence_parity::PhysicalPositionHint::new(123),
+            bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+                bootstrap_recovery_hints: None,
+                structural_entry_count: 7,
+                complete_object_count: 4,
+                recovered_object_count: 2,
+                unknown_object_count: 2,
+                incomplete_object_count: 1,
+                canonical_map_digest: [0x44; 32],
+                damaged_region_count: 1,
+            },
+            replicas,
+            detail: "no canonical survivor".to_string(),
+            protected,
+        },
+    ))
+}
+
+fn replicas_of(kind: remanence_parity::TerminalReplicaFailureKind) -> [TerminalReplicaEvidence; 3] {
+    std::array::from_fn(|_| {
+        TerminalReplicaEvidence::Invalid(remanence_parity::TerminalReplicaFailure {
+            kind,
+            detail: "test evidence".to_string(),
+        })
+    })
+}
+
+/// Bit 2 follows `walk_performed`, which is the only fact that tells a parity tape's clean walk
+/// from a tape with no parity. The other full-physical bits are set on either path.
+#[test]
+fn verdict_evidence_sets_protected_content_only_where_the_walk_ran() {
+    use remanence_state::library_runtime::verification_modes as bit;
+    let every_full_bit = bit::TERMINAL_INDEX
+        | bit::PHYSICAL_PREFIX
+        | bit::REPLICAS
+        | bit::SEPARATIONS
+        | bit::EOD_MEASURED;
+    let walked = remanence_parity::ProtectedContentVerification {
+        walk_performed: true,
+        ..remanence_parity::ProtectedContentVerification::none_protected()
+    };
+    let clean_walk = terminal_verification_evidence(&full_outcome_with(walked));
+    assert_eq!(clean_walk.modes, every_full_bit | bit::PROTECTED_CONTENT);
+    assert_eq!(clean_walk.unprotected, None);
+    let no_parity = terminal_verification_evidence(&full_outcome_with(
+        remanence_parity::ProtectedContentVerification::none_protected(),
+    ));
+    assert_eq!(no_parity.modes, every_full_bit);
+    let not_performed = terminal_verification_evidence(&full_outcome_with(
+        remanence_parity::ProtectedContentVerification::not_performed("no scheme"),
+    ));
+    assert_eq!(not_performed.modes, every_full_bit);
+}
+
+/// Bit 3 is clear when any replica entry is a placeholder that was never inspected, and set
+/// when every replica was examined, even when each was found invalid. BOT recovery sets bits 5
+/// and 6 and never 0, 1 or 4.
+#[test]
+fn verdict_evidence_leaves_replicas_clear_for_placeholders_on_recovery() {
+    use remanence_parity::TerminalReplicaFailureKind as Kind;
+    use remanence_state::library_runtime::verification_modes as bit;
+    let none = remanence_parity::ProtectedContentVerification::none_protected;
+    let inspected = terminal_verification_evidence(&recovery_outcome_with(
+        replicas_of(Kind::PayloadInvalid),
+        none(),
+    ));
+    assert_eq!(
+        inspected.modes,
+        bit::REPLICAS | bit::EOD_MEASURED | bit::BOT_RECOVERY
+    );
+    let placeholders = terminal_verification_evidence(&recovery_outcome_with(
+        replicas_of(Kind::NotInspected),
+        none(),
+    ));
+    assert_eq!(placeholders.modes, bit::EOD_MEASURED | bit::BOT_RECOVERY);
+    // One placeholder among examined members is enough to leave the bit clear.
+    let mut mixed = replicas_of(Kind::PayloadInvalid);
+    mixed[1] = replicas_of(Kind::NotInspected)[1].clone();
+    let mixed = terminal_verification_evidence(&recovery_outcome_with(mixed, none()));
+    assert_eq!(mixed.modes, bit::EOD_MEASURED | bit::BOT_RECOVERY);
+    // A member found missing by an actual examination is an evaluation.
+    let missing =
+        terminal_verification_evidence(&recovery_outcome_with(replicas_of(Kind::Missing), none()));
+    assert_eq!(
+        missing.modes,
+        bit::REPLICAS | bit::EOD_MEASURED | bit::BOT_RECOVERY
+    );
+}
+
+/// The verifier's `w..t` range becomes the verdict's `unprotected`, on both arms, and its
+/// absence stays absent.
+#[test]
+fn verdict_evidence_carries_the_unprotected_tail() {
+    use remanence_state::library_log::Unprotected;
+    let tail = remanence_parity::ProtectedContentVerification {
+        walk_performed: true,
+        unprotected_ordinals: Some(4..6),
+        ..remanence_parity::ProtectedContentVerification::none_protected()
+    };
+    let full = terminal_verification_evidence(&full_outcome_with(tail.clone()));
+    assert_eq!(full.unprotected, Some(Unprotected { w: 4, t: 6 }));
+    let recovery = terminal_verification_evidence(&recovery_outcome_with(
+        replicas_of(remanence_parity::TerminalReplicaFailureKind::PayloadInvalid),
+        tail,
+    ));
+    assert_eq!(recovery.unprotected, Some(Unprotected { w: 4, t: 6 }));
 }
 
 struct ShortFirstModelWriteTransport {
@@ -8720,7 +8860,7 @@ fn verify_index_unreadable_bootstrap_uses_catalog_hints() {
         ParityConfig::Scheme(default_scheme_for_block_size(512 * 1024)),
     ] {
         with_catalog_recovery_tape(parity, None, |index, cfg, drive| {
-            let report = handle_drive_verify_tape_index(
+            let (report, evidence) = handle_drive_verify_tape_index(
                 0x0100,
                 index,
                 cfg,
@@ -8734,6 +8874,18 @@ fn verify_index_unreadable_bootstrap_uses_catalog_hints() {
                 None,
             )
             .expect("verify-index proceeds with unreadable BOT");
+            // No terminal footer exists, so no replica was examined (bit 3 clear). With no parity
+            // there is no walk, and with a scheme but no bootstrap or ParityMap the pass is not
+            // performed (bit 2 clear in both). EOD was measured and BOT recovery ran.
+            assert_eq!(
+                evidence,
+                VerdictEvidence {
+                    modes: remanence_state::library_runtime::verification_modes::EOD_MEASURED
+                        | remanence_state::library_runtime::verification_modes::BOT_RECOVERY,
+                    unprotected: None,
+                    native_reference: None,
+                }
+            );
             let io = report.io.as_ref().expect("recovery-required I/O");
             assert!(io.total.as_ref().unwrap().single_read > 0);
             assert!(
@@ -9154,7 +9306,7 @@ fn catalog_recovery_terminal_tail_retains_bootstrap_provenance() {
                         summary.detail
                     );
                 }
-                let verification = handle_drive_verify_tape_index(
+                let (verification, evidence) = handle_drive_verify_tape_index(
                     0x0100,
                     index,
                     cfg,
@@ -9168,6 +9320,23 @@ fn catalog_recovery_terminal_tail_retains_bootstrap_provenance() {
                     None,
                 )
                 .expect("verification reports damaged BOT with surviving replicas");
+                // The terminal tail survived and was validated, the prefix read and EOD measured;
+                // the tape has no parity, so no protected-content walk ran (bit 2 clear).
+                {
+                    use remanence_state::library_runtime::verification_modes as bit;
+                    assert_eq!(
+                        evidence,
+                        VerdictEvidence {
+                            modes: bit::TERMINAL_INDEX
+                                | bit::PHYSICAL_PREFIX
+                                | bit::REPLICAS
+                                | bit::SEPARATIONS
+                                | bit::EOD_MEASURED,
+                            unprotected: None,
+                            native_reference: None,
+                        }
+                    );
+                }
                 let io = verification.io.as_ref().expect("degraded I/O");
                 assert!(io.total.as_ref().unwrap().read_position > 0);
                 drop(drive.begin_verification_io());
@@ -10529,6 +10698,53 @@ impl VerificationActorHarness {
     }
 }
 
+/// A real full verification of a parity tape through the real drive actor reports the protected
+/// walk: the evidence has `PROTECTED_CONTENT` set, from the verifier's `walk_performed`, with
+/// every other full-physical bit and no unprotected tail.
+#[tokio::test]
+async fn real_parity_walk_sets_protected_content_in_the_verdict_evidence() {
+    use remanence_state::library_runtime::verification_modes as bit;
+    let harness = VerificationActorHarness::new();
+    let id = Uuid::new_v4();
+    let handle = harness.state.operations.register(id, "tape_verification");
+    let (reply, rx) = oneshot::channel();
+    harness
+        .tx
+        .send(DriveCommand::VerifyTapeIndex {
+            progress: crate::tape_verification::Progress::new(handle.clone(), harness.tape_uuid),
+            handle,
+            tape_uuid: harness.tape_uuid,
+            needs_drive_load: false,
+            library_serial: "LIB-VERIFY".into(),
+            barcode: Some("VERIFY001L9".into()),
+            source_slot: None,
+            drive_serial: Some("DRV-VERIFY".into()),
+            reply,
+        })
+        .await
+        .unwrap();
+    let (report, evidence) = within("the verification reply (real parity walk)", rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.state,
+        pb::TapeIndexVerificationState::VerifiedComplete as i32,
+        "{}",
+        report.detail
+    );
+    assert_eq!(
+        evidence.modes,
+        bit::TERMINAL_INDEX
+            | bit::PHYSICAL_PREFIX
+            | bit::PROTECTED_CONTENT
+            | bit::REPLICAS
+            | bit::SEPARATIONS
+            | bit::EOD_MEASURED
+    );
+    assert_eq!(evidence.unprotected, None);
+}
+
 #[tokio::test]
 async fn verification_cancel_before_first_drive_command_leaves_no_fence() {
     let harness = VerificationActorHarness::new();
@@ -10758,19 +10974,9 @@ struct TypedVerificationHarness {
 }
 impl TypedVerificationHarness {
     fn new() -> Self {
-        let typed = crate::tests::TypedRoot::open();
         let tape_uuid = [0xB7; 16];
-        let mut index = typed.catalog().write_handle();
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: "VERIFY001L9".into(),
-                block_size: 256 * 1024,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
-        drop(index);
+        // Provisioned through the library log, so the runtime knows the tape's identity.
+        let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "VERIFY001L9")]);
         let mut world = VirtualWorld::single_drive("LIB-VERIFY", 0x100, "DRV-VERIFY", 0x400, 1);
         world.put_tape_in_drive(0x100, "VERIFY001L9", None, VirtualTape::default());
         let mut state = typed.api_state();
@@ -10801,7 +11007,7 @@ impl TypedVerificationHarness {
     ) -> (
         Uuid,
         oneshot::Receiver<Result<pb::TapeIndexVerification, Status>>,
-        oneshot::Sender<Result<pb::TapeIndexVerification, Status>>,
+        oneshot::Sender<Result<VerifiedTapeIndex, Status>>,
     ) {
         let (operation, result) = crate::tape_verification::start(
             &self.state,
@@ -10832,6 +11038,90 @@ impl TypedVerificationHarness {
         }
     }
 
+    /// The evidence a clean full-physical verification of a parity tape reports: every check
+    /// but BOT recovery ran, and nothing is unprotected.
+    fn evidence(&self) -> VerdictEvidence {
+        use remanence_state::library_runtime::verification_modes as bit;
+        VerdictEvidence {
+            modes: bit::TERMINAL_INDEX
+                | bit::PHYSICAL_PREFIX
+                | bit::PROTECTED_CONTENT
+                | bit::REPLICAS
+                | bit::SEPARATIONS
+                | bit::EOD_MEASURED,
+            unprotected: None,
+            native_reference: None,
+        }
+    }
+
+    /// The runtime this harness's state is built on.
+    fn runtime(&self) -> remanence_state::library_runtime::LibraryRuntime {
+        self.typed
+            .catalog()
+            .library_runtime()
+            .expect("the harness is typed")
+    }
+
+    /// Give the tape a native log with one closed record, so `current_native_reference`
+    /// names it. The writer lease is released before the verification starts.
+    fn with_native_log(self) -> Self {
+        let paths = self.typed.paths().clone();
+        let mut owner = remanence_state::TapeAuthority::open(
+            paths.journal_dir.join("tapes"),
+            self.tape_uuid,
+            &paths.sqlite_path,
+        )
+        .unwrap()
+        .acquire_exclusive()
+        .unwrap();
+        owner
+            .publish_initialized(
+                256 * 1024,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        let runtime = self.runtime();
+        runtime.refresh_native(&owner.freeze().unwrap()).unwrap();
+        runtime.catch_up().unwrap();
+        drop(owner);
+        self
+    }
+
+    /// The operation's lifecycle events and verdicts together, in log order. Every state
+    /// built on this runtime is dropped first, as in `into_chain`.
+    async fn into_records(self, operation: Uuid) -> (Vec<Seen>, crate::tests::TypedRoot) {
+        let Self {
+            mut typed,
+            state,
+            drive_rx,
+            _changer_rx,
+            ..
+        } = self;
+        drop((state, drive_rx, _changer_rx));
+        let records = typed
+            .records(|record| {
+                if let Some(value) = record.operation_recorded() {
+                    return (value.operation == *operation.as_bytes()).then(|| {
+                        Seen::Event(crate::tests::ChainEvent {
+                            kind: value.kind,
+                            event: value.event.clone(),
+                            actor: record.envelope.actor.clone(),
+                        })
+                    });
+                }
+                record
+                    .verification_verdict()
+                    .filter(|v| v.operation == *operation.as_bytes())
+                    .map(|v| Seen::Verdict(v.clone()))
+            })
+            .await;
+        (records, typed)
+    }
+
     /// The legacy audit log stays empty: the typed arm is the only record.
     fn assert_no_legacy_records(&self) {
         crate::tests::assert_no_legacy_audit_records(&self.state);
@@ -10849,6 +11139,44 @@ impl TypedVerificationHarness {
         drop((state, drive_rx, _changer_rx));
         typed.operation_chain(operation).await
     }
+}
+
+/// One record of a verification's log: a lifecycle event or the typed verdict.
+enum Seen {
+    Event(crate::tests::ChainEvent),
+    Verdict(remanence_state::library_log::VerificationVerdict),
+}
+
+/// The verdict records among `seen`.
+fn verdicts_of(seen: &[Seen]) -> Vec<&remanence_state::library_log::VerificationVerdict> {
+    seen.iter()
+        .filter_map(|s| match s {
+            Seen::Verdict(v) => Some(v),
+            Seen::Event(_) => None,
+        })
+        .collect()
+}
+
+/// The tape's catalog row after the library log is replayed into a fresh projection: the
+/// SQLite file is deleted and the store reopened, so only the durable records can supply it.
+/// Every handle on the root's runtime must already be dropped.
+fn replayed_tape_row(
+    typed: &crate::tests::TypedRoot,
+    tape: [u8; 16],
+) -> remanence_state::TapeRecord {
+    let paths = typed.paths();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", paths.sqlite_path.display()));
+        match std::fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => panic!("remove disposable SQLite file {}: {e}", path.display()),
+        }
+    }
+    let mut state =
+        remanence_state::StateHandle::open_with_config(paths.clone(), typed.config()).unwrap();
+    state.rebuild_projection_from_tape_logs().unwrap();
+    state.catalog().get_tape(&tape).unwrap().expect("tape row")
 }
 
 /// Bound a wait on a channel, oneshot or watch, so a regression fails with the name of what
@@ -10887,7 +11215,9 @@ async fn typed_verification_success_records_accepted_started_finished() {
     let mut harness = TypedVerificationHarness::new();
     let (id, result, reply) = harness.start_until_drive_command().await;
     let expected = harness.verdict();
-    reply.send(Ok(expected.clone())).unwrap();
+    reply
+        .send(Ok((expected.clone(), harness.evidence())))
+        .unwrap();
     assert_eq!(
         within("the verification result (success)", result)
             .await
@@ -10941,6 +11271,345 @@ async fn typed_verification_success_records_accepted_started_finished() {
     assert_eq!(chain[2].actor, AuditActor::System);
 }
 
+/// The lifecycle shape of a verification's records, in log order.
+fn shape_of(seen: &[Seen]) -> Vec<&'static str> {
+    use remanence_state::library_log as lib;
+    seen.iter()
+        .map(|s| match s {
+            Seen::Verdict(_) => "verdict",
+            Seen::Event(e) => match e.event {
+                lib::OperationEvent::Accepted(_) => "accepted",
+                lib::OperationEvent::Started(_) => "started",
+                lib::OperationEvent::Finished(_) => "finished",
+                lib::OperationEvent::Failed(_) => "failed",
+                lib::OperationEvent::CancelRequested(_) => "cancel_requested",
+                lib::OperationEvent::CancelledBeforeDispatch(_) => "cancelled",
+                _ => "other",
+            },
+        })
+        .collect()
+}
+
+/// T1, production path: over a typed runtime, verifying a tape with a native log records
+/// exactly one verdict, after `Started` and before `Finished`. Its `at` is the tape's current
+/// native reference and its `modes` are the evidence the verifier reported. The projection
+/// shows the state, the time and the digest, and a replay of the durable records, over a fresh
+/// SQLite file, gives the same row.
+#[tokio::test]
+async fn typed_verification_with_a_native_log_records_one_verdict_before_finished() {
+    use remanence_state::library_log as lib;
+    let mut harness = TypedVerificationHarness::new().with_native_log();
+    let tape = harness.tape_uuid;
+    let reference = harness
+        .runtime()
+        .current_native_reference(tape)
+        .unwrap()
+        .expect("the tape has a native log");
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let expected = harness.verdict();
+    let evidence = harness.evidence();
+    reply
+        .send(Ok((expected.clone(), evidence.clone())))
+        .unwrap();
+    assert_eq!(
+        within("the verification result (native log)", result)
+            .await
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    let live = harness
+        .runtime()
+        .reader()
+        .unwrap()
+        .get_tape(&tape)
+        .unwrap()
+        .unwrap();
+    let (seen, typed) = harness.into_records(id).await;
+    assert_eq!(
+        shape_of(&seen),
+        ["accepted", "started", "verdict", "finished"]
+    );
+    let verdicts = verdicts_of(&seen);
+    assert_eq!(verdicts.len(), 1);
+    let verdict = verdicts[0];
+    assert_eq!(verdict.at.as_ref(), Some(&reference), "never `None` here");
+    assert_eq!(verdict.tape, reference.tape);
+    assert_eq!(verdict.outcome, lib::VerificationOutcome::VerifiedComplete);
+    // TERMINAL_INDEX, PHYSICAL_PREFIX, PROTECTED_CONTENT, REPLICAS, SEPARATIONS, EOD_MEASURED.
+    assert_eq!(verdict.modes, 0b0011_1111);
+    assert_eq!(verdict.modes, evidence.modes);
+    assert_eq!(verdict.edition_digest, Some([7; 32]));
+    assert!(verdict.damaged.0.is_empty());
+    assert_eq!(verdict.unprotected, None);
+    assert_eq!(verdict.progress, None);
+    assert_eq!(live.last_verification_state, Some(2));
+    assert!(live.last_verified_at_utc.is_some());
+    assert_eq!(live.last_verified_edition_digest, Some(vec![7; 32]));
+    let replayed = replayed_tape_row(&typed, tape);
+    assert_eq!(
+        replayed.last_verification_state,
+        live.last_verification_state
+    );
+    assert_eq!(replayed.last_verified_at_utc, live.last_verified_at_utc);
+    assert_eq!(
+        replayed.last_verified_edition_digest,
+        live.last_verified_edition_digest
+    );
+}
+
+/// T2, D-W-7: a tape with no native log verifies through the production path with a verdict
+/// whose `at` is `None`, and the fold accepts it: the record is in the replayed log and
+/// projects. The runtime found no native reference when it recorded.
+#[tokio::test]
+async fn typed_verification_without_a_native_log_records_a_verdict_with_no_reference() {
+    use remanence_state::library_log as lib;
+    let mut harness = TypedVerificationHarness::new();
+    let tape = harness.tape_uuid;
+    assert_eq!(
+        harness.runtime().current_native_reference(tape).unwrap(),
+        None
+    );
+    let identity = harness
+        .runtime()
+        .tape_state(tape)
+        .expect("provisioned")
+        .tape;
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let evidence = harness.evidence();
+    reply.send(Ok((harness.verdict(), evidence))).unwrap();
+    within("the verification result (no native log)", result)
+        .await
+        .unwrap()
+        .unwrap();
+    let (seen, typed) = harness.into_records(id).await;
+    assert_eq!(
+        shape_of(&seen),
+        ["accepted", "started", "verdict", "finished"]
+    );
+    let verdict = verdicts_of(&seen)[0];
+    assert_eq!(verdict.at, None);
+    assert_eq!(verdict.tape, identity);
+    assert_eq!(verdict.outcome, lib::VerificationOutcome::VerifiedComplete);
+    assert_eq!(
+        replayed_tape_row(&typed, tape).last_verification_state,
+        Some(2)
+    );
+}
+
+/// T3, production path: each of proto states 2, 3 and 4 records its outcome and projects as
+/// that state; the recovery state carries no edition digest.
+#[tokio::test]
+async fn typed_verification_projects_the_state_of_each_outcome() {
+    use pb::TapeIndexVerificationState as State;
+    use remanence_state::library_log as lib;
+    use remanence_state::library_runtime::verification_modes as bit;
+    for (state, outcome, projected, digest, modes) in [
+        (
+            State::VerifiedComplete,
+            lib::VerificationOutcome::VerifiedComplete,
+            2,
+            Some(vec![7; 32]),
+            0b0011_1111,
+        ),
+        (
+            State::VerifiedDegraded,
+            lib::VerificationOutcome::VerifiedDegraded,
+            3,
+            Some(vec![7; 32]),
+            0b0011_1011,
+        ),
+        (
+            State::RecoveryRequired,
+            lib::VerificationOutcome::RecoveryRequired,
+            4,
+            None,
+            bit::EOD_MEASURED | bit::BOT_RECOVERY,
+        ),
+    ] {
+        let mut harness = TypedVerificationHarness::new();
+        let tape = harness.tape_uuid;
+        let (id, result, reply) = harness.start_until_drive_command().await;
+        let report = pb::TapeIndexVerification {
+            state: state as i32,
+            edition_digest: digest.clone(),
+            ..harness.verdict()
+        };
+        let evidence = VerdictEvidence {
+            modes,
+            ..harness.evidence()
+        };
+        reply.send(Ok((report, evidence))).unwrap();
+        within("the verification result (outcome)", result)
+            .await
+            .unwrap()
+            .unwrap();
+        let (seen, typed) = harness.into_records(id).await;
+        let verdicts = verdicts_of(&seen);
+        assert_eq!(verdicts.len(), 1, "{state:?}");
+        assert_eq!(verdicts[0].outcome, outcome, "{state:?}");
+        assert_eq!(verdicts[0].modes, modes, "{state:?}");
+        assert_eq!(
+            verdicts[0].edition_digest.map(|d| d.to_vec()),
+            digest,
+            "{state:?}"
+        );
+        let row = replayed_tape_row(&typed, tape);
+        assert_eq!(row.last_verification_state, Some(projected), "{state:?}");
+        assert_eq!(row.last_verified_edition_digest, digest, "{state:?}");
+    }
+}
+
+/// T4: the deferred legacy response, proto state 1, records no verdict, and the operation
+/// otherwise behaves as before: `Accepted, Started, Finished` and no projected verification.
+#[tokio::test]
+async fn typed_verification_state_one_records_no_verdict() {
+    let mut harness = TypedVerificationHarness::new();
+    let tape = harness.tape_uuid;
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let report = pb::TapeIndexVerification {
+        state: pb::TapeIndexVerificationState::DeferredFullPhysicalVerify as i32,
+        edition_digest: None,
+        ..harness.verdict()
+    };
+    let evidence = harness.evidence();
+    reply.send(Ok((report, evidence))).unwrap();
+    within("the verification result (state 1)", result)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Succeeded as i32
+    );
+    let (seen, typed) = harness.into_records(id).await;
+    assert_eq!(shape_of(&seen), ["accepted", "started", "finished"]);
+    let row = replayed_tape_row(&typed, tape);
+    assert_eq!(row.last_verification_state, None);
+    assert_eq!(row.last_verified_at_utc, None);
+}
+
+/// D-2b-3: the verdict's `at` is the native reference captured while the verification still held
+/// the tape, not one read when the verdict is recorded. A write lands in the window between the
+/// release and the record (the hook publishes a second closed native record), the tape's current
+/// reference moves on, and the verdict still names the captured one.
+#[tokio::test]
+async fn typed_verification_records_the_reference_captured_while_the_tape_was_held() {
+    let mut harness = TypedVerificationHarness::new().with_native_log();
+    let tape = harness.tape_uuid;
+    let runtime = harness.runtime();
+    let captured = runtime
+        .current_native_reference(tape)
+        .unwrap()
+        .expect("the tape has a native log");
+    let paths = harness.typed.paths().clone();
+    let window_runtime = runtime.clone();
+    *harness
+        .state
+        .drive_pool()
+        .unwrap()
+        .verdict_window_hook
+        .lock()
+        .unwrap() = Some(Box::new(move || {
+        let mut writer = remanence_state::TapeAuthority::open(
+            paths.journal_dir.join("tapes"),
+            tape,
+            &paths.sqlite_path,
+        )
+        .unwrap()
+        .acquire_exclusive()
+        .unwrap();
+        let mut report = writer.latest_commit().unwrap().unwrap();
+        report.ordinal += 1;
+        report.operation_id = [0x42; 16];
+        writer.publish_report(&report).unwrap();
+        window_runtime
+            .refresh_native(&writer.freeze().unwrap())
+            .unwrap();
+    }));
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let evidence = harness.evidence();
+    reply.send(Ok((harness.verdict(), evidence))).unwrap();
+    within("the verification result (write in the window)", result)
+        .await
+        .unwrap()
+        .unwrap();
+    let later = runtime
+        .current_native_reference(tape)
+        .unwrap()
+        .expect("the log still has a closed record");
+    assert!(
+        later.sequence > captured.sequence,
+        "the hook must have moved the reference: {later:?} {captured:?}"
+    );
+    drop(runtime);
+    let (seen, _typed) = harness.into_records(id).await;
+    assert_eq!(
+        shape_of(&seen),
+        ["accepted", "started", "verdict", "finished"]
+    );
+    assert_eq!(verdicts_of(&seen)[0].at, Some(captured));
+}
+
+/// A verification that found an unprotected tail records it as the verdict's `unprotected`,
+/// and the projected state still follows the outcome, not the tail.
+#[tokio::test]
+async fn typed_verification_records_the_unprotected_tail() {
+    use remanence_state::library_log as lib;
+    let mut harness = TypedVerificationHarness::new();
+    let tape = harness.tape_uuid;
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let evidence = VerdictEvidence {
+        unprotected: Some(lib::Unprotected { w: 4, t: 6 }),
+        ..harness.evidence()
+    };
+    reply.send(Ok((harness.verdict(), evidence))).unwrap();
+    within("the verification result (unprotected tail)", result)
+        .await
+        .unwrap()
+        .unwrap();
+    let (seen, typed) = harness.into_records(id).await;
+    assert_eq!(
+        verdicts_of(&seen)[0].unprotected,
+        Some(lib::Unprotected { w: 4, t: 6 })
+    );
+    assert_eq!(
+        replayed_tape_row(&typed, tape).last_verification_state,
+        Some(2)
+    );
+}
+
+/// If the verdict cannot be recorded, the operation fails and `Finished` is never appended.
+/// A zero `modes` mask is refused by the fold (`InvalidSchema`), so nothing is published for
+/// the verdict, and the chain ends in `Failed` carrying the refusal.
+#[tokio::test]
+async fn typed_verification_whose_verdict_is_refused_fails_without_finished() {
+    let mut harness = TypedVerificationHarness::new();
+    let tape = harness.tape_uuid;
+    let (id, result, reply) = harness.start_until_drive_command().await;
+    let evidence = VerdictEvidence {
+        modes: 0,
+        ..harness.evidence()
+    };
+    reply.send(Ok((harness.verdict(), evidence))).unwrap();
+    let error = within("the verification result (refused verdict)", result)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Failed as i32
+    );
+    let (seen, typed) = harness.into_records(id).await;
+    assert_eq!(shape_of(&seen), ["accepted", "started", "failed"]);
+    assert!(verdicts_of(&seen).is_empty());
+    assert_eq!(
+        replayed_tape_row(&typed, tape).last_verification_state,
+        None
+    );
+}
+
 /// A non-cancel error from the drive ends the typed chain in `Failed` with its message.
 #[tokio::test]
 async fn typed_verification_failure_records_failed_with_the_error_message() {
@@ -10988,7 +11657,9 @@ async fn typed_verification_cancel_after_started_records_cancelled() {
     Daemon::cancel_operation(&harness.state.daemon_service(), cancel_request(id))
         .await
         .expect("cancel after Started");
-    reply.send(Ok(harness.verdict())).unwrap();
+    reply
+        .send(Ok((harness.verdict(), harness.evidence())))
+        .unwrap();
     assert_eq!(
         within("the verification result (cancel after Started)", result)
             .await
@@ -11002,7 +11673,18 @@ async fn typed_verification_cancel_after_started_records_cancelled() {
         pb::OperationState::Cancelled as i32
     );
     harness.assert_no_legacy_records();
-    let chain = harness.into_chain(id).await;
+    let tape = harness.tape_uuid;
+    let (seen, typed) = harness.into_records(id).await;
+    // A cancelled verification records no verdict, and nothing is projected.
+    assert!(verdicts_of(&seen).is_empty());
+    assert_eq!(replayed_tape_row(&typed, tape).last_verified_at_utc, None);
+    let chain: Vec<_> = seen
+        .into_iter()
+        .filter_map(|s| match s {
+            Seen::Event(e) => Some(e),
+            Seen::Verdict(_) => None,
+        })
+        .collect();
     assert_eq!(chain.len(), 4, "{chain:?}");
     assert_tape_verification_chain(&chain);
     assert!(matches!(chain[0].event, lib::OperationEvent::Accepted(_)));

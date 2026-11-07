@@ -2022,6 +2022,13 @@ impl Record {
             _ => None,
         }
     }
+    /// Read the typed verification verdict without permitting record construction.
+    pub fn verification_verdict(&self) -> Option<&VerificationVerdict> {
+        match &self.body {
+            Body::VerificationVerdict(value) => Some(value),
+            _ => None,
+        }
+    }
     /// Read the typed cleaning body without permitting record construction.
     pub fn cleaning_recorded(&self) -> Option<&CleaningRecorded> {
         match &self.body {

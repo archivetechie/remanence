@@ -507,8 +507,16 @@ async fn assert_verify_admitted(f: &mut Fixture) {
     let crate::write_owner::DriveCommand::VerifyTapeIndex { reply, .. } = command else {
         panic!("expected admitted verify command");
     };
+    // This test drives `verify_tape_index` itself; the verdict evidence is not read.
     reply
-        .send(Ok(pb::TapeIndexVerification::default()))
+        .send(Ok((
+            pb::TapeIndexVerification::default(),
+            crate::write_owner::terminal_inventory::VerdictEvidence {
+                modes: remanence_state::library_runtime::verification_modes::EOD_MEASURED,
+                unprotected: None,
+                native_reference: None,
+            },
+        )))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), verify)
         .await

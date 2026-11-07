@@ -556,12 +556,12 @@ impl CatalogCore {
                 &self.conn,
                 &v.tape.uuid,
                 &at,
-                if !v.damaged.0.is_empty() {
-                    3
-                } else if v.unprotected.is_some() {
-                    4
-                } else {
-                    2
+                // Ruling 34: the outcome is the state; damage and the unprotected tail are
+                // evidence about it and no longer stand in for it.
+                match v.outcome {
+                    lib::VerificationOutcome::VerifiedComplete => 2,
+                    lib::VerificationOutcome::VerifiedDegraded => 3,
+                    lib::VerificationOutcome::RecoveryRequired => 4,
                 },
                 v.edition_digest.as_ref().map(|d| d.as_slice()),
             )?,

@@ -51,6 +51,44 @@ pub enum RuntimeError {
         projection: Box<RuntimeError>,
     },
 }
+/// Ruling 34's verification modes, one bit per check. A bit records that the check ran,
+/// not what it found; the mask is nonzero and bits 7 to 31 are zero.
+pub mod verification_modes {
+    /// The five terminal components (replicas A, B and C, separations AB and BC) were validated.
+    pub const TERMINAL_INDEX: u32 = 1 << 0;
+    /// Every physical prefix row was read, and `verified_prefix_record_count` is present.
+    pub const PHYSICAL_PREFIX: u32 = 1 << 1;
+    /// The REM-PARITY 2.2 protected-content walk ran.
+    pub const PROTECTED_CONTENT: u32 = 1 << 2;
+    /// `replica_health` was evaluated: no replica entry is a placeholder.
+    pub const REPLICAS: u32 = 1 << 3;
+    /// `separation_health` was evaluated.
+    pub const SEPARATIONS: u32 = 1 << 4;
+    /// `measured_eod_lba` came from the drive.
+    pub const EOD_MEASURED: u32 = 1 << 5;
+    /// `verification_basis` is `bot_structural_recovery` and `recovery_inventory` is attached.
+    pub const BOT_RECOVERY: u32 = 1 << 6;
+}
+
+/// What a verification's producer decides about its verdict. The runtime adds
+/// the operation and the tape identity under its dispatch lease
+/// (`LibraryRuntime::record_verification_verdict`); it records the native
+/// reference it is given and never reads one itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerdictFacts {
+    /// The tape's native reference as it stood when the verification ran, captured while
+    /// the verification still held the tape (D-2b-3). `None` means the tape had no native
+    /// reference then; a write after the capture does not change it (D-W-7).
+    pub native_reference: Option<lib::TapeAt>,
+    /// Terminal outcome, one of proto states 2, 3 and 4.
+    pub outcome: lib::VerificationOutcome,
+    /// The unprotected tail (`w < t`), when the verification's own result gives one.
+    pub unprotected: Option<lib::Unprotected>,
+    /// Checks that ran: the nonzero seven-bit mask of ruling 34.
+    pub modes: u32,
+    /// Digest of the verified terminal edition, absent for `RecoveryRequired`.
+    pub edition_digest: Option<lib::Hash>,
+}
 struct WallClock;
 impl Clock for WallClock {
     fn now(&self) -> u64 {
@@ -833,6 +871,8 @@ pub(crate) mod restart;
 #[cfg(test)]
 mod session_ack_tests;
 pub mod terminal;
+#[cfg(test)]
+mod verdict_tests;
 
 #[cfg(test)]
 mod measurements;

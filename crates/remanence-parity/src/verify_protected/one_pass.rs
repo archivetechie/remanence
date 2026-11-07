@@ -193,6 +193,8 @@ impl PrefixObserver for PrefixChecks<'_> {
         let Some(scheme) = &self.scheme else {
             return Ok(false);
         };
+        // A parity tape's sidecar and ParityMap checks run from here on.
+        self.result.walk_performed = true;
         let entry = &self.map.map.entries()[file];
         if !self.map.is_validated(entry.tape_file_number) {
             return Ok(false);

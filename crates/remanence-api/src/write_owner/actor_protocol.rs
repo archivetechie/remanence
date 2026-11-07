@@ -175,7 +175,7 @@ pub(crate) enum DriveCommand {
         barcode: Option<String>,
         source_slot: Option<u16>,
         drive_serial: Option<String>,
-        reply: oneshot::Sender<Result<pb::TapeIndexVerification, Status>>,
+        reply: oneshot::Sender<Result<super::terminal_inventory::VerifiedTapeIndex, Status>>,
     },
     SupersedeTail {
         request: pb::SupersedeTailRequest,

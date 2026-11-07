@@ -522,7 +522,8 @@ pub(crate) fn bot_recovery_control_event_to_proto(
 
 pub(crate) fn terminal_replica_failure_kind_name(kind: TerminalReplicaFailureKind) -> &'static str {
     match kind {
-        TerminalReplicaFailureKind::Missing => "missing",
+        // The wire text of a placeholder is unchanged: it reports as a missing member.
+        TerminalReplicaFailureKind::Missing | TerminalReplicaFailureKind::NotInspected => "missing",
         TerminalReplicaFailureKind::HeaderRead => "header_read",
         TerminalReplicaFailureKind::HeaderInvalid => "header_invalid",
         TerminalReplicaFailureKind::FooterRead => "footer_read",
@@ -574,6 +575,67 @@ pub(crate) fn bot_recovery_reason_detail(reason: BotStructuralRecoveryReason) ->
     }
 }
 
+/// A full verification's wire report with the facts that report cannot carry.
+pub(crate) type VerifiedTapeIndex = (pb::TapeIndexVerification, VerdictEvidence);
+
+/// Facts of one full verification that the wire report drops (ruling 34): which checks
+/// ran and the unprotected tail. Built from the outcome where the checks ran, never
+/// inferred from the report, which cannot tell a tape with no parity from a clean walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerdictEvidence {
+    /// The nonzero seven-bit `verification_modes` mask.
+    pub(crate) modes: u32,
+    /// The verifier's `w..t` unprotected range, when it found `w < t`.
+    pub(crate) unprotected: Option<remanence_state::library_log::Unprotected>,
+    /// The tape's native reference, captured by `verify_tape_index_critical` while the
+    /// verification still holds the tape (D-2b-3). `terminal_verification_evidence` leaves it
+    /// `None`: only the holder of the reservation can name it.
+    pub(crate) native_reference: Option<remanence_state::library_log::TapeAt>,
+}
+
+/// Read the verdict evidence off a full verification's outcome. The basis is the code
+/// path: the full-physical arms (`terminal_verified_to_proto`) always ran the terminal
+/// validation, the prefix read, the separation evaluation and the EOD measurement; the
+/// BOT-recovery arm never evaluates separations or the verified prefix and carries the
+/// recovery inventory. The protected-content and replica bits come from the facts the
+/// verifier keeps: `walk_performed`, and whether any replica entry is a placeholder.
+pub(crate) fn terminal_verification_evidence(
+    outcome: &remanence_parity::TerminalIndexVerificationOutcome,
+) -> VerdictEvidence {
+    use remanence_parity::TerminalIndexVerificationOutcome as Outcome;
+    use remanence_state::library_runtime::verification_modes as bit;
+    let (protected, replicas, mut modes) = match outcome {
+        Outcome::VerifiedComplete(verified) | Outcome::VerifiedDegraded(verified) => (
+            &verified.protected,
+            &verified.replicas,
+            bit::TERMINAL_INDEX | bit::PHYSICAL_PREFIX | bit::SEPARATIONS | bit::EOD_MEASURED,
+        ),
+        // `terminal_recovery_required` measures EOD with `locate_end_of_data` before the walk.
+        Outcome::RecoveryRequired(recovery) => (
+            &recovery.protected,
+            &recovery.replicas,
+            bit::EOD_MEASURED | bit::BOT_RECOVERY,
+        ),
+    };
+    if protected.walk_performed {
+        modes |= bit::PROTECTED_CONTENT;
+    }
+    // All or nothing: a placeholder among inspected replicas is an incomplete evaluation, not an evaluation.
+    if replicas.iter().all(TerminalReplicaEvidence::was_inspected) {
+        modes |= bit::REPLICAS;
+    }
+    VerdictEvidence {
+        modes,
+        unprotected: protected.unprotected_ordinals.as_ref().map(|range| {
+            remanence_state::library_log::Unprotected {
+                w: range.start,
+                t: range.end,
+            }
+        }),
+        native_reference: None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_drive_verify_tape_index(
     bay: u16,
@@ -590,7 +652,7 @@ pub(crate) fn handle_drive_verify_tape_index(
         &crate::operations::OperationHandle,
         crate::tape_verification::Progress,
     )>,
-) -> Result<pb::TapeIndexVerification, Status> {
+) -> Result<VerifiedTapeIndex, Status> {
     let io = drive.begin_verification_io();
     let _verification = drive.verification_context().verification();
     let mut route_status = remanence_parity::VerificationRouteStatus {
@@ -660,13 +722,16 @@ pub(crate) fn handle_drive_verify_tape_index(
             )
             .map_err(status_from_terminal_index_verification_error)?
         };
+        // The facts the wire report cannot carry are read where the checks ran, before
+        // the outcome is converted.
+        let evidence = terminal_verification_evidence(&outcome);
         let mut report = terminal_verification_to_proto(tape_uuid, outcome);
         prepared.append_provenance(&mut report.detail);
-        Ok(report)
+        Ok((report, evidence))
     })();
     let io = io.finish();
     log_verification_io(&io, route_status);
-    if let Ok(report) = &mut result {
+    if let Ok((report, _)) = &mut result {
         report.io = Some(verification_io_to_proto(io));
     }
     // A late cancel suppresses a verdict, never an unrelated error.
@@ -1056,7 +1121,8 @@ pub(crate) const fn terminal_replica_failure_name(
     kind: TerminalReplicaFailureKind,
 ) -> &'static str {
     match kind {
-        TerminalReplicaFailureKind::Missing => "missing",
+        // The wire text of a placeholder is unchanged: it reports as a missing member.
+        TerminalReplicaFailureKind::Missing | TerminalReplicaFailureKind::NotInspected => "missing",
         TerminalReplicaFailureKind::HeaderRead => "header_read",
         TerminalReplicaFailureKind::HeaderInvalid => "header_invalid",
         TerminalReplicaFailureKind::FooterRead => "footer_read",

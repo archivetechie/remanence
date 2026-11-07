@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use ciborium::value::Value;
 use remanence_library::verification_io::VerificationPhase;
 use remanence_state::library_log as lib;
+use remanence_state::library_runtime::VerdictFacts;
 use remanence_state::AuditActor;
 #[cfg(test)]
 use remanence_state::AuditEvent;
@@ -17,10 +18,12 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::audit_projection::{append_operation_audit, OperationAuditInput};
 use crate::operations::OperationHandle;
+use crate::write_owner::terminal_inventory::{VerdictEvidence, VerifiedTapeIndex};
 use crate::{pb, ApiState};
 
 const KIND: &str = "tape_verification";
 type Verdict = Result<pb::TapeIndexVerification, Status>;
+type Verified = Result<VerifiedTapeIndex, Status>;
 
 /// Start independently of the request lifetime. The receiver preserves unary errors.
 pub(crate) fn start(
@@ -53,7 +56,7 @@ pub(crate) fn start(
     let state = state.clone();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let result: Verdict = async {
+        let result: Verified = async {
             record_started(&handle, || {
                 record(
                     &state,
@@ -91,13 +94,26 @@ pub(crate) fn start(
         .await;
         // Mount ownership is released before a terminal status becomes visible.
         // Honour a cancellation that arrives while the mount path releases ownership.
-        let result = result.and_then(|verdict| {
+        // The typed verdict is recorded before `Finished`; if that record fails the
+        // operation takes the failure path below and `Finished` is never appended.
+        let result: Verdict = result.and_then(|(verdict, evidence)| {
             check_cancelled(&handle)?;
+            // The tape is released by now. A test injects its write here, in the window.
+            #[cfg(test)]
+            if let Some(hook) = state
+                .drive_pool
+                .as_ref()
+                .and_then(|pool| pool.verdict_window_hook.lock().unwrap().take())
+            {
+                hook();
+            }
+            record_verdict(&state, &handle, tape_uuid, &verdict, evidence)?;
             Ok(verdict)
         });
         let result = match result {
             Ok(verdict) => {
-                // Rung 2: the verdict (state, edition digest) becomes a durable VerificationVerdict record.
+                // The test-only legacy arm still reads its verdict back from the audit detail;
+                // the typed arm recorded the verdict in `record_verdict` above.
                 #[cfg(test)]
                 let detail = legacy_verdict_detail(&verdict);
                 #[cfg(not(test))]
@@ -169,6 +185,67 @@ fn legacy_verdict_detail(verdict: &pb::TapeIndexVerification) -> BTreeMap<String
         detail.insert("edition_digest".into(), Value::Bytes(digest.clone()));
     }
     detail
+}
+
+/// The verdict outcome of a proto verification state: states 2, 3 and 4 in order. State 1,
+/// the deferred legacy response, and any other state record no verdict.
+pub(crate) fn verdict_outcome(state: i32) -> Option<lib::VerificationOutcome> {
+    use pb::TapeIndexVerificationState as State;
+    match State::try_from(state) {
+        Ok(State::VerifiedComplete) => Some(lib::VerificationOutcome::VerifiedComplete),
+        Ok(State::VerifiedDegraded) => Some(lib::VerificationOutcome::VerifiedDegraded),
+        Ok(State::RecoveryRequired) => Some(lib::VerificationOutcome::RecoveryRequired),
+        _ => None,
+    }
+}
+
+/// Record the typed `VerificationVerdict` of a finished verification (ruling 34). Proto
+/// states 2, 3 and 4 are the three outcomes; state 1, the deferred legacy response, and any
+/// other state record no verdict. The runtime resolves `at` and the tape identity under its
+/// dispatch lease; `evidence` carries the checks that ran and the unprotected tail, read from
+/// the verifier's own outcome. The edition digest is the verified terminal edition's.
+fn record_verdict(
+    state: &ApiState,
+    handle: &OperationHandle,
+    tape_uuid: [u8; 16],
+    verdict: &pb::TapeIndexVerification,
+    evidence: VerdictEvidence,
+) -> Result<(), Status> {
+    let Some(outcome) = verdict_outcome(verdict.state) else {
+        return Ok(());
+    };
+    let edition_digest = verdict
+        .edition_digest
+        .as_deref()
+        .map(|digest| {
+            <[u8; 32]>::try_from(digest)
+                .map_err(|_| Status::internal("verification edition digest is not 32 bytes"))
+        })
+        .transpose()?;
+    let Some(runtime) = state.catalog.library_runtime() else {
+        // Only the test-only legacy arm runs without a runtime: production fails at `Started`.
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(not(test))]
+        return Err(Status::failed_precondition(
+            "tape verification requires shared LibraryAuthority",
+        ));
+    };
+    runtime
+        .record_verification_verdict(
+            *handle.op_id_uuid().as_bytes(),
+            tape_uuid,
+            VerdictFacts {
+                native_reference: evidence.native_reference,
+                outcome,
+                unprotected: evidence.unprotected,
+                modes: evidence.modes,
+                edition_digest,
+            },
+            AuditActor::System,
+        )
+        .map(|_| ())
+        .map_err(|e| Status::failed_precondition(e.to_string()))
 }
 
 /// Append one lifecycle event. With a library runtime the typed `event` is the

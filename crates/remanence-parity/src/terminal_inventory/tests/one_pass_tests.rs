@@ -859,8 +859,38 @@ fn full_verification_routes_accept_unprotected_committed_tail() {
         assert!(result.protected().is_clean(), "{route:?}: {result:?}");
         assert_eq!(result.protected().sidecars.len(), 1);
         assert_eq!(result.protected().unprotected_ordinals, Some(4..6));
+        assert!(result.protected().walk_performed, "{route:?}");
         assert!(!result.is_complete_tape());
         results.push(result);
     }
     assert_eq!(results[0], results[1]);
+}
+
+/// `walk_performed` is true exactly where a protected-content pass ran: a parity tape's clean
+/// walk on both routes, and never for a tape with no parity, which returns before any walk and
+/// reports the same clean values (ruling 34, `PROTECTED_CONTENT`).
+#[test]
+fn walk_performed_is_true_for_a_parity_tape_and_false_without_parity() {
+    let parity = protected_fixture();
+    let plain = fixture(&[4], &[4], false);
+    for route in [VerificationRoute::Walk, VerificationRoute::OnePass] {
+        let run = |records: Vec<Record>| {
+            verify_terminal_index_full_with_route(
+                &mut RecordingSource::new(records),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                None,
+                ScanMode::Standard,
+                route,
+                |_| {},
+            )
+            .unwrap()
+        };
+        let protected = run(parity.records.clone());
+        assert!(protected.protected().is_clean(), "{route:?}");
+        assert!(protected.protected().walk_performed, "{route:?}");
+        let unprotected = run(plain.records.clone());
+        assert!(unprotected.protected().is_clean(), "{route:?}");
+        assert!(!unprotected.protected().walk_performed, "{route:?}");
+    }
 }

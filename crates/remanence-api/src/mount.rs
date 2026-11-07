@@ -812,7 +812,7 @@ pub(crate) async fn verify_tape_index(
     tape_uuid: TapeUuid,
     handle: crate::operations::OperationHandle,
     progress: crate::tape_verification::Progress,
-) -> Result<pb::TapeIndexVerification, Status> {
+) -> Result<crate::write_owner::terminal_inventory::VerifiedTapeIndex, Status> {
     let state = state.clone();
     await_critical_task(
         "verify_tape_index",
@@ -828,7 +828,7 @@ async fn verify_tape_index_critical(
     tape_uuid: TapeUuid,
     handle: crate::operations::OperationHandle,
     progress: crate::tape_verification::Progress,
-) -> Result<pb::TapeIndexVerification, Status> {
+) -> Result<crate::write_owner::terminal_inventory::VerifiedTapeIndex, Status> {
     let pool = state.drive_pool()?.clone();
     pool.wait_tape_closeout(tape_uuid).await;
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
@@ -885,6 +885,20 @@ async fn verify_tape_index_critical(
     let result = response
         .await
         .map_err(|_| Status::unavailable("drive actor stopped during tape index verification"))?;
+    // D-2b-3: the verdict's `at` names the native reference as it stood when the verification
+    // ran. Only the holder of the tape can name it: native writes need the reservation held
+    // here, so a reference read after the release could include a write the verification never
+    // read. Captured only for a state that records a verdict.
+    let result = result.and_then(|(report, mut evidence)| {
+        if crate::tape_verification::verdict_outcome(report.state).is_some() {
+            if let Some(runtime) = state.catalog.library_runtime() {
+                evidence.native_reference = runtime
+                    .current_native_reference(tape_uuid)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            }
+        }
+        Ok((report, evidence))
+    });
     if let Some(home_slot) = mount.home_slot {
         let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
             bay: mount.bay,
@@ -5241,13 +5255,19 @@ mod tests {
             );
             assert!(write_refusal.message().contains("DRV0101"));
             drop(other_reservations);
+            // The legacy harness has no library runtime, so the evidence is never recorded.
+            let evidence = || crate::write_owner::terminal_inventory::VerdictEvidence {
+                modes: remanence_state::library_runtime::verification_modes::EOD_MEASURED,
+                unprotected: None,
+                native_reference: None,
+            };
             if cancelled {
                 harness.state.operations.request_cancel(&id).unwrap();
                 assert!(handle.is_cancelled());
                 // A late cancellation still suppresses an actor's completed verdict.
-                reply.send(Ok(expected.clone())).unwrap();
+                reply.send(Ok((expected.clone(), evidence()))).unwrap();
             } else {
-                reply.send(Ok(expected.clone())).unwrap();
+                reply.send(Ok((expected.clone(), evidence()))).unwrap();
             }
             let terminal = loop {
                 let status = watch.next().await.unwrap().unwrap();
@@ -5324,7 +5344,16 @@ mod tests {
         let crate::write_owner::DriveCommand::VerifyTapeIndex { reply, .. } = command else {
             panic!("verification command")
         };
-        reply.send(Ok(expected.clone())).unwrap();
+        reply
+            .send(Ok((
+                expected.clone(),
+                crate::write_owner::terminal_inventory::VerdictEvidence {
+                    modes: remanence_state::library_runtime::verification_modes::EOD_MEASURED,
+                    unprotected: None,
+                    native_reference: None,
+                },
+            )))
+            .unwrap();
         assert_eq!(unary.await.unwrap().unwrap().into_inner(), expected);
         let records =
             remanence_state::FileAuditLog::replay(harness.state.audit_dir.as_ref()).unwrap();

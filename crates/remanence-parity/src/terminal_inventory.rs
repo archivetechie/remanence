@@ -52,6 +52,9 @@ use std::cell::RefCell;
 /// Typed stage at which one terminal member failed validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalReplicaFailureKind {
+    /// The member was never inspected: this is a placeholder standing in for evidence that
+    /// was not gathered, not the result of an evaluation. Reported like `Missing`.
+    NotInspected,
     /// No complete member could be located at its planned position.
     Missing,
     /// The complete header record could not be read.
@@ -94,6 +97,20 @@ pub enum TerminalReplicaEvidence {
     ConsistentEnvelope,
     /// This member cannot be used as inventory authority.
     Invalid(TerminalReplicaFailure),
+}
+
+impl TerminalReplicaEvidence {
+    /// False for a `NotInspected` placeholder; true for every evaluation, including one
+    /// that found the member missing or invalid.
+    pub fn was_inspected(&self) -> bool {
+        !matches!(
+            self,
+            Self::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::NotInspected,
+                ..
+            })
+        )
+    }
 }
 
 /// Successful fast inventory selection and redundancy evidence.
@@ -2652,7 +2669,7 @@ fn read_fixed_block(
 fn missing_evidence(detail: &str) -> [TerminalReplicaEvidence; 3] {
     std::array::from_fn(|_| {
         TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
-            kind: TerminalReplicaFailureKind::Missing,
+            kind: TerminalReplicaFailureKind::NotInspected,
             detail: detail.to_string(),
         })
     })
@@ -4039,10 +4056,19 @@ mod tests {
             Some("no_complete_layout"),
         )
         .expect("untrusted tail returns typed recovery evidence");
-        assert!(matches!(
-            outcome,
-            TerminalIndexVerificationOutcome::RecoveryRequired(_)
-        ));
+        let TerminalIndexVerificationOutcome::RecoveryRequired(recovery) = outcome else {
+            panic!("physical data after the planned EOD requires structural recovery")
+        };
+        // No terminal layout was complete, so no replica was ever examined: each entry is a
+        // placeholder, and none counts as an evaluation (ruling 34, `REPLICAS`).
+        assert!(recovery.replicas.iter().all(|evidence| matches!(
+            evidence,
+            TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::NotInspected,
+                ..
+            })
+        )));
+        assert!(recovery.replicas.iter().all(|e| !e.was_inspected()));
     }
 
     #[test]
@@ -4066,6 +4092,11 @@ mod tests {
             .replicas
             .iter()
             .all(|evidence| matches!(evidence, TerminalReplicaEvidence::Invalid(_))));
+        // Every replica was examined and found invalid: that is an evaluation, not a placeholder.
+        assert!(recovery
+            .replicas
+            .iter()
+            .all(TerminalReplicaEvidence::was_inspected));
         assert!(
             source.read_lbas.contains(&0),
             "recovery must perform a BOT walk"
