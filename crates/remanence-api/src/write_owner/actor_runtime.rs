@@ -368,6 +368,10 @@ pub(super) fn drive_loop(
     actor_tx: mpsc::Sender<DriveCommand>,
     mut rx: mpsc::Receiver<DriveCommand>,
 ) -> Option<MountedFinish> {
+    // The mailbox must close when external owners and active sessions are gone.
+    let weak_actor_tx = actor_tx.downgrade();
+    drop(actor_tx);
+    let actor_tx = weak_actor_tx;
     drive.set_command_deadline(cfg.lifecycle.as_ref().map(|l| l.shutdown_deadline.clone()));
     let mut index = match Ok::<_, remanence_state::StateError>(cfg.catalog.write_handle()) {
         Ok(index) => index,
@@ -394,6 +398,10 @@ pub(super) fn drive_loop(
                 mut selected,
                 reply,
             } => {
+                let Some(actor_tx) = actor_tx.upgrade() else {
+                    let _ = reply.send(Err(crate::drive_pool::DaemonShuttingDown::status()));
+                    continue;
+                };
                 let Some(mounted) = cfg.mounted() else {
                     let _ = reply.send(Err(Status::failed_precondition(
                         "mounted command on library actor",
@@ -542,6 +550,10 @@ pub(super) fn drive_loop(
                 drive_serial,
                 reply,
             } => {
+                let Some(actor_tx) = actor_tx.upgrade() else {
+                    let _ = reply.send(Err(crate::drive_pool::DaemonShuttingDown::status()));
+                    continue;
+                };
                 let _ = handle_drive_open_write(
                     bay,
                     &mut index,

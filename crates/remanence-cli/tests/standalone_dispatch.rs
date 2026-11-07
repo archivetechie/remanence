@@ -123,10 +123,16 @@ struct RemovalTransport {
     fail_writes: bool,
     check_all_writes: bool,
     writes_observed: u64,
+    world: remanence_chaos::model::SharedVirtualWorld,
+    bootstrap_step: u8,
+    init_probe: bool,
+    init_exit: Option<std::path::PathBuf>,
+    init_fault: bool,
 }
 impl RemovalTransport {
     /// Inspect persisted evidence at the dispatch boundary, before model IO.
-    fn assert_write_guard(&mut self, opcode: u8) {
+    fn assert_write_guard(&mut self, cdb: &[u8], bytes: Option<&[u8]>) {
+        let opcode = cdb[0];
         // Finalization writes 2 GiB of separation records. Replaying the complete
         // audit log before every zero block makes this observer quadratic.
         // Inspect every 256th media write and every filemark boundary;
@@ -134,35 +140,112 @@ impl RemovalTransport {
         if opcode == 0x0a {
             self.writes_observed += 1;
         }
-        if opcode == 0x0a && self.writes_observed % 256 != 1 && !self.check_all_writes {
+        if opcode == 0x0a
+            && self.writes_observed % 256 != 1
+            && !self.check_all_writes
+            && !matches!(self.bootstrap_step, 1 | 2)
+        {
             return;
         }
         if !matches!(opcode, 0x0a | 0x10) {
             return;
         }
+        if self.init_probe {
+            ruling24_assert_no_init_session(&self.config);
+        }
         let config = remanence_state::load_config(&self.config).unwrap();
         let paths = remanence_state::StatePaths::from_config(&self.config, &config);
         let index = remanence_state::CatalogReader::open(&config.index.sqlite_path).unwrap();
         let sessions = index.non_terminal_sessions().unwrap();
-        let session = sessions
-            .iter()
-            .find(|s| s.session_kind == "write")
-            .expect("write session must precede bootstrap dispatch");
-        assert!(
-            matches!(&session.drive_key, Some(remanence_library::DriveKey::Standalone { drive_serial }) if drive_serial == "HOME-DRIVE")
-        );
-        let uuid: [u8; 16] = session.tape_uuid.as_deref().unwrap().try_into().unwrap();
+        let from_write = bytes
+            .and_then(|bytes| remanence_parity::bootstrap::parse_bootstrap_block(bytes).ok())
+            .map(|bootstrap| bootstrap.tape_uuid);
+        let remanence_chaos::model::DeviceRole::Drive { bay } = self.inner.role() else {
+            panic!("write guard requires a model drive");
+        };
+        let endpoint = {
+            let world = self.world.lock().unwrap();
+            let label = world
+                .loaded_barcode(bay)
+                .expect("write drive has a cartridge");
+            assert!(world.tapes.contains_key(label), "write cartridge exists");
+            let serial = world
+                .drive_serials
+                .get(&bay)
+                .expect("write drive has a serial");
+            assert_eq!(serial, "HOME-DRIVE", "write transport endpoint");
+            remanence_library::DriveKey::Standalone {
+                drive_serial: serial.clone(),
+            }
+        };
+        let uuid = from_write
+            .or_else(|| {
+                let world = self.world.lock().unwrap();
+                let label = world.loaded_barcode(bay)?;
+                let remanence_chaos::model::Record::Block(bytes) =
+                    world.tapes[label].records.first()?
+                else {
+                    return None;
+                };
+                remanence_parity::bootstrap::parse_bootstrap_block(bytes)
+                    .ok()
+                    .map(|b| b.tape_uuid)
+            })
+            .expect("write guard requires a Bootstrap tape UUID");
+        for session in sessions.iter().filter(|s| {
+            s.session_kind == "write" && s.tape_uuid.as_deref() == Some(uuid.as_slice())
+        }) {
+            // Native sessions carry no endpoint. In that case the model drive
+            // and its loaded cartridge above prove the dispatch endpoint (D-R2a-7).
+            if let Some(recorded) = &session.drive_key {
+                assert_eq!(
+                    recorded, &endpoint,
+                    "matching non-terminal write session has a different endpoint: {session:?}"
+                );
+            }
+        }
         let durable =
             remanence_state::CalibrationControlStore::open(&paths.calibration_dir).unwrap();
         assert!(
             durable.row(uuid).write_epoch > 0,
             "calibration fence must reach disk before the first bootstrap write"
         );
-        let audit = remanence_state::FileAuditLog::replay(&paths.audit_dir).unwrap();
-        assert!(audit
-            .iter()
-            .any(|r| r.event == remanence_state::AuditEvent::SessionOpened
-                && r.session_id == Some(session.session_id)));
+        let native = paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", uuid::Uuid::from_bytes(uuid).simple()));
+        let mut empty = true;
+        let native_authorized = match std::fs::File::open(native) {
+            Ok(mut file) => {
+                remanence_state::tape_log::store::Header::decode(&mut file, uuid).unwrap();
+                let offset = std::io::Seek::stream_position(&mut file).unwrap();
+                empty = file.metadata().unwrap().len() == offset;
+                let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+                let mut fold = remanence_state::tape_log::fold::Fold::new();
+                while let Some(frame) = decoder.next_frame().unwrap() {
+                    fold.push(&frame).unwrap();
+                }
+                let (summary, _) = fold.finish(decoder.tail()).unwrap();
+                summary.open_session.is_some()
+                    || summary.finalization.as_ref().is_some_and(|v| !v.prepared)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("read native write authority: {error}"),
+        };
+        let bootstrap_authorized = empty
+            && match self.bootstrap_step {
+                0 => opcode == 0x0a && from_write == Some(uuid),
+                1 => opcode == 0x10 && cdb[2..5] == [0, 0, 1],
+                2 => opcode == 0x10 && cdb[1] & 1 == 0 && cdb[2..5] == [0, 0, 0],
+                _ => false,
+            };
+        if bootstrap_authorized {
+            self.bootstrap_step += 1;
+        }
+        assert!(
+            native_authorized || bootstrap_authorized,
+            "write session must precede bootstrap dispatch"
+        );
     }
 }
 impl remanence_library::SgTransport for RemovalTransport {
@@ -174,19 +257,53 @@ impl remanence_library::SgTransport for RemovalTransport {
         self.inner.execute_in(cdb, buf)
     }
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
-        self.assert_write_guard(cdb[0]);
+        self.assert_write_guard(cdb, None);
         if cdb[0] == 0x1e {
-            Ok(())
-        } else {
-            self.inner.execute_none(cdb)
+            return Ok(());
         }
+        let result = self.inner.execute_none(cdb);
+        if result.is_ok() && cdb[0] == 0x10 && cdb[2..5] == [0, 0, 1] {
+            if let Some(path) = &self.init_exit {
+                let world = self.world.lock().unwrap();
+                let label = world.loaded_barcode(0x100).unwrap();
+                let tape = &world.tapes[label];
+                let records: Vec<(u8, Vec<u8>, u32)> = tape
+                    .records
+                    .iter()
+                    .map(|record| match record {
+                        remanence_chaos::model::Record::Block(bytes) => (0, bytes.clone(), 0),
+                        remanence_chaos::model::Record::ZeroBlock(size) => (1, vec![], *size),
+                        remanence_chaos::model::Record::Filemark => (2, vec![], 0),
+                    })
+                    .collect();
+                std::fs::write(
+                    path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "records": records, "written_bytes": tape.written_bytes,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                std::process::exit(86);
+            }
+            if self.init_fault {
+                return Err(remanence_library::ScsiError::TransportError {
+                    status: 0,
+                    host_status: 3,
+                    driver_status: 0,
+                    info: 1,
+                    sense: vec![],
+                });
+            }
+        }
+        result
     }
     fn execute_out(
         &mut self,
         cdb: &[u8],
         buf: &[u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
-        self.assert_write_guard(cdb[0]);
+        self.assert_write_guard(cdb, Some(buf));
         if self.fail_writes && cdb[0] == 0x0a {
             return Err(remanence_library::ScsiError::TransportError {
                 status: 0,
@@ -250,6 +367,11 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
                     fail_writes: false,
                     check_all_writes: true,
                     writes_observed: 0,
+                    world: world.clone(),
+                    bootstrap_step: 0,
+                    init_probe: false,
+                    init_exit: None,
+                    init_fault: false,
                 })
                     as Box<dyn remanence_library::SgTransport>)
             },
@@ -662,6 +784,11 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
                         fail_writes: fail,
                         check_all_writes: true,
                         writes_observed: 0,
+                        world: world.clone(),
+                        bootstrap_step: 0,
+                        init_probe: false,
+                        init_exit: None,
+                        init_fault: false,
                     })
                         as Box<dyn remanence_library::SgTransport>)
                 },
@@ -959,6 +1086,11 @@ impl VersionFixture {
                         fail_writes: false,
                         check_all_writes: !extra.starts_with(&["tape", "finalize"]),
                         writes_observed: 0,
+                        world: self.world.clone(),
+                        bootstrap_step: 0,
+                        init_probe: false,
+                        init_exit: None,
+                        init_fault: false,
                     },
                     mutation: std::sync::Arc::clone(&mutation),
                 })
@@ -1018,6 +1150,16 @@ impl remanence_library::SgTransport for VersionMutationTransport {
         cdb: &[u8],
         buf: &[u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        // Fresh admission has succeeded before this Bootstrap dispatch, and
+        // the object source is opened only after session open returns.
+        if cdb[0] == 0x0a && remanence_parity::bootstrap::parse_bootstrap_block(buf).is_ok() {
+            if let Some((path, bytes, replace)) = self.mutation.lock().unwrap().take() {
+                if replace {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
         assert!(
             !(self.interrupt_write && cdb[0] == 0x0a),
             "injected interruption before finalization media write"
@@ -1040,24 +1182,6 @@ impl remanence_library::SgTransport for VersionMutationTransport {
         self.inner.execute_out(cdb, buf)
     }
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
-        if cdb[0] == 0x00 && self.mutation.lock().unwrap().is_some() {
-            let config = remanence_state::load_config(&self.inner.config).unwrap();
-            let index = remanence_state::projector::open(config.index.sqlite_path)
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
-            if index
-                .non_terminal_sessions()
-                .unwrap()
-                .iter()
-                .any(|s| s.session_kind == "write")
-            {
-                let (path, bytes, replace) = self.mutation.lock().unwrap().take().unwrap();
-                if replace {
-                    std::fs::remove_file(&path).unwrap();
-                }
-                std::fs::write(path, bytes).unwrap();
-            }
-        }
         self.inner.execute_none(cdb)
     }
     fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
@@ -1537,9 +1661,7 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
     let bot = "5b1f0c2e-8d4a-4c3b-9e7f-1a2b3c4d5e6f";
     let simple = bot.replace('-', "");
     let wrong = "0f0e0d0c-0b0a-4908-8706-050403020100";
-    let hint = format!(
-        "Cannot initialize this cartridge: missing catalog row for {bot}. It carries a Remanence identity unknown to this catalog: adopt it with `rem tape adopt --label STRAY --pool default` (the default), or erase it by re-running with --clobber-data --clobber-unknown-tape {bot} and the clobber confirmation."
-    );
+    let hint = "tape provisioning conflict: observed BOT predecessor has no typed identity; no Bootstrap write admitted";
     let mismatch =
         format!("--clobber-unknown-tape {wrong} does not match BOT uuid {bot}; no write attempted");
     // An orphan instance has no tape-level pool authority.
@@ -1551,13 +1673,13 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
         "--confirm-clobber",
         "CLOBBER STRAY",
     ];
-    for (options, seed_copy, succeeds, message) in [
-        (vec![], false, false, hint.as_str()),
+    for (options, seed_copy, succeeds, message, seed_label) in [
+        (vec![], false, false, hint),
         (
             vec!["--clobber-data", "--confirm-clobber", "CLOBBER STRAY"],
             false,
             false,
-            hint.as_str(),
+            hint,
         ),
         (named.to_vec(), true, false, copies),
         (
@@ -1602,8 +1724,30 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
             true,
             "",
         ),
-    ] {
+    ]
+    .into_iter()
+    .map(|(options, seed_copy, succeeds, message)| (options, seed_copy, succeeds, message, false))
+    .chain(std::iter::once((
+        named.to_vec(),
+        false,
+        false,
+        "label",
+        true,
+    ))) {
         let f = VersionFixture::new();
+        let label_holder = if seed_label {
+            f.new_tape("STRAY");
+            f.ok(&["tape", "init", "--label", "STRAY", "--generation", "L9"]);
+            Some(
+                f.index()
+                    .get_tape_by_voltag("STRAY")
+                    .unwrap()
+                    .unwrap()
+                    .tape_uuid,
+            )
+        } else {
+            None
+        };
         let payload = remanence_api::build_tape_bootstrap(
             *uuid::Uuid::parse_str(bot).unwrap().as_bytes(),
             262144,
@@ -1635,18 +1779,21 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
                 .unwrap();
         }
         let before = f.writes();
+        let before_records = ruling24_library_records(&f.config());
         let mut args = vec!["tape", "init", "--label", "STRAY", "--generation", "L9"];
         args.extend(options.iter().copied());
         let (code, out, errors) = f.run(&args, true);
         assert_eq!(code == ExitCode::SUCCESS, succeeds, "{out}\n{errors}");
-        let config = remanence_state::load_config(f.config()).unwrap();
-        let paths = remanence_state::StatePaths::from_config(f.config(), &config);
-        let clobber_audit: Vec<_> = remanence_state::FileAuditLog::replay(&paths.audit_dir)
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.event == remanence_state::AuditEvent::TapeProvisioned)
-            .filter(|r| r.detail.contains_key("clobbered_uuid"))
-            .collect();
+        let after_records = ruling24_library_records(&f.config());
+        assert_eq!(
+            &after_records[..before_records.len()],
+            before_records.as_slice()
+        );
+        let added = &after_records[before_records.len()..];
+        let provisions: Vec<_> = added.iter().filter_map(|r| r.reprovision()).collect();
+        assert!(added
+            .iter()
+            .all(|r| r.tag() != remanence_state::library_log::Tag::Retire));
         if succeeds {
             assert!(errors.is_empty(), "{errors}");
             assert!(f.writes() > before);
@@ -1657,25 +1804,41 @@ fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
             let fresh = uuid::Uuid::from_slice(&tape.tape_uuid).unwrap();
             assert_ne!(fresh.to_string(), bot);
             assert_eq!(result["tape_uuid"], fresh.to_string());
-            assert_eq!(clobber_audit.len(), 1);
-            let detail = &clobber_audit[0].detail;
+            assert_eq!(provisions.len(), 1);
+            let record = provisions[0];
+            assert_eq!(record.tape.uuid, *fresh.as_bytes());
             assert_eq!(
-                detail.get("clobbered_uuid"),
-                Some(&ciborium::value::Value::Text(simple.clone()))
+                record.mode,
+                remanence_state::library_log::ProvisionMode::Initialize
             );
+            assert_eq!(record.predecessor, None);
             assert_eq!(
-                detail.get("clobbered_identity"),
-                Some(&ciborium::value::Value::Text("unknown-to-catalog".into()))
-            );
-            assert_eq!(
-                detail.get("forced"),
-                Some(&ciborium::value::Value::Bool(true))
+                record.replaced_bot,
+                Some(*uuid::Uuid::parse_str(bot).unwrap().as_bytes())
             );
         } else {
             assert!(out.contains(message), "{options:?}\n{out}");
             assert_eq!(f.writes(), before, "{options:?}");
-            assert!(f.index().get_tape_by_voltag("STRAY").unwrap().is_none());
-            assert!(clobber_audit.is_empty());
+            if let Some(holder) = label_holder {
+                assert_eq!(
+                    f.index()
+                        .get_tape_by_voltag("STRAY")
+                        .unwrap()
+                        .unwrap()
+                        .tape_uuid,
+                    holder
+                );
+                assert!(
+                    out.contains(&format!(
+                        "label STRAY belongs to tape {}; choose a new label",
+                        uuid::Uuid::from_slice(&holder).unwrap()
+                    )),
+                    "{out}"
+                );
+            } else {
+                assert!(f.index().get_tape_by_voltag("STRAY").unwrap().is_none());
+            }
+            assert!(provisions.is_empty());
         }
     }
 }
@@ -4283,4 +4446,322 @@ fn corrupt_seal_or_decision_cannot_be_repaired_or_superseded_to_writable() {
         assert_eq!(std::fs::read(&log).unwrap(), bytes);
         assert_eq!(f.index().get_tape(&id).unwrap().unwrap().state, "sealed");
     }
+}
+
+/// Init has no durable write session, including at each observed modifying command.
+fn ruling24_assert_no_init_session(config_path: &Path) {
+    let config = remanence_state::load_config(config_path).unwrap();
+    let sql = rusqlite::Connection::open(&config.index.sqlite_path).unwrap();
+    let count: i64 = sql
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "standalone init must not create a SQL session");
+    assert!(remanence_state::FileAuditLog::replay(&config.audit.dir)
+        .unwrap()
+        .iter()
+        .all(|r| r.event != remanence_state::AuditEvent::SessionOpened));
+}
+
+/// Dispatch real standalone init over a persistent model, optionally cutting its first delimiter.
+fn ruling24_run_init(
+    root: &Path,
+    world: &remanence_chaos::model::SharedVirtualWorld,
+    exit: Option<std::path::PathBuf>,
+    fault: bool,
+    extra: &[&str],
+) -> (ExitCode, String, String) {
+    let mut args = vec![
+        "rem",
+        "--json",
+        "--allow-untrusted-state-volume",
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
+        "tape",
+        "init",
+        "--label",
+        "FIRST",
+        "--generation",
+        "L9",
+    ];
+    args.extend_from_slice(extra);
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let code = remanence_cli::run_with_standalone_test_io(
+        &args,
+        root,
+        &root.join("state"),
+        &root.join("absent"),
+        &root.join("locks"),
+        vec![remanence_library::DeviceAttachment {
+            sg_path: "/dev/home-model".into(),
+            sysfs_path: "/sys/home-model".into(),
+        }],
+        |_: &Path| {
+            Ok(Box::new(RemovalTransport {
+                inner: remanence_chaos::model::ModelTransport::new(
+                    world.clone(),
+                    remanence_chaos::model::DeviceRole::Drive { bay: 0x100 },
+                ),
+                config: root.join("state/rem/config.toml"),
+                fail_writes: false,
+                check_all_writes: true,
+                writes_observed: 0,
+                world: world.clone(),
+                bootstrap_step: 0,
+                init_probe: true,
+                init_exit: exit.clone(),
+                init_fault: fault,
+            }) as Box<dyn remanence_library::SgTransport>)
+        },
+        &mut out,
+        &mut errors,
+    );
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(errors).unwrap(),
+    )
+}
+
+/// Blank physical media for real CLI initialization, without an initial provision.
+fn ruling24_blank_world() -> remanence_chaos::model::SharedVirtualWorld {
+    use remanence_chaos::model::{VirtualTape, VirtualWorld};
+    let mut world = VirtualWorld::single_drive("UNEXPOSED", 0x100, "HOME-DRIVE", 0x400, 0);
+    world.put_tape_in_drive(
+        0x100,
+        "FIRST",
+        None,
+        VirtualTape::empty(256 * 1024 * 1024, 262144),
+    );
+    std::sync::Arc::new(std::sync::Mutex::new(world))
+}
+
+/// Replay authenticated library records through the existing public read-only APIs.
+fn ruling24_library_records(config_path: &Path) -> Vec<remanence_state::library_log::Record> {
+    let config = remanence_state::load_config(config_path).unwrap();
+    let paths = remanence_state::StatePaths::from_config(config_path, &config);
+    let state = remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
+    let uuid = state.library_runtime().manifest().library_uuid();
+    drop(state);
+    let view = remanence_state::library_log::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    remanence_state::library_log::store::replay_observed(
+        &paths.audit_dir,
+        uuid,
+        &view,
+        &mut |applied| {
+            records.push(applied.record().clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+    records
+}
+
+/// Decode public canonical structural bytes for a G3 assertion before G4 adds its typed accessor.
+fn ruling24_reprovision_predecessor(
+    record: &remanence_state::library_log::Record,
+) -> ciborium::Value {
+    let (bytes, _) = remanence_state::library_log::codec::encode(1, [0; 32], record).unwrap();
+    let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let start = remanence_state::log_frame::PREFIX_LEN;
+    let value: ciborium::Value = ciborium::from_reader(&bytes[start..start + size]).unwrap();
+    fn field(value: &ciborium::Value, key: u64) -> ciborium::Value {
+        let ciborium::Value::Map(map) = value else {
+            panic!("canonical map");
+        };
+        map.iter()
+            .find(|(k, _)| *k == ciborium::Value::Integer(key.into()))
+            .unwrap()
+            .1
+            .clone()
+    }
+    field(&field(&value, 1), 1)
+}
+
+/// A blank standalone init creates one identity and never a durable write session.
+#[test]
+fn ruling24_standalone_init_has_no_session() {
+    let root = tempfile::tempdir().unwrap();
+    let world = ruling24_blank_world();
+    let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    let config = root.path().join("state/rem/config.toml");
+    ruling24_assert_no_init_session(&config);
+    let records = ruling24_library_records(&config);
+    let provisions: Vec<_> = records
+        .iter()
+        .filter(|r| r.tag() == remanence_state::library_log::Tag::Reprovision)
+        .collect();
+    assert_eq!(provisions.len(), 1);
+    assert_eq!(
+        ruling24_reprovision_predecessor(provisions[0]),
+        ciborium::Value::Null
+    );
+}
+
+/// An init cut after Bootstrap leaves no session/fence; the next init refuses the now-unknown BOT.
+#[test]
+fn ruling24_standalone_init_crash_requires_unknown_identity_confirmation() {
+    const NAME: &str = "ruling24_standalone_init_crash_requires_unknown_identity_confirmation";
+    if let Some(root) = std::env::var_os("R2A_INIT_CRASH_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        let result = ruling24_run_init(
+            &root,
+            &ruling24_blank_world(),
+            Some(root.join("media.json")),
+            false,
+            &[],
+        );
+        panic!("init crash cut was not reached: {result:?}");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture"])
+        .env("R2A_INIT_CRASH_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.code(),
+        Some(86),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let config_path = root.path().join("state/rem/config.toml");
+    ruling24_assert_no_init_session(&config_path);
+    let records = ruling24_library_records(&config_path);
+    assert!(records
+        .iter()
+        .all(|r| r.tag() != remanence_state::library_log::Tag::Reprovision));
+    let config = remanence_state::load_config(&config_path).unwrap();
+    let state = remanence_state::StateHandle::open_with_config(
+        remanence_state::StatePaths::from_config(&config_path, &config),
+        config,
+    )
+    .unwrap();
+    assert!(!state.library_runtime().motion_fenced());
+    assert!(state
+        .catalog()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    drop(state);
+    let media: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("media.json")).unwrap()).unwrap();
+    let saved: Vec<(u8, Vec<u8>, u32)> = serde_json::from_value(media["records"].clone()).unwrap();
+    let world = ruling24_blank_world();
+    {
+        use remanence_chaos::model::Record;
+        let mut w = world.lock().unwrap();
+        let tape = w.tapes.get_mut("FIRST").unwrap();
+        tape.records = saved
+            .into_iter()
+            .map(|(kind, bytes, size)| match kind {
+                0 => Record::Block(bytes),
+                1 => Record::ZeroBlock(size),
+                2 => Record::Filemark,
+                _ => panic!("saved media"),
+            })
+            .collect();
+        tape.written_bytes = media["written_bytes"].as_u64().unwrap();
+    }
+    let before = world.lock().unwrap().tapes["FIRST"].records.clone();
+    let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}");
+    assert!(
+        format!("{out} {errors}").contains("observed BOT predecessor has no typed identity"),
+        "{out} {errors}"
+    );
+    assert!(world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19)));
+    assert_eq!(world.lock().unwrap().tapes["FIRST"].records, before);
+    assert!(ruling24_library_records(&config_path)
+        .iter()
+        .all(|r| r.tag() != remanence_state::library_log::Tag::Reprovision));
+}
+
+/// A transport fault after the Bootstrap delimiter publishes no identity;
+/// a new invocation must name that unknown BOT before replacing it.
+#[test]
+fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
+    use remanence_state::library_log::{ProvisionMode, Tag};
+    let root = tempfile::tempdir().unwrap();
+    let world = ruling24_blank_world();
+    let config = root.path().join("state/rem/config.toml");
+    let (code, out, errors) = ruling24_run_init(root.path(), &world, None, true, &[]);
+    assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+    ruling24_assert_no_init_session(&config);
+    let records = ruling24_library_records(&config);
+    // Home-mode configuration predates the attempted media write. The failed
+    // init must add no provisioning, session, fence or other library record.
+    assert!(records
+        .iter()
+        .all(|r| r.tag() == Tag::ConfigurationAccepted));
+    let (unknown, before) = {
+        let w = world.lock().unwrap();
+        let tape = &w.tapes["FIRST"];
+        let remanence_chaos::model::Record::Block(bytes) = &tape.records[0] else {
+            panic!("fault must follow Bootstrap write");
+        };
+        assert!(matches!(
+            tape.records[1],
+            remanence_chaos::model::Record::Filemark
+        ));
+        (
+            remanence_parity::bootstrap::parse_bootstrap_block(bytes)
+                .unwrap()
+                .tape_uuid,
+            tape.records.clone(),
+        )
+    };
+    world.lock().unwrap().command_log.clear();
+    let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}");
+    assert!(
+        format!("{out} {errors}").contains("observed BOT predecessor has no typed identity"),
+        "{out} {errors}"
+    );
+    assert_eq!(world.lock().unwrap().tapes["FIRST"].records, before);
+    assert!(world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19)));
+    assert_eq!(ruling24_library_records(&config), records);
+    let unknown_text = uuid::Uuid::from_bytes(unknown).to_string();
+    let (code, out, errors) = ruling24_run_init(
+        root.path(),
+        &world,
+        None,
+        false,
+        &[
+            "--clobber-data",
+            "--clobber-unknown-tape",
+            &unknown_text,
+            "--confirm-clobber",
+            "CLOBBER FIRST",
+        ],
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{out} {errors}");
+    ruling24_assert_no_init_session(&config);
+    let records = ruling24_library_records(&config);
+    assert!(records.iter().all(|r| r.tag() != Tag::Retire));
+    let provisions: Vec<_> = records.iter().filter_map(|r| r.reprovision()).collect();
+    assert_eq!(provisions.len(), 1);
+    assert_eq!(provisions[0].mode, ProvisionMode::Initialize);
+    assert_eq!(provisions[0].predecessor, None);
+    assert_eq!(provisions[0].replaced_bot, Some(unknown));
+    assert_ne!(provisions[0].tape.uuid, unknown);
 }

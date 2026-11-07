@@ -33,6 +33,7 @@ pub(super) fn library_parts(
                 fault: fault.clone(),
                 evidence: None,
                 last_opcode: None,
+                bootstrap_step: 0,
                 empty_prefix_recovery: None,
             }))
         })

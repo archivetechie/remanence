@@ -2456,16 +2456,6 @@ pub(super) fn handle_drive_open_write(
     let bytes_committed = 0u64;
     let last_checkpoint_at_utc = None;
     let mut last_durable_checkpoint = durable_checkpoint_records.last().cloned();
-    // Rulings 1–19 have no durable write-session representation before the
-    // first Initialized commit. Both parity construction and the plain writer
-    // can dispatch Bootstrap bytes; refuse before either writer after proving the actual physical boundary.
-    if cfg.authority.runtime().is_some() && durable_checkpoint_records.is_empty() {
-        let _ = reply.send(Err(Status::failed_precondition(
-            "cannot open a fresh write session without durable pre-Bootstrap session authority; no Bootstrap bytes were written",
-        )));
-        return None;
-    }
-
     let bootstrap_dispatch_before = drive.media_write_dispatch_count();
     if let Some(authority) = fresh_parity_authority {
         parity_session = match open_parity_actor_session(

@@ -2043,6 +2043,13 @@ impl Record {
             _ => None,
         }
     }
+    /// Borrow provisioning evidence without exposing body construction.
+    pub fn reprovision(&self) -> Option<&Reprovision> {
+        match &self.body {
+            Body::Reprovision(value) => Some(value),
+            _ => None,
+        }
+    }
     /// Borrow the physical inventory observation named by a motion outcome.
     pub fn inventory_observation(&self) -> Option<&InventoryReconciled> {
         match &self.body {

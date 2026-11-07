@@ -22,6 +22,7 @@ struct Transport {
     fault: Arc<Mutex<Option<u8>>>,
     evidence: Option<PathBuf>,
     last_opcode: Option<u8>,
+    bootstrap_step: u8,
     empty_prefix_recovery: Option<EmptyPrefixRecoveryProof>,
 }
 /// Test observer for exactly ruling19's recovery of a missing Bootstrap
@@ -92,6 +93,27 @@ impl EmptyPrefixRecoveryProof {
         true
     }
 }
+
+/// Permit only the ordered, identity-checked precommit bootstrap sequence.
+fn authorize_bootstrap(step: &mut u8, cdb: &[u8], bytes: Option<&[u8]>) -> bool {
+    let permitted = match *step {
+        0 => {
+            cdb[0] == 0x0a
+                && bytes.is_some_and(|bytes| {
+                    remanence_parity::bootstrap::parse_bootstrap_block(bytes)
+                        .is_ok_and(|bootstrap| bootstrap.tape_uuid == UUID)
+                })
+        }
+        1 => cdb[0] == 0x10 && cdb[2..5] == [0, 0, 1],
+        2 => cdb[0] == 0x10 && cdb[1] & 1 == 0 && cdb[2..5] == [0, 0, 0],
+        _ => false,
+    };
+    if permitted {
+        *step += 1;
+    }
+    permitted
+}
+
 impl Transport {
     fn observe(&mut self, cdb: &[u8], bytes: Option<&[u8]>) -> std::result::Result<(), ScsiError> {
         self.commands.lock().unwrap().push(cdb.to_vec());
@@ -112,7 +134,7 @@ impl Transport {
         }
         if !recovery
             && matches!(cdb[0], 0x0a | 0x10 | 0x19)
-            && (previous != Some(0x0a) || cdb[0] != 0x0a)
+            && (previous != Some(0x0a) || cdb[0] != 0x0a || matches!(self.bootstrap_step, 1 | 2))
         {
             if let Some(path) = &self.evidence {
                 let native_path = path
@@ -122,22 +144,29 @@ impl Transport {
                     .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
                 // Observe the actual durable native source without acquiring a
                 // second tape owner while execute_out holds the writer lease.
-                let native_authorized = if let Ok(mut file) = std::fs::File::open(&native_path) {
-                    remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
-                    let offset = std::io::Seek::stream_position(&mut file).unwrap();
-                    let mut decoder =
-                        remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
-                    let mut fold = remanence_state::tape_log::fold::Fold::new();
-                    while let Some(frame) = decoder.next_frame().unwrap() {
-                        fold.push(&frame).unwrap();
+                let mut native_empty = true;
+                let native_authorized = match std::fs::File::open(&native_path) {
+                    Ok(mut file) => {
+                        remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+                        let offset = std::io::Seek::stream_position(&mut file).unwrap();
+                        native_empty = file.metadata().unwrap().len() == offset;
+                        let mut decoder =
+                            remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+                        let mut fold = remanence_state::tape_log::fold::Fold::new();
+                        while let Some(frame) = decoder.next_frame().unwrap() {
+                            native_empty = false;
+                            fold.push(&frame).unwrap();
+                        }
+                        let (summary, _) = fold.finish(decoder.tail()).unwrap();
+                        summary.open_session.is_some()
+                            || summary.finalization.as_ref().is_some_and(|v| !v.prepared)
                     }
-                    let (summary, _) = fold.finish(decoder.tail()).unwrap();
-                    summary.open_session.is_some()
-                        || summary.finalization.as_ref().is_some_and(|v| !v.prepared)
-                } else {
-                    false
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => panic!("read native session authority: {error}"),
                 };
-                if !native_authorized {
+                let bootstrap_authorized =
+                    native_empty && authorize_bootstrap(&mut self.bootstrap_step, cdb, bytes);
+                if !native_authorized && !bootstrap_authorized {
                     let records = FileAuditLog::replay(path).unwrap();
                     let last = records
                         .iter()
@@ -435,6 +464,7 @@ tape_catalog_dir = "{0}/cache"
                 fault: self.fault.clone(),
                 evidence: Some(self.config.audit.dir.clone()),
                 last_opcode: None,
+                bootstrap_step: 0,
                 empty_prefix_recovery: proof,
             }),
             self.root.path(),
@@ -603,6 +633,7 @@ fn encrypted_append_carries_recipients_and_replay_guard_without_deleting_source(
             fault: fixture.fault.clone(),
             evidence: None,
             last_opcode: None,
+            bootstrap_step: 0,
             empty_prefix_recovery: None,
         }),
         &mut state,
@@ -931,6 +962,7 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
             fault: fixture.fault.clone(),
             evidence: None,
             last_opcode: None,
+            bootstrap_step: 0,
             empty_prefix_recovery: None,
         }),
         &mut state,
@@ -1059,6 +1091,7 @@ fn transferred_reservation_and_audit_latch_survive_into_owner_and_finish() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            bootstrap_step: 0,
             empty_prefix_recovery: None,
         }),
         &mut state,
@@ -1254,6 +1287,7 @@ fn device_lock_excludes_another_state_directory_until_owner_finish() {
                 fault: other.fault.clone(),
                 evidence: None,
                 last_opcode: None,
+                bootstrap_step: 0,
                 empty_prefix_recovery: None,
             }),
             fixture.root.path(),
@@ -1517,6 +1551,7 @@ async fn cleanup_spawn_failure_finishes_in_place_and_releases_every_obligation()
                 fault: fixture.fault.clone(),
                 evidence: Some(fixture.config.audit.dir.clone()),
                 last_opcode: None,
+                bootstrap_step: 0,
                 empty_prefix_recovery: None,
             }),
             &mut state,
@@ -1629,6 +1664,7 @@ fn frontend_returns_committed_receipt_beside_post_projection_failure() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            bootstrap_step: 0,
             empty_prefix_recovery: None,
         }),
         &mut state,
@@ -1682,6 +1718,7 @@ fn projection_busy_returns_committed_receipt_on_native_replay() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            bootstrap_step: 0,
             empty_prefix_recovery: None,
         }),
         &mut state,
@@ -1747,6 +1784,7 @@ fn supersede_requires_mounted_generation_before_any_modifying_command() {
             fault: fixture.fault.clone(),
             evidence: Some(fixture.config.audit.dir.clone()),
             last_opcode: None,
+            bootstrap_step: 0,
             empty_prefix_recovery: None,
         }),
         &mut state,

@@ -364,6 +364,7 @@ fn insertion_removal_and_swap_require_a_new_proof() {
     );
 }
 #[test]
+#[ignore = "ruling 24: a pre-commit session is process-local, so no durable session exists to recover; the post-commit restart fence waits on ruling 29 (L2)"]
 fn crash_after_session_open_allows_read_mount_but_refuses_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
@@ -371,13 +372,6 @@ fn crash_after_session_open_allows_read_mount_but_refuses_writes() {
     let lock = root.path().join("locks");
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
-    mount
-        .session(
-            mounted.tape_uuid,
-            uuid::Uuid::new_v4(),
-            AuditEvent::SessionOpened,
-        )
-        .unwrap();
     drop(mounted);
     drop(mount);
     let paths = state.paths().clone();
@@ -1193,13 +1187,6 @@ fn ephemeral_open_and_mount_leave_all_durable_authority_unchanged() {
     let world = world();
     let mut backend = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
     let mounted = backend.mount(target()).unwrap();
-    backend
-        .session(
-            mounted.tape_uuid,
-            uuid::Uuid::new_v4(),
-            AuditEvent::SessionOpened,
-        )
-        .unwrap();
     backend.release(mounted);
     seed_open_session(
         &mut state,

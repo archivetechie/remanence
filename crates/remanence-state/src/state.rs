@@ -572,16 +572,18 @@ impl StateHandle {
         provenance: crate::LabelProvenance,
         observation: Option<crate::MediaObservation>,
     ) -> Result<(), StateError> {
-        self.provision_replacing_media(input, provenance, observation, None)
+        self.provision_replacing_media(input, provenance, observation, None, None)
     }
 
     /// Confirmed BOT replacement shares provisioning and calibration eviction.
+    /// `replaced_bot` is the overwritten foreign BOT UUID, evidence only.
     pub fn provision_replacing_media(
         &mut self,
         input: ProvisionTapeInput,
         provenance: crate::LabelProvenance,
         observation: Option<crate::MediaObservation>,
         previous_uuid: Option<[u8; 16]>,
+        replaced_bot: Option<[u8; 16]>,
     ) -> Result<(), StateError> {
         let prior = match self
             .index
@@ -648,7 +650,7 @@ impl StateHandle {
                     lib::Reprovision {
                         pool_source: None,
                         operation: None,
-                        replaced_bot: None,
+                        replaced_bot,
                         tape: lib::TapeRef {
                             uuid: input.tape_uuid,
                             incarnation: 1,
@@ -2731,6 +2733,7 @@ pool_id = "camera.copy-a"
                 crate::LabelProvenance::Operator,
                 Some(observation),
                 Some(uuid),
+                None,
             )
             .unwrap();
         let tape = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
@@ -4761,6 +4764,7 @@ pool_id = "camera.copy-a"
                 crate::LabelProvenance::Changer,
                 crate::MediaObservation::label_hint("ACM045L9"),
                 Some(old_uuid),
+                None,
             )
             .expect("reprovision physical identity");
 

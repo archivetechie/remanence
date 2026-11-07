@@ -9283,13 +9283,6 @@ fn provision_initialized_tape_with_media(
     input: remanence_state::ProvisionTapeInput,
     context: ProvisioningContext<'_>,
 ) -> Result<(), String> {
-    // Unknown BOT destruction is rejected by admission; keep this producer
-    // from silently dropping that fact if a caller violates the precondition.
-    if context.clobbered_unknown_uuid.is_some() {
-        return Err(
-            "unknown prior tape identity cannot be preserved by initialization authority".into(),
-        );
-    }
     let remanence_state::ProvisionTapeInput {
         tape_uuid,
         voltag,
@@ -9313,6 +9306,7 @@ fn provision_initialized_tape_with_media(
             context.provenance,
             context.observation,
             context.previous_uuid,
+            context.clobbered_unknown_uuid,
         )
         .map_err(|e| format!("provision catalog tape row: {e}"))?;
     let assignment = state
@@ -12750,6 +12744,13 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             clobber_unknown_tape.map(|v| v.bot_uuid()),
         )?
     };
+    let clobbered_unknown_uuid = initialization_guard
+        .as_ref()
+        .and_then(remanence_state::InitializationGuard::replaced_bot);
+    if !args.dry_run && clobber_unknown_tape.map(|named| named.bot_uuid()) != clobbered_unknown_uuid
+    {
+        return Err("initialization request disagrees with checked unknown BOT identity; no write attempted".into());
+    }
     let action_result = {
         remanence_api::maybe_write_tape_init_bootstrap_on_drive(
             &mut drive,
@@ -12791,7 +12792,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             ));
         }
     }
-    let clobbered_unknown_uuid = clobber_unknown_tape.map(|named| named.bot_uuid());
+
     let unknown_tape_next = match &decision {
         remanence_api::InitDecision::NeedsExplicitRebuild {
             reason: remanence_api::TapeInitError::MissingCatalogRow { bot_uuid },

@@ -143,6 +143,7 @@ fn configured_owner_and_memory(
                 fault: f.fault.clone(),
                 evidence: Some(f.config.audit.dir.clone()),
                 last_opcode: None,
+                bootstrap_step: 0,
                 empty_prefix_recovery: None,
             },
             replica_attempts: replicas,
@@ -1020,7 +1021,7 @@ fn bootstrap_barrier_crash_child() {
 fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
     for parity in [false, true] {
         for after_barrier in [false, true] {
-            let (f, state) = Fixture::new(parity);
+            let (mut f, state) = Fixture::new(parity);
             drop(state);
             let manifest = f.root.path().join("bootstrap-crash.json");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1064,8 +1065,8 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
                 config.clone(),
             )
             .unwrap();
-            // Existing crash recovery quarantines the orphaned mounted write;
-            // neither a completed BOT nor a completed barrier invents authority.
+            // A precommit session is process-local; neither Bootstrap nor its
+            // completed barrier invents a durable session or restart fence.
             let mount = OperatorMount::with_transport(
                 Path::new(DEVICE),
                 &StaticAllowlist::new([SERIAL]),
@@ -1075,6 +1076,7 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
                     fault: f.fault.clone(),
                     evidence: None,
                     last_opcode: None,
+                    bootstrap_step: 0,
                     empty_prefix_recovery: None,
                 }),
                 &mut state,
@@ -1083,8 +1085,7 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
             .unwrap();
             mount.finish().unwrap();
             let fences = state.catalog().list_active_tape_io_fences().unwrap();
-            assert_eq!(fences.len(), 1);
-            assert_eq!(fences[0].reason, "standalone_write_lost_by_restart");
+            assert!(fences.is_empty());
             assert!(state.catalog().non_terminal_sessions().unwrap().is_empty());
             assert!(!remanence_state::TapeAuthority::exists(
                 config.journal.dir.join("tapes"),
@@ -1092,7 +1093,13 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
             )
             .unwrap());
             no_modifications(&f, 0);
-            drop(state);
+            f.config = config.clone();
+            let mut owner = f.owner(state);
+            owner.open_session("default").unwrap();
+            owner.append(f.request("after-bootstrap-crash")).unwrap();
+            owner.close_session().unwrap();
+            owner.finish().unwrap();
+            assert_fresh_native_prefix(&config);
             std::fs::remove_dir_all(&config.daemon.state_dir).unwrap();
         }
     }
@@ -1288,19 +1295,26 @@ fn b4b2b_tape_owned_decisions_survive_empty_catalog_rebuild() {
     }
 }
 
-/// The missing precommit session source cannot be hidden by either writer's
-/// Bootstrap constructor. Both real mounted paths refuse before media mutation.
+/// Fresh admission refuses data in place of the Bootstrap delimiter in both
+/// parity modes, before the precommit gate and before any media modification.
 #[test]
 fn typed_fresh_session_refuses_before_parity_or_plain_bootstrap() {
     for parity in [false, true] {
         let (f, state) = Fixture::new(parity);
+        f.world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut("HAND")
+            .unwrap()
+            .records[1] = Record::Block(vec![0x55; BLOCK as usize]);
         let mut owner = f.owner(state);
         let before = command_count(&f);
         let error = owner.open_session("default").unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("pre-Bootstrap session authority"),
+                .contains("data where bootstrap filemark was expected"),
             "{error:?}"
         );
         no_modifications(&f, before);
@@ -1308,5 +1322,36 @@ fn typed_fresh_session_refuses_before_parity_or_plain_bootstrap() {
         let reopened = f.reopen().unwrap();
         assert!(!reopened.library_runtime().motion_fenced());
         drop(reopened);
+    }
+}
+
+/// Compare the first native records with the unchanged tape-log golden corpus.
+fn assert_fresh_native_prefix(config: &remanence_state::RemConfig) {
+    let path = config
+        .journal
+        .dir
+        .join("tapes")
+        .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+    let mut file = std::fs::File::open(path).unwrap();
+    remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+    for (sequence, tag) in [
+        (1, remanence_state::tape_log::Tag::Initialized),
+        (2, remanence_state::tape_log::Tag::SessionOpened),
+    ] {
+        let frame = decoder.next_frame().unwrap().unwrap();
+        assert_eq!(frame.sequence, sequence);
+        assert_eq!(frame.record.tag(), tag);
+    }
+    let golden = include_str!("../../../../../../fixtures/tape-log/FRAMES.tsv");
+    for line in golden.lines().filter(|line| !line.starts_with('#')) {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.get(1) == Some(&"1") {
+            assert_eq!(fields[2], "Initialized");
+        }
+        if fields.get(1) == Some(&"2") {
+            assert_eq!(fields[2], "SessionOpened");
+        }
     }
 }

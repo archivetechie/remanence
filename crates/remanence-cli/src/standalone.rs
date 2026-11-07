@@ -2347,6 +2347,10 @@ fn complete_init(
         initialization_guard,
         clobber_unknown_tape,
     } = plan;
+    let clobbered_unknown_uuid = initialization_guard.replaced_bot();
+    if clobber_unknown_tape.map(|named| named.bot_uuid()) != clobbered_unknown_uuid {
+        return Err("initialization request disagrees with checked unknown BOT identity; no write attempted".into());
+    }
     let action = remanence_api::maybe_write_tape_init_bootstrap_on_drive(
         drive,
         &decision,
@@ -2370,7 +2374,7 @@ fn complete_init(
         }
         return Err("initialization refused by the media write gate; no write attempted".into());
     }
-    let clobbered_unknown_uuid = clobber_unknown_tape.map(|named| named.bot_uuid());
+
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
         let previous_uuid = state
             .record_initialization_replacement(initialization_guard)

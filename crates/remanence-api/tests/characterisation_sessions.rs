@@ -51,9 +51,8 @@ fn state_paths(config: &RemConfig) -> StatePaths {
 /// The catalog the daemon builds: the library runtime over the state root, installed on the
 /// projection client. The runtime holds the state lock until every clone of it is dropped. The
 /// drive-collection heartbeat, the idle-unload timers and the timer-park listener drop theirs
-/// when shutdown begins; the library's drive actor thread keeps one for the life of the process
-/// (`drive_loop` holds a sender to its own mailbox, so the mailbox never closes), so a second
-/// start in one process still cannot take the lock again.
+/// when shutdown begins; drive actors release theirs when their external mailbox owners and
+/// active sessions are gone, permitting a second start in the same process.
 fn open_runtime_catalog(config: &RemConfig) -> remanence_state::ProjectionClient {
     let paths = state_paths(config);
     let lock = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
@@ -101,6 +100,26 @@ struct Harness {
 }
 
 impl Harness {
+    /// Wait for asynchronous actor teardown after the server task has ended.
+    async fn wait_for_teardown(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match StateLockGuard::acquire(&self.config.daemon.state_dir) {
+                Ok(lock) => {
+                    drop(lock);
+                    return;
+                }
+                Err(error) if error.is_state_lock_held() && Instant::now() < deadline => {
+                    // Actor threads release their runtime owners asynchronously.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => {
+                    panic!("state root still locked after asynchronous teardown: {error}")
+                }
+            }
+        }
+    }
+
     fn new(parity: bool) -> Self {
         let temp = if let Some(parent) = std::env::var_os("CHARACTERISATION_CRASH_PARENT") {
             tempfile::tempdir_in(parent).unwrap()
@@ -273,6 +292,12 @@ impl Drop for Client {
 }
 
 impl Client {
+    /// Await server cancellation so its service handles release their state owners.
+    async fn shutdown(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+
     fn reader(&self) -> pb::read_session_service_client::ReadSessionServiceClient<Channel> {
         pb::read_session_service_client::ReadSessionServiceClient::new(self.channel.clone())
     }
@@ -465,7 +490,8 @@ async fn checkpoint_and_close_report_objects_that_remain_readable_after_restart(
         assert_eq!(closed.checkpointed_objects.len(), 1);
         assert_eq!(closed.checkpointed_objects[0].object_id, third.object_id);
         client.state.shutdown_drive_pool().await.unwrap();
-        drop(client);
+        client.shutdown().await;
+        fixture.wait_for_teardown().await;
         let client = fixture.start().await;
         client.assert_object(&first, b"checkpoint bytes").await;
         client
@@ -566,7 +592,8 @@ async fn check_graceful_shutdown_restart(other_drive: bool) {
         "graceful shutdown closes the session-owned partial epoch"
     );
     let cursor = tape.written_extent_lba.unwrap();
-    drop(client);
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
 
     let restart_bay = if other_drive {
         // Simulate an operator transfer while the daemon is stopped. Keep the
@@ -644,7 +671,8 @@ async fn check_graceful_shutdown_restart(other_drive: bool) {
         before,
         "idle shutdown sends no commands"
     );
-    drop(client);
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
 
     // Startup itself schedules the normal idle timer for the still-seated tape.
     fixture.config.daemon.drive_idle_unload_seconds = 1;
@@ -823,6 +851,8 @@ struct Injection {
     lose_sidecar_reply: bool,
     lost_write_replies: usize,
     commands: Vec<Vec<u8>>,
+    crash_cut: Option<(bool, std::path::PathBuf, SharedVirtualWorld)>,
+    crash_writes: usize,
 }
 struct Transport {
     inner: ModelTransport,
@@ -834,6 +864,38 @@ impl Transport {
         let mut injection = self.injection.lock().unwrap();
         if matches!(self.role, DeviceRole::Drive { .. }) {
             injection.commands.push(cdb.to_vec());
+            if cdb[0] == 0x0a {
+                injection.crash_writes += 1;
+            }
+            if let Some((after_commit, path, world)) = &injection.crash_cut {
+                let cut = if *after_commit {
+                    cdb[0] == 0x0a && injection.crash_writes == 2
+                } else {
+                    cdb[0] == 0x10 && cdb[1] & 1 == 0 && cdb[2..5] == [0, 0, 0]
+                };
+                if cut {
+                    let world = world.lock().unwrap();
+                    let tape = &world.tapes[BARCODE];
+                    let records: Vec<(u8, Vec<u8>, u32)> = tape
+                        .records
+                        .iter()
+                        .map(|record| match record {
+                            Record::Block(bytes) => (0, bytes.clone(), 0),
+                            Record::ZeroBlock(size) => (1, vec![], *size),
+                            Record::Filemark => (2, vec![], 0),
+                        })
+                        .collect();
+                    std::fs::write(
+                        path,
+                        serde_json::to_vec(&serde_json::json!({
+                            "records": records, "written_bytes": tape.written_bytes,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    std::process::exit(86);
+                }
+            }
         }
         if matches!(self.role, DeviceRole::Drive { .. })
             && injection
@@ -1039,7 +1101,8 @@ async fn first_load_optimisation_and_subsequent_load_wait_without_data_commands(
         }
         client.close(&session).await;
         client.state.shutdown_drive_pool().await.unwrap();
-        drop(client);
+        client.shutdown().await;
+        fixture.wait_for_teardown().await;
         fixture
             .library_handle()
             .unload(BAY, Some(0x400), &StaticAllowlist::new([LIBRARY]))
@@ -1561,7 +1624,11 @@ async fn check_finalized_access(restart: bool) {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     client.state.shutdown_drive_pool().await.unwrap();
-    drop(client);
+    // Release every RPC channel so the server's connections can finish teardown.
+    drop(catalog);
+    drop(daemon);
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
     // Native inspection owns a lease only after the actor has released it.
     {
         use remanence_state::authority::TapeAuthorityView;
@@ -2088,7 +2155,8 @@ async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_res
         .await
         .unwrap_err();
     client.state.shutdown_drive_pool().await.unwrap();
-    drop(client);
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
     {
         let paths = remanence_state::StatePaths::from_config(
             fixture.root.join("config.toml"),
@@ -2162,6 +2230,9 @@ async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_res
         }
         operation = Some(op.operation_id);
         client.state.shutdown_drive_pool().await.unwrap();
+        drop(watch);
+        client.shutdown().await;
+        fixture.wait_for_teardown().await;
     }
 }
 
@@ -2261,3 +2332,278 @@ async fn session_epochs_end_at_close_and_full_epoch_ignores_checkpoint_boundarie
 
 #[path = "characterisation/b10_pool.rs"]
 mod b10_pool;
+
+/// Shutting down the real actor pool releases its runtime and permits a second start.
+#[tokio::test]
+async fn shutdown_releases_actor_state_lock_and_allows_restart() {
+    let harness = Harness::new(false);
+    let client = harness.start().await;
+    client.state.shutdown_drive_pool().await.unwrap();
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let lock = loop {
+        match StateLockGuard::acquire(&harness.config.daemon.state_dir) {
+            Ok(lock) => break lock,
+            Err(error) if error.is_state_lock_held() && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("state root still locked after actor shutdown: {error}"),
+        }
+    };
+    drop(lock);
+    let restarted = harness.start().await;
+    restarted.state.shutdown_drive_pool().await.unwrap();
+    drop(restarted);
+}
+
+/// Read native source records without acquiring a second tape owner.
+fn ruling24_native_records(config: &RemConfig) -> Vec<remanence_state::tape_log::Record> {
+    let path = config
+        .journal
+        .dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()));
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("read tape source: {error}"),
+    };
+    remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+    let mut records = Vec::new();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        records.push(frame.record.clone());
+    }
+    records
+}
+
+/// Require the same Initialized/SessionOpened prefix as every golden tape log.
+fn ruling24_assert_prefix(config: &RemConfig) {
+    use remanence_state::tape_log::Tag;
+    let records = ruling24_native_records(config);
+    assert_eq!(records[0].tag(), Tag::Initialized);
+    assert_eq!(records[1].tag(), Tag::SessionOpened);
+    let golden = include_str!("../../../fixtures/tape-log/FRAMES.tsv");
+    let mut pairs = [0, 0];
+    for line in golden.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        match fields.get(1).copied() {
+            Some("1") => {
+                assert_eq!(fields[2], "Initialized");
+                pairs[0] += 1;
+            }
+            Some("2") => {
+                assert_eq!(fields[2], "SessionOpened");
+                pairs[1] += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(pairs[0] > 0);
+    assert_eq!(pairs[0], pairs[1]);
+}
+
+/// A fresh library tape writes and reads in both modes, with native publication after Bootstrap.
+#[tokio::test]
+async fn ruling24_fresh_first_write_matches_native_golden() {
+    for parity in [false, true] {
+        let fixture = Harness::new(parity);
+        let client = fixture.start().await;
+        fixture.injection.lock().unwrap().commands.clear();
+        let session = client.open().await;
+        let object = client
+            .append(&session, "first-native", b"first native write")
+            .await;
+        client.close(&session).await;
+        client.assert_object(&object, b"first native write").await;
+        ruling24_assert_prefix(&fixture.config);
+        {
+            let injection = fixture.injection.lock().unwrap();
+            let modifying: Vec<_> = injection
+                .commands
+                .iter()
+                .filter(|c| matches!(c[0], 0x0a | 0x10 | 0x19))
+                .collect();
+            assert_eq!(modifying[0][0], 0x0a);
+            assert_eq!(modifying[1][0], 0x10);
+            assert_eq!(&modifying[1][2..5], &[0, 0, 1]);
+            assert_eq!(modifying[2][0], 0x10);
+            assert_eq!(&modifying[2][1..5], &[0, 0, 0, 0]);
+            assert_eq!(modifying[3][0], 0x0a);
+        }
+        client.state.shutdown_drive_pool().await.unwrap();
+        client.shutdown().await;
+        fixture.wait_for_teardown().await;
+    }
+}
+
+/// Capture every library segment byte to prove a precommit crash adds no library authority.
+fn ruling24_library_bytes(config: &RemConfig) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(&config.audit.dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_str().unwrap().to_string(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Run the real gRPC writer in a child that exits at the media/native publication boundary.
+async fn ruling24_crash_test(name: &str, after_commit: bool) {
+    if let Some(parent) = std::env::var_os("R2A_CRASH_PARENT") {
+        let parent = std::path::PathBuf::from(parent);
+        let fixture = Harness::new(std::env::var("R2A_PARITY").unwrap() == "true");
+        let client = fixture.start().await;
+        std::fs::write(
+            parent.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "root": fixture.root, "config": fixture.config,
+                "library": ruling24_library_bytes(&fixture.config),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fixture.injection.lock().unwrap().crash_cut = Some((
+            after_commit,
+            parent.join("media.json"),
+            fixture.world.clone(),
+        ));
+        let session = client.open().await;
+        client
+            .append(&session, "cut", b"cut before first data write")
+            .await;
+        panic!("native publication crash cut was not reached");
+    }
+    for parity in [false, true] {
+        let parent = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("R2A_CRASH_PARENT", parent.path())
+            .env("CHARACTERISATION_CRASH_PARENT", parent.path())
+            .env("R2A_PARITY", parity.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "child: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(parent.path().join("state.json")).unwrap())
+                .unwrap();
+        let media: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(parent.path().join("media.json")).unwrap())
+                .unwrap();
+        let mut fixture = Harness::new(parity);
+        fixture.root = serde_json::from_value(saved["root"].clone()).unwrap();
+        fixture.config = serde_json::from_value(saved["config"].clone()).unwrap();
+        let records: Vec<(u8, Vec<u8>, u32)> =
+            serde_json::from_value(media["records"].clone()).unwrap();
+        {
+            let mut world = fixture.world.lock().unwrap();
+            let tape = world.tapes.get_mut(BARCODE).unwrap();
+            tape.records = records
+                .into_iter()
+                .map(|(kind, bytes, size)| match kind {
+                    0 => Record::Block(bytes),
+                    1 => Record::ZeroBlock(size),
+                    2 => Record::Filemark,
+                    _ => panic!("invalid saved media"),
+                })
+                .collect();
+            tape.written_bytes = media["written_bytes"].as_u64().unwrap();
+        }
+        let before = ruling24_native_records(&fixture.config);
+        if after_commit {
+            ruling24_assert_prefix(&fixture.config);
+        } else {
+            assert!(before.is_empty());
+            let projection =
+                remanence_state::projector::open(&fixture.config.index.sqlite_path).unwrap();
+            assert!(
+                projection
+                    .write_handle()
+                    .non_terminal_sessions()
+                    .unwrap()
+                    .is_empty(),
+                "the child left no precommit session row before restart"
+            );
+            drop(projection);
+            assert!(!remanence_state::TapeAuthority::exists(
+                fixture.config.journal.dir.join("tapes"),
+                UUID
+            )
+            .unwrap());
+            let library: std::collections::BTreeMap<String, Vec<u8>> =
+                serde_json::from_value(saved["library"].clone()).unwrap();
+            assert!(
+                !library.is_empty(),
+                "fixture has provisioned library authority"
+            );
+            assert_eq!(
+                ruling24_library_bytes(&fixture.config),
+                library,
+                "no library record can name the process-local session"
+            );
+        }
+        let client = fixture.start().await;
+        let index = remanence_state::projector::open(&fixture.config.index.sqlite_path)
+            .unwrap()
+            .write_handle();
+        if after_commit {
+            let session = before
+                .iter()
+                .find_map(|r| match r {
+                    remanence_state::tape_log::Record::SessionOpened(open) => Some(open.session_id),
+                    _ => None,
+                })
+                .unwrap();
+            let projected = index
+                .session_state(uuid::Uuid::from_bytes(session))
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(projected.as_str(), "open" | "closed"),
+                "{projected}"
+            );
+            if projected == "closed" {
+                assert!(ruling24_native_records(&fixture.config).iter().any(|record| matches!(record,
+                    remanence_state::tape_log::Record::SessionEnded(end)
+                        if end.session_id == session
+                            && end.reason == remanence_state::tape_log::SessionEndReason::CrashRecovered)));
+            }
+        } else {
+            assert!(index.non_terminal_sessions().unwrap().is_empty());
+        }
+        drop(index);
+        let session = client.open().await;
+        let object = client
+            .append(&session, "after-cut", b"readable after cut")
+            .await;
+        client.close(&session).await;
+        client.assert_object(&object, b"readable after cut").await;
+        ruling24_assert_prefix(&fixture.config);
+        client.state.shutdown_drive_pool().await.unwrap();
+        client.shutdown().await;
+        fixture.wait_for_teardown().await;
+    }
+}
+
+/// A process exit at the Bootstrap barrier leaves no durable session or library record.
+#[tokio::test]
+async fn ruling24_crash_before_bootstrap_commit() {
+    ruling24_crash_test("ruling24_crash_before_bootstrap_commit", false).await;
+}
+
+/// A process exit before the first data WRITE preserves the committed native session on restart.
+#[tokio::test]
+async fn ruling24_crash_after_bootstrap_commit() {
+    ruling24_crash_test("ruling24_crash_after_bootstrap_commit", true).await;
+}

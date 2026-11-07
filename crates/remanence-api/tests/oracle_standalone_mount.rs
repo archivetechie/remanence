@@ -59,6 +59,7 @@ fn transport(world: &SharedVirtualWorld) -> FaultTransport {
         hide_serial: false,
         fence_observer: None,
         session_observer: None,
+        bootstrap_step: 0,
         short_write: None,
     }
 }
@@ -166,6 +167,7 @@ struct FaultTransport {
     hide_serial: bool,
     fence_observer: Option<(PathBuf, u64, Arc<Mutex<usize>>)>,
     session_observer: Option<PathBuf>,
+    bootstrap_step: u8,
     short_write: Option<Arc<Mutex<bool>>>,
 }
 
@@ -177,31 +179,76 @@ fn assert_no_media_dispatch(log: &RecordingLog) {
     let log = log.borrow();
     assert!(log.iter().all(|cdb| !modifies_media(cdb[0])), "{log:?}");
 }
+
+/// Permit only the ordered, identity-checked precommit bootstrap sequence.
+fn authorize_bootstrap(step: &mut u8, cdb: &[u8], bytes: Option<&[u8]>) -> bool {
+    let permitted = match *step {
+        0 => {
+            cdb[0] == 0x0a
+                && bytes.is_some_and(|bytes| {
+                    remanence_parity::bootstrap::parse_bootstrap_block(bytes)
+                        .is_ok_and(|bootstrap| bootstrap.tape_uuid == UUID)
+                })
+        }
+        1 => cdb[0] == 0x10 && cdb[2..5] == [0, 0, 1],
+        2 => cdb[0] == 0x10 && cdb[1] & 1 == 0 && cdb[2..5] == [0, 0, 0],
+        _ => false,
+    };
+    if permitted {
+        *step += 1;
+    }
+    permitted
+}
+
 impl FaultTransport {
-    fn check(&self, cdb: &[u8]) -> Result<(), ScsiError> {
+    fn check(&mut self, cdb: &[u8], bytes: Option<&[u8]>) -> Result<(), ScsiError> {
         if modifies_media(cdb[0]) {
             if let Some(db_path) = &self.session_observer {
-                // A separate connection must see a committed, recoverable write
-                // session for this tape and C2's decoded standalone DriveKey.
-                // RestartSession.drive_key exposes the migrated endpoint without
-                // prescribing its SQLite encoding in this oracle.
                 let index = remanence_state::projector::open(db_path)
                     .map(|catalog| catalog.write_handle())
                     .unwrap();
+                for session in index
+                    .non_terminal_sessions()
+                    .unwrap()
+                    .iter()
+                    .filter(|session| {
+                        session.session_kind == "write"
+                            && session.tape_uuid.as_deref() == Some(UUID.as_slice())
+                    })
+                {
+                    assert!(matches!(&session.drive_key,
+                        Some(remanence_library::DriveKey::Standalone { drive_serial })
+                            if drive_serial == SERIAL));
+                }
+                let path = db_path
+                    .parent()
+                    .unwrap()
+                    .join("journals/tapes")
+                    .join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()));
+                let mut native_empty = true;
+                let native_authorized = match std::fs::File::open(path) {
+                    Ok(mut file) => {
+                        remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+                        let offset = std::io::Seek::stream_position(&mut file).unwrap();
+                        native_empty = file.metadata().unwrap().len() == offset;
+                        let mut decoder =
+                            remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+                        let mut fold = remanence_state::tape_log::fold::Fold::new();
+                        while let Some(frame) = decoder.next_frame().unwrap() {
+                            native_empty = false;
+                            fold.push(&frame).unwrap();
+                        }
+                        let (summary, _) = fold.finish(decoder.tail()).unwrap();
+                        summary.open_session.is_some()
+                            || summary.finalization.as_ref().is_some_and(|v| !v.prepared)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => panic!("read native session authority: {error}"),
+                };
+                let bootstrap_authorized =
+                    native_empty && authorize_bootstrap(&mut self.bootstrap_step, cdb, bytes);
                 assert!(
-                    index
-                        .non_terminal_sessions()
-                        .unwrap()
-                        .iter()
-                        .any(|session| {
-                            session.session_kind == "write"
-                                && session.tape_uuid.as_deref() == Some(UUID.as_slice())
-                                && matches!(
-                                    &session.drive_key,
-                                    Some(remanence_library::DriveKey::Standalone { drive_serial })
-                                        if drive_serial == SERIAL
-                                )
-                        }),
+                    native_authorized || bootstrap_authorized,
                     "durable standalone write session must precede media dispatch opcode {:02x}",
                     cdb[0]
                 );
@@ -246,14 +293,14 @@ impl FaultTransport {
 }
 impl SgTransport for FaultTransport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
-        self.check(cdb)?;
+        self.check(cdb, None)?;
         if self.hide_serial && cdb[0] == 0x12 && cdb[1] & 1 != 0 && cdb[2] == 0x80 {
             return Ok(TransferOutcome::clean(0));
         }
         self.inner.execute_in(cdb, buf)
     }
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
-        self.check(cdb)?;
+        self.check(cdb, None)?;
         if cdb.first() == Some(&0x1e) {
             // The existing model does not implement PREVENT/ALLOW. Use the
             // fixture's no-data completion; RecordingTransport still observes
@@ -266,7 +313,7 @@ impl SgTransport for FaultTransport {
         self.inner.execute_none(cdb)
     }
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
-        self.check(cdb)?;
+        self.check(cdb, Some(buf))?;
         if cdb[0] == 0x0a {
             if let Some(fired) = &self.short_write {
                 assert!(

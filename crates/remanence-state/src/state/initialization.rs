@@ -7,6 +7,13 @@ use super::*;
 pub struct InitializationGuard {
     previous: Option<crate::library_log::fold::TapeState>,
     owner: Option<crate::TapeAuthorityLease>,
+    replaced_bot: Option<[u8; 16]>,
+}
+impl InitializationGuard {
+    /// Foreign BOT identity checked by preflight, retained as overwrite evidence only.
+    pub fn replaced_bot(&self) -> Option<[u8; 16]> {
+        self.replaced_bot
+    }
 }
 impl StateHandle {
     /// Validate known identity/label and exclude concurrent native finalization
@@ -17,13 +24,24 @@ impl StateHandle {
         label: &str,
         clobbered_unknown: Option<[u8; 16]>,
     ) -> Result<InitializationGuard, StateError> {
-        if clobbered_unknown.is_some() {
-            return Err(StateError::TapeProvisionConflict("unknown-BOT clobber has no typed predecessor authority; no Bootstrap write admitted (C8-G4)".into()));
+        if clobbered_unknown.is_some() && previous != clobbered_unknown {
+            return Err(StateError::TapeProvisionConflict(
+                "named unknown BOT identity does not match the observed predecessor; no Bootstrap write admitted".into(),
+            ));
         }
         self.library
             .ensure_motion_allowed()
             .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
-        let previous=previous.map(|id| self.library.tape_state(id).ok_or_else(||StateError::TapeProvisionConflict("observed BOT predecessor has no typed identity; no Bootstrap write admitted".into()))).transpose()?;
+        let previous = if let Some(unknown) = clobbered_unknown {
+            if self.library.tape_state(unknown).is_some() {
+                return Err(StateError::TapeProvisionConflict(
+                    "named BOT identity is known; use the retire-and-replace path".into(),
+                ));
+            }
+            None
+        } else {
+            previous.map(|id| self.library.tape_state(id).ok_or_else(||StateError::TapeProvisionConflict("observed BOT predecessor has no typed identity; no Bootstrap write admitted".into()))).transpose()?
+        };
         let holder = self
             .library
             .tape_for_label(label)
@@ -52,7 +70,11 @@ impl StateHandle {
                 Ok::<_, StateError>(owner)
             })
             .transpose()?;
-        Ok(InitializationGuard { previous, owner })
+        Ok(InitializationGuard {
+            previous,
+            owner,
+            replaced_bot: clobbered_unknown,
+        })
     }
 
     /// Called only after the physical owner reports a successful Bootstrap write.
@@ -110,6 +132,14 @@ mod tests {
         (root, state)
     }
     fn provision(state: &mut StateHandle, id: [u8; 16], previous: Option<[u8; 16]>) {
+        provision_with_evidence(state, id, previous, None);
+    }
+    fn provision_with_evidence(
+        state: &mut StateHandle,
+        id: [u8; 16],
+        previous: Option<[u8; 16]>,
+        replaced_bot: Option<[u8; 16]>,
+    ) {
         state
             .provision_replacing_media(
                 crate::ProvisionTapeInput {
@@ -122,6 +152,7 @@ mod tests {
                 crate::LabelProvenance::Operator,
                 Some(crate::MediaObservation::label_hint("ACM901L9").unwrap()),
                 previous,
+                replaced_bot,
             )
             .unwrap();
     }
@@ -183,6 +214,87 @@ mod tests {
             .is_err());
         assert_eq!(state.library.test_source_records(), before);
     }
+    #[test]
+    fn ruling23_unknown_bot_is_evidence_only_after_initialization() {
+        let (root, mut state) = state();
+        let unknown = [0x91; 16];
+        let fresh = [0x92; 16];
+        let guard = state
+            .prepare_tape_initialization(Some(unknown), "ACM901L9", Some(unknown))
+            .unwrap();
+        assert!(guard.previous.is_none());
+        assert!(guard.owner.is_none());
+        let evidence = guard.replaced_bot();
+        assert_eq!(evidence, Some(unknown));
+        let predecessor = state.record_initialization_replacement(guard).unwrap();
+        assert_eq!(predecessor, None);
+        provision_with_evidence(&mut state, fresh, predecessor, evidence);
+        let verify = |state: &StateHandle| {
+            let records = state.library.test_source_records();
+            let provisions: Vec<_> = records
+                .iter()
+                .filter_map(|r| match r.body_view() {
+                    lib::BodyView::Reprovision(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(provisions.len(), 1);
+            let record = provisions[0];
+            assert_eq!(record.tape.uuid, fresh);
+            assert_eq!(record.mode, lib::ProvisionMode::Initialize);
+            assert_eq!(record.predecessor, None);
+            assert_eq!(record.replaced_bot, Some(unknown));
+            assert_eq!(record.pool_source, None);
+            assert_eq!(record.operation, None);
+            assert!(records.iter().all(|r| r.tag() != lib::Tag::Retire));
+            assert!(state.library.tape_state(unknown).is_none());
+            assert!(state.catalog().get_tape(&unknown).unwrap().is_none());
+            assert!(state.library.tape_state(fresh).is_some());
+        };
+        verify(&state);
+        drop(state);
+        let reopened = StateHandle::open_from_config_file(root.path().join("config.toml")).unwrap();
+        verify(&reopened);
+    }
+
+    #[test]
+    fn ruling23_unknown_bot_refusals_publish_no_records() {
+        let (_root, mut state) = state();
+        let unknown = [0x93; 16];
+        let other = [0x94; 16];
+        // A valid unknown identity is admitted; the refusals below are specific
+        // protections, not the retired blanket C8-G4 refusal.
+        let guard = state
+            .prepare_tape_initialization(Some(unknown), "ACM901L9", Some(unknown))
+            .unwrap();
+        assert_eq!(guard.replaced_bot(), Some(unknown));
+        drop(guard);
+        for (previous, named) in [
+            (None, Some(unknown)),
+            (Some(other), Some(unknown)),
+            (Some(unknown), None),
+        ] {
+            let before = state.library.test_source_records();
+            assert!(state
+                .prepare_tape_initialization(previous, "ACM901L9", named)
+                .is_err());
+            assert_eq!(state.library.test_source_records(), before);
+        }
+        provision(&mut state, other, None);
+        for (previous, named, label, message) in [
+            (Some(unknown), Some(unknown), "ACM901L9", "label is held"),
+            (Some(other), Some(other), "FREE", "retire-and-replace"),
+        ] {
+            let before = state.library.test_source_records();
+            let error = state
+                .prepare_tape_initialization(previous, label, named)
+                .err()
+                .expect("protected identity must refuse");
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(state.library.test_source_records(), before);
+        }
+    }
+
     #[test]
     fn manual_request_cut_before_prepared_reuses_identity_but_startup_terminal_refuses() {
         let (_root, mut state) = state();

@@ -900,3 +900,47 @@ fn shutdown_round2_dispatched_and_unknown_loads_still_count_after_restart() {
         assert_eq!(drive_load_commands(&world), usize::from(dispatched));
     }
 }
+
+/// A queued open cannot dispatch once every external mailbox owner has gone.
+#[tokio::test]
+async fn actor_without_external_sender_refuses_queued_open_and_exits() {
+    let root = tempfile::tempdir().unwrap();
+    let world = setup(root.path());
+    let mut library = open_model_library(world.clone());
+    let cfg = config(root.path(), &library);
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let before = world.lock().unwrap().command_log.len();
+    let (tx, rx) = mpsc::channel(1);
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::OpenWrite {
+        actor: AuditActor::System,
+        pool_cfg: pool(),
+        selected: selected(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape,
+        needs_drive_load: false,
+        library_serial: LIBRARY.into(),
+        barcode: Some(BARCODE.into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: Some(DRIVE.into()),
+        reply,
+    })
+    .await
+    .unwrap();
+    let (finished, completion) = oneshot::channel();
+    let actor = std::thread::spawn(move || {
+        super::super::super::actor_runtime::drive_loop(BAY, &mut drive, cfg, tx, rx);
+        let _ = finished.send(());
+    });
+    let result = tokio::time::timeout(StdDuration::from_secs(2), received)
+        .await
+        .expect("queued open must receive a reply")
+        .unwrap();
+    assert!(result.as_ref().is_err_and(DaemonShuttingDown::is_status));
+    tokio::time::timeout(StdDuration::from_secs(2), completion)
+        .await
+        .expect("actor must exit when its mailbox closes")
+        .unwrap();
+    actor.join().unwrap();
+    assert_eq!(world.lock().unwrap().command_log.len(), before);
+}

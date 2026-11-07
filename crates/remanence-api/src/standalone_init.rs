@@ -7,11 +7,11 @@ use crate::{
     TapeUuid,
 };
 use remanence_library::DriveHandle;
-use remanence_state::{AuditEvent, StateHandle};
+use remanence_state::StateHandle;
 
 impl OperatorMount<'_> {
     /// Prepare a BOT initialization decision, then run its write and provisioning
-    /// under the same durable calibration/session guards as mounted writes.
+    /// under the same durable calibration guard as mounted writes.
     /// Preparation must only inspect/configure media; it returns the planned UUID.
     pub fn initialize<T, R>(
         &mut self,
@@ -44,8 +44,6 @@ impl OperatorMount<'_> {
             let control = self.state.calibration_control().clone();
             crate::calibration::install_standalone_calibration_fence(&mut drive, &control, uuid)
                 .map_err(refusal)?;
-            let id = uuid::Uuid::new_v4();
-            self.session(uuid, id, AuditEvent::SessionOpened)?;
             let before = drive.media_write_dispatch_count();
             let _outcome_context =
                 drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
@@ -91,15 +89,6 @@ impl OperatorMount<'_> {
                 }
                 drive.mark_media_failure_outcome_applied();
             }
-            self.session(
-                uuid,
-                id,
-                if uncertain {
-                    AuditEvent::SessionOrphaned
-                } else {
-                    AuditEvent::SessionClosed
-                },
-            )?;
             result
         })();
         let allow = drive.allow_medium_removal().map_err(refusal);
@@ -113,18 +102,5 @@ impl OperatorMount<'_> {
         allow?;
         release?;
         Ok(value)
-    }
-
-    /// C8-G5: a bootstrap write needs a durable pre-write session obligation,
-    /// but native SessionOpened requires an already committed Bootstrap. Keep
-    /// the real write gate closed; legacy audit is no longer that authority.
-    pub(crate) fn session(
-        &mut self,
-        _tape_uuid: TapeUuid,
-        _id: uuid::Uuid,
-        _event: AuditEvent,
-    ) -> Result<(), MountError> {
-        self.flush_audit()?;
-        Err(refusal("standalone initialization requires durable pre-Bootstrap write-session authority; no Bootstrap bytes were written"))
     }
 }
