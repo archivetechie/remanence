@@ -15942,6 +15942,8 @@ fn typed_discovery_unsupported_batch_keeps_source_and_refuses_motion() {
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         let before = source_bytes();
+        let counted = crate::tests::refusal_tests::mark(&paths.sqlite_path);
+        let library_uuid = runtime.manifest().library_uuid();
         let mut batch = vec![input("NEW", 0x102)];
         match fault {
             "duplicate" => batch.extend([input("SAME", 0x103), input("SAME", 0x104)]),
@@ -15958,7 +15960,25 @@ fn typed_discovery_unsupported_batch_keeps_source_and_refuses_motion() {
             "{error}"
         );
         assert!(runtime.motion_fenced());
-        assert_eq!(source_bytes(), before, "no partial unique observation");
+        if fault != "blank" {
+            // A collision (an active serial, or one serial twice in a snapshot) is counted: the
+            // library log only grew, by one record. That it names the right subject and that no
+            // member of the batch was observed are checked from the log's bytes below.
+            let after = source_bytes();
+            assert_eq!(after.len(), before.len());
+            assert!(
+                after
+                    .iter()
+                    .all(|(name, bytes)| bytes.starts_with(&before[name])),
+                "the library log is append-only"
+            );
+            crate::tests::refusal_tests::assert_grew_by(&paths.sqlite_path, &counted, 1);
+        } else {
+            // A blank serial is a malformed observation, not a collision: refused as before, and
+            // not counted.
+            assert_eq!(source_bytes(), before, "no partial unique observation");
+            crate::tests::refusal_tests::assert_grew_by(&paths.sqlite_path, &counted, 0);
+        }
         let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
             "LIB-DISCOVERY",
             0x100,
@@ -16007,6 +16027,39 @@ fn typed_discovery_unsupported_batch_keeps_source_and_refuses_motion() {
         );
         assert_eq!(drives[0].drive_uuid, known[0].drive_uuid);
         assert_eq!(drives[0].last_element_address, Some(0x101));
+        drop((drives, reopened));
+        let log = crate::tests::refusal_tests::read_log(&paths, library_uuid);
+        let observed = log
+            .iter()
+            .filter(|(tag, _)| *tag == remanence_state::library_log::Tag::DriveObserved)
+            .count();
+        assert_eq!(
+            observed, 2,
+            "only KNOWN's two observations, none of the batch"
+        );
+        let known_drive: [u8; 16] = known[0].drive_uuid.clone().try_into().unwrap();
+        let counted = crate::tests::refusal_tests::refusals(&log);
+        // The collision with KNOWN names that drive; a serial reported twice that no known drive
+        // holds names the library.
+        let subject = match fault {
+            "historical" => Some(("drive", Some(known_drive))),
+            "duplicate" => Some(("library", None)),
+            _ => None,
+        };
+        match subject {
+            Some((kind, id)) => assert_eq!(
+                counted,
+                [crate::tests::refusal_tests::RecordedRefusal::expect(
+                    8,
+                    "DriveIdentityConflictLatch",
+                    kind,
+                    id,
+                    remanence_state::AuditActor::System,
+                )],
+                "{fault}"
+            ),
+            None => assert!(counted.is_empty(), "{fault}: {counted:?}"),
+        }
     }
 }
 

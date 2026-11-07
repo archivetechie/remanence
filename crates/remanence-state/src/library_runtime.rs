@@ -89,6 +89,30 @@ pub struct VerdictFacts {
     /// Digest of the verified terminal edition, absent for `RecoveryRequired`.
     pub edition_digest: Option<lib::Hash>,
 }
+/// What a recorded refusal (`LibraryRuntime::record_refusal`) is about, as the `Diagnostic`
+/// record names it. `subject_kind` is the variant's lower-case name, and `subject_id` is the
+/// hyphenated UUID of the thing named, when the request names one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalSubject {
+    /// A tape, when the request names one (`tape`).
+    Tape(Option<lib::Id>),
+    /// A drive (`drive`).
+    Drive(lib::Id),
+    /// An operation (`operation`).
+    Operation(lib::Id),
+    /// The library as a whole, with no identifier: `library` and no `subject_id`.
+    Library,
+}
+impl RefusalSubject {
+    fn fields(self) -> (&'static str, Option<lib::Id>) {
+        match self {
+            Self::Tape(id) => ("tape", id),
+            Self::Drive(id) => ("drive", Some(id)),
+            Self::Operation(id) => ("operation", Some(id)),
+            Self::Library => ("library", None),
+        }
+    }
+}
 struct WallClock;
 impl Clock for WallClock {
     fn now(&self) -> u64 {
@@ -867,6 +891,8 @@ mod cleaning;
 mod drive_observation;
 mod peer_observations;
 pub(crate) mod readiness;
+#[cfg(test)]
+pub(crate) mod refusal_tests;
 pub(crate) mod restart;
 #[cfg(test)]
 mod session_ack_tests;

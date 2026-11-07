@@ -637,7 +637,7 @@ fn assert_import_refused(
     let sqlite = mount.state.paths().sqlite_path.clone();
     let commands = world.lock().unwrap().command_log.len();
     let tree = journal_tree(&journal_dir);
-    let sql = std::fs::read(&sqlite).unwrap();
+    let before = crate::tests::refusal_tests::mark(&sqlite);
     let tape_state = mount
         .state
         .catalog()
@@ -661,11 +661,9 @@ fn assert_import_refused(
         "no staging directory and no publication"
     );
     assert!(!remanence_state::TapeAuthority::exists(journal_dir.join("tapes"), UUID).unwrap());
-    assert_eq!(
-        std::fs::read(&sqlite).unwrap(),
-        sql,
-        "SQL is byte-identical"
-    );
+    // The refusal is counted in the library log: one record, which the projection applies and
+    // projects nothing from. Every row outside the projection's own books is unchanged.
+    crate::tests::refusal_tests::assert_grew_by(&sqlite, &before, 1);
     assert_eq!(
         mount
             .state
@@ -717,6 +715,42 @@ fn journal_import_is_refused_before_any_effect_and_authorizes_no_append() {
     assert_eq!(
         state.catalog().get_tape(&UUID).unwrap().unwrap().state,
         "recovery_required"
+    );
+}
+
+/// Ruling 32-L1, counted. Each refused import is one `RefusalRecorded` naming the mounted tape,
+/// in the library log of the state that refused it, and the log holds nothing else of them.
+#[test]
+fn journal_import_refusal_is_recorded_each_time_with_its_tape() {
+    use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
+    let root = tempfile::tempdir().unwrap();
+    let from = source_journal(&root.path().join("original"), crate::ParityConfig::None);
+    let world = world();
+    let lock = root.path().join("locks");
+    let mut state = adopted_state(&root.path().join("new-host"), crate::ParityConfig::None);
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
+    assert_import_refused(&mut mount, &mut mounted, &from, &world);
+    mount.release(mounted);
+    drop(state);
+
+    let log = read_log(&paths, library_uuid);
+    let expected = RecordedRefusal::expect(
+        14,
+        "JournalImportDeferred",
+        "tape",
+        Some(UUID),
+        remanence_state::AuditActor::local_user(),
+    );
+    assert_eq!(refusals(&log), [expected.clone(), expected]);
+    assert!(
+        log[log.len() - 2..]
+            .iter()
+            .all(|(tag, _)| *tag == remanence_state::library_log::Tag::Diagnostic),
+        "the two refusals are the last two records: {log:?}"
     );
 }
 
@@ -2576,6 +2610,65 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
     );
     assert!(again.is_err());
     assert_eq!(world.lock().unwrap().command_log.len(), commands);
+}
+
+/// Code 5, through `OperatorMount::initialize`, the standalone write path. A failed WRITE whose
+/// uncertainty the library log cannot record latches the motion fence and refuses with its text,
+/// and the raise is counted once in the library log, naming the tape. (`recover_sessions_after_restart`
+/// reaches the same function for a standalone write session lost by a restart, but the library log
+/// has no write-kind session, so that caller cannot be driven.)
+#[test]
+fn an_unrecordable_standalone_write_fence_is_counted_once_with_its_tape() {
+    use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state_with_audit(root.path(), false);
+    let paths = state.paths().clone();
+    let runtime = state.library_runtime();
+    let library_uuid = runtime.manifest().library_uuid();
+    let world = world();
+    let injected = fault();
+    let mut mount = backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        injected.clone(),
+    )
+    .unwrap();
+    assert!(!runtime.motion_fenced());
+    let result: Result<(), _> = mount.initialize(
+        false,
+        |_, _| Ok((UUID, ())),
+        |drive, _, ()| {
+            *injected.lock().unwrap() = Some(10);
+            let error = drive.write_block_unpositioned(&[0; 512]).unwrap_err();
+            Err(error.to_string())
+        },
+    );
+    // The refusal's own text ("cannot durably record standalone write uncertainty ...") is the
+    // closure's result; `initialize` then checks the latch it set, and answers that instead.
+    let error = result
+        .expect_err("the fence cannot be recorded")
+        .to_string();
+    assert_eq!(
+        error,
+        "library authority failed; motion is fenced until startup reconciliation"
+    );
+    assert!(mount.unusable);
+    assert!(runtime.motion_fenced());
+    drop((mount, runtime));
+    drop(state);
+
+    let log = read_log(&paths, library_uuid);
+    assert_eq!(
+        refusals(&log),
+        [RecordedRefusal::expect(
+            5,
+            "StandaloneFenceUnrecorded",
+            "tape",
+            Some(UUID),
+            remanence_state::AuditActor::local_user(),
+        )]
+    );
 }
 
 /// Mounted origin conversion discards the bootstrap shortcut after a failed pipeline.

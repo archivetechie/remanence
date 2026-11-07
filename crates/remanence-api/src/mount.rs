@@ -950,7 +950,10 @@ pub(crate) fn prepare_manual_finalize_request(
                 )));
             }
             runtime
-                .ensure_manual_operation_continuable(accepted.value.operation)
+                .ensure_manual_operation_continuable(
+                    accepted.value.operation,
+                    admission.actor.clone(),
+                )
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
             admission.candidate_operation_id = Uuid::from_bytes(accepted.value.operation);
         }

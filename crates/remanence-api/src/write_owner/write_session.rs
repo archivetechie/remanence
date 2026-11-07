@@ -41,8 +41,22 @@ use crate::{
 };
 
 /// Logged in place of the `checkpoint-barrier-overdue` SQL alarm, which has no library-log
-/// record yet; the barrier, its timing and the idle-close arming are unchanged.
+/// record yet, and counted in the library log by `record_barrier_alarm_unrecorded`; the barrier,
+/// its timing and the idle-close arming are unchanged.
 pub(super) const CHECKPOINT_BARRIER_ALARM_UNRECORDED: &str = "CheckpointBarrierAlarmUnrecorded: the checkpoint-barrier-overdue alarm is not recorded until the library log records it; no alarm was raised";
+
+/// Count one occurrence of the unrecorded checkpoint-barrier alarm in the library log: one
+/// `RefusalRecorded` naming the session's tape. Both occurrences call this, after their log line.
+/// A configuration without a library runtime (a unit-test fixture) records nothing.
+fn record_barrier_alarm_unrecorded(cfg: &WriteOwnerConfig, tape_uuid: TapeUuid) {
+    if let Some(runtime) = cfg.authority.runtime() {
+        runtime.record_refusal(
+            remanence_state::library_log::RefusalCode::CheckpointBarrierAlarmUnrecorded,
+            remanence_state::library_runtime::RefusalSubject::Tape(Some(tape_uuid)),
+            remanence_state::AuditActor::System,
+        );
+    }
+}
 
 pub(super) struct CloseWriteActorInput<'a> {
     index: &'a mut CatalogIndex,
@@ -1440,6 +1454,7 @@ impl WriteSessionState<'_> {
                     .as_secs(),
                 "{CHECKPOINT_BARRIER_ALARM_UNRECORDED}"
             );
+            record_barrier_alarm_unrecorded(cfg, tape_uuid);
         }
         match perform_checkpoint_barrier(
             self.index,
@@ -1516,6 +1531,7 @@ impl WriteSessionState<'_> {
                             error = %err,
                             "{CHECKPOINT_BARRIER_ALARM_UNRECORDED}"
                         );
+                        record_barrier_alarm_unrecorded(cfg, tape_uuid);
                     }
                 }
                 let session = session_proto(WriteSessionProtoInput {

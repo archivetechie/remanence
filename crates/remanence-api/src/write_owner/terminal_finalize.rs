@@ -850,7 +850,10 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                 )));
             }
             runtime
-                .ensure_manual_operation_continuable(accepted.value.operation)
+                .ensure_manual_operation_continuable(
+                    accepted.value.operation,
+                    request.actor.clone(),
+                )
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
             request.candidate_operation_id = Uuid::from_bytes(accepted.value.operation);
         }

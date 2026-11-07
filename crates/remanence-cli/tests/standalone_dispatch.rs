@@ -4225,10 +4225,96 @@ tape_catalog_dir = "{0}/cache"
     );
 }
 
+/// Hashes of every file under the native journal directory.
+fn native_journal_hashes(
+    config: &remanence_state::RemConfig,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    fn visit(path: &Path, hashes: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, hashes);
+            } else {
+                hashes.insert(
+                    path.clone(),
+                    Sha256::digest(std::fs::read(path).unwrap()).to_vec(),
+                );
+            }
+        }
+    }
+    let mut hashes = Default::default();
+    visit(&config.journal.dir, &mut hashes);
+    hashes
+}
+
+/// Hashes of every file in the audit directory except the library log's `.remlib` segments: the
+/// legacy `.remaudit` files and the lock. The library log is checked through its decoded records.
+fn legacy_audit_hashes(
+    config: &remanence_state::RemConfig,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    std::fs::read_dir(&config.audit.dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file() && path.extension().is_none_or(|ext| ext != "remlib"))
+        .map(|path| {
+            let hash = Sha256::digest(std::fs::read(&path).unwrap()).to_vec();
+            (path, hash)
+        })
+        .collect()
+}
+
+/// The library log's records, replayed without opening state, so that reading them cannot append.
+fn library_records_read_only(
+    config_path: &Path,
+    library_uuid: [u8; 16],
+) -> Vec<remanence_state::library_log::Record> {
+    let config = remanence_state::load_config(config_path).unwrap();
+    let paths = remanence_state::StatePaths::from_config(config_path, &config);
+    let view = remanence_state::library_log::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    remanence_state::library_log::store::replay_observed(
+        &paths.audit_dir,
+        library_uuid,
+        &view,
+        &mut |applied| {
+            records.push(applied.record().clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+    records
+}
+
+/// A catalog's rows without the tables where the projection keeps its own books (which library
+/// records it has applied, and how far it has got). A record it applies and projects nothing from
+/// moves those and no other table.
+fn without_projection_books(content: &[(String, Vec<String>)]) -> Vec<&(String, Vec<String>)> {
+    const BOOKS: [&str; 6] = [
+        "library_fold_progress",
+        "library_projection_decisions",
+        "library_projection_identity",
+        "library_projection_progress",
+        "library_projection_records",
+        "projection_sources",
+    ];
+    content
+        .iter()
+        .filter(|(table, _)| !BOOKS.contains(&table.as_str()))
+        .collect()
+}
+
 /// Test 32L(2), ruling 32-L1: `rem tape import-journals --from DIR` refuses with
 /// `JournalImportDeferred` before it enumerates or opens any device, with and without an active
 /// fence on the tape. The transport factory records zero calls, nothing appears under the
-/// journal directory, and SQL is unchanged.
+/// journal directory, and the native tape logs are byte-identical. The refusal is counted: the
+/// library log gains one `RefusalRecorded` (code 14, naming no tape) and nothing else, and the
+/// catalog changes only in the tables where the projection keeps its own books.
 #[test]
 fn import_journals_refuses_before_enumerating_or_opening_any_device() {
     let root = tempfile::tempdir().unwrap();
@@ -4271,7 +4357,7 @@ fn import_journals_refuses_before_enumerating_or_opening_any_device() {
     let config_path = xdg.join("rem/config.toml");
     let config = remanence_state::load_config(&config_path).unwrap();
     let id = [0x41; 16];
-    {
+    let library_uuid = {
         let mut state = remanence_state::StateHandle::open_from_config_file(&config_path).unwrap();
         state
             .provision_tape_with_media(
@@ -4286,7 +4372,8 @@ fn import_journals_refuses_before_enumerating_or_opening_any_device() {
                 remanence_state::MediaObservation::label_hint("IMPORT1L9"),
             )
             .unwrap();
-    }
+        state.library_runtime().manifest().library_uuid()
+    };
     // A source journal a previous host left: what a non-refusing import would publish.
     let from = root.path().join("backup");
     std::fs::create_dir_all(from.join("tapes")).unwrap();
@@ -4322,7 +4409,9 @@ fn import_journals_refuses_before_enumerating_or_opening_any_device() {
         }
         let tree = state_tree(&journal_dir);
         let sql = sql_content(&config.index.sqlite_path);
-        let hashes = authority_hashes(&config);
+        let native = native_journal_hashes(&config);
+        let legacy = legacy_audit_hashes(&config);
+        let records = library_records_read_only(&config_path, library_uuid);
         let (code, response) = run(
             &[
                 "--device",
@@ -4350,15 +4439,71 @@ fn import_journals_refuses_before_enumerating_or_opening_any_device() {
             "fenced={fenced}: {response}"
         );
         assert_eq!(state_tree(&journal_dir), tree, "fenced={fenced}");
-        assert_eq!(authority_hashes(&config), hashes, "fenced={fenced}");
+        assert_eq!(
+            native_journal_hashes(&config),
+            native,
+            "fenced={fenced}: a native log changed"
+        );
+        assert_eq!(
+            legacy_audit_hashes(&config),
+            legacy,
+            "fenced={fenced}: a legacy audit file changed"
+        );
         assert!(
             !remanence_state::TapeAuthority::exists(journal_dir.join("tapes"), id).unwrap(),
             "fenced={fenced}: nothing was published"
         );
-        assert!(
-            sql_content(&config.index.sqlite_path) == sql,
-            "fenced={fenced}: SQL changed"
+        // The library log is append-only, and the refusal is the one record it gained.
+        let after = library_records_read_only(&config_path, library_uuid);
+        assert_eq!(
+            &after[..records.len()],
+            records.as_slice(),
+            "fenced={fenced}"
         );
+        let added = &after[records.len()..];
+        assert_eq!(added.len(), 1, "fenced={fenced}: {added:?}");
+        let refusal = added[0].diagnostic().expect("the record is a diagnostic");
+        assert_eq!(
+            refusal.event,
+            remanence_state::library_log::DiagnosticEvent::RefusalRecorded
+        );
+        assert_eq!(refusal.subject_kind.as_str(), "tape");
+        assert!(refusal.subject_id.is_none(), "the request names no tape");
+        assert_eq!(
+            refusal
+                .detail
+                .0
+                .iter()
+                .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "code".to_owned(),
+                    remanence_state::library_log::DiagnosticValue::Unsigned(14)
+                ),
+                (
+                    "name".to_owned(),
+                    remanence_state::library_log::DiagnosticValue::Text(
+                        "JournalImportDeferred".into()
+                    )
+                ),
+            ],
+            "fenced={fenced}"
+        );
+        // The catalog changes only where the projection keeps its own books, by that one record.
+        let after_sql = sql_content(&config.index.sqlite_path);
+        assert!(
+            without_projection_books(&after_sql) == without_projection_books(&sql),
+            "fenced={fenced}: SQL changed beyond the projection's books"
+        );
+        let applied = |content: &[(String, Vec<String>)]| {
+            content
+                .iter()
+                .find(|(table, _)| table == "library_projection_records")
+                .map(|(_, rows)| rows.len())
+                .unwrap()
+        };
+        assert_eq!(applied(&after_sql), applied(&sql) + 1, "fenced={fenced}");
     }
 }
 
@@ -4703,11 +4848,16 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
     assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
     ruling24_assert_no_init_session(&config);
     let records = ruling24_library_records(&config);
-    // Home-mode configuration predates the attempted media write. The failed
-    // init must add no provisioning, session, fence or other library record.
-    assert!(records
+    // Home-mode configuration predates the attempted media write. The failed init adds no
+    // provisioning, session or fence record. Its one other record counts the refusal to record the
+    // write's uncertainty (`StandaloneFenceUnrecorded`, code 5).
+    let (counted, others): (Vec<_>, Vec<_>) = records
         .iter()
-        .all(|r| r.tag() == Tag::ConfigurationAccepted));
+        .partition(|record| record.diagnostic().is_some());
+    assert!(others
+        .iter()
+        .all(|record| record.tag() == Tag::ConfigurationAccepted));
+    assert_eq!(counted.len(), 1, "{counted:?}");
     let (unknown, before) = {
         let w = world.lock().unwrap();
         let tape = &w.tapes["FIRST"];
@@ -4725,6 +4875,37 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
             tape.records.clone(),
         )
     };
+    let refusal = counted[0].diagnostic().unwrap();
+    assert_eq!(
+        refusal.event,
+        remanence_state::library_log::DiagnosticEvent::RefusalRecorded
+    );
+    assert_eq!(refusal.subject_kind.as_str(), "tape");
+    assert_eq!(
+        refusal.subject_id.as_ref().map(|id| id.as_str().to_owned()),
+        Some(uuid::Uuid::from_bytes(unknown).to_string()),
+        "the refusal names the tape whose write was uncertain"
+    );
+    assert_eq!(
+        refusal
+            .detail
+            .0
+            .iter()
+            .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "code".to_owned(),
+                remanence_state::library_log::DiagnosticValue::Unsigned(5)
+            ),
+            (
+                "name".to_owned(),
+                remanence_state::library_log::DiagnosticValue::Text(
+                    "StandaloneFenceUnrecorded".into()
+                )
+            ),
+        ]
+    );
     world.lock().unwrap().command_log.clear();
     let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
     assert_ne!(code, ExitCode::SUCCESS, "{out}");

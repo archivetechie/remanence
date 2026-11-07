@@ -2029,6 +2029,13 @@ impl Record {
             _ => None,
         }
     }
+    /// Read the typed diagnostic body without permitting record construction.
+    pub fn diagnostic(&self) -> Option<&Diagnostic> {
+        match &self.body {
+            Body::Diagnostic(value) => Some(value),
+            _ => None,
+        }
+    }
     /// Read the typed cleaning body without permitting record construction.
     pub fn cleaning_recorded(&self) -> Option<&CleaningRecorded> {
         match &self.body {

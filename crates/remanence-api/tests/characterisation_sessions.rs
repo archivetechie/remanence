@@ -121,6 +121,11 @@ impl Harness {
     }
 
     fn new(parity: bool) -> Self {
+        Self::new_with_checkpoint_age(parity, 3600)
+    }
+
+    /// A fixture whose pending checkpoint batch goes overdue after `checkpoint_age` seconds.
+    fn new_with_checkpoint_age(parity: bool, checkpoint_age: u64) -> Self {
         let temp = if let Some(parent) = std::env::var_os("CHARACTERISATION_CRASH_PARENT") {
             tempfile::tempdir_in(parent).unwrap()
         } else {
@@ -136,7 +141,7 @@ default_idle_timeout_seconds = 1800
 io_memory_ceiling = "64 MiB"
 append_ring_bytes = "16 MiB"
 checkpoint_max_objects = 100
-checkpoint_max_age_seconds = 3600
+checkpoint_max_age_seconds = {checkpoint_age}
 [tape_io]
 read_reservoir_bytes = "16 MiB"
 [[libraries]]
@@ -502,6 +507,125 @@ async fn checkpoint_and_close_report_objects_that_remain_readable_after_restart(
     }
 }
 
+/// Every `RefusalRecorded` of the library log as `(code, name, subject_kind, subject_id, actor)`,
+/// replayed from its bytes once the daemon has stopped and released the log. Reopening the state
+/// to learn the log's identity appends nothing: its configuration is the one already accepted.
+fn recorded_refusals(
+    fixture: &Harness,
+) -> Vec<(
+    u64,
+    String,
+    String,
+    Option<String>,
+    remanence_state::AuditActor,
+)> {
+    use remanence_state::library_log::{
+        native_view::NativeTapeView, store, DiagnosticEvent, DiagnosticValue,
+    };
+    let paths = state_paths(&fixture.config);
+    let uuid = StateHandle::open_with_config(paths.clone(), fixture.config.clone())
+        .unwrap()
+        .library_runtime()
+        .manifest()
+        .library_uuid();
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+    let mut found = Vec::new();
+    store::replay_observed(&paths.audit_dir, uuid, &view, &mut |applied| {
+        let record = applied.record();
+        if let Some(d) = record.diagnostic() {
+            if d.event == DiagnosticEvent::RefusalRecorded {
+                let entry = |key: &str| {
+                    d.detail
+                        .0
+                        .iter()
+                        .find(|e| e.0.as_str() == key)
+                        .map(|e| e.1.clone())
+                };
+                let (Some(DiagnosticValue::Unsigned(code)), Some(DiagnosticValue::Text(name))) =
+                    (entry("code"), entry("name"))
+                else {
+                    panic!("a refusal record without its code and name: {d:?}");
+                };
+                found.push((
+                    code,
+                    name.as_str().to_owned(),
+                    d.subject_kind.as_str().to_owned(),
+                    d.subject_id.as_ref().map(|id| id.as_str().to_owned()),
+                    record.envelope.actor.clone(),
+                ));
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    found
+}
+
+/// What starting the daemon records: the foreign drive poll is off, once per start (code 9).
+fn foreign_poll_disabled() -> (
+    u64,
+    String,
+    String,
+    Option<String>,
+    remanence_state::AuditActor,
+) {
+    (
+        9,
+        "ForeignDrivePollDisabled".to_owned(),
+        "library".to_owned(),
+        None,
+        remanence_state::AuditActor::System,
+    )
+}
+
+/// A timer checkpoint that runs more than a second past its batch deadline is counted in the
+/// library log (`CheckpointBarrierAlarmUnrecorded`, code 11), once, naming the session's tape.
+/// The second append is held in the transport past the one-second timer, so the timer's
+/// checkpoint queues behind it and runs late. A session whose timer checkpoint runs on time
+/// records nothing. Each start of the daemon also records its one code 9.
+#[tokio::test]
+async fn an_overdue_timer_checkpoint_is_counted_in_the_library_log() {
+    let on_time = Harness::new_with_checkpoint_age(false, 1);
+    let client = on_time.start().await;
+    let session = client.open().await;
+    client.append(&session, "first", b"first object").await;
+    // The timer's checkpoint runs on its own deadline, with the actor idle.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    client.close(&session).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+    client.shutdown().await;
+    on_time.wait_for_teardown().await;
+    assert_eq!(
+        recorded_refusals(&on_time),
+        [foreign_poll_disabled()],
+        "an on-time checkpoint records no refusal"
+    );
+
+    let fixture = Harness::new_with_checkpoint_age(false, 1);
+    let client = fixture.start().await;
+    let session = client.open().await;
+    client.append(&session, "first", b"first object").await;
+    fixture.injection.lock().unwrap().write_delay = Duration::from_secs(3);
+    client.append(&session, "second", b"second object").await;
+    client.close(&session).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    // Code 9 comes from a thread that starts asynchronously with the daemon, so the two records
+    // are compared as a set, not in order.
+    let recorded = recorded_refusals(&fixture);
+    let barrier = (
+        11,
+        "CheckpointBarrierAlarmUnrecorded".to_owned(),
+        "tape".to_owned(),
+        Some(uuid::Uuid::from_bytes(UUID).to_string()),
+        remanence_state::AuditActor::System,
+    );
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(recorded.contains(&foreign_poll_disabled()), "{recorded:?}");
+    assert!(recorded.contains(&barrier), "{recorded:?}");
+}
+
 /// Bind the durable close audit to the exact session, independently of RPC lookup.
 fn assert_session_closed(fixture: &Harness, session_id: &[u8]) {
     let id = uuid::Uuid::from_slice(session_id).unwrap();
@@ -853,6 +977,8 @@ struct Injection {
     commands: Vec<Vec<u8>>,
     crash_cut: Option<(bool, std::path::PathBuf, SharedVirtualWorld)>,
     crash_writes: usize,
+    /// Stall the next WRITE this long before the model sees it, then clear.
+    write_delay: Duration,
 }
 struct Transport {
     inner: ModelTransport,
@@ -969,6 +1095,10 @@ impl SgTransport for Transport {
         result
     }
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        if cdb[0] == 0x0a && matches!(self.role, DeviceRole::Drive { .. }) {
+            let delay = std::mem::take(&mut self.injection.lock().unwrap().write_delay);
+            std::thread::sleep(delay);
+        }
         self.before(cdb)?;
         let outcome = self.inner.execute_out(cdb, buf)?;
         let mut injection = self.injection.lock().unwrap();

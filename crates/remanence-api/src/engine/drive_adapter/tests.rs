@@ -2441,6 +2441,9 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
             .collect::<Vec<_>>()
     };
     let before = source_bytes();
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let counted = crate::tests::refusal_tests::mark(&fixture.config.index.sqlite_path);
     let error = crate::mount_support::raise_standalone_fence(
         &mut state,
         UUID,
@@ -2455,13 +2458,35 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
         .to_string()
         .contains("cannot durably record standalone write uncertainty"));
     assert!(state.library_runtime().motion_fenced());
-    assert_eq!(source_bytes(), before);
+    // The library log only grew, by the one record that counts the refusal.
+    let after = source_bytes();
+    assert_eq!(after.len(), before.len());
+    assert!(
+        after
+            .iter()
+            .zip(&before)
+            .all(|(now, was)| now.starts_with(was)),
+        "the library log is append-only"
+    );
+    crate::tests::refusal_tests::assert_grew_by(&fixture.config.index.sqlite_path, &counted, 1);
     assert!(state
         .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
     assert!(fixture.commands.lock().unwrap().is_empty());
+    drop(state);
+    let log = crate::tests::refusal_tests::read_log(&paths, library_uuid);
+    assert_eq!(
+        crate::tests::refusal_tests::refusals(&log),
+        [crate::tests::refusal_tests::RecordedRefusal::expect(
+            5,
+            "StandaloneFenceUnrecorded",
+            "tape",
+            Some(UUID),
+            remanence_state::AuditActor::local_user(),
+        )]
+    );
 }
 
 /// R13 operator recovery releases only the typed suffix fence after the real

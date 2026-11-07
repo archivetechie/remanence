@@ -608,8 +608,15 @@ impl StateHandle {
             })
             .transpose()?;
         use crate::library_log as lib;
-        let observation = observation.ok_or_else(|| StateError::TapeProvisionConflict(
-            "Reprovision requires recorded medium family; provisioning without generation awaits a representation ruling".into()))?;
+        let observation = observation.ok_or_else(|| {
+            self.library.record_refusal(
+                lib::RefusalCode::UnknownGenerationAdoption,
+                crate::library_runtime::RefusalSubject::Tape(Some(input.tape_uuid)),
+                AuditActor::local_user(),
+            );
+            StateError::TapeProvisionConflict(
+            "UnknownGenerationAdoption: Reprovision requires recorded medium family; provisioning without generation awaits a representation ruling".into())
+        })?;
         let medium = lib::MediumSpec {
             family: lib::MediumFamily::Lto(observation.generation),
             usable_logical_bytes: observation.generation.raw_capacity_bytes(),
@@ -948,8 +955,15 @@ impl StateHandle {
             geometry.as_str(),
         );
         use crate::library_log as lib;
-        let observation = input.observation.ok_or_else(|| StateError::TapeProvisionConflict(
-            "Reprovision adoption requires recorded medium family; unknown-generation adoption awaits a representation ruling".into()))?;
+        let observation = input.observation.ok_or_else(|| {
+            self.library.record_refusal(
+                lib::RefusalCode::UnknownGenerationAdoption,
+                crate::library_runtime::RefusalSubject::Tape(Some(input.tape_uuid)),
+                AuditActor::local_user(),
+            );
+            StateError::TapeProvisionConflict(
+            "UnknownGenerationAdoption: Reprovision adoption requires recorded medium family; unknown-generation adoption awaits a representation ruling".into())
+        })?;
         let parity_scheme = match &input.parity {
             remanence_parity::ParityConfig::None => None,
             remanence_parity::ParityConfig::Scheme(scheme) => Some(lib::ParityScheme {
@@ -2411,6 +2425,71 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
             )
             .is_err());
+    }
+
+    /// Code 7, at both sites, through the methods the operator commands call. A tape whose label
+    /// names no generation cannot be provisioned, and an adoption with no observed generation
+    /// cannot be recorded: each is refused with the code's prefix and counted as one record naming
+    /// the tape, and nothing else is appended or projected.
+    #[test]
+    fn unknown_generation_provisioning_and_adoption_are_refused_and_recorded_with_their_tape() {
+        use crate::library_runtime::refusal_tests::refusals;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let runtime = handle.library_runtime();
+        let before = runtime.test_source_records().len();
+        let expected = |tape: [u8; 16]| {
+            (
+                7,
+                "UnknownGenerationAdoption".to_owned(),
+                "tape".to_owned(),
+                Some(Uuid::from_bytes(tape).to_string()),
+                AuditActor::local_user(),
+                SourceLayer::Layer5,
+            )
+        };
+
+        let unlabelled = [0x31; 16];
+        let error = handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: unlabelled,
+                voltag: "NOGEN".into(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect_err("a label without a generation");
+        assert_eq!(
+            error.to_string(),
+            "tape provisioning conflict: UnknownGenerationAdoption: Reprovision requires recorded medium family; provisioning without generation awaits a representation ruling"
+        );
+        assert_eq!(runtime.test_source_records().len(), before + 1);
+        assert_eq!(refusals(&runtime), [expected(unlabelled)]);
+
+        let mut input = adoption_input(Uuid::new_v4());
+        input.observation = None;
+        let adopted = input.tape_uuid;
+        let error = handle
+            .adopt_bootstrap_identity(
+                input,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("an adoption with no observed generation");
+        assert_eq!(
+            error.to_string(),
+            "tape provisioning conflict: UnknownGenerationAdoption: Reprovision adoption requires recorded medium family; unknown-generation adoption awaits a representation ruling"
+        );
+        assert_eq!(runtime.test_source_records().len(), before + 2);
+        assert_eq!(
+            refusals(&runtime),
+            [expected(unlabelled), expected(adopted)]
+        );
+        for tape in [unlabelled, adopted] {
+            assert!(handle.catalog().get_tape(&tape).unwrap().is_none());
+            assert!(runtime.tape_state(tape).is_none());
+        }
     }
 
     /// Corrections are authority for adopted tapes too, and stale or failed

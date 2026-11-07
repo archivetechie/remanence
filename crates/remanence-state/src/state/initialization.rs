@@ -325,8 +325,19 @@ mod tests {
             .contains("closed"));
         assert_eq!(
             state.library.test_source_records().len(),
-            count + 1,
-            "only startup's actual Failed was added"
+            count + 2,
+            "startup's actual Failed, and the one record that counts the refused retry"
+        );
+        assert_eq!(
+            crate::library_runtime::refusal_tests::refusals(&state.library),
+            [(
+                3,
+                "ClosedOperationRetry".to_owned(),
+                "operation".to_owned(),
+                Some(uuid::Uuid::from_bytes(first).to_string()),
+                AuditActor::System,
+                crate::audit::SourceLayer::Layer5,
+            )]
         );
         assert!(
             crate::TapeAuthority::list_entries(state.paths.journal_dir.join("tapes"))

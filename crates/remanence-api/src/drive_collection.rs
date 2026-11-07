@@ -116,7 +116,8 @@ pub(crate) fn touch_managed_drive_heartbeats(
 }
 
 /// Logged once at daemon start while the library log has no record for foreign
-/// drive health; the poll thread then ends before any SCSI command or SQL write.
+/// drive health, and counted there as one `RefusalRecorded`; the poll thread then ends before
+/// any SCSI command or SQL write.
 pub(crate) const FOREIGN_DRIVE_POLL_DISABLED: &str = "ForeignDrivePollDisabled: foreign drive health polling is off until the library log records it; no foreign drive was polled";
 
 pub(crate) fn foreign_drive_poll_loop(
@@ -127,8 +128,14 @@ pub(crate) fn foreign_drive_poll_loop(
     audit: AuditAppendContext,
     base_cadence: Duration,
 ) {
-    if catalog.library_runtime().is_some() {
+    if let Some(runtime) = catalog.library_runtime() {
         tracing::warn!("{FOREIGN_DRIVE_POLL_DISABLED}");
+        // The thread ends here, so this is the one record of a process start. No library is named.
+        runtime.record_refusal(
+            remanence_state::library_log::RefusalCode::ForeignDrivePollDisabled,
+            remanence_state::library_runtime::RefusalSubject::Library,
+            AuditActor::System,
+        );
         return;
     }
     let mut backoff = Duration::from_secs(0);

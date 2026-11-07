@@ -72,7 +72,12 @@ impl LibraryRuntime {
         }
         if let Some(operation) = prior {
             if latest.as_ref().is_none_or(|event| !operation_open(event)) {
-                return Err(StateError::TapeProvisionConflict(format!("manual request operation is closed ({latest:?}); same-operation physical retry has no permitted transition")).into());
+                self.record_refusal_locked(
+                    lib::RefusalCode::ClosedOperationRetry,
+                    RefusalSubject::Operation(operation),
+                    actor,
+                );
+                return Err(StateError::TapeProvisionConflict(format!("ClosedOperationRetry: manual request operation is closed ({latest:?}); same-operation physical retry has no permitted transition")).into());
             }
             self.catch_up_locked()?;
             return Ok(operation);
@@ -99,6 +104,7 @@ impl LibraryRuntime {
     pub fn ensure_manual_operation_continuable(
         &self,
         operation: lib::Id,
+        actor: lib::AuditActor,
     ) -> Result<(), RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         let view = self
@@ -142,7 +148,12 @@ impl LibraryRuntime {
         if !latest.as_ref().is_some_and(|v| {
             operation_open(v) || (matches!(v, lib::OperationEvent::Finished(_)) && sealed)
         }) {
-            return Err(StateError::TapeProvisionConflict(format!("manual operation cannot resume from {latest:?}; no permitted same-operation completion transition")).into());
+            self.record_refusal_locked(
+                lib::RefusalCode::ClosedOperationRetry,
+                RefusalSubject::Operation(operation),
+                actor,
+            );
+            return Err(StateError::TapeProvisionConflict(format!("ClosedOperationRetry: manual operation cannot resume from {latest:?}; no permitted same-operation completion transition")).into());
         }
         Ok(())
     }

@@ -8,8 +8,9 @@
 //! `manual_finalize_tape`, the entry point the gRPC service uses.
 //!
 //! A same-key retry whose operation has closed is refused by `ensure_manual_operation_continuable`.
-//! Its refusal is pinned by its exact current text. The countable code, `ClosedOperationRetry`,
-//! arrives with L1-W (ruling 25), so each pin carries a marker where that assertion will go.
+//! Its refusal is pinned by its exact text, which starts with the countable code,
+//! `ClosedOperationRetry` (ruling 25). The refusal is counted: the library log gains one
+//! `RefusalRecorded` naming the operation and the actor that retried, and nothing else.
 //!
 //! A new-key request is refused by the retained intent, whatever became of the first operation.
 //!
@@ -26,6 +27,7 @@
 //! after two progress steps, and after the native seal.
 
 use super::*;
+use crate::tests::refusal_tests::{assert_grew_by, mark, refusals, RecordedRefusal};
 use crate::tests::TypedRoot;
 use remanence_state::library_log as lib;
 use std::collections::BTreeMap;
@@ -350,8 +352,9 @@ fn assert_acceptance_applied(live: &Live, admission: &ManualFinalizeTapeAdmissio
 }
 
 /// Retry the original request under its own key. Checks that it is refused as a failed
-/// precondition, that the library log and the native logs did not change, and that no media
-/// command was sent. Returns the refusal so the caller can pin its text.
+/// precondition, that the native logs did not change, that the library log only grew, by the one
+/// record that counts the refusal, and that no media command was sent. Returns the refusal so the
+/// caller can pin its text.
 async fn same_key_retry_is_refused(
     typed: &TypedRoot,
     admission: &ManualFinalizeTapeAdmission,
@@ -359,17 +362,64 @@ async fn same_key_retry_is_refused(
 ) -> Status {
     assert_acceptance_applied(live, admission);
     let before = durable_bytes(typed.paths());
+    let counted = mark(&typed.paths().sqlite_path);
     let error = manual_finalize_tape(&live.state, admission.clone())
         .await
         .expect_err("a closed operation admits no same-key retry");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    let after = durable_bytes(typed.paths());
     assert_eq!(
-        durable_bytes(typed.paths()),
-        before,
-        "the refused retry appended no record"
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "the refused retry created no file"
     );
+    for (path, was) in &before {
+        if path.starts_with(&typed.paths().audit_dir) {
+            assert!(
+                after[path].starts_with(was),
+                "{}: the library log is append-only",
+                path.display()
+            );
+        } else {
+            assert_eq!(
+                &after[path],
+                was,
+                "{}: a native log changed",
+                path.display()
+            );
+        }
+    }
+    assert_grew_by(&typed.paths().sqlite_path, &counted, 1);
     live.assert_no_media_command();
     error
+}
+
+/// The refusal is the code's, and the library log counts it once, naming the first operation and
+/// the actor that retried.
+async fn assert_closed_retry_counted(
+    typed: &mut TypedRoot,
+    admission: &ManualFinalizeTapeAdmission,
+    request: &crate::write_owner::ManualFinalizeTapeActorRequest,
+    refusal: &Status,
+) {
+    assert!(
+        refusal
+            .message()
+            .starts_with("tape provisioning conflict: ClosedOperationRetry: "),
+        "{refusal}"
+    );
+    let log = typed.refusal_log();
+    assert_eq!(
+        refusals(&log),
+        [RecordedRefusal::expect(
+            3,
+            "ClosedOperationRetry",
+            "operation",
+            Some(*request.candidate_operation_id.as_bytes()),
+            admission.actor.clone(),
+        )]
+    );
+    assert_eq!(log.last().unwrap().0, lib::Tag::Diagnostic);
 }
 
 /// A restart closed the started finalize as `Failed { summary: "daemon_restart" }`.
@@ -377,15 +427,14 @@ async fn same_key_retry_is_refused(
 async fn same_key_retry_after_failed_daemon_restart_is_refused_with_nothing_written() {
     let (mut typed, admission, request, mut live) = finalize_then_restart(Closure::Restart);
     let error = same_key_retry_is_refused(&typed, &admission, &mut live).await;
-    // L1-W: assert ClosedOperationRetry
     assert_eq!(
         error.message(),
-        "tape provisioning conflict: manual operation cannot resume from \
+        "tape provisioning conflict: ClosedOperationRetry: manual operation cannot resume from \
          Some(Failed(Failed { retry: None, refusal_code: None, \
          summary: TextValue(\"daemon_restart\") })); \
          no permitted same-operation completion transition"
     );
-    drop((live, error));
+    drop((live, error.clone()));
     assert!(matches!(
         first_operation_events(&mut typed, &request).await.as_slice(),
         [
@@ -394,6 +443,7 @@ async fn same_key_retry_after_failed_daemon_restart_is_refused_with_nothing_writ
             lib::OperationEvent::Failed(failed),
         ] if failed.summary.as_str() == "daemon_restart"
     ));
+    assert_closed_retry_counted(&mut typed, &admission, &request, &error).await;
 }
 
 /// A real attempt failed and the worker recorded `Failed`.
@@ -401,18 +451,17 @@ async fn same_key_retry_after_failed_daemon_restart_is_refused_with_nothing_writ
 async fn same_key_retry_after_plain_failed_is_refused_with_nothing_written() {
     let (mut typed, admission, request, mut live) = finalize_then_restart(Closure::Failed);
     let error = same_key_retry_is_refused(&typed, &admission, &mut live).await;
-    // L1-W: assert ClosedOperationRetry
     assert_eq!(
         error.message(),
         format!(
-            "tape provisioning conflict: manual operation cannot resume from \
+            "tape provisioning conflict: ClosedOperationRetry: manual operation cannot resume from \
              Some(Failed(Failed {{ retry: None, refusal_code: None, \
              summary: TextValue(\"drive actor is unavailable; finalization operation {} \
              remains incomplete\") }})); no permitted same-operation completion transition",
             request.candidate_operation_id
         )
     );
-    drop((live, error));
+    drop((live, error.clone()));
     assert!(matches!(
         first_operation_events(&mut typed, &request).await.as_slice(),
         [
@@ -421,6 +470,7 @@ async fn same_key_retry_after_plain_failed_is_refused_with_nothing_written() {
             lib::OperationEvent::Failed(failed),
         ] if failed.summary.as_str().starts_with("drive actor is unavailable")
     ));
+    assert_closed_retry_counted(&mut typed, &admission, &request, &error).await;
 }
 
 /// The worker could not tell whether the physical work completed.
@@ -429,13 +479,12 @@ async fn same_key_retry_after_completion_unknown_is_refused_with_nothing_written
     let (mut typed, admission, request, mut live) =
         finalize_then_restart(Closure::CompletionUnknown);
     let error = same_key_retry_is_refused(&typed, &admission, &mut live).await;
-    // L1-W: assert ClosedOperationRetry
     assert_eq!(
         error.message(),
-        "tape provisioning conflict: manual operation cannot resume from \
+        "tape provisioning conflict: ClosedOperationRetry: manual operation cannot resume from \
          Some(CompletionUnknown(Unit)); no permitted same-operation completion transition"
     );
-    drop((live, error));
+    drop((live, error.clone()));
     assert!(matches!(
         first_operation_events(&mut typed, &request)
             .await
@@ -446,6 +495,7 @@ async fn same_key_retry_after_completion_unknown_is_refused_with_nothing_written
             lib::OperationEvent::CompletionUnknown(_),
         ]
     ));
+    assert_closed_retry_counted(&mut typed, &admission, &request, &error).await;
 }
 
 /// Not a closed state, and the one a real restart leaves: the daemon's own startup runs no
@@ -460,7 +510,10 @@ async fn same_key_retry_after_a_restart_that_closes_nothing_passes_the_continuat
         .catalog
         .library_runtime()
         .expect("typed runtime")
-        .ensure_manual_operation_continuable(*request.candidate_operation_id.as_bytes())
+        .ensure_manual_operation_continuable(
+            *request.candidate_operation_id.as_bytes(),
+            admission.actor.clone(),
+        )
         .expect("an open operation may resume");
     let index = live.state.catalog.write_handle();
     let (_, retry) = prepare_manual_finalize_request(&index, admission, |pool_id| {

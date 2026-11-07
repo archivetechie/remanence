@@ -245,6 +245,36 @@ impl LibraryRuntime {
         })?;
         Ok(verdict)
     }
+    /// Count one stand-in refusal: append a `Diagnostic` with `RefusalRecorded`, the code's number
+    /// and its own name, naming the subject (Appendix G). The caller has already decided to
+    /// refuse and returns its refusal whatever happens here: a failure to record is logged and
+    /// never changes the answer. Do not call this with the dispatch lease held; a site that
+    /// holds it calls `record_refusal_locked`.
+    pub fn record_refusal(
+        &self,
+        code: lib::RefusalCode,
+        subject: RefusalSubject,
+        actor: lib::AuditActor,
+    ) {
+        let diagnostic = refusal_diagnostic(code, subject);
+        let appended =
+            self.append(|a, v| a.diagnostic(diagnostic, actor, lib::SourceLayer::Layer5, v));
+        log_unrecorded_refusal(code, appended);
+    }
+
+    /// `record_refusal` for a site that already holds the dispatch lease, as `append_locked` is
+    /// `append` for one that does. The same record, and the same answer when it fails.
+    pub(crate) fn record_refusal_locked(
+        &self,
+        code: lib::RefusalCode,
+        subject: RefusalSubject,
+        actor: lib::AuditActor,
+    ) {
+        let diagnostic = refusal_diagnostic(code, subject);
+        let appended =
+            self.append_locked(|a, v| a.diagnostic(diagnostic, actor, lib::SourceLayer::Layer5, v));
+        log_unrecorded_refusal(code, appended);
+    }
     /// Publish a non-write session selected by its owner. The immutable source
     /// head and tape incarnation are resolved under the same dispatch lease.
     #[allow(clippy::too_many_arguments)]
@@ -563,6 +593,38 @@ pub(crate) fn session_projection(value: &lib::SessionObserved) -> crate::Restart
         drive_bay: key.as_ref().and_then(|v| v.bay().map(i64::from)),
         drive_uuid: None,
         drive_key: key,
+    }
+}
+
+/// The `RefusalRecorded` record of one refusal. Keys ascend: "code", then "name". The name is the
+/// variant's own, so no site spells it.
+fn refusal_diagnostic(code: lib::RefusalCode, subject: RefusalSubject) -> lib::Diagnostic {
+    let (subject_kind, subject_id) = subject.fields();
+    lib::Diagnostic {
+        event: lib::DiagnosticEvent::RefusalRecorded,
+        subject_kind: subject_kind.into(),
+        subject_id: subject_id.map(|id| uuid::Uuid::from_bytes(id).to_string().as_str().into()),
+        detail: lib::Bounded(vec![
+            lib::DiagnosticEntry(
+                "code".into(),
+                lib::DiagnosticValue::Unsigned(u64::from(code as u32)),
+            ),
+            lib::DiagnosticEntry(
+                "name".into(),
+                lib::DiagnosticValue::Text(format!("{code:?}").as_str().into()),
+            ),
+        ]),
+    }
+}
+
+/// A refusal that could not be recorded is answered unchanged; the failure is only logged.
+fn log_unrecorded_refusal(code: lib::RefusalCode, appended: Result<lib::Receipt, RuntimeError>) {
+    if let Err(error) = appended {
+        tracing::warn!(
+            code = ?code,
+            %error,
+            "the refusal was not recorded in the library log; it is answered unchanged"
+        );
     }
 }
 

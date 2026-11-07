@@ -77,13 +77,42 @@ impl LibraryRuntime {
             self.0.motion_fenced.store(true, Ordering::Release);
             RuntimeError::State(StateError::JournalReplayFailed(format!("{message}; drive discovery cannot preserve the required identity alarm; motion is fenced")))
         };
+        // The known drive that holds a serial: the earliest-seen active one, else the earliest-seen.
+        let holder_of = |serial: &str| {
+            known
+                .values()
+                .filter(|v| {
+                    v.value
+                        .serial
+                        .as_ref()
+                        .is_some_and(|v| v.as_str() == serial)
+                })
+                .min_by_key(|v| (v.retired, v.first, v.value.drive_uuid))
+                .map(|v| v.value.drive_uuid)
+        };
+        // A serial or identity collision is counted in the library log as one `RefusalRecorded`,
+        // after the latch and the refusal's own text: it names the known drive involved, or the
+        // library when no known drive matches (a duplicate of a serial never seen before).
+        let conflict = |message: &str, drive: Option<lib::Id>| {
+            let error = refusal(message);
+            self.record_refusal_locked(
+                lib::RefusalCode::DriveIdentityConflictLatch,
+                drive.map_or(RefusalSubject::Library, RefusalSubject::Drive),
+                lib::AuditActor::System,
+            );
+            error
+        };
         let mut serials = BTreeSet::new();
         for input in &inputs {
+            // A blank serial is a malformed observation, not a collision: refused, not counted.
             if input.serial.trim().is_empty() {
                 return Err(refusal("blank drive serial"));
             }
             if !serials.insert(input.serial.trim()) {
-                return Err(refusal("duplicate serial in discovery snapshot"));
+                return Err(conflict(
+                    "duplicate serial in discovery snapshot",
+                    holder_of(input.serial.trim()),
+                ));
             }
         }
         let generation = generation.checked_add(1).ok_or_else(|| {
@@ -102,8 +131,9 @@ impl LibraryRuntime {
                             .is_some_and(|v| v.as_str() == serial)
                 })
                 .count();
+            let holder = holder_of(serial);
             if active > 1 {
-                return Err(refusal("historical active serial collision"));
+                return Err(conflict("historical active serial collision", holder));
             }
             let norm = |v: Option<String>| v.map(|v| lib::Text::from(v.trim()));
             let vendor = norm(input.vendor);
@@ -120,11 +150,17 @@ impl LibraryRuntime {
                         && as_str(&v.value.product) == as_str(&product)
                 })
                 .min_by_key(|v| (v.retired, v.first, v.value.drive_uuid));
-            if prior.is_some_and(|v| v.retired) {
-                return Err(refusal("retired drive reappeared"));
+            if let Some(retired) = prior.filter(|v| v.retired) {
+                return Err(conflict(
+                    "retired drive reappeared",
+                    Some(retired.value.drive_uuid),
+                ));
             }
             if prior.is_none() && active > 0 {
-                return Err(refusal("new identity would collide with an active serial"));
+                return Err(conflict(
+                    "new identity would collide with an active serial",
+                    holder,
+                ));
             }
             let uuid =
                 prior.map_or_else(|| *uuid::Uuid::new_v4().as_bytes(), |v| v.value.drive_uuid);

@@ -965,12 +965,19 @@ impl OperatorMount<'_> {
     /// Ruling 32-L1: the library log does not yet record an authority import, so
     /// import refuses before it checks, stages, publishes or writes anything. The
     /// CLI refuses earlier, before it enumerates or opens a device; this is the
-    /// second line of defence and is unreachable from any production caller.
+    /// second line of defence and is unreachable from any production caller. Each
+    /// refusal is counted in the library log as one `RefusalRecorded` naming the
+    /// mounted tape, and is the only record it appends.
     pub fn import_journals(
         &mut self,
-        _mounted: &mut MountedTape,
+        mounted: &mut MountedTape,
         _from: &Path,
     ) -> Result<(), MountError> {
+        self.state.library_runtime().record_refusal(
+            remanence_state::library_log::RefusalCode::JournalImportDeferred,
+            remanence_state::library_runtime::RefusalSubject::Tape(Some(mounted.tape_uuid)),
+            remanence_state::AuditActor::local_user(),
+        );
         Err(refusal(JOURNAL_IMPORT_DEFERRED))
     }
 }
@@ -988,9 +995,14 @@ pub(crate) fn raise_standalone_fence(
     // C8-G10: the original producer couples tape, endpoint and free-form
     // evidence. FenceRaised has a single scope and CompletionEvidence only;
     // neither an invented DriveFault nor dropping the endpoint is equivalent.
-    state
-        .library_runtime()
-        .fence_motion_after_evidence_failure();
+    let runtime = state.library_runtime();
+    runtime.fence_motion_after_evidence_failure();
+    // Each raise is counted in the library log as one `RefusalRecorded` naming the tape.
+    runtime.record_refusal(
+        remanence_state::library_log::RefusalCode::StandaloneFenceUnrecorded,
+        remanence_state::library_runtime::RefusalSubject::Tape(Some(tape_uuid)),
+        remanence_state::AuditActor::local_user(),
+    );
     Err(refusal(format!(
         "cannot durably record standalone write uncertainty for {} at {:?} ({reason}): {detail}; motion is fenced and recovery is required",
         uuid::Uuid::from_bytes(tape_uuid), endpoint

@@ -378,6 +378,21 @@ fn drive_stewardship_deferred() -> Status {
     )
 }
 
+/// The refusal above, counted in the library log first: one `RefusalRecorded` naming the drive the
+/// request names. The caller holds the installed runtime and has decoded the drive.
+fn drive_stewardship_refused(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    actor: remanence_state::AuditActor,
+    drive_uuid: [u8; 16],
+) -> Status {
+    runtime.record_refusal(
+        remanence_state::library_log::RefusalCode::DriveStewardshipDeferred,
+        remanence_state::library_runtime::RefusalSubject::Drive(drive_uuid),
+        actor,
+    );
+    drive_stewardship_deferred()
+}
+
 fn ensure_mutable_drive(record: &DriveRecord, allow_derived_identity: bool) -> Result<(), Status> {
     if record.identity_source == "Derived" && !allow_derived_identity {
         return Err(Status::failed_precondition(
@@ -843,11 +858,12 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
     ) -> Result<Response<pb::DriveCatalogEntry>, Status> {
         let actor = crate::auth::authorize_request(&request, crate::auth::AuthPermission::Write)?;
         let request = request.into_inner();
-        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        let drive_uuid =
+            crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         validate_iso_date(request.purchase_date.as_str(), "purchase_date")?;
         validate_iso_date(request.warranty_until.as_str(), "warranty_until")?;
-        if self.state.catalog.library_runtime().is_some() {
-            return Err(drive_stewardship_deferred());
+        if let Some(runtime) = self.state.catalog.library_runtime() {
+            return Err(drive_stewardship_refused(&runtime, actor, drive_uuid));
         }
         #[cfg(test)]
         {
@@ -915,15 +931,16 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         let actor =
             crate::auth::authorize_request(&request, crate::auth::AuthPermission::Lifecycle)?;
         let request = request.into_inner();
-        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        let drive_uuid =
+            crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         // Retirement no longer carries a permanence acknowledgement: it is
         // reversible through ReinstateDrive. The reason remains mandatory —
         // it is what the audit trail and the reinstatement record cite.
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
-        if self.state.catalog.library_runtime().is_some() {
-            return Err(drive_stewardship_deferred());
+        if let Some(runtime) = self.state.catalog.library_runtime() {
+            return Err(drive_stewardship_refused(&runtime, actor, drive_uuid));
         }
         #[cfg(test)]
         {
@@ -990,12 +1007,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         let actor =
             crate::auth::authorize_request(&request, crate::auth::AuthPermission::Lifecycle)?;
         let request = request.into_inner();
-        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        let drive_uuid =
+            crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
-        if self.state.catalog.library_runtime().is_some() {
-            return Err(drive_stewardship_deferred());
+        if let Some(runtime) = self.state.catalog.library_runtime() {
+            return Err(drive_stewardship_refused(&runtime, actor, drive_uuid));
         }
         #[cfg(test)]
         {
@@ -2981,6 +2999,114 @@ mod tests {
 
         drop((service, state));
         assert_eq!(typed_steward_decisions(&mut typed).await, 0);
+    }
+
+    /// Site 10, through the three RPCs. Each deferred request is one `RefusalRecorded` naming the
+    /// drive it names, and the actor that asked; a request refused for its own fault records
+    /// nothing, and nothing else is appended.
+    #[tokio::test]
+    async fn stewardship_typed_refusals_are_each_recorded_with_their_drive() {
+        use crate::tests::refusal_tests::{assert_grew_by, mark, refusals, RecordedRefusal};
+        let mut typed = crate::tests::TypedRoot::open();
+        let sqlite = typed.paths().sqlite_path.clone();
+        let state = typed.api_state();
+        let drive_uuid = observe_typed_steward_drive(&state);
+        let drive: [u8; 16] = drive_uuid.clone().try_into().unwrap();
+        let service = state.library_service();
+        fn as_steward<T>(mut request: Request<T>) -> Request<T> {
+            request
+                .metadata_mut()
+                .insert("x-remanence-actor", "steward-a".parse().unwrap());
+            request
+        }
+        let annotate = |warranty_until: &str| {
+            as_steward(Request::new(pb::AnnotateDriveRequest {
+                drive_uuid: drive_uuid.clone(),
+                purchase_date: String::new(),
+                warranty_until: warranty_until.to_string(),
+                cost: String::new(),
+                note: "n".to_string(),
+                notes_set: String::new(),
+                allow_derived_identity: false,
+            }))
+        };
+        let retire = |reason: &str| {
+            as_steward(Request::new(pb::RetireDriveRequest {
+                drive_uuid: drive_uuid.clone(),
+                reason: reason.to_string(),
+                allow_derived_identity: false,
+            }))
+        };
+        let reinstate = |reason: &str| {
+            as_steward(Request::new(pb::ReinstateDriveRequest {
+                drive_uuid: drive_uuid.clone(),
+                reason: reason.to_string(),
+                allow_derived_identity: false,
+            }))
+        };
+        let before = mark(&sqlite);
+
+        // Each is refused for its own fault, before any drive stewardship is deferred.
+        assert_eq!(
+            service
+                .annotate_drive(annotate("not-a-date"))
+                .await
+                .expect_err("a malformed date")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            service
+                .retire_drive(retire("  "))
+                .await
+                .expect_err("a blank reason")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            service
+                .reinstate_drive(reinstate(""))
+                .await
+                .expect_err("a blank reason")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_grew_by(&sqlite, &before, 0);
+
+        let deferred = |refused: Option<Status>, recorded: u64| {
+            let refused = refused.expect("a valid request is deferred");
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(refused.message(), STEWARDSHIP_DEFERRED);
+            assert_grew_by(&sqlite, &before, recorded);
+        };
+        deferred(
+            service.annotate_drive(annotate("2031-01-31")).await.err(),
+            1,
+        );
+        deferred(service.retire_drive(retire("removed")).await.err(), 2);
+        deferred(
+            service.reinstate_drive(reinstate("returned")).await.err(),
+            3,
+        );
+        crate::tests::assert_no_legacy_audit_records(&state);
+
+        drop((service, state));
+        let log = typed.refusal_log();
+        let expected = RecordedRefusal::expect(
+            10,
+            "DriveStewardshipDeferred",
+            "drive",
+            Some(drive),
+            remanence_state::AuditActor::Service("steward-a".into()),
+        );
+        assert_eq!(
+            refusals(&log),
+            [expected.clone(), expected.clone(), expected]
+        );
+        assert_eq!(
+            log.last().unwrap().0,
+            remanence_state::library_log::Tag::Diagnostic
+        );
     }
 
     #[tokio::test]

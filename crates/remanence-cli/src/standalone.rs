@@ -1219,6 +1219,15 @@ where
         command: Tape::ImportJournals { .. },
     } = &cli.command
     {
+        // The state is open here (this command is not discovery-only), and the request names no
+        // tape. The refusal is counted in the library log before it is answered.
+        if let Some(state) = state.as_ref() {
+            state.library_runtime().record_refusal(
+                remanence_state::library_log::RefusalCode::JournalImportDeferred,
+                remanence_state::library_runtime::RefusalSubject::Tape(None),
+                remanence_state::AuditActor::local_user(),
+            );
+        }
         return Err(remanence_api::mount_support::JOURNAL_IMPORT_DEFERRED.into());
     }
     let mut health = matches!(cli.command, Command::Setup { .. } | Command::Doctor)

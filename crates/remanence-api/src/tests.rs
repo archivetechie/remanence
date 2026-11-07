@@ -60,6 +60,9 @@ use crate::write_session_ingress::*;
 #[path = "ingress_deadline_tests.rs"]
 mod ingress_deadline_tests;
 
+#[path = "refusal_tests.rs"]
+pub(crate) mod refusal_tests;
+
 const OBJECT_ID_TEXT: &str = "11111111-1111-1111-1111-111111111111";
 const OPERATION_ID_TEXT: &str = "22222222-2222-2222-2222-222222222222";
 const TAPE_UUID: [u8; 16] = [3u8; 16];
@@ -10869,42 +10872,43 @@ tape_catalog_dir = "{0}/cache"
         &self,
         pick: &mut impl FnMut(&remanence_state::library_log::Record) -> Option<T>,
     ) -> Result<Vec<T>, ChainRead> {
-        use nix::errno::Errno;
-        use remanence_state::library_log::{native_view::NativeTapeView, store};
-        use remanence_state::tape_log::store::StoreError as TapeStoreError;
-        let view = NativeTapeView::probe(
-            &self.paths.journal_dir.join("tapes"),
-            &self.paths.sqlite_path,
-        )
+        read_library_records(&self.paths, self.library_uuid, pick)
+    }
+}
+
+/// Replay the library log of `library_uuid` under `paths` and collect `pick` over its records in
+/// sequence order. The log is exclusively locked while any runtime over it is alive, which this
+/// reports as `ChainRead::Busy`.
+pub(crate) fn read_library_records<T>(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+    pick: &mut impl FnMut(&remanence_state::library_log::Record) -> Option<T>,
+) -> Result<Vec<T>, ChainRead> {
+    use nix::errno::Errno;
+    use remanence_state::library_log::{native_view::NativeTapeView, store};
+    use remanence_state::tape_log::store::StoreError as TapeStoreError;
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path)
         .map_err(|error| match error {
             TapeStoreError::Locked(errno) if errno == Errno::EWOULDBLOCK => ChainRead::Busy(errno),
             other => ChainRead::Failed(format!("probe the native tape logs: {other:?}")),
         })?;
-        let mut picked = Vec::new();
-        store::replay_observed(
-            &self.paths.audit_dir,
-            self.library_uuid,
-            &view,
-            &mut |record| {
-                if let Some(value) = pick(record.record()) {
-                    picked.push(value);
-                }
-                Ok(())
-            },
-        )
-        .map_err(|error| match error {
-            store::StoreError::Locked(errno) if errno == Errno::EWOULDBLOCK => {
-                ChainRead::Busy(errno)
-            }
-            other => ChainRead::Failed(format!("replay the library log: {other:?}")),
-        })?;
-        Ok(picked)
-    }
+    let mut picked = Vec::new();
+    store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+        if let Some(value) = pick(record.record()) {
+            picked.push(value);
+        }
+        Ok(())
+    })
+    .map_err(|error| match error {
+        store::StoreError::Locked(errno) if errno == Errno::EWOULDBLOCK => ChainRead::Busy(errno),
+        other => ChainRead::Failed(format!("replay the library log: {other:?}")),
+    })?;
+    Ok(picked)
 }
 
 /// Why one attempt to read the library log failed. The two stores report a competing owner
 /// through different error types; both map to `Busy`.
-enum ChainRead {
+pub(crate) enum ChainRead {
     Busy(nix::errno::Errno),
     Failed(String),
 }
