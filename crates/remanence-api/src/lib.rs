@@ -144,6 +144,7 @@ use auth::{
 };
 pub(crate) use catalog_conversion::{append_mode_for_tape_file_number, timestamp_from_rfc3339};
 pub use daemon_catalog_services::{CatalogService, DaemonService};
+pub use drive_collection::observe_configured_library_drives;
 pub(crate) use hex_encoding::bytes_to_hex;
 pub use library::LibraryServiceApi;
 pub(crate) use live_status::{DriveByteCounters, LibrarySnapshot};

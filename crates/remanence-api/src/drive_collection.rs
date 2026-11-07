@@ -555,6 +555,23 @@ pub(crate) fn observe_drive_catalog_from_libraries<'a>(
         .map_err(status_from_state_error)
 }
 
+/// Observe one library's drives through the same funnel the daemon uses
+/// (`observe_drive_catalog_from_libraries`), for a caller outside this crate that is about to
+/// publish a readiness owner naming a drive's serial: the owner's serial must match an observed
+/// identity at its endpoint. The message is the `Status` message.
+pub fn observe_configured_library_drives(
+    index: &mut CatalogIndex,
+    library: &remanence_library::Library,
+    config: &RemConfig,
+) -> Result<(), String> {
+    observe_drive_catalog_from_libraries(
+        index,
+        std::iter::once(library),
+        &drive_managed_library_serials(config),
+    )
+    .map_err(|status| status.message().to_string())
+}
+
 #[cfg(test)]
 mod b3b_strict_tests {
     use super::*;

@@ -257,8 +257,7 @@ impl LibraryRuntime {
         actor: lib::AuditActor,
     ) {
         let diagnostic = refusal_diagnostic(code, subject);
-        let appended =
-            self.append(|a, v| a.diagnostic(diagnostic, actor, lib::SourceLayer::Layer5, v));
+        let appended = self.append_diagnostic(diagnostic, actor, lib::SourceLayer::Layer5);
         log_unrecorded_refusal(code, appended);
     }
 
@@ -271,9 +270,69 @@ impl LibraryRuntime {
         actor: lib::AuditActor,
     ) {
         let diagnostic = refusal_diagnostic(code, subject);
-        let appended =
-            self.append_locked(|a, v| a.diagnostic(diagnostic, actor, lib::SourceLayer::Layer5, v));
+        let appended = self.append_diagnostic_locked(diagnostic, actor, lib::SourceLayer::Layer5);
         log_unrecorded_refusal(code, appended);
+    }
+
+    /// Record the presentation facts of an operation: one `OperationProgress` `Diagnostic` naming
+    /// the operation, with each fact as a detail entry (keys ascend, as the fold requires). It
+    /// describes a record the caller has already appended and is never read by a decision, so a
+    /// failure to record it is logged and never changes the caller's outcome. For a site that
+    /// holds the dispatch lease, like `record_refusal_locked`, and appended through the same
+    /// `append_diagnostic_locked`. No details records nothing.
+    pub(crate) fn record_operation_progress_locked(
+        &self,
+        operation: lib::Id,
+        details: &[(&str, &str)],
+        actor: lib::AuditActor,
+    ) {
+        if details.is_empty() {
+            return;
+        }
+        let ordered: std::collections::BTreeMap<&str, &str> = details.iter().copied().collect();
+        let (subject_kind, subject_id) = RefusalSubject::Operation(operation).fields();
+        let diagnostic = lib::Diagnostic {
+            event: lib::DiagnosticEvent::OperationProgress,
+            subject_kind: subject_kind.into(),
+            subject_id: subject_id.map(|id| uuid::Uuid::from_bytes(id).to_string().as_str().into()),
+            detail: lib::Bounded(
+                ordered
+                    .into_iter()
+                    .map(|(key, value)| {
+                        lib::DiagnosticEntry(key.into(), lib::DiagnosticValue::Text(value.into()))
+                    })
+                    .collect(),
+            ),
+        };
+        if let Err(error) =
+            self.append_diagnostic_locked(diagnostic, actor, lib::SourceLayer::Layer4)
+        {
+            tracing::warn!(
+                %error,
+                "the operation's progress detail was not recorded in the library log; the operation is unchanged"
+            );
+        }
+    }
+
+    /// The one append of a `Diagnostic` to the library log, for a site without the dispatch
+    /// lease. Every diagnostic wrapper in this file goes through it or its `_locked` twin.
+    fn append_diagnostic(
+        &self,
+        diagnostic: lib::Diagnostic,
+        actor: lib::AuditActor,
+        layer: lib::SourceLayer,
+    ) -> Result<lib::Receipt, RuntimeError> {
+        self.append(|a, v| a.diagnostic(diagnostic, actor, layer, v))
+    }
+
+    /// `append_diagnostic` for a site that already holds the dispatch lease.
+    fn append_diagnostic_locked(
+        &self,
+        diagnostic: lib::Diagnostic,
+        actor: lib::AuditActor,
+        layer: lib::SourceLayer,
+    ) -> Result<lib::Receipt, RuntimeError> {
+        self.append_locked(|a, v| a.diagnostic(diagnostic, actor, layer, v))
     }
     /// Publish a non-write session selected by its owner. The immutable source
     /// head and tape incarnation are resolved under the same dispatch lease.

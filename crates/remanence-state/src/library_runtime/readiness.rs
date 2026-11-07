@@ -1,6 +1,6 @@
 //! Readiness source publication from explicit operation inputs. No SQL row or
-//! audit detail map supplies authority. An absent deadline is not silently
-//! converted to a finite or unbounded typed duration.
+//! audit detail map supplies authority. An absent deadline is recorded as an
+//! absent limit (`limit_ms: None`), never converted to a finite duration.
 use super::AuthorityError;
 use super::{LibraryRuntime, RuntimeError};
 use crate::{
@@ -22,8 +22,10 @@ impl LibraryRuntime {
             .readiness_load_attempts(operation)
             .map_err(Into::into)
     }
-    /// Publish the real creation facts before a readiness-owned LOAD. This
-    /// converter deliberately refuses inputs the closed schema cannot express.
+    /// Publish the real creation facts before a readiness-owned LOAD. Every
+    /// owner produces a record: the decision-relevant facts are typed keys, the
+    /// process-local device paths are not recorded, and the evidence path goes to
+    /// a `Diagnostic`.
     pub fn begin_readiness(
         &self,
         input: &MediaReadinessOperationInput,
@@ -43,18 +45,16 @@ impl LibraryRuntime {
         input: &MediaReadinessOperationInput,
         owned: bool,
     ) -> Result<uuid::Uuid, RuntimeError> {
-        // C8-G11: these actual durable presentation facts have no fields in
-        // ReadinessObserved. Do not silently discard them or invent a side log.
-        if input.run_id.is_some()
-            || input.changer_sg.is_some()
-            || input.drive_sg.is_some()
-            || input.source_slot.is_some()
-            || input.evidence_path.is_some()
-        {
-            return Err(invalid(
-                "readiness owner metadata cannot be preserved by the available authority format",
-            ));
-        }
+        // The typed key holds a UUID; a caller's run label that is not one has no encoding.
+        let run = input
+            .run_id
+            .as_deref()
+            .map(|run| {
+                uuid::Uuid::parse_str(run)
+                    .map(|run| *run.as_bytes())
+                    .map_err(|_| invalid("readiness run id is not a UUID"))
+            })
+            .transpose()?;
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         let prior_source = self.readiness_source_locked(*input.operation_id.as_bytes())?;
         if let Some(serial) = input.drive_serial.as_deref() {
@@ -66,16 +66,19 @@ impl LibraryRuntime {
                 ));
             }
         }
-        let deadline = input.deadline_at_utc.as_deref().ok_or_else(|| {
-            invalid("readiness operation has no deadline; typed limit has no absent encoding")
-        })?;
-        let deadline = OffsetDateTime::parse(deadline, &Rfc3339)
-            .map_err(|e| invalid(format!("invalid readiness deadline: {e}")))?;
+        // No deadline is a fact, not an error: the owner records `limit_ms: None`.
+        let deadline_ns = input
+            .deadline_at_utc
+            .as_deref()
+            .map(|deadline| {
+                let deadline = OffsetDateTime::parse(deadline, &Rfc3339)
+                    .map_err(|e| invalid(format!("invalid readiness deadline: {e}")))?;
+                u64::try_from(deadline.unix_timestamp_nanos()).map_err(|e| invalid(e.to_string()))
+            })
+            .transpose()?;
         let now = OffsetDateTime::now_utc();
         let started_unix_ns =
             u64::try_from(now.unix_timestamp_nanos()).map_err(|e| invalid(e.to_string()))?;
-        let deadline_ns =
-            u64::try_from(deadline.unix_timestamp_nanos()).map_err(|e| invalid(e.to_string()))?;
         let endpoint = super::motion::endpoint(&input.endpoint);
         let phase = phase(&input.phase)?;
         let state = state(&input.state)?;
@@ -112,19 +115,25 @@ impl LibraryRuntime {
             _ => lib::ReadinessResult::Pending,
         };
         if let Some((_, owner)) = &prior_source {
-            let limit_ms = owner.limit_ms.ok_or_else(|| {
-                invalid("readiness owner refresh changed immutable creation facts")
-            })?;
-            let represented_deadline = owner
-                .started_unix_ns
-                .checked_add(limit_ms.saturating_mul(1_000_000))
-                .ok_or_else(|| invalid("readiness deadline overflow"))?;
+            // A deadline is an immutable creation fact and matches as an `Option`: finite
+            // against finite within 1 ms, none against none, and never one against the other.
+            let deadline_matches = match (owner.limit_ms, deadline_ns) {
+                (Some(limit_ms), Some(deadline_ns)) => {
+                    let represented_deadline = owner
+                        .started_unix_ns
+                        .checked_add(limit_ms.saturating_mul(1_000_000))
+                        .ok_or_else(|| invalid("readiness deadline overflow"))?;
+                    deadline_ns.saturating_sub(represented_deadline) < 1_000_000
+                        && deadline_ns >= represented_deadline
+                }
+                (None, None) => true,
+                _ => false,
+            };
             if owner.endpoint != endpoint
                 || owner.barcode.as_ref().map(|b| b.as_str()) != input.barcode.as_deref()
                 || owner.media != media
                 || owner.scope != scope
-                || deadline_ns.saturating_sub(represented_deadline) >= 1_000_000
-                || deadline_ns < represented_deadline
+                || !deadline_matches
             {
                 return Err(invalid(
                     "readiness owner refresh changed immutable creation facts",
@@ -143,26 +152,48 @@ impl LibraryRuntime {
             let (_, ready_generation) =
                 authority.readiness_context(*input.operation_id.as_bytes(), &endpoint)?;
             let prior = prior_source;
-            let (previous, started_unix_ns, limit_ms) = match prior {
+            // `source_slot` and `run` are creation facts: a refresh keeps the owner's. The
+            // device paths are process-local and are not recorded.
+            let (previous, started_unix_ns, limit_ms, source_slot, run, cancel_source) = match prior
+            {
                 Some((source, owner)) => {
                     if owner.endpoint != endpoint {
                         return Err(
                             lib::store::StoreError::Fold(lib::FoldError::WrongCounterpart).into(),
                         );
                     }
-                    (Some(source), owner.started_unix_ns, owner.limit_ms)
+                    (
+                        Some(source),
+                        owner.started_unix_ns,
+                        owner.limit_ms,
+                        owner.source_slot,
+                        owner.run,
+                        owner.cancel_source,
+                    )
                 }
                 None => {
-                    let duration = deadline_ns
-                        .checked_sub(started_unix_ns)
-                        .ok_or(lib::store::StoreError::Fold(lib::FoldError::InvalidSchema))?;
-                    (None, started_unix_ns, Some(duration / 1_000_000))
+                    let limit_ms = deadline_ns
+                        .map(|deadline_ns| {
+                            deadline_ns
+                                .checked_sub(started_unix_ns)
+                                .map(|duration| duration / 1_000_000)
+                                .ok_or(lib::store::StoreError::Fold(lib::FoldError::InvalidSchema))
+                        })
+                        .transpose()?;
+                    (
+                        None,
+                        started_unix_ns,
+                        limit_ms,
+                        input.source_slot,
+                        run,
+                        None,
+                    )
                 }
             };
             let value = lib::ReadinessObserved {
-                source_slot: None,
-                run: None,
-                cancel_source: None,
+                source_slot,
+                run,
+                cancel_source,
                 operation: *input.operation_id.as_bytes(),
                 endpoint,
                 tape: None,
@@ -204,6 +235,16 @@ impl LibraryRuntime {
                 Ok(receipt)
             }
         })?;
+        // The evidence path is presentation: one `Diagnostic` naming the operation, recorded
+        // after the owner it describes. A failure to record it never changes the owner's
+        // outcome.
+        if let Some(path) = input.evidence_path.as_deref() {
+            self.record_operation_progress_locked(
+                operation,
+                &[("evidence_path", path)],
+                lib::AuditActor::System,
+            );
+        }
         Ok(uuid::Uuid::from_bytes(operation))
     }
     /// Serial is redundant only when the endpoint or discovery source proves
@@ -362,13 +403,11 @@ impl LibraryRuntime {
         &self,
         input: &MediaReadinessTransitionInput,
     ) -> Result<(), RuntimeError> {
-        if input.cancel_source.is_some()
-            || input.signal.is_some()
-            || input.evidence_path.is_some()
-            || input.last_error_json.is_some()
-        {
-            return Err(invalid("readiness transition metadata cannot be preserved by the available authority format"));
-        }
+        // `cancel_source` is a typed key; `signal`, `last_error_json`, `evidence_path` and a
+        // `transport_class` that has no completion evidence behind it are presentation and go to
+        // one `Diagnostic` once the observation is appended. With evidence, the class is what
+        // the evidence says and the projection derives it.
+        let (cancel_source, untyped_cancel) = typed_cancel_source(input.cancel_source.as_deref())?;
         if input.completion_evidence.is_none()
             && (input.last_sense_raw.is_some()
                 || input.last_sense_key.is_some()
@@ -376,8 +415,7 @@ impl LibraryRuntime {
                 || input.last_ascq.is_some()
                 || input.last_host_status.is_some()
                 || input.last_driver_status.is_some()
-                || input.target_status.is_some()
-                || input.transport_class.is_some())
+                || input.target_status.is_some())
         {
             return Err(invalid(
                 "readiness transition requires its actual command completion",
@@ -443,6 +481,7 @@ impl LibraryRuntime {
             && value.state == next_state
             && value.scope == next_scope
             && value.evidence == input.completion_evidence
+            && value.cancel_source == cancel_source
         {
             self.catch_up_locked()?;
             return Ok(());
@@ -451,6 +490,9 @@ impl LibraryRuntime {
             return Err(invalid("readiness operation is already terminal"));
         }
         value.scope = next_scope;
+        // Every observation states its cancel source; none clears an earlier one, as every
+        // legacy transition without one did.
+        value.cancel_source = cancel_source;
         if next_result == lib::ReadinessResult::Ready {
             value.load_intent =
                 self.pending_readiness_load_locked(value.operation, &value.endpoint)?;
@@ -465,11 +507,52 @@ impl LibraryRuntime {
             .authority
             .readiness_context(value.operation, &value.endpoint)?
             .1;
+        let operation = value.operation;
         self.append_locked(|a, v| {
             a.readiness_observed(value, lib::AuditActor::System, lib::SourceLayer::Layer4, v)
         })?;
+        let mut details = Vec::new();
+        if untyped_cancel {
+            details.push(("cancel_source", "signal"));
+        }
+        let (evidence_path, last_error_json, signal) = (
+            input.evidence_path.as_deref(),
+            input.last_error_json.as_deref(),
+            input.signal.as_deref(),
+        );
+        let unproven_transport_class = input
+            .transport_class
+            .as_deref()
+            .filter(|_| input.completion_evidence.is_none());
+        for (key, text) in [
+            ("evidence_path", evidence_path),
+            ("last_error_json", last_error_json),
+            ("signal", signal),
+            ("transport_class", unproven_transport_class),
+        ] {
+            if let Some(text) = text {
+                details.push((key, text));
+            }
+        }
+        self.record_operation_progress_locked(operation, &details, lib::AuditActor::System);
         Ok(())
     }
+}
+
+/// The legacy cancel-source spelling as the typed key, and whether it was the CLI's `signal`,
+/// which has no variant: no production reader branches on it, so it records no key and the
+/// diagnostic names it.
+fn typed_cancel_source(
+    value: Option<&str>,
+) -> Result<(Option<lib::CancelSource>, bool), RuntimeError> {
+    Ok(match value {
+        None => (None, false),
+        Some("operator") => (Some(lib::CancelSource::Operator), false),
+        Some("shutdown") => (Some(lib::CancelSource::Shutdown), false),
+        Some("startup_reconcile") => (Some(lib::CancelSource::StartupReconcile), false),
+        Some("signal") => (None, true),
+        Some(other) => return Err(invalid(format!("unsupported cancel source {other:?}"))),
+    })
 }
 
 /// Ready is produced only by an issued TUR that returned GOOD. The transport's
@@ -485,16 +568,30 @@ fn successful_probe(evidence: &lib::CompletionEvidence) -> bool {
         && evidence.residual.unwrap_or(0) == 0
 }
 
-/// These phase names explicitly denote a TUR observation; other command labels
-/// need an authenticated command counterpart rather than a guessed opcode.
+/// The opcode a phase's command is, for every (phase, opcode) pair production records: the TEST
+/// UNIT READY probes, the drive's SSC LOAD (the initializing command, the immediate loads and the
+/// completion of the drive load), MOVE MEDIUM and REWIND. A transition's own opcode must equal
+/// it. The `Before...` and `After...` phases issue no command and have none. Only the TEST UNIT
+/// READY phases can carry a Ready observation.
 pub(crate) fn phase_opcode(phase: lib::ReadinessPhase) -> Option<u8> {
     match phase {
         lib::ReadinessPhase::ReadinessPoll
+        | lib::ReadinessPhase::LoadDriveReadiness
         | lib::ReadinessPhase::WaitReadyTur
+        | lib::ReadinessPhase::PreLoadTur
+        | lib::ReadinessPhase::AlreadyLoadedTur
         | lib::ReadinessPhase::StartupReconcileTur
         | lib::ReadinessPhase::SessionOpenShortProbe
         | lib::ReadinessPhase::SessionOpenAfterImmediateLoad
-        | lib::ReadinessPhase::Ready => Some(0),
+        | lib::ReadinessPhase::Ready => Some(0x00),
+        lib::ReadinessPhase::RewindBeforeBotRead
+        | lib::ReadinessPhase::RewindBeforeBootstrapWrite => Some(0x01),
+        // The drive's SSC LOAD; `robotics.rs` records its completion under `LoadDriveCompletion`.
+        lib::ReadinessPhase::InitializingCommandLoad
+        | lib::ReadinessPhase::ConditionalImmediateLoad
+        | lib::ReadinessPhase::SessionOpenImmediateLoad
+        | lib::ReadinessPhase::LoadDriveCompletion => Some(0x1b),
+        lib::ReadinessPhase::MoveMedium => Some(0xa5),
         _ => None,
     }
 }
@@ -565,6 +662,8 @@ fn phase(value: &str) -> Result<lib::ReadinessPhase, RuntimeError> {
         "after_pre_load_tur" => lib::ReadinessPhase::AfterPreLoadTur,
         "before_already_loaded_tur" => lib::ReadinessPhase::BeforeAlreadyLoadedTur,
         "after_already_loaded_tur" => lib::ReadinessPhase::AfterAlreadyLoadedTur,
+        "load_drive_readiness" => lib::ReadinessPhase::LoadDriveReadiness,
+        "load_drive_completion" => lib::ReadinessPhase::LoadDriveCompletion,
         _ => return Err(invalid(format!("unsupported ReadinessPhase {value:?}"))),
     })
 }
@@ -590,6 +689,10 @@ fn state(value: &str) -> Result<lib::ReadinessState, RuntimeError> {
         _ => return Err(invalid(format!("unsupported ReadinessState {value:?}"))),
     })
 }
+
+#[cfg(test)]
+#[path = "readiness_owner_tests.rs"]
+mod readiness_owner_tests;
 
 #[cfg(test)]
 mod tests {

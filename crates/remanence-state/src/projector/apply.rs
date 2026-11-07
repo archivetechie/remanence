@@ -877,13 +877,13 @@ impl CatalogCore {
                     None,
                     MediaReadinessOperationInput {
                         operation_id: Uuid::from_bytes(v.operation),
-                        run_id: None,
+                        run_id: v.run.map(|run| Uuid::from_bytes(run).to_string()),
                         endpoint: endpoint(&v.endpoint),
                         changer_sg: None,
                         drive_sg: None,
                         drive_serial,
                         barcode: v.barcode.as_ref().map(|x| x.0.clone()),
-                        source_slot: None,
+                        source_slot: v.source_slot,
                         media_generation: match v.tape {
                             Some(t) => self.get_tape(&t.uuid)?.and_then(|t| {
                                 crate::tape_generation(&t).map(|(g, _)| g.generation_number())
@@ -944,6 +944,7 @@ impl CatalogCore {
                         .as_ref()
                         .and_then(|_| crate::library_runtime::readiness::phase_opcode(v.phase)),
                     v.evidence.as_ref(),
+                    v.cancel_source.map(spelling),
                 )?;
             }
             Body::FenceRaised(v) => match &v.scope {
@@ -1051,6 +1052,7 @@ impl CatalogCore {
                         operation,
                         "pre_ready_loading",
                         Some(0x1b),
+                        None,
                         None,
                     )?;
                 }
@@ -1298,6 +1300,7 @@ impl CatalogCore {
         state: &str,
         opcode: Option<u8>,
         evidence: Option<&lib::CompletionEvidence>,
+        cancel_source: Option<String>,
     ) -> Result<(), StateError> {
         self.record_media_readiness_transition(
             None,
@@ -1320,7 +1323,7 @@ impl CatalogCore {
                 transport_class: evidence
                     .filter(|e| e.completion == lib::Completion::Unknown)
                     .map(|_| "unknown".into()),
-                cancel_source: None,
+                cancel_source,
                 signal: None,
                 evidence_path: None,
                 last_error_json: None,

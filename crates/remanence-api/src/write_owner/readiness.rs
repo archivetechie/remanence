@@ -826,6 +826,13 @@ pub(crate) fn record_session_open_readiness_poll_transition(
     };
     let (sense_key, asc, ascq, target_status, transport_class, last_error_json, sense_raw) =
         session_open_readiness_evidence(readiness);
+    // The completion of the drive's LOAD carries the LOAD's evidence; every other phase here is
+    // a TEST UNIT READY observation.
+    let opcode = if phase == "load_drive_completion" {
+        0x1b
+    } else {
+        0x00
+    };
     index
         .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
             completion_evidence: Some((&readiness.outcome().evidence).into()),
@@ -833,7 +840,7 @@ pub(crate) fn record_session_open_readiness_poll_transition(
             phase: Some(phase.to_string()),
             state: state.to_string(),
             dirty_scope: readiness.is_ready().then(|| "none".into()),
-            last_cdb_opcode: Some(0x00),
+            last_cdb_opcode: Some(opcode),
             last_sense_raw: sense_raw,
             last_sense_key: sense_key,
             last_asc: asc,

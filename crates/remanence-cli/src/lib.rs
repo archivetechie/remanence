@@ -9125,12 +9125,25 @@ trait TapeInitStateOps {
         authority: TapeInitProvisionAuthority,
     ) -> Result<(), String>;
 
+    /// Observe the library's drives before a readiness owner names one: the owner's drive
+    /// serial must match an observed identity at its endpoint.
+    fn observe_library_drives(
+        &mut self,
+        library: &Library,
+        config: &remanence_state::RemConfig,
+    ) -> Result<(), String> {
+        let _ = (library, config);
+        Ok(())
+    }
+
+    /// Begin the readiness owner and return its operation id. Under the typed runtime the id is
+    /// minted by the writer (the same entry `tape wait-ready --wait` uses) and may differ from
+    /// `input.operation_id`: every later record must carry the returned one.
     fn record_media_readiness_operation(
         &mut self,
         input: remanence_state::MediaReadinessOperationInput,
-    ) -> Result<(), String> {
-        let _ = input;
-        Ok(())
+    ) -> Result<Uuid, String> {
+        Ok(input.operation_id)
     }
 
     fn record_media_readiness_transition(
@@ -9221,14 +9234,20 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         )
     }
 
+    fn observe_library_drives(
+        &mut self,
+        library: &Library,
+        config: &remanence_state::RemConfig,
+    ) -> Result<(), String> {
+        remanence_api::observe_configured_library_drives(&mut self.write_handle(), library, config)
+            .map_err(|error| format!("observe drives of library {}: {error}", library.serial))
+    }
+
     fn record_media_readiness_operation(
         &mut self,
         input: remanence_state::MediaReadinessOperationInput,
-    ) -> Result<(), String> {
-        self.write_handle()
-            .record_media_readiness_operation(input)
-            .map(|_| ())
-            .map_err(|error| format!("record media readiness operation: {error}"))
+    ) -> Result<Uuid, String> {
+        begin_readiness_owner(&mut self.write_handle(), input)
     }
 
     fn record_media_readiness_transition(
@@ -9330,6 +9349,15 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
         self.library_runtime()
     }
 
+    fn observe_library_drives(
+        &mut self,
+        library: &Library,
+        config: &remanence_state::RemConfig,
+    ) -> Result<(), String> {
+        remanence_api::observe_configured_library_drives(self, library, config)
+            .map_err(|error| format!("observe drives of library {}: {error}", library.serial))
+    }
+
     fn project_catalog_inputs(
         &mut self,
         voltag: &str,
@@ -9355,10 +9383,8 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
     fn record_media_readiness_operation(
         &mut self,
         input: remanence_state::MediaReadinessOperationInput,
-    ) -> Result<(), String> {
-        remanence_state::CatalogIndex::record_media_readiness_operation(self, input)
-            .map(|_| ())
-            .map_err(|error| format!("record media readiness operation: {error}"))
+    ) -> Result<Uuid, String> {
+        begin_readiness_owner(self, input)
     }
 
     fn record_media_readiness_transition(
@@ -9727,21 +9753,20 @@ fn run_tape_wait_ready(
             return ExitCode::from(1);
         }
     };
-    let result =
-        match run_tape_wait_ready_hardware(library, &policy, args, &mut state.write_handle()) {
-            Ok(result) => result,
-            Err(failure) => {
-                print_tape_wait_ready_failure(
-                    library.serial.as_str(),
-                    &failure,
-                    args.json,
-                    out,
-                    err,
-                );
-                print_warnings(report, err);
-                return ExitCode::from(failure.exit_code);
-            }
-        };
+    let result = match run_tape_wait_ready_hardware(
+        library,
+        &policy,
+        args,
+        &config,
+        &mut state.write_handle(),
+    ) {
+        Ok(result) => result,
+        Err(failure) => {
+            print_tape_wait_ready_failure(library.serial.as_str(), &failure, args.json, out, err);
+            print_warnings(report, err);
+            return ExitCode::from(failure.exit_code);
+        }
+    };
     print_tape_wait_ready_result(library.serial.as_str(), &result, args.json, out, err);
     print_warnings(report, err);
     tape_wait_ready_exit_code(&result)
@@ -9752,6 +9777,7 @@ fn run_tape_wait_ready_hardware(
     library: &Library,
     policy: &StaticAllowlist,
     args: &TapeWaitReadyArgs,
+    config: &remanence_state::RemConfig,
     catalog: &mut remanence_state::CatalogIndex,
 ) -> Result<TapeWaitReadyResult, TapeWaitReadyFailure> {
     let signal_guard =
@@ -9760,7 +9786,7 @@ fn run_tape_wait_ready_hardware(
             exit_code: 1,
         })?;
     let (operation_id, drive_element, barcode) =
-        resolve_wait_ready_operation(library, args, catalog).map_err(|message| {
+        resolve_wait_ready_operation(library, args, config, catalog).map_err(|message| {
             TapeWaitReadyFailure {
                 message,
                 exit_code: 50,
@@ -9982,6 +10008,7 @@ fn run_tape_wait_ready_hardware(
     _library: &Library,
     _policy: &StaticAllowlist,
     _args: &TapeWaitReadyArgs,
+    _config: &remanence_state::RemConfig,
     _catalog: &mut remanence_state::CatalogIndex,
 ) -> Result<TapeWaitReadyResult, TapeWaitReadyFailure> {
     Err(TapeWaitReadyFailure {
@@ -10024,6 +10051,7 @@ fn resolve_wait_ready_drive(
 fn resolve_wait_ready_operation(
     library: &Library,
     args: &TapeWaitReadyArgs,
+    config: &remanence_state::RemConfig,
     catalog: &mut remanence_state::CatalogIndex,
 ) -> Result<(Uuid, u16, Option<String>), String> {
     if let Some(operation_id) = args.resume {
@@ -10057,6 +10085,9 @@ fn resolve_wait_ready_operation(
     if !conflicts.is_empty() {
         return Err(wait_ready_active_conflict_error(&conflicts));
     }
+    // The owner names the drive's serial, which must match an observed identity at its endpoint.
+    remanence_api::observe_configured_library_drives(catalog, library, config)
+        .map_err(|error| format!("observe drives of library {}: {error}", library.serial))?;
     let operation_id = Uuid::new_v4();
     let drive_bay = library
         .drive_bays
@@ -10091,14 +10122,25 @@ fn resolve_wait_ready_operation(
         deadline_at_utc: args.wait.then(|| deadline_after(args.timeout)).flatten(),
         evidence_path: None,
     };
-    let owner = if args.wait && catalog.library_runtime().is_some() {
-        catalog.begin_typed_media_readiness_operation(input)
+    let operation_id = begin_readiness_owner(catalog, input)?;
+    Ok((operation_id, drive_element, barcode))
+}
+
+/// The one way the CLI begins a readiness owner, for tape init, `tape wait-ready` and its
+/// `--wait`: under the typed runtime the writer mints the operation (the id in `input` is not
+/// used) and the caller carries the returned id into every later record; without a runtime
+/// (historical fixtures) the owner is recorded under `input.operation_id`.
+fn begin_readiness_owner(
+    index: &mut remanence_state::CatalogIndex,
+    input: remanence_state::MediaReadinessOperationInput,
+) -> Result<Uuid, String> {
+    let owner = if index.library_runtime().is_some() {
+        index.begin_typed_media_readiness_operation(input)
     } else {
-        catalog.record_media_readiness_operation(input)
+        index.record_media_readiness_operation(input)
     }
     .map_err(|error| format!("record media readiness operation: {error}"))?;
-    let operation_id = Uuid::parse_str(&owner.operation_id).map_err(|error| error.to_string())?;
-    Ok((operation_id, drive_element, barcode))
+    Uuid::parse_str(&owner.operation_id).map_err(|error| error.to_string())
 }
 
 fn wait_ready_active_conflict_error(
@@ -12346,38 +12388,41 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         fresh_block_size,
         drive_element,
     } = plan;
-    let operation_id = Uuid::new_v4();
     let drive_bay = library
         .drive_bays
         .iter()
         .find(|bay| bay.element_address == drive_element);
     let signal_guard = MediaReadinessSignalGuard::install()?;
-    state.record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-        operation_id,
-        run_id: None,
-        endpoint: remanence_state::DriveKey::new(library.serial.clone(), drive_element),
-        changer_sg: Some(library.changer_sg.display().to_string()),
-        drive_sg: drive_bay
-            .and_then(|bay| bay.installed.as_ref())
-            .and_then(|drive| drive.sg_path.as_ref())
-            .map(|path| path.display().to_string()),
-        drive_serial: drive_bay
-            .and_then(|bay| bay.installed.as_ref())
-            .map(|drive| drive.serial.clone()),
-        barcode: Some(voltag.clone()),
-        source_slot: if candidate.location == TapeInitLocation::Slot {
-            Some(candidate.element_address)
-        } else {
-            drive_bay.and_then(|bay| bay.source_slot)
-        },
-        media_generation: Some(generation.generation_number()),
-        media_family: Some(generation),
-        phase: "planned".to_string(),
-        state: "planned".to_string(),
-        dirty_scope: Some("drive+tape".to_string()),
-        deadline_at_utc: deadline_after(MEDIA_CONDITIONING_TIMEOUT),
-        evidence_path: None,
-    })?;
+    state.observe_library_drives(library, config)?;
+    // The writer mints the operation under the typed runtime; every later record carries the id
+    // it returns.
+    let operation_id =
+        state.record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: Uuid::new_v4(),
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new(library.serial.clone(), drive_element),
+            changer_sg: Some(library.changer_sg.display().to_string()),
+            drive_sg: drive_bay
+                .and_then(|bay| bay.installed.as_ref())
+                .and_then(|drive| drive.sg_path.as_ref())
+                .map(|path| path.display().to_string()),
+            drive_serial: drive_bay
+                .and_then(|bay| bay.installed.as_ref())
+                .map(|drive| drive.serial.clone()),
+            barcode: Some(voltag.clone()),
+            source_slot: if candidate.location == TapeInitLocation::Slot {
+                Some(candidate.element_address)
+            } else {
+                drive_bay.and_then(|bay| bay.source_slot)
+            },
+            media_generation: Some(generation.generation_number()),
+            media_family: Some(generation),
+            phase: "planned".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: deadline_after(MEDIA_CONDITIONING_TIMEOUT),
+            evidence_path: None,
+        })?;
     record_media_readiness_signal_if_requested(state, operation_id, "before_open_library", || {
         signal_guard.requested_signal_name()
     })?;
@@ -20736,8 +20781,14 @@ mod tests {
             library: Some("LIB-WAIT".to_string()),
             json: false,
         };
-        let result = run_tape_wait_ready_hardware(&library, &policy, &args, &mut index)
-            .unwrap_or_else(|failure| panic!("wait route fails: {}", failure.message));
+        let result = run_tape_wait_ready_hardware(
+            &library,
+            &policy,
+            &args,
+            &tape_init_config_with_pool(4096),
+            &mut index,
+        )
+        .unwrap_or_else(|failure| panic!("wait route fails: {}", failure.message));
         TEST_CLI_TRANSPORT_FACTORY
             .with(|slot| assert!(slot.borrow().is_none(), "route opens model transport"));
         assert!(result.timed_out);
@@ -20760,6 +20811,402 @@ mod tests {
                 .state,
             "timeout_unknown"
         );
+    }
+
+    /// A runtime-backed state with `tape_init_config_with_pool`'s configuration.
+    fn runtime_backed_state(
+        root: &Path,
+    ) -> (remanence_state::RemConfig, remanence_state::StateHandle) {
+        let mut config = tape_init_config_with_pool(4096);
+        config.daemon.state_dir = root.join("state");
+        config.journal.dir = root.join("journals");
+        config.audit.dir = root.join("audit");
+        config.index.sqlite_path = root.join("index/rem-state.sqlite");
+        config.cache.tape_catalog_dir = root.join("cache/tapes");
+        let paths = remanence_state::StatePaths::from_config(root.join("config.toml"), &config);
+        let state = remanence_state::StateHandle::open_with_config(paths, config.clone())
+            .expect("runtime-backed state");
+        (config, state)
+    }
+
+    /// The owner of a fresh wait-ready names the drive's serial, which the typed runtime accepts
+    /// only for a drive it has observed: `resolve_wait_ready_operation` observes the library's
+    /// drives first, as the daemon does.
+    #[test]
+    fn tape_wait_ready_observes_the_librarys_drives_before_its_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, state) = runtime_backed_state(temp.path());
+        let mut catalog = state.write_handle();
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        let args = TapeWaitReadyArgs {
+            endpoint: None,
+            resume: None,
+            barcode: Some("AOX030L9".to_string()),
+            drive_element: None,
+            already_loaded: false,
+            wait: true,
+            timeout: StdDuration::from_secs(1),
+            poll: StdDuration::ZERO,
+            config: temp.path().join("config.toml"),
+            library: Some("LIB-A".to_string()),
+            json: false,
+        };
+        let (operation_id, drive_element, _) =
+            resolve_wait_ready_operation(&library, &args, &config, &mut catalog)
+                .expect("the owner is accepted once the drive is observed");
+        assert_eq!(drive_element, 0x0100);
+        assert_eq!(
+            catalog
+                .media_readiness_operation(operation_id)
+                .unwrap()
+                .unwrap()
+                .drive_serial
+                .as_deref(),
+            Some("DRV-UA-test")
+        );
+        assert!(catalog
+            .list_drives(true, true)
+            .unwrap()
+            .iter()
+            .any(|drive| drive.serial.as_deref() == Some("DRV-UA-test")));
+    }
+
+    /// Tape init observes through `TapeInitStateOps::observe_library_drives`; an owner naming the
+    /// drive is refused before it and accepted after it.
+    #[test]
+    fn tape_init_state_observes_the_librarys_drives_before_an_owner_names_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, mut state) = runtime_backed_state(temp.path());
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        let owner = || remanence_state::MediaReadinessOperationInput {
+            operation_id: Uuid::new_v4(),
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB-A".to_string(), 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("DRV-UA-test".to_string()),
+            barcode: Some("AOX030L9".to_string()),
+            source_slot: None,
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "planned".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        };
+        let refused = state
+            .write_handle()
+            .begin_typed_media_readiness_operation(owner())
+            .expect_err("an unobserved drive has no source identity");
+        assert!(
+            refused.to_string().contains("no matching source identity"),
+            "{refused}"
+        );
+        state
+            .observe_library_drives(&library, &config)
+            .expect("observe the library's drives");
+        state
+            .write_handle()
+            .begin_typed_media_readiness_operation(owner())
+            .expect("the observed drive is accepted");
+    }
+
+    /// A readiness owner on `lto9_loaded_test_library`'s drive.
+    fn lto9_library_owner(operation_id: Uuid) -> remanence_state::MediaReadinessOperationInput {
+        remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB-A".to_string(), 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("DRV-UA-test".to_string()),
+            barcode: Some("AOX030L9".to_string()),
+            source_slot: None,
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "readiness_poll".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        }
+    }
+
+    /// Tape init begins its owner through `TapeInitStateOps::record_media_readiness_operation`,
+    /// which under the typed runtime mints the operation and returns it: the proposed id is not
+    /// the record's, and the returned one is.
+    #[test]
+    fn tape_init_state_mints_the_readiness_operation_it_returns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, mut state) = runtime_backed_state(temp.path());
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        state
+            .observe_library_drives(&library, &config)
+            .expect("observe the library's drives");
+        let proposed = Uuid::new_v4();
+        let minted = state
+            .record_media_readiness_operation(lto9_library_owner(proposed))
+            .expect("the typed runtime accepts an owner it mints");
+        assert_ne!(minted, proposed);
+        let catalog = state.write_handle();
+        assert!(catalog.media_readiness_operation(minted).unwrap().is_some());
+        assert!(catalog
+            .media_readiness_operation(proposed)
+            .unwrap()
+            .is_none());
+        // Later records carry the returned id.
+        state
+            .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+                completion_evidence: None,
+                operation_id: minted,
+                phase: Some("before_open_library".to_string()),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                last_cdb_opcode: None,
+                last_sense_raw: None,
+                last_sense_key: None,
+                last_asc: None,
+                last_ascq: None,
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: None,
+            })
+            .expect("a transition on the minted operation");
+    }
+
+    /// A wait-ready without `--wait` has no deadline and still begins its owner through the
+    /// minting entry the typed runtime accepts.
+    #[test]
+    fn tape_wait_ready_without_wait_mints_a_no_deadline_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, state) = runtime_backed_state(temp.path());
+        let mut catalog = state.write_handle();
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        let args = TapeWaitReadyArgs {
+            endpoint: None,
+            resume: None,
+            barcode: Some("AOX030L9".to_string()),
+            drive_element: None,
+            already_loaded: false,
+            wait: false,
+            timeout: StdDuration::from_secs(1),
+            poll: StdDuration::ZERO,
+            config: temp.path().join("config.toml"),
+            library: Some("LIB-A".to_string()),
+            json: false,
+        };
+        let (operation_id, _, _) =
+            resolve_wait_ready_operation(&library, &args, &config, &mut catalog)
+                .expect("a no-wait owner is accepted");
+        let row = catalog
+            .media_readiness_operation(operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deadline_at_utc, None);
+        assert_eq!(row.drive_serial.as_deref(), Some("DRV-UA-test"));
+    }
+
+    /// The CLI's signal abort, through the production recorder on a runtime-backed state: the
+    /// transition (a `transport_class` with no completion evidence, the signal, a detail and
+    /// `cancel_source: signal`) is recorded, not refused, and fences the operation.
+    #[test]
+    fn a_signal_abort_is_recorded_under_the_typed_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, mut state) = runtime_backed_state(temp.path());
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        state
+            .observe_library_drives(&library, &config)
+            .expect("observe the library's drives");
+        let operation_id = state
+            .record_media_readiness_operation(lto9_library_owner(Uuid::new_v4()))
+            .expect("owner");
+        let err = record_media_readiness_signal_if_requested(
+            &mut state,
+            operation_id,
+            "readiness_poll",
+            || Some("SIGTERM"),
+        )
+        .expect_err("a signal aborts the readiness flow");
+        assert!(media_readiness_error_is_signal_abort(&err), "{err}");
+        let row = state
+            .write_handle()
+            .media_readiness_operation(operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "aborted_unknown");
+        assert_eq!(row.dirty_scope.as_deref(), Some("drive+tape"));
+        assert_eq!(row.cancel_source, None, "`signal` has no typed key");
+        assert_eq!(
+            row.quarantine_id.as_deref(),
+            Some(format!("mrq-{operation_id}").as_str())
+        );
+    }
+
+    /// The first TEST UNIT READY of tape init (`pre_load_tur` for a slot, `already_loaded_tur` for
+    /// a loaded tape) is a real probe of the drive, recorded by
+    /// `poll_already_observed_media_readiness`: under the typed runtime its Ready is accepted on
+    /// either phase and the projection shows the phase and TEST UNIT READY's opcode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_first_tur_of_tape_init_is_recorded_as_ready_under_the_typed_runtime() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, mut state) = runtime_backed_state(temp.path());
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-A",
+            0x0100,
+            "DRV-UA-test",
+            0x0400,
+            1,
+        )));
+        let library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(0x0100, "AOX030L9", Some(0x0400), VirtualTape::default());
+            world.library_snapshot()
+        };
+        let factory_world = Arc::clone(&world);
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world
+                    .lock()
+                    .unwrap()
+                    .role_for_path(path)
+                    .expect("model path");
+                Ok(Box::new(ModelTransport::new(
+                    Arc::clone(&factory_world),
+                    role,
+                )))
+            }));
+        });
+        let policy = StaticAllowlist::new(["LIB-A"]);
+        let mut handle = open_library_handle(&library, &policy).expect("open the model library");
+        let mut drive = handle.open_drive(0x0100, &policy).expect("open the drive");
+        state
+            .observe_library_drives(&library, &config)
+            .expect("observe the library's drives");
+        for phase in ["pre_load_tur", "already_loaded_tur"] {
+            let operation_id = state
+                .record_media_readiness_operation(lto9_library_owner(Uuid::new_v4()))
+                .expect("owner");
+            let readiness = drive.probe_media_readiness(MediaFamily::Lto9OrLater);
+            assert!(readiness.is_ready(), "the model drive is ready");
+            poll_already_observed_media_readiness(readiness, phase, operation_id, &mut state)
+                .unwrap_or_else(|e| panic!("a Ready on {phase} is refused: {e}"));
+            let row = state
+                .write_handle()
+                .media_readiness_operation(operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "ready", "{phase}");
+            assert_eq!(row.phase, phase);
+            assert_eq!(row.last_cdb_opcode, Some(0), "{phase}");
+        }
+    }
+
+    /// The command phases tape init records with an opcode, through its production recorders on a
+    /// runtime-backed state: MOVE MEDIUM's write-ahead and failure, the conditional immediate
+    /// LOAD's failure, and the two rewinds' failures.
+    #[test]
+    fn the_command_phases_of_tape_init_are_recorded_under_the_typed_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (config, mut state) = runtime_backed_state(temp.path());
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        state
+            .observe_library_drives(&library, &config)
+            .expect("observe the library's drives");
+        let begin = |state: &mut remanence_state::StateHandle| {
+            state
+                .record_media_readiness_operation(lto9_library_owner(Uuid::new_v4()))
+                .expect("owner")
+        };
+        let row = |state: &remanence_state::StateHandle, id: Uuid| {
+            state
+                .write_handle()
+                .media_readiness_operation(id)
+                .unwrap()
+                .unwrap()
+        };
+
+        let id = begin(&mut state);
+        state
+            .record_media_readiness_transition(media_readiness_mechanical_transition(
+                id,
+                "move_medium",
+                "pre_ready_loading",
+                Some(0xa5),
+                None,
+            ))
+            .expect("the MOVE MEDIUM write-ahead");
+        assert_eq!(row(&state, id).phase, "move_medium");
+        assert_eq!(
+            record_media_readiness_signal_or_mechanical_failure(
+                &mut state,
+                id,
+                "move_medium",
+                "transport_unknown",
+                Some(0xa5),
+                "move failed",
+                None,
+            ),
+            Ok(None)
+        );
+        assert_eq!(row(&state, id).state, "transport_unknown");
+
+        let id = begin(&mut state);
+        assert_eq!(
+            record_media_readiness_signal_or_mechanical_failure(
+                &mut state,
+                id,
+                "conditional_immediate_load",
+                "transport_unknown",
+                Some(0x1b),
+                "immediate load failed",
+                None,
+            ),
+            Ok(None)
+        );
+        assert_eq!(row(&state, id).phase, "conditional_immediate_load");
+
+        for (phase, completion, expected) in [
+            (
+                "rewind_before_bot_read",
+                remanence_library::outcome::Completion::Unknown,
+                "transport_unknown",
+            ),
+            (
+                "rewind_before_bootstrap_write",
+                remanence_library::outcome::Completion::Known,
+                "terminal_error",
+            ),
+        ] {
+            let id = begin(&mut state);
+            assert_eq!(
+                record_media_readiness_signal_or_command_failure(
+                    &mut state,
+                    id,
+                    phase,
+                    Some(0x01),
+                    "rewind failed",
+                    completion,
+                    None,
+                ),
+                Ok(None)
+            );
+            let recorded = row(&state, id);
+            assert_eq!(
+                (recorded.phase.as_str(), recorded.state.as_str()),
+                (phase, expected)
+            );
+        }
     }
 
     #[test]
@@ -20796,8 +21243,13 @@ mod tests {
             json: false,
         };
 
-        let err = resolve_wait_ready_operation(&library, &args, &mut index)
-            .expect_err("new wait-ready must refuse an active fence");
+        let err = resolve_wait_ready_operation(
+            &library,
+            &args,
+            &tape_init_config_with_pool(4096),
+            &mut index,
+        )
+        .expect_err("new wait-ready must refuse an active fence");
 
         assert!(err.contains("active media-readiness operation"), "{err}");
         assert!(err.contains(&operation_id.to_string()), "{err}");

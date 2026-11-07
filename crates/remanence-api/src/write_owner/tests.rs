@@ -1889,6 +1889,221 @@ fn load_wait_absorbs_only_retryable_drive_completions() {
     assert!(retryable_readiness_from_load_error(&medium_error, MediaFamily::Lto9OrLater).is_none());
 }
 
+/// A runtime-backed state under `root`, for the typed readiness paths.
+fn runtime_backed_catalog(
+    root: &Path,
+) -> (
+    remanence_state::library_runtime::LibraryRuntime,
+    remanence_state::projector::ProjectionClient,
+) {
+    use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
+    let paths = StatePaths {
+        config_path: root.join("config"),
+        state_dir: root.join("state"),
+        audit_dir: root.join("library"),
+        journal_dir: root.join("native"),
+        sqlite_path: root.join("catalog.sqlite"),
+        tape_cache_dir: root.join("cache"),
+        calibration_dir: root.join("calibration"),
+    };
+    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime.clone());
+    (runtime, catalog)
+}
+
+/// The completion of a drive LOAD that a retryable CHECK CONDITION ends is recorded by the
+/// production helper under `load_drive_completion` with the LOAD's opcode, and the typed
+/// runtime accepts it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_retryable_load_completion_is_recorded_with_the_load_opcode() {
+    let root = tempfile::tempdir().unwrap();
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    let operation_id = Uuid::from_bytes(
+        runtime
+            .start_owned_operation(
+                remanence_state::library_log::OperationKind::MediaReadinessWait,
+                remanence_state::AuditActor::System,
+            )
+            .unwrap(),
+    );
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB-LOAD", 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: Some("LOAD01L9".to_string()),
+            source_slot: Some(0x0400),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "load_drive_readiness".to_string(),
+            state: "planned".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    let error = LoadError::DriveLoad(remanence_library::DriveOpError::new(
+        remanence_library::DriveOpErrorKind::ScsiError(
+            remanence_library::ScsiError::CheckCondition {
+                sense: readiness_fixed_sense(0x02, 0x04, 0x01),
+                bytes_transferred: 0,
+            },
+        ),
+    ));
+    let readiness = retryable_readiness_from_load_error(&error, MediaFamily::Lto9OrLater)
+        .expect("a becoming-ready LOAD completion is retryable");
+    record_session_open_readiness_poll_transition(
+        &mut index,
+        operation_id,
+        "load_drive_completion",
+        &readiness,
+        false,
+    )
+    .expect("the typed runtime accepts the LOAD's completion");
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.phase, "load_drive_completion");
+    assert_eq!(row.last_cdb_opcode, Some(0x1b));
+}
+
+/// The daemon's LOAD phases that carry an opcode, through their production recorders on a
+/// runtime-backed state: the session-open immediate LOAD's command fence, and the initializing
+/// LOAD's failure (as the readiness wait and startup record it).
+#[test]
+fn the_daemons_load_phases_are_recorded_under_the_typed_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    let begin = |index: &mut CatalogIndex| {
+        let operation_id = Uuid::from_bytes(
+            runtime
+                .start_owned_operation(
+                    remanence_state::library_log::OperationKind::MediaReadinessWait,
+                    remanence_state::AuditActor::System,
+                )
+                .unwrap(),
+        );
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("LIB-LOAD", 0x0100),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: None,
+                barcode: Some("LOAD01L9".to_string()),
+                source_slot: Some(0x0400),
+                media_generation: Some(9),
+                media_family: Some(remanence_state::LtoGen::Lto9),
+                phase: "session_open_short_probe".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        operation_id
+    };
+
+    let id = begin(&mut index);
+    record_session_open_mechanical_transition(
+        &mut index,
+        id,
+        "session_open_immediate_load",
+        "transport_unknown",
+        Some(0x1b),
+        Some("drive LOAD IMMED failed".to_string()),
+    )
+    .expect("the session-open LOAD fence is accepted");
+    let row = index.media_readiness_operation(id).unwrap().unwrap();
+    assert_eq!(row.phase, "session_open_immediate_load");
+    assert_eq!(row.state, "transport_unknown");
+
+    let id = begin(&mut index);
+    let failure = remanence_library::MediaReadiness::new(
+        remanence_library::MediaReadinessKind::TransportUnknown {
+            detail: "DID_TIME_OUT".to_string(),
+        },
+    );
+    index
+        .record_media_readiness_transition(
+            crate::startup_media_readiness::media_readiness_initializing_load_failed_transition(
+                id,
+                &failure,
+                "LOAD failed",
+            ),
+        )
+        .expect("the initializing LOAD's failure is accepted");
+    let row = index.media_readiness_operation(id).unwrap().unwrap();
+    assert_eq!(row.phase, "initializing_command_load");
+    assert_eq!(row.state, "transport_unknown");
+}
+
+/// Startup reconciliation of an owner it cannot reverify records its unresolved transition (a
+/// `transport_class` with no completion evidence) through the typed runtime, attributed to
+/// startup reconciliation.
+#[test]
+fn startup_records_an_unresolved_readiness_owner_under_the_typed_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    let operation_id = Uuid::from_bytes(
+        runtime
+            .start_owned_operation(
+                remanence_state::library_log::OperationKind::MediaReadinessWait,
+                remanence_state::AuditActor::System,
+            )
+            .unwrap(),
+    );
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB-SOURCE", 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: Some("UNT001L9".to_string()),
+            source_slot: Some(0x0400),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "readiness_poll".to_string(),
+            state: "becoming_ready".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    let (_, library) = unthreaded_cartridge_world("LIB-SOURCE");
+    let reconciled = crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
+        &mut index,
+        library.library(),
+        &mut [],
+    )
+    .expect("the unresolved owner is recorded, not refused");
+    assert_eq!(reconciled, 1);
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "aborted_unknown");
+    assert_eq!(row.cancel_source.as_deref(), Some("startup_reconcile"));
+    assert_eq!(
+        row.quarantine_id.as_deref(),
+        Some(format!("mrq-{operation_id}").as_str())
+    );
+}
+
 /// The abort reason is the caller's only account of why a session died,
 /// and until now the server read it off the request and dropped it. It now
 /// reaches the session audit record -- and an abort with no reason leaves
