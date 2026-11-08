@@ -273,6 +273,10 @@ pub struct LibraryHandle {
     /// `'static` bound (see [`TransportFactory`]) so the handle owns
     /// it outright.
     transport_factory: TransportFactory,
+    /// Readiness-owned LOADs that [`Self::load_with_admission`] completed on a
+    /// drive handle it then dropped, keyed by bay. The next drive handle opened
+    /// for that bay takes them, so the readiness poll on it can close them.
+    handed_off_motion: std::collections::HashMap<u16, Vec<crate::motion::PendingMotion>>,
 }
 
 /// Snapshot-dirty state shared between a library handle and its open
@@ -1492,7 +1496,10 @@ impl LibraryHandle {
         };
         Ok(DriveHandle {
             motion_context: self.changer.motion_context.clone(),
-            pending_motion: Vec::new(),
+            pending_motion: self
+                .handed_off_motion
+                .remove(&bay_address)
+                .unwrap_or_default(),
             endpoint: MountEndpoint::Durable(DriveKey::Bay {
                 library_serial,
                 bay: bay_address,
@@ -1606,6 +1613,15 @@ impl LibraryHandle {
         let result = match self.open_drive(bay, policy) {
             Ok(mut drive) => {
                 let result = drive.load_as(op);
+                if result.is_ok() {
+                    let pending = drive.take_pending_motion();
+                    if !pending.is_empty() {
+                        self.handed_off_motion
+                            .entry(bay)
+                            .or_default()
+                            .extend(pending);
+                    }
+                }
                 let semantic_refusal=result.as_ref().err().is_some_and(|error|matches!(&error.kind,
                     crate::DriveOpErrorKind::MotionAuthority(error) if error.kind==crate::motion::MotionAuthorityFailure::SemanticRefusal));
                 if semantic_refusal {
@@ -3252,6 +3268,7 @@ impl Library {
         Ok(LibraryHandle {
             changer,
             transport_factory: Box::new(transport_for),
+            handed_off_motion: std::collections::HashMap::new(),
         })
     }
 }

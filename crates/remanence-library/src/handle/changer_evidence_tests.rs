@@ -653,3 +653,92 @@ fn typed_motion_confirmation_failure_never_repeats_move() {
     assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0xa5).count(), 1);
     assert!(handle.changer_mut().take_pending_motion().is_empty());
 }
+
+/// PFD4: a readiness-owned LOAD completed by `load_with_admission` is carried to the next
+/// drive handle opened for that bay, once, and to no other bay.
+#[test]
+fn readiness_owned_load_is_handed_to_the_next_drive_handle_of_that_bay() {
+    use crate::motion::*;
+    struct Authority;
+    impl MotionAuthority for Authority {
+        fn intent(
+            &self,
+            _: &MotionCommand,
+            _: &MotionContext,
+        ) -> Result<MotionTicket, MotionAuthorityError> {
+            Ok(MotionTicket {
+                sequence: 1,
+                record_uuid: [1; 16],
+            })
+        }
+        fn failed(
+            &self,
+            _: MotionTicket,
+            _: &crate::outcome::CompletionEvidence,
+        ) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+        fn unconfirmed(&self, _: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+        fn confirm_inventory(
+            &self,
+            _: &PendingMotion,
+            _: &Library,
+        ) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+        fn confirm_readiness(
+            &self,
+            _: &PendingMotion,
+            _: &crate::MediaReadiness,
+            _: Duration,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("the handoff only moves the pending LOAD; the composer closes it");
+        }
+        fn confirm_standalone(&self, _: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            panic!("changer test");
+        }
+        fn ensure_motion_allowed(&self) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+    }
+    const OTHER_BAY: u16 = 0x101;
+    let mut library = composed_test_lib(SERIAL);
+    library.layout.drive_count = 2;
+    let mut second = library.drive_bays[0].clone();
+    second.element_address = OTHER_BAY;
+    second.installed.as_mut().unwrap().sg_path =
+        Some(std::path::PathBuf::from("/dev/sg-drive-mock-b"));
+    library.drive_bays.push(second);
+    let factory = |path: &Path| -> Result<Box<dyn SgTransport>, IoErrorKind> {
+        let responses = if path == Path::new("/dev/sg-mock") {
+            open_script(SERIAL)
+        } else {
+            drive_script()
+        };
+        Ok(Box::new(FixtureTransport::new().with_responses(responses)))
+    };
+    let mut handle = library
+        .open_with(&policy(), with_inventory(&library, factory))
+        .unwrap();
+    handle.set_motion_authority(Arc::new(Authority));
+    let context = MotionContext {
+        parent_operation: Some([7; 16]),
+        load_confirmation: LoadConfirmation::Readiness,
+        ..Default::default()
+    };
+    handle
+        .with_motion_context(context.clone(), |handle| handle.load(SLOT, BAY, &policy()))
+        .unwrap();
+
+    let mut other = handle.open_drive(OTHER_BAY, &policy()).unwrap();
+    assert!(other.take_pending_motion().is_empty());
+    let mut loaded = handle.open_drive(BAY, &policy()).unwrap();
+    let pending = loaded.take_pending_motion();
+    assert_eq!(pending.len(), 1);
+    assert!(matches!(pending[0].command, MotionCommand::Load(_)));
+    assert_eq!(pending[0].context, context);
+    let mut again = handle.open_drive(BAY, &policy()).unwrap();
+    assert!(again.take_pending_motion().is_empty());
+}

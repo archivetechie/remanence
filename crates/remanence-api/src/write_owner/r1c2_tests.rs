@@ -692,3 +692,167 @@ fn restart_reconciles_an_open_or_unknown_load_before_it_can_admit_a_write() {
         "{refused}"
     );
 }
+
+// ---------------------------------------------------------------------------
+//  Decision R1c-4: a waited LoadDrive closes its own LOAD intent
+// ---------------------------------------------------------------------------
+
+/// Run the daemon's `LoadDrive` with `wait_ready = true` over the typed runtime and the model
+/// world, to Ready. The library and the config stay alive for the caller.
+fn waited_load(
+    root: &Root,
+    world: &Arc<Mutex<VirtualWorld>>,
+) -> (
+    remanence_state::StateHandle,
+    WriteOwnerConfig,
+    remanence_library::LibraryHandle,
+) {
+    let state = root.open();
+    let mut index = state.write_handle();
+    let mut library = open_model_library(world.clone());
+    // The daemon observes its drives before it serves; the readiness row names the drive
+    // serial this records.
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from([SERIAL.to_string()]),
+    )
+    .unwrap();
+    let mut cfg = test_write_owner_config(
+        root.paths.sqlite_path.clone(),
+        root.paths.audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.catalog = state.projection_client();
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
+    let api = crate::ApiState::new(state.projection_client());
+    let operation = api
+        .accept_owner_request(
+            AuditActor::User("loader".into()),
+            "load_drive",
+            "library",
+            SERIAL.into(),
+            [0x33; 32],
+        )
+        .unwrap();
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation, "load_drive");
+    cfg.configure_operation_library(&mut library, &handle);
+    super::robotics::run_load_sequence(&mut index, &cfg, &handle, &mut library, 0x400, BAY_A, true)
+        .unwrap();
+    (state, cfg, library)
+}
+
+fn waited_world() -> Arc<Mutex<VirtualWorld>> {
+    let mut model = VirtualWorld::single_drive(SERIAL, BAY_A, "DRV-R1C2", 0x400, 1);
+    model.put_tape_in_slot(0x400, "R1C2L01L9", VirtualTape::default());
+    Arc::new(Mutex::new(model))
+}
+
+/// A waited `LoadDrive` that reaches Ready closes its readiness-owned LOAD: the endpoint has
+/// nothing unresolved, every MotionIntent in the library log has a MotionOutcome, and the UNLOAD
+/// the robotics executor runs next (the same call and context as its Unload arm) is admitted
+/// and succeeds.
+#[test]
+fn waited_load_drive_closes_its_load_intent_and_the_unload_is_admitted() {
+    let root = root();
+    let world = waited_world();
+    let library_uuid;
+    {
+        let (state, cfg, mut library) = waited_load(&root, &world);
+        let runtime = state.library_runtime();
+        library_uuid = runtime.manifest().library_uuid();
+        assert!(
+            !runtime.endpoint_motion_unresolved(&key(BAY_A)),
+            "the waited LOAD is closed once the drive is Ready"
+        );
+        assert_eq!(drive_load_commands_on(&world, BAY_A), 1);
+
+        let unload_operation = uuid::Uuid::from_bytes([0x34; 16]);
+        let outcome = library
+            .with_motion_context(
+                remanence_library::motion::MotionContext {
+                    parent_operation: Some(*unload_operation.as_bytes()),
+                    ..Default::default()
+                },
+                |library| {
+                    crate::mount_support::unload_library_bay_with_admission(
+                        library,
+                        BAY_A,
+                        None,
+                        &cfg.policy,
+                        None,
+                        std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+                        &mut || Ok(()),
+                    )
+                },
+            )
+            .unwrap_or_else(|error| panic!("the UNLOAD after a waited LOAD was refused: {error}"));
+        assert!(matches!(
+            outcome,
+            crate::mount_support::UnloadOutcome::Unloaded
+        ));
+        assert!(!runtime.endpoint_motion_unresolved(&key(BAY_A)));
+    }
+    // Every MotionIntent has a MotionOutcome. The log is locked while the runtime lives, so
+    // read it back once the state is gone.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (intents, outcomes) = loop {
+        match crate::tests::read_library_records(&root.paths, library_uuid, &mut |record| {
+            if let Some(intent) = record.motion_intent() {
+                return Some((
+                    Some((record.envelope.record_uuid, intent.motion.clone())),
+                    None,
+                ));
+            }
+            record
+                .motion_outcome()
+                .map(|outcome| (None, Some(outcome.intent.record_uuid)))
+        }) {
+            Ok(records) => {
+                let intents: Vec<_> = records.iter().filter_map(|r| r.0.clone()).collect();
+                let outcomes: Vec<_> = records.iter().filter_map(|r| r.1).collect();
+                break (intents, outcomes);
+            }
+            Err(crate::tests::ChainRead::Busy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(crate::tests::ChainRead::Busy(errno)) => {
+                panic!("library log still locked: {errno}")
+            }
+            Err(crate::tests::ChainRead::Failed(message)) => panic!("{message}"),
+        }
+    };
+    assert!(
+        intents.len() >= 4,
+        "MOVE and LOAD, then UNLOAD and MOVE: {intents:?}"
+    );
+    for (uuid, motion) in &intents {
+        assert!(
+            outcomes.contains(uuid),
+            "MotionIntent {motion:?} has no MotionOutcome"
+        );
+    }
+}
+
+/// After a waited LOAD, the endpoint's own R1c-3 predicate sees nothing unresolved, so a write
+/// admission on the bay is admitted.
+#[test]
+fn waited_load_drive_leaves_the_bay_admissible_for_a_write() {
+    let root = root();
+    let world = waited_world();
+    let (state, _cfg, _library) = waited_load(&root, &world);
+    let runtime = state.library_runtime();
+    let index = state.write_handle();
+    crate::startup_media_readiness::ensure_media_readiness_admitted(
+        &index,
+        Some(&runtime),
+        "open session",
+        SERIAL,
+        Some(BAY_A),
+        None,
+        false,
+    )
+    .unwrap_or_else(|error| panic!("write admission refused: {}", error.message()));
+}
