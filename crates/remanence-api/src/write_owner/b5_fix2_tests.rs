@@ -66,7 +66,7 @@ impl SgTransport for CleaningStopTransport {
 
 /// Exercise the real shutdown waiter while the manual cleaning worker owns MOVE.
 async fn cleaning_shutdown(before_unload: bool) {
-    let temp = tempfile::tempdir().unwrap();
+    let typed = crate::tests::TypedRoot::open();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-CLEAN-STOP",
         0x100,
@@ -94,10 +94,7 @@ async fn cleaning_shutdown(before_unload: bool) {
     let unloads = Arc::new(AtomicU64::new(0));
     let snapshot = world.lock().unwrap().library_snapshot();
     let library = open_model_library(world.clone());
-    let index_path = temp.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let mut index = typed.catalog().write_handle();
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-CLEAN-STOP".into(),
@@ -112,13 +109,11 @@ async fn cleaning_shutdown(before_unload: bool) {
         })
         .unwrap()
         .drive_uuid;
-    let mut cfg = test_write_owner_config(
-        index_path.clone(),
-        temp.path().join("audit"),
+    let mut cfg = test_typed_write_owner_config(
+        &typed,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    std::fs::create_dir_all(&cfg.fixture_audit().audit_dir).unwrap();
     cfg.cleaning.min_cycle_duration = "0s".into();
     cfg.lifecycle = Some(lifecycle.clone());
     let board = crate::live_status::ChangerWaitBoard::default();
@@ -133,7 +128,7 @@ async fn cleaning_shutdown(before_unload: bool) {
         Arc::new(HashMap::new()),
         lifecycle.clone(),
     );
-    let mut api = crate::ApiState::new(remanence_state::projector::open(&index_path).unwrap());
+    let mut api = crate::ApiState::new(typed.catalog());
     api.drive_pool = Some(pool.clone());
     let cleaning_world = world.clone();
     let cleaning_unloads = unloads.clone();
@@ -154,6 +149,7 @@ async fn cleaning_shutdown(before_unload: bool) {
         library.set_changer_ready_wait(cfg.changer_ready_wait.clone());
         let registry = crate::operations::OperationRegistry::default();
         let handle = registry.register(Uuid::new_v4(), "cleaning");
+        cfg.configure_operation_library(&mut library, &handle);
         run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive_uuid, "now")
     });
     if before_unload {

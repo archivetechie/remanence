@@ -54,9 +54,10 @@ serial = "POOL-WRITE-LIBRARY"
         root.path().display()
     );
     std::fs::write(&config_path, text).unwrap();
-    let state = StateHandle::open_from_config_file(&config_path).unwrap();
+    let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+    // The state's own funnel records the tape's Reprovision identity in the library log, which
+    // the runtime's session and fence records require; the catalog handle's call writes SQL only.
     state
-        .write_handle()
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: TAPE,
             voltag: "POOL001L9".into(),
@@ -365,41 +366,26 @@ impl Fixture {
     }
 }
 
-/// A daemon's legacy bay columns derive endpoint_key in the schema trigger.
+/// A daemon's open bay session, published through the library runtime, blocks an archive write.
 #[test]
 fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing() {
+    use remanence_state::library_log as lib;
     let fixture = fixture();
-    let mut state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
+    let state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
     let session_id = uuid::Uuid::new_v4();
-    remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
-        .unwrap()
-        .append(remanence_state::AuditEventRecord {
-            actor: remanence_state::AuditActor::System,
-            source_layer: remanence_state::SourceLayer::Layer5,
-            operation_id: None,
-            session_id: Some(session_id),
-            idempotency_key: None,
-            event: remanence_state::AuditEvent::SessionOpened,
-            subject: remanence_state::AuditSubject {
-                kind: "session".into(),
-                id: Some(session_id.to_string()),
-            },
-            detail: [
-                ("session_kind".into(), ciborium::Value::Text("write".into())),
-                ("tape_uuid".into(), ciborium::Value::Bytes(TAPE.to_vec())),
-                (
-                    "library_serial".into(),
-                    ciborium::Value::Text(LIBRARY.into()),
-                ),
-                (
-                    "drive_bay".into(),
-                    ciborium::Value::Integer(u64::from(BAY).into()),
-                ),
-            ]
-            .into(),
-        })
+    state
+        .library_runtime()
+        .observe_session(
+            *session_id.as_bytes(),
+            lib::SessionKind::Operation,
+            Some(&remanence_library::DriveKey::new(LIBRARY, BAY)),
+            Some(TAPE),
+            lib::SessionEvent::Opened,
+            None,
+            remanence_state::AuditActor::System,
+            (None, None),
+        )
         .unwrap();
-    state.replay_audit_projection().unwrap();
     let before = state.catalog().non_terminal_sessions().unwrap();
     assert_eq!(
         before[0].drive_key,
@@ -426,12 +412,27 @@ fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing(
             Some(&remanence_library::DriveKey::new(LIBRARY, BAY))
         )
         .unwrap());
-    let records = remanence_state::FileAuditLog::replay(fixture.root.path().join("audit")).unwrap();
-    assert!(!records.iter().any(|r| matches!(
-        r.event,
-        remanence_state::AuditEvent::SessionOrphaned
-            | remanence_state::AuditEvent::TapeIoFenceRaised
-    )));
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    drop(state);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut fences = 0;
+    let mut sessions = 0;
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+        match record.record().tag() {
+            lib::Tag::FenceRaised => fences += 1,
+            lib::Tag::SessionObserved => sessions += 1,
+            _ => {}
+        }
+        Ok(())
+    })
+    .unwrap();
+    // The seeded `Opened` is the log's only session record: nothing orphaned or closed it.
+    assert_eq!((fences, sessions), (0, 1));
     assert!(!fixture
         .world
         .lock()
@@ -616,7 +617,6 @@ fn typed_write_error_keeps_appended_fence_abandonment_and_checkpoint_context() {
         leading
     );
 }
-use remanence_state::AuditSink as _;
 
 // ---------------------------------------------------------------------------
 //  Decisions R1c-2 and R1c-3 on the production path

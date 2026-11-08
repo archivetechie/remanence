@@ -693,18 +693,25 @@ fn run_cell(
 ) {
     let (mut drive, commands, _admission) = open_cell(command, completion, path);
     let _context = drive.scoped_outcome_context(context(path, command));
-    let root = tempfile::tempdir().unwrap();
-    let index_path = root.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[([93; 16], "MATRIX93L9")]);
+    // The readiness cells record an operation naming a drive serial, which the typed runtime
+    // accepts only for a drive its library log has observed; `TypedRoot` observes none. Those
+    // cells touch no fence and no tape, so they keep a plain catalog (the readiness rows are
+    // SQL-only in this test); every other cell runs over the typed root.
+    let legacy_root = tempfile::tempdir().unwrap();
+    let mut index = if path == PathKind::Readiness {
+        remanence_state::projector::open(legacy_root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap()
+    } else {
+        typed.catalog().write_handle()
+    };
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C9", 0x100, "C9D", 0x400, 1,
     )));
     let library = open_model_library(world);
-    let mut cfg = test_write_owner_config(
-        index_path,
-        root.path().join("audit"),
+    let mut cfg = test_typed_write_owner_config(
+        &typed,
         &library,
         library_snapshot_cell(library.library().clone()),
     );

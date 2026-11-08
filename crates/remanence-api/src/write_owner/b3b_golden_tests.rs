@@ -90,14 +90,8 @@ fn bootstrap(fault: Fault) -> (String, String) {
 fn bootstrap_with_fence_count(fault: Fault, expected_fences: usize) -> (String, String) {
     const BLOCK_SIZE: u32 = 256 * 1024;
 
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-fresh-parity-bootstrap-fence-")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open test index");
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[([0x46; 16], "PARITY1L9")]);
+    let mut index = typed.catalog().write_handle();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-FRESH-PARITY-FENCE",
         0x0100,
@@ -141,13 +135,7 @@ fn bootstrap_with_fence_count(fault: Fault, expected_fences: usize) -> (String, 
         })
         .expect("open model library");
     let snapshot = library_snapshot_cell(library.library().clone());
-    let audit_dir = temp.path().join("audit");
-    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-    let mut cfg = test_write_owner_config(index_path, audit_dir.clone(), &library, snapshot);
-    cfg.checkpoint_journal_dir = temp.path().join("journals/tapes");
-    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
-    std::fs::create_dir_all(cfg.checkpoint_journal_dir.parent().expect("journal parent"))
-        .expect("create journal parent");
+    let cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let tape_uuid = [0x46; 16];
     let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
     let selected = SelectedTape {

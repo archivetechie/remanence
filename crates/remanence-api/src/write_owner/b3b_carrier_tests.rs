@@ -205,19 +205,14 @@ fn b3b_preparation_renderer_census() {
 /// The parity fence helper persists the WRITE's carried cause without classifying or decoding it.
 #[test]
 fn b3b_fence_consumer_census() {
-    let root = tempfile::tempdir().unwrap();
-    let index_path = root.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[([93; 16], "CENSUS93L9")]);
+    let mut index = typed.catalog().write_handle();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C6", 0x100, "C6D", 0x400, 1,
     )));
     let library = open_model_library(world);
     let snapshot = library_snapshot_cell(library.library().clone());
-    let audit = root.path().join("audit");
-    std::fs::create_dir(&audit).unwrap();
-    let cfg = test_write_owner_config(index_path, audit, &library, snapshot);
+    let cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let selected = SelectedTape {
         standalone_endpoint: None,
         pool_id: "c6".into(),
@@ -252,15 +247,11 @@ fn b3b_fence_consumer_census() {
 fn b3b_scoped_admission_fence_uses_classified_cause() {
     use crate::append_admission::{AdmissionError, AdmissionErrorKind};
     for scoped in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("state.sqlite");
-        let mut index = remanence_state::projector::open(&path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
+        let typed = crate::tests::TypedRoot::open_with_tapes(&[([93; 16], "SCOPED93L9")]);
+        let mut index = typed.catalog().write_handle();
         let (_, library) = unthreaded_cartridge_world("B3B-SCOPED");
-        let cfg = test_write_owner_config(
-            path,
-            root.path().join("audit"),
+        let cfg = test_typed_write_owner_config(
+            &typed,
             &library,
             library_snapshot_cell(library.library().clone()),
         );
@@ -290,7 +281,7 @@ fn b3b_scoped_admission_fence_uses_classified_cause() {
         assert_eq!(counters(), (before.0 + u64::from(!scoped), before.1));
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
-        assert_eq!(fences[0].reason, "SessionSuffixContradiction");
+        assert_eq!(fences[0].reason, "session_suffix_contradiction");
     }
 }
 
@@ -438,6 +429,18 @@ fn b3b_mounted_write_failure_raises_one_fence() {
     mounted_message_failure("transport lost after earlier good writes");
 }
 
+/// The `FenceRaised` records the library log holds, read after every holder of the runtime is dropped.
+fn fence_raised_records(typed: &mut crate::tests::TypedRoot) -> usize {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(typed.records(|record| {
+            (record.tag() == remanence_state::library_log::Tag::FenceRaised).then_some(())
+        }))
+        .len()
+}
+
 /// Exercise a mounted operation without a durable named-tail ending and return its stored policy and retry.
 fn mounted_message_failure(
     message: &'static str,
@@ -446,18 +449,14 @@ fn mounted_message_failure(
     String,
     String,
 ) {
-    let root = tempfile::tempdir().unwrap();
-    let index_path = root.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let mut typed = crate::tests::TypedRoot::open_with_tapes(&[([95; 16], "MSGFAIL95L9")]);
+    let mut index = typed.catalog().write_handle();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C7", 0x100, "C7D", 0x400, 1,
     )));
     let library = open_model_library(world);
     let snapshot = library_snapshot_cell(library.library().clone());
-    let mut cfg =
-        test_write_owner_config(index_path, root.path().join("audit"), &library, snapshot);
+    let mut cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let (mut drive, commands) = drive_with_failure(10, 2, Some(message));
     cfg.placement =
         crate::write_owner::ActorPlacement::Mounted(crate::write_owner::MountedDriveContext {
@@ -496,25 +495,18 @@ fn mounted_message_failure(
     let fences = index.list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "transfer_error");
-    let records = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).unwrap();
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| r.event == AuditEvent::TapeIoFenceRaised)
-            .count(),
-        1
-    );
-    (
-        drive.media_failure_outcome_after(0).unwrap().clone(),
-        fences[0].reason.clone(),
-        status
-            .metadata()
-            .get("remanence-retry")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .into(),
-    )
+    let reason = fences[0].reason.clone();
+    let outcome = drive.media_failure_outcome_after(0).unwrap().clone();
+    let retry: String = status
+        .metadata()
+        .get("remanence-retry")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .into();
+    drop((index, cfg));
+    assert_eq!(fence_raised_records(&mut typed), 1);
+    (outcome, reason, retry)
 }
 
 /// Diagnostic collisions preserve equal outcomes, reasons and retry through mounted, parity, admission and closeout consumers.
@@ -533,23 +525,14 @@ fn b3b_same_cause_two_messages() {
         let results: Vec<_> = messages
             .into_iter()
             .map(|message| {
-                let root = tempfile::tempdir().unwrap();
-                let index_path = root.path().join("state.sqlite");
-                let mut index = remanence_state::projector::open(&index_path)
-                    .map(|catalog| catalog.write_handle())
-                    .unwrap();
+                let typed = crate::tests::TypedRoot::open_with_tapes(&[([96; 16], "TWOMSG96L9")]);
+                let mut index = typed.catalog().write_handle();
                 let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
                     "C7", 0x100, "C7D", 0x400, 1,
                 )));
                 let library = open_model_library(world);
                 let snapshot = library_snapshot_cell(library.library().clone());
-                std::fs::create_dir(root.path().join("audit")).unwrap();
-                let cfg = test_write_owner_config(
-                    index_path,
-                    root.path().join("audit"),
-                    &library,
-                    snapshot,
-                );
+                let cfg = test_typed_write_owner_config(&typed, &library, snapshot);
                 let write = consumer == "parity";
                 let (mut drive, _) =
                     drive_with_failure(if write { 10 } else { 8 }, 0, Some(message));
@@ -679,11 +662,8 @@ fn b3b_mounted_definite_rejection_no_fence() {
     }
     const UUID: [u8; 16] = [97; 16];
     const BLOCK: u32 = 4096;
-    let root = tempfile::tempdir().unwrap();
-    let index_path = root.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let mut typed = crate::tests::TypedRoot::open_with_tapes(&[(UUID, "REJECT97L9")]);
+    let mut index = typed.catalog().write_handle();
     let world = VirtualWorld::single_drive("C7", 0x100, "C7D", 0x400, 1);
     let bootstrap = crate::build_tape_bootstrap(
         UUID,
@@ -697,8 +677,7 @@ fn b3b_mounted_definite_rejection_no_fence() {
     let world = Arc::new(Mutex::new(world));
     let library = open_model_library(world.clone());
     let snapshot = library_snapshot_cell(library.library().clone());
-    let mut cfg =
-        test_write_owner_config(index_path, root.path().join("audit"), &library, snapshot);
+    let mut cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let armed = Arc::new(Mutex::new(false));
     let commands = Arc::new(Mutex::new(Vec::new()));
     let position = |lba: u64| {
@@ -788,10 +767,8 @@ fn b3b_mounted_definite_rejection_no_fence() {
     );
     assert!(result.is_err());
     assert!(index.list_active_tape_io_fences().unwrap().is_empty());
-    assert!(FileAuditLog::replay(&cfg.fixture_audit().audit_dir)
-        .unwrap()
-        .iter()
-        .all(|r| r.event != AuditEvent::TapeIoFenceRaised));
+    drop((index, cfg));
+    assert_eq!(fence_raised_records(&mut typed), 0);
     let before = commands.lock().unwrap().len();
     let ctx = crate::append_admission::context(UUID, BLOCK, 0, 2);
     let admission = crate::append_admission::admit_append_boundary(
@@ -1058,28 +1035,15 @@ fn b3b_fix1_terminal_prefix_eom_fence_precedes_recovery() {
     );
     let outcome =
         crate::write_owner::checkpoint::write_failure_outcome(&mut drive, before, Some(&error));
-    let mut index = remanence_state::projector::open(root.path().join("index.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: uuid,
-            voltag: "EOM".into(),
-            block_size: 262144,
-            parity: ParityConfig::None,
-            force: false,
-        })
-        .unwrap();
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[(uuid, "EOM001L9")]);
+    let mut index = typed.catalog().write_handle();
     let cfg = crate::write_owner::TerminalWriteConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            root.path().join("audit"),
-            true,
-            &(Arc::new(Mutex::new(()))),
+        authority: crate::write_owner::TerminalAuthority::Typed(
+            typed.catalog().library_runtime().unwrap(),
         ),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: root.path().join("tapes"),
+        checkpoint_journal_dir: typed.paths().journal_dir.join("tapes"),
     };
     let mut lease = remanence_state::authority::fixtures::AuthorityBuilder::new(
         &cfg.checkpoint_journal_dir,

@@ -1486,24 +1486,11 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
     let observed = vec![0x53; BLOCK as usize];
     for mutation in ["exact", "mutated", "extra", "filemark", "early_eod"] {
         let mut f = fixture_with_size(BLOCK);
-        let root = tempfile::tempdir().unwrap();
-        let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        index
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid: UUID,
-                voltag: "TAIL".into(),
-                block_size: BLOCK,
-                parity: remanence_parity::ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
-        std::fs::create_dir(root.path().join("tapes")).unwrap();
-        std::fs::create_dir(root.path().join("audit")).unwrap();
-        let authority =
-            remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
-                .unwrap();
+        let typed = crate::tests::TypedRoot::open_with_tapes(&[(UUID, "TAIL01L9")]);
+        let mut index = typed.catalog().write_handle();
+        let tapes = typed.paths().journal_dir.join("tapes");
+        std::fs::create_dir_all(&tapes).unwrap();
+        let authority = remanence_state::TapeAuthority::open(&tapes, UUID, index.path()).unwrap();
         let mut lease = authority.acquire_exclusive().unwrap();
         lease
             .publish_initialized(
@@ -1570,15 +1557,12 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
                 "{mutation}: {error}"
             );
             let cfg = crate::write_owner::TerminalWriteConfig {
-                authority: crate::write_owner::TerminalAuthority::fixture(
-                    None,
-                    root.path().join("audit"),
-                    true,
-                    &(Arc::new(Mutex::new(()))),
+                authority: crate::write_owner::TerminalAuthority::Typed(
+                    typed.catalog().library_runtime().unwrap(),
                 ),
                 io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
                 mounted_endpoint: None,
-                checkpoint_journal_dir: root.path().join("tapes"),
+                checkpoint_journal_dir: tapes.clone(),
             };
             let status = {
                 let outcome = crate::append_admission::admission_error_outcome(&error);
@@ -1597,7 +1581,7 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
             );
             let fences = index.list_active_tape_io_fences().unwrap();
             assert_eq!(fences.len(), 1);
-            assert_eq!(fences[0].reason, "SessionSuffixContradiction");
+            assert_eq!(fences[0].reason, "session_suffix_contradiction");
         }
         assert_eq!(writes(&f.commands.lock().unwrap()), 0);
     }
@@ -2063,29 +2047,15 @@ pub(crate) fn golden_production_admission_rows() {
             AdmissionErrorKind::SuffixIo { .. } => "SuffixIo",
         };
         assert_eq!(actual_kind, name);
-        let root = tempfile::tempdir().unwrap();
-        let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        index
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid: UUID,
-                voltag: "TAIL".into(),
-                block_size: SIZE,
-                parity: remanence_parity::ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
+        let typed = crate::tests::TypedRoot::open_with_tapes(&[(UUID, "TAIL01L9")]);
+        let mut index = typed.catalog().write_handle();
         let cfg = crate::write_owner::TerminalWriteConfig {
-            authority: crate::write_owner::TerminalAuthority::fixture(
-                None,
-                root.path().join("audit"),
-                true,
-                &(Arc::new(Mutex::new(()))),
+            authority: crate::write_owner::TerminalAuthority::Typed(
+                typed.catalog().library_runtime().unwrap(),
             ),
             io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
             mounted_endpoint: None,
-            checkpoint_journal_dir: root.path().join("tapes"),
+            checkpoint_journal_dir: typed.paths().journal_dir.join("tapes"),
         };
         let outcome = admission_error_outcome(&error);
         daemon_admission_error(
@@ -2099,7 +2069,7 @@ pub(crate) fn golden_production_admission_rows() {
         let fences = index.list_active_tape_io_fences().unwrap();
         if name == "SessionSuffixContradiction" {
             assert_eq!(fences.len(), 1);
-            assert_eq!(fences[0].reason, "SessionSuffixContradiction");
+            assert_eq!(fences[0].reason, "session_suffix_contradiction");
         } else {
             assert!(fences.is_empty(), "{name}: {fences:?}");
         }
