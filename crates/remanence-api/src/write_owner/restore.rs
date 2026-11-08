@@ -345,7 +345,9 @@ pub(crate) fn stream_one_object(
                     },
                     Arc::clone(&cfg.io_memory),
                 )
-                .map_err(|err| status_from_format_error(&err, format!("read object: {err}")))?;
+                .map_err(|err| {
+                    status_from_read_object_error(&err, format!("read object: {err}"))
+                })?;
                 let (_payload_bytes, _digest) = sink
                     .finish()
                     .map_err(|err| Status::internal(format!("finish payload stream: {err}")))?;
@@ -1072,6 +1074,19 @@ pub(crate) fn status_from_format_error(err: &FormatError, message: String) -> St
     }
 }
 
+/// The verified whole-object read's mapper. Bytes read back that contradict
+/// the digest or checksum recorded with them at write time are stored
+/// corruption, `DATA_LOSS`, with no retry metadata; every other failure keeps
+/// the shared mapping.
+fn status_from_read_object_error(err: &FormatError, message: String) -> Status {
+    match err {
+        FormatError::FileDigestMismatch { .. }
+        | FormatError::ManifestDigestMismatch
+        | FormatError::UstarChecksumMismatch { .. } => Status::data_loss(message),
+        _ => status_from_format_error(err, message),
+    }
+}
+
 /// Keep typed media refusals distinct from arbitrary transport diagnostics.
 fn status_from_tape_io_error(error: &remanence_library::TapeIoError, message: String) -> Status {
     crate::closeout_obligation::RetryCause::tape_io(error).attach(Status::internal(message))
@@ -1145,3 +1160,7 @@ pub(super) fn attach_outcome_retry(
     );
     status
 }
+
+#[cfg(test)]
+#[path = "restore_stored_corrupt_tests.rs"]
+mod stored_corrupt_tests;

@@ -695,22 +695,46 @@ fn allocate_locked_slab_with(
     Ok((buffer, slab))
 }
 
+/// Why the read submitter stopped before its plan was done, classified where
+/// its error is produced and never inferred from the error's text.
+enum SubmitterExit {
+    /// The submitter's own failure: a READ, a position proof, or an invariant.
+    Fault(TapeIoError),
+    /// The submitter could go no further only because the consumer had
+    /// already stopped: `consumer_alive` is false, or the consumer's delivery
+    /// receiver or free-buffer sender is gone. The consumer's result carries
+    /// the cause.
+    ConsumerStopped(TapeIoError),
+}
+
+impl SubmitterExit {
+    fn into_error(self) -> TapeIoError {
+        match self {
+            Self::Fault(error) | Self::ConsumerStopped(error) => error,
+        }
+    }
+}
+
 fn send_handoff(
     tx: &SyncSender<Result<ReadDelivery, TapeIoError>>,
     delivery: ReadDelivery,
-) -> Result<(), TapeIoError> {
+) -> Result<(), SubmitterExit> {
     tx.try_send(Ok(delivery)).map_err(|error| match error {
-        std::sync::mpsc::TrySendError::Full(_) => remanence_library::TapeIoError::new(
-            remanence_library::TapeIoErrorKind::OperationFailed(
-                "read delivery channel construction invariant violated: handoff push would block"
-                    .to_string(),
-            ),
-        ),
-        std::sync::mpsc::TrySendError::Disconnected(_) => remanence_library::TapeIoError::new(
-            remanence_library::TapeIoErrorKind::OperationFailed(
-                "read delivery receiver dropped".to_string(),
-            ),
-        ),
+        std::sync::mpsc::TrySendError::Full(_) => {
+            SubmitterExit::Fault(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "read delivery channel construction invariant violated: handoff push would block"
+                        .to_string(),
+                ),
+            ))
+        }
+        std::sync::mpsc::TrySendError::Disconnected(_) => {
+            SubmitterExit::ConsumerStopped(remanence_library::TapeIoError::new(
+                remanence_library::TapeIoErrorKind::OperationFailed(
+                    "read delivery receiver dropped".to_string(),
+                ),
+            ))
+        }
     })
 }
 
@@ -721,7 +745,7 @@ fn send_proof_frontier(
     through_seq: u64,
     plan_records_end: u64,
     terminal: Option<&ReadTerminalAccumulator>,
-) -> Result<(), TapeIoError> {
+) -> Result<(), SubmitterExit> {
     let proof = source.prove_read_position(expected).map_err(|error| {
         if let Some(terminal) = terminal {
             terminal.record(
@@ -729,7 +753,7 @@ fn send_proof_frontier(
                 Status::internal(format!("read position proof: {error}")),
             );
         }
-        error
+        SubmitterExit::Fault(error)
     })?;
     tx.send(Ok(ReadDelivery::ProofFrontier {
         through_seq,
@@ -737,8 +761,10 @@ fn send_proof_frontier(
         proof,
     }))
     .map_err(|_| {
-        remanence_library::TapeIoError::new(remanence_library::TapeIoErrorKind::OperationFailed(
-            "read delivery receiver dropped".to_string(),
+        SubmitterExit::ConsumerStopped(remanence_library::TapeIoError::new(
+            remanence_library::TapeIoErrorKind::OperationFailed(
+                "read delivery receiver dropped".to_string(),
+            ),
         ))
     })
 }
@@ -876,7 +902,7 @@ fn run_read_pipeline<T: Send>(
         let mut previous_completion = None::<Instant>;
         let mut submitter_state = WatermarkSubmitterState::Filling;
 
-        let submitter_result = (|| -> Result<(), TapeIoError> {
+        let submitter_result = (|| -> Result<(), SubmitterExit> {
             send_proof_frontier(
                 source,
                 &delivery_tx,
@@ -903,7 +929,10 @@ fn run_read_pipeline<T: Send>(
                             config.terminal.as_deref(),
                         )?;
                     }
-                    reservoir.wait_while_parked()?;
+                    // Its only failure is `consumer_alive` false.
+                    reservoir
+                        .wait_while_parked()
+                        .map_err(SubmitterExit::ConsumerStopped)?;
                     assert_eq!(submitter_state, WatermarkSubmitterState::Gated);
                     submitter_state = WatermarkSubmitterState::ResumingProofPending;
                     // GATED -> RESUMING(rp-pending) -> FILLING. This proof is
@@ -927,12 +956,16 @@ fn run_read_pipeline<T: Send>(
                     );
                 }
 
+                // After `drop(free_tx)` the consumer holds the only free-buffer
+                // sender, so a disconnect means the consumer has stopped.
                 let (buffer, waited) = match free_rx.try_recv() {
                     Ok(buffer) => (buffer, Duration::ZERO),
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return Err(remanence_library::TapeIoError::new(
-                            remanence_library::TapeIoErrorKind::OperationFailed(
-                                "read reservoir free-buffer channel disconnected".to_string(),
+                        return Err(SubmitterExit::ConsumerStopped(
+                            remanence_library::TapeIoError::new(
+                                remanence_library::TapeIoErrorKind::OperationFailed(
+                                    "read reservoir free-buffer channel disconnected".to_string(),
+                                ),
                             ),
                         ));
                     }
@@ -972,11 +1005,11 @@ fn run_read_pipeline<T: Send>(
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         let started = Instant::now();
                         let buffer = free_rx.recv().map_err(|_| {
-                            remanence_library::TapeIoError::new(
+                            SubmitterExit::ConsumerStopped(remanence_library::TapeIoError::new(
                                 remanence_library::TapeIoErrorKind::OperationFailed(
                                     "read reservoir free-buffer channel disconnected".to_string(),
                                 ),
-                            )
+                            ))
                         })?;
                         (buffer, started.elapsed())
                     }
@@ -1032,7 +1065,7 @@ fn run_read_pipeline<T: Send>(
                         match delivery_tx.send(Err(error)) {
                             Ok(()) => root_sent = true,
                             Err(send_error) => match send_error.0 {
-                                Err(error) => return Err(error),
+                                Err(error) => return Err(SubmitterExit::Fault(error)),
                                 Ok(_) => unreachable!("submitter sent an error delivery"),
                             },
                         }
@@ -1044,11 +1077,11 @@ fn run_read_pipeline<T: Send>(
                 submitter_remaining = submitter_remaining
                     .checked_sub(u64::from(records_read))
                     .ok_or_else(|| {
-                        remanence_library::TapeIoError::new(
+                        SubmitterExit::Fault(remanence_library::TapeIoError::new(
                             remanence_library::TapeIoErrorKind::OperationFailed(
                                 "read submitter plan remaining underflow".to_string(),
                             ),
-                        )
+                        ))
                     })?;
                 plan_records_end += u64::from(records_read);
                 seq += 1;
@@ -1067,9 +1100,9 @@ fn run_read_pipeline<T: Send>(
                     evidence: outcome.evidence,
                     handoff: outcome.handoff,
                 });
-                if let Err(error) = send_handoff(&delivery_tx, delivery) {
+                if let Err(exit) = send_handoff(&delivery_tx, delivery) {
                     reservoir.consume(valid_bytes);
-                    return Err(error);
+                    return Err(exit);
                 }
                 if config.ranged_frontier && bytes_since_ranged_proof >= proof_cadence {
                     send_proof_frontier(
@@ -1102,9 +1135,14 @@ fn run_read_pipeline<T: Send>(
         let decode_result = decode
             .join()
             .unwrap_or_else(|_| Err(FormatError::parse("read decode thread panicked")));
-        if let Err(error) = submitter_result {
-            if !root_sent {
-                return Err(FormatError::from(error));
+        if let Err(exit) = submitter_result {
+            // A submitter that stopped only because the consumer had already
+            // stopped has no cause of its own; a failed consumer's error is
+            // the one to report. A fault keeps winning.
+            let consumer_failed_first =
+                matches!(exit, SubmitterExit::ConsumerStopped(_)) && decode_result.is_err();
+            if !root_sent && !consumer_failed_first {
+                return Err(FormatError::from(exit.into_error()));
             }
         }
         decode_result
@@ -3473,5 +3511,422 @@ mod tests {
         assert_eq!(teardown.load(Ordering::SeqCst), 3);
         assert_eq!(disposition, ReadTerminalDisposition::Disconnected);
         assert_eq!(emissions, 0);
+    }
+
+    const STORED_CORRUPT_BLOCK: usize = 512;
+    const STORED_CORRUPT_MEMBER_1: &str = "member-1.bin";
+    const STORED_CORRUPT_MEMBER_2: &str = "member-2.bin";
+
+    /// A two-member REM-OBJECT in 512-byte blocks. Member 1 (the first payload
+    /// member in tar order, 3 chunks) has the first byte of its last chunk
+    /// flipped; member 2 (12 chunks), the manifest and the tar EOF records
+    /// follow it, so a decoder that fails on member 1 leaves far more blocks
+    /// unread than the reservoir and the delivery slots can hold.
+    struct StoredCorruptObject {
+        blocks: Vec<Vec<u8>>,
+        block_count: u64,
+        member_1: Vec<u8>,
+        /// Object-local index of member 1's last data block, the flipped one.
+        member_1_last_block: u64,
+    }
+
+    fn two_member_object_with_flipped_member_1() -> StoredCorruptObject {
+        let opts = options(STORED_CORRUPT_BLOCK);
+        let member_1 = (0..1300)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        let member_2 = (0..12 * STORED_CORRUPT_BLOCK)
+            .map(|value| u8::try_from(value % 241).unwrap())
+            .collect::<Vec<_>>();
+        let files = [
+            RemTarFile {
+                path: STORED_CORRUPT_MEMBER_1,
+                file_id: "file-member-1",
+                data: member_1.as_slice(),
+                mtime: Some("0"),
+                executable: Some(false),
+            },
+            RemTarFile {
+                path: STORED_CORRUPT_MEMBER_2,
+                file_id: "file-member-2",
+                data: member_2.as_slice(),
+                mtime: Some("0"),
+                executable: Some(false),
+            },
+        ];
+        let mut block_sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut block_sink, &opts, &files).unwrap();
+        let member = &layout.files[0];
+        assert_eq!(member.path, STORED_CORRUPT_MEMBER_1);
+        assert_eq!(member.chunk_count, 3);
+        let member_1_last_block = member
+            .first_chunk_lba
+            .expect("member 1 has payload chunks")
+            .0
+            + member.chunk_count
+            - 1;
+        let mut blocks = block_sink.blocks;
+        blocks[usize::try_from(member_1_last_block).unwrap()][0] ^= 0x01;
+        assert!(
+            layout.projected_size_blocks >= member_1_last_block + 1 + 12,
+            "member 2 follows the flipped member"
+        );
+        StoredCorruptObject {
+            blocks,
+            block_count: layout.projected_size_blocks,
+            member_1,
+            member_1_last_block,
+        }
+    }
+
+    /// Set once when an injected fault fires.
+    #[derive(Default)]
+    struct InjectedFaultSignal {
+        fired: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl InjectedFaultSignal {
+        fn fire(&self) {
+            *self.fired.lock().unwrap_or_else(|err| err.into_inner()) = true;
+            self.changed.notify_all();
+        }
+
+        fn wait(&self) -> bool {
+            let fired = self.fired.lock().unwrap_or_else(|err| err.into_inner());
+            let (fired, _) = self
+                .changed
+                .wait_timeout_while(fired, Duration::from_secs(10), |fired| !*fired)
+                .unwrap_or_else(|err| err.into_inner());
+            *fired
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InjectedFault {
+        /// Fail the Nth position proof (1-based).
+        ProofNumber(usize),
+        /// Fail the first position proof issued after N READs have completed.
+        ProofAfterReads(usize),
+        /// Fail the Nth READ (1-based).
+        Read(usize),
+    }
+
+    /// A `VecBlockSource` with a chosen staging ring whose injected position
+    /// proof or READ fails with a typed tape error, as a drive would.
+    struct InjectedFaultSource {
+        inner: VecBlockSource,
+        ring_buffers: u32,
+        fault: InjectedFault,
+        signal: Arc<InjectedFaultSignal>,
+        proofs: usize,
+        reads: usize,
+    }
+
+    impl BlockRead for InjectedFaultSource {
+        fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+            self.inner.read_block(buf)
+        }
+    }
+
+    impl BlockSource for InjectedFaultSource {
+        fn read_block_batch(
+            &mut self,
+            buf: &mut [u8],
+            block_size_bytes: u32,
+            requested_records: u32,
+            remaining_records_in_file: u32,
+        ) -> Result<remanence_library::ReadBatchOutcome, TapeIoError> {
+            self.reads += 1;
+            if matches!(self.fault, InjectedFault::Read(at) if at == self.reads) {
+                self.signal.fire();
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "injected tape read failure".to_string(),
+                    ),
+                ));
+            }
+            self.inner.read_block_batch(
+                buf,
+                block_size_bytes,
+                requested_records,
+                remaining_records_in_file,
+            )
+        }
+
+        fn read_batch_blocks(&self, block_size_bytes: u32) -> u32 {
+            self.inner.read_batch_blocks(block_size_bytes)
+        }
+
+        fn read_ring_buffers(&self) -> u32 {
+            self.ring_buffers
+        }
+
+        fn prove_read_position(
+            &mut self,
+            expected: TapePosition,
+        ) -> Result<remanence_library::DevicePositionProof, TapeIoError> {
+            self.proofs += 1;
+            let fail = match self.fault {
+                InjectedFault::ProofNumber(at) => at == self.proofs,
+                InjectedFault::ProofAfterReads(reads) => self.reads >= reads,
+                InjectedFault::Read(_) => false,
+            };
+            if fail {
+                self.signal.fire();
+                return Err(remanence_library::TapeIoError::new(
+                    remanence_library::TapeIoErrorKind::OperationFailed(
+                        "injected position proof failure".to_string(),
+                    ),
+                ));
+            }
+            self.inner.prove_read_position(expected)
+        }
+
+        fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+            self.inner.locate(lba)
+        }
+
+        fn space(&mut self, count: i64, kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+            self.inner.space(count, kind)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.inner.position()
+        }
+    }
+
+    /// Discards payload bytes, but holds the decoder inside member 1's last
+    /// payload write, before the reader can check member 1's digest, until the
+    /// injected fault has fired. Times out rather than hanging.
+    struct FaultGatedSink {
+        signal: Arc<InjectedFaultSignal>,
+        member_1_len: u64,
+        in_member_1: bool,
+        member_1_seen: u64,
+    }
+
+    impl RemTarEntrySink for FaultGatedSink {
+        fn begin_file(&mut self, entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+            self.in_member_1 = entry.path == STORED_CORRUPT_MEMBER_1;
+            self.member_1_seen = 0;
+            Ok(())
+        }
+
+        fn write_file_data(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+            if self.in_member_1 {
+                self.member_1_seen += bytes.len() as u64;
+                if self.member_1_seen == self.member_1_len && !self.signal.wait() {
+                    return Err(FormatError::invalid(
+                        "test gate: the injected fault never fired",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn end_file(&mut self, _entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+            Ok(())
+        }
+    }
+
+    /// The smallest reservoir `run_read_pipeline` accepts for `source`.
+    fn minimum_reservoir_bytes(source: &dyn BlockSource) -> u64 {
+        let block = u32::try_from(STORED_CORRUPT_BLOCK).unwrap();
+        u64::from(block)
+            * u64::from(source.read_batch_blocks(block))
+            * u64::from(source.read_ring_buffers())
+    }
+
+    fn stored_corrupt_config(
+        reservoir_bytes: u64,
+        high_pct: u8,
+        low_pct: u8,
+        terminal: &Arc<ReadTerminalAccumulator>,
+    ) -> ReadPipelineConfig {
+        ReadPipelineConfig {
+            reservoir_bytes,
+            high_pct,
+            low_pct,
+            ranged_frontier: false,
+            proof_cadence_bytes: reservoir_bytes / 2,
+            terminal: Some(Arc::clone(terminal)),
+        }
+    }
+
+    /// Rung D-R, T2 (design D, D1b): with one block per READ and the minimum
+    /// reservoir, the decoder fails on member 1 while the submitter still has
+    /// member 2, the manifest and the EOF blocks to read. The submitter then
+    /// fails only because the consumer stopped, and the decoder's digest
+    /// failure must be what the caller receives.
+    #[test]
+    fn stored_corrupt_digest_failure_beyond_first_batch_reaches_caller() {
+        let object = two_member_object_with_flipped_member_1();
+        let mut source = VecBlockSource::new(object.blocks).with_read_batch_blocks_for_test(1);
+        let reservoir_bytes = minimum_reservoir_bytes(&source);
+        assert_eq!(reservoir_bytes, 2 * STORED_CORRUPT_BLOCK as u64);
+        let terminal = Arc::new(ReadTerminalAccumulator::default());
+        let position = source.position().unwrap();
+        let mut payload = Vec::new();
+        let mut sink = CapturePayloadSink::new(&mut payload);
+
+        let err = read_object_payload_with_pipeline(
+            &mut source,
+            STORED_CORRUPT_BLOCK,
+            object.block_count,
+            position,
+            None,
+            &mut sink,
+            stored_corrupt_config(reservoir_bytes, 90, 25, &terminal),
+            IoMemoryReservation::new(1 << 20).expect("memory manager"),
+        )
+        .expect_err("a flipped stored byte must fail the verified read");
+        drop(sink);
+        let reads = source
+            .calls
+            .iter()
+            .filter(|call| matches!(call, VecBlockSourceCall::ReadBlockBatch { .. }))
+            .count() as u64;
+        eprintln!("T2 read_object_payload_with_pipeline returned: {err}");
+        eprintln!(
+            "T2 READ commands issued: {reads} of {} blocks; member 1 ends at block {}",
+            object.block_count, object.member_1_last_block
+        );
+
+        assert!(
+            reads > 1 && reads < object.block_count,
+            "the read must span batches and stop before the object's end: {reads} of {}",
+            object.block_count
+        );
+        assert_eq!(
+            payload.len(),
+            object.member_1.len(),
+            "member 1 streams in full before its digest is checked"
+        );
+        assert!(
+            matches!(&err, FormatError::FileDigestMismatch { path, .. } if path == STORED_CORRUPT_MEMBER_1),
+            "the decoder's digest failure for {STORED_CORRUPT_MEMBER_1} must reach the caller, got: {err}"
+        );
+        assert!(
+            terminal.finalize_after_join().is_none(),
+            "no genuine fault was injected, so nothing outranks the decoder"
+        );
+    }
+
+    /// Rung D-R, T4 (design D, D1b; amendment r1.1): a genuine submitter fault
+    /// raised before the decoder fails keeps what it returns today, and the
+    /// client is sent the fault through the ScsiRoot terminal cause.
+    ///
+    /// The last two cases hold the decoder inside member 1's last payload write
+    /// until the fault has fired, so member 1's blocks are already queued when
+    /// the submitter fails and the decoder then fails on them. Four ring
+    /// buffers with equal 50% watermarks let the submitter park and re-prove
+    /// at two outstanding blocks while the decoder is held at one.
+    #[test]
+    fn stored_corrupt_genuine_submitter_fault_still_wins() {
+        const PROOF_ERROR: &str = "tape operation failed: injected position proof failure";
+        const PROOF_STATUS: &str =
+            "read position proof: tape operation failed: injected position proof failure";
+        const READ_ERROR: &str = "tape operation failed: injected tape read failure";
+        const READ_STATUS: &str = "tape read: tape operation failed: injected tape read failure";
+        let object = two_member_object_with_flipped_member_1();
+        // READ n (1-based) reads object-local block n - 1 at one block per READ.
+        let reads_through_member_1 = usize::try_from(object.member_1_last_block + 1).unwrap();
+        let digest_mismatch = format!("file digest mismatch for {STORED_CORRUPT_MEMBER_1}");
+        let cases = [
+            (
+                "position proof at window open",
+                InjectedFault::ProofNumber(1),
+                PROOF_ERROR,
+                PROOF_STATUS,
+            ),
+            (
+                "third READ, before member 1",
+                InjectedFault::Read(3),
+                READ_ERROR,
+                READ_STATUS,
+            ),
+            // The READ error is delivered behind member 1's queued blocks, the
+            // submitter returns Ok, and the decoder's result is returned, as
+            // before D1b; the client still gets the READ fault.
+            (
+                "READ after member 1 is queued",
+                InjectedFault::Read(reads_through_member_1 + 1),
+                digest_mismatch.as_str(),
+                READ_STATUS,
+            ),
+            // The proof fails after member 1's flipped block was queued and
+            // never proven; the decoder then fails on it. The fault wins.
+            (
+                "position proof after member 1 is queued",
+                InjectedFault::ProofAfterReads(reads_through_member_1),
+                PROOF_ERROR,
+                PROOF_STATUS,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, fault, expected_error, expected_status) in cases {
+            let signal = Arc::new(InjectedFaultSignal::default());
+            let mut source = InjectedFaultSource {
+                inner: VecBlockSource::new(object.blocks.clone())
+                    .with_read_batch_blocks_for_test(1),
+                ring_buffers: 4,
+                fault,
+                signal: Arc::clone(&signal),
+                proofs: 0,
+                reads: 0,
+            };
+            let reservoir_bytes = minimum_reservoir_bytes(&source);
+            let terminal = Arc::new(ReadTerminalAccumulator::default());
+            let position = source.position().unwrap();
+            let mut sink = FaultGatedSink {
+                signal,
+                member_1_len: object.member_1.len() as u64,
+                in_member_1: false,
+                member_1_seen: 0,
+            };
+
+            let err = read_object_payload_with_pipeline(
+                &mut source,
+                STORED_CORRUPT_BLOCK,
+                object.block_count,
+                position,
+                None,
+                &mut sink,
+                stored_corrupt_config(reservoir_bytes, 50, 50, &terminal),
+                IoMemoryReservation::new(1 << 20).expect("memory manager"),
+            )
+            .expect_err("an injected fault must fail the read");
+            let status = terminal
+                .finalize_after_join()
+                .expect("the genuine fault records the terminal cause");
+            eprintln!(
+                "T4 {case} ({fault:?}): returned {err}; terminal status {:?} {:?}; reads {} proofs {}",
+                status.code(),
+                status.message(),
+                source.reads,
+                source.proofs
+            );
+
+            let returned_expected = if expected_error == digest_mismatch {
+                matches!(&err, FormatError::FileDigestMismatch { path, .. } if path == STORED_CORRUPT_MEMBER_1)
+                    && err.to_string().starts_with(expected_error)
+            } else {
+                matches!(&err, FormatError::TapeIo(_)) && err.to_string() == expected_error
+            };
+            if !returned_expected {
+                failures.push(format!(
+                    "{case}: returned {err:?}, expected {expected_error:?}"
+                ));
+            }
+            if status.code() != tonic::Code::Internal || status.message() != expected_status {
+                failures.push(format!(
+                    "{case}: terminal status {:?} {:?}, expected Internal {expected_status:?}",
+                    status.code(),
+                    status.message()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }
