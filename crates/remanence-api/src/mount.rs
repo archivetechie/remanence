@@ -938,7 +938,7 @@ pub(crate) fn prepare_manual_finalize_request(
                 || accepted.value.at.tape.uuid != admission.tape_uuid
             {
                 return Err(Status::already_exists(
-                    "FinalizeTape idempotency key is bound to another request",
+                    crate::write_owner::FINALIZE_TAPE_IDEMPOTENCY_CONFLICT,
                 ));
             }
             if accepted.status
@@ -997,7 +997,7 @@ pub(crate) fn prepare_manual_finalize_request(
         {
             if scope.request_fingerprint.as_slice() != admission.request_fingerprint {
                 return Err(Status::already_exists(
-                    "FinalizeTape idempotency key is already bound to a different request",
+                    crate::write_owner::FINALIZE_TAPE_IDEMPOTENCY_CONFLICT,
                 ));
             }
             admission.candidate_operation_id = scope.operation_id;
@@ -1213,7 +1213,7 @@ fn rejoin_accepted_manual_finalization(
     };
     if scope.request_fingerprint.as_slice() != admission.request_fingerprint {
         return Err(Status::already_exists(
-            "FinalizeTape idempotency key is already bound to a different request",
+            crate::write_owner::FINALIZE_TAPE_IDEMPOTENCY_CONFLICT,
         ));
     }
     let Some(projection) = index

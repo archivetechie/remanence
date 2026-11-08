@@ -26,6 +26,11 @@ use remanence_state::{
 use tonic::Status;
 use uuid::Uuid;
 
+/// The refusal text for a `FinalizeTape` idempotency key already bound to a different request,
+/// wherever a bound request's fingerprint is compared (not yet the ConflictingDuplicate refusal).
+pub(crate) const FINALIZE_TAPE_IDEMPOTENCY_CONFLICT: &str =
+    "FinalizeTape idempotency key is already bound to a different request";
+
 use super::actor_runtime::{record_session_close_snapshot, WriteOwnerConfig};
 use super::checkpoint::{fence_failed_parity_raw_write, project_checkpoint_authority_bounded};
 use super::read_session::session_open_reject_tape_io_fences;
@@ -837,9 +842,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             if accepted.value.request_fingerprint != request.request_fingerprint
                 || accepted.value.at.tape.uuid != request.tape_uuid
             {
-                return Err(Status::already_exists(
-                    "FinalizeTape request differs from authenticated acceptance",
-                ));
+                return Err(Status::already_exists(FINALIZE_TAPE_IDEMPOTENCY_CONFLICT));
             }
             if accepted.status
                 != remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
@@ -941,9 +944,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                 && manual.idempotency_key == *request.idempotency_key.as_bytes()
             {
                 if manual.request_fingerprint != request.request_fingerprint {
-                    return Err(Status::already_exists(
-                        "FinalizeTape idempotency key is already bound to a different request",
-                    ));
+                    return Err(Status::already_exists(FINALIZE_TAPE_IDEMPOTENCY_CONFLICT));
                 }
                 request.candidate_operation_id = Uuid::from_bytes(manual.operation_id);
             }
@@ -960,9 +961,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             .map_err(crate::status_from_state_error)?
         {
             if scope.request_fingerprint.as_slice() != request.request_fingerprint {
-                return Err(Status::already_exists(
-                    "FinalizeTape idempotency key is already bound to a different request",
-                ));
+                return Err(Status::already_exists(FINALIZE_TAPE_IDEMPOTENCY_CONFLICT));
             }
             request.candidate_operation_id = scope.operation_id;
         }
@@ -2697,9 +2696,7 @@ pub(super) fn validate_manual_finalize_owned_request(
             .map_err(crate::status_from_state_error)?
         {
             if scope.request_fingerprint.as_slice() != request.request_fingerprint {
-                return Err(Status::already_exists(
-                    "FinalizeTape idempotency key is already bound to a different request",
-                ));
+                return Err(Status::already_exists(FINALIZE_TAPE_IDEMPOTENCY_CONFLICT));
             }
             if scope.operation_id != request.candidate_operation_id {
                 return Err(Status::failed_precondition(format!(

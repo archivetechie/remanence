@@ -663,12 +663,21 @@ fn load_drive(
 
 /// What sutradhara's caller sends: the `FinalizeTape` RPC under idempotency key `key`.
 async fn finalize_rpc(state: &ApiState, key: Uuid) -> Result<pb::TapeFinalization, Status> {
+    finalize_rpc_with_reason(state, key, REASON).await
+}
+
+/// The `FinalizeTape` RPC under idempotency key `key`, with the operator's `reason`.
+async fn finalize_rpc_with_reason(
+    state: &ApiState,
+    key: Uuid,
+    reason: &str,
+) -> Result<pb::TapeFinalization, Status> {
     <crate::CatalogService as crate::pb::catalog_server::Catalog>::finalize_tape(
         &state.catalog_service(),
         tonic::Request::new(pb::FinalizeTapeRequest {
             tape_uuid: TAPE.to_vec(),
             expected_pool_id: None,
-            reason: REASON.to_string(),
+            reason: reason.to_string(),
             idempotency_key: Some(pb::IdempotencyKey {
                 value: key.as_bytes().to_vec(),
             }),
@@ -1663,4 +1672,109 @@ fn a_same_key_retry_during_startup_recovery_joins_it_and_the_tape_is_sealed_once
 #[test]
 fn startup_recovery_after_a_same_key_retry_is_refused_or_finds_the_tape_sealed() {
     check_two_resumers(FirstResumer::Retry);
+}
+
+// ---------------------------------------------------------------------------------------------
+// One idempotency-conflict text (TIX.10)
+//
+// A same-key `FinalizeTape` whose request differs from the one the key is bound to is refused
+// `AlreadyExists` with one text, on admission, on preflight and through the RPC. The tests assert
+// the literal text, never the code's constant.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn admission_of_a_same_key_request_with_another_fingerprint_is_refused_with_the_conflict_text() {
+    let (typed, first, _request, live) = finalize_then_restart(Closure::Open);
+    let before = durable_bytes(typed.paths());
+    let mut changed = first;
+    changed.request_fingerprint = [0xB4; 32];
+    let index = live.state.catalog.write_handle();
+    let error =
+        prepare_manual_finalize_request(&index, changed, |pool_id| live.state.pool_config(pool_id))
+            .expect_err("a changed request under a bound key is refused");
+    drop(index);
+    assert_eq!(error.code(), tonic::Code::AlreadyExists, "{error}");
+    assert_eq!(
+        error.message(),
+        "FinalizeTape idempotency key is already bound to a different request"
+    );
+    assert_eq!(durable_bytes(typed.paths()), before, "admission wrote");
+}
+
+#[test]
+fn preflight_of_a_same_key_request_with_another_fingerprint_is_refused_with_the_conflict_text() {
+    let (typed, _first, mut request, live) = finalize_then_restart(Closure::Open);
+    let before = durable_bytes(typed.paths());
+    request.request_fingerprint = [0xB4; 32];
+    let mut index = live.state.catalog.write_handle();
+    let error = crate::write_owner::preflight_manual_finalize_cancellable(
+        &mut index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::from_api(&live.state).unwrap(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: live.state.checkpoint_journal_dir.as_path(),
+        },
+        None,
+        &mut request,
+        None,
+        || false,
+    )
+    .expect_err("a changed request under a bound key is refused");
+    drop(index);
+    assert_eq!(error.code(), tonic::Code::AlreadyExists, "{error}");
+    assert_eq!(
+        error.message(),
+        "FinalizeTape idempotency key is already bound to a different request"
+    );
+    assert_eq!(durable_bytes(typed.paths()), before, "preflight wrote");
+}
+
+#[test]
+fn the_finalize_rpc_with_a_changed_reason_under_a_bound_key_is_refused_with_the_conflict_text() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    install_checkpoint(&typed);
+    let key = Uuid::from_u128(0xF2);
+    let tapes = typed.paths().journal_dir.join("tapes");
+    let catalog = typed.catalog();
+    let incarnation = runtime();
+    let held = incarnation.block_on(async move {
+        let mut state = ApiState::new(catalog);
+        state.checkpoint_journal_dir = Arc::new(tapes);
+        let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+        finalize_rpc(&state, key)
+            .await
+            .expect("the first FinalizeTape is accepted");
+        let command = tokio::time::timeout(Duration::from_secs(5), drive_rx.recv())
+            .await
+            .expect("the worker dispatches to the drive")
+            .expect("a drive command");
+        let crate::write_owner::DriveCommand::FinalizeTape { reply, .. } = command else {
+            panic!("the first drive command is the finalize");
+        };
+        let error = finalize_rpc_with_reason(&state, key, "a different reason")
+            .await
+            .expect_err("the same key with another reason is refused");
+        assert_eq!(error.code(), tonic::Code::AlreadyExists, "{error}");
+        assert_eq!(
+            error.message(),
+            "FinalizeTape idempotency key is already bound to a different request"
+        );
+        assert!(
+            matches!(
+                drive_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the refused request sent a drive command"
+        );
+        assert!(
+            matches!(
+                changer_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the refused request sent a changer command"
+        );
+        Box::new((reply, drive_rx, changer_rx)) as Box<dyn std::any::Any>
+    });
+    drop(incarnation);
+    drop(held);
 }

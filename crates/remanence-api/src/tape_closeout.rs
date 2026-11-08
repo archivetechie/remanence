@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use tonic::Status;
 use uuid::Uuid;
 const KIND: &str = "tape_closeout";
+const CLOSEOUT_TAPE_IDEMPOTENCY_CONFLICT: &str =
+    "CloseoutTape idempotency key is already bound to a different request";
 
 /// Operator acceptance carries the original fingerprint into a writer-minted
 /// operation. Closed failures remain the explicit same-operation retry gap.
@@ -74,9 +76,7 @@ pub(crate) fn start(
         .map_err(|e| Status::failed_precondition(e.to_string()))?;
     if let Some((operation, accepted)) = &prior {
         if accepted.request_fingerprint != fingerprint {
-            return Err(Status::already_exists(
-                "CloseoutTape idempotency key is already bound to a different request",
-            ));
+            return Err(Status::already_exists(CLOSEOUT_TAPE_IDEMPOTENCY_CONFLICT));
         }
         let id = Uuid::from_bytes(operation.operation);
         let response = pb::OperationRef {
@@ -203,9 +203,7 @@ fn historical_start(
         .as_ref()
         .is_some_and(|s| s.request_fingerprint != fingerprint)
     {
-        return Err(Status::already_exists(
-            "CloseoutTape idempotency key is already bound to a different request",
-        ));
+        return Err(Status::already_exists(CLOSEOUT_TAPE_IDEMPOTENCY_CONFLICT));
     }
     let id = existing
         .as_ref()
