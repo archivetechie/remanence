@@ -16332,6 +16332,14 @@ fn run_typed_readiness_owner_source_case(with_legacy_metadata: bool, failed_load
         .with_library_runtime(runtime.clone());
     let mut index = catalog.write_handle();
     let (world, mut library) = unthreaded_cartridge_world("LIB-TYPED-READY");
+    // The daemon observes its drives before it serves; a readiness row names the drive
+    // serial this records.
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &std::collections::HashSet::from(["LIB-TYPED-READY".to_string()]),
+    )
+    .unwrap();
     let failed_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if failed_load {
         let model = world.lock().unwrap().library_snapshot();
