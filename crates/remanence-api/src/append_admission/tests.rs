@@ -2067,17 +2067,27 @@ pub(crate) fn golden_production_admission_rows() {
             &outcome,
         );
         let fences = index.list_active_tape_io_fences().unwrap();
-        if name == "SessionSuffixContradiction" {
-            assert_eq!(fences.len(), 1);
+        // Ruling 13: a recovery-required refusal is a durable write fence, not the SQL state flag.
+        if matches!(
+            name,
+            "SessionSuffixContradiction"
+                | "TailBeyondKnownState"
+                | "Unproved"
+                | "MissingBootstrapFilemark"
+        ) {
+            assert_eq!(fences.len(), 1, "{name}: {fences:?}");
             assert_eq!(fences[0].reason, "session_suffix_contradiction");
         } else {
             assert!(fences.is_empty(), "{name}: {fences:?}");
         }
         assert_eq!(
-            index.get_tape(&UUID).unwrap().unwrap().state == "recovery_required",
+            index.tape_io_is_fenced(Some(&UUID), None, None).unwrap(),
             matches!(
                 name,
-                "TailBeyondKnownState" | "Unproved" | "MissingBootstrapFilemark"
+                "TailBeyondKnownState"
+                    | "Unproved"
+                    | "MissingBootstrapFilemark"
+                    | "SessionSuffixContradiction"
             )
         );
         eprintln!("golden admission: {name}: base destination preserved");
