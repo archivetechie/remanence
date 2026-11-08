@@ -10,6 +10,9 @@ struct CleaningStopTransport {
     world: Arc<Mutex<VirtualWorld>>,
     lifecycle: DrivePoolLifecycle,
     before_unload: bool,
+    /// How the first UNLOAD fails: a decodable CHECK CONDITION (the outcome is known, so the
+    /// typed motion record is `Failed`) or a transport `Io` (the outcome is unknown).
+    known_failure: bool,
     unloads: Arc<AtomicU64>,
 }
 
@@ -40,6 +43,19 @@ impl SgTransport for CleaningStopTransport {
                 self.lifecycle
                     .cut_changer_wait
                     .store(true, Ordering::SeqCst);
+                if self.known_failure {
+                    // HARDWARE ERROR, media load or eject failed: a known, decodable failure.
+                    let mut sense = vec![0; 18];
+                    sense[0] = 0x70;
+                    sense[2] = 4;
+                    sense[7] = 10;
+                    sense[12] = 0x53;
+                    sense[13] = 0x00;
+                    return Err(remanence_library::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    });
+                }
                 return Err(remanence_library::ScsiError::Io(std::io::Error::other(
                     "first cleaning UNLOAD failed",
                 )));
@@ -65,7 +81,7 @@ impl SgTransport for CleaningStopTransport {
 }
 
 /// Exercise the real shutdown waiter while the manual cleaning worker owns MOVE.
-async fn cleaning_shutdown(before_unload: bool) {
+async fn cleaning_shutdown(before_unload: bool, known_failure: bool) {
     let typed = crate::tests::TypedRoot::open();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-CLEAN-STOP",
@@ -142,6 +158,7 @@ async fn cleaning_shutdown(before_unload: bool) {
                     world: cleaning_world.clone(),
                     lifecycle: lifecycle.clone(),
                     before_unload,
+                    known_failure,
                     unloads: cleaning_unloads.clone(),
                 }))
             })
@@ -162,6 +179,21 @@ async fn cleaning_shutdown(before_unload: bool) {
         let world = world.lock().unwrap();
         assert_eq!(world.loaded_barcode(0x100), Some("CLN001L9"));
         assert!(!world.drive_states[&0x100].initializing_command_required);
+    } else if !known_failure {
+        // The first UNLOAD's outcome is unknown: the typed motion rule forbids another command
+        // until physical reconciliation, so the retry is refused and never reaches the transport.
+        let error = tokio::time::timeout(StdDuration::from_secs(10), cleaning)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("motion scope requires physical reconciliation before another command"),
+            "{error}"
+        );
+        assert_eq!(unloads.load(Ordering::SeqCst), 1);
     } else {
         tokio::time::timeout(StdDuration::from_secs(10), async {
             while board.get("LIB-CLEAN-STOP").is_none() {
@@ -198,12 +230,17 @@ async fn cleaning_shutdown(before_unload: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_clean_shutdown_before_unload_keeps_cartridge_seated() {
-    cleaning_shutdown(true).await;
+    cleaning_shutdown(true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_clean_shutdown_after_unload_waits_for_retry_and_magazine_move() {
-    cleaning_shutdown(false).await;
+    cleaning_shutdown(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_clean_shutdown_after_unknown_unload_requires_reconciliation() {
+    cleaning_shutdown(false, false).await;
 }
 
 /// A lost open reply closes its audit lifetime and arms the real idle return.

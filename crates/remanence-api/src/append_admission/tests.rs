@@ -2090,6 +2090,12 @@ pub(crate) fn golden_production_admission_rows() {
                     | "SessionSuffixContradiction"
             )
         );
+        // Ruling 13 deleted the SQL flag: no row may leave the tape in "recovery_required".
+        assert_ne!(
+            index.get_tape(&UUID).unwrap().unwrap().state,
+            "recovery_required",
+            "{name}"
+        );
         eprintln!("golden admission: {name}: base destination preserved");
     }
 }

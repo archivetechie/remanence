@@ -696,8 +696,12 @@ fn run_cell(
     let typed = crate::tests::TypedRoot::open_with_tapes(&[([93; 16], "MATRIX93L9")]);
     // The readiness cells record an operation naming a drive serial, which the typed runtime
     // accepts only for a drive its library log has observed; `TypedRoot` observes none. Those
-    // cells touch no fence and no tape, so they keep a plain catalog (the readiness rows are
-    // SQL-only in this test); every other cell runs over the typed root.
+    // cells touch no fence and no tape, so they keep a plain catalog; every other cell runs over
+    // the typed root. The plain catalog takes the fixture-only SQL readiness arm
+    // (`#[cfg(any(test, feature = "fixtures"))]`): production refuses that arm without a runtime
+    // ("readiness requires shared LibraryAuthority", `remanence-state/src/projector/handle.rs`).
+    // So these cells do not prove typed readiness persistence; converting them waits for a typed
+    // fixture that observes a drive.
     let legacy_root = tempfile::tempdir().unwrap();
     let mut index = if path == PathKind::Readiness {
         remanence_state::projector::open(legacy_root.path().join("state.sqlite"))

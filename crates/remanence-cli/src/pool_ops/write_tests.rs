@@ -422,10 +422,16 @@ fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing(
     .unwrap();
     let mut fences = 0;
     let mut sessions = 0;
+    let mut seeded_sessions = 0;
     lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
         match record.record().tag() {
             lib::Tag::FenceRaised => fences += 1,
-            lib::Tag::SessionObserved => sessions += 1,
+            lib::Tag::SessionObserved => {
+                sessions += 1;
+                if record.record().envelope.session_id == Some(*session_id.as_bytes()) {
+                    seeded_sessions += 1;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -433,6 +439,10 @@ fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing(
     .unwrap();
     // The seeded `Opened` is the log's only session record: nothing orphaned or closed it.
     assert_eq!((fences, sessions), (0, 1));
+    assert_eq!(
+        seeded_sessions, 1,
+        "the one session record is the seeded session's"
+    );
     assert!(!fixture
         .world
         .lock()
