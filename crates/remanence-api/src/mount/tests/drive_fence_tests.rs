@@ -180,6 +180,11 @@ async fn l1r3eg4_actor_slot_uses_unfenced_bay() {
 
 /// M2/M3: seated and only-bay cases return one typed refusal without waiting or dispatch.
 async fn refused_actor(seated: bool) {
+    refused_actor_with_busy_bay(seated, false).await;
+}
+
+/// Keep closeout guards alive so a fenced seated bay must refuse before any busy wait.
+async fn refused_actor_with_busy_bay(seated: bool, seated_busy: bool) {
     let mut root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
     let world = world(seated, seated);
     let (state, mut changer, mut drives) = actor_state(&root, &world);
@@ -189,6 +194,20 @@ async fn refused_actor(seated: bool) {
         .drive_pool()
         .unwrap()
         .test_begin_actor_work(crate::drive_pool::DriveKey::new(SERIAL, OTHER));
+    // Planning reads reservations; actor work keeps a mistaken busy wait pending.
+    let _seated_reservation = seated_busy.then(|| {
+        state
+            .drive_pool()
+            .unwrap()
+            .reserve_drive(&crate::drive_pool::DriveKey::new(SERIAL, BAY))
+            .unwrap()
+    });
+    let _seated_closing = seated_busy.then(|| {
+        state
+            .drive_pool()
+            .unwrap()
+            .test_begin_actor_work(crate::drive_pool::DriveKey::new(SERIAL, BAY))
+    });
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         resolve_and_reserve_actor_mount(&state, state.drive_pool().unwrap(), SERIAL, &TAPE),
@@ -211,6 +230,12 @@ async fn refused_actor(seated: bool) {
 #[tokio::test]
 async fn l1r3eg4_actor_seated_refuses() {
     refused_actor(true).await;
+}
+
+/// Check (a) must refuse even when both the fenced seated bay and the other bay are busy.
+#[tokio::test]
+async fn l1r3eg4_actor_seated_busy_refuses_without_wait() {
+    refused_actor_with_busy_bay(true, true).await;
 }
 
 #[tokio::test]
@@ -389,6 +414,7 @@ async fn l1r3eg4_mounted_drive_precedes_cause14_once() {
         "{second}"
     );
     assert_eq!(records.len(), 2, "exactly one refusal per mounted request");
+    assert_eq!(records[0].subject_kind.as_str(), "tape");
     assert_eq!(
         records[0].detail,
         lib::Bounded(vec![

@@ -18134,6 +18134,11 @@ fn l1r3e_cleaning_capability_dispatches_move_and_load() {
             drive_refusals, 1,
             "capability red proof must record exactly one code-12 refusal: {result:?}"
         );
+    } else {
+        assert_eq!(
+            drive_refusals, 0,
+            "cleaning's LOAD must be admitted: {result:?}; commands={log:?}"
+        );
     }
     println!("A6 code-12 refusals: {drive_refusals}");
     assert!(
@@ -18143,6 +18148,15 @@ fn l1r3e_cleaning_capability_dispatches_move_and_load() {
     assert!(
         log.iter().any(|c| c.opcode == 0x1b),
         "cleaning must dispatch LOAD: {result:?}; commands={log:?}"
+    );
+    let first_load = log.iter().position(|c| c.opcode == 0x1b).unwrap();
+    assert_eq!(
+        log[..first_load]
+            .iter()
+            .filter(|c| c.opcode == 0xa5)
+            .count(),
+        1,
+        "exactly one MOVE must precede the first LOAD: {result:?}; commands={log:?}"
     );
 }
 
