@@ -456,6 +456,45 @@ fn l1a_fresh_retired_and_zero_floor() {
     assert_eq!(f.raises(B), raises);
 }
 
+/// Only cause 14 suppresses native projection; an unrelated tape fence must catch up.
+#[test]
+fn l1a_other_tape_fences_do_not_skip_projection() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (_, before) = f.native(T, false);
+    f.rt()
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape(T)),
+                    cause: lib::FenceCause::TransferError,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    f.close();
+    let tail = f.tail_without_runtime(T, B);
+    assert!(tail.log_reference().0 > before.log_reference().0);
+    f.reopen();
+    assert_eq!(
+        f.rt()
+            .reader()
+            .unwrap()
+            .projected_through_sequence(T)
+            .unwrap(),
+        tail.log_reference().0
+    );
+    assert!(f.raises(T).is_empty());
+}
+
 /// Both obligations are evaluated even when crash-ack validation has nothing to replay.
 #[test]
 fn l1a_short_log_basis_skip_and_other_tape_projection() {

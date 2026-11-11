@@ -3811,7 +3811,7 @@ fn l1a_floor_all_reference_kinds_live_and_replay() {
     for body in cases {
         let expected = body
             .at()
-            .or_else(|| match &body {
+            .or(match &body {
                 Body::FenceRaised(v) => v.at.as_ref(),
                 _ => None,
             })
@@ -4028,4 +4028,62 @@ fn l1a_active_tape_fences_two_tapes_and_drive() {
             assert_eq!(actual, expected);
         }
     }
+}
+
+/// Store appends and disk replay preserve tape-local active fences across releases.
+#[test]
+fn l1a_active_tape_fences_live_and_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(dir.path(), &Present);
+    put(&mut log, provision(1, Some("A")));
+    put(&mut log, provision(2, Some("B")));
+    let drive = Body::FenceRaised(FenceRaised {
+        detail: Bounded(vec![]),
+        kind: FenceKind::DriveFault,
+        scope: FenceScope::Drive(endpoint("LIBA0001")),
+        cause: FenceCause::TransferError,
+        evidence: None,
+        at: None,
+        operation: None,
+    });
+    let steps = [
+        (fence(1), vec![3], vec![]),
+        (fence(2), vec![3], vec![4]),
+        (drive, vec![3], vec![4]),
+        (fence(1), vec![3, 6], vec![4]),
+        (release(3), vec![6], vec![4]),
+        (release(5), vec![6], vec![4]),
+        (release(4), vec![6], vec![]),
+        (release(6), vec![], vec![]),
+        (fence(2), vec![], vec![11]),
+        (release(11), vec![], vec![]),
+    ];
+    for (body, one, two) in steps {
+        put(&mut log, body);
+        for (id, expected) in [(1, one), (2, two), (3, vec![])] {
+            let actual: Vec<_> = log
+                .state()
+                .fold
+                .active_tape_fences(&tape(id).uuid)
+                .map(|(n, raise)| {
+                    assert_eq!(raise.scope, FenceScope::Tape(tape(id)));
+                    n
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+    let live = log.state().fold.clone();
+    drop(log);
+    let replay = replay(dir.path(), LOG, &Present).unwrap();
+    assert!(replay.refusal.is_none());
+    for id in [1, 2, 3] {
+        let active = |fold: &LibraryFold| {
+            fold.active_tape_fences(&tape(id).uuid)
+                .map(|(n, raise)| (n, raise.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(active(&replay.fold), active(&live));
+    }
+    live.assert_same_state(&replay.fold);
 }

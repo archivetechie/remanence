@@ -124,10 +124,13 @@ pub(crate) fn mark_retained(fold: &lib::LibraryFold, tape: &lib::Id, mark: &Mark
         raise.cause == lib::FenceCause::NativeLogBehindProjection && carries_mark(raise, mark)
     })
 }
+/// An unsatisfied received floor with its digest evidence and observation.
+type FloorObligation<'a> = ((u64, lib::Hash, u64), &'a BTreeSet<lib::Hash>, &'static str);
+
 fn raise(
     tape: lib::TapeRef,
     native: Option<NativeExtent>,
-    floor: Option<((u64, lib::Hash, u64), &BTreeSet<lib::Hash>, &'static str)>,
+    floor: Option<FloorObligation<'_>>,
     mark: Option<(&MarkEvidence, &'static str)>,
 ) -> lib::FenceRaised {
     use lib::DiagnosticValue::{Bytes, Text, Unsigned};
