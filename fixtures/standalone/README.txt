@@ -36,8 +36,7 @@ hardware qualification. MODE SENSE test bytes are constructed explicitly
 in the API oracle; they are not claimed as captured hardware output.
 
 index-v0.1.0.sql is the released SQLite shape (user_version 16), taken from
-crates/remanence-state/src/index.rs at tag v0.1.0,
-commit 3dd5afdfc9e774bffa96dd340cb34a69988fcdbf. It includes MINIMUM_SCHEMA
+crates/remanence-state/src/index.rs at tag v0.1.0. It includes MINIMUM_SCHEMA
 and the additive columns, object_copies_pool_idx, objects_content_digest_idx,
 tapes_pool_idx, and schema_meta schema_version BLOB row of that release.
 The migration test inserts labelled, unparseable-label, and unlabelled rows
