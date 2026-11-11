@@ -80,9 +80,11 @@ crates/remanence-cli/src/lib.rs	begin_readiness_owner	record_media_readiness_ope
 crates/remanence-cli/src/lib.rs	poll_already_observed_media_readiness	record_media_readiness_transition	1	routes-to-runtime	permanent
 crates/remanence-cli/src/lib.rs	poll_media_readiness_after_initial_probe	record_media_readiness_transition	2	routes-to-runtime	permanent
 crates/remanence-cli/src/lib.rs	provision_initialized_tape_with_media	provision_replacing_media	1	routes-to-runtime	permanent
-crates/remanence-cli/src/lib.rs	record_media_readiness_command_failure	record_media_readiness_transition	1	routes-to-runtime	permanent
-crates/remanence-cli/src/lib.rs	record_media_readiness_signal_or_mechanical_failure	record_media_readiness_transition	1	routes-to-runtime	permanent
-crates/remanence-cli/src/lib.rs	record_media_readiness_signal_transition	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_command_failure	record_media_readiness_fence	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_fence	record_media_readiness_fence	2	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_fence	record_media_readiness_transition	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_signal_or_mechanical_failure	record_media_readiness_fence	1	routes-to-runtime	permanent
+crates/remanence-cli/src/lib.rs	record_media_readiness_signal_transition	record_media_readiness_fence	1	routes-to-runtime	permanent
 crates/remanence-cli/src/lib.rs	record_media_readiness_transition	record_media_readiness_transition	2	routes-to-runtime	permanent
 crates/remanence-cli/src/lib.rs	run_tape_init_hardware	record_media_readiness_operation	1	routes-to-runtime	permanent
 crates/remanence-cli/src/lib.rs	run_tape_init_hardware	record_media_readiness_transition	1	routes-to-runtime	permanent

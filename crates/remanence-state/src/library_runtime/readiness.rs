@@ -56,6 +56,19 @@ impl LibraryRuntime {
             })
             .transpose()?;
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        self.begin_readiness_inner_locked(input, owned, run, Vec::new(), None)
+    }
+
+    /// Append through the existing begin constructor while the caller holds dispatch.
+    /// A successor preserves the authenticated medium, including its exact family.
+    fn begin_readiness_inner_locked<'a>(
+        &self,
+        input: &'a MediaReadinessOperationInput,
+        owned: bool,
+        run: Option<lib::Id>,
+        mut details: Vec<(&'a str, &'a str)>,
+        inherited_media: Option<Option<lib::MediumFamily>>,
+    ) -> Result<uuid::Uuid, RuntimeError> {
         let prior_source = self.readiness_source_locked(*input.operation_id.as_bytes())?;
         if let Some(serial) = input.drive_serial.as_deref() {
             let known = self
@@ -92,7 +105,8 @@ impl LibraryRuntime {
             Some("drive+tape") | Some("drive") | None => lib::ReadinessScope::Endpoint,
             Some(other) => return Err(invalid(format!("unsupported readiness scope {other:?}"))),
         };
-        let media = input.media_family.map(lib::MediumFamily::Lto);
+        let media =
+            inherited_media.unwrap_or_else(|| input.media_family.map(lib::MediumFamily::Lto));
         if input.media_generation.is_some() && media.is_none() {
             return Err(invalid(
                 "readiness producer must supply its exact media family",
@@ -231,7 +245,6 @@ impl LibraryRuntime {
         // The evidence path and the spelling of an aliased phase are presentation: one
         // `Diagnostic` naming the operation, recorded after the owner it describes. A failure to
         // record it never changes the owner's outcome.
-        let mut details = Vec::new();
         if let Some(path) = input.evidence_path.as_deref() {
             details.push(("evidence_path", path));
         }
@@ -390,6 +403,113 @@ impl LibraryRuntime {
         Ok(pending.into_values().next())
     }
 
+    /// Record a requires-release fence on the authenticated head. Ready closes
+    /// its operation, so a later fence begins an unowned successor under the same lock.
+    pub fn record_readiness_fence(
+        &self,
+        input: &MediaReadinessTransitionInput,
+    ) -> Result<uuid::Uuid, RuntimeError> {
+        let next_state = state(&input.state)?;
+        if !is_fence_state(next_state) {
+            return Err(invalid("readiness fence requires a fence state"));
+        }
+        validate_evidence_columns(input)?;
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let source = self.readiness_transition_source_locked(input)?;
+        let value = &source.1;
+        match value.result {
+            lib::ReadinessResult::Pending if is_fence_state(value.state) => Ok(input.operation_id),
+            lib::ReadinessResult::Pending => {
+                let (cancel_source, untyped_cancel) =
+                    typed_cancel_source(input.cancel_source.as_deref())?;
+                self.transition_readiness_locked(input, source, cancel_source, untyped_cancel)?;
+                Ok(input.operation_id)
+            }
+            lib::ReadinessResult::Ready => {
+                let next_phase = input
+                    .phase
+                    .as_deref()
+                    .map(phase)
+                    .transpose()?
+                    .unwrap_or(value.phase);
+                let scope = transition_scope(input, value.scope, next_state)?;
+                validate_fence_identity(input, next_phase)?;
+                if input.completion_evidence.is_some() {
+                    return Err(invalid(
+                        "readiness successor begin cannot carry completion evidence",
+                    ));
+                }
+                let (_, untyped_cancel) = typed_cancel_source(input.cancel_source.as_deref())?;
+                let endpoint = match &value.endpoint {
+                    lib::DriveKey::Bay(bay) => {
+                        crate::DriveKey::new(bay.library_serial.as_str(), bay.bay)
+                    }
+                    lib::DriveKey::Standalone(drive) => crate::DriveKey::Standalone {
+                        drive_serial: drive.drive_serial.as_str().into(),
+                    },
+                };
+                let media_family = match value.media {
+                    Some(lib::MediumFamily::Lto(family)) => Some(family),
+                    _ => None,
+                };
+                let successor = MediaReadinessOperationInput {
+                    operation_id: uuid::Uuid::new_v4(),
+                    run_id: None,
+                    endpoint,
+                    changer_sg: None,
+                    drive_sg: None,
+                    drive_serial: None,
+                    barcode: value.barcode.as_ref().map(|label| label.as_str().into()),
+                    source_slot: value.source_slot,
+                    media_generation: media_family.map(|family| family.generation_number()),
+                    media_family,
+                    phase: input
+                        .phase
+                        .clone()
+                        .unwrap_or_else(|| phase_spelling(next_phase)),
+                    state: input.state.clone(),
+                    dirty_scope: Some(
+                        match scope {
+                            lib::ReadinessScope::Library => "selected-library-snapshot",
+                            lib::ReadinessScope::Endpoint => "drive+tape",
+                        }
+                        .into(),
+                    ),
+                    deadline_at_utc: None,
+                    evidence_path: None,
+                };
+                let predecessor = input.operation_id.to_string();
+                let mut details = transition_presentation(input);
+                if untyped_cancel {
+                    details.push(("cancel_source", "signal"));
+                }
+                details.push(("follows_operation", predecessor.as_str()));
+                self.begin_readiness_inner_locked(
+                    &successor,
+                    false,
+                    None,
+                    details,
+                    Some(value.media),
+                )
+            }
+            _ => Err(invalid("readiness operation is already terminal")),
+        }
+    }
+
+    /// Require an authenticated source without consulting the projection.
+    fn readiness_transition_source_locked(
+        &self,
+        input: &MediaReadinessTransitionInput,
+    ) -> Result<(lib::DecisionRef, lib::ReadinessObserved), RuntimeError> {
+        self.readiness_source_locked(*input.operation_id.as_bytes())?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "readiness transition has no authenticated owner for operation {}",
+                    input.operation_id
+                ))
+            })
+    }
+
     /// Advance explicit producer state using the immutable authenticated owner
     /// and actual captured completion. Missing completion is not inferred from
     /// a display opcode, decoded sense fields, or a diagnostic string.
@@ -402,28 +522,20 @@ impl LibraryRuntime {
         // one `Diagnostic` once the observation is appended. With evidence, the class is what
         // the evidence says and the projection derives it.
         let (cancel_source, untyped_cancel) = typed_cancel_source(input.cancel_source.as_deref())?;
-        if input.completion_evidence.is_none()
-            && (input.last_sense_raw.is_some()
-                || input.last_sense_key.is_some()
-                || input.last_asc.is_some()
-                || input.last_ascq.is_some()
-                || input.last_host_status.is_some()
-                || input.last_driver_status.is_some()
-                || input.target_status.is_some())
-        {
-            return Err(invalid(
-                "readiness transition requires its actual command completion",
-            ));
-        }
+        validate_evidence_columns(input)?;
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
-        let (previous, mut value) = self
-            .readiness_source_locked(*input.operation_id.as_bytes())?
-            .ok_or_else(|| {
-                invalid(format!(
-                    "readiness transition has no authenticated owner for operation {}",
-                    input.operation_id
-                ))
-            })?;
+        let source = self.readiness_transition_source_locked(input)?;
+        self.transition_readiness_locked(input, source, cancel_source, untyped_cancel)
+    }
+
+    /// Share the transition body with the fence funnel under its dispatch guard.
+    fn transition_readiness_locked(
+        &self,
+        input: &MediaReadinessTransitionInput,
+        (previous, mut value): (lib::DecisionRef, lib::ReadinessObserved),
+        cancel_source: Option<lib::CancelSource>,
+        untyped_cancel: bool,
+    ) -> Result<(), RuntimeError> {
         let next_state = state(&input.state)?;
         let next_phase = input
             .phase
@@ -443,46 +555,8 @@ impl LibraryRuntime {
                 "ready observation requires an actual successful readiness probe",
             ));
         }
-        // The scope of an unresolved operation never narrows. An observation that ends the
-        // operation, or that raises a fence, does not ask the row to narrow: it is accepted and
-        // the row keeps its own scope, which is the broader one. A fence is open (`Pending`)
-        // since M-1, but refusing its record would leave unrecorded the very uncertainty it
-        // reports, and its producer names `drive+tape` without knowing whether the row is
-        // Library-scoped. Any other observation that names a narrower scope is still refused.
-        let keeps_row_scope =
-            next_result != lib::ReadinessResult::Pending || is_fence_state(next_state);
-        let next_scope = match input.dirty_scope.as_deref() {
-            None => value.scope,
-            Some("selected-library-snapshot") => lib::ReadinessScope::Library,
-            Some("drive+tape" | "drive")
-                if value.scope == lib::ReadinessScope::Endpoint || keeps_row_scope =>
-            {
-                value.scope
-            }
-            Some("none") if keeps_row_scope => value.scope,
-            _ => {
-                return Err(invalid(
-                    "readiness transition cannot narrow unresolved scope",
-                ))
-            }
-        };
-        if input
-            .last_cdb_opcode
-            .is_some_and(|opcode| Some(opcode) != phase_opcode(next_phase))
-        {
-            return Err(invalid(
-                "readiness opcode cannot be derived from its source phase",
-            ));
-        }
-        if input
-            .quarantine_id
-            .as_deref()
-            .is_some_and(|id| id != format!("mrq-{}", input.operation_id))
-        {
-            return Err(invalid(
-                "readiness quarantine identity is not the operation-derived identity",
-            ));
-        }
+        let next_scope = transition_scope(input, value.scope, next_state)?;
+        validate_fence_identity(input, next_phase)?;
         if value.phase == next_phase
             && value.state == next_state
             && value.scope == next_scope
@@ -530,28 +604,123 @@ impl LibraryRuntime {
         {
             details.push(("phase_spelling", spelling));
         }
-        let (evidence_path, last_error_json, signal) = (
-            input.evidence_path.as_deref(),
-            input.last_error_json.as_deref(),
-            input.signal.as_deref(),
-        );
-        let unproven_transport_class = input
-            .transport_class
-            .as_deref()
-            .filter(|_| input.completion_evidence.is_none());
-        for (key, text) in [
-            ("evidence_path", evidence_path),
-            ("last_error_json", last_error_json),
-            ("signal", signal),
-            ("transport_class", unproven_transport_class),
-        ] {
-            if let Some(text) = text {
-                details.push((key, text));
-            }
-        }
+        details.extend(transition_presentation(input));
         self.record_operation_progress_locked(operation, &details, lib::AuditActor::System);
         Ok(())
     }
+}
+
+/// Reject decoded evidence columns without their captured completion.
+fn validate_evidence_columns(input: &MediaReadinessTransitionInput) -> Result<(), RuntimeError> {
+    if input.completion_evidence.is_none()
+        && (input.last_sense_raw.is_some()
+            || input.last_sense_key.is_some()
+            || input.last_asc.is_some()
+            || input.last_ascq.is_some()
+            || input.last_host_status.is_some()
+            || input.last_driver_status.is_some()
+            || input.target_status.is_some())
+    {
+        return Err(invalid(
+            "readiness transition requires its actual command completion",
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the transition scope rule equally to open heads and Ready successors.
+fn transition_scope(
+    input: &MediaReadinessTransitionInput,
+    scope: lib::ReadinessScope,
+    next_state: lib::ReadinessState,
+) -> Result<lib::ReadinessScope, RuntimeError> {
+    let next_result = readiness_result(next_state);
+    // The scope of an unresolved operation never narrows. An observation that ends the
+    // operation, or that raises a fence, does not ask the row to narrow: it is accepted and
+    // the row keeps its own scope, which is the broader one. A fence is open (`Pending`)
+    // since M-1, but refusing its record would leave unrecorded the very uncertainty it
+    // reports, and its producer names `drive+tape` without knowing whether the row is
+    // Library-scoped. Any other observation that names a narrower scope is still refused.
+    let keeps_row_scope =
+        next_result != lib::ReadinessResult::Pending || is_fence_state(next_state);
+    let next_scope = match input.dirty_scope.as_deref() {
+        None => scope,
+        Some("selected-library-snapshot") => lib::ReadinessScope::Library,
+        Some("drive+tape" | "drive")
+            if scope == lib::ReadinessScope::Endpoint || keeps_row_scope =>
+        {
+            scope
+        }
+        Some("none") if keeps_row_scope => scope,
+        _ => {
+            return Err(invalid(
+                "readiness transition cannot narrow unresolved scope",
+            ))
+        }
+    };
+    Ok(next_scope)
+}
+
+/// Validate the producer opcode and operation-derived quarantine identity.
+fn validate_fence_identity(
+    input: &MediaReadinessTransitionInput,
+    next_phase: lib::ReadinessPhase,
+) -> Result<(), RuntimeError> {
+    if input
+        .last_cdb_opcode
+        .is_some_and(|opcode| Some(opcode) != phase_opcode(next_phase))
+    {
+        return Err(invalid(
+            "readiness opcode cannot be derived from its source phase",
+        ));
+    }
+    if input
+        .quarantine_id
+        .as_deref()
+        .is_some_and(|id| id != format!("mrq-{}", input.operation_id))
+    {
+        return Err(invalid(
+            "readiness quarantine identity is not the operation-derived identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Presentation shared by a transition and a successor begin diagnostic.
+fn transition_presentation(input: &MediaReadinessTransitionInput) -> Vec<(&str, &str)> {
+    let mut details = Vec::new();
+    let (evidence_path, last_error_json, signal) = (
+        input.evidence_path.as_deref(),
+        input.last_error_json.as_deref(),
+        input.signal.as_deref(),
+    );
+    let unproven_transport_class = input
+        .transport_class
+        .as_deref()
+        .filter(|_| input.completion_evidence.is_none());
+    for (key, text) in [
+        ("evidence_path", evidence_path),
+        ("last_error_json", last_error_json),
+        ("signal", signal),
+        ("transport_class", unproven_transport_class),
+    ] {
+        if let Some(text) = text {
+            details.push((key, text));
+        }
+    }
+    details
+}
+
+/// The canonical phase spelling, matching the projection's closed enum spelling.
+fn phase_spelling(value: lib::ReadinessPhase) -> String {
+    let mut text = String::new();
+    for (i, c) in format!("{value:?}").chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            text.push('_');
+        }
+        text.extend(c.to_lowercase());
+    }
+    text
 }
 
 /// The legacy cancel-source spelling as the typed key, and whether it was the CLI's `signal`,

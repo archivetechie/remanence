@@ -856,3 +856,161 @@ fn waited_load_drive_leaves_the_bay_admissible_for_a_write() {
     )
     .unwrap_or_else(|error| panic!("write admission refused: {}", error.message()));
 }
+
+/// A1: an unowned successor fence survives the daemon's real startup twice
+/// without another readiness observation, and remains explicitly releasable.
+#[test]
+fn readiness_successor_fence_survives_two_daemon_starts_and_release() {
+    use remanence_state::{MediaReadinessOperationInput, MediaReadinessTransitionInput};
+    let root = root();
+    let world = seated_world();
+    let transition = |id, phase: &str, state: &str| MediaReadinessTransitionInput {
+        operation_id: id,
+        phase: Some(phase.into()),
+        state: state.into(),
+        dirty_scope: Some("drive+tape".into()),
+        last_cdb_opcode: None,
+        completion_evidence: None,
+        last_sense_raw: None,
+        last_sense_key: None,
+        last_asc: None,
+        last_ascq: None,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: None,
+        cancel_source: None,
+        signal: None,
+        evidence_path: None,
+        last_error_json: None,
+        quarantine_id: None,
+    };
+    let (library_uuid, predecessor, fenced, row) = {
+        let state = root.open();
+        let mut catalog = state.write_handle();
+        let library = world.lock().unwrap().library_snapshot();
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut catalog,
+            [&library],
+            &HashSet::from([SERIAL.to_string()]),
+        )
+        .unwrap();
+        let owner = catalog
+            .begin_typed_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id: uuid::Uuid::new_v4(),
+                run_id: None,
+                endpoint: key(BAY_A),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("DRV-R1C2".into()),
+                barcode: Some("R1C2A01L9".into()),
+                source_slot: Some(0x400),
+                media_generation: Some(9),
+                media_family: Some(remanence_state::LtoGen::Lto9),
+                phase: "readiness_poll".into(),
+                state: "planned".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        let predecessor = uuid::Uuid::parse_str(&owner.operation_id).unwrap();
+        let mut ready = transition(predecessor, "wait_ready_tur", "ready");
+        ready.dirty_scope = Some("none".into());
+        ready.last_cdb_opcode = Some(0);
+        ready.completion_evidence = Some((&CompletionEvidence::success()).into());
+        catalog.record_media_readiness_transition(ready).unwrap();
+        let mut fence = transition(predecessor, "clobber_confirmation", "aborted_unknown");
+        fence.quarantine_id = Some(format!("mrq-{predecessor}"));
+        fence.signal = Some("SIGINT".into());
+        fence.cancel_source = Some("signal".into());
+        let fenced = catalog.record_media_readiness_fence(fence).unwrap();
+        assert_ne!(fenced, predecessor);
+        let row = catalog.media_readiness_operation(fenced).unwrap().unwrap();
+        assert_eq!(row.state, "aborted_unknown");
+        assert_eq!(row.phase, "clobber_confirmation");
+        assert_eq!(row.dirty_scope.as_deref(), Some("drive+tape"));
+        assert_eq!(row.quarantine_id, Some(format!("mrq-{fenced}")));
+        (
+            state.library_runtime().manifest().library_uuid(),
+            predecessor,
+            fenced,
+            row,
+        )
+    };
+    // Read authenticated source records only after the state owner is closed.
+    let observations = || {
+        // The projection worker can retain the authority briefly after StateHandle drops,
+        // as in the adjacent waited-load source-replay test. Bound the teardown wait.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match crate::tests::read_library_records(&root.paths, library_uuid, &mut |record| {
+                record.readiness_observation().cloned()
+            }) {
+                Ok(records) => break records,
+                Err(crate::tests::ChainRead::Busy(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(crate::tests::ChainRead::Busy(errno)) => {
+                    panic!("closed readiness source remains locked: {errno}")
+                }
+                Err(crate::tests::ChainRead::Failed(message)) => panic!("{message}"),
+            }
+        }
+    };
+    let before = observations();
+    assert_eq!(before.len(), 3, "owner, Ready, successor fence");
+    for start in 1..=2 {
+        let (state, api, runtime) = start_daemon(&root, &world, plain)
+            .unwrap_or_else(|error| panic!("startup {start} refused the successor fence: {error}"));
+        assert_eq!(
+            state
+                .catalog()
+                .media_readiness_operation(fenced)
+                .unwrap()
+                .unwrap(),
+            row
+        );
+        assert_eq!(
+            state
+                .catalog()
+                .media_readiness_operation(predecessor)
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready"
+        );
+        runtime.block_on(api.shutdown_drive_pool()).unwrap();
+        drop(api);
+        drop(runtime);
+        drop(state);
+        assert_eq!(observations(), before, "startup {start} appended readiness");
+    }
+    {
+        let state = root.open();
+        let mut catalog = state.write_handle();
+        let mut release = transition(fenced, "quarantine_release", "released");
+        release.dirty_scope = Some("none".into());
+        release.cancel_source = Some("operator".into());
+        release.quarantine_id = Some(format!("mrq-{fenced}"));
+        catalog.record_media_readiness_transition(release).unwrap();
+        assert_eq!(
+            catalog
+                .media_readiness_operation(fenced)
+                .unwrap()
+                .unwrap()
+                .state,
+            "released"
+        );
+        assert!(catalog
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .is_empty());
+    }
+    let released = observations();
+    assert_eq!(released.len(), before.len() + 1);
+    assert_eq!(
+        released.last().unwrap().result,
+        remanence_state::library_log::ReadinessResult::Released
+    );
+}

@@ -9162,12 +9162,14 @@ trait TapeInitStateOps {
         Ok(())
     }
 
-    /// The state the operation's head records now, or `None` when there is no such operation
-    /// (or no readback, as in a dry run). A signal reads it to see whether a fence is already
-    /// the operation's head.
-    fn media_readiness_head_state(&mut self, operation_id: Uuid) -> Result<Option<String>, String> {
-        let _ = operation_id;
-        Ok(None)
+    /// Record a fence and return the operation that holds its quarantine.
+    fn record_media_readiness_fence(
+        &mut self,
+        input: remanence_state::MediaReadinessTransitionInput,
+    ) -> Result<Uuid, String> {
+        let operation_id = input.operation_id;
+        self.record_media_readiness_transition(input)?;
+        Ok(operation_id)
     }
 
     fn media_readiness_admission_conflicts(
@@ -9276,11 +9278,13 @@ impl TapeInitStateOps for remanence_state::StateHandle {
             .map_err(|error| format!("record media readiness transition: {error}"))
     }
 
-    fn media_readiness_head_state(&mut self, operation_id: Uuid) -> Result<Option<String>, String> {
-        self.catalog()
-            .media_readiness_operation(operation_id)
-            .map(|record| record.map(|record| record.state))
-            .map_err(|error| format!("read media readiness operation: {error}"))
+    fn record_media_readiness_fence(
+        &mut self,
+        input: remanence_state::MediaReadinessTransitionInput,
+    ) -> Result<Uuid, String> {
+        self.write_handle()
+            .record_media_readiness_fence(input)
+            .map_err(|error| format!("record media readiness transition: {error}"))
     }
 
     fn media_readiness_admission_conflicts(
@@ -9419,10 +9423,12 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
             .map_err(|error| format!("record media readiness transition: {error}"))
     }
 
-    fn media_readiness_head_state(&mut self, operation_id: Uuid) -> Result<Option<String>, String> {
-        remanence_state::CatalogIndex::media_readiness_operation(self, operation_id)
-            .map(|record| record.map(|record| record.state))
-            .map_err(|error| format!("read media readiness operation: {error}"))
+    fn record_media_readiness_fence(
+        &mut self,
+        input: remanence_state::MediaReadinessTransitionInput,
+    ) -> Result<Uuid, String> {
+        remanence_state::CatalogIndex::record_media_readiness_fence(self, input)
+            .map_err(|error| format!("record media readiness transition: {error}"))
     }
 
     fn media_readiness_admission_conflicts(
@@ -10000,6 +10006,7 @@ fn run_tape_wait_ready_hardware(
                             "wait_ready_tur",
                             signal,
                         )
+                        .map(|_| ())
                     }
                 },
             )
@@ -10418,15 +10425,13 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
             poll
         } else {
             if let Some(signal_name) = signal() {
-                record_media_readiness_signal_transition(
+                let fenced = record_media_readiness_signal_transition(
                     state,
                     operation_id,
                     "readiness_poll",
                     signal_name,
                 )?;
-                return Err(format!(
-                    "media readiness interrupted by {signal_name}; recorded aborted_unknown fence"
-                ));
+                return Err(media_readiness_signal_abort_message(signal_name, fenced));
             }
             attempts = attempts.saturating_add(1);
             let mut readiness = drive.probe_media_readiness(family);
@@ -10456,15 +10461,13 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
         };
 
         if let Some(signal_name) = signal() {
-            record_media_readiness_signal_transition(
+            let fenced = record_media_readiness_signal_transition(
                 state,
                 operation_id,
                 "readiness_poll",
                 signal_name,
             )?;
-            return Err(format!(
-                "media readiness interrupted by {signal_name}; recorded aborted_unknown fence"
-            ));
+            return Err(media_readiness_signal_abort_message(signal_name, fenced));
         }
 
         if wait
@@ -10527,15 +10530,13 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
         let mut remaining = std::cmp::min(sleep_for, timeout.saturating_sub(elapsed));
         while remaining > StdDuration::ZERO {
             if let Some(signal_name) = signal() {
-                record_media_readiness_signal_transition(
+                let fenced = record_media_readiness_signal_transition(
                     state,
                     operation_id,
                     "readiness_poll",
                     signal_name,
                 )?;
-                return Err(format!(
-                    "media readiness interrupted by {signal_name}; recorded aborted_unknown fence"
-                ));
+                return Err(media_readiness_signal_abort_message(signal_name, fenced));
             }
             let chunk = std::cmp::min(SIGNAL_SLEEP_SLICE, remaining);
             media_readiness_sleep(chunk);
@@ -10747,23 +10748,15 @@ fn media_readiness_signal_transition(
     }
 }
 
-/// Record the `aborted_unknown` a signal leaves. When the operation's head is already a fence,
-/// that fence is the durable record of the uncertain outcome and a signal adds nothing to it (only
-/// a release may follow a fence), so nothing is recorded; the caller still returns the signal-abort
-/// message.
+/// Record a signal fence through the runtime funnel and return the quarantine's
+/// operation id, including a successor when readiness already completed.
 fn record_media_readiness_signal_transition<S: TapeInitStateOps>(
     state: &mut S,
     operation_id: Uuid,
     phase: &str,
     signal: &str,
-) -> Result<(), String> {
-    if state
-        .media_readiness_head_state(operation_id)?
-        .is_some_and(|head| media_readiness_state_requires_release(head.as_str()))
-    {
-        return Ok(());
-    }
-    state.record_media_readiness_transition(media_readiness_signal_transition(
+) -> Result<Uuid, String> {
+    state.record_media_readiness_fence(media_readiness_signal_transition(
         operation_id,
         phase,
         signal,
@@ -10783,12 +10776,13 @@ where
     let Some(signal) = signal() else {
         return Ok(());
     };
-    record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
-    Err(media_readiness_signal_abort_message(signal))
+    let fenced = record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
+    Err(media_readiness_signal_abort_message(signal, fenced))
 }
 
-fn media_readiness_signal_abort_message(signal: &str) -> String {
-    format!("media readiness interrupted by {signal}; recorded aborted_unknown fence")
+/// Preserve signal exit-code recognition and name the operation holding the fence.
+fn media_readiness_signal_abort_message(signal: &str, fenced: Uuid) -> String {
+    format!("media readiness interrupted by {signal}; recorded aborted_unknown fence; quarantine mrq-{fenced}")
 }
 
 fn media_readiness_error_is_signal_abort(message: &str) -> bool {
@@ -10836,13 +10830,15 @@ fn record_media_readiness_command_failure<S: TapeInitStateOps>(
     error: &str,
     completion: remanence_library::outcome::Completion,
 ) -> Result<(), String> {
-    state.record_media_readiness_transition(media_readiness_mechanical_transition(
-        operation_id,
-        phase,
-        media_readiness_command_failure_state(completion),
-        cdb_opcode,
-        Some(error.to_string()),
-    ))
+    state
+        .record_media_readiness_fence(media_readiness_mechanical_transition(
+            operation_id,
+            phase,
+            media_readiness_command_failure_state(completion),
+            cdb_opcode,
+            Some(error.to_string()),
+        ))
+        .map(|_| ())
 }
 
 fn record_media_readiness_signal_or_mechanical_failure<S: TapeInitStateOps>(
@@ -10855,10 +10851,10 @@ fn record_media_readiness_signal_or_mechanical_failure<S: TapeInitStateOps>(
     signal: Option<&str>,
 ) -> Result<Option<String>, String> {
     if let Some(signal) = signal {
-        record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
-        return Ok(Some(media_readiness_signal_abort_message(signal)));
+        let fenced = record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
+        return Ok(Some(media_readiness_signal_abort_message(signal, fenced)));
     }
-    state.record_media_readiness_transition(media_readiness_mechanical_transition(
+    state.record_media_readiness_fence(media_readiness_mechanical_transition(
         operation_id,
         phase,
         mechanical_state,
@@ -10878,8 +10874,8 @@ fn record_media_readiness_signal_or_command_failure<S: TapeInitStateOps>(
     signal: Option<&str>,
 ) -> Result<Option<String>, String> {
     if let Some(signal) = signal {
-        record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
-        return Ok(Some(media_readiness_signal_abort_message(signal)));
+        let fenced = record_media_readiness_signal_transition(state, operation_id, phase, signal)?;
+        return Ok(Some(media_readiness_signal_abort_message(signal, fenced)));
     }
     record_media_readiness_command_failure(
         state,
@@ -12819,13 +12815,13 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             Ok(confirmed) => confirmed,
             Err(error) => {
                 if let Some(signal) = signal_guard.requested_signal_name() {
-                    record_media_readiness_signal_transition(
+                    let fenced = record_media_readiness_signal_transition(
                         state,
                         operation_id,
                         "clobber_confirmation",
                         signal,
                     )?;
-                    return Err(media_readiness_signal_abort_message(signal));
+                    return Err(media_readiness_signal_abort_message(signal, fenced));
                 }
                 return Err(error);
             }
@@ -21138,6 +21134,16 @@ mod tests {
         )
         .expect_err("a signal aborts the readiness flow");
         assert!(media_readiness_error_is_signal_abort(&err), "{err}");
+        assert!(
+            err.contains(&format!("quarantine mrq-{operation_id}")),
+            "{err}"
+        );
+        let active = state
+            .catalog()
+            .list_active_media_readiness_operations(None)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].operation_id, operation_id.to_string());
         let row = state
             .write_handle()
             .media_readiness_operation(operation_id)
@@ -21662,7 +21668,10 @@ mod tests {
             .err()
             .expect("a signal aborts the readiness flow");
         assert!(media_readiness_error_is_signal_abort(&message), "{message}");
-        assert_eq!(message, media_readiness_signal_abort_message("SIGINT"));
+        assert_eq!(
+            message,
+            media_readiness_signal_abort_message("SIGINT", init.operation_id)
+        );
         assert_eq!(
             tape_wait_ready_failure_from_poll_error(message).exit_code,
             130
@@ -21736,6 +21745,224 @@ mod tests {
             false,
         );
         assert_eq!(classify(&initializing, true).state, "becoming_ready");
+    }
+
+    /// Successful TUR completion for tests that already created a readiness owner.
+    fn test_ready_readiness_transition(id: Uuid) -> remanence_state::MediaReadinessTransitionInput {
+        let mut ready =
+            media_readiness_mechanical_transition(id, "wait_ready_tur", "ready", Some(0), None);
+        ready.dirty_scope = Some("none".into());
+        ready.quarantine_id = None;
+        ready.completion_evidence =
+            Some((&remanence_library::outcome::CompletionEvidence::success()).into());
+        ready
+    }
+
+    /// Reach Ready through tape init's actual first-probe recorder on the model drive.
+    #[cfg(target_os = "linux")]
+    fn ready_tape_init_for_readiness_successor() -> VirtualTapeInit {
+        let mut init = virtual_tape_init(0);
+        let readiness = init.drive.probe_media_readiness(MediaFamily::Lto9OrLater);
+        assert!(
+            readiness.is_ready(),
+            "the loaded model tape is ready: {readiness:?}"
+        );
+        poll_already_observed_media_readiness(
+            readiness,
+            "already_loaded_tur",
+            init.operation_id,
+            &mut init.state,
+            false,
+        )
+        .unwrap();
+        assert_eq!(init.row().state, "ready");
+        init
+    }
+
+    /// C1: the clobber prompt's signal quarantines a successor, which admission
+    /// sees exactly once and the ordinary quarantine release can end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readiness_signal_after_ready_quarantines_and_releases_a_successor() {
+        let mut init = ready_tape_init_for_readiness_successor();
+        let predecessor = init.row();
+        let history = init.history();
+        let fenced = record_media_readiness_signal_transition(
+            &mut init.state,
+            init.operation_id,
+            "clobber_confirmation",
+            "SIGINT",
+        )
+        .unwrap();
+        assert_ne!(fenced, init.operation_id);
+        let message = media_readiness_signal_abort_message("SIGINT", fenced);
+        assert_eq!(message, format!("media readiness interrupted by SIGINT; recorded aborted_unknown fence; quarantine mrq-{fenced}"));
+        assert_eq!(init.row(), predecessor);
+        assert_eq!(init.history(), history);
+        let mut catalog = init.state.write_handle();
+        let row = catalog.media_readiness_operation(fenced).unwrap().unwrap();
+        assert_eq!(row.state, "aborted_unknown");
+        assert_eq!(row.phase, "clobber_confirmation");
+        assert_eq!(row.dirty_scope.as_deref(), Some("drive+tape"));
+        assert_eq!(row.library_serial, predecessor.library_serial);
+        assert_eq!(row.drive_element, predecessor.drive_element);
+        assert_eq!(row.barcode, predecessor.barcode);
+        assert_eq!(row.quarantine_id, Some(format!("mrq-{fenced}")));
+        let conflicts = catalog
+            .media_readiness_admission_conflicts("LIB-A", Some(0x0100), Some("AOX030L9"), false)
+            .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].operation_id, fenced.to_string());
+        let active = catalog
+            .list_active_media_readiness_operations(None)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].operation_id, fenced.to_string());
+        catalog
+            .record_media_readiness_transition(media_readiness_release_transition(
+                fenced,
+                "operator checked the drive",
+            ))
+            .unwrap();
+        assert_eq!(
+            catalog
+                .media_readiness_operation(fenced)
+                .unwrap()
+                .unwrap()
+                .state,
+            "released"
+        );
+        assert!(catalog
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// C3: unknown write-gate completion after Ready records a transport fence
+    /// without changing the predecessor's proof of readiness.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readiness_write_gate_failure_after_ready_begins_a_successor() {
+        let mut init = ready_tape_init_for_readiness_successor();
+        let predecessor = init.row();
+        assert_eq!(
+            record_media_readiness_signal_or_command_failure(
+                &mut init.state,
+                init.operation_id,
+                "apply_init_write_gate",
+                None,
+                "write gate completion unknown",
+                remanence_library::outcome::Completion::Unknown,
+                None
+            ),
+            Ok(None)
+        );
+        assert_eq!(init.row(), predecessor);
+        let active = init
+            .state
+            .catalog()
+            .list_active_media_readiness_operations(None)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        let row = &active[0];
+        assert_ne!(row.operation_id, init.operation_id.to_string());
+        assert_eq!(row.state, "transport_unknown");
+        assert_eq!(row.phase, "apply_init_write_gate");
+        assert_eq!(row.dirty_scope.as_deref(), Some("drive+tape"));
+        assert_eq!(row.library_serial, predecessor.library_serial);
+        assert_eq!(row.drive_element, predecessor.drive_element);
+        assert_eq!(row.barcode, predecessor.barcode);
+        assert_eq!(row.quarantine_id, Some(format!("mrq-{}", row.operation_id)));
+    }
+
+    /// C5: a later command failure cannot replace the fence already on the head.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readiness_command_failure_on_a_fenced_head_records_nothing() {
+        let mut init = virtual_tape_init(1);
+        init.probe_and_poll("already_loaded_tur", false, || None)
+            .unwrap();
+        assert_eq!(init.row().state, "terminal_error");
+        let history = init.history();
+        let row = init.row();
+        assert_eq!(
+            record_media_readiness_signal_or_command_failure(
+                &mut init.state,
+                init.operation_id,
+                "rewind_before_bot_read",
+                Some(0x01),
+                "rewind failed",
+                remanence_library::outcome::Completion::Unknown,
+                None
+            ),
+            Ok(None)
+        );
+        assert_eq!(init.history(), history);
+        assert_eq!(init.row(), row);
+    }
+
+    /// C6: wait-ready uses the same successor rule after its Ready TUR and
+    /// continues to report signal exit code 130.
+    #[test]
+    fn readiness_wait_ready_post_ready_signal_begins_a_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, state) = runtime_backed_state(temp.path());
+        let mut catalog = state.write_handle();
+        let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
+        let args = TapeWaitReadyArgs {
+            endpoint: None,
+            resume: None,
+            barcode: Some("AOX030L9".into()),
+            drive_element: None,
+            already_loaded: false,
+            wait: true,
+            timeout: StdDuration::from_secs(1),
+            poll: StdDuration::ZERO,
+            config: temp.path().join("config.toml"),
+            library: Some("LIB-A".into()),
+            json: false,
+        };
+        let (id, bay, _) =
+            resolve_wait_ready_operation(&library, &args, &config, &mut catalog).unwrap();
+        assert_eq!(bay, 0x0100);
+        catalog
+            .record_media_readiness_transition(test_ready_readiness_transition(id))
+            .unwrap();
+        let predecessor = catalog.media_readiness_operation(id).unwrap().unwrap();
+        let message = record_media_readiness_signal_if_requested(
+            &mut catalog,
+            id,
+            "after_wait_ready_tur",
+            || Some("SIGTERM"),
+        )
+        .unwrap_err();
+        assert!(media_readiness_error_is_signal_abort(&message), "{message}");
+        let active = catalog
+            .list_active_media_readiness_operations(None)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        let row = &active[0];
+        assert_ne!(row.operation_id, id.to_string());
+        assert_eq!(row.state, "aborted_unknown");
+        assert_eq!(row.phase, "after_wait_ready_tur");
+        assert_eq!(row.dirty_scope.as_deref(), Some("drive+tape"));
+        assert_eq!(row.library_serial, predecessor.library_serial);
+        assert_eq!(row.drive_element, predecessor.drive_element);
+        assert_eq!(row.barcode, predecessor.barcode);
+        assert_eq!(row.quarantine_id, Some(format!("mrq-{}", row.operation_id)));
+        assert!(
+            message.contains(&format!("quarantine mrq-{}", row.operation_id)),
+            "{message}"
+        );
+        assert_eq!(
+            catalog.media_readiness_operation(id).unwrap().unwrap(),
+            predecessor
+        );
+        assert_eq!(predecessor.state, "ready");
+        assert_eq!(
+            tape_wait_ready_failure_from_poll_error(message).exit_code,
+            130
+        );
     }
 
     /// The command phases tape init records with an opcode, through its production recorders on a
@@ -21815,6 +22042,10 @@ mod tests {
             ),
         ] {
             let id = begin(&mut state);
+            state
+                .record_media_readiness_transition(test_ready_readiness_transition(id))
+                .expect("successful TUR before rewind");
+            let predecessor = row(&state, id);
             assert_eq!(
                 record_media_readiness_signal_or_command_failure(
                     &mut state,
@@ -21827,10 +22058,31 @@ mod tests {
                 ),
                 Ok(None)
             );
-            let recorded = row(&state, id);
+            let recorded = state
+                .catalog()
+                .list_active_media_readiness_operations(None)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.phase == phase)
+                .expect("rewind successor fence");
+            assert_ne!(recorded.operation_id, id.to_string());
+            assert_eq!(row(&state, id), predecessor);
+            assert_eq!(predecessor.state, "ready");
             assert_eq!(
                 (recorded.phase.as_str(), recorded.state.as_str()),
                 (phase, expected)
+            );
+            assert_eq!(
+                recorded.last_cdb_opcode, None,
+                "the successor begin carries no completion evidence; 0x01 is the validated input opcode"
+            );
+            assert_eq!(recorded.dirty_scope.as_deref(), Some("drive+tape"));
+            assert_eq!(recorded.library_serial, predecessor.library_serial);
+            assert_eq!(recorded.drive_element, predecessor.drive_element);
+            assert_eq!(recorded.barcode, predecessor.barcode);
+            assert_eq!(
+                recorded.quarantine_id,
+                Some(format!("mrq-{}", recorded.operation_id))
             );
         }
     }

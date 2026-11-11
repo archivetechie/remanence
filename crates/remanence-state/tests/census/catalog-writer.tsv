@@ -57,6 +57,8 @@ crates/remanence-api/src/write_owner/actor_runtime.rs::refresh_actor_changer::wr
 crates/remanence-cli/src/lib.rs::open_tape_init_dry_run_catalog::CatalogReader::empty	1
 # Standalone provision initialized tape with media uses a writer issued by its StateHandle.
 crates/remanence-cli/src/lib.rs::provision_initialized_tape_with_media::write_handle	1
+# Record a readiness fence through the shared runtime.
+crates/remanence-cli/src/lib.rs::record_media_readiness_fence::write_handle	1
 # Persist media readiness operation at the existing audit/projection point.
 crates/remanence-cli/src/lib.rs::record_media_readiness_operation::write_handle	1
 # Persist media readiness transition at the existing audit/projection point.

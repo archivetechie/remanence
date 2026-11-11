@@ -1511,3 +1511,301 @@ fn a_non_fence_observation_cannot_narrow_a_library_scoped_row() {
         lib::ReadinessScope::Endpoint
     );
 }
+
+/// S1: a post-Ready signal begins one fresh, releasable successor and preserves
+/// all authenticated creation facts without extending the predecessor's chain.
+#[test]
+fn readiness_funnel_begins_a_successor_after_ready() {
+    let f = open();
+    let mut input = f.owner();
+    // Also permits the fresh-id red proof to reach the terminal-owner check.
+    input.deadline_at_utc = None;
+    input.source_slot = Some(0x400);
+    input.run_id = Some(uuid::Uuid::new_v4().to_string());
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    f.runtime.transition_readiness(&ready_of(&input)).unwrap();
+    let predecessor = f.observations(&input);
+    let ready = predecessor.last().unwrap();
+    let mut fence = transition_to(&input, "aborted_unknown");
+    fence.phase = Some("clobber_confirmation".into());
+    fence.signal = Some("SIGINT".into());
+    fence.cancel_source = Some("signal".into());
+    fence.transport_class = Some("unknown".into());
+    fence.last_error_json = Some("signal detail".into());
+    fence.evidence_path = Some("evidence/signal".into());
+    let id = f.runtime.record_readiness_fence(&fence).unwrap();
+    assert_ne!(id, input.operation_id);
+    assert_eq!(f.observations(&input), predecessor);
+    let mut successor = input.clone();
+    successor.operation_id = id;
+    let observed = f.observations(&successor);
+    assert_eq!(observed.len(), 1);
+    let head = &observed[0];
+    assert_eq!(head.previous, None);
+    assert_eq!(head.state, lib::ReadinessState::AbortedUnknown);
+    assert_eq!(head.phase, lib::ReadinessPhase::ClobberConfirmation);
+    assert_eq!(head.result, lib::ReadinessResult::Pending);
+    assert_eq!(head.endpoint, ready.endpoint);
+    assert_eq!(head.barcode, ready.barcode);
+    assert_eq!(head.media, ready.media);
+    assert_eq!(head.scope, ready.scope);
+    assert_eq!(head.source_slot, ready.source_slot);
+    assert_eq!(head.limit_ms, None);
+    assert_eq!(head.run, None);
+    assert_eq!(head.evidence, None);
+    assert_eq!(head.cancel_source, None);
+    assert!(head.ready_generation > ready.ready_generation);
+    let progress: Vec<_> = f
+        .progress()
+        .into_iter()
+        .filter(|(_, subject, _)| subject.as_deref() == Some(id.to_string().as_str()))
+        .collect();
+    assert_eq!(progress.len(), 1);
+    for (key, value) in [
+        ("follows_operation", input.operation_id.to_string()),
+        ("signal", "SIGINT".into()),
+        ("cancel_source", "signal".into()),
+        ("transport_class", "unknown".into()),
+        ("last_error_json", "signal detail".into()),
+        ("evidence_path", "evidence/signal".into()),
+    ] {
+        assert!(progress[0].2.contains(&(key.into(), value)));
+    }
+    let row = f.projected(&successor);
+    assert_eq!(row.state, "aborted_unknown");
+    assert_eq!(row.phase, "clobber_confirmation");
+    assert_eq!(row.dirty_scope.as_deref(), Some("drive+tape"));
+    assert_eq!(row.quarantine_id, Some(format!("mrq-{id}")));
+    assert_eq!(f.projected(&input).state, "ready");
+    f.runtime
+        .transition_readiness(&release_of(&successor))
+        .unwrap();
+    assert_eq!(
+        f.observations(&successor).last().unwrap().result,
+        lib::ReadinessResult::Released
+    );
+    assert_eq!(
+        f.runtime.readiness_load_attempts(*id.as_bytes()).unwrap(),
+        0
+    );
+}
+
+/// S2: on a waiting head the funnel appends exactly the ordinary transition.
+#[test]
+fn readiness_funnel_on_an_open_head_matches_transition() {
+    let funnel = open();
+    let direct = open();
+    let mut a = funnel.owner();
+    a.state = "becoming_ready".into();
+    let mut b = direct.owner();
+    b.state = a.state.clone();
+    funnel.runtime.begin_owned_readiness(&a).unwrap();
+    direct.runtime.begin_owned_readiness(&b).unwrap();
+    let fa = transition_to(&a, "terminal_error");
+    let fb = transition_to(&b, "terminal_error");
+    assert_eq!(
+        funnel.runtime.record_readiness_fence(&fa).unwrap(),
+        a.operation_id
+    );
+    direct.runtime.transition_readiness(&fb).unwrap();
+    let records = funnel.observations(&a);
+    assert_eq!(records.len(), 2);
+    let mut actual = records[1].clone();
+    let expected = direct.observations(&b)[1].clone();
+    assert_eq!(actual.previous.is_some(), expected.previous.is_some());
+    // Identity, clock, deadline rounding and predecessor references differ by fixture.
+    actual.operation = expected.operation;
+    actual.previous = expected.previous;
+    actual.started_unix_ns = expected.started_unix_ns;
+    actual.limit_ms = expected.limit_ms;
+    assert_eq!(actual, expected);
+    assert!(funnel
+        .runtime
+        .test_source_records()
+        .iter()
+        .filter_map(|r| r.readiness_observation())
+        .all(|r| r.operation == *a.operation_id.as_bytes()));
+}
+
+/// S3: an existing fence is the answer even when the new report differs.
+#[test]
+fn readiness_funnel_returns_an_existing_fence_without_appending() {
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    f.runtime
+        .transition_readiness(&transition_to(&input, "terminal_error"))
+        .unwrap();
+    let before = f.runtime.test_source_records();
+    for state in ["terminal_error", "aborted_unknown"] {
+        assert_eq!(
+            f.runtime
+                .record_readiness_fence(&transition_to(&input, state))
+                .unwrap(),
+            input.operation_id
+        );
+        assert_eq!(f.runtime.test_source_records().len(), before.len());
+    }
+}
+
+/// S4: invalid requests and terminal heads cannot append a successor.
+#[test]
+fn readiness_funnel_refuses_invalid_requests_without_appending() {
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    f.runtime.transition_readiness(&ready_of(&input)).unwrap();
+    let before = f.runtime.test_source_records().len();
+    let mut cases = vec![(
+        transition_to(&input, "becoming_ready"),
+        "requires a fence state",
+    )];
+    let mut unknown = transition_to(&input, "terminal_error");
+    unknown.operation_id = uuid::Uuid::new_v4();
+    cases.push((unknown, "no authenticated owner"));
+    let mut evidence = transition_to(&input, "terminal_error");
+    evidence.completion_evidence = ready_of(&input).completion_evidence;
+    cases.push((evidence, "cannot carry completion evidence"));
+    let mut opcode = transition_to(&input, "terminal_error");
+    opcode.last_cdb_opcode = Some(0x01);
+    cases.push((opcode, "opcode cannot be derived"));
+    let mut identity = transition_to(&input, "terminal_error");
+    identity.quarantine_id = Some("mrq-wrong".into());
+    cases.push((identity, "operation-derived identity"));
+    let mut scope = transition_to(&input, "terminal_error");
+    scope.dirty_scope = Some("invalid".into());
+    cases.push((scope, "cannot narrow unresolved scope"));
+    let mut decoded = transition_to(&input, "terminal_error");
+    decoded.last_asc = Some(4);
+    cases.push((decoded, "actual command completion"));
+    for (request, message) in cases {
+        refused(
+            f.runtime.record_readiness_fence(&request).unwrap_err(),
+            message,
+        );
+        assert_eq!(f.runtime.test_source_records().len(), before);
+    }
+    let released = f.owner();
+    f.runtime.begin_owned_readiness(&released).unwrap();
+    f.runtime
+        .transition_readiness(&transition_to(&released, "terminal_error"))
+        .unwrap();
+    f.runtime
+        .transition_readiness(&release_of(&released))
+        .unwrap();
+    let before = f.runtime.test_source_records().len();
+    refused(
+        f.runtime
+            .record_readiness_fence(&transition_to(&released, "terminal_error"))
+            .unwrap_err(),
+        "already terminal",
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+}
+
+/// D1's shared scope rule retains the wider predecessor scope after Ready;
+/// an omitted phase retains the predecessor phase as an ordinary transition does.
+#[test]
+fn readiness_funnel_successor_keeps_library_scope_and_inherited_phase() {
+    let f = open();
+    let input = library_scoped_owner(&f, "planned");
+    f.runtime.transition_readiness(&ready_of(&input)).unwrap();
+    let id = f
+        .runtime
+        .record_readiness_fence(&transition_to(&input, "terminal_error"))
+        .unwrap();
+    let mut successor = input.clone();
+    successor.operation_id = id;
+    let head = f.observations(&successor).pop().unwrap();
+    assert_eq!(head.scope, lib::ReadinessScope::Library);
+    assert_eq!(head.phase, lib::ReadinessPhase::WaitReadyTur);
+}
+
+/// S5: the catalog returns the successor identity and notifies its observer;
+/// fixtures retain the legacy transition and leave an existing fence unchanged.
+#[test]
+fn readiness_funnel_catalog_routes_and_notifies() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug, Default)]
+    struct Observer(AtomicUsize);
+    impl crate::index::MediaReadinessObserver for Observer {
+        fn changed(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    f.runtime.transition_readiness(&ready_of(&input)).unwrap();
+    let mut catalog = crate::projector::open(&f.paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(f.runtime.clone())
+        .write_handle();
+    let observer = Arc::new(Observer::default());
+    catalog.set_readiness_observer(observer.clone());
+    let mut fence = transition_to(&input, "aborted_unknown");
+    fence.phase = Some("clobber_confirmation".into());
+    let id = catalog.record_media_readiness_fence(fence).unwrap();
+    assert_ne!(id, input.operation_id);
+    assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        catalog
+            .media_readiness_operation(input.operation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "ready"
+    );
+    let row = catalog.media_readiness_operation(id).unwrap().unwrap();
+    assert_eq!(row.state, "aborted_unknown");
+    assert_eq!(row.phase, "clobber_confirmation");
+    assert_eq!(row.quarantine_id, Some(format!("mrq-{id}")));
+    assert_eq!(
+        row.deadline_at_utc, None,
+        "successor discards the finite deadline"
+    );
+
+    let fixture_path = f.paths.state_dir.join("fixture.sqlite");
+    let mut fixture = crate::projector::open(&fixture_path)
+        .unwrap()
+        .write_handle();
+    fixture
+        .record_media_readiness_operation(input.clone())
+        .unwrap();
+    assert_eq!(
+        fixture
+            .record_media_readiness_fence(transition_to(&input, "terminal_error"))
+            .unwrap(),
+        input.operation_id
+    );
+    let row = fixture
+        .media_readiness_operation(input.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "terminal_error");
+    let history_count = || {
+        rusqlite::Connection::open(&fixture_path)
+            .unwrap()
+            .query_row(
+                "select count(*) from media_readiness_transitions",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let before = history_count();
+    assert_eq!(
+        fixture
+            .record_media_readiness_fence(transition_to(&input, "aborted_unknown"))
+            .unwrap(),
+        input.operation_id
+    );
+    assert_eq!(history_count(), before);
+    assert_eq!(
+        fixture
+            .media_readiness_operation(input.operation_id)
+            .unwrap()
+            .unwrap(),
+        row
+    );
+}

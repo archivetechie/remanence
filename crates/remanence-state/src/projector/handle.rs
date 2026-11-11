@@ -116,6 +116,49 @@ impl CatalogIndex {
             "readiness requires shared LibraryAuthority".into(),
         ))
     }
+    /// Record a readiness fence and return the operation holding its quarantine.
+    /// The runtime decides from authenticated history under its dispatch lock.
+    pub fn record_media_readiness_fence(
+        &mut self,
+        input: MediaReadinessTransitionInput,
+    ) -> Result<Uuid, StateError> {
+        if let Some(runtime) = self.library_runtime() {
+            let operation = runtime
+                .record_readiness_fence(&input)
+                .map_err(readiness_error)?;
+            if let Some(observer) = self.readiness_observer.as_deref() {
+                observer.changed();
+            }
+            return Ok(operation);
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            let operation = input.operation_id;
+            if self
+                .media_readiness_operation(operation)?
+                .is_some_and(|row| {
+                    matches!(
+                        row.state.as_str(),
+                        "aborted_unknown"
+                            | "timeout_unknown"
+                            | "transport_unknown"
+                            | "terminal_error"
+                            | "reservation_conflict"
+                    )
+                })
+            {
+                return Ok(operation);
+            }
+            self.with_core(|core| {
+                core.record_media_readiness_transition(self.readiness_observer.as_deref(), input)
+            })?;
+            Ok(operation)
+        }
+        #[cfg(not(any(test, feature = "fixtures")))]
+        Err(StateError::ConfigInvalid(
+            "readiness requires shared LibraryAuthority".into(),
+        ))
+    }
     /// Count the SSC LOAD attempts recorded for a media-readiness operation
     /// since its most recent `ready` transition.
     ///
