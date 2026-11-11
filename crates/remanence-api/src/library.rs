@@ -3760,7 +3760,7 @@ mod tests {
             &state.library_service(),
             Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
-quarantine_id: fence.quarantine_id,
+                quarantine_id: fence.quarantine_id,
                 acknowledgment: "drive verified".into(),
             }),
         )

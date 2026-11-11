@@ -457,30 +457,46 @@ fn l1a_fresh_retired_and_zero_floor() {
     assert_eq!(f.raises(B), raises);
 }
 
-/// Only cause 14 suppresses native projection; an unrelated tape fence must catch up.
+/// Only cause 14 suppresses projection; every other admitted tape cause must catch up.
 #[test]
 fn l1a_other_tape_fences_do_not_skip_projection() {
     let mut f = Fixture::new();
     f.provision(T);
     let (_, before) = f.native(T, false);
-    f.rt()
-        .append(|a, v| {
-            a.fence_raised(
-                lib::FenceRaised {
-                    kind: lib::FenceKind::Write,
-                    scope: lib::FenceScope::Tape(tape(T)),
-                    cause: lib::FenceCause::TransferError,
-                    evidence: None,
-                    at: None,
-                    operation: None,
-                    detail: lib::Bounded(vec![]),
-                },
-                lib::AuditActor::System,
-                lib::SourceLayer::Layer4,
-                v,
-            )
-        })
-        .unwrap();
+    for cause in [
+        lib::FenceCause::PartialBatch,
+        lib::FenceCause::TransferError,
+        lib::FenceCause::CloseoutCheckMismatch,
+        lib::FenceCause::SupersedeTailFailed,
+        lib::FenceCause::StandaloneWriteLostByRestart,
+        lib::FenceCause::AppendAdmissionRefused,
+        lib::FenceCause::ResetUnitAttention,
+        lib::FenceCause::PositionDrift,
+        lib::FenceCause::AuthorityAmbiguous,
+        lib::FenceCause::SessionSuffixContradiction,
+        lib::FenceCause::CloseoutReadContradiction,
+        lib::FenceCause::Cleaning,
+        lib::FenceCause::CheckpointBarrierFailed,
+    ] {
+        f.rt()
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(tape(T)),
+                        cause,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+    }
     f.close();
     let tail = f.tail_without_runtime(T, B);
     assert!(tail.log_reference().0 > before.log_reference().0);
@@ -510,9 +526,7 @@ fn l1a_short_log_basis_skip_and_other_tape_projection() {
         let (prefix, snapshot) = f.native(T, false);
         f.native(B, false);
         let at = f.rt().native_reference(&snapshot).unwrap();
-        if floor {
-            f.name(0, at.clone());
-        }
+        let named_by = floor.then(|| f.name(0, at.clone()));
         let old = f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T].clone();
         f.close();
         std::fs::write(f.path(T), prefix).unwrap();
@@ -529,8 +543,57 @@ fn l1a_short_log_basis_skip_and_other_tape_projection() {
         let raises = f.raises(T);
         assert_eq!(raises.len(), 1);
         let raised = &raises[0].1;
+        let keys: Vec<_> = raised
+            .detail
+            .0
+            .iter()
+            .map(|entry| entry.0.as_str())
+            .collect();
+        let expected = match basis {
+            "floor" => vec![
+                "basis",
+                "floor_digest",
+                "floor_named_by",
+                "floor_sequence",
+                "observed_closed_end",
+                "observed_floor",
+                "observed_last_closed",
+            ],
+            "mark" => vec![
+                "basis",
+                "mark_offset",
+                "mark_sequence",
+                "observed_closed_end",
+                "observed_last_closed",
+                "observed_mark",
+                "source_byte_end",
+                "source_digest",
+            ],
+            "both" => vec![
+                "basis",
+                "floor_digest",
+                "floor_named_by",
+                "floor_sequence",
+                "mark_offset",
+                "mark_sequence",
+                "observed_closed_end",
+                "observed_floor",
+                "observed_last_closed",
+                "observed_mark",
+                "source_byte_end",
+                "source_digest",
+            ],
+            _ => unreachable!(),
+        };
+        assert_eq!(keys, expected, "whole detail key list for {basis}");
         assert_eq!(value(raised, "basis"), Text(basis.into()));
         if floor {
+            assert_eq!(value(raised, "floor_sequence"), Unsigned(at.sequence));
+            assert_eq!(
+                value(raised, "floor_digest"),
+                Bytes(lib::Blob(at.record_digest.to_vec()))
+            );
+            assert_eq!(value(raised, "floor_named_by"), Unsigned(named_by.unwrap()));
             assert_eq!(value(raised, "observed_floor"), Text("behind".into()));
             assert_eq!(raised.at, Some(at));
             assert!(
@@ -1103,6 +1166,76 @@ fn l1b_release_refusal_codes_and_other_causes() {
     l1b_force(&mut f, sequence).unwrap();
     assert!(!l1b_release_record(&f).forced);
     assert!(l1b_refusals(&f).is_empty());
+}
+
+/// Force preserves the exact scope/suffix errors without appending or releasing anything.
+#[test]
+fn l1b_force_preserves_scope_and_suffix_refusals() {
+    for (scope, cause, expected) in [
+        (
+            lib::FenceScope::Drive(lib::DriveKey::Bay(lib::Bay {
+                library_serial: "LIBA0001".into(),
+                bay: 1,
+            })),
+            lib::FenceCause::TransferError,
+            "fence is not tape-scoped",
+        ),
+        (
+            lib::FenceScope::Tape(tape(T)),
+            lib::FenceCause::SessionSuffixContradiction,
+            "suffix fence requires explicit physical tail recovery",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.provision(T);
+        let runtime = f.rt();
+        let raised = lib::FenceRaised {
+            kind: if matches!(scope, lib::FenceScope::Drive(_)) {
+                lib::FenceKind::DriveFault
+            } else {
+                lib::FenceKind::Write
+            },
+            scope,
+            cause,
+            evidence: None,
+            at: None,
+            operation: None,
+            detail: lib::Bounded(vec![]),
+        };
+        let sequence = runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    raised.clone(),
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        let before = runtime.test_source_records().len();
+        let error = runtime
+            .release_tape_fence(
+                &format!("library:{sequence}"),
+                "operator checked evidence",
+                true,
+                lib::AuditActor::System,
+            )
+            .unwrap_err();
+        match error {
+            RuntimeError::State(StateError::ConfigInvalid(message)) => {
+                assert_eq!(message, expected)
+            }
+            other => panic!("unexpected refusal: {other}"),
+        }
+        assert!(l1b_refusals(&f).is_empty());
+        assert_eq!(
+            runtime.test_source_records().len(),
+            before,
+            "force must not append for {expected}"
+        );
+        assert_eq!(runtime.0.authority.active_fence(sequence), Some(raised));
+    }
 }
 
 /// Floor waivers survive only the exact bytes/extent, and an exact restoration

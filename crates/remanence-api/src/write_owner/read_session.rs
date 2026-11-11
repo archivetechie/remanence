@@ -579,7 +579,7 @@ mod admission_tests {
     use remanence_state::library_log as lib;
 
     /// The shared session site chooses the typed first conflict, preserves
-    /// other payloads, and counts either native-loss or independent D3 once.
+    /// other payloads, and counts native-loss or operator-retry D3 once.
     #[test]
     fn l1b_session_admission_payload_precedence_and_count() {
         for case in ["native", "ordinary", "suffix", "contradicted"] {
@@ -607,6 +607,9 @@ mod admission_tests {
             let index = f.index();
             let error = session_open_reject_tape_io_fences(&index, &T, None, "open read session")
                 .unwrap_err();
+            if case == "contradicted" {
+                assert_eq!(error.metadata().get("remanence-retry").unwrap(), "operator");
+            }
             if let Some(code) = expected {
                 assert!(
                     error.message().starts_with(if code == 1 {

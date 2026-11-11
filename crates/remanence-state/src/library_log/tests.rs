@@ -4030,13 +4030,9 @@ fn l1a_active_tape_fences_two_tapes_and_drive() {
     }
 }
 
-/// Store appends and disk replay preserve tape-local active fences across releases.
+/// Every append prefix preserves tape-local active fences identically on disk replay.
 #[test]
 fn l1a_active_tape_fences_live_and_replay() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut log, _) = open(dir.path(), &Present);
-    put(&mut log, provision(1, Some("A")));
-    put(&mut log, provision(2, Some("B")));
     let drive = Body::FenceRaised(FenceRaised {
         detail: Bounded(vec![]),
         kind: FenceKind::DriveFault,
@@ -4058,34 +4054,40 @@ fn l1a_active_tape_fences_live_and_replay() {
         (fence(2), vec![], vec![11]),
         (release(11), vec![], vec![]),
     ];
-    for (body, one, two) in steps {
-        put(&mut log, body);
-        for (id, expected) in [(1, one), (2, two), (3, vec![])] {
-            let actual: Vec<_> = log
-                .state()
-                .fold
-                .active_tape_fences(&tape(id).uuid)
-                .map(|(n, raise)| {
-                    assert_eq!(raise.scope, FenceScope::Tape(tape(id)));
-                    n
-                })
-                .collect();
-            assert_eq!(actual, expected);
+    for k in 1..=steps.len() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(dir.path(), &Present);
+        put(&mut log, provision(1, Some("A")));
+        put(&mut log, provision(2, Some("B")));
+        for (body, one, two) in steps[..k].iter().cloned() {
+            put(&mut log, body);
+            for (id, expected) in [(1, one), (2, two), (3, vec![])] {
+                let actual: Vec<_> = log
+                    .state()
+                    .fold
+                    .active_tape_fences(&tape(id).uuid)
+                    .map(|(n, raise)| {
+                        assert_eq!(raise.scope, FenceScope::Tape(tape(id)));
+                        n
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+            }
         }
+        let live = log.state().fold.clone();
+        drop(log);
+        let replay = replay(dir.path(), LOG, &Present).unwrap();
+        assert!(replay.refusal.is_none());
+        for id in [1, 2, 3] {
+            let active = |fold: &LibraryFold| {
+                fold.active_tape_fences(&tape(id).uuid)
+                    .map(|(n, raise)| (n, raise.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(active(&replay.fold), active(&live));
+        }
+        live.assert_same_state(&replay.fold);
     }
-    let live = log.state().fold.clone();
-    drop(log);
-    let replay = replay(dir.path(), LOG, &Present).unwrap();
-    assert!(replay.refusal.is_none());
-    for id in [1, 2, 3] {
-        let active = |fold: &LibraryFold| {
-            fold.active_tape_fences(&tape(id).uuid)
-                .map(|(n, raise)| (n, raise.clone()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(active(&replay.fold), active(&live));
-    }
-    live.assert_same_state(&replay.fold);
 }
 
 /// Forced cause-14 memory survives replay; unrelated releases preserve it and

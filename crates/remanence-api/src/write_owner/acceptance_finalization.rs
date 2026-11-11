@@ -676,7 +676,7 @@ async fn check(
                 assert_eq!(fence.tape_uuid, TAPE);
                 api.library_service().release_tape_io_fence(Request::new(pb::ReleaseTapeIoFenceRequest {
                     force: false,
-quarantine_id: fence.quarantine_id,
+                    quarantine_id: fence.quarantine_id,
                     acknowledgment: "checked committed prefix and fixed finalization plan".into(),
                 })).await.map_err(|e| format!("operator release: {e}"))?;
                 route = "operator release and retry";

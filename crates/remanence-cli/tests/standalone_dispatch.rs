@@ -5019,10 +5019,10 @@ fn l1b_opcodes(f: &VersionFixture) -> Vec<u8> {
         .collect()
 }
 
-/// Each refused command stops at exactly the mount boundary, before RESERVE too.
+/// Fenced and independently contradicted reads stop at mount, before RESERVE too.
 #[test]
 fn l1b_standalone_reads_refuse_before_reserve() {
-    use remanence_state::library_log as lib;
+    use remanence_state::{authority::TapeAuthorityView, library_log as lib};
     let f = VersionFixture::with_parity(false);
     let source = f.root.path().join("saved.txt");
     std::fs::write(&source, b"saved").unwrap();
@@ -5083,8 +5083,8 @@ fn l1b_standalone_reads_refuse_before_reserve() {
     }
     // Identity inquiries, ready/rewind, block limits/mode, locate/position, BOT reads.
     assert_eq!(
-        mount_ops.unwrap(),
-        vec![0x12, 0x12, 0x12, 0x12, 0x00, 0x01, 0x05, 0x1a, 0x92, 0x34, 0x08, 0x08]
+        mount_ops.as_ref().unwrap().as_slice(),
+        &[0x12, 0x12, 0x12, 0x12, 0x00, 0x01, 0x05, 0x1a, 0x92, 0x34, 0x08, 0x08]
     );
     // Ordinary fences remain advisory for data reads.
     let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
@@ -5108,6 +5108,109 @@ fn l1b_standalone_reads_refuse_before_reserve() {
         f.ok(verb);
     }
     assert_eq!(l1b_refusals(&f).len(), before);
+
+    // Keep a satisfied higher floor, but claim earlier evidence that replay
+    // contradicts. This isolates D3 without a cause-14 fence on every CLI open.
+    struct EarlierEvidence(lib::TapeAt);
+    impl lib::TapeView for EarlierEvidence {
+        fn lookup(&self, at: &lib::TapeAt) -> Result<lib::TapeLookup, lib::FoldError> {
+            assert_eq!(at, &self.0);
+            Ok(lib::TapeLookup::Present {
+                digest: at.record_digest,
+                kind: remanence_state::tape_log::Tag::Initialized,
+            })
+        }
+    }
+    let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    for fence in state.write_handle().list_active_tape_io_fences().unwrap() {
+        state
+            .release_tape_io_fence(&fence.quarantine_id, "isolate D3", false)
+            .unwrap();
+    }
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let paths = remanence_state::StatePaths::from_config(f.config(), &config);
+    let runtime = state.library_runtime();
+    let latest = {
+        let authority = remanence_state::TapeAuthority::open(
+            paths.journal_dir.join("tapes"),
+            id,
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let owner = authority.acquire_exclusive().unwrap();
+        runtime.native_reference(&owner.freeze().unwrap()).unwrap()
+    };
+    assert!(latest.sequence > 1);
+    let earlier = lib::TapeAt {
+        sequence: 1,
+        record_digest: [0xa5; 32],
+        ..latest.clone()
+    };
+    let claimed = EarlierEvidence(earlier.clone());
+    for (at, operation, stale) in [(latest, [0x71; 16], false), (earlier, [0x72; 16], true)] {
+        runtime
+            .append(|a, v| {
+                let view: &dyn lib::TapeView = if stale { &claimed } else { v };
+                a.verification_verdict(
+                    lib::VerificationVerdict {
+                        tape: at.tape,
+                        at: Some(at),
+                        outcome: lib::VerificationOutcome::VerifiedComplete,
+                        operation,
+                        damaged: lib::Bounded(vec![]),
+                        unprotected: None,
+                        modes: 1,
+                        edition_digest: None,
+                        progress: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .unwrap();
+    }
+    drop(runtime);
+    drop(state);
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    assert!(state.library_runtime().contradicted(id));
+    assert!(state
+        .write_handle()
+        .tape_io_admission_conflicts(&id, None)
+        .unwrap()
+        .is_empty());
+    drop(state);
+    for reserve in [false, true] {
+        for verb in verbs
+            .iter()
+            .filter(|verb| !verb.starts_with(&["tape", "restore"]))
+        {
+            let mut args = verb.clone();
+            if reserve {
+                args.push("--reserve");
+            }
+            f.world.lock().unwrap().command_log.clear();
+            let before = l1b_refusals(&f).len();
+            let (code, out, errors) = f.run(&args, true);
+            assert_ne!(code, ExitCode::SUCCESS, "{args:?}");
+            assert!(
+                VersionFixture::envelope(&out)["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("ContradictedTapeAdmission: "),
+                "{out}\n{errors}"
+            );
+            let records = l1b_refusals(&f);
+            assert_eq!(records.len(), before + 1);
+            l1b_assert_refusal(records.last().unwrap(), id, 2);
+            assert_eq!(&l1b_opcodes(&f), mount_ops.as_ref().unwrap());
+            assert!(f
+                .index()
+                .tape_io_admission_conflicts(&id, None)
+                .unwrap()
+                .is_empty());
+        }
+    }
 }
 
 /// A new library knows the physical tape's identity but has no dependent records.

@@ -7263,7 +7263,7 @@ mod tests {
             &lowered_state.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
-quarantine_id: fence.quarantine_id,
+                quarantine_id: fence.quarantine_id,
                 acknowledgment: "checked terminal state".into(),
             }),
         )
@@ -8349,7 +8349,7 @@ quarantine_id: fence.quarantine_id,
             &state.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
-quarantine_id: fence.quarantine_id,
+                quarantine_id: fence.quarantine_id,
                 acknowledgment: "checked terminal intent".into(),
             }),
         )

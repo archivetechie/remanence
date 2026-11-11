@@ -985,6 +985,8 @@ mod force_tests {
             .floor_digests
             .insert([9; 32]);
         assert_eq!(decide(&changed, native, None, &proof), Err(FloorConflict));
+        assert!(matches!(proof.source_unchanged(tape.uuid), Ok(true)));
+        assert_eq!(decide(&changed, None, None, &proof), Err(FloorConflict));
         assert_eq!(decide(&fold, None, None, &proof), Err(LogAbsent));
         assert_eq!(
             decide(

@@ -8827,7 +8827,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             &api.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
-quarantine_id: fence.quarantine_id,
+                quarantine_id: fence.quarantine_id,
                 acknowledgment: "verified tape and drive".into(),
             }),
         )
