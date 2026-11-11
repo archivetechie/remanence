@@ -985,6 +985,7 @@ impl CatalogCore {
                                 &format!("library:{}", v.fence),
                                 &v.evidence.0,
                                 &at,
+                                Some(v.forced),
                             )?;
                         }
                         lib::FenceScope::Drive(key) => {

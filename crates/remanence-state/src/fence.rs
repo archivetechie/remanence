@@ -50,7 +50,7 @@ fn project(index: &mut CatalogIndex, record: &AuditRecord) -> Result<(), StateEr
     }
     let ack = text("release_ack")
         .ok_or_else(|| StateError::IndexCorrupt("fence release has no acknowledgment".into()))?;
-    index.complete_tape_io_fence_release(id, ack, &record.timestamp_utc)?;
+    index.complete_tape_io_fence_release(id, ack, &record.timestamp_utc, None)?;
     Ok(())
 }
 

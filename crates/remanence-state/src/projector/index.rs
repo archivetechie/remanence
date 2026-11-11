@@ -733,6 +733,8 @@ pub struct TapeIoFenceRecord {
     pub release_ack: Option<String>,
     /// Durable endpoint when recorded; absent on historical UUID-only evidence.
     pub endpoint: Option<DriveKey>,
+    /// Whether a typed release bypassed the cause's required proof; absent otherwise.
+    pub release_forced: Option<bool>,
 }
 
 /// One raw REOWP wrap descriptor exactly as harvested. The cache stores these unchanged;
@@ -1885,7 +1887,7 @@ impl CatalogCore {
             .conn
             .prepare(
                 "select fence_id, tape_uuid, barcode, state, reason, evidence_json,
-                        quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key
+                        quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key, release_forced
                  from tape_io_fences
                  where state = 'active'
                  order by updated_at_utc desc, fence_id",
@@ -1992,7 +1994,7 @@ impl CatalogCore {
         ack: &str,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
         let now = now_utc()?;
-        self.complete_tape_io_fence_release(quarantine_id, ack, &now)
+        self.complete_tape_io_fence_release(quarantine_id, ack, &now, None)
     }
 
     /// Project durable release evidence without changing its original time or acknowledgment.
@@ -2001,8 +2003,16 @@ impl CatalogCore {
         quarantine_id: &str,
         ack: &str,
         released_at: &str,
+        forced: Option<bool>,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
-        project_fence_release_core(&self.conn, quarantine_id, Some(ack), released_at, true)?;
+        project_fence_release_core(
+            &self.conn,
+            quarantine_id,
+            Some(ack),
+            released_at,
+            true,
+            forced,
+        )?;
         self.tape_io_fence_by_quarantine_id(quarantine_id)
     }
 
@@ -2014,7 +2024,7 @@ impl CatalogCore {
         self.conn
             .query_row(
                 "select fence_id, tape_uuid, barcode, state, reason, evidence_json,
-                        quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key
+                        quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key, release_forced
                  from tape_io_fences
                  where quarantine_id = ?1",
                 params![quarantine_id],
@@ -9178,7 +9188,8 @@ fn project_fence_core(
            evidence_json = excluded.evidence_json,
            created_at_utc = excluded.created_at_utc,
            updated_at_utc = excluded.updated_at_utc,
-           release_ack = null",
+           release_ack = null,
+           release_forced = null",
         params![
             input.tape_uuid.as_slice(),
             input.barcode,
@@ -9200,8 +9211,9 @@ fn project_fence_release_core(
     ack: Option<&str>,
     at: &str,
     active_only: bool,
+    forced: Option<bool>,
 ) -> Result<usize, StateError> {
-    conn.execute("update tape_io_fences set state='released',updated_at_utc=?2,release_ack=?3 where quarantine_id=?1 and (?4=0 or state='active')", params![quarantine_id,at,ack,active_only]).map_err(|e|sqlite_error("project tape fence release",e))
+    conn.execute("update tape_io_fences set state='released',updated_at_utc=?2,release_ack=?3,release_forced=?5 where quarantine_id=?1 and (?4=0 or state='active')", params![quarantine_id,at,ack,active_only,forced]).map_err(|e|sqlite_error("project tape fence release",e))
 }
 
 fn project_tape_io_fence_released(
@@ -9224,6 +9236,7 @@ fn project_tape_io_fence_released(
         detail_text(record, "release_ack").as_deref(),
         &record.timestamp_utc,
         false,
+        None,
     )?;
     if changed == 0 {
         divergences.push(format!(
@@ -12192,6 +12205,12 @@ fn migrate_standalone_evidence(conn: &Connection) -> Result<(), StateError> {
     // Tape fences have always been keyed by UUID. Record an endpoint when known;
     // never fabricate a bay for historical fences that have no endpoint evidence.
     ensure_column(conn, "tape_io_fences", "endpoint_key", "endpoint_key text")?;
+    ensure_column(
+        conn,
+        "tape_io_fences",
+        "release_forced",
+        "release_forced integer",
+    )?;
     Ok(())
 }
 
@@ -12347,6 +12366,12 @@ fn migrate_cleaning_binding_columns(conn: &Connection) -> Result<(), StateError>
         "library_cleaning_runs",
         "home_slot",
         "home_slot integer",
+    )?;
+    ensure_column(
+        conn,
+        "tape_io_fences",
+        "release_forced",
+        "release_forced integer",
     )?;
     Ok(())
 }
@@ -13257,6 +13282,7 @@ fn tape_io_fence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TapeIoFen
             .get::<_, Option<String>>(10)?
             .map(decode_endpoint_sql)
             .transpose()?,
+        release_forced: row.get(11)?,
     })
 }
 
@@ -16183,6 +16209,116 @@ mod tests {
             .expect("lookup")
             .expect("readiness operation must survive rebuild clear");
         assert_eq!(record.barcode.as_deref(), Some("AOX031L9"));
+    }
+
+    /// D16(x): replaying a raise over a released row reactivates it without
+    /// retaining the previous release's acknowledgment or forced evidence.
+    #[test]
+    fn l1b2_reraise_clears_release_forced() {
+        let root = tempfile::tempdir().unwrap();
+        let mut core = CatalogCore::open(root.path().join("catalog.sqlite")).unwrap();
+        for forced in [true, false] {
+            let raise = || TapeIoFenceInput {
+                tape_uuid: [0x51; 16],
+                barcode: Some("L1B251L9".into()),
+                reason: "native_log_behind_projection".into(),
+                evidence_json: None,
+            };
+            project_fence_core(&core.conn, raise(), "library:1", "raised", None).unwrap();
+            let released = core
+                .complete_tape_io_fence_release(
+                    "library:1",
+                    "operator verified",
+                    "released",
+                    Some(forced),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.release_forced, Some(forced));
+            project_fence_core(&core.conn, raise(), "library:1", "raised-again", None).unwrap();
+            let active = core
+                .tape_io_fence_by_quarantine_id("library:1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(active.state, "active");
+            assert_eq!(active.updated_at_utc, "raised-again");
+            assert_eq!(active.release_ack, None);
+            assert_eq!(active.release_forced, None);
+            let raw: Option<i64> = core
+                .conn
+                .query_row(
+                    "select release_forced from tape_io_fences where quarantine_id='library:1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw, None);
+        }
+    }
+
+    /// D16(y): the next production writer open adds the nullable column to a
+    /// current-version pre-column catalog and preserves its existing rows.
+    #[test]
+    fn l1b2_existing_catalog_gains_release_forced_on_writer_open() {
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::parse_config_toml(&format!(
+            r#"
+[daemon]
+state_dir = "{0}/state"
+default_idle_timeout_seconds = 1800
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+[audit]
+dir = "{0}/audit"
+fsync = true
+[index]
+sqlite_path = "{0}/index.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+"#,
+            root.path().display()
+        ))
+        .unwrap();
+        let paths = crate::StatePaths::from_config(root.path().join("config.toml"), &config);
+        drop(crate::StateHandle::open_with_config(paths.clone(), config.clone()).unwrap());
+        let conn = Connection::open(&paths.sqlite_path).unwrap();
+        conn.execute_batch(
+            "alter table tape_io_fences drop column release_forced;
+             insert into tape_io_fences(tape_uuid,state,reason,quarantine_id,created_at_utc,updated_at_utc,release_ack)
+             values(X'51515151515151515151515151515151','active','partial_batch','historical-active','raised','raised',null),
+                   (X'52525252525252525252525252525252','released','partial_batch','historical-released','raised','released','ack');"
+        ).unwrap();
+        assert!(!table_column_exists(&conn, "tape_io_fences", "release_forced").unwrap());
+        assert_eq!(
+            conn.query_row("pragma user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let query = "select quarantine_id,state,release_ack,endpoint_key from tape_io_fences order by quarantine_id";
+        let before = migration_rows(&conn, query);
+        let state = crate::StateHandle::open_with_config(paths, config).unwrap();
+        assert!(table_column_exists(&conn, "tape_io_fences", "release_forced").unwrap());
+        assert_eq!(migration_rows(&conn, query), before);
+        for id in ["historical-active", "historical-released"] {
+            assert_eq!(
+                state
+                    .catalog()
+                    .tape_io_fence_by_quarantine_id(id)
+                    .unwrap()
+                    .unwrap()
+                    .release_forced,
+                None
+            );
+        }
+        let nonnull: i64 = conn
+            .query_row(
+                "select count(*) from tape_io_fences where release_forced is not null",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nonnull, 0);
     }
 
     #[test]

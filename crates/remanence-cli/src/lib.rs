@@ -8583,6 +8583,7 @@ fn tape_io_fence_json(record: &remanence_state::TapeIoFenceRecord) -> Value {
         "created_at_utc": record.created_at_utc.as_str(),
         "updated_at_utc": record.updated_at_utc.as_str(),
         "release_ack": record.release_ack.as_deref(),
+        "forced": record.release_forced,
     })
 }
 
@@ -22044,6 +22045,218 @@ mod tests {
         );
     }
 
+    /// Exercise real log-loss detection and the CLI release entry, retaining its
+    /// JSON alongside the durable identities for the visibility/rebuild checks.
+    fn l1b2_release_fixture(
+        config: &Path,
+    ) -> (remanence_state::StatePaths, Vec<String>, Vec<Value>) {
+        use remanence_state::{authority::TapeAuthorityView, library_log as lib};
+        let id = [0x51; 16];
+        let parsed = remanence_state::load_config(config).unwrap();
+        let paths = remanence_state::StatePaths::from_config(config, &parsed);
+        let mut state =
+            remanence_state::StateHandle::open_with_config(paths.clone(), parsed).unwrap();
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "CLI051L9".into(),
+                block_size: 262144,
+                parity: remanence_api::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let path = paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple()));
+        let short = {
+            let authority = remanence_state::TapeAuthority::open(
+                paths.journal_dir.join("tapes"),
+                id,
+                &paths.sqlite_path,
+            )
+            .unwrap();
+            let mut owner = authority.acquire_exclusive().unwrap();
+            owner
+                .publish_initialized(
+                    262144,
+                    None,
+                    remanence_state::tape_log::CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+            let short = fs::read(&path).unwrap();
+            owner
+                .open_session(id, "2026-11-11T00:00:00Z".into())
+                .unwrap();
+            owner
+                .end_session(
+                    id,
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionEndReason::CleanClose,
+                    None,
+                    std::iter::empty(),
+                )
+                .unwrap();
+            state
+                .library_runtime()
+                .refresh_native(&owner.freeze().unwrap())
+                .unwrap();
+            state.library_runtime().catch_up().unwrap();
+            short
+        };
+        let full = fs::read(&path).unwrap();
+        drop(state);
+        fs::write(&path, &short).unwrap();
+        let state = remanence_state::StateHandle::open_from_config_file(config).unwrap();
+        let fence = state
+            .catalog()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.tape_uuid == id)
+            .unwrap();
+        drop(state);
+        fs::write(&path, full).unwrap();
+        let active_json = tape_io_fence_json(&fence);
+        let state = remanence_state::StateHandle::open_from_config_file(config).unwrap();
+        let ordinary = state
+            .library_runtime()
+            .append(|a, view| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(lib::TapeRef {
+                            uuid: id,
+                            incarnation: 1,
+                        }),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .unwrap()
+            .sequence;
+        drop(state);
+        let ids = vec![fence.quarantine_id, format!("library:{ordinary}")];
+        let mut output = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let mut args = vec![
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                id.as_str(),
+                "--after-settled-inventory",
+                "--ack",
+                "operator verified inventory",
+                "--config",
+                config.to_str().unwrap(),
+                "--json",
+            ];
+            if index == 0 {
+                args.push("--force");
+            }
+            let cli = Cli::parse_from(args);
+            let RemCommand::Tape {
+                command: RemTapeCommand::Quarantine { command },
+            } = cli.command
+            else {
+                panic!("wrong command")
+            };
+            command.validate_before_discovery().unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                run_tape_quarantine(&command, &mut out, &mut err),
+                ExitCode::SUCCESS,
+                "{}",
+                String::from_utf8_lossy(&err),
+            );
+            output.push(serde_json::from_slice(&out).unwrap());
+        }
+        output.push(active_json);
+        (paths, ids, output)
+    }
+
+    /// D16(v): forced, ordinary and active fences expose true, false and null;
+    /// SQLite retains the corresponding 1/0 values through typed projection.
+    #[test]
+    fn l1b2_forced_release_is_operator_visible() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let (paths, ids, output) = l1b2_release_fixture(&config);
+        let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+        let reader = remanence_state::CatalogReader::open(&paths.sqlite_path).unwrap();
+        for (index, forced) in [true, false].into_iter().enumerate() {
+            assert_eq!(output[index]["schema"], "rem.tape.quarantine.release.v1");
+            assert_eq!(output[index]["kind"], "item");
+            assert_eq!(output[index]["data"]["forced"], json!(forced));
+            let raw: Option<i64> = conn
+                .query_row(
+                    "select release_forced from tape_io_fences where quarantine_id=?1",
+                    [&ids[index]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw, Some(i64::from(forced)));
+            let record = reader
+                .tape_io_fence_by_quarantine_id(&ids[index])
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, "released");
+            assert_eq!(record.release_forced, Some(forced));
+        }
+        assert_eq!(output[2]["state"], "active");
+        assert!(output[2].as_object().unwrap().contains_key("forced"));
+        assert_eq!(output[2]["forced"], Value::Null);
+    }
+
+    /// D16(w): a real offline rebuild preserves both release values. Capture
+    /// the expectation directly from SQL so a broken row mapper cannot mask it.
+    #[test]
+    fn l1b2_offline_rebuild_keeps_release_forced() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let (paths, ids, _) = l1b2_release_fixture(&config);
+        let before = {
+            let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+            ids.iter()
+                .map(|id| {
+                    conn.query_row(
+                        "select release_forced from tape_io_fences where quarantine_id=?1",
+                        [id],
+                        |r| r.get::<_, Option<bool>>(0),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(before, vec![Some(true), Some(false)]);
+        remanence_state::StateHandle::rebuild_projection_from_config_file(&config).unwrap();
+        let reader = remanence_state::CatalogReader::open(&paths.sqlite_path).unwrap();
+        let after = ids
+            .iter()
+            .map(|id| {
+                let record = reader.tape_io_fence_by_quarantine_id(id).unwrap().unwrap();
+                assert_eq!(record.state, "released");
+                record.release_forced
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, before,
+            "offline rebuild must retain typed release evidence"
+        );
+    }
+
     #[test]
     fn tape_quarantine_release_requires_settled_inventory_and_ack() {
         let missing_ack = Cli::try_parse_from([
@@ -29631,6 +29844,7 @@ async fn release_fence_on_channel(
         created_at_utc: record.created_at_utc,
         updated_at_utc: record.updated_at_utc,
         release_ack: record.release_ack,
+        release_forced: None,
     })
 }
 

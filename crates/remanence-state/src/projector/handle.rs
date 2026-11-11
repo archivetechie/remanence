@@ -257,8 +257,11 @@ impl CatalogIndex {
         quarantine_id: &str,
         ack: &str,
         released_at: &str,
+        forced: Option<bool>,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
-        self.with_core(|core| core.complete_tape_io_fence_release(quarantine_id, ack, released_at))
+        self.with_core(|core| {
+            core.complete_tape_io_fence_release(quarantine_id, ack, released_at, forced)
+        })
     }
     /// Fetch one tape-I/O fence by quarantine id.
     pub fn tape_io_fence_by_quarantine_id(
