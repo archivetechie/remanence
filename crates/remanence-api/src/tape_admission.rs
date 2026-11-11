@@ -166,6 +166,30 @@ pub(crate) mod test_support {
         pub fn index(&self) -> CatalogIndex {
             self.state.as_ref().unwrap().write_handle()
         }
+        /// Restart through the production owner after all caller-owned clones drop.
+        pub fn reopen(&mut self) {
+            drop(self.state.take());
+            self.state = Some(
+                StateHandle::open_with_config(self.root.paths().clone(), self.config.clone())
+                    .unwrap(),
+            );
+        }
+        /// Configured public ingress with a pool that needs no hardware at admission.
+        pub fn api_state(&self) -> crate::ApiState {
+            let mut api = crate::ApiState::new_with_config(
+                self.state.as_ref().unwrap().projection_client(),
+                &self.config,
+            )
+            .unwrap();
+            let (changer, _commands) = tokio::sync::mpsc::channel(1);
+            api.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+                "ADMISSION-LIBRARY",
+                changer,
+                Default::default(),
+                Arc::new(Default::default()),
+            ));
+            api
+        }
         pub fn raise(&self, tape: lib::Id, cause: lib::FenceCause) -> u64 {
             self.state
                 .as_ref()
@@ -408,5 +432,182 @@ pub(crate) mod test_support {
                 )
             ])
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Public daemon ingress must use the owner's typed refusal authority.
+    use super::{lib, test_support::*};
+    use crate::pb;
+    use pb::library_service_server::LibraryService;
+    use pb::write_session_service_server::WriteSessionService;
+    use remanence_state::authority::TapeAuthorityView;
+    use tonic::{Code, Request};
+
+    /// Reach admission through the same TapeTarget RPC as a daemon client.
+    async fn open_tape(api: &crate::ApiState, tape: lib::Id) -> tonic::Status {
+        api.write_session_service()
+            .open_write_session(Request::new(pb::OpenWriteSessionRequest {
+                target: Some(pb::open_write_session_request::Target::TapeTarget(
+                    pb::TapeTarget {
+                        tape_uuid: tape.to_vec(),
+                        mount_if_needed: true,
+                        required_pool_id: "admission".into(),
+                        allow_unpooled: false,
+                    },
+                )),
+                body_format: Some("rem-object-v1".into()),
+                idempotency_key: None,
+                recover_session_id: None,
+            }))
+            .await
+            .expect_err("admission must refuse before mounting")
+    }
+
+    /// A forced release remembers restoration, but cannot authorize a later loss.
+    #[tokio::test]
+    async fn deleted_log_after_forced_release_is_refused_and_recorded() {
+        let mut f = Fixture::new();
+        let path = f
+            .root
+            .paths()
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", uuid::Uuid::from_bytes(T).simple()));
+        let short = {
+            let runtime = f.state.as_ref().unwrap().library_runtime();
+            let authority = remanence_state::TapeAuthority::open(
+                f.root.paths().journal_dir.join("tapes"),
+                T,
+                &f.root.paths().sqlite_path,
+            )
+            .unwrap();
+            let mut owner = authority.acquire_exclusive().unwrap();
+            owner
+                .publish_initialized(
+                    262144,
+                    None,
+                    remanence_state::tape_log::CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+            let short = std::fs::read(&path).unwrap();
+            owner
+                .open_session(T, "2026-11-11T00:00:00Z".into())
+                .unwrap();
+            owner
+                .end_session(
+                    T,
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionEndReason::CleanClose,
+                    None,
+                    std::iter::empty(),
+                )
+                .unwrap();
+            runtime.refresh_native(&owner.freeze().unwrap()).unwrap();
+            runtime.catch_up().unwrap();
+            short
+        };
+        let full = std::fs::read(&path).unwrap();
+        drop(f.state.take());
+        std::fs::write(&path, short).unwrap();
+        f.reopen();
+        let first = f.index().tape_io_admission_conflicts(&T, None).unwrap();
+        assert_eq!(first.len(), 1);
+        let first_id = first[0].quarantine_id.clone();
+        drop(f.state.take());
+        std::fs::write(&path, full).unwrap();
+        f.reopen();
+        let api = f.api_state();
+        let released = api
+            .library_service()
+            .release_tape_io_fence(Request::new(pb::ReleaseTapeIoFenceRequest {
+                quarantine_id: first_id.clone(),
+                acknowledgment: "operator restored exact log".into(),
+                force: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(released.state, "released");
+        drop(api);
+        drop(f.state.take());
+        std::fs::remove_file(&path).unwrap();
+        f.reopen();
+        let api = f.api_state();
+        let conflicts = f.index().tape_io_admission_conflicts(&T, None).unwrap();
+        assert_eq!(conflicts.len(), 1, "deletion must raise the second fence");
+        let fence = &conflicts[0];
+        assert_ne!(fence.quarantine_id, first_id);
+        assert_eq!(fence.state, "active");
+        assert_eq!(
+            f.state
+                .as_ref()
+                .unwrap()
+                .library_runtime()
+                .fence_for_quarantine_id(&fence.quarantine_id)
+                .unwrap()
+                .cause,
+            lib::FenceCause::NativeLogBehindProjection
+        );
+        drop(api);
+        let tape_id = uuid::Uuid::from_bytes(T).to_string();
+        let before = f
+            .refusals()
+            .into_iter()
+            .filter(|d| d.subject_id.as_ref().is_some_and(|s| s.as_str() == tape_id))
+            .count();
+        f.reopen();
+        let api = f.api_state();
+        let error = open_tape(&api, T).await;
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains(&fence.quarantine_id), "{error}");
+        assert!(api
+            .drive_pool
+            .as_ref()
+            .unwrap()
+            .sessions_by_drive()
+            .values()
+            .all(|(_, session)| session.tape_uuid != T));
+        drop(api);
+        let records: Vec<_> = f
+            .refusals()
+            .into_iter()
+            .filter(|d| d.subject_id.as_ref().is_some_and(|s| s.as_str() == tape_id))
+            .collect();
+        assert_eq!(
+            (
+                error.message().contains("TapeLogBehindProjection: "),
+                records.len()
+            ),
+            (true, before + 1),
+            "prefix and refusal count: {error}"
+        );
+        assert_code(records.last().unwrap(), T, 1);
+    }
+
+    /// An unfenced contradicted tape keeps its refusal and records code 2.
+    #[tokio::test]
+    async fn contradicted_tape_ingress_is_refused_and_recorded() {
+        let mut f = Fixture::new();
+        f.contradict(B);
+        let api = f.api_state();
+        let error = open_tape(&api, B).await;
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            format!(
+                "tape {} is not writable: {}",
+                uuid::Uuid::from_bytes(B),
+                crate::WritabilityError::ContradictedTape
+            )
+        );
+        drop(api);
+        let records = f.refusals();
+        assert_eq!(records.len(), 1);
+        assert_code(&records[0], B, 2);
     }
 }

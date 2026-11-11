@@ -142,8 +142,9 @@ pub struct CatalogIndex {
     readiness_observer: Option<Arc<dyn MediaReadinessObserver>>,
 }
 impl CatalogIndex {
-    /// Authority capability from the state owner; absent on read-only readers
-    /// and isolated projection fixtures. No global path-based registry is used.
+    /// Authority capability from the state owner; absent on read-only readers unless
+    /// their owner attached it, and on isolated projection fixtures. No global
+    /// path-based registry is used.
     pub fn library_runtime(&self) -> Option<crate::library_runtime::LibraryRuntime> {
         self.library.clone()
     }
@@ -208,6 +209,11 @@ impl CatalogReader {
             CatalogCore::open(":memory:")?,
             PathBuf::from(":memory:"),
         ))
+    }
+    /// Answer the typed-refusal helpers with the shared library authority.
+    pub fn with_library_runtime(mut self, library: crate::library_runtime::LibraryRuntime) -> Self {
+        self.0.library = Some(library);
+        self
     }
 }
 

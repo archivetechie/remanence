@@ -323,6 +323,11 @@ async fn open_write_session_reserved_for_caller(
         let pool_cfg = state.pool_config(target.pool_id())?;
         let index = remanence_state::CatalogReader::open(state.index_path.as_ref())
             .map_err(|err| Status::internal(err.to_string()))?;
+        let index = if let Some(library) = state.catalog.library_runtime() {
+            index.with_library_runtime(library)
+        } else {
+            index
+        };
         let mut deciding_skips = crate::pool_write::SelectionSkips::default();
         let disposition = match &target {
             WriteSessionTarget::Pool { .. } => {
