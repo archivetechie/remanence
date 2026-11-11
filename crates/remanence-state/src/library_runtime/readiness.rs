@@ -418,7 +418,18 @@ impl LibraryRuntime {
         let source = self.readiness_transition_source_locked(input)?;
         let value = &source.1;
         match value.result {
-            lib::ReadinessResult::Pending if is_fence_state(value.state) => Ok(input.operation_id),
+            lib::ReadinessResult::Pending if is_fence_state(value.state) => {
+                typed_cancel_source(input.cancel_source.as_deref())?;
+                let next_phase = input
+                    .phase
+                    .as_deref()
+                    .map(phase)
+                    .transpose()?
+                    .unwrap_or(value.phase);
+                transition_scope(input, value.scope, next_state)?;
+                validate_fence_identity(input, next_phase)?;
+                Ok(input.operation_id)
+            }
             lib::ReadinessResult::Pending => {
                 let (cancel_source, untyped_cancel) =
                     typed_cancel_source(input.cancel_source.as_deref())?;
@@ -426,12 +437,11 @@ impl LibraryRuntime {
                 Ok(input.operation_id)
             }
             lib::ReadinessResult::Ready => {
-                let next_phase = input
+                let input_phase = input
                     .phase
                     .as_deref()
-                    .map(phase)
-                    .transpose()?
-                    .unwrap_or(value.phase);
+                    .ok_or_else(|| invalid("readiness successor fence requires a phase"))?;
+                let next_phase = phase(input_phase)?;
                 let scope = transition_scope(input, value.scope, next_state)?;
                 validate_fence_identity(input, next_phase)?;
                 if input.completion_evidence.is_some() {
@@ -463,10 +473,7 @@ impl LibraryRuntime {
                     source_slot: value.source_slot,
                     media_generation: media_family.map(|family| family.generation_number()),
                     media_family,
-                    phase: input
-                        .phase
-                        .clone()
-                        .unwrap_or_else(|| phase_spelling(next_phase)),
+                    phase: input_phase.into(),
                     state: input.state.clone(),
                     dirty_scope: Some(
                         match scope {
@@ -709,18 +716,6 @@ fn transition_presentation(input: &MediaReadinessTransitionInput) -> Vec<(&str, 
         }
     }
     details
-}
-
-/// The canonical phase spelling, matching the projection's closed enum spelling.
-fn phase_spelling(value: lib::ReadinessPhase) -> String {
-    let mut text = String::new();
-    for (i, c) in format!("{value:?}").chars().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            text.push('_');
-        }
-        text.extend(c.to_lowercase());
-    }
-    text
 }
 
 /// The legacy cancel-source spelling as the typed key, and whether it was the CLI's `signal`,

@@ -21899,6 +21899,12 @@ mod tests {
         );
         assert_eq!(init.history(), history);
         assert_eq!(init.row(), row);
+        let active = init
+            .state
+            .catalog()
+            .list_active_media_readiness_operations(None)
+            .unwrap();
+        assert_eq!(active.len(), 1);
     }
 
     /// C6: wait-ready uses the same successor rule after its Ready TUR and

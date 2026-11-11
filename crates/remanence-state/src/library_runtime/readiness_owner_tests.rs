@@ -1648,6 +1648,32 @@ fn readiness_funnel_returns_an_existing_fence_without_appending() {
     }
 }
 
+/// A fence head validates malformed reports before answering with its existing identity.
+#[test]
+fn readiness_funnel_fence_head_refuses_a_malformed_fence() {
+    let f = open();
+    let input = f.owner();
+    f.runtime.begin_owned_readiness(&input).unwrap();
+    f.runtime
+        .transition_readiness(&transition_to(&input, "terminal_error"))
+        .unwrap();
+    let before = f.runtime.test_source_records().len();
+    let mut fence = transition_to(&input, "terminal_error");
+    fence.quarantine_id = Some("mrq-wrong".into());
+    refused(
+        f.runtime.record_readiness_fence(&fence).unwrap_err(),
+        "operation-derived identity",
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+    let mut fence = transition_to(&input, "terminal_error");
+    fence.cancel_source = Some("unknown".into());
+    refused(
+        f.runtime.record_readiness_fence(&fence).unwrap_err(),
+        "unsupported cancel source",
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+}
+
 /// S4: invalid requests and terminal heads cannot append a successor.
 #[test]
 fn readiness_funnel_refuses_invalid_requests_without_appending() {
@@ -1678,7 +1704,9 @@ fn readiness_funnel_refuses_invalid_requests_without_appending() {
     let mut decoded = transition_to(&input, "terminal_error");
     decoded.last_asc = Some(4);
     cases.push((decoded, "actual command completion"));
-    for (request, message) in cases {
+    for (mut request, message) in cases {
+        // Each case targets a validation other than the required successor phase.
+        request.phase = Some("readiness_poll".into());
         refused(
             f.runtime.record_readiness_fence(&request).unwrap_err(),
             message,
@@ -1704,21 +1732,26 @@ fn readiness_funnel_refuses_invalid_requests_without_appending() {
 }
 
 /// D1's shared scope rule retains the wider predecessor scope after Ready;
-/// an omitted phase retains the predecessor phase as an ordinary transition does.
+/// a successor requires its own phase before anything can be appended.
 #[test]
-fn readiness_funnel_successor_keeps_library_scope_and_inherited_phase() {
+fn readiness_funnel_successor_keeps_library_scope_and_needs_a_phase() {
     let f = open();
     let input = library_scoped_owner(&f, "planned");
     f.runtime.transition_readiness(&ready_of(&input)).unwrap();
-    let id = f
-        .runtime
-        .record_readiness_fence(&transition_to(&input, "terminal_error"))
-        .unwrap();
+    let mut fence = transition_to(&input, "terminal_error");
+    fence.phase = Some("readiness_poll".into());
+    let id = f.runtime.record_readiness_fence(&fence).unwrap();
     let mut successor = input.clone();
     successor.operation_id = id;
     let head = f.observations(&successor).pop().unwrap();
     assert_eq!(head.scope, lib::ReadinessScope::Library);
-    assert_eq!(head.phase, lib::ReadinessPhase::WaitReadyTur);
+    let before = f.runtime.test_source_records().len();
+    fence.phase = None;
+    refused(
+        f.runtime.record_readiness_fence(&fence).unwrap_err(),
+        "readiness successor fence requires a phase",
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
 }
 
 /// S5: the catalog returns the successor identity and notifies its observer;
