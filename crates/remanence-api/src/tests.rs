@@ -10233,33 +10233,149 @@ fn startup_fence_scope_and_readiness_recovery() {
     assert!(error.message().contains(&unscoped.quarantine_id));
 }
 
-/// Fenced checkpoint recovery does not open or repair a damaged journal.
-#[test]
-fn startup_fences_only_the_tape_below_its_projection_mark() {
-    use remanence_state::authority::TapeAuthorityView;
-    let dir = tempfile::tempdir().unwrap();
-    let tapes = dir.path().join("tapes");
-    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+/// A production state/daemon restart fences only the tape whose native source disappeared.
+#[tokio::test]
+async fn startup_fences_only_the_tape_below_its_projection_mark() {
+    let mut root =
+        TypedRoot::open_with_tapes(&[([0x51; 16], "FLOOR51L9"), ([0x52; 16], "FLOOR52L9")]);
     for id in [[0x51; 16], [0x52; 16]] {
-        let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
-            .build()
-            .unwrap();
-        append_checkpoint_record(&tapes, id);
-        index
-            .project_tape_log(&authority.freeze().unwrap())
-            .unwrap();
+        l1a_api_native(&root, id, false);
     }
-    let path = tapes.join(format!("{}.remtape", Uuid::from_bytes([0x51; 16]).simple()));
-    std::fs::remove_file(path).unwrap();
-    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
-    assert!(index
-        .tape_io_is_fenced(Some(&[0x51; 16]), None, None)
-        .unwrap());
-    assert!(!index
-        .tape_io_is_fenced(Some(&[0x52; 16]), None, None)
-        .unwrap());
+    let paths = root.paths().clone();
+    let config = root.config();
+    root.release();
+    std::fs::remove_file(
+        paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes([0x51; 16]).simple())),
+    )
+    .unwrap();
+    let state = StateHandle::open_with_config(paths, config.clone()).unwrap();
+    let api = ApiState::new_with_config(state.projection_client(), &config).unwrap();
+    let lost = active_fences_for(state.catalog(), [0x51; 16]);
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].reason, "native_log_behind_projection");
+    assert!(active_fences_for(state.catalog(), [0x52; 16]).is_empty());
+    state.library_runtime().catch_up().unwrap();
+    drop(api);
+}
+
+/// Publish a real native source and return the sequence-one prefix for destructive restart tests.
+fn l1a_api_native(root: &TypedRoot, id: [u8; 16], long: bool) -> Vec<u8> {
+    use remanence_state::authority::TapeAuthorityView;
+    let paths = root.paths();
+    let authority = remanence_state::TapeAuthority::open(
+        paths.journal_dir.join("tapes"),
+        id,
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut owner = authority.acquire_exclusive().unwrap();
+    owner
+        .publish_initialized(
+            262144,
+            None,
+            remanence_state::tape_log::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    let prefix = std::fs::read(
+        paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple())),
+    )
+    .unwrap();
+    let time = if long {
+        format!("2026-11-11T00:00:00.{}Z", "1".repeat(9))
+    } else {
+        "2026-11-11T00:00:00Z".into()
+    };
+    owner.open_session(id, time.clone()).unwrap();
+    owner
+        .end_session(
+            id,
+            time,
+            remanence_state::tape_log::SessionEndReason::CleanClose,
+            None,
+            std::iter::empty(),
+        )
+        .unwrap();
+    let runtime = root.runtime.as_ref().unwrap();
+    runtime.refresh_native(&owner.freeze().unwrap()).unwrap();
+    runtime.catch_up().unwrap();
+    prefix
+}
+
+/// Daemon startup and later catch-up both tolerate each fenced projection failure mode.
+#[tokio::test]
+async fn l1a_daemon_starts_for_short_rewritten_and_short_bytes() {
+    for fault in ["behind", "digest_mismatch", "short_bytes"] {
+        let id = [0x51; 16];
+        let mut root = TypedRoot::open_with_tapes(&[(id, "FLOOR51L9")]);
+        let prefix = l1a_api_native(&root, id, fault == "short_bytes");
+        let paths = root.paths().clone();
+        let config = root.config();
+        root.release();
+        let path = paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple()));
+        std::fs::write(path, prefix).unwrap();
+        if fault != "behind" {
+            let authority =
+                remanence_state::TapeAuthority::open_fixture(paths.journal_dir.join("tapes"), id)
+                    .unwrap();
+            let mut owner = authority.acquire_exclusive().unwrap();
+            owner
+                .open_session([0x91; 16], "2026-11-11T00:00:00Z".into())
+                .unwrap();
+            owner
+                .end_session(
+                    [0x91; 16],
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionEndReason::CleanClose,
+                    None,
+                    std::iter::empty(),
+                )
+                .unwrap();
+        }
+        let state = StateHandle::open_with_config(paths, config.clone()).unwrap();
+        assert_eq!(
+            state
+                .library_runtime()
+                .take_projection_measurement()
+                .1
+                .len(),
+            0
+        );
+        let api = ApiState::new_with_config(state.projection_client(), &config).unwrap();
+        let fences = active_fences_for(state.catalog(), id);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, "native_log_behind_projection");
+        assert_eq!(state.catalog().projected_through_sequence(id).unwrap(), 3);
+        assert_eq!(
+            state
+                .catalog()
+                .session_state(Uuid::from_bytes(id))
+                .unwrap()
+                .as_deref(),
+            Some("closed")
+        );
+        state.library_runtime().catch_up().unwrap();
+        assert_eq!(
+            state
+                .library_runtime()
+                .take_projection_measurement()
+                .1
+                .len(),
+            0
+        );
+        drop(api);
+    }
 }
 
 /// Active fences of one tape, oldest first.

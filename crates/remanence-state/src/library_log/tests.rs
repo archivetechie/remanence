@@ -3782,3 +3782,250 @@ fn lost_fence_recording_precedes_first_ambiguity_marker() {
         log.clear_ambiguity(&Present).unwrap();
     }
 }
+
+/// Ruling 31's floor is independent of kind, application and release lifetime.
+#[test]
+fn l1a_floor_all_reference_kinds_live_and_replay() {
+    let cases = [
+        b4b0_supersede(1),
+        Body::ManualFinalizationAccepted(ManualFinalizationAccepted {
+            at: at(1, 1),
+            operation: [5; 16],
+            actor_fingerprint: "operator".into(),
+            idempotency_key: [5; 16],
+            request_fingerprint: [6; 32],
+            assignment_generation: 1,
+        }),
+        Body::AcceptUnprotectedFinalization(AcceptUnprotectedFinalization {
+            at: at(1, 1),
+            operation: [2; 16],
+            w: 1,
+            t: 2,
+            reason: "fixture".into(),
+        }),
+        progress(1),
+        verdict(),
+        b4b0_repair(1, 1),
+        fence(1),
+    ];
+    for body in cases {
+        let expected = body
+            .at()
+            .or_else(|| match &body {
+                Body::FenceRaised(v) => v.at.as_ref(),
+                _ => None,
+            })
+            .unwrap()
+            .clone();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(dir.path(), &Present);
+        put(&mut log, provision(1, None));
+        let raised = put(&mut log, body.clone());
+        let summary = &log.state().fold.contradictions[&fold::Scope::Tape(tape(1).uuid)];
+        assert_eq!(
+            summary.floor,
+            Some((expected.sequence, expected.record_digest, raised.sequence)),
+            "{:?}",
+            body.tag()
+        );
+        assert_eq!(
+            summary.floor_digests,
+            std::collections::BTreeSet::from([expected.record_digest])
+        );
+        if matches!(body, Body::FenceRaised(_)) {
+            assert_eq!(log.state().fold.highest_reference(tape(1)), None);
+            put(&mut log, release(raised.sequence));
+            assert_eq!(log.state().fold.open_fences(), 0);
+            assert_eq!(
+                log.state().fold.contradictions[&fold::Scope::Tape(tape(1).uuid)].floor,
+                Some((expected.sequence, expected.record_digest, raised.sequence))
+            );
+        }
+        let live = log.state().fold.clone();
+        drop(log);
+        let replay = replay(dir.path(), LOG, &Present).unwrap();
+        assert!(replay.refusal.is_none());
+        live.assert_same_state(&replay.fold);
+        assert_eq!(live.contradictions, replay.fold.contradictions);
+    }
+}
+
+/// Equal references retain their first naming sequence; advancing resets conflicts.
+#[test]
+fn l1a_floor_conflicts_duplicates_and_idempotent_apply() {
+    let mut f = initialized();
+    let mut h = History::default();
+    let make = |sequence, digest| {
+        let mut b = fence(1);
+        if let Body::FenceRaised(v) = &mut b {
+            v.at = Some(TapeAt {
+                record_digest: [digest; 32],
+                ..at(1, sequence)
+            });
+        }
+        b
+    };
+    for (sequence, digest) in [(9, 9), (9, 10), (8, 11)] {
+        feed(&mut f, make(sequence, digest), &Present).unwrap();
+    }
+    let summary = &f.contradictions[&fold::Scope::Tape(tape(1).uuid)];
+    assert_eq!(summary.floor, Some((9, [9; 32], 3)));
+    assert_eq!(
+        summary.floor_digests,
+        std::collections::BTreeSet::from([[9; 32], [10; 32]])
+    );
+    feed(&mut f, make(10, 12), &Present).unwrap();
+    let summary = &f.contradictions[&fold::Scope::Tape(tape(1).uuid)];
+    assert_eq!(summary.floor, Some((10, [12; 32], 6)));
+    assert_eq!(
+        summary.floor_digests,
+        std::collections::BTreeSet::from([[12; 32]])
+    );
+    // These calls exercise both note sites in apply, then its duplicate-only site.
+    let mut f = initialized();
+    let b = b4b0_supersede(12);
+    feed(&mut f, b.clone(), &Present).unwrap();
+    let first = f.contradictions.clone();
+    assert!(matches!(
+        feed(&mut f, b.clone(), &Present).unwrap(),
+        fold::Validated::Duplicate(_)
+    ));
+    assert_eq!(f.contradictions, first);
+    b4b0_receive(&mut f, &mut h, b, &Present).unwrap();
+    assert_eq!(f.contradictions, first);
+    // Replay records excluded evidence, while live refuses it without receipt.
+    let absent = View(BTreeMap::from([(
+        (tape(1).uuid, 20),
+        TapeLookup::Contradiction,
+    )]));
+    b4b0_receive(&mut f, &mut h, b4b0_repair(20, 20), &absent).unwrap();
+    let summary = &f.contradictions[&fold::Scope::Tape(tape(1).uuid)];
+    assert_eq!(summary.floor, Some((20, [20; 32], 6)));
+    assert_eq!(summary.excluded, 1);
+}
+
+/// apply notes a deferred fence but never receives an unresolved dependent candidate.
+#[test]
+fn l1a_floor_apply_pending_site() {
+    let mut f = initialized();
+    let mut h = History::default();
+    b4b0_receive(&mut f, &mut h, verdict(), &View::default()).unwrap();
+    feed(&mut f, fence(1), &View::default()).unwrap();
+    assert_eq!(
+        f.contradictions[&fold::Scope::Tape(tape(1).uuid)].floor,
+        Some((999, [231; 32], 4))
+    );
+    assert_eq!(f.pending.len(), 2);
+    let before = f.contradictions.clone();
+    assert_eq!(
+        feed(&mut f, b4b0_supersede(1000), &View::default()).unwrap_err(),
+        FoldError::Unresolved
+    );
+    assert_eq!(f.contradictions, before);
+}
+
+/// The durable append site keeps a deferred fence's evidence and rejects before publication.
+#[test]
+fn l1a_floor_store_pending_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(dir.path(), &Present);
+    put(&mut log, provision(1, None));
+    put(&mut log, verdict());
+    drop(log);
+    let (mut log, _) = open(dir.path(), &View::default());
+    assert_eq!(log.state().fold.pending.len(), 1);
+    let raised = log
+        .append(
+            fence(1),
+            AuditActor::System,
+            SourceLayer::Layer4,
+            &View::default(),
+        )
+        .unwrap();
+    assert_eq!(log.state().fold.pending.len(), 2);
+    assert_eq!(
+        log.state().fold.contradictions[&fold::Scope::Tape(tape(1).uuid)].floor,
+        Some((999, [231; 32], raised.sequence))
+    );
+    let before = log.state().fold.contradictions.clone();
+    let last = log.state().last_sequence;
+    assert!(matches!(
+        log.append(
+            b4b0_supersede(1000),
+            AuditActor::System,
+            SourceLayer::Layer4,
+            &View::default()
+        ),
+        Err(StoreError::Fold(FoldError::Unresolved))
+    ));
+    assert_eq!(log.state().last_sequence, last);
+    assert_eq!(log.state().fold.contradictions, before);
+    let live = log.state().fold.clone();
+    drop(log);
+    let replay = replay(dir.path(), LOG, &View::default()).unwrap();
+    assert!(replay.refusal.is_none());
+    live.assert_same_state(&replay.fold);
+    assert_eq!(live.contradictions, replay.fold.contradictions);
+}
+
+/// Replay records held/deferred references at receipt, never again during resolve.
+#[test]
+fn l1a_floor_replay_pending_site() {
+    let mut f = initialized();
+    let mut h = History::default();
+    b4b0_receive(&mut f, &mut h, verdict(), &View::default()).unwrap();
+    assert_eq!(
+        f.contradictions[&fold::Scope::Tape(tape(1).uuid)].floor,
+        Some((1, [1; 32], 3))
+    );
+    b4b0_receive(&mut f, &mut h, fence(1), &View::default()).unwrap();
+    assert_eq!(
+        f.contradictions[&fold::Scope::Tape(tape(1).uuid)].floor,
+        Some((999, [231; 32], 4))
+    );
+    assert_eq!(f.pending.len(), 2);
+    let before = f.contradictions.clone();
+    f.resolve(&Present, &h).unwrap();
+    assert!(f.pending.is_empty());
+    assert_eq!(f.contradictions, before);
+}
+
+/// The keyed fence reader stays tape-local, ordered and synchronized across releases.
+#[test]
+fn l1a_active_tape_fences_two_tapes_and_drive() {
+    let mut f = initialized();
+    let drive = Body::FenceRaised(FenceRaised {
+        detail: Bounded(vec![]),
+        kind: FenceKind::DriveFault,
+        scope: FenceScope::Drive(endpoint("LIBA0001")),
+        cause: FenceCause::TransferError,
+        evidence: None,
+        at: None,
+        operation: None,
+    });
+    let steps = [
+        (fence(1), vec![3], vec![]),
+        (fence(2), vec![3], vec![4]),
+        (drive, vec![3], vec![4]),
+        (fence(1), vec![3, 6], vec![4]),
+        (release(3), vec![6], vec![4]),
+        (release(5), vec![6], vec![4]),
+        (release(4), vec![6], vec![]),
+        (release(6), vec![], vec![]),
+        (fence(2), vec![], vec![11]),
+        (release(11), vec![], vec![]),
+    ];
+    for (body, one, two) in steps {
+        feed(&mut f, body, &Present).unwrap();
+        for (id, expected) in [(1, one), (2, two), (3, vec![])] {
+            let actual: Vec<_> = f
+                .active_tape_fences(&tape(id).uuid)
+                .map(|(n, raise)| {
+                    assert_eq!(raise.scope, FenceScope::Tape(tape(id)));
+                    n
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+}

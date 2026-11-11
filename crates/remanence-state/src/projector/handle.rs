@@ -25,6 +25,15 @@ fn readiness_error(error: crate::library_runtime::RuntimeError) -> StateError {
 }
 
 impl CatalogIndex {
+    /// Capture both projection watermarks and their source-byte bindings before rebuild.
+    pub(crate) fn tape_projection_marks(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<[u8; 16], crate::library_runtime::native_floor::MarkEvidence>,
+        StateError,
+    > {
+        self.with_core(|core| core.tape_projection_marks())
+    }
     /// SQLite `PRAGMA user_version` after migration.
     pub fn schema_version(&self) -> Result<u32, StateError> {
         self.with_core(|core| core.schema_version())

@@ -97,6 +97,11 @@ impl NativeTapeView {
         self.tapes.values().cloned()
     }
 
+    /// Frozen evidence for one tape; absence is distinct from a zero-length log.
+    pub(crate) fn snapshot(&self, tape: Id) -> Option<&Snapshot> {
+        self.tapes.get(&tape)
+    }
+
     /// A replaced source cannot re-enter this process through a retained old
     /// snapshot, even when its former sequence is higher than the repaired log.
     pub(crate) fn accepts_snapshot(&self, snapshot: &Snapshot) -> Result<bool, StoreError> {

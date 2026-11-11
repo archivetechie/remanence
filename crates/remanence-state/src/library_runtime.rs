@@ -241,10 +241,29 @@ impl LibraryRuntime {
         }
         let snapshot = authority.snapshot()?;
         let projector = ProjectionClient::open(&paths.sqlite_path)?;
+        let marks = projector.reader()?.tape_projection_marks()?;
+        let raises = authority.with_fold(|fold| native_floor::detect(fold, &marks, &view));
+        let snapshot = if raises.is_empty() {
+            snapshot
+        } else {
+            for raise in raises {
+                authority.fence_raised(
+                    raise,
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    &view,
+                )?;
+            }
+            authority.snapshot()?
+        };
         projector.project_library(snapshot, Box::new(view.clone()), ApplyPath::Startup)?;
         // Library identities/assignments precede native sessions and terminal
         // state. Every native prefix was validated before either replay starts.
+        let fenced = authority.with_fold(native_floor::fenced_tapes);
         for native in view.snapshots() {
+            if fenced.contains(&native.header().tape_uuid) {
+                continue;
+            }
             let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
             if let ProjectionResult::Failed { error, .. } = projector.project(
                 AuthorityRecord::Tape(Box::new(snapshot)),
@@ -409,7 +428,11 @@ impl LibraryRuntime {
         self.0
             .projector
             .project_library(snapshot, Box::new(view.clone()), ApplyPath::Live)?;
+        let fenced = self.0.authority.with_fold(native_floor::fenced_tapes);
         for native in view.snapshots() {
+            if fenced.contains(&native.header().tape_uuid) {
+                continue;
+            }
             let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
             if let ProjectionResult::Failed { error, .. } = self
                 .0
@@ -444,6 +467,25 @@ impl LibraryRuntime {
             view.clone()
         };
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
+        let replay = snapshot
+            .replay(&view, &mut |_| Ok(()))
+            .map_err(AuthorityError::Store)?;
+        let snapshot = if replay.refusal.is_none() {
+            let marks = index.tape_projection_marks()?;
+            for raise in native_floor::detect(&replay.fold, &marks, &view) {
+                self.append_locked(|authority, view| {
+                    authority.fence_raised(
+                        raise,
+                        lib::AuditActor::System,
+                        lib::SourceLayer::Layer4,
+                        view,
+                    )
+                })?;
+            }
+            self.0.authority.snapshot()?
+        } else {
+            snapshot
+        };
         *self
             .0
             .ack_progress
@@ -539,6 +581,7 @@ impl LibraryRuntime {
                 )
                 .into());
             }
+            native_floor::refuse_unforced_release(&fence)?;
             self.append_locked(|a, v| {
                 a.fence_released(
                     lib::FenceReleased {
@@ -893,6 +936,9 @@ impl LibraryRuntime {
 
 mod motion;
 mod native_fences;
+pub(crate) mod native_floor;
+#[cfg(test)]
+mod native_floor_tests;
 
 mod adoption;
 mod cleaning;

@@ -1235,6 +1235,15 @@ impl StateHandle {
                 applied,
             )
         })?;
+        let replay = lib::store::replay_observed(
+            manifest.library_root(),
+            manifest.library_uuid(),
+            &view,
+            &mut |_| Ok(()),
+        )
+        .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        let marks = index.tape_projection_marks()?;
+        crate::library_runtime::native_floor::check_rebuild(&replay.fold, &marks, &view)?;
         let natives = view
             .snapshots()
             .map(crate::tape_log::authority::AuthoritySnapshot::new)

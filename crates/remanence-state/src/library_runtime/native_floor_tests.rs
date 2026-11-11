@@ -1,0 +1,799 @@
+//! Ruling 31 production-open tests. Each fixture owns real native/library logs
+//! and reopens StateHandle after changing bytes with every prior owner dropped.
+use super::*;
+use crate::authority::{TapeAuthorityView, TapeAuthorityWriter};
+use crate::tape_log::{authority::AuthoritySnapshot, CommitCursor, SessionEndReason};
+use lib::DiagnosticValue::{Bytes, Text, Unsigned};
+use std::collections::BTreeSet;
+
+const T: lib::Id = [0x51; 16];
+const B: lib::Id = [0x52; 16];
+const TIME: &str = "2026-11-11T00:00:00Z";
+fn tape(id: lib::Id) -> lib::TapeRef {
+    lib::TapeRef {
+        uuid: id,
+        incarnation: 1,
+    }
+}
+fn value(raise: &lib::FenceRaised, key: &str) -> lib::DiagnosticValue {
+    raise
+        .detail
+        .0
+        .iter()
+        .find(|e| e.0.as_str() == key)
+        .unwrap()
+        .1
+        .clone()
+}
+struct Fixture {
+    paths: StatePaths,
+    config: crate::RemConfig,
+    state: Option<crate::StateHandle>,
+    _root: tempfile::TempDir,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let config_text = format!(
+            r#"
+[daemon]
+state_dir = "{0}/state"
+default_idle_timeout_seconds = 1800
+[journal]
+dir = "{0}/native"
+require_trusted_volume = false
+[audit]
+dir = "{0}/library"
+fsync = true
+[index]
+sqlite_path = "{0}/index.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+"#,
+            root.path().display()
+        );
+        let config = crate::parse_config_toml(&config_text).unwrap();
+        std::fs::write(root.path().join("config.toml"), config_text).unwrap();
+        let paths = StatePaths::from_config(root.path().join("config.toml"), &config);
+        let state = crate::StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+        Self {
+            paths,
+            config,
+            state: Some(state),
+            _root: root,
+        }
+    }
+    fn rt(&self) -> LibraryRuntime {
+        self.state.as_ref().unwrap().library_runtime()
+    }
+    fn close(&mut self) {
+        drop(self.state.take());
+    }
+    fn reopen(&mut self) {
+        self.close();
+        self.state = Some(
+            crate::StateHandle::open_with_config(self.paths.clone(), self.config.clone()).unwrap(),
+        );
+    }
+    fn path(&self, id: lib::Id) -> std::path::PathBuf {
+        self.paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()))
+    }
+    fn sql_loss(&self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let path =
+                std::path::PathBuf::from(format!("{}{suffix}", self.paths.sqlite_path.display()));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+    fn provision(&self, id: lib::Id) {
+        self.rt()
+            .append(|a, v| {
+                a.reprovision(
+                    lib::Reprovision {
+                        tape: tape(id),
+                        predecessor: None,
+                        mode: lib::ProvisionMode::Initialize,
+                        label: None,
+                        label_provenance: None,
+                        parity_scheme: None,
+                        medium: lib::MediumSpec {
+                            family: lib::MediumFamily::Lto(lib::LtoGen::Lto9),
+                            usable_logical_bytes: 18_000_000_000_000,
+                            record_size: 262144,
+                            rerecord: true,
+                            lifecycle_ops: true,
+                            source: lib::GenerationSource::Operator,
+                        },
+                        pool: None,
+                        endpoint: None,
+                        adoption: None,
+                        pool_source: None,
+                        operation: None,
+                        replaced_bot: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+    }
+    /// A sequence-one backup and an independently variable two-record session tail.
+    fn native(&self, id: lib::Id, long: bool) -> (Vec<u8>, AuthoritySnapshot) {
+        let authority = crate::TapeAuthority::open(
+            self.paths.journal_dir.join("tapes"),
+            id,
+            &self.paths.sqlite_path,
+        )
+        .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                262144,
+                None,
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        let prefix = std::fs::read(self.path(id)).unwrap();
+        let time = if long {
+            format!("2026-11-11T00:00:00.{}Z", "1".repeat(9))
+        } else {
+            TIME.into()
+        };
+        owner.open_session(id, time.clone()).unwrap();
+        owner
+            .end_session(
+                id,
+                time,
+                SessionEndReason::CleanClose,
+                None,
+                std::iter::empty(),
+            )
+            .unwrap();
+        let snapshot = owner.freeze().unwrap();
+        self.rt().refresh_native(&snapshot).unwrap();
+        self.rt().catch_up().unwrap();
+        (prefix, snapshot)
+    }
+    fn tail_without_runtime(&self, id: lib::Id, session: lib::Id) -> AuthoritySnapshot {
+        let authority =
+            crate::TapeAuthority::open_fixture(self.paths.journal_dir.join("tapes"), id).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner.open_session(session, TIME.into()).unwrap();
+        owner
+            .end_session(
+                session,
+                TIME.into(),
+                SessionEndReason::CleanClose,
+                None,
+                std::iter::empty(),
+            )
+            .unwrap();
+        owner.freeze().unwrap()
+    }
+    fn prepared(&self) -> AuthoritySnapshot {
+        let authority =
+            crate::TapeAuthority::open_fixture(self.paths.journal_dir.join("tapes"), T).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_report(&(&crate::checkpoint::tests::record(T)).into())
+            .unwrap();
+        let mut plan = crate::checkpoint::tests::finalization_intent(T);
+        let manual = plan.manual.as_mut().unwrap();
+        manual.assignment_generation = 1;
+        manual.assigned_pool_id = None;
+        manual.expected_pool_id = None;
+        owner.begin_finalization(&(&plan).into()).unwrap();
+        let snapshot = owner.freeze().unwrap();
+        self.rt().refresh_native(&snapshot).unwrap();
+        self.rt().catch_up().unwrap();
+        snapshot
+    }
+    fn name(&self, kind: u8, at: lib::TapeAt) -> u64 {
+        self.rt()
+            .append(|a, v| {
+                let actor = lib::AuditActor::System;
+                let layer = lib::SourceLayer::Layer4;
+                match kind {
+                    0 => a.supersede_tail(
+                        lib::SupersedeTail {
+                            at,
+                            operation: Some([7; 16]),
+                            session_id: Some([8; 16]),
+                            preview_digest: Some([0; 32]),
+                            tail_file_count: 0,
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                    1 => a.manual_finalization_accepted(
+                        lib::ManualFinalizationAccepted {
+                            at,
+                            operation: [0x61; 16],
+                            actor_fingerprint: "operator".into(),
+                            idempotency_key: [5; 16],
+                            request_fingerprint: [6; 32],
+                            assignment_generation: 1,
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                    2 => a.accept_unprotected_finalization(
+                        lib::AcceptUnprotectedFinalization {
+                            at,
+                            operation: [7; 16],
+                            w: 1,
+                            t: 2,
+                            reason: "fixture".into(),
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                    3 => a.verification_progress(
+                        lib::VerificationProgress {
+                            at,
+                            operation: [7; 16],
+                            plan_digest: [3; 32],
+                            modes: 1,
+                            parts_done: 1,
+                            next: lib::VerificationCursor {
+                                partition: 0,
+                                file: 1,
+                                lba: 1,
+                                ordinal: 1,
+                                part: 1,
+                            },
+                            completed_digest: [4; 32],
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                    4 => a.verification_verdict(
+                        lib::VerificationVerdict {
+                            tape: at.tape,
+                            at: Some(at),
+                            outcome: lib::VerificationOutcome::VerifiedComplete,
+                            operation: [7; 16],
+                            damaged: lib::Bounded(vec![]),
+                            unprotected: None,
+                            modes: 1,
+                            edition_digest: None,
+                            progress: None,
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                    5 => a.recovery_recorded(
+                        lib::RecoveryRecorded {
+                            operation: [7; 16],
+                            prior: None,
+                            action: lib::RecoveryAction::RepairApplied(lib::RepairApplied {
+                                retained_through: at.sequence,
+                                archived_prefix_digest: [42; 32],
+                            }),
+                            at,
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                    _ => a.fence_raised(
+                        lib::FenceRaised {
+                            kind: lib::FenceKind::Write,
+                            scope: lib::FenceScope::Tape(at.tape),
+                            cause: lib::FenceCause::TransferError,
+                            evidence: None,
+                            at: Some(at),
+                            operation: None,
+                            detail: lib::Bounded(vec![]),
+                        },
+                        actor,
+                        layer,
+                        v,
+                    ),
+                }
+            })
+            .unwrap()
+            .sequence
+    }
+    fn raises(&self, id: lib::Id) -> Vec<(u64, lib::FenceRaised)> {
+        self.rt().0.authority.with_fold(|fold| {
+            fold.active_tape_fences(&id)
+                .filter(|(_, r)| r.cause == lib::FenceCause::NativeLogBehindProjection)
+                .map(|(n, r)| (n, r.clone()))
+                .collect()
+        })
+    }
+    fn retire(&mut self, id: lib::Id) {
+        self.state
+            .as_mut()
+            .unwrap()
+            .retire_tape(crate::RetireTapeInput {
+                tape_uuid: id,
+                reason: "fixture".into(),
+            })
+            .unwrap();
+    }
+}
+
+/// Every received kind, including a released fence, survives SQL/log loss and refuses ordinary release.
+#[test]
+fn l1a_absent_floor_all_kinds_restart_and_release_refusal() {
+    for kind in 0..8 {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let snapshot = f.prepared();
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        let named_by = f.name(kind, at.clone());
+        if kind == 7 {
+            f.rt()
+                .append(|a, v| {
+                    a.fence_released(
+                        lib::FenceReleased {
+                            fence: named_by,
+                            evidence: "fixture".into(),
+                            forced: false,
+                            detail: lib::Bounded(vec![]),
+                        },
+                        lib::AuditActor::System,
+                        lib::SourceLayer::Layer4,
+                        v,
+                    )
+                })
+                .unwrap();
+        }
+        f.close();
+        f.sql_loss();
+        std::fs::rename(f.path(T), f._root.path().join("saved.remtape")).unwrap();
+        f.reopen();
+        for _ in 0..2 {
+            let raises = f.raises(T);
+            assert_eq!(raises.len(), 1, "kind {kind}");
+            let (sequence, raised) = &raises[0];
+            assert_eq!(
+                raised,
+                &lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape(T)),
+                    cause: lib::FenceCause::NativeLogBehindProjection,
+                    evidence: None,
+                    at: Some(at.clone()),
+                    operation: None,
+                    detail: lib::Bounded(vec![
+                        lib::DiagnosticEntry("basis".into(), Text("floor".into())),
+                        lib::DiagnosticEntry(
+                            "floor_digest".into(),
+                            Bytes(lib::Blob(at.record_digest.to_vec()))
+                        ),
+                        lib::DiagnosticEntry("floor_named_by".into(), Unsigned(named_by)),
+                        lib::DiagnosticEntry("floor_sequence".into(), Unsigned(at.sequence)),
+                        lib::DiagnosticEntry("observed_closed_end".into(), Unsigned(0)),
+                        lib::DiagnosticEntry("observed_floor".into(), Text("absent".into())),
+                        lib::DiagnosticEntry("observed_last_closed".into(), Unsigned(0)),
+                    ]),
+                }
+            );
+            let before = f.rt().0.authority.with_fold(|fold| fold.received_through);
+            let error = f
+                .rt()
+                .release_tape_fence(
+                    &format!("library:{sequence}"),
+                    "acknowledged",
+                    lib::AuditActor::System,
+                )
+                .unwrap_err();
+            let RuntimeError::State(StateError::ConfigInvalid(message)) = error else {
+                panic!("wrong release refusal")
+            };
+            assert_eq!(message,"native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; or rebuild the catalog with rem rebuild-catalog-from-journals, then release with --force; or retire the tape");
+            assert_eq!(
+                f.rt().0.authority.with_fold(|fold| fold.received_through),
+                before
+            );
+            f.reopen();
+        }
+    }
+}
+
+/// Fresh/retired identities have no obligation, while a published zero prefix remains a floor.
+#[test]
+fn l1a_fresh_retired_and_zero_floor() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    f.close();
+    f.sql_loss();
+    f.reopen();
+    assert!(f.raises(T).is_empty());
+    let (_, snapshot) = f.native(T, false);
+    let at = f.rt().native_reference(&snapshot).unwrap();
+    f.name(0, at);
+    f.retire(T);
+    f.close();
+    f.sql_loss();
+    std::fs::remove_file(f.path(T)).unwrap();
+    f.reopen();
+    assert!(f.raises(T).is_empty());
+    f.provision(B);
+    let authority =
+        crate::TapeAuthority::open(f.paths.journal_dir.join("tapes"), B, &f.paths.sqlite_path)
+            .unwrap();
+    let mut owner = authority.acquire_exclusive().unwrap();
+    owner.publish_empty_prefix(262144, None).unwrap();
+    let snapshot = owner.freeze().unwrap();
+    let at = f.rt().native_reference(&snapshot).unwrap();
+    assert_eq!(at.sequence, 0);
+    f.rt().refresh_native(&snapshot).unwrap();
+    f.name(0, at.clone());
+    drop(owner);
+    drop(authority);
+    f.close();
+    f.sql_loss();
+    std::fs::remove_file(f.path(B)).unwrap();
+    f.reopen();
+    let raises = f.raises(B);
+    assert_eq!(raises.len(), 1);
+    let raised = &raises[0].1;
+    assert!(raised.at.is_none());
+    assert_eq!(value(raised, "floor_sequence"), Unsigned(0));
+    assert_eq!(
+        value(raised, "floor_digest"),
+        Bytes(lib::Blob(at.record_digest.to_vec()))
+    );
+    f.reopen();
+    assert_eq!(f.raises(B), raises);
+}
+
+/// Both obligations are evaluated even when crash-ack validation has nothing to replay.
+#[test]
+fn l1a_short_log_basis_skip_and_other_tape_projection() {
+    for (sql, floor, basis) in [
+        (false, true, "floor"),
+        (true, false, "mark"),
+        (true, true, "both"),
+    ] {
+        let mut f = Fixture::new();
+        f.provision(T);
+        f.provision(B);
+        let (prefix, snapshot) = f.native(T, false);
+        f.native(B, false);
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        if floor {
+            f.name(0, at.clone());
+        }
+        let old = f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T].clone();
+        f.close();
+        std::fs::write(f.path(T), prefix).unwrap();
+        let healthy = f.tail_without_runtime(B, [0x99; 16]);
+        if !sql {
+            f.sql_loss();
+        }
+        f.reopen();
+        assert_eq!(
+            f.rt().take_projection_measurement().1.len(),
+            1,
+            "only the healthy tape entered project(Tape)"
+        );
+        let raises = f.raises(T);
+        assert_eq!(raises.len(), 1);
+        let raised = &raises[0].1;
+        assert_eq!(value(raised, "basis"), Text(basis.into()));
+        if floor {
+            assert_eq!(value(raised, "observed_floor"), Text("behind".into()));
+            assert_eq!(raised.at, Some(at));
+            assert!(
+                f.rt()
+                    .0
+                    .authority
+                    .with_fold(|fold| fold.contradictions[&lib::fold::Scope::Tape(T)].excluded)
+                    >= 1
+            );
+        } else {
+            assert!(raised.at.is_none());
+        }
+        if sql {
+            assert_eq!(value(raised, "observed_mark"), Text("behind".into()));
+            assert_eq!(value(raised, "mark_sequence"), Unsigned(old.sequence));
+            assert_eq!(value(raised, "mark_offset"), Unsigned(old.offset));
+            let (end, digest) = old.source.unwrap();
+            assert_eq!(value(raised, "source_byte_end"), Unsigned(end));
+            assert_eq!(
+                value(raised, "source_digest"),
+                Bytes(lib::Blob(digest.to_vec()))
+            );
+            assert_eq!(
+                f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T],
+                old
+            );
+            assert_eq!(
+                f.rt()
+                    .reader()
+                    .unwrap()
+                    .session_state(uuid::Uuid::from_bytes(T))
+                    .unwrap()
+                    .as_deref(),
+                Some("closed")
+            );
+        }
+        assert_eq!(
+            f.rt()
+                .reader()
+                .unwrap()
+                .projected_through_sequence(B)
+                .unwrap(),
+            healthy.log_reference().0
+        );
+        f.rt().catch_up().unwrap();
+        assert_eq!(f.rt().take_projection_measurement().1.len(), 1);
+        f.reopen();
+        assert_eq!(f.raises(T), raises);
+    }
+}
+
+/// Equal sequence counts do not hide rewritten bytes or a shorter closing record.
+#[test]
+fn l1a_digest_rewrite_and_short_bytes_skip_projection() {
+    for short in [false, true] {
+        for floor in [false, true] {
+            let mut f = Fixture::new();
+            f.provision(T);
+            let (prefix, old_snapshot) = f.native(T, short);
+            let at = f.rt().native_reference(&old_snapshot).unwrap();
+            if floor {
+                f.name(0, at);
+            }
+            let old = f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T].clone();
+            f.close();
+            std::fs::write(f.path(T), prefix).unwrap();
+            let replacement = f.tail_without_runtime(T, [0x91; 16]);
+            assert_eq!(
+                replacement.log_reference().0,
+                old_snapshot.log_reference().0
+            );
+            assert_eq!(
+                replacement.raw.summary().closed_end < old.source.unwrap().0,
+                short
+            );
+            f.reopen();
+            assert_eq!(
+                f.rt().take_projection_measurement().1.len(),
+                0,
+                "fenced tape never entered project(Tape)"
+            );
+            let raises = f.raises(T);
+            assert_eq!(raises.len(), 1);
+            let raised = &raises[0].1;
+            assert_eq!(
+                value(raised, "observed_mark"),
+                Text(
+                    if short {
+                        "short_bytes"
+                    } else {
+                        "digest_mismatch"
+                    }
+                    .into()
+                )
+            );
+            assert_eq!(
+                value(raised, "basis"),
+                Text(if floor { "both" } else { "mark" }.into())
+            );
+            if floor {
+                assert_eq!(
+                    value(raised, "observed_floor"),
+                    Text("digest_mismatch".into())
+                );
+            }
+            assert_eq!(
+                f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T],
+                old
+            );
+            f.rt().catch_up().unwrap();
+            assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
+            f.reopen();
+            assert_eq!(f.raises(T), raises);
+        }
+    }
+}
+
+/// Conflicting fence-only evidence is carried in sorted order even while the source exists.
+#[test]
+fn l1a_floor_conflict_at_open() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (_, snapshot) = f.native(T, false);
+    let at = f.rt().native_reference(&snapshot).unwrap();
+    let named_by = f.name(6, at.clone());
+    let mut other = at.clone();
+    other.record_digest = [0x19; 32];
+    f.name(6, other.clone());
+    f.close();
+    f.sql_loss();
+    f.reopen();
+    let raises = f.raises(T);
+    assert_eq!(raises.len(), 1);
+    let raised = &raises[0].1;
+    assert_eq!(value(raised, "basis"), Text("floor".into()));
+    assert_eq!(
+        value(raised, "observed_floor"),
+        Text("digest_conflict".into())
+    );
+    assert_eq!(value(raised, "floor_named_by"), Unsigned(named_by));
+    assert_eq!(raised.at, Some(at.clone()));
+    let digests = BTreeSet::from([at.record_digest, other.record_digest]);
+    assert_eq!(
+        value(raised, "conflict_digests"),
+        Bytes(lib::Blob(digests.iter().flatten().copied().collect()))
+    );
+    f.reopen();
+    assert_eq!(f.raises(T), raises);
+}
+
+/// The skip is limited to active cause-14 tapes; a retired unexamined short source still errors.
+#[test]
+fn l1a_retired_short_source_still_aborts_projection() {
+    for retired in [false, true] {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (prefix, _) = f.native(T, false);
+        if retired {
+            f.retire(T);
+        }
+        f.close();
+        std::fs::write(f.path(T), prefix).unwrap();
+        let result = crate::StateHandle::open_with_config(f.paths.clone(), f.config.clone());
+        if retired {
+            assert!(result.is_err());
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("projection source is shorter than its digest"));
+        } else {
+            f.state = Some(result.unwrap());
+            assert_eq!(f.raises(T).len(), 1);
+        }
+    }
+}
+
+/// There is no crash acknowledgement to make validate replay the floor.
+#[test]
+fn l1a_rebuild_detects_floor_from_explicit_replay() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (prefix, snapshot) = f.native(T, false);
+    let at = f.rt().native_reference(&snapshot).unwrap();
+    f.close();
+    std::fs::write(f.path(T), prefix).unwrap();
+    f.sql_loss();
+    f.reopen();
+    assert!(f.raises(T).is_empty());
+    // A fence-only reference is admissible even though the native prefix is short.
+    let named_by = f.name(6, at.clone());
+    f.state
+        .as_mut()
+        .unwrap()
+        .rebuild_projection_from_tape_logs()
+        .unwrap();
+    let raises = f.raises(T);
+    assert_eq!(raises.len(), 1);
+    assert_eq!(raises[0].1.at, Some(at));
+    assert_eq!(value(&raises[0].1, "basis"), Text("floor".into()));
+    assert_eq!(value(&raises[0].1, "floor_named_by"), Unsigned(named_by));
+    assert_eq!(value(&raises[0].1, "observed_floor"), Text("behind".into()));
+    assert_eq!(
+        f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T].sequence,
+        1
+    );
+    f.state
+        .as_mut()
+        .unwrap()
+        .rebuild_projection_from_tape_logs()
+        .unwrap();
+    assert_eq!(f.raises(T), raises);
+    f.close();
+    f.sql_loss();
+    f.reopen();
+    assert_eq!(f.raises(T), raises);
+}
+
+#[test]
+fn l1a_offline_preserves_exact_mark_above_carried_floor() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (prefix, snapshot) = f.native(T, false);
+    let at = f.rt().native_reference(&snapshot).unwrap();
+    let through_floor = std::fs::read(f.path(T)).unwrap();
+    f.name(0, at);
+    let snapshot = f.tail_without_runtime(T, B);
+    f.rt().refresh_native(&snapshot).unwrap();
+    f.rt().catch_up().unwrap();
+    let mark = f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T].clone();
+    assert_eq!(mark.sequence, 5);
+    f.close();
+    let sql = std::fs::read(&f.paths.sqlite_path).unwrap();
+    std::fs::write(f.path(T), &prefix).unwrap();
+    f.sql_loss();
+    f.reopen();
+    let floor_raises = f.raises(T);
+    assert_eq!(floor_raises.len(), 1);
+    assert_eq!(value(&floor_raises[0].1, "basis"), Text("floor".into()));
+    f.close();
+    f.sql_loss();
+    f.reopen();
+    assert_eq!(f.raises(T), floor_raises);
+    f.close();
+    f.sql_loss();
+    std::fs::write(&f.paths.sqlite_path, sql).unwrap();
+    let library_files = || {
+        std::fs::read_dir(&f.paths.audit_dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let library_before = library_files();
+    for (bytes, sequence) in [(&prefix, 1), (&through_floor, 3)] {
+        std::fs::write(f.path(T), bytes).unwrap();
+        let error = crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path)
+            .unwrap_err();
+        let crate::StateError::ConfigInvalid(message) = error else {
+            panic!("{error}")
+        };
+        assert_eq!(message, format!(
+            "RebuildWouldDropMarkEvidence: tape {} mark 5/{} log {sequence}/{}; start the daemon, which fences, or retire the tape",
+            uuid::Uuid::from_bytes(T), mark.source.unwrap().0, bytes.len(),
+        ));
+        assert_eq!(std::fs::read(f.path(T)).unwrap(), *bytes);
+        assert_eq!(library_files(), library_before);
+        let catalog = crate::projector::open(&f.paths.sqlite_path).unwrap();
+        assert_eq!(
+            catalog.write_handle().tape_projection_marks().unwrap()[&T],
+            mark
+        );
+    }
+    f.reopen();
+    let raises = f.raises(T);
+    assert_eq!(raises.len(), 2);
+    assert_eq!(raises[0], floor_raises[0]);
+    assert_eq!(value(&raises[1].1, "basis"), Text("mark".into()));
+    assert_eq!(value(&raises[1].1, "mark_sequence"), Unsigned(5));
+    assert_eq!(value(&raises[1].1, "mark_offset"), Unsigned(mark.offset));
+    assert_eq!(
+        value(&raises[1].1, "source_byte_end"),
+        Unsigned(mark.source.unwrap().0)
+    );
+    assert_eq!(
+        value(&raises[1].1, "source_digest"),
+        Bytes(lib::Blob(mark.source.unwrap().1.to_vec()))
+    );
+    f.close();
+    crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
+    f.reopen();
+    assert_eq!(f.raises(T), raises);
+    assert_eq!(
+        f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T].sequence,
+        3
+    );
+    f.close();
+    f.sql_loss();
+    std::fs::write(f.path(T), prefix).unwrap();
+    crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
+    f.reopen();
+    assert_eq!(f.raises(T), raises);
+}

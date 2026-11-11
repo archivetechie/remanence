@@ -30,6 +30,63 @@ create table if not exists tape_log_object_commits (
 );";
 
 impl CatalogCore {
+    /// A mark survives when either its row or its source binding exists.
+    pub(crate) fn tape_projection_marks(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<[u8; 16], crate::library_runtime::native_floor::MarkEvidence>,
+        StateError,
+    > {
+        use crate::library_runtime::native_floor::MarkEvidence;
+        let mut query = self.conn.prepare(
+            "select ids.tape_uuid, m.projected_through_sequence, m.projected_through_offset, s.byte_end, s.source_digest
+             from (select tape_uuid from tape_log_projection where incarnation=1
+                   union select tape_uuid from tape_projection_sources) ids
+             left join tape_log_projection m on m.tape_uuid=ids.tape_uuid and m.incarnation=1
+             left join tape_projection_sources s on s.tape_uuid=ids.tape_uuid order by ids.tape_uuid"
+        ).map_err(|e| sqlite_error("read tape projection evidence", e))?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Option<SqliteU64>>(1)?,
+                    r.get::<_, Option<SqliteU64>>(2)?,
+                    r.get::<_, Option<SqliteU64>>(3)?,
+                    r.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })
+            .map_err(|e| sqlite_error("query tape projection evidence", e))?;
+        rows.map(|row| {
+            let (id, sequence, offset, end, digest) =
+                row.map_err(|e| sqlite_error("decode tape projection evidence", e))?;
+            let id = id
+                .try_into()
+                .map_err(|_| StateError::IndexCorrupt("invalid projection UUID".into()))?;
+            let source = match (end, digest) {
+                (None, None) => None,
+                (Some(end), Some(digest)) => Some((
+                    end.get(),
+                    digest.try_into().map_err(|_| {
+                        StateError::IndexCorrupt("invalid projection source digest".into())
+                    })?,
+                )),
+                _ => {
+                    return Err(StateError::IndexCorrupt(
+                        "incomplete projection source evidence".into(),
+                    ))
+                }
+            };
+            Ok((
+                id,
+                MarkEvidence {
+                    sequence: sequence.map_or(0, SqliteU64::get),
+                    offset: offset.map_or(0, SqliteU64::get),
+                    source,
+                },
+            ))
+        })
+        .collect()
+    }
     /// One writer lease and outer transaction cover full replacement. Nested
     /// library/native apply uses savepoints, so any failed chunk retains the
     /// prior complete cache while the runtime keeps catch-up admission dirty.

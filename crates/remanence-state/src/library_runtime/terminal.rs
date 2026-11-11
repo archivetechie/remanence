@@ -572,6 +572,7 @@ mod tests {
                 lib::AuditActor::System,
             )
             .unwrap();
+        let before_count = runtime.0.authority.with_fold(|fold| fold.received_through);
         drop(owner);
         drop(runtime);
         for path in crate::TapeAuthority::list_entries(paths.journal_dir.join("tapes")).unwrap() {
@@ -583,6 +584,45 @@ mod tests {
                 std::fs::remove_file(p).unwrap();
             }
         }
+        let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
+        let records = runtime.test_source_records();
+        assert_eq!(
+            runtime.0.authority.with_fold(|fold| fold.received_through),
+            before_count + 1
+        );
+        let record = records.last().unwrap();
+        assert_eq!(record.envelope.actor, lib::AuditActor::System);
+        assert_eq!(record.envelope.source_layer, lib::SourceLayer::Layer4);
+        let lib::BodyView::FenceRaised(raised) = record.body_view() else {
+            panic!("open must fence the missing accepted native prefix");
+        };
+        use lib::DiagnosticValue::{Bytes, Text, Unsigned};
+        assert_eq!(
+            raised,
+            &lib::FenceRaised {
+                kind: lib::FenceKind::Write,
+                scope: lib::FenceScope::Tape(value.at.tape),
+                cause: lib::FenceCause::NativeLogBehindProjection,
+                evidence: None,
+                at: Some(value.at.clone()),
+                operation: None,
+                detail: lib::Bounded(vec![
+                    lib::DiagnosticEntry("basis".into(), Text("floor".into())),
+                    lib::DiagnosticEntry(
+                        "floor_digest".into(),
+                        Bytes(lib::Blob(value.at.record_digest.to_vec()))
+                    ),
+                    lib::DiagnosticEntry(
+                        "floor_named_by".into(),
+                        Unsigned(accepted.source.sequence)
+                    ),
+                    lib::DiagnosticEntry("floor_sequence".into(), Unsigned(value.at.sequence)),
+                    lib::DiagnosticEntry("observed_closed_end".into(), Unsigned(0)),
+                    lib::DiagnosticEntry("observed_floor".into(), Text("absent".into())),
+                    lib::DiagnosticEntry("observed_last_closed".into(), Unsigned(0)),
+                ]),
+            }
+        );
         let before = std::fs::read_dir(&paths.audit_dir)
             .unwrap()
             .map(|v| {
@@ -590,7 +630,6 @@ mod tests {
                 (p.clone(), std::fs::read(p).unwrap())
             })
             .collect::<Vec<_>>();
-        let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
         let retry = runtime
             .manual_acceptance_by_request(value.actor_fingerprint.as_str(), value.idempotency_key)
             .unwrap()

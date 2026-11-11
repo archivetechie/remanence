@@ -557,6 +557,7 @@ fn s12_released_fence_on_replaced_native_record_does_not_cover() {
     }));
     f.release(&id);
 
+    f.lose(T);
     drop(f.runtime.take());
     std::fs::remove_file(
         f.paths
@@ -571,27 +572,106 @@ fn s12_released_fence_on_replaced_native_record_does_not_cover() {
             std::fs::remove_file(path).unwrap();
         }
     }
-    f.reopen().unwrap();
-    let replacement = f.native(T, Some(SessionEndReason::FailedAppend));
+    let replacement = replacement_without_runtime(&f.paths, T);
     let replaced = replacement.record_evidence(3).unwrap().unwrap();
     assert_eq!(replaced.kind, Tag::SessionEnded);
     assert_ne!(replaced.digest, original.digest);
 
-    f.lose(T);
     f.recover();
     let raises = f.raises();
-    assert_eq!(raises.len(), 2);
+    assert_eq!(raises.len(), 3);
     assert_ending_fence(&raises[1], replaced.digest);
+    let record = &raises[2];
+    assert_eq!(record.envelope.actor, lib::AuditActor::System);
+    assert_eq!(record.envelope.source_layer, lib::SourceLayer::Layer4);
+    let lib::BodyView::FenceRaised(raised) = record.body_view() else {
+        panic!("expected floor fence")
+    };
+    let mut digests = [original.digest, replaced.digest];
+    digests.sort();
+    use lib::DiagnosticValue::{Bytes, Text, Unsigned};
+    assert_eq!(
+        raised,
+        &lib::FenceRaised {
+            kind: lib::FenceKind::Write,
+            scope: lib::FenceScope::Tape(tape(T)),
+            cause: lib::FenceCause::NativeLogBehindProjection,
+            evidence: None,
+            at: Some(lib::TapeAt {
+                tape: tape(T),
+                sequence: 3,
+                record_digest: original.digest
+            }),
+            operation: None,
+            detail: lib::Bounded(vec![
+                lib::DiagnosticEntry("basis".into(), Text("floor".into())),
+                lib::DiagnosticEntry(
+                    "conflict_digests".into(),
+                    Bytes(lib::Blob(digests.concat()))
+                ),
+                lib::DiagnosticEntry(
+                    "floor_digest".into(),
+                    Bytes(lib::Blob(original.digest.to_vec()))
+                ),
+                lib::DiagnosticEntry("floor_named_by".into(), Unsigned(2)),
+                lib::DiagnosticEntry("floor_sequence".into(), Unsigned(3)),
+                lib::DiagnosticEntry(
+                    "observed_closed_end".into(),
+                    Unsigned(replacement.summary().closed_end)
+                ),
+                lib::DiagnosticEntry("observed_floor".into(), Text("digest_conflict".into())),
+                lib::DiagnosticEntry("observed_last_closed".into(), Unsigned(3)),
+            ]),
+        }
+    );
     let live = f.live(T);
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].reason, "authority_ambiguous");
-    assert_eq!(live[0].tape_uuid, T);
+    assert_eq!(live.len(), 2);
+    assert_eq!(
+        live.iter()
+            .map(|r| r.reason.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["authority_ambiguous", "native_log_behind_projection"])
+    );
+    assert!(live.iter().all(|r| r.tape_uuid == T));
     assert!(!f.marker().exists());
 
     f.lose(T);
     f.recover();
-    assert_eq!(f.raises().len(), 2);
-    assert_eq!(f.live(T).len(), 1);
+    assert_eq!(f.raises().len(), 3);
+    assert_eq!(f.live(T).len(), 2);
+}
+
+/// Build S12's replacement while no runtime can observe the temporarily absent source.
+fn replacement_without_runtime(paths: &StatePaths, uuid: lib::Id) -> Snapshot {
+    // Native volume admission needs a catalog file; no library runtime is opened.
+    drop(crate::projector::open(&paths.sqlite_path).unwrap());
+    let authority =
+        crate::TapeAuthority::open(paths.journal_dir.join("tapes"), uuid, &paths.sqlite_path)
+            .unwrap();
+    let mut owner = authority.acquire_exclusive().unwrap();
+    owner
+        .publish_initialized(
+            262144,
+            None,
+            CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    let mut session = uuid;
+    session[0] ^= 0x10;
+    owner.open_session(session, TIME.into()).unwrap();
+    owner
+        .end_session(
+            session,
+            TIME.into(),
+            SessionEndReason::FailedAppend,
+            None,
+            std::iter::empty(),
+        )
+        .unwrap();
+    owner.freeze().unwrap().raw.clone()
 }
 
 /// S4c: released evidence at the session's opening frame meets D5(b)'s lower bound.

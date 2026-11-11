@@ -331,6 +331,10 @@ pub enum Validated {
 /// Bounded tape-reference authority and replay diagnostics (D3/D9).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TapeReferences {
+    /// Highest received native reference, its digest and the first naming library sequence.
+    pub floor: Option<(u64, Hash, u64)>,
+    /// Every digest received at the current floor, including conflicting evidence.
+    pub floor_digests: BTreeSet<Hash>,
     /// Lowest mismatching native sequence, if any.
     pub minimum_contradiction: Option<u64>,
     /// Highest dependent reference received, independent of its disposition.
@@ -376,6 +380,7 @@ pub struct LibraryFold {
     pub pending_rejection: Option<(u64, Id)>,
     latest: Index<(Tag, Scope, Option<Id>), Held>,
     fences: Index<u64, Held>,
+    tape_fences: Index<Id, BTreeSet<u64>>,
     supersedes: Index<(TapeRef, Option<Id>), Held>,
     supersede_sequences: Index<u64, (TapeRef, Option<Id>)>,
     unprotected: Index<(TapeRef, Id), Held>,
@@ -671,6 +676,7 @@ impl LibraryFold {
         self.lookup_count.get()
             + self.latest.probes()
             + self.fences.probes()
+            + self.tape_fences.probes()
             + self.supersedes.probes()
             + self.supersede_sequences.probes()
             + self.unprotected.probes()
@@ -857,6 +863,24 @@ impl LibraryFold {
                 .or_default();
             summary.highest_reference =
                 Some(summary.highest_reference.unwrap_or(0).max(at.sequence));
+        }
+    }
+    /// Preserve received evidence independently of application and repair policy.
+    fn note_floor(&mut self, at: Option<&TapeAt>, sequence: u64) {
+        let Some(at) = at else { return };
+        let summary = self
+            .contradictions
+            .entry(Scope::Tape(at.tape.uuid))
+            .or_default();
+        match summary.floor {
+            Some((floor, _, _)) if floor > at.sequence => {}
+            Some((floor, _, _)) if floor == at.sequence => {
+                summary.floor_digests.insert(at.record_digest);
+            }
+            _ => {
+                summary.floor = Some((at.sequence, at.record_digest, sequence));
+                summary.floor_digests = BTreeSet::from([at.record_digest]);
+            }
         }
     }
     fn exclude(&mut self, at: &TapeAt) {
@@ -1823,6 +1847,10 @@ impl LibraryFold {
         }
         let result = self.validate(&record, view, history)?;
         let at = record.body.at().cloned();
+        let floor_at = at.clone().or_else(|| match &record.body {
+            Body::FenceRaised(v) => v.at.clone(),
+            _ => None,
+        });
         match &result {
             Validated::Apply => self.apply_validated(sequence, record, receipt, view)?,
             Validated::Duplicate(_) => {
@@ -1831,6 +1859,7 @@ impl LibraryFold {
             }
         }
         self.note_reference(at.as_ref());
+        self.note_floor(floor_at.as_ref(), sequence);
         self.received_through = sequence;
         self.watermark();
         Ok(result)
@@ -1863,12 +1892,17 @@ impl LibraryFold {
             None
         };
         let at = record.body.at().cloned();
+        let floor_at = at.clone().or_else(|| match &record.body {
+            Body::FenceRaised(v) => v.at.clone(),
+            _ => None,
+        });
         if let Some(scope) = deferred_scope {
             self.defer_fence(sequence, record, receipt, scope, view, applied)?;
         } else {
             self.commit_observed(sequence, record, receipt, view, applied)?;
         }
         self.note_reference(at.as_ref());
+        self.note_floor(floor_at.as_ref(), sequence);
         self.received_through = sequence;
         self.watermark();
         Ok(())
@@ -1967,6 +2001,12 @@ impl LibraryFold {
                         self.unresolved_fence_evidence.insert(sequence);
                     }
                 }
+                if let FenceScope::Tape(tape) = &v.scope {
+                    self.tape_fences
+                        .entry(tape.uuid)
+                        .or_default()
+                        .insert(sequence);
+                }
                 self.fences.insert(
                     sequence,
                     Held {
@@ -1985,6 +2025,14 @@ impl LibraryFold {
                     return Err(FoldError::WrongCounterpart);
                 };
                 let scope = release_scope(&raised.scope)?;
+                if let FenceScope::Tape(tape) = &raised.scope {
+                    if let Some(sequences) = self.tape_fences.get_mut(&tape.uuid) {
+                        sequences.remove(&v.fence);
+                        if sequences.is_empty() {
+                            self.tape_fences.remove(&tape.uuid);
+                        }
+                    }
+                }
                 self.fences.remove(&v.fence);
                 self.unresolved_fence_evidence.remove(&v.fence);
                 self.fence_liveness_failures.remove(&v.fence);
@@ -2334,6 +2382,10 @@ impl LibraryFold {
         let scope = self.scopes_for(&record.body, history)?;
         let blocked = self.blocked(&scope);
         let at = record.body.at().cloned();
+        let floor_at = at.clone().or_else(|| match &record.body {
+            Body::FenceRaised(v) => v.at.clone(),
+            _ => None,
+        });
         // D2/D4: native evidence is decided even behind an unrelated scope wait.
         let validation = if blocked {
             self.check_reference(&record.body, view)
@@ -2361,6 +2413,7 @@ impl LibraryFold {
             }
         }
         self.note_reference(at.as_ref());
+        self.note_floor(floor_at.as_ref(), sequence);
         self.received_through = sequence;
         self.watermark();
         Ok(())
@@ -2636,6 +2689,21 @@ impl LibraryFold {
         }
     }
 
+    /// Open fences on one tape, in ascending durable raise sequence order.
+    pub fn active_tape_fences(&self, tape: &Id) -> impl Iterator<Item = (u64, &FenceRaised)> {
+        self.tape_fences
+            .get(tape)
+            .into_iter()
+            .flatten()
+            .map(|sequence| {
+                (
+                    *sequence,
+                    self.active_fence(*sequence)
+                        .expect("indexed tape fence is open"),
+                )
+            })
+    }
+
     /// Open fences, individually identified by their raise sequence.
     pub fn open_fences(&self) -> usize {
         self.fences.len()
@@ -2726,6 +2794,7 @@ impl LibraryFold {
             pending_bytes,
             latest,
             fences,
+            tape_fences,
             intents,
             uncertain,
             loads,
@@ -2754,7 +2823,17 @@ impl LibraryFold {
         let authority = |fold: &Self| {
             fold.contradictions
                 .iter()
-                .map(|(t, s)| (t.clone(), (s.minimum_contradiction, s.highest_reference)))
+                .map(|(t, s)| {
+                    (
+                        t.clone(),
+                        (
+                            s.minimum_contradiction,
+                            s.highest_reference,
+                            s.floor,
+                            s.floor_digests.clone(),
+                        ),
+                    )
+                })
                 .collect::<BTreeMap<_, _>>()
         };
         assert_eq!(authority(self), authority(other));

@@ -208,6 +208,12 @@ impl LibraryAuthority {
             .cloned()
     }
 
+    /// Read derived authority under the same log lock used by the writer.
+    pub fn with_fold<T>(&self, f: impl FnOnce(&LibraryFold) -> T) -> T {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        f(&log.state().fold)
+    }
+
     fn write(
         &self,
         body: Body,
