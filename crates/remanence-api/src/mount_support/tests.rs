@@ -3208,3 +3208,256 @@ fn operator_spool_cutover_measurement() {
         println!("CUTOVER_SPOOL {{\"sample\":{sample},\"input_bytes\":{},\"seconds\":{seconds:.6},\"mib_per_second\":{:.6},\"write_cdbs\":{writes},\"library_source_bytes\":{authority_bytes}}}",PAYLOAD*OBJECTS,(PAYLOAD*OBJECTS) as f64/1048576.0/seconds);
     }
 }
+
+/// L1-R3a fixtures publish the model's verified Bootstrap through the native owner.
+/// Shared only by the new production-path tests; the ruling-11 reproduction stays intact.
+fn r3a_initialized_state(root: &Path, world: &SharedVirtualWorld) -> StateHandle {
+    use remanence_state::authority::TapeAuthorityView;
+    let state = state(root);
+    let records = world.lock().unwrap().tapes["HAND"].records.clone();
+    assert_eq!(records.len(), 2);
+    let Record::Block(bytes) = &records[0] else {
+        panic!("Bootstrap")
+    };
+    let bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(bytes).unwrap();
+    assert_eq!(bootstrap.tape_uuid, UUID);
+    assert_eq!(bootstrap.block_size_bytes, BLOCK);
+    assert!(bootstrap.scheme.is_none());
+    assert!(matches!(records[1], Record::Filemark));
+    let authority = remanence_state::TapeAuthority::open(
+        state.paths().journal_dir.join("tapes"),
+        UUID,
+        &state.paths().sqlite_path,
+    )
+    .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    lease
+        .publish_initialized(
+            BLOCK,
+            None,
+            remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    state
+        .write_handle()
+        .project_tape_log(&lease.freeze().unwrap())
+        .unwrap();
+    state
+}
+
+/// A2: the production coupled failure reconstructs D4 and blocks the next mounted WRITE.
+#[test]
+fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
+    use remanence_state::library_log as lib;
+    let root = tempfile::tempdir().unwrap();
+    let world = world();
+    let mut state = r3a_initialized_state(root.path(), &world);
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let audit_path = std::fs::read_dir(&paths.audit_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "remlib"))
+        .unwrap();
+    let fault = fault();
+    let mut mount = OperatorMount::with_transport_for_test(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: BAY }),
+            fault: fault.clone(),
+            audit_cut: Some(audit_path.clone()),
+            hide_serial: false,
+            commands: None,
+            cut_after_prevent: false,
+            boundary: None,
+        }),
+        &mut state,
+        &root.path().join("locks"),
+    )
+    .unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor.open_session("default").unwrap();
+    *fault.lock().unwrap() = Some(0x0a);
+    assert!(actor
+        .write_checkpointed(request(root.path(), "r3a-cut"))
+        .is_err());
+    assert!(actor
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    let marker = paths.audit_dir.join("library-log.fence-reconcile");
+    assert!(
+        std::fs::read(&marker)
+            .unwrap()
+            .chunks_exact(16)
+            .any(|entry| entry == UUID),
+        "ruling-11 lost append must name its tape"
+    );
+    std::fs::remove_dir(&audit_path).unwrap();
+    std::fs::rename(audit_path.with_extension("saved"), &audit_path).unwrap();
+    let count = dispatched_writes(&world);
+    assert!(actor
+        .write_checkpointed(request(root.path(), "r3a-latched"))
+        .is_err());
+    assert_eq!(dispatched_writes(&world), count);
+    let _ = actor.finish();
+    let ending_at = {
+        use lib::{
+            native_view::NativeTapeView,
+            store::{Clock, Origin, UuidSource},
+            LibraryLog,
+        };
+        struct Now;
+        impl Clock for Now {
+            fn now(&self) -> u64 {
+                1
+            }
+        }
+        struct Fresh;
+        impl UuidSource for Fresh {
+            fn next(&self, _: u64) -> [u8; 16] {
+                *uuid::Uuid::new_v4().as_bytes()
+            }
+        }
+        let _lease = remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap();
+        let native = remanence_state::tape_log::store::Store::open(
+            paths.journal_dir.join("tapes"),
+            UUID,
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let native = native.snapshot().unwrap();
+        let end = native.summary().last_session_end.as_ref().unwrap();
+        assert_eq!(
+            end.reason,
+            remanence_state::tape_log::SessionEndReason::DriveError
+        );
+        let mut ending = None;
+        native
+            .visit_frames(|frame| {
+                if let remanence_state::tape_log::Record::SessionEnded(value) = &frame.record {
+                    if value.session_id == end.session_id {
+                        ending = Some(frame.sequence);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let sequence = ending.unwrap();
+        let evidence = native.record_evidence(sequence).unwrap().unwrap();
+        assert_eq!(evidence.kind, remanence_state::tape_log::Tag::SessionEnded);
+        let at = lib::TapeAt {
+            tape: lib::TapeRef {
+                uuid: UUID,
+                incarnation: 1,
+            },
+            sequence,
+            record_digest: evidence.digest,
+        };
+        let view =
+            NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+        let mut log = LibraryLog::open(
+            &paths.audit_dir,
+            library_uuid,
+            Origin {
+                host: "r3a-recovery".into(),
+                pid: std::process::id(),
+                build: "test".into(),
+            },
+            Box::new(Now),
+            Box::new(Fresh),
+            true,
+            &view,
+        )
+        .unwrap();
+        log.clear_ambiguity(&view).unwrap();
+        assert!(marker.exists());
+        at
+    };
+    let mut state = reopen_state();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    let id = fences[0].quarantine_id.clone();
+    assert_eq!(fences[0].reason, "authority_ambiguous");
+    let sequence = id.strip_prefix("library:").unwrap().parse().unwrap();
+    assert_eq!(
+        state.library_runtime().active_fence(sequence).unwrap(),
+        lib::FenceRaised {
+            kind: lib::FenceKind::Write,
+            scope: lib::FenceScope::Tape(ending_at.tape),
+            cause: lib::FenceCause::AuthorityAmbiguous,
+            evidence: None,
+            at: Some(ending_at),
+            operation: None,
+            detail: lib::Bounded(vec![]),
+        }
+    );
+    assert!(!marker.exists());
+    let mut mount = backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        self::fault(),
+    )
+    .unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, _reopen_state) = own_mount!(mount, mounted, state);
+    let before = dispatched_writes(&world);
+    let error = actor
+        .write_checkpointed(request(root.path(), "r3a-refused"))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(&id),
+        "refusal must name {id}: {error}"
+    );
+    assert_eq!(dispatched_writes(&world), before);
+    actor.finish().unwrap();
+}
+
+/// A3: a real mounted Object and clean close produce the zero-tail native shape used by S10.
+#[test]
+fn r3a_clean_mounted_close_has_no_native_tail() {
+    let root = tempfile::tempdir().unwrap();
+    let world = world();
+    let mut state = r3a_initialized_state(root.path(), &world);
+    let paths = state.paths().clone();
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, _reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "r3a-clean"))
+        .unwrap();
+    actor.close_session().unwrap();
+    actor.finish().unwrap();
+    let native = remanence_state::tape_log::store::Store::open(
+        paths.journal_dir.join("tapes"),
+        UUID,
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let native = native.snapshot().unwrap();
+    assert!(native.summary().open_session.is_none());
+    let end = native.summary().last_session_end.as_ref().unwrap();
+    eprintln!(
+        "A3 observed: reason={:?}, tail_file_count={}, possible_tail_blocks={}",
+        end.reason, end.tail_file_count, end.possible_tail_blocks
+    );
+    assert_eq!(
+        end.reason,
+        remanence_state::tape_log::SessionEndReason::CleanClose
+    );
+    assert_eq!(
+        end.tail_file_count, 0,
+        "A3 requires stop and report on nonzero tail"
+    );
+    assert_eq!(
+        end.possible_tail_blocks, 0,
+        "A3 requires stop and report on nonzero tail"
+    );
+}

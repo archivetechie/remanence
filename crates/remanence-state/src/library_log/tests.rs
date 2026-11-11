@@ -3572,3 +3572,213 @@ fn native_view_read_failure_stops_live_and_replay_without_contradiction() {
         assert_eq!(restored.terminal_hash, expected);
     }
 }
+
+/// S9: each lost tape fence survives recovery; unrelated bodies leave no trigger.
+#[test]
+fn lost_fence_recording_all_three_sites() {
+    use remanence_library::durable_file::test_support::register;
+    use std::sync::atomic::AtomicU8;
+    let d = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(d.path(), &Present);
+    put(&mut log, provision(1, None));
+    let registration = register(
+        d.path().into(),
+        Arc::new(durability::FaultDirectory(Arc::new(
+            durability::Injection {
+                stage: AtomicU8::new(1),
+                after: false,
+            },
+        ))),
+    );
+    assert!(matches!(
+        log.append(fence(1), AuditActor::System, SourceLayer::Layer4, &Present),
+        Err(StoreError::Ambiguous(_))
+    ));
+    assert_eq!(
+        log.fence_reconciliation_tapes().unwrap(),
+        vec![tape(1).uuid]
+    );
+    assert!(matches!(
+        log.append(fence(2), AuditActor::System, SourceLayer::Layer4, &Present),
+        Err(StoreError::Fenced)
+    ));
+    assert_eq!(
+        log.fence_reconciliation_tapes().unwrap(),
+        vec![tape(1).uuid, tape(2).uuid]
+    );
+    drop(registration);
+    log.clear_ambiguity(&Present).unwrap();
+    assert_eq!(
+        log.fence_reconciliation_tapes().unwrap(),
+        vec![tape(1).uuid, tape(2).uuid]
+    );
+    log.finish_fence_reconciliation().unwrap();
+    assert!(!d.path().join("library-log.fence-reconcile").exists());
+    log.finish_fence_reconciliation().unwrap();
+
+    // The frozen-view contract is deliberately violated only after publication.
+    struct FailsOnApply(AtomicU64);
+    impl TapeView for FailsOnApply {
+        fn lookup(&self, at: &TapeAt) -> Result<TapeLookup, FoldError> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Present.lookup(at)
+            } else {
+                Err(FoldError::InvalidSchema)
+            }
+        }
+    }
+    let prior = log.state().last_sequence;
+    assert!(matches!(
+        log.append(
+            fence(1),
+            AuditActor::System,
+            SourceLayer::Layer4,
+            &FailsOnApply(AtomicU64::new(0))
+        ),
+        Err(StoreError::Ambiguous(_))
+    ));
+    assert_eq!(
+        log.fence_reconciliation_tapes().unwrap(),
+        vec![tape(1).uuid]
+    );
+    log.clear_ambiguity(&Present).unwrap();
+    assert_eq!(
+        log.state().last_sequence,
+        prior + 1,
+        "apply failure retained published fence"
+    );
+    log.finish_fence_reconciliation().unwrap();
+    let registration = register(
+        d.path().into(),
+        Arc::new(durability::FaultDirectory(Arc::new(
+            durability::Injection {
+                stage: AtomicU8::new(1),
+                after: false,
+            },
+        ))),
+    );
+    assert!(matches!(
+        log.append(
+            diagnostic(),
+            AuditActor::System,
+            SourceLayer::Layer4,
+            &Present
+        ),
+        Err(StoreError::Ambiguous(_))
+    ));
+    assert!(log.fence_reconciliation_tapes().unwrap().is_empty());
+    assert!(!d.path().join("library-log.fence-reconcile").exists());
+    drop(registration);
+    log.clear_ambiguity(&Present).unwrap();
+}
+
+/// S9a: hook observation at the first marker open proves the tape was synced first.
+#[test]
+fn lost_fence_recording_precedes_first_ambiguity_marker() {
+    use remanence_library::durable_file::{test_support::register, DurableDirectory, DurableFile};
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+    struct Observer {
+        fault: durability::FaultDirectory,
+        synced: Arc<AtomicBool>,
+        directory_synced: Arc<AtomicBool>,
+        marker_opens: AtomicU64,
+    }
+    struct ObservedFile {
+        inner: Box<dyn DurableFile>,
+        path: PathBuf,
+        synced: Arc<AtomicBool>,
+    }
+    impl DurableFile for ObservedFile {
+        fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.inner.append(bytes)
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            self.inner.sync()?;
+            if self
+                .path
+                .extension()
+                .is_some_and(|e| e == "fence-reconcile")
+            {
+                assert_eq!(std::fs::read(&self.path)?, tape(1).uuid);
+                // The wrapper calls host fsync after this hook; do it here too so
+                // the observation records completed durability, not just an attempt.
+                std::fs::File::open(&self.path)?.sync_all()?;
+                self.synced.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+    impl DurableDirectory for Observer {
+        fn create(&self, path: &Path) -> io::Result<Box<dyn DurableFile>> {
+            self.open(path)
+        }
+        fn open(&self, path: &Path) -> io::Result<Box<dyn DurableFile>> {
+            if path.extension().is_some_and(|e| e == "ambiguous") {
+                assert!(
+                    self.synced.load(Ordering::SeqCst),
+                    "reconcile sync must precede first ambiguity marker"
+                );
+                assert!(
+                    self.directory_synced.load(Ordering::SeqCst),
+                    "reconcile directory sync must precede first ambiguity marker"
+                );
+                assert_eq!(
+                    std::fs::read(path.with_extension("fence-reconcile"))?,
+                    tape(1).uuid
+                );
+                self.marker_opens.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Box::new(ObservedFile {
+                inner: self.fault.open(path)?,
+                path: path.into(),
+                synced: self.synced.clone(),
+            }))
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fault.rename(from, to)
+        }
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fault.rename_noreplace(from, to)
+        }
+        fn sync(&self, path: &Path) -> io::Result<()> {
+            self.fault.sync(path)?;
+            if self.synced.load(Ordering::SeqCst) {
+                std::fs::File::open(path)?.sync_all()?;
+                self.directory_synced.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn set_len(&self, path: &Path, len: u64) -> io::Result<()> {
+            self.fault.set_len(path, len)
+        }
+    }
+    for stage in [1, 2] {
+        let d = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(d.path(), &Present);
+        put(&mut log, provision(1, None));
+        let observer = Arc::new(Observer {
+            fault: durability::FaultDirectory(Arc::new(durability::Injection {
+                stage: AtomicU8::new(stage),
+                after: false,
+            })),
+            synced: Arc::new(AtomicBool::new(false)),
+            directory_synced: Arc::new(AtomicBool::new(false)),
+            marker_opens: AtomicU64::new(0),
+        });
+        let registration = register(d.path().into(), observer.clone());
+        assert!(matches!(
+            log.append(fence(1), AuditActor::System, SourceLayer::Layer4, &Present),
+            Err(StoreError::Ambiguous(_))
+        ));
+        assert_eq!(observer.marker_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            log.fence_reconciliation_tapes().unwrap(),
+            vec![tape(1).uuid]
+        );
+        assert!(matches!(log.snapshot(), Err(StoreError::Fenced)));
+        drop(registration);
+        log.clear_ambiguity(&Present).unwrap();
+    }
+}

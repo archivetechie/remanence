@@ -1,6 +1,6 @@
 //! Restart bookkeeping derives open work from authenticated sources. Native
 //! write sessions stay native and unresolved until physical recovery; a broad
-//! native end reason never invents a library quarantine cause or endpoint.
+//! ending yields a fence only under ruling 21 at open, for a tape whose fence append was lost.
 use super::*;
 use std::collections::BTreeMap;
 

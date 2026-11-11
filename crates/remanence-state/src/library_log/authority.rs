@@ -951,6 +951,22 @@ impl LibraryAuthority {
             _state_lock: self._state_lock.clone(),
         })
     }
+    /// Tapes whose fence publication was lost, read under append ownership.
+    pub(crate) fn fence_reconciliation_tapes(&self) -> Result<Vec<Id>, AuthorityError> {
+        Ok(self
+            .log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fence_reconciliation_tapes()?)
+    }
+    /// Retire the reconciliation trigger after the replacement fences are durable.
+    pub(crate) fn finish_fence_reconciliation(&self) -> Result<(), AuthorityError> {
+        Ok(self
+            .log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_fence_reconciliation()?)
+    }
 }
 
 #[cfg(test)]

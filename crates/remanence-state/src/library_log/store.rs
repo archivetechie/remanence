@@ -653,6 +653,50 @@ impl LibraryLog {
         }
         self.clear_ambiguity(view)
     }
+    /// Durably name a tape whose safety fence could not be published.
+    pub(crate) fn record_lost_fence(&self, tape: TapeRef) {
+        let result = (|| -> io::Result<()> {
+            let mut file = File::options()
+                .create(true)
+                .append(true)
+                .open(self.identity.with_extension("fence-reconcile"))?;
+            file.write_all(&tape.uuid)?;
+            file.sync_all()?;
+            File::open(&self.dir)?.sync_all()
+        })();
+        if let Err(error) = result {
+            tracing::error!(tape = %uuid::Uuid::from_bytes(tape.uuid), %error, "could not record lost library fence");
+        }
+    }
+    /// Read the lost-tape trigger; malformed entries must keep runtime admission closed.
+    pub(crate) fn fence_reconciliation_tapes(&self) -> Result<Vec<Id>, StoreError> {
+        let bytes = match fs::read(self.identity.with_extension("fence-reconcile")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.len() % 16 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed fence-reconcile entries",
+            )
+            .into());
+        }
+        Ok(bytes
+            .chunks_exact(16)
+            .map(|entry| entry.try_into().unwrap())
+            .collect())
+    }
+    /// Remove the trigger only after all owed fences have been durably reconciled.
+    pub(crate) fn finish_fence_reconciliation(&self) -> Result<(), StoreError> {
+        match fs::remove_file(self.identity.with_extension("fence-reconcile")) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
     /// Preflight under the append lease, publish, then advance in-memory authority.
     #[allow(dead_code)] // No production caller until B4b.
     pub(super) fn append(
@@ -685,8 +729,25 @@ impl LibraryLog {
         applied: &mut dyn FnMut(u64),
         check: &dyn Fn(&LibraryFold, &Body) -> Result<(), StoreError>,
     ) -> Result<Receipt, StoreError> {
-        if publication::has_ambiguity(&self.identity)? {
-            return Err(StoreError::Fenced);
+        let lost = match &body {
+            Body::FenceRaised(FenceRaised {
+                scope: FenceScope::Tape(tape),
+                ..
+            }) => Some(*tape),
+            _ => None,
+        };
+        match publication::has_ambiguity(&self.identity) {
+            Ok(false) => (),
+            refusal => {
+                if let Some(tape) = lost {
+                    self.record_lost_fence(tape);
+                }
+                return Err(match refusal {
+                    Ok(true) => StoreError::Fenced,
+                    Err(error) => StoreError::Io(error),
+                    Ok(false) => unreachable!(),
+                });
+            }
         }
         if let Some(e) = &self.state.refusal {
             return Err(StoreError::RecoveryRequired(e.clone()));
@@ -775,22 +836,18 @@ impl LibraryLog {
             } else {
                 let target = self.dir.join(&self.state.segments.last().unwrap().name);
                 let mut f = File::options().append(true).open(target)?;
+                // Publication helpers fence before the lost tape can be recorded.
+                f.write_all(&bytes)?;
                 if synced {
-                    publication::append_and_publish(
-                        &mut f,
-                        &bytes,
-                        None,
-                        &self.identity,
-                        &self.dir,
-                        || Ok(()),
-                    )?;
-                } else {
-                    publication::append_without_sync(&mut f, &bytes, &self.identity, &self.dir)?;
+                    f.sync_all()?;
                 }
             }
             Ok(())
         })();
         if let Err(e) = result {
+            if let Some(tape) = lost {
+                self.record_lost_fence(tape);
+            }
             publication::fence_ambiguity(&self.dir, &self.identity);
             return Err(StoreError::Ambiguous(e));
         }
@@ -809,6 +866,9 @@ impl LibraryLog {
             applied,
         ) {
             // Publication already happened: fail closed if a future scope lacks apply semantics.
+            if let Some(tape) = lost {
+                self.record_lost_fence(tape);
+            }
             publication::fence_ambiguity(&self.dir, &self.identity);
             return Err(StoreError::Ambiguous(io::Error::other(error)));
         }

@@ -233,6 +233,15 @@ impl LibraryRuntime {
         )?;
         let snapshot = authority.snapshot()?;
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
+        if manifest
+            .library_root()
+            .join("library-log.fence-reconcile")
+            .try_exists()
+            .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
+        {
+            native_fences::reconcile(&authority, &view)?;
+        }
+        let snapshot = authority.snapshot()?;
         let projector = ProjectionClient::open(&paths.sqlite_path)?;
         projector.project_library(snapshot, Box::new(view.clone()), ApplyPath::Startup)?;
         // Library identities/assignments precede native sessions and terminal
@@ -885,6 +894,7 @@ impl LibraryRuntime {
 }
 
 mod motion;
+mod native_fences;
 
 mod adoption;
 mod cleaning;
