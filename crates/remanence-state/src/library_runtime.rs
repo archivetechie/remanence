@@ -242,7 +242,17 @@ impl LibraryRuntime {
         let snapshot = authority.snapshot()?;
         let projector = ProjectionClient::open(&paths.sqlite_path)?;
         let marks = projector.reader()?.tape_projection_marks()?;
-        let raises = authority.with_fold(|fold| native_floor::detect(fold, &marks, &view));
+        let raises = authority.with_fold(|fold| {
+            native_floor::detect(
+                fold,
+                &marks,
+                &view,
+                &lib::native_view::NativePrefixDigests {
+                    view: &view,
+                    root: manifest.tape_root(),
+                },
+            )
+        });
         let snapshot = if raises.is_empty() {
             snapshot
         } else {
@@ -472,7 +482,15 @@ impl LibraryRuntime {
             .map_err(AuthorityError::Store)?;
         let snapshot = if replay.refusal.is_none() {
             let marks = index.tape_projection_marks()?;
-            for raise in native_floor::detect(&replay.fold, &marks, &view) {
+            for raise in native_floor::detect(
+                &replay.fold,
+                &marks,
+                &view,
+                &lib::native_view::NativePrefixDigests {
+                    view: &view,
+                    root: self.0.manifest.tape_root(),
+                },
+            ) {
                 self.append_locked(|authority, view| {
                     authority.fence_raised(
                         raise,
@@ -557,6 +575,7 @@ impl LibraryRuntime {
         &self,
         id: &str,
         acknowledgment: &str,
+        force: bool,
         actor: lib::AuditActor,
     ) -> Result<Option<crate::TapeIoFenceRecord>, RuntimeError> {
         if acknowledgment.trim().is_empty() {
@@ -581,14 +600,60 @@ impl LibraryRuntime {
                 )
                 .into());
             }
-            native_floor::refuse_unforced_release(&fence)?;
+            let forced = fence.cause == lib::FenceCause::NativeLogBehindProjection;
+            let detail = if forced {
+                if !force {
+                    native_floor::refuse_unforced_release(&fence)?;
+                }
+                let lib::FenceScope::Tape(tape) = fence.scope else {
+                    unreachable!()
+                };
+                let marks = self.0.projector.reader()?.tape_projection_marks()?;
+                let view = self
+                    .0
+                    .view
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let digests = lib::native_view::NativePrefixDigests {
+                    view: &view,
+                    root: self.0.manifest.tape_root(),
+                };
+                match self.0.authority.with_fold(|fold| {
+                    native_floor::force_release_decision(
+                        fold,
+                        tape,
+                        native_floor::extent(&view, tape.uuid),
+                        marks.get(&tape.uuid),
+                        &view,
+                        &digests,
+                    )
+                }) {
+                    Ok(detail) => detail,
+                    Err(reason) => {
+                        let code = if reason == native_floor::ForceRefusal::Contradicted {
+                            lib::RefusalCode::ContradictedTapeAdmission
+                        } else {
+                            lib::RefusalCode::TapeLogBehindProjection
+                        };
+                        self.record_refusal_locked(
+                            code,
+                            RefusalSubject::Tape(Some(tape.uuid)),
+                            actor,
+                        );
+                        return Err(StateError::ConfigInvalid(reason.message()).into());
+                    }
+                }
+            } else {
+                lib::Bounded(vec![])
+            };
             self.append_locked(|a, v| {
                 a.fence_released(
                     lib::FenceReleased {
-                        detail: lib::Bounded(vec![]),
+                        detail,
                         fence: sequence,
                         evidence: acknowledgment.into(),
-                        forced: false,
+                        forced,
                     },
                     actor,
                     lib::SourceLayer::Layer4,
@@ -908,6 +973,22 @@ impl LibraryRuntime {
             .find(|v| !v.retired && v.label.as_ref().is_some_and(|v| v.as_str() == label))
             .map(|v| v.tape.uuid))
     }
+    /// Resolve a projected quarantine identity to its active typed source.
+    pub fn fence_for_quarantine_id(&self, id: &str) -> Option<lib::FenceRaised> {
+        let sequence = id.strip_prefix("library:")?.parse::<u64>().ok()?;
+        self.0.authority.active_fence(sequence)
+    }
+    /// Serialize admission against authority updates; callers hold no dispatch lease.
+    pub fn contradicted(&self, tape: lib::Id) -> bool {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.authority.with_fold(|fold| {
+            fold.contradicted(lib::TapeRef {
+                uuid: tape,
+                incarnation: 1,
+            })
+        })
+    }
+
     /// Exact source identity and cause of active tape raises.
     pub fn active_fence(&self, sequence: u64) -> Option<lib::FenceRaised> {
         self.0.authority.active_fence(sequence)

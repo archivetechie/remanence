@@ -392,6 +392,7 @@ fn l1a_absent_floor_all_kinds_restart_and_release_refusal() {
                 .release_tape_fence(
                     &format!("library:{sequence}"),
                     "acknowledged",
+                    false,
                     lib::AuditActor::System,
                 )
                 .unwrap_err();
@@ -835,4 +836,405 @@ fn l1a_offline_preserves_exact_mark_above_carried_floor() {
     crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
     f.reopen();
     assert_eq!(f.raises(T), raises);
+}
+
+/// Frozen identity plus length detects replacement, truncation and disappearance.
+#[test]
+fn l1b_prefix_source_freshness_real_files() {
+    use lib::native_view::NativePrefixDigests;
+    use native_floor::PrefixDigestSource;
+    for change in ["unchanged", "replace", "truncate", "remove"] {
+        let f = Fixture::new();
+        f.provision(T);
+        let (short, _) = f.native(T, false);
+        let runtime = f.rt();
+        let view = runtime.0.view.lock().unwrap().clone();
+        let source = NativePrefixDigests {
+            view: &view,
+            root: runtime.0.manifest.tape_root(),
+        };
+        assert!(source.source_unchanged(T).unwrap());
+        match change {
+            "replace" => {
+                let old = f.path(T).with_extension("old");
+                std::fs::rename(f.path(T), &old).unwrap();
+                std::fs::copy(old, f.path(T)).unwrap();
+            }
+            "truncate" => std::fs::OpenOptions::new()
+                .write(true)
+                .open(f.path(T))
+                .unwrap()
+                .set_len(short.len() as u64)
+                .unwrap(),
+            "remove" => std::fs::remove_file(f.path(T)).unwrap(),
+            _ => {}
+        }
+        assert_eq!(
+            matches!(source.source_unchanged(T), Ok(true)),
+            change == "unchanged",
+            "{change}"
+        );
+        assert!(source.source_unchanged(B).is_err());
+        assert!(source.prefix_digest(B, 0).is_err());
+    }
+}
+
+/// The waiver compares every recorded value and never suppresses an independent mark.
+#[test]
+fn l1b_detector_exact_waiver_and_independent_mark() {
+    use lib::native_view::NativePrefixDigests;
+    let f = Fixture::new();
+    f.provision(T);
+    f.native(T, false);
+    let runtime = f.rt();
+    let view = runtime.0.view.lock().unwrap().clone();
+    let source = NativePrefixDigests {
+        view: &view,
+        root: runtime.0.manifest.tape_root(),
+    };
+    let mut fold = runtime.0.authority.with_fold(Clone::clone);
+    let extent = native_floor::extent(&view, T).unwrap();
+    fold.contradictions.insert(
+        lib::fold::Scope::Tape(T),
+        lib::fold::TapeReferences {
+            floor: Some((extent.last_closed + 1, [8; 32], 42)),
+            floor_digests: BTreeSet::from([[8; 32]]),
+            ..Default::default()
+        },
+    );
+    let memory =
+        native_floor::force_release_decision(&fold, tape(T), Some(extent), None, &view, &source)
+            .unwrap();
+    fold.forced_observation.insert(T, memory.clone());
+    let empty = std::collections::BTreeMap::new();
+    assert!(native_floor::detect(&fold, &empty, &view, &source).is_empty());
+    for i in 0..7 {
+        let mut altered = memory.clone();
+        altered.0[i].1 = Text("changed".into());
+        fold.forced_observation.insert(T, altered);
+        let raised = native_floor::detect(&fold, &empty, &view, &source);
+        assert_eq!(raised.len(), 1, "key {i}");
+        assert_eq!(value(&raised[0], "basis"), Text("floor".into()));
+    }
+    fold.forced_observation.insert(T, memory);
+    let marks = std::collections::BTreeMap::from([(
+        T,
+        native_floor::MarkEvidence {
+            sequence: extent.last_closed + 1,
+            offset: 0,
+            source: None,
+        },
+    )]);
+    let raised = native_floor::detect(&fold, &marks, &view, &source);
+    assert_eq!(raised.len(), 1);
+    assert_eq!(value(&raised[0], "basis"), Text("mark".into()));
+}
+
+/// Refusal counts are observed through the durable library records, not SQL text.
+fn l1b_refusals(f: &Fixture) -> Vec<(u64, String, String, Option<String>)> {
+    f.rt()
+        .test_source_records()
+        .into_iter()
+        .filter_map(|record| {
+            let lib::BodyView::Diagnostic(d) = record.body_view() else {
+                return None;
+            };
+            if d.event != lib::DiagnosticEvent::RefusalRecorded {
+                return None;
+            }
+            let (Unsigned(code), Text(name)) = (&d.detail.0[0].1, &d.detail.0[1].1) else {
+                panic!("refusal detail")
+            };
+            Some((
+                *code,
+                name.as_str().into(),
+                d.subject_kind.as_str().into(),
+                d.subject_id.as_ref().map(|v| v.as_str().into()),
+            ))
+        })
+        .collect()
+}
+fn l1b_force(
+    f: &mut Fixture,
+    sequence: u64,
+) -> Result<Option<crate::TapeIoFenceRecord>, StateError> {
+    f.state.as_mut().unwrap().release_tape_io_fence(
+        &format!("library:{sequence}"),
+        "operator checked evidence",
+        true,
+    )
+}
+fn l1b_release_record(f: &Fixture) -> lib::FenceReleased {
+    f.rt()
+        .test_source_records()
+        .into_iter()
+        .rev()
+        .find_map(|r| match r.body_view() {
+            lib::BodyView::FenceReleased(v) => Some(v.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+fn l1b_assert_refused_once(f: &mut Fixture, sequence: u64, code: u64, reason: &str) {
+    let before = l1b_refusals(f);
+    let error = l1b_force(f, sequence).unwrap_err().to_string();
+    assert!(error.contains(reason), "{error}");
+    let after = l1b_refusals(f);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        after.last().unwrap(),
+        &(
+            code,
+            if code == 2 {
+                "ContradictedTapeAdmission"
+            } else {
+                "TapeLogBehindProjection"
+            }
+            .into(),
+            "tape".into(),
+            Some(uuid::Uuid::from_bytes(T).to_string())
+        )
+    );
+    assert!(f.rt().active_fence(sequence).is_some());
+}
+
+/// A mark can only be released after exact restoration or rebuild; a later loss
+/// creates a fresh fence even when the last forced release remembered nothing.
+#[test]
+fn l1b_release_mark_restore_rebuild_and_lost_twice() {
+    for rebuild in [false, true] {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (short, snapshot) = f.native(T, false);
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        let full = std::fs::read(f.path(T)).unwrap();
+        f.close();
+        std::fs::write(f.path(T), &short).unwrap();
+        let offline = crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path)
+            .unwrap_err();
+        assert!(offline.to_string().contains("RebuildWouldDropMarkEvidence"));
+        f.reopen();
+        let sequence = f.raises(T)[0].0;
+        l1b_assert_refused_once(&mut f, sequence, 1, "live projection mark is above");
+        f.close();
+        if rebuild {
+            crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
+        } else {
+            std::fs::write(f.path(T), &full).unwrap();
+        }
+        f.reopen();
+        assert_eq!(
+            l1b_force(&mut f, sequence).unwrap().unwrap().state,
+            "released"
+        );
+        let release = l1b_release_record(&f);
+        assert!(release.forced && release.detail.0.is_empty());
+        f.reopen();
+        assert!(f.raises(T).is_empty());
+        if rebuild {
+            f.name(6, at);
+            f.reopen();
+            assert_eq!(f.raises(T).len(), 1);
+        } else {
+            f.close();
+            std::fs::write(f.path(T), &short).unwrap();
+            f.reopen();
+            assert_eq!(f.raises(T).len(), 1);
+            assert_ne!(f.raises(T)[0].0, sequence);
+            f.close();
+            std::fs::remove_file(f.path(T)).unwrap();
+            f.reopen();
+            assert_eq!(f.raises(T).len(), 1);
+            let sequence = f.raises(T)[0].0;
+            l1b_assert_refused_once(&mut f, sequence, 1, "tape log on disk changed");
+        }
+    }
+}
+
+/// Force refuses contradictions, conflicting floors and both byte/digest mark
+/// losses, while ordinary acknowledgements keep forced=false even with force set.
+#[test]
+fn l1b_release_refusal_codes_and_other_causes() {
+    for fault in [
+        "contradicted",
+        "floor_conflict",
+        "short_bytes",
+        "source_digest",
+    ] {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (short, snapshot) = f.native(T, fault == "short_bytes");
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        if fault == "contradicted" {
+            f.name(4, at.clone());
+        }
+        if fault == "floor_conflict" {
+            f.name(6, at.clone());
+            f.name(
+                6,
+                lib::TapeAt {
+                    record_digest: [0x19; 32],
+                    ..at
+                },
+            );
+        }
+        f.close();
+        if fault == "contradicted" {
+            f.sql_loss();
+            std::fs::write(f.path(T), &short).unwrap();
+        } else if fault != "floor_conflict" {
+            std::fs::write(f.path(T), &short).unwrap();
+            f.tail_without_runtime(T, [0x91; 16]);
+        }
+        f.reopen();
+        let sequence = f.raises(T)[0].0;
+        let (code, reason) = match fault {
+            "contradicted" => (2, "ContradictedTapeAdmission"),
+            "floor_conflict" => (1, "floor digests conflict"),
+            "short_bytes" => (1, "source bytes extend beyond"),
+            _ => (1, "source digest differs"),
+        };
+        l1b_assert_refused_once(&mut f, sequence, code, reason);
+    }
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (_, snapshot) = f.native(T, false);
+    let sequence = f.name(6, f.rt().native_reference(&snapshot).unwrap());
+    l1b_force(&mut f, sequence).unwrap();
+    assert!(!l1b_release_record(&f).forced);
+    assert!(l1b_refusals(&f).is_empty());
+}
+
+/// Floor waivers survive only the exact bytes/extent, and an exact restoration
+/// followed by an empty release clears the latest remembered observation.
+#[test]
+fn l1b_release_floor_memory_content_extent_and_clear() {
+    for mismatch in [false, true] {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (short, snapshot) = f.native(T, false);
+        let full = std::fs::read(f.path(T)).unwrap();
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        f.name(6, at);
+        f.close();
+        f.sql_loss();
+        std::fs::write(f.path(T), &short).unwrap();
+        if mismatch {
+            f.tail_without_runtime(T, [0x91; 16]);
+        }
+        f.reopen();
+        let seq = f.raises(T)[0].0;
+        l1b_force(&mut f, seq).unwrap();
+        let release = l1b_release_record(&f);
+        assert!(release.forced);
+        assert_eq!(release.detail.0.len(), 7);
+        assert_eq!(
+            release.detail.0[4].1,
+            Text(
+                if mismatch {
+                    "digest_mismatch"
+                } else {
+                    "behind"
+                }
+                .into()
+            )
+        );
+        f.reopen();
+        assert!(f.raises(T).is_empty());
+        f.close();
+        if mismatch {
+            let before = std::fs::metadata(f.path(T)).unwrap().len();
+            std::fs::write(f.path(T), &short).unwrap();
+            f.tail_without_runtime(T, [0x92; 16]);
+            assert_eq!(std::fs::metadata(f.path(T)).unwrap().len(), before);
+        } else {
+            // Decode the real header to find its exact byte end, retaining no records.
+            let mut header = std::io::Cursor::new(&short);
+            crate::tape_log::store::Header::decode(&mut header, T).unwrap();
+            std::fs::write(f.path(T), &short[..header.position() as usize]).unwrap();
+        }
+        f.reopen();
+        assert!(
+            f.raises(T).iter().any(|(_, raise)| raise
+                .detail
+                .0
+                .iter()
+                .any(|entry| entry.0.as_str() == "floor_sequence")),
+            "changed bytes/extent must invalidate the floor waiver itself"
+        );
+        f.close();
+        std::fs::write(f.path(T), &full).unwrap();
+        f.reopen();
+        // The restored bytes may differ from the last projected mark; rebuild is explicit.
+        f.close();
+        crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
+        f.reopen();
+        for (seq, _) in f.raises(T) {
+            l1b_force(&mut f, seq).unwrap();
+        }
+        assert!(l1b_release_record(&f).detail.0.is_empty());
+        assert!(f
+            .rt()
+            .0
+            .authority
+            .with_fold(|fold| fold.forced_observation[&T].0.is_empty()));
+        f.reopen();
+        assert!(f.raises(T).is_empty());
+    }
+    // A later received reference above a waived floor requires a new fence.
+    {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (short, snapshot) = f.native(T, false);
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        f.name(6, at.clone());
+        f.close();
+        f.sql_loss();
+        std::fs::write(f.path(T), short).unwrap();
+        f.reopen();
+        let sequence = f.raises(T)[0].0;
+        l1b_force(&mut f, sequence).unwrap();
+        f.reopen();
+        assert!(f.raises(T).is_empty());
+        f.name(
+            6,
+            lib::TapeAt {
+                sequence: at.sequence + 1,
+                record_digest: [0x77; 32],
+                ..at.clone()
+            },
+        );
+        f.reopen();
+        assert_eq!(f.raises(T).len(), 1);
+        assert_eq!(
+            value(&f.raises(T)[0].1, "floor_sequence"),
+            Unsigned(at.sequence + 1)
+        );
+    }
+    // Sequence-zero floors are named by SupersedeTail, the schema's only zero-reference body.
+    let mut f = Fixture::new();
+    f.provision(T);
+    {
+        let authority =
+            crate::TapeAuthority::open(f.paths.journal_dir.join("tapes"), T, &f.paths.sqlite_path)
+                .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner.publish_empty_prefix(262144, None).unwrap();
+        let snapshot = owner.freeze().unwrap();
+        let at = f.rt().native_reference(&snapshot).unwrap();
+        assert_eq!(at.sequence, 0);
+        f.rt().refresh_native(&snapshot).unwrap();
+        f.name(0, at);
+    }
+    let full = std::fs::read(f.path(T)).unwrap();
+    f.close();
+    f.sql_loss();
+    std::fs::remove_file(f.path(T)).unwrap();
+    f.reopen();
+    let seq = f.raises(T)[0].0;
+    f.close();
+    std::fs::write(f.path(T), full).unwrap();
+    f.reopen();
+    l1b_force(&mut f, seq).unwrap();
+    assert!(l1b_release_record(&f).detail.0.is_empty());
 }

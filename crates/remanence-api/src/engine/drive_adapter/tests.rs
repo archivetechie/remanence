@@ -2370,6 +2370,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
         .unwrap();
     for sequence in [ordinary.sequence, ordinary.sequence, suffix.sequence] {
         let mut request = tonic::Request::new(crate::pb::ReleaseTapeIoFenceRequest {
+            force: false,
             quarantine_id: format!("library:{sequence}"),
             acknowledgment: "inspected original failure".into(),
         });

@@ -482,6 +482,7 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
             .release_tape_io_fence(
                 &fence.quarantine_id,
                 "test operator inspected library and tape",
+                false,
             )
             .unwrap();
     }

@@ -2,6 +2,7 @@
 //! marks. Observations are ordered and independent; only exact typed fence
 //! evidence carries an obligation. This module never writes sources or SQL.
 use crate::library_log::{self as lib, native_view::NativeTapeView, TapeView};
+use crate::tape_log::store::StoreError;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Snapshot the tape-local cause-14 membership once per native projection pass.
@@ -16,7 +17,7 @@ pub(super) fn fenced_tapes(fold: &lib::LibraryFold) -> BTreeSet<lib::Id> {
         .collect()
 }
 
-/// Until L1b introduces forced release, cause-14 evidence cannot be acknowledged away.
+/// Cause-14 evidence cannot be acknowledged away without an explicit force request.
 pub(super) fn refuse_unforced_release(fence: &lib::FenceRaised) -> Result<(), crate::StateError> {
     if fence.cause == lib::FenceCause::NativeLogBehindProjection {
         return Err(crate::StateError::ConfigInvalid("native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; or rebuild the catalog with rem rebuild-catalog-from-journals, then release with --force; or retire the tape".into()));
@@ -38,7 +39,7 @@ pub(crate) struct MarkEvidence {
     pub source: Option<(u64, lib::Hash)>,
 }
 
-fn extent(view: &NativeTapeView, tape: lib::Id) -> Option<NativeExtent> {
+pub(super) fn extent(view: &NativeTapeView, tape: lib::Id) -> Option<NativeExtent> {
     view.snapshot(tape).map(|s| NativeExtent {
         last_closed: s.summary().last_closed_sequence,
         closed_end: s.summary().closed_end,
@@ -88,6 +89,139 @@ fn observe_mark(
     }
     None
 }
+/// Fallible prefix bytes and path identity, injectable for release refusal proofs.
+pub(crate) trait PrefixDigestSource {
+    fn prefix_digest(&self, tape: lib::Id, end: u64) -> Result<lib::Hash, StoreError>;
+    fn source_unchanged(&self, tape: lib::Id) -> Result<bool, StoreError>;
+}
+
+/// Reasons a forced release cannot waive the current native evidence.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ForceRefusal {
+    LogChanged,
+    Contradicted,
+    FloorConflict,
+    LogAbsent,
+    MarkAboveLog,
+    SourceBeyondLog,
+    SourceDigestChanged,
+    ReadFailed,
+}
+
+impl ForceRefusal {
+    /// Release payload; ConfigInvalid's existing outer display is preserved.
+    pub(super) fn message(&self) -> String {
+        if *self == Self::LogChanged {
+            return "TapeLogBehindProjection: the tape log on disk changed after this process read it; restart the daemon after restoring the log, then release with --force".into();
+        }
+        let (code, reason) = match self {
+            Self::Contradicted => (
+                "ContradictedTapeAdmission",
+                "the library log excludes records that depend on this tape's log",
+            ),
+            Self::FloorConflict => ("TapeLogBehindProjection", "received floor digests conflict"),
+            Self::LogAbsent => ("TapeLogBehindProjection", "the tape log is absent"),
+            Self::MarkAboveLog => (
+                "TapeLogBehindProjection",
+                "the live projection mark is above the tape log",
+            ),
+            Self::SourceBeyondLog => (
+                "TapeLogBehindProjection",
+                "the projection source bytes extend beyond the tape log",
+            ),
+            Self::SourceDigestChanged => (
+                "TapeLogBehindProjection",
+                "the projection source digest differs from the tape log",
+            ),
+            Self::ReadFailed => (
+                "TapeLogBehindProjection",
+                "native evidence could not be read",
+            ),
+            Self::LogChanged => unreachable!(),
+        };
+        format!("{code}: {reason}; restore the exact tape log, then release with --force; or rebuild the catalog with rem rebuild-catalog-from-journals, then release with --force; or retire the tape")
+    }
+}
+
+/// Construct the exact seven-value observation used both at release and detection.
+fn forced_observation(
+    tape: lib::Id,
+    floor: (u64, lib::Hash, u64),
+    native: NativeExtent,
+    observed: &str,
+    digests: &dyn PrefixDigestSource,
+) -> Result<lib::Bounded<lib::DiagnosticEntry, 256>, StoreError> {
+    use lib::DiagnosticValue::{Bytes, Text, Unsigned};
+    let prefix = digests.prefix_digest(tape, native.closed_end)?;
+    Ok(lib::Bounded(vec![
+        lib::DiagnosticEntry("basis".into(), Text("floor".into())),
+        lib::DiagnosticEntry("floor_digest".into(), Bytes(lib::Blob(floor.1.to_vec()))),
+        lib::DiagnosticEntry("floor_sequence".into(), Unsigned(floor.0)),
+        lib::DiagnosticEntry("observed_closed_end".into(), Unsigned(native.closed_end)),
+        lib::DiagnosticEntry("observed_floor".into(), Text(observed.into())),
+        lib::DiagnosticEntry("observed_last_closed".into(), Unsigned(native.last_closed)),
+        lib::DiagnosticEntry(
+            "observed_prefix_digest".into(),
+            Bytes(lib::Blob(prefix.to_vec())),
+        ),
+    ]))
+}
+
+/// Evaluate release under dispatch. Freshness precedes every fact from the view;
+/// only an unsatisfied floor can be waived, never a live projection mark.
+pub(crate) fn force_release_decision(
+    fold: &lib::LibraryFold,
+    tape: lib::TapeRef,
+    native: Option<NativeExtent>,
+    mark: Option<&MarkEvidence>,
+    view: &dyn TapeView,
+    digests: &dyn PrefixDigestSource,
+) -> Result<lib::Bounded<lib::DiagnosticEntry, 256>, ForceRefusal> {
+    if !matches!(digests.source_unchanged(tape.uuid), Ok(true)) {
+        return Err(ForceRefusal::LogChanged);
+    }
+    if fold.contradicted(tape) {
+        return Err(ForceRefusal::Contradicted);
+    }
+    let reference = fold.contradictions.get(&lib::fold::Scope::Tape(tape.uuid));
+    if reference.is_some_and(|r| r.floor_digests.len() > 1) {
+        return Err(ForceRefusal::FloorConflict);
+    }
+    let native = native.ok_or(ForceRefusal::LogAbsent)?;
+    if let Some(mark) = mark {
+        if mark.sequence > native.last_closed {
+            return Err(ForceRefusal::MarkAboveLog);
+        }
+        if let Some((end, expected)) = mark.source {
+            if end > native.closed_end {
+                return Err(ForceRefusal::SourceBeyondLog);
+            }
+            let actual = digests
+                .prefix_digest(tape.uuid, end)
+                .map_err(|_| ForceRefusal::ReadFailed)?;
+            if actual != expected {
+                return Err(ForceRefusal::SourceDigestChanged);
+            }
+        }
+    }
+    if let Some((reference, floor)) = reference.and_then(|r| r.floor.map(|f| (r, f))) {
+        let lookup = view
+            .lookup(&lib::TapeAt {
+                tape,
+                sequence: floor.0,
+                record_digest: floor.1,
+            })
+            .map_err(|_| ForceRefusal::ReadFailed)?;
+        if let Some(observed) =
+            observe_floor(floor, &reference.floor_digests, Some(native), || Ok(lookup))
+        {
+            return forced_observation(tape.uuid, floor, native, observed, digests)
+                .map_err(|_| ForceRefusal::ReadFailed);
+        }
+    }
+    Ok(lib::Bounded(vec![]))
+}
+
 fn detail(raise: &lib::FenceRaised, name: &str) -> Option<lib::DiagnosticValue> {
     raise
         .detail
@@ -197,7 +331,9 @@ pub(crate) fn detect(
     fold: &lib::LibraryFold,
     marks: &BTreeMap<lib::Id, MarkEvidence>,
     view: &NativeTapeView,
+    digests: &dyn PrefixDigestSource,
 ) -> Vec<lib::FenceRaised> {
+    let prefix_digests = digests;
     let mut raises = Vec::new();
     for (id, state) in &fold.tapes {
         if state.retired {
@@ -219,14 +355,20 @@ pub(crate) fn detect(
                     raise.cause == lib::FenceCause::NativeLogBehindProjection
                         && carries_floor(raise, f)
                 });
-                (!carried).then_some((f, digests, observed))
+                let waived = !carried
+                    && fold.forced_observation.get(id).is_some_and(|remembered| {
+                        native
+                            .and_then(|native| {
+                                forced_observation(*id, f, native, observed, prefix_digests).ok()
+                            })
+                            .as_ref()
+                            == Some(remembered)
+                    });
+                (!carried && !waived).then_some((f, digests, observed))
             });
         let mark = marks.get(id).and_then(|mark| {
             let observed = observe_mark(mark, native, |end| {
-                view.snapshot(*id)
-                    .ok_or(())?
-                    .projection_prefix_digest(end)
-                    .map_err(|_| ())
+                digests.prefix_digest(*id, end).map_err(|_| ())
             })?;
             (!mark_retained(fold, id, mark)).then_some((mark, observed))
         });
@@ -242,6 +384,7 @@ pub(crate) fn check_rebuild(
     fold: &lib::LibraryFold,
     marks: &BTreeMap<lib::Id, MarkEvidence>,
     view: &NativeTapeView,
+    digests: &dyn PrefixDigestSource,
 ) -> Result<(), crate::StateError> {
     for (id, state) in &fold.tapes {
         if state.retired {
@@ -250,10 +393,7 @@ pub(crate) fn check_rebuild(
         let Some(mark) = marks.get(id) else { continue };
         let native = extent(view, *id);
         if observe_mark(mark, native, |end| {
-            view.snapshot(*id)
-                .ok_or(())?
-                .projection_prefix_digest(end)
-                .map_err(|_| ())
+            digests.prefix_digest(*id, end).map_err(|_| ())
         })
         .is_some()
             && !mark_retained(fold, id, mark)
@@ -652,9 +792,17 @@ mod tests {
             })
             .unwrap();
         let view = runtime.0.view.lock().unwrap().clone();
+        let digests = lib::native_view::NativePrefixDigests {
+            view: &view,
+            root: runtime.0.manifest.tape_root(),
+        };
         let mut marks = BTreeMap::from([(tape.uuid, mark())]);
-        let evaluate =
-            |marks: &BTreeMap<_, _>| runtime.0.authority.with_fold(|f| detect(f, marks, &view));
+        let evaluate = |marks: &BTreeMap<_, _>| {
+            runtime
+                .0
+                .authority
+                .with_fold(|f| detect(f, marks, &view, &digests))
+        };
         let append = |raised| {
             runtime
                 .append(|a, v| {
@@ -707,13 +855,248 @@ mod tests {
         assert_eq!(detail(&third[0], "basis"), Some(Text("floor".into())));
         runtime.0.authority.with_fold(|fold| {
             assert!(!mark_retained(fold, &tape.uuid, &mark()));
-            assert!(check_rebuild(fold, &marks, &view).is_ok());
-            assert!(
-                check_rebuild(fold, &BTreeMap::from([(tape.uuid, mark())]), &view)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("RebuildWouldDropMarkEvidence")
-            );
+            assert!(check_rebuild(fold, &marks, &view, &digests).is_ok());
+            assert!(check_rebuild(
+                fold,
+                &BTreeMap::from([(tape.uuid, mark())]),
+                &view,
+                &digests
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("RebuildWouldDropMarkEvidence"));
         });
+    }
+}
+
+#[cfg(test)]
+mod force_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Proof {
+        stale: bool,
+        stat_error: bool,
+        digest_error: bool,
+        lookup_error: bool,
+        wrong_digest: bool,
+        wrong_lookup: bool,
+    }
+    impl PrefixDigestSource for Proof {
+        fn prefix_digest(&self, _: lib::Id, _: u64) -> Result<lib::Hash, StoreError> {
+            if self.digest_error {
+                return Err(StoreError::Refused("fault"));
+            }
+            Ok([if self.wrong_digest { 9 } else { 8 }; 32])
+        }
+        fn source_unchanged(&self, _: lib::Id) -> Result<bool, StoreError> {
+            if self.stat_error {
+                return Err(StoreError::Refused("fault"));
+            }
+            Ok(!self.stale)
+        }
+    }
+    impl TapeView for Proof {
+        fn lookup(&self, at: &lib::TapeAt) -> Result<lib::TapeLookup, lib::FoldError> {
+            if self.lookup_error {
+                return Err(lib::FoldError::TapeUnavailable("fault".into()));
+            }
+            let digest = if self.wrong_lookup {
+                [9; 32]
+            } else {
+                at.record_digest
+            };
+            Ok(if at.sequence == 0 {
+                lib::TapeLookup::EmptyPrefix { digest }
+            } else {
+                lib::TapeLookup::Present {
+                    digest,
+                    kind: crate::tape_log::Tag::Initialized,
+                }
+            })
+        }
+    }
+    /// Release checks every refusal and preserves the one exact floor observation.
+    #[test]
+    fn l1b_force_decision_refusals_and_seven_keys() {
+        use ForceRefusal::*;
+        let tape = lib::TapeRef {
+            uuid: [1; 16],
+            incarnation: 1,
+        };
+        let native = Some(NativeExtent {
+            last_closed: 8,
+            closed_end: 100,
+        });
+        let mark = MarkEvidence {
+            sequence: 8,
+            offset: 70,
+            source: Some((90, [8; 32])),
+        };
+        let mut fold = lib::LibraryFold::default();
+        fold.contradictions.insert(
+            lib::fold::Scope::Tape(tape.uuid),
+            lib::fold::TapeReferences {
+                floor: Some((8, [8; 32], 42)),
+                floor_digests: BTreeSet::from([[8; 32]]),
+                ..Default::default()
+            },
+        );
+        let proof = Proof::default();
+        let decide =
+            |fold: &lib::LibraryFold,
+             native: Option<NativeExtent>,
+             mark: Option<&MarkEvidence>,
+             p: &Proof| { force_release_decision(fold, tape, native, mark, p, p) };
+        assert_eq!(
+            decide(&fold, native, Some(&mark), &proof),
+            Ok(lib::Bounded(vec![]))
+        );
+        for p in [
+            Proof {
+                stale: true,
+                ..proof.clone()
+            },
+            Proof {
+                stat_error: true,
+                ..proof.clone()
+            },
+        ] {
+            let mut contradicted = fold.clone();
+            contradicted
+                .contradictions
+                .get_mut(&lib::fold::Scope::Tape(tape.uuid))
+                .unwrap()
+                .minimum_contradiction = Some(1);
+            assert_eq!(decide(&contradicted, None, None, &p), Err(LogChanged));
+        }
+        let mut changed = fold.clone();
+        changed
+            .contradictions
+            .get_mut(&lib::fold::Scope::Tape(tape.uuid))
+            .unwrap()
+            .minimum_contradiction = Some(1);
+        assert_eq!(decide(&changed, native, None, &proof), Err(Contradicted));
+        let mut changed = fold.clone();
+        changed
+            .contradictions
+            .get_mut(&lib::fold::Scope::Tape(tape.uuid))
+            .unwrap()
+            .floor_digests
+            .insert([9; 32]);
+        assert_eq!(decide(&changed, native, None, &proof), Err(FloorConflict));
+        assert_eq!(decide(&fold, None, None, &proof), Err(LogAbsent));
+        assert_eq!(
+            decide(
+                &fold,
+                native,
+                Some(&MarkEvidence {
+                    sequence: 9,
+                    ..mark.clone()
+                }),
+                &proof
+            ),
+            Err(MarkAboveLog)
+        );
+        assert_eq!(
+            decide(
+                &fold,
+                native,
+                Some(&MarkEvidence {
+                    source: Some((101, [8; 32])),
+                    ..mark.clone()
+                }),
+                &proof
+            ),
+            Err(SourceBeyondLog)
+        );
+        assert_eq!(
+            decide(
+                &fold,
+                native,
+                Some(&mark),
+                &Proof {
+                    wrong_digest: true,
+                    ..proof.clone()
+                }
+            ),
+            Err(SourceDigestChanged)
+        );
+        assert_eq!(
+            decide(
+                &fold,
+                native,
+                Some(&mark),
+                &Proof {
+                    digest_error: true,
+                    ..proof.clone()
+                }
+            ),
+            Err(ReadFailed)
+        );
+        assert_eq!(
+            decide(
+                &fold,
+                native,
+                None,
+                &Proof {
+                    lookup_error: true,
+                    ..proof.clone()
+                }
+            ),
+            Err(ReadFailed)
+        );
+        let short = Some(NativeExtent {
+            last_closed: 7,
+            closed_end: 80,
+        });
+        assert_eq!(
+            decide(
+                &fold,
+                short,
+                None,
+                &Proof {
+                    digest_error: true,
+                    ..proof.clone()
+                }
+            ),
+            Err(ReadFailed)
+        );
+        let detail = decide(&fold, short, None, &proof).unwrap();
+        use lib::DiagnosticValue::{Bytes, Text, Unsigned};
+        assert_eq!(
+            detail,
+            lib::Bounded(vec![
+                lib::DiagnosticEntry("basis".into(), Text("floor".into())),
+                lib::DiagnosticEntry("floor_digest".into(), Bytes(lib::Blob(vec![8; 32]))),
+                lib::DiagnosticEntry("floor_sequence".into(), Unsigned(8)),
+                lib::DiagnosticEntry("observed_closed_end".into(), Unsigned(80)),
+                lib::DiagnosticEntry("observed_floor".into(), Text("behind".into())),
+                lib::DiagnosticEntry("observed_last_closed".into(), Unsigned(7)),
+                lib::DiagnosticEntry(
+                    "observed_prefix_digest".into(),
+                    Bytes(lib::Blob(vec![8; 32]))
+                ),
+            ])
+        );
+        let detail = decide(
+            &fold,
+            native,
+            None,
+            &Proof {
+                wrong_lookup: true,
+                ..proof.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(detail.0[4].1, Text("digest_mismatch".into()));
+        fold.contradictions
+            .get_mut(&lib::fold::Scope::Tape(tape.uuid))
+            .unwrap()
+            .floor = Some((0, [8; 32], 42));
+        assert_eq!(
+            decide(&fold, native, None, &proof),
+            Ok(lib::Bounded(vec![]))
+        );
     }
 }

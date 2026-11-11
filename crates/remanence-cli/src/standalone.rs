@@ -1043,7 +1043,7 @@ where
         },
     } = &cli.command
     {
-        if let Some(record) = crate::release_fence_via_daemon(&config, id, ack)? {
+        if let Some(record) = crate::release_fence_via_daemon(&config, id, ack, false)? {
             return Ok(crate::tape_io_fence_json(&record));
         }
     }
@@ -1179,7 +1179,7 @@ where
                     return Err("fence raised by a library daemon: release it on the host that owns it with rem --config <the library config> tape quarantine release ID --after-settled-inventory --ack TEXT".into());
                 }
                 let released = state
-                    .release_tape_io_fence(id, ack.trim())
+                    .release_tape_io_fence(id, ack.trim(), false)
                     .map_err(err)?
                     .ok_or("no active tape-I/O fence with this ID")?;
                 output.active_fences =
@@ -1638,6 +1638,26 @@ where
             expected_uuid: expected,
         })
         .map_err(err)?;
+    if matches!(
+        &cli.command,
+        Command::Get { .. }
+            | Command::Tape {
+                command: Tape::Identify | Tape::Verify { .. } | Tape::Restore { .. },
+            }
+    ) {
+        let rescue_scan = matches!(
+            &cli.command,
+            Command::Tape {
+                command: Tape::Restore { scan: true, .. }
+            }
+        );
+        remanence_api::mount_support::standalone_data_admission(
+            backend.catalog_index(),
+            mounted.tape_uuid,
+            rescue_scan,
+        )
+        .map_err(err)?;
+    }
     if cli.reserve {
         backend.reserve(&mut mounted).map_err(err)?
     }

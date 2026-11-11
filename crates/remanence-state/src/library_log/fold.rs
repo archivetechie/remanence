@@ -375,6 +375,8 @@ pub struct LibraryFold {
     pub fence_liveness_failures: BTreeMap<u64, (TapeRef, FoldError)>,
     /// Missing fence evidence, which never delays the fence.
     pub unresolved_fence_evidence: BTreeSet<u64>,
+    /// Exact observation remembered by the latest forced cause-14 release.
+    pub forced_observation: BTreeMap<Id, Bounded<DiagnosticEntry, 256>>,
     pending_bytes: usize,
     /// Most recent pending retry refusal, observed without changing pending retention.
     pub pending_rejection: Option<(u64, Id)>,
@@ -2025,6 +2027,11 @@ impl LibraryFold {
                     return Err(FoldError::WrongCounterpart);
                 };
                 let scope = release_scope(&raised.scope)?;
+                if v.forced && raised.cause == FenceCause::NativeLogBehindProjection {
+                    if let FenceScope::Tape(tape) = &raised.scope {
+                        self.forced_observation.insert(tape.uuid, v.detail.clone());
+                    }
+                }
                 if let FenceScope::Tape(tape) = &raised.scope {
                     if let Some(sequences) = self.tape_fences.get_mut(&tape.uuid) {
                         sequences.remove(&v.fence);
@@ -2795,6 +2802,7 @@ impl LibraryFold {
             latest,
             fences,
             tape_fences,
+            forced_observation,
             intents,
             uncertain,
             loads,

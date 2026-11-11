@@ -4008,3 +4008,155 @@ fn selected_geometry_and_request_guards_reject_forged_pool_and_parity() {
         Err(PoolWriteError::InvalidInput(_))
     ));
 }
+
+/// The pinned and capacity sites compose code-first payloads while their public
+/// error displays retain the existing outer wrappers (decision D-L1b-1).
+#[test]
+fn l1b_pinned_capacity_payload_precedence_and_counts() {
+    use crate::tape_admission::test_support::{assert_code, Fixture, T};
+    use remanence_state::library_log as lib;
+    for capacity in [false, true] {
+        for case in ["native", "ordinary", "suffix", "contradicted"] {
+            let mut f = Fixture::new();
+            let selected =
+                selected_tape_from_record(f.index().get_tape(&T).unwrap().unwrap(), &f.pool.id)
+                    .unwrap();
+            let expected = match case {
+                "native" => {
+                    f.raise(T, lib::FenceCause::NativeLogBehindProjection);
+                    f.raise(T, lib::FenceCause::TransferError);
+                    Some(1)
+                }
+                "ordinary" => {
+                    f.raise(T, lib::FenceCause::TransferError);
+                    None
+                }
+                "suffix" => {
+                    f.raise(T, lib::FenceCause::SessionSuffixContradiction);
+                    f.raise(T, lib::FenceCause::NativeLogBehindProjection);
+                    None
+                }
+                _ => {
+                    f.contradict(T);
+                    Some(2)
+                }
+            };
+            let index = f.index();
+            let (payload, display) = if capacity {
+                let error =
+                    ensure_selected_tape_accepts_write_inner(&index, &f.pool, &selected, false)
+                        .unwrap_err();
+                let display = error.to_string();
+                let PoolWriteError::InvalidInput(payload) = error else {
+                    panic!("wrong capacity variant")
+                };
+                assert_eq!(display, format!("invalid pool write input: {payload}"));
+                (payload, display)
+            } else {
+                let error = admit_pinned_tape_for_write_session(
+                    &index,
+                    T,
+                    &f.pool.id,
+                    &f.pool,
+                    &f.root.paths().journal_dir.join("tapes"),
+                )
+                .unwrap_err();
+                let display = error.to_string();
+                let payload = match error {
+                    PinnedTapeError::Fenced { reason, .. } => {
+                        assert!(display.starts_with(&format!(
+                            "tape {} is fenced by quarantine ",
+                            Uuid::from_bytes(T)
+                        )));
+                        reason
+                    }
+                    PinnedTapeError::NotWritable {
+                        reason: WritabilityError::ContradictedTape,
+                        ..
+                    } => {
+                        let reason = WritabilityError::ContradictedTape.to_string();
+                        assert_eq!(
+                            display,
+                            format!("tape {} is not writable: {reason}", Uuid::from_bytes(T))
+                        );
+                        reason
+                    }
+                    other => panic!("wrong pinned variant: {other:?}"),
+                };
+                (payload, display)
+            };
+            if let Some(code) = expected {
+                assert!(
+                    payload.starts_with(if code == 1 {
+                        "TapeLogBehindProjection: "
+                    } else {
+                        "ContradictedTapeAdmission: "
+                    }),
+                    "{display}"
+                );
+            } else {
+                let reason = if case == "suffix" {
+                    "session_suffix_contradiction"
+                } else {
+                    "transfer_error"
+                };
+                if capacity {
+                    let fence = index
+                        .list_active_tape_io_fences()
+                        .unwrap()
+                        .into_iter()
+                        .find(|r| r.reason == reason)
+                        .unwrap();
+                    assert_eq!(
+                        payload,
+                        format!(
+                            "selected tape is blocked by active tape-I/O fence {}: {reason}",
+                            fence.quarantine_id
+                        )
+                    );
+                } else {
+                    assert_eq!(payload, reason);
+                }
+            }
+            drop(index);
+            let records = f.refusals();
+            assert_eq!(records.len(), usize::from(expected.is_some()));
+            if let Some(code) = expected {
+                assert_code(&records[0], T, code);
+            }
+        }
+    }
+}
+
+/// Pool filtering skips both native-loss and contradiction candidates without
+/// counting; explicit pinned requests then record one refusal for each tape.
+#[test]
+fn l1b_pool_skips_unrecorded_and_pinned_refusals() {
+    use crate::tape_admission::test_support::{assert_code, Fixture, B, T};
+    use remanence_state::library_log as lib;
+    let mut f = Fixture::new();
+    f.contradict(B);
+    f.raise(T, lib::FenceCause::NativeLogBehindProjection);
+    let index = f.index();
+    assert!(!index.tape_contradicted(&[0x99; 16]).unwrap());
+    let error = select_tape_in_pool_with_policy(&index, &f.pool, 0, &HashSet::new(), &FillOldest)
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("TapeLogBehindProjection"), "{text}");
+    assert!(text.contains("ContradictedTapeAdmission"), "{text}");
+    for id in [T, B] {
+        assert!(admit_pinned_tape_for_write_session(
+            &index,
+            id,
+            &f.pool.id,
+            &f.pool,
+            &f.root.paths().journal_dir.join("tapes")
+        )
+        .is_err());
+    }
+    drop(index);
+    let records = f.refusals();
+    assert_eq!(records.len(), 2);
+    assert_code(&records[0], T, 1);
+    assert_code(&records[1], B, 2);
+}

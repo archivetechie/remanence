@@ -4087,3 +4087,58 @@ fn l1a_active_tape_fences_live_and_replay() {
     }
     live.assert_same_state(&replay.fold);
 }
+
+/// Forced cause-14 memory survives replay; unrelated releases preserve it and
+/// an empty later override replaces it rather than retaining a stale waiver.
+#[test]
+fn l1b_forced_observation_memory_live_and_replay() {
+    for steps in 1..=4 {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, _) = open(dir.path(), &Present);
+        put(&mut log, provision(1, Some("A")));
+        let memory = Bounded(vec![DiagnosticEntry(
+            "basis".into(),
+            DiagnosticValue::Text("floor".into()),
+        )]);
+        for step in 0..steps {
+            let cause = if step == 1 {
+                FenceCause::TransferError
+            } else {
+                FenceCause::NativeLogBehindProjection
+            };
+            let sequence = log.state().fold.received_through + 1;
+            let Body::FenceRaised(mut raise) = fence(1) else {
+                unreachable!()
+            };
+            raise.cause = cause;
+            put(&mut log, Body::FenceRaised(raise));
+            put(
+                &mut log,
+                Body::FenceReleased(FenceReleased {
+                    fence: sequence,
+                    evidence: "operator".into(),
+                    forced: step != 2,
+                    detail: if step == 0 {
+                        memory.clone()
+                    } else {
+                        Bounded(vec![])
+                    },
+                }),
+            );
+            assert_eq!(
+                log.state().fold.forced_observation.get(&tape(1).uuid),
+                Some(&if step == 3 {
+                    Bounded(vec![])
+                } else {
+                    memory.clone()
+                })
+            );
+        }
+        let live = log.state().fold.clone();
+        drop(log);
+        let replay = replay(dir.path(), LOG, &Present).unwrap();
+        assert!(replay.refusal.is_none());
+        assert_eq!(live.forced_observation, replay.fold.forced_observation);
+        live.assert_same_state(&replay.fold);
+    }
+}

@@ -105,6 +105,7 @@ mod mount;
 pub mod mount_support;
 mod standalone_init;
 mod standalone_write;
+pub(crate) mod tape_admission;
 pub use mount_support::{
     ChangerMount, MountBackend, MountEndpoint, MountError, MountTarget, MountedTape, OperatorMount,
 };

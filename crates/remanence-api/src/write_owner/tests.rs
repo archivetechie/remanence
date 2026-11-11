@@ -8826,7 +8826,8 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &api.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
-                quarantine_id: fence.quarantine_id,
+                force: false,
+quarantine_id: fence.quarantine_id,
                 acknowledgment: "verified tape and drive".into(),
             }),
         )

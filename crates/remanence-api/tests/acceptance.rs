@@ -1042,7 +1042,7 @@ fn release_fences(rig: &Rig) {
     for fence in fences {
         assert_eq!(fence.tape_uuid, uuid(0));
         state
-            .release_tape_io_fence(&fence.quarantine_id, "acceptance release")
+            .release_tape_io_fence(&fence.quarantine_id, "acceptance release", false)
             .unwrap()
             .unwrap();
     }

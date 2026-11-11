@@ -7262,7 +7262,8 @@ mod tests {
         <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &lowered_state.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
-                quarantine_id: fence.quarantine_id,
+                force: false,
+quarantine_id: fence.quarantine_id,
                 acknowledgment: "checked terminal state".into(),
             }),
         )
@@ -8347,7 +8348,8 @@ mod tests {
         <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &state.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
-                quarantine_id: fence.quarantine_id,
+                force: false,
+quarantine_id: fence.quarantine_id,
                 acknowledgment: "checked terminal intent".into(),
             }),
         )

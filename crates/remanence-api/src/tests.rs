@@ -10475,6 +10475,7 @@ async fn release_fence_rpc_and_live_admission() {
     let library = state.library_service();
     let request = |id: &str, ack: &str| {
         tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+            force: false,
             quarantine_id: id.into(),
             acknowledgment: ack.into(),
         })

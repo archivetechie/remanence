@@ -222,6 +222,10 @@ impl CatalogIndex {
     pub fn list_active_tape_io_fences(&self) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         self.with_core(|core| core.list_active_tape_io_fences())
     }
+    /// Selection pre-filter projected from the library fold; absent identities are false.
+    pub fn tape_contradicted(&self, tape: &[u8; 16]) -> Result<bool, StateError> {
+        self.with_core(|core| core.tape_contradicted(tape))
+    }
     /// Return active tape-I/O fences matching a tape UUID or barcode.
     pub fn tape_io_admission_conflicts(
         &self,

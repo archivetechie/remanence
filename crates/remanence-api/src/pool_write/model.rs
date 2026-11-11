@@ -592,6 +592,9 @@ pub enum PinnedWriteDisposition {
 /// Hard writability precondition failure for one tape candidate.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum WritabilityError {
+    /// A received dependency is excluded by the library fold.
+    #[error("ContradictedTapeAdmission: the library log excludes records that depend on this tape's log")]
+    ContradictedTape,
     /// Native terminal work excludes Object admission.
     #[error("tape {tape_uuid} is sealed, seal-due or finalizing; maintenance must complete before Object admission")]
     MaintenanceRequired {

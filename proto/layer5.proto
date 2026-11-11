@@ -119,6 +119,8 @@ service Daemon {
 message ReleaseTapeIoFenceRequest {
   string quarantine_id = 1;
   string acknowledgment = 2;
+  // Applies only to native_log_behind_projection fences.
+  bool force = 3;
 }
 
 message TapeIoFence {

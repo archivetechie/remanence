@@ -191,6 +191,36 @@ impl TapeView for NativeTapeView {
     }
 }
 
+/// Native digest reads and path freshness share the runtime's frozen view.
+/// Only forced release asks for freshness; detection reads the captured prefix.
+pub(crate) struct NativePrefixDigests<'a> {
+    pub view: &'a NativeTapeView,
+    pub root: &'a Path,
+}
+impl crate::library_runtime::native_floor::PrefixDigestSource for NativePrefixDigests<'_> {
+    fn prefix_digest(&self, tape: Id, end: u64) -> Result<super::Hash, StoreError> {
+        self.view
+            .snapshot(tape)
+            .ok_or(StoreError::Refused("native log absent"))?
+            .projection_prefix_digest(end)
+    }
+    fn source_unchanged(&self, tape: Id) -> Result<bool, StoreError> {
+        use std::os::unix::fs::MetadataExt;
+        let snapshot = self
+            .view
+            .snapshot(tape)
+            .ok_or(StoreError::Refused("native log absent"))?;
+        let metadata = fs::metadata(
+            self.root
+                .join(format!("{}.remtape", uuid::Uuid::from_bytes(tape).simple())),
+        )?;
+        Ok(
+            snapshot.file_identity()? == Some((metadata.dev(), metadata.ino()))
+                && metadata.len() == snapshot.captured_end(),
+        )
+    }
+}
+
 #[cfg(test)]
 #[path = "native_view_tests.rs"]
 mod tests;

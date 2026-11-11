@@ -1243,7 +1243,15 @@ impl StateHandle {
         )
         .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
         let marks = index.tape_projection_marks()?;
-        crate::library_runtime::native_floor::check_rebuild(&replay.fold, &marks, &view)?;
+        crate::library_runtime::native_floor::check_rebuild(
+            &replay.fold,
+            &marks,
+            &view,
+            &lib::native_view::NativePrefixDigests {
+                view: &view,
+                root: manifest.tape_root(),
+            },
+        )?;
         let natives = view
             .snapshots()
             .map(crate::tape_log::authority::AuthoritySnapshot::new)
@@ -1364,9 +1372,10 @@ impl StateHandle {
         &mut self,
         quarantine_id: &str,
         ack: &str,
+        force: bool,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
         self.library
-            .release_tape_fence(quarantine_id, ack, AuditActor::local_user())
+            .release_tape_fence(quarantine_id, ack, force, AuditActor::local_user())
             .map_err(|e| StateError::ConfigInvalid(e.to_string()))
     }
 

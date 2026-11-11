@@ -247,13 +247,34 @@ pub(crate) fn ensure_selected_tape_accepts_write_inner(
             tape.state
         )));
     }
-    let conflicts =
+    let mut conflicts =
         state.tape_io_admission_conflicts(&selected.tape_uuid, tape.voltag.as_deref())?;
+    crate::tape_admission::order_conflicts(state, &mut conflicts);
     if let Some(conflict) = conflicts.first() {
-        return Err(PoolWriteError::InvalidInput(format!(
-            "selected tape is blocked by active tape-I/O fence {}: {}",
-            conflict.quarantine_id, conflict.reason
-        )));
+        return Err(PoolWriteError::InvalidInput(
+            crate::tape_admission::fence_payload(
+                state,
+                selected.tape_uuid,
+                conflict,
+                format!(
+                    "selected tape is blocked by active tape-I/O fence {}: {}",
+                    conflict.quarantine_id, conflict.reason
+                ),
+                true,
+                remanence_state::library_log::AuditActor::System,
+            ),
+        ));
+    }
+    if state.tape_contradicted(&selected.tape_uuid)? {
+        crate::tape_admission::record_code(
+            state,
+            selected.tape_uuid,
+            remanence_state::library_log::RefusalCode::ContradictedTapeAdmission,
+            remanence_state::library_log::AuditActor::System,
+        );
+        return Err(PoolWriteError::InvalidInput(
+            crate::tape_admission::contradiction_text(selected.tape_uuid, "selected tape write"),
+        ));
     }
     let tape_block_size = u64::from(selected.block_size);
     if tape_block_size != pool_cfg.block_size_bytes {

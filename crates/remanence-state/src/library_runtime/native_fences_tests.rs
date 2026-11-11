@@ -234,7 +234,12 @@ impl Fixture {
     }
     fn release(&self, id: &str) {
         self.rt()
-            .release_tape_fence(id, "operator examined the tail", lib::AuditActor::System)
+            .release_tape_fence(
+                id,
+                "operator examined the tail",
+                false,
+                lib::AuditActor::System,
+            )
             .unwrap();
     }
 }

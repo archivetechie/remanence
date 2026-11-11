@@ -4946,3 +4946,344 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
     assert_eq!(provisions[0].replaced_bot, Some(unknown));
     assert_ne!(provisions[0].tape.uuid, unknown);
 }
+
+fn l1b_raise(
+    state: &remanence_state::StateHandle,
+    id: [u8; 16],
+    cause: remanence_state::library_log::FenceCause,
+) {
+    use remanence_state::library_log as lib;
+    state
+        .library_runtime()
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(lib::TapeRef {
+                        uuid: id,
+                        incarnation: 1,
+                    }),
+                    cause,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+}
+fn l1b_refusals(f: &VersionFixture) -> Vec<remanence_state::library_log::Diagnostic> {
+    ruling24_library_records(&f.config())
+        .iter()
+        .filter_map(|r| r.diagnostic())
+        .filter(|d| d.event == remanence_state::library_log::DiagnosticEvent::RefusalRecorded)
+        .cloned()
+        .collect()
+}
+fn l1b_assert_refusal(d: &remanence_state::library_log::Diagnostic, id: [u8; 16], code: u64) {
+    use remanence_state::library_log as lib;
+    assert_eq!(d.subject_kind.as_str(), "tape");
+    assert_eq!(
+        d.subject_id.as_ref().unwrap().as_str(),
+        uuid::Uuid::from_bytes(id).to_string()
+    );
+    assert_eq!(
+        d.detail,
+        lib::Bounded(vec![
+            lib::DiagnosticEntry("code".into(), lib::DiagnosticValue::Unsigned(code)),
+            lib::DiagnosticEntry(
+                "name".into(),
+                lib::DiagnosticValue::Text(
+                    if code == 1 {
+                        "TapeLogBehindProjection"
+                    } else {
+                        "ContradictedTapeAdmission"
+                    }
+                    .into()
+                )
+            )
+        ])
+    );
+}
+fn l1b_opcodes(f: &VersionFixture) -> Vec<u8> {
+    f.world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .map(|c| c.opcode)
+        .collect()
+}
+
+/// Each refused command stops at exactly the mount boundary, before RESERVE too.
+#[test]
+fn l1b_standalone_reads_refuse_before_reserve() {
+    use remanence_state::library_log as lib;
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("saved.txt");
+    std::fs::write(&source, b"saved").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    f.ok(&["tape", "finalize", "--acknowledge-tape", "FIRST"]);
+    let id: [u8; 16] = f
+        .index()
+        .list_tapes(None, remanence_state::TapeKindFilter::All)
+        .unwrap()[0]
+        .tape_uuid
+        .clone()
+        .try_into()
+        .unwrap();
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    l1b_raise(&state, id, lib::FenceCause::NativeLogBehindProjection);
+    drop(state);
+    let dest = f.root.path().join("read-out");
+    let verbs = vec![
+        vec!["tape", "verify"],
+        vec!["tape", "verify", "--full"],
+        vec!["tape", "restore", "--out", dest.to_str().unwrap()],
+        vec!["get", "saved.txt", "--out", dest.to_str().unwrap()],
+        vec!["tape", "identify"],
+    ];
+    let mut mount_ops = None;
+    for reserve in [false, true] {
+        for verb in &verbs {
+            let mut args = verb.clone();
+            if reserve {
+                args.push("--reserve");
+            }
+            f.world.lock().unwrap().command_log.clear();
+            let before = l1b_refusals(&f).len();
+            let (code, out, errors) = f.run(&args, true);
+            assert_ne!(code, ExitCode::SUCCESS, "{args:?}");
+            let envelope = VersionFixture::envelope(&out);
+            assert!(
+                envelope["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("TapeLogBehindProjection: "),
+                "{out}\n{errors}"
+            );
+            let records = l1b_refusals(&f);
+            assert_eq!(records.len(), before + 1);
+            l1b_assert_refusal(records.last().unwrap(), id, 1);
+            let ops = l1b_opcodes(&f);
+            assert!(
+                !ops.iter().any(|op| matches!(op, 0x16 | 0x17 | 0x0a | 0x10)),
+                "{ops:?}"
+            );
+            if let Some(expected) = &mount_ops {
+                assert_eq!(&ops, expected);
+            } else {
+                mount_ops = Some(ops);
+            }
+        }
+    }
+    // Identity inquiries, ready/rewind, block limits/mode, locate/position, BOT reads.
+    assert_eq!(
+        mount_ops.unwrap(),
+        vec![0x12, 0x12, 0x12, 0x12, 0x00, 0x01, 0x05, 0x1a, 0x92, 0x34, 0x08, 0x08]
+    );
+    // Ordinary fences remain advisory for data reads.
+    let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let fence = state
+        .write_handle()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.reason == "native_log_behind_projection")
+        .unwrap();
+    state
+        .release_tape_io_fence(&fence.quarantine_id, "test restored", true)
+        .unwrap();
+    l1b_raise(&state, id, lib::FenceCause::TransferError);
+    drop(state);
+    let before = l1b_refusals(&f).len();
+    for verb in &verbs {
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest).unwrap();
+        }
+        f.ok(verb);
+    }
+    assert_eq!(l1b_refusals(&f).len(), before);
+}
+
+/// A new library knows the physical tape's identity but has no dependent records.
+/// Scan rescue works with its native log absent; excluded evidence still refuses.
+#[test]
+fn l1b_standalone_scan_rescues_absent_log_but_not_contradiction() {
+    use remanence_state::{authority::TapeAuthorityView, library_log as lib};
+    let original = VersionFixture::with_parity(false);
+    let source = original.root.path().join("rescued.txt");
+    std::fs::write(&source, b"rescue bytes").unwrap();
+    original.ok(&["put", source.to_str().unwrap()]);
+    let id: [u8; 16] = original
+        .index()
+        .list_tapes(None, remanence_state::TapeKindFilter::All)
+        .unwrap()[0]
+        .tape_uuid
+        .clone()
+        .try_into()
+        .unwrap();
+    let mut f = VersionFixture::with_parity(false);
+    f.world = original.world.clone();
+    let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    state
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: id,
+            voltag: "RESCUEL9".into(),
+            block_size: 262144,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let paths = remanence_state::StatePaths::from_config(f.config(), &config);
+    let native = paths
+        .journal_dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
+    // Capture a genuine initialized prefix for the later excluded dependency.
+    let authority = remanence_state::TapeAuthority::open(
+        paths.journal_dir.join("tapes"),
+        id,
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut owner = authority.acquire_exclusive().unwrap();
+    owner
+        .publish_initialized(
+            262144,
+            None,
+            remanence_state::tape_log::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    let snapshot = owner.freeze().unwrap();
+    let runtime = state.library_runtime();
+    runtime.refresh_native(&snapshot).unwrap();
+    let at = runtime.native_reference(&snapshot).unwrap();
+    let bytes = std::fs::read(&native).unwrap();
+    l1b_raise(&state, id, lib::FenceCause::NativeLogBehindProjection);
+    drop(snapshot);
+    drop(owner);
+    drop(authority);
+    drop(runtime);
+    drop(state);
+    std::fs::remove_file(&native).unwrap();
+    let dest = f.root.path().join("rescue-out");
+    let blocked = vec![
+        vec!["tape", "verify"],
+        vec!["tape", "verify", "--full"],
+        vec!["tape", "restore", "--out", dest.to_str().unwrap()],
+        vec!["get", "rescued.txt", "--out", dest.to_str().unwrap()],
+        vec!["tape", "identify"],
+    ];
+    for verb in &blocked {
+        let (code, out, errors) = f.run(verb, true);
+        assert_ne!(code, ExitCode::SUCCESS);
+        assert!(
+            VersionFixture::envelope(&out)["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("TapeLogBehindProjection: "),
+            "{out}\n{errors}"
+        );
+    }
+    let records = l1b_refusals(&f);
+    assert_eq!(records.len(), blocked.len());
+    for record in &records {
+        l1b_assert_refusal(record, id, 1);
+    }
+    f.world.lock().unwrap().command_log.clear();
+    f.ok(&["tape", "restore", "--scan", "--out", dest.to_str().unwrap()]);
+    let outputs: Vec<_> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        std::fs::read(outputs[0].join("rescued.txt")).unwrap(),
+        b"rescue bytes"
+    );
+    assert!(
+        !l1b_opcodes(&f).iter().any(|op| matches!(op, 0x0a | 0x10)),
+        "rescue wrote media"
+    );
+    assert_eq!(l1b_refusals(&f).len(), blocked.len());
+    // Restore the same log, name it, then lose it again: D3 now applies.
+    std::fs::write(&native, bytes).unwrap();
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    state
+        .library_runtime()
+        .append(|a, v| {
+            a.verification_verdict(
+                lib::VerificationVerdict {
+                    tape: at.tape,
+                    at: Some(at),
+                    outcome: lib::VerificationOutcome::VerifiedComplete,
+                    operation: [0x71; 16],
+                    damaged: lib::Bounded(vec![]),
+                    unprotected: None,
+                    modes: 1,
+                    edition_digest: None,
+                    progress: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    drop(state);
+    std::fs::remove_file(&native).unwrap();
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    assert!(state.library_runtime().contradicted(id));
+    // Isolate the independent contradiction gate using the fixture producer.
+    for fence in state
+        .write_handle()
+        .tape_io_admission_conflicts(&id, None)
+        .unwrap()
+    {
+        let n = fence
+            .quarantine_id
+            .strip_prefix("library:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_released(
+                    lib::FenceReleased {
+                        fence: n,
+                        evidence: "isolate D3".into(),
+                        forced: false,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+    }
+    drop(state);
+    // The next open may re-raise cause 14; scan still reaches the D3 gate.
+    let (code, out, errors) = f.run(
+        &["tape", "restore", "--scan", "--out", dest.to_str().unwrap()],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(
+        out.contains("ContradictedTapeAdmission:"),
+        "{out}\n{errors}"
+    );
+    let records = l1b_refusals(&f);
+    assert_eq!(records.len(), blocked.len() + 1);
+    l1b_assert_refusal(records.last().unwrap(), id, 2);
+}

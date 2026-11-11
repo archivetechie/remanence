@@ -347,14 +347,35 @@ pub fn admit_pinned_tape_for_write_session(
                 reason,
             }
         })?;
-        let conflicts = state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
+        let mut conflicts =
+            state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
+        crate::tape_admission::order_conflicts(state, &mut conflicts);
         if let Some(conflict) = conflicts.first() {
             return Err(PinnedTapeError::Fenced {
                 tape_uuid: uuid_text,
                 quarantine_id: conflict.quarantine_id.clone(),
-                reason: conflict.reason.clone(),
+                reason: crate::tape_admission::fence_payload(
+                    state,
+                    tape_uuid,
+                    conflict,
+                    conflict.reason.clone(),
+                    true,
+                    remanence_state::library_log::AuditActor::System,
+                ),
             });
         }
+    }
+    if state.tape_contradicted(&tape_uuid)? {
+        crate::tape_admission::record_code(
+            state,
+            tape_uuid,
+            remanence_state::library_log::RefusalCode::ContradictedTapeAdmission,
+            remanence_state::library_log::AuditActor::System,
+        );
+        return Err(PinnedTapeError::NotWritable {
+            tape_uuid: uuid_text,
+            reason: WritabilityError::ContradictedTape,
+        });
     }
     let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
     if !fresh
@@ -504,19 +525,33 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
             reasons.push(error);
             continue;
         }
-        let conflicts = state
+        let mut conflicts = state
             .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
             .map_err(SelectTapeError::State)?;
+        crate::tape_admission::order_conflicts(state, &mut conflicts);
         if let Some(conflict) = conflicts.first() {
+            let reason = crate::tape_admission::fence_payload(
+                state,
+                tape_uuid,
+                conflict,
+                conflict.reason.clone(),
+                false,
+                remanence_state::library_log::AuditActor::System,
+            );
             skips.record(
                 &pool_id,
                 tape_uuid,
-                &format!("fenced by {}: {}", conflict.quarantine_id, conflict.reason),
+                &format!("fenced by {}: {}", conflict.quarantine_id, reason),
             );
             reasons.push(WritabilityError::TapeIoFence {
                 quarantine_id: conflict.quarantine_id.clone(),
-                reason: conflict.reason.clone(),
+                reason,
             });
+            continue;
+        }
+        if state.tape_contradicted(&tape_uuid)? {
+            skips.record(&pool_id, tape_uuid, "ContradictedTapeAdmission");
+            reasons.push(WritabilityError::ContradictedTape);
             continue;
         }
         // Ranking observes the durable fold without taking a competing lease.

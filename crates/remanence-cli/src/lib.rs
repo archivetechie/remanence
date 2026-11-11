@@ -2740,6 +2740,10 @@ enum TapeQuarantineCommand {
         #[arg(long, value_name = "TEXT")]
         ack: String,
 
+        /// Override a native_log_behind_projection fence after restoring or rebuilding.
+        #[arg(long)]
+        force: bool,
+
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -8476,6 +8480,7 @@ fn run_tape_quarantine(
             quarantine,
             config,
             ack,
+            force,
             json,
             ..
         } => {
@@ -8491,7 +8496,7 @@ fn run_tape_quarantine(
                 Err(code) => return code,
             };
             if quarantine.starts_with("tioq-") {
-                match release_fence_via_daemon(&config, quarantine, ack) {
+                match release_fence_via_daemon(&config, quarantine, ack, *force) {
                     Ok(Some(record)) => {
                         return print_tape_io_quarantine_released(&record, *json, out, err)
                     }
@@ -8518,23 +8523,25 @@ fn run_tape_quarantine(
             };
             let record = match find_media_readiness_quarantine(&records, quarantine.as_str()) {
                 Ok(record) => record.clone(),
-                Err(_) => match state.release_tape_io_fence(quarantine.as_str(), ack.trim()) {
-                    Ok(Some(record)) => {
-                        return print_tape_io_quarantine_released(&record, *json, out, err);
+                Err(_) => {
+                    match state.release_tape_io_fence(quarantine.as_str(), ack.trim(), *force) {
+                        Ok(Some(record)) => {
+                            return print_tape_io_quarantine_released(&record, *json, out, err);
+                        }
+                        Ok(None) => {
+                            let _ = writeln!(
+                                err,
+                                "error: no active media-readiness or tape-I/O quarantine {:?}",
+                                quarantine
+                            );
+                            return ExitCode::from(1);
+                        }
+                        Err(error) => {
+                            let _ = writeln!(err, "error: {error}");
+                            return ExitCode::from(1);
+                        }
                     }
-                    Ok(None) => {
-                        let _ = writeln!(
-                            err,
-                            "error: no active media-readiness or tape-I/O quarantine {:?}",
-                            quarantine
-                        );
-                        return ExitCode::from(1);
-                    }
-                    Err(error) => {
-                        let _ = writeln!(err, "error: {error}");
-                        return ExitCode::from(1);
-                    }
-                },
+                }
             };
             let operation_id = match Uuid::parse_str(record.operation_id.as_str()) {
                 Ok(operation_id) => operation_id,
@@ -17935,10 +17942,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = tape_init_config_with_pool(4096);
         config.daemon.socket_path = Some(dir.path().join("absent.sock"));
-        assert!(release_fence_via_daemon(&config, "tioq-missing", "checked")
-            .unwrap()
-            .is_none());
-        assert!(release_fence_via_daemon(&config, "tioq-missing", " ").is_err());
+        assert!(
+            release_fence_via_daemon(&config, "tioq-missing", "checked", false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(release_fence_via_daemon(&config, "tioq-missing", " ", false).is_err());
     }
 
     /// A connected CLI releases through gRPC while the daemon retains the state lock.
@@ -17981,14 +17990,16 @@ mod tests {
                 .await
                 .unwrap();
             let released =
-                release_fence_on_channel(channel.clone(), &fence.quarantine_id, "verified")
+                release_fence_on_channel(channel.clone(), &fence.quarantine_id, "verified", false)
                     .await
                     .unwrap();
             assert_eq!(released.state, "released");
             assert_eq!(released.release_ack.as_deref(), Some("verified"));
-            assert!(release_fence_on_channel(channel, "missing", "checked")
-                .await
-                .is_err());
+            assert!(
+                release_fence_on_channel(channel, "missing", "checked", false)
+                    .await
+                    .is_err()
+            );
             assert!(remanence_state::StateLockGuard::acquire(dir.path()).is_err());
             task.abort();
         });
@@ -21892,6 +21903,145 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    /// The parsed --force reaches the offline library-fence release and writes
+    /// forced=true in its source record; omission keeps D8's refusal intact.
+    #[test]
+    fn l1b_force_cli_offline_release() {
+        use remanence_state::{authority::TapeAuthorityView, library_log as lib};
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let id = [0x51; 16];
+        let mut state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "CLI051L9".into(),
+                block_size: 262144,
+                parity: remanence_api::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = state.paths().clone();
+        let uuid = state.library_runtime().manifest().library_uuid();
+        let path = paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple()));
+        let short = {
+            let authority = remanence_state::TapeAuthority::open(
+                paths.journal_dir.join("tapes"),
+                id,
+                &paths.sqlite_path,
+            )
+            .unwrap();
+            let mut owner = authority.acquire_exclusive().unwrap();
+            owner
+                .publish_initialized(
+                    262144,
+                    None,
+                    remanence_state::tape_log::CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+            let short = fs::read(&path).unwrap();
+            owner
+                .open_session(id, "2026-11-11T00:00:00Z".into())
+                .unwrap();
+            owner
+                .end_session(
+                    id,
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionEndReason::CleanClose,
+                    None,
+                    std::iter::empty(),
+                )
+                .unwrap();
+            state
+                .library_runtime()
+                .refresh_native(&owner.freeze().unwrap())
+                .unwrap();
+            state.library_runtime().catch_up().unwrap();
+            short
+        };
+        let full = fs::read(&path).unwrap();
+        drop(state);
+        fs::write(&path, &short).unwrap();
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        let fence = state
+            .catalog()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.tape_uuid == id)
+            .unwrap();
+        drop(state);
+        fs::write(&path, full).unwrap();
+        for force in [false, true] {
+            let mut args = vec![
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                fence.quarantine_id.as_str(),
+                "--after-settled-inventory",
+                "--ack",
+                "restored exact log",
+                "--config",
+                config.to_str().unwrap(),
+                "--json",
+            ];
+            if force {
+                args.push("--force");
+            }
+            let cli = Cli::parse_from(args);
+            let RemCommand::Tape {
+                command: RemTapeCommand::Quarantine { command },
+            } = cli.command
+            else {
+                panic!("wrong command")
+            };
+            command.validate_before_discovery().unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_tape_quarantine(&command, &mut out, &mut err);
+            assert_eq!(
+                code,
+                if force {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                },
+                "{}",
+                String::from_utf8_lossy(&err)
+            );
+            if !force {
+                assert!(String::from_utf8_lossy(&err).contains("requires --force"));
+            }
+        }
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let mut releases = 0;
+        let replay = lib::store::replay_observed(&paths.audit_dir, uuid, &view, &mut |applied| {
+            if applied.record().tag() == lib::Tag::FenceReleased {
+                releases += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(replay.refusal.is_none());
+        assert_eq!(releases, 1);
+        // Forced cause-14 releases alone install this entry, even for empty detail.
+        assert_eq!(
+            replay.fold.forced_observation.get(&id),
+            Some(&lib::Bounded(vec![]))
+        );
     }
 
     #[test]
@@ -29413,6 +29563,7 @@ fn release_fence_via_daemon(
     config: &remanence_state::RemConfig,
     id: &str,
     ack: &str,
+    force: bool,
 ) -> Result<Option<remanence_state::TapeIoFenceRecord>, String> {
     if ack.trim().is_empty() {
         return Err("--ack must be non-empty".into());
@@ -29442,7 +29593,9 @@ fn release_fence_via_daemon(
         let channel = remanence_api::connect_unix(socket)
             .await
             .map_err(|e| e.to_string())?;
-        release_fence_on_channel(channel, id, ack).await.map(Some)
+        release_fence_on_channel(channel, id, ack, force)
+            .await
+            .map(Some)
     })
 }
 
@@ -29451,9 +29604,11 @@ async fn release_fence_on_channel(
     channel: Channel,
     id: &str,
     ack: &str,
+    force: bool,
 ) -> Result<remanence_state::TapeIoFenceRecord, String> {
     let record = pb::library_service_client::LibraryServiceClient::new(channel)
         .release_tape_io_fence(pb::ReleaseTapeIoFenceRequest {
+            force,
             quarantine_id: id.into(),
             acknowledgment: ack.into(),
         })

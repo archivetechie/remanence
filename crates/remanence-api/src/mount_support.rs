@@ -25,7 +25,9 @@ pub fn standalone_fence_releasable(fence: &remanence_state::TapeIoFenceRecord) -
 
 /// Shared recovery advice for startup, standalone write admission and tape init.
 pub(crate) fn fence_release_options(fence: &remanence_state::TapeIoFenceRecord) -> &'static str {
-    if standalone_fence_releasable(fence) {
+    if fence.reason == "native_log_behind_projection" {
+        "--after-settled-inventory --ack TEXT --force, after restoring the exact tape log or rebuilding the catalog (or retire the tape)"
+    } else if standalone_fence_releasable(fence) {
         "--ack TEXT"
     } else {
         "--after-settled-inventory --ack TEXT"
@@ -67,6 +69,50 @@ pub fn standalone_fence_policy(
         }
     }
     Ok(fences)
+}
+
+/// Refuse standalone data commands against the shared authority before reservation.
+/// Physical scan rescue exempts only cause 14; excluded dependencies still refuse.
+pub fn standalone_data_admission(
+    index: &CatalogIndex,
+    tape: TapeUuid,
+    rescue_scan: bool,
+) -> Result<(), MountError> {
+    use remanence_state::library_log as lib;
+    if index.library_runtime().is_none() {
+        return Err(refusal(
+            "standalone admission requires shared LibraryAuthority",
+        ));
+    }
+    if !rescue_scan {
+        for fence in index.list_active_tape_io_fences().map_err(refusal)? {
+            if fence.tape_uuid.as_slice() == tape
+                && crate::tape_admission::typed_cause(index, &fence)
+                    == Some(lib::FenceCause::NativeLogBehindProjection)
+            {
+                return Err(refusal(crate::tape_admission::fence_payload(
+                    index,
+                    tape,
+                    &fence,
+                    format!(
+                        "standalone data command blocked by active tape-I/O fence {}: {}",
+                        fence.quarantine_id, fence.reason
+                    ),
+                    true,
+                    lib::AuditActor::local_user(),
+                )));
+            }
+        }
+    }
+    if let Some(message) = crate::tape_admission::contradicted_payload(
+        index,
+        tape,
+        "standalone data command",
+        lib::AuditActor::local_user(),
+    ) {
+        return Err(refusal(message));
+    }
+    Ok(())
 }
 
 /// How an invocation addresses a cartridge; labels are location hints only.
@@ -1025,3 +1071,119 @@ impl OperatorMount<'_> {
 
 #[cfg(test)]
 mod unload_tests;
+
+#[cfg(test)]
+mod l1b_admission_tests {
+    use super::*;
+    use crate::tape_admission::test_support::{assert_code, Fixture, B, T};
+    use remanence_state::library_log as lib;
+
+    #[test]
+    fn l1b_standalone_authority_and_scan_boundary() {
+        for (contradicted, scan, expected) in [
+            (false, false, Some(1)),
+            (false, true, None),
+            (true, false, Some(2)),
+            (true, true, Some(2)),
+        ] {
+            let mut f = Fixture::new();
+            if contradicted {
+                f.contradict(T);
+            } else {
+                f.raise(T, lib::FenceCause::NativeLogBehindProjection);
+            }
+            let index = f.index();
+            let result = standalone_data_admission(&index, T, scan);
+            if let Some(code) = expected {
+                let text = result.unwrap_err().to_string();
+                assert!(
+                    text.starts_with(if code == 1 {
+                        "TapeLogBehindProjection: "
+                    } else {
+                        "ContradictedTapeAdmission: "
+                    }),
+                    "{text}"
+                );
+            } else {
+                result.unwrap();
+            }
+            // A different loaded identity does not inherit this tape's fence.
+            standalone_data_admission(&index, B, false).unwrap();
+            drop(index);
+            let records = f.refusals();
+            assert_eq!(records.len(), usize::from(expected.is_some()));
+            if let Some(code) = expected {
+                assert_code(&records[0], T, code);
+            }
+        }
+        let f = Fixture::new();
+        let catalog = remanence_state::projector::open(&f.root.paths().sqlite_path).unwrap();
+        let index = catalog.write_handle();
+        assert_eq!(
+            standalone_data_admission(&index, T, true)
+                .unwrap_err()
+                .to_string(),
+            "standalone admission requires shared LibraryAuthority"
+        );
+    }
+
+    #[test]
+    fn l1b_cause14_release_advice_at_all_consumers() {
+        use std::io::{Read, Seek};
+        for cause in [
+            lib::FenceCause::NativeLogBehindProjection,
+            lib::FenceCause::TransferError,
+        ] {
+            let f = Fixture::new();
+            f.raise(T, cause);
+            let index = f.index();
+            let fences = index.list_active_tape_io_fences().unwrap();
+            let expected = if cause == lib::FenceCause::NativeLogBehindProjection {
+                "--after-settled-inventory --ack TEXT --force, after restoring the exact tape log or rebuilding the catalog (or retire the tape)"
+            } else {
+                "--after-settled-inventory --ack TEXT"
+            };
+            assert_eq!(fence_release_options(&fences[0]), expected);
+            let write = standalone_fence_policy(&index, Some(T), None, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                write.contains(&format!("{} {expected}`", fences[0].quarantine_id)),
+                "{write}"
+            );
+            let init = crate::tape_init::tape_init_fence_refusal(&fences, None, Some(&T)).unwrap();
+            assert!(
+                init.contains(&format!("{} {expected}`", fences[0].quarantine_id)),
+                "{init}"
+            );
+            let log = tempfile::tempfile().unwrap();
+            let mut reader = log.try_clone().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || log.try_clone().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap()
+            });
+            reader.rewind().unwrap();
+            let mut text = String::new();
+            reader.read_to_string(&mut text).unwrap();
+            assert!(
+                text.contains(&format!("{} {expected}", fences[0].quarantine_id)),
+                "{text}"
+            );
+            let mut standalone = fences[0].clone();
+            standalone.endpoint = Some(remanence_library::DriveKey::Standalone {
+                drive_serial: "ADVICE".into(),
+            });
+            assert_eq!(
+                fence_release_options(&standalone),
+                if cause == lib::FenceCause::NativeLogBehindProjection {
+                    expected
+                } else {
+                    "--ack TEXT"
+                }
+            );
+        }
+    }
+}

@@ -149,9 +149,34 @@ impl super::WriteOwnerConfig {
                 false
             };
             if !allowed {
-                return Err(Status::failed_precondition(
-                    "session blocked by active tape-I/O fence",
-                ));
+                let mut conflicts = index
+                    .tape_io_admission_conflicts(&mounted.tape_uuid, mounted.barcode.as_deref())
+                    .map_err(crate::status_from_state_error)?;
+                crate::tape_admission::order_conflicts(index, &mut conflicts);
+                let message = "session blocked by active tape-I/O fence".to_owned();
+                let message = if let Some(first) = conflicts.first() {
+                    crate::tape_admission::fence_payload(
+                        index,
+                        mounted.tape_uuid,
+                        first,
+                        message,
+                        true,
+                        lib::AuditActor::System,
+                    )
+                } else {
+                    message
+                };
+                return Err(Status::failed_precondition(message));
+            }
+        }
+        if !recovering_tail {
+            if let Some(message) = crate::tape_admission::contradicted_payload(
+                index,
+                mounted.tape_uuid,
+                "mounted write",
+                remanence_state::library_log::AuditActor::System,
+            ) {
+                return Err(Status::failed_precondition(message));
             }
         }
         if !index
@@ -208,5 +233,71 @@ impl super::WriteOwnerConfig {
             "operator-mounted drive is not ready: {:?}",
             first
         )))
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use crate::tape_admission::test_support::{assert_code, drive, Fixture, T};
+    use remanence_state::library_log as lib;
+
+    /// Mounted admission preserves tail-recovery's independent gate and codes
+    /// only the first ordinary admission refusal, after typed cause ordering.
+    #[test]
+    fn l1b_mounted_admission_payload_precedence_and_count() {
+        for case in ["native", "ordinary", "suffix", "contradicted", "recovery"] {
+            let mut f = Fixture::new();
+            let expected = match case {
+                "native" => {
+                    f.raise(T, lib::FenceCause::NativeLogBehindProjection);
+                    f.raise(T, lib::FenceCause::TransferError);
+                    Some(1)
+                }
+                "ordinary" => {
+                    f.raise(T, lib::FenceCause::TransferError);
+                    None
+                }
+                "suffix" => {
+                    f.raise(T, lib::FenceCause::SessionSuffixContradiction);
+                    f.raise(T, lib::FenceCause::NativeLogBehindProjection);
+                    None
+                }
+                _ => {
+                    f.contradict(T);
+                    if case == "recovery" {
+                        None
+                    } else {
+                        Some(2)
+                    }
+                }
+            };
+            let drive = drive();
+            let cfg = f.config(&drive);
+            let index = f.index();
+            let result = cfg.mounted_admission_inner(&index, &drive, case == "recovery");
+            if case == "recovery" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                match expected {
+                    Some(1) => assert_eq!(
+                        error.message(),
+                        "TapeLogBehindProjection: session blocked by active tape-I/O fence"
+                    ),
+                    Some(2) => assert!(error
+                        .message()
+                        .starts_with("ContradictedTapeAdmission: mounted write refused:")),
+                    _ => assert_eq!(error.message(), "session blocked by active tape-I/O fence"),
+                }
+            }
+            drop(index);
+            drop(cfg);
+            drop(drive);
+            let records = f.refusals();
+            assert_eq!(records.len(), usize::from(expected.is_some()));
+            if let Some(code) = expected {
+                assert_code(&records[0], T, code);
+            }
+        }
     }
 }

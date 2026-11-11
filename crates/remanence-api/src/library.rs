@@ -694,7 +694,12 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 Status::failed_precondition("fence release requires shared LibraryAuthority")
             })?;
             runtime
-                .release_tape_fence(&request.quarantine_id, &request.acknowledgment, actor)
+                .release_tape_fence(
+                    &request.quarantine_id,
+                    &request.acknowledgment,
+                    request.force,
+                    actor,
+                )
                 .map_err(|e| Status::failed_precondition(e.to_string()))?
                 .ok_or_else(|| Status::not_found("tape-I/O fence not found"))
         })
@@ -3754,7 +3759,8 @@ mod tests {
         <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &state.library_service(),
             Request::new(pb::ReleaseTapeIoFenceRequest {
-                quarantine_id: fence.quarantine_id,
+                force: false,
+quarantine_id: fence.quarantine_id,
                 acknowledgment: "drive verified".into(),
             }),
         )
@@ -4512,5 +4518,188 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
         state.begin_shutdown();
+    }
+    /// The daemon evaluates the restored view under dispatch, but refuses it if
+    /// the on-disk path changes afterwards; each refusal records one code.
+    #[tokio::test]
+    async fn l1b_force_rpc_restored_log_and_stale_view() {
+        use remanence_state::{authority::TapeAuthorityView, library_log as lib, StateHandle};
+        let id = [0x51; 16];
+        for change in ["unchanged", "replace", "truncate"] {
+            let mut root = crate::tests::TypedRoot::open_with_tapes(&[(id, "RPC051L9")]);
+            let paths = root.paths().clone();
+            let config = root.config();
+            let runtime = root.catalog().write_handle().library_runtime().unwrap();
+            let library_uuid = runtime.manifest().library_uuid();
+            let path = paths
+                .journal_dir
+                .join("tapes")
+                .join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
+            let short = {
+                let authority = remanence_state::TapeAuthority::open(
+                    paths.journal_dir.join("tapes"),
+                    id,
+                    &paths.sqlite_path,
+                )
+                .unwrap();
+                let mut owner = authority.acquire_exclusive().unwrap();
+                owner
+                    .publish_initialized(
+                        262144,
+                        None,
+                        remanence_state::tape_log::CommitCursor {
+                            partition: 0,
+                            lba: 2,
+                        },
+                    )
+                    .unwrap();
+                let short = std::fs::read(&path).unwrap();
+                owner
+                    .open_session(id, "2026-11-11T00:00:00Z".into())
+                    .unwrap();
+                owner
+                    .end_session(
+                        id,
+                        "2026-11-11T00:00:00Z".into(),
+                        remanence_state::tape_log::SessionEndReason::CleanClose,
+                        None,
+                        std::iter::empty(),
+                    )
+                    .unwrap();
+                runtime.refresh_native(&owner.freeze().unwrap()).unwrap();
+                runtime.catch_up().unwrap();
+                short
+            };
+            let full = std::fs::read(&path).unwrap();
+            drop(runtime);
+            root.release();
+            std::fs::write(&path, &short).unwrap();
+            let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            let fence = state
+                .catalog()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.tape_uuid == id)
+                .unwrap();
+            drop(state);
+            std::fs::write(&path, &full).unwrap();
+            let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            let api = crate::ApiState::new_with_config(state.projection_client(), &config).unwrap();
+            match change {
+                "replace" => {
+                    let replacement = path.with_extension("short");
+                    std::fs::write(&replacement, &short).unwrap();
+                    std::fs::rename(replacement, &path).unwrap();
+                }
+                "truncate" => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(short.len() as u64)
+                    .unwrap(),
+                _ => {}
+            }
+            let result = api
+                .library_service()
+                .release_tape_io_fence(Request::new(pb::ReleaseTapeIoFenceRequest {
+                    quarantine_id: fence.quarantine_id.clone(),
+                    acknowledgment: "operator restored exact log".into(),
+                    force: true,
+                }))
+                .await;
+            if change == "unchanged" {
+                assert_eq!(result.unwrap().into_inner().state, "released");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.message().contains("TapeLogBehindProjection: the tape log on disk changed after this process read it; restart the daemon after restoring the log, then release with --force"),"{error}");
+                assert_eq!(
+                    state
+                        .catalog()
+                        .tape_io_fence_by_quarantine_id(&fence.quarantine_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "active"
+                );
+            }
+            drop(api);
+            drop(state);
+            let view = lib::native_view::NativeTapeView::probe(
+                &paths.journal_dir.join("tapes"),
+                &paths.sqlite_path,
+            )
+            .unwrap();
+            let mut records = Vec::new();
+            let replay = lib::store::replay_observed(
+                &paths.audit_dir,
+                library_uuid,
+                &view,
+                &mut |applied| {
+                    records.push(applied.record().clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(replay.refusal.is_none());
+            let releases: Vec<_> = records
+                .iter()
+                .filter(|r| r.tag() == lib::Tag::FenceReleased)
+                .collect();
+            let refusals: Vec<_> = records
+                .iter()
+                .filter_map(lib::Record::diagnostic)
+                .filter(|d| d.event == lib::DiagnosticEvent::RefusalRecorded)
+                .collect();
+            if change == "unchanged" {
+                assert_eq!(releases.len(), 1);
+                // Only a forced cause-14 release installs even an empty observation.
+                assert_eq!(
+                    replay.fold.forced_observation.get(&id),
+                    Some(&lib::Bounded(vec![]))
+                );
+                assert!(refusals.is_empty());
+            } else {
+                assert!(releases.is_empty());
+                assert_eq!(refusals.len(), 1);
+                let d = refusals[0];
+                assert_eq!(d.subject_kind.as_str(), "tape");
+                assert_eq!(
+                    d.subject_id.as_ref().unwrap().as_str(),
+                    uuid::Uuid::from_bytes(id).to_string()
+                );
+                assert_eq!(
+                    d.detail,
+                    lib::Bounded(vec![
+                        lib::DiagnosticEntry("code".into(), lib::DiagnosticValue::Unsigned(1)),
+                        lib::DiagnosticEntry(
+                            "name".into(),
+                            lib::DiagnosticValue::Text("TapeLogBehindProjection".into())
+                        )
+                    ])
+                );
+                let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+                let api =
+                    crate::ApiState::new_with_config(state.projection_client(), &config).unwrap();
+                assert!(api
+                    .library_service()
+                    .release_tape_io_fence(Request::new(pb::ReleaseTapeIoFenceRequest {
+                        quarantine_id: fence.quarantine_id.clone(),
+                        acknowledgment: "still short after restart".into(),
+                        force: true,
+                    }))
+                    .await
+                    .is_err());
+                assert_eq!(
+                    state
+                        .catalog()
+                        .tape_io_fence_by_quarantine_id(&fence.quarantine_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "active"
+                );
+            }
+        }
     }
 }

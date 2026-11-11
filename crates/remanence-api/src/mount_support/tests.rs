@@ -472,7 +472,7 @@ fn durable_terminal_component_projection_failure_asks_for_replay_and_resumes() {
     assert!(!fences.is_empty());
     for fence in fences {
         state
-            .release_tape_io_fence(&fence.quarantine_id, "projection fault removed")
+            .release_tape_io_fence(&fence.quarantine_id, "projection fault removed", false)
             .unwrap();
     }
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
@@ -2351,7 +2351,7 @@ fn standalone_fences_match_only_recorded_tape_or_endpoint() {
             1
         );
         state
-            .release_tape_io_fence(&fence.quarantine_id, "checked")
+            .release_tape_io_fence(&fence.quarantine_id, "checked", false)
             .unwrap()
             .unwrap();
         let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
@@ -2398,7 +2398,7 @@ fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
     assert!(standalone_fence_releasable(&fence));
     crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog()).unwrap();
     state
-        .release_tape_io_fence(&fence.quarantine_id, "rescued files")
+        .release_tape_io_fence(&fence.quarantine_id, "rescued files", false)
         .unwrap()
         .unwrap();
     let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();

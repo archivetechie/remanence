@@ -1898,6 +1898,19 @@ impl CatalogCore {
             .map_err(|err| sqlite_error("read active tape io fence", err))
     }
 
+    /// Read the projected contradiction bit without treating a missing row as a refusal.
+    pub fn tape_contradicted(&self, tape: &[u8; 16]) -> Result<bool, StateError> {
+        self.conn
+            .query_row(
+                "select contradicted from library_tape_status where tape_uuid=?1",
+                [tape.as_slice()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(|error| sqlite_error("read tape contradiction", error))
+    }
+
     /// Return active tape-I/O fences matching a tape UUID or barcode.
     pub fn tape_io_admission_conflicts(
         &self,
