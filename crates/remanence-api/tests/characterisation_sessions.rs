@@ -2737,3 +2737,130 @@ async fn ruling24_crash_before_bootstrap_commit() {
 async fn ruling24_crash_after_bootstrap_commit() {
     ruling24_crash_test("ruling24_crash_after_bootstrap_commit", true).await;
 }
+
+/// A4: an admissible seated tape is excluded by a durable endpoint fence across restart.
+#[tokio::test]
+async fn l1r3e_drive_fence_excludes_seated_ready_session_across_restart() {
+    use remanence_state::library_log as lib;
+    let fixture = Harness::new(false);
+    let client = fixture.start().await;
+    let session = client.open().await;
+    client
+        .append(&session, "drive-fence-control", b"control bytes")
+        .await;
+    client.close(&session).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    let fence = {
+        let state =
+            StateHandle::open_with_config(state_paths(&fixture.config), fixture.config.clone())
+                .unwrap();
+        state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(lib::DriveKey::Bay(lib::Bay {
+                            library_serial: LIBRARY.into(),
+                            bay: BAY,
+                        })),
+                        cause: lib::FenceCause::Cleaning,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let before_native = ruling24_native_records(&fixture.config)
+        .iter()
+        .filter(|r| matches!(r, remanence_state::tape_log::Record::SessionOpened(_)))
+        .count();
+    let client = fixture.start().await;
+    fixture.injection.lock().unwrap().commands.clear();
+    let error = client
+        .writer()
+        .open_write_session(open_request("archive"))
+        .await
+        .unwrap_err();
+    assert!(error.message().starts_with("DriveFenced: "), "{error}");
+    assert!(fixture
+        .injection
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .all(|c| !matches!(
+            c[0],
+            0x00 | 0x01 | 0x08 | 0x0a | 0x10 | 0x1b | 0x2b | 0x34 | 0x92 | 0xa5
+        )));
+    client.state.shutdown_drive_pool().await.unwrap();
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    assert_eq!(
+        ruling24_native_records(&fixture.config)
+            .iter()
+            .filter(|r| matches!(r, remanence_state::tape_log::Record::SessionOpened(_)))
+            .count(),
+        before_native
+    );
+    assert_eq!(
+        recorded_refusals(&fixture)
+            .iter()
+            .filter(|r| r.0 == 12)
+            .count(),
+        1
+    );
+    let paths = state_paths(&fixture.config);
+    let uuid = StateHandle::open_with_config(paths.clone(), fixture.config.clone())
+        .unwrap()
+        .library_runtime()
+        .manifest()
+        .library_uuid();
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    lib::store::replay_observed(&paths.audit_dir, uuid, &view, &mut |applied| {
+        if applied.sequence() > fence {
+            assert!(!matches!(
+                applied.record().tag(),
+                lib::Tag::MotionIntent | lib::Tag::SessionObserved
+            ));
+        }
+        Ok(())
+    })
+    .unwrap();
+    {
+        let state = StateHandle::open_with_config(paths, fixture.config.clone()).unwrap();
+        state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_released(
+                    lib::FenceReleased {
+                        fence,
+                        evidence: "drive fence test release".into(),
+                        forced: false,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+    }
+    let client = fixture.start().await;
+    let session = client.open().await;
+    client.close(&session).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+}

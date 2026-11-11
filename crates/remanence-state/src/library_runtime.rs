@@ -1015,6 +1015,8 @@ impl LibraryRuntime {
     }
 }
 
+mod drive_fence;
+pub use drive_fence::{DriveDataRefusal, DriveFenced};
 mod motion;
 mod native_fences;
 pub(crate) mod native_floor;

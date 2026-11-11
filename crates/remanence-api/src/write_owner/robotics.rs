@@ -86,6 +86,23 @@ pub(crate) fn handle_robotics(
     action: RoboticsAction,
     handle: &crate::operations::OperationHandle,
 ) -> RoboticsOutcome {
+    handle_robotics_with_opener(index, cfg, library_serial, action, handle, |lib, policy| {
+        lib.open(policy)
+    })
+}
+
+/// Execute the same robotics route with a caller-supplied library opener for model tests.
+fn handle_robotics_with_opener(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    library_serial: &str,
+    action: RoboticsAction,
+    handle: &crate::operations::OperationHandle,
+    open: impl FnOnce(
+        &remanence_library::Library,
+        &dyn remanence_library::AccessPolicy,
+    ) -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>,
+) -> RoboticsOutcome {
     if library_serial != cfg.library().serial {
         return RoboticsOutcome::Failed {
             message: format!(
@@ -155,7 +172,7 @@ pub(crate) fn handle_robotics(
             phase: "admission",
         };
     }
-    let mut library = match lib.open(&cfg.policy) {
+    let mut library = match open(lib, &cfg.policy) {
         Ok(handle) => handle,
         Err(err) => {
             return RoboticsOutcome::Failed {
@@ -885,3 +902,7 @@ pub(super) fn admit_fenced_elements(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "robotics_drive_fence_tests.rs"]
+mod drive_fence_tests;

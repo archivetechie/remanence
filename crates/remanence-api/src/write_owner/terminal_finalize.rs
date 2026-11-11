@@ -256,6 +256,17 @@ pub(crate) fn finalize_mounted_tape(
     } else {
         None
     };
+    if let (Some(runtime), Some(endpoint)) =
+        (cfg.authority.runtime(), drive.endpoint().durable_key())
+    {
+        runtime
+            .admit_drive_data(
+                endpoint,
+                remanence_state::library_runtime::RefusalSubject::Tape(Some(request.tape_uuid)),
+                request.actor.clone(),
+            )
+            .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
+    }
     prepare(index, drive)?;
     let drive_config = drive.read_config().map_err(|error| {
         super::restore::attach_outcome_retry(

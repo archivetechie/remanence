@@ -303,8 +303,60 @@ impl MotionAuthority for LibraryRuntime {
         context: &MotionContext,
     ) -> Result<MotionTicket, MotionAuthorityError> {
         LibraryRuntime::ensure_motion_allowed(self).map_err(|error| self.motion_error(error))?;
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let destination = match command {
+            MotionCommand::Load(key) => Some(endpoint(key)),
+            MotionCommand::Move {
+                library_serial,
+                destination,
+                ..
+            } => Some(lib::DriveKey::Bay(lib::Bay {
+                library_serial: library_serial.as_str().into(),
+                bay: *destination,
+            })),
+            MotionCommand::Unload(_) => None,
+        };
+        if let Some(destination) = destination {
+            let fences = self.0.authority.active_drive_fences(&destination);
+            if let Some((fence, raise)) = fences.first() {
+                let maintenance_valid = context.maintenance.as_ref().is_some_and(|cap| {
+                    context.parent_operation.is_some()
+                        && fences.len() == 1
+                        && *fence == cap.fence
+                        && raise.cause == lib::FenceCause::Cleaning
+                        && raise.operation == context.parent_operation
+                        && self
+                            .0
+                            .authority
+                            .cleaning_run_cartridge(&cap.run)
+                            .is_some_and(|tape| tape.uuid == cap.cartridge)
+                        && match command {
+                            MotionCommand::Move { source, .. } => {
+                                self.0.authority.cleaning_run_home(&cap.run) == Some(*source)
+                            }
+                            _ => true,
+                        }
+                });
+                if !maintenance_valid {
+                    let refusal = super::DriveFenced {
+                        endpoint: destination,
+                        fence: *fence,
+                        cause: raise.cause,
+                    };
+                    self.record_refusal_locked(
+                        lib::RefusalCode::DriveFenced,
+                        super::RefusalSubject::Tape(context.tape.map(|(uuid, _)| uuid)),
+                        lib::AuditActor::System,
+                    );
+                    return Err(MotionAuthorityError {
+                        kind: MotionAuthorityFailure::SemanticRefusal,
+                        message: refusal.to_string(),
+                    });
+                }
+            }
+        }
         let receipt = self
-            .append(|authority, view| {
+            .append_locked(|authority, view| {
                 if context.load_confirmation == LoadConfirmation::Readiness
                     && matches!(command, MotionCommand::Load(_))
                 {
@@ -662,3 +714,7 @@ impl MotionAuthority for LibraryRuntime {
         .map_err(|error| self.motion_error(error))
     }
 }
+
+#[cfg(test)]
+#[path = "drive_fence_motion_tests.rs"]
+mod drive_fence_tests;

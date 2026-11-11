@@ -311,6 +311,20 @@ fn run_cleaning_sequence_owned(
         .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
     let mut motion =
         crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(drive_bay));
+    let maintenance = if cfg.authority.runtime().is_some() {
+        Some(remanence_library::motion::MaintenanceCapability {
+            fence: owned_fence
+                .ok_or_else(|| Status::internal("cleaning load has no owned fence sequence"))?,
+            run: run_id.clone(),
+            cartridge: tape_row
+                .tape_uuid
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::internal("cleaning cartridge has invalid UUID"))?,
+        })
+    } else {
+        None
+    };
     let mut failed_load_after_completed_move = false;
     let loaded = retry_cleaning_move(
         index,
@@ -321,7 +335,21 @@ fn run_cleaning_sequence_owned(
         true,
         || {
             library
-                .load_with_admission(slot_address, drive_bay, &cfg.policy, &mut || motion.admit())
+                .with_motion_context(
+                    remanence_library::motion::MotionContext {
+                        parent_operation: Some(*handle.op_id_uuid().as_bytes()),
+                        maintenance: maintenance.clone(),
+                        ..Default::default()
+                    },
+                    |library| {
+                        library.load_with_admission(
+                            slot_address,
+                            drive_bay,
+                            &cfg.policy,
+                            &mut || motion.admit(),
+                        )
+                    },
+                )
                 .map_err(|err| {
                     motion.refusal.take().unwrap_or_else(|| match &err {
                         remanence_library::LoadError::DriveLoad(error)

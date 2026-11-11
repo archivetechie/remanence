@@ -18021,3 +18021,131 @@ fn typed_robotics_immediate_load_records_normal_outcomes() {
         }
     }
 }
+
+/// A6: the real typed cleaning owner must dispatch MOVE and LOAD under its owned fence.
+/// Later cleaning completion is outside this assertion's admission boundary.
+#[test]
+fn l1r3e_cleaning_capability_dispatches_move_and_load() {
+    use remanence_state::{
+        library_log as lib, library_runtime::LibraryRuntime, StateLockGuard, StatePaths,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let paths = StatePaths {
+        config_path: root.join("config"),
+        state_dir: root.join("state"),
+        audit_dir: root.join("library"),
+        journal_dir: root.join("native"),
+        sqlite_path: root.join("catalog.sqlite"),
+        tape_cache_dir: root.join("cache"),
+        calibration_dir: root.join("calibration"),
+    };
+    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime.clone());
+    let mut index = catalog.write_handle();
+    let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 1);
+    model.put_tape_in_slot(
+        0x400,
+        "CLNU01L9",
+        VirtualTape {
+            cleaning_cart: true,
+            cleaning_cart_expired: false,
+            ..VirtualTape::default()
+        },
+    );
+    let world = Arc::new(Mutex::new(model));
+    let mut library = open_model_library(world.clone());
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from(["LIB-CLEAN".into()]),
+    )
+    .unwrap();
+    let drive = index.list_drives(true, true).unwrap()[0].drive_uuid.clone();
+    let mut cfg = test_write_owner_config(
+        paths.sqlite_path.clone(),
+        paths.audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.catalog = catalog.clone();
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
+    cfg.cleaning.min_cycle_duration = "0s".into();
+    let api = crate::ApiState::new(catalog.clone());
+    let action = crate::write_owner::RoboticsAction::Clean {
+        drive_uuid: drive.clone(),
+        trigger: "now".into(),
+    };
+    let fingerprint = crate::operation_source::robotics_fingerprint("LIB-CLEAN", &action);
+    let operation = api
+        .accept_owner_request(
+            AuditActor::User("real-cleaner".into()),
+            "clean_drive",
+            "library",
+            "LIB-CLEAN".into(),
+            fingerprint,
+        )
+        .unwrap();
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation, "clean_drive");
+    super::robotics::record_library_operation(
+        &mut index,
+        &cfg,
+        &handle,
+        "LIB-CLEAN",
+        lib::OperationEvent::Started(lib::Unit),
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    cfg.configure_operation_library(&mut library, &handle);
+    let result = run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive, "now");
+    let log = world.lock().unwrap().command_log.clone();
+    let library_uuid = runtime.manifest().library_uuid();
+    drop(api);
+    drop(library);
+    drop(cfg);
+    drop(index);
+    drop(catalog);
+    drop(runtime);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut drive_refusals = 0;
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+        if let Some(value) = record.record().diagnostic() {
+            if value.event == lib::DiagnosticEvent::RefusalRecorded
+                && value.detail.0.iter().any(|entry| {
+                    entry.0.as_str() == "code" && entry.1 == lib::DiagnosticValue::Unsigned(12)
+                })
+            {
+                drive_refusals += 1;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    if !log.iter().any(|c| c.opcode == 0xa5) {
+        assert_eq!(
+            drive_refusals, 1,
+            "capability red proof must record exactly one code-12 refusal: {result:?}"
+        );
+    }
+    println!("A6 code-12 refusals: {drive_refusals}");
+    assert!(
+        log.iter().any(|c| c.opcode == 0xa5),
+        "cleaning must dispatch MOVE before later outcomes: {result:?}; commands={log:?}"
+    );
+    assert!(
+        log.iter().any(|c| c.opcode == 0x1b),
+        "cleaning must dispatch LOAD: {result:?}; commands={log:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[path = "drive_fence_api_tests.rs"]
+mod drive_fence_api_tests;

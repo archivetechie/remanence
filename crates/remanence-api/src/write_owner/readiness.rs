@@ -442,6 +442,15 @@ pub(crate) fn session_open_reject_admission_conflicts(
     ctx: &SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
     let endpoint = remanence_state::DriveKey::new(ctx.library_serial, ctx.bay);
+    if let Some(runtime) = index.library_runtime() {
+        runtime
+            .admit_drive_data(
+                &endpoint,
+                remanence_state::library_runtime::RefusalSubject::Tape(None),
+                remanence_state::library_log::AuditActor::System,
+            )
+            .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
+    }
     if index
         .tape_io_is_fenced(None, ctx.barcode, Some(&endpoint))
         .map_err(status_from_state_error)?

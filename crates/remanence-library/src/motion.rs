@@ -29,6 +29,17 @@ pub enum LoadConfirmation {
     /// The stable readiness operation publishes ReadinessObserved then Done.
     Readiness,
 }
+/// Process-local proof naming the exact cleaning obligation and selected cartridge.
+/// The runtime validates this against retained authority before admitting motion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaintenanceCapability {
+    /// Active drive-fence raise owned by this cleaning operation.
+    pub fence: u64,
+    /// Cleaning run retaining the selected cartridge and home slot.
+    pub run: String,
+    /// UUID of the run's selected cleaning cartridge.
+    pub cartridge: [u8; 16],
+}
 /// Immutable operation facts captured for one dispatch owner.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MotionContext {
@@ -42,6 +53,8 @@ pub struct MotionContext {
     pub readiness_generation: Option<u64>,
     /// Explicit owner for a successful LOAD's final confirmation.
     pub load_confirmation: LoadConfirmation,
+    /// Validated only at dispatch; never written into MotionIntent.
+    pub maintenance: Option<MaintenanceCapability>,
 }
 /// One successful command awaiting its owner's physical confirmation.
 #[derive(Clone, Debug)]

@@ -93,6 +93,14 @@ impl super::WriteOwnerConfig {
             library
                 .ensure_motion_allowed()
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let mounted = self.mounted().expect("mounted readiness capability");
+            library
+                .admit_drive_data(
+                    &mounted.endpoint,
+                    remanence_state::library_runtime::RefusalSubject::Tape(Some(mounted.tape_uuid)),
+                    mounted.actor.clone(),
+                )
+                .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
         }
         self.mounted_audit_ready()?;
         let mounted = self.mounted().expect("mounted readiness capability");

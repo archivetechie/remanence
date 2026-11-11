@@ -515,6 +515,7 @@ fn typed_motion_gate_preserves_context_and_refusal_kind() {
             inventory_generation: Some(3),
             readiness_generation: Some(4),
             load_confirmation: LoadConfirmation::Inventory,
+            maintenance: None,
         };
         let result = handle
             .changer_mut()

@@ -208,6 +208,25 @@ impl LibraryAuthority {
             .cloned()
     }
 
+    /// Read an active cleaning run's selected cartridge under the log lock.
+    pub(crate) fn cleaning_run_cartridge(&self, run: &str) -> Option<TapeRef> {
+        self.with_fold(|fold| fold.cleaning_run_cartridge(run))
+    }
+
+    /// Read an active cleaning run's retained home slot under the log lock.
+    pub(crate) fn cleaning_run_home(&self, run: &str) -> Option<u16> {
+        self.with_fold(|fold| fold.cleaning_run_home(run))
+    }
+
+    /// Read active drive raises under the writer's log lock, in sequence order.
+    pub(crate) fn active_drive_fences(&self, endpoint: &DriveKey) -> Vec<(u64, FenceRaised)> {
+        self.with_fold(|fold| {
+            fold.active_drive_fences(endpoint)
+                .map(|(sequence, raise)| (sequence, raise.clone()))
+                .collect()
+        })
+    }
+
     /// Read derived authority under the same log lock used by the writer.
     pub fn with_fold<T>(&self, f: impl FnOnce(&LibraryFold) -> T) -> T {
         let log = self.log.lock().unwrap_or_else(|e| e.into_inner());

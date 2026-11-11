@@ -383,6 +383,7 @@ pub struct LibraryFold {
     latest: Index<(Tag, Scope, Option<Id>), Held>,
     fences: Index<u64, Held>,
     tape_fences: Index<Id, BTreeSet<u64>>,
+    drive_fences: Index<DriveKey, BTreeSet<u64>>,
     supersedes: Index<(TapeRef, Option<Id>), Held>,
     supersede_sequences: Index<u64, (TapeRef, Option<Id>)>,
     unprotected: Index<(TapeRef, Id), Held>,
@@ -679,6 +680,7 @@ impl LibraryFold {
             + self.latest.probes()
             + self.fences.probes()
             + self.tape_fences.probes()
+            + self.drive_fences.probes()
             + self.supersedes.probes()
             + self.supersede_sequences.probes()
             + self.unprotected.probes()
@@ -2009,6 +2011,12 @@ impl LibraryFold {
                         .or_default()
                         .insert(sequence);
                 }
+                if let FenceScope::Drive(endpoint) = &v.scope {
+                    self.drive_fences
+                        .entry(endpoint.clone())
+                        .or_default()
+                        .insert(sequence);
+                }
                 self.fences.insert(
                     sequence,
                     Held {
@@ -2037,6 +2045,14 @@ impl LibraryFold {
                         sequences.remove(&v.fence);
                         if sequences.is_empty() {
                             self.tape_fences.remove(&tape.uuid);
+                        }
+                    }
+                }
+                if let FenceScope::Drive(endpoint) = &raised.scope {
+                    if let Some(sequences) = self.drive_fences.get_mut(endpoint) {
+                        sequences.remove(&v.fence);
+                        if sequences.is_empty() {
+                            self.drive_fences.remove(endpoint);
                         }
                     }
                 }
@@ -2711,6 +2727,34 @@ impl LibraryFold {
             })
     }
 
+    /// Selected cartridge retained by an active cleaning run.
+    pub(crate) fn cleaning_run_cartridge(&self, run: &str) -> Option<TapeRef> {
+        self.cleaning_run_cartridges.get(&Text::from(run)).copied()
+    }
+
+    /// Home slot retained when the run selected its cartridge for MovingIn.
+    pub(crate) fn cleaning_run_home(&self, run: &str) -> Option<u16> {
+        self.cleaning_run_homes.get(&Text::from(run)).copied()
+    }
+
+    /// Active drive raises in durable sequence order, independent of observed identities.
+    pub(crate) fn active_drive_fences(
+        &self,
+        endpoint: &DriveKey,
+    ) -> impl Iterator<Item = (u64, &FenceRaised)> {
+        self.drive_fences
+            .get(endpoint)
+            .into_iter()
+            .flatten()
+            .map(|sequence| {
+                (
+                    *sequence,
+                    self.active_fence(*sequence)
+                        .expect("indexed drive fence is open"),
+                )
+            })
+    }
+
     /// Open fences, individually identified by their raise sequence.
     pub fn open_fences(&self) -> usize {
         self.fences.len()
@@ -2802,6 +2846,7 @@ impl LibraryFold {
             latest,
             fences,
             tape_fences,
+            drive_fences,
             forced_observation,
             intents,
             uncertain,
@@ -3104,5 +3149,72 @@ mod verdict_shape_tests {
             f.validate_shape(1, &record(Body::VerificationVerdict(v), 1)),
             Err(FoldError::InvalidSchema)
         );
+    }
+}
+
+#[cfg(test)]
+mod drive_fence_tests {
+    use super::*;
+    use crate::library_log::tests::{feed, receipt, record, release, History, Present};
+
+    /// Drive indexing follows both mutations and replay without a DriveObserved identity.
+    #[test]
+    fn endpoint_fences_follow_raise_release_and_replay() {
+        for endpoint in [
+            DriveKey::Bay(Bay {
+                library_serial: "LIB".into(),
+                bay: 1,
+            }),
+            DriveKey::Standalone(Standalone {
+                drive_serial: "DRIVE".into(),
+            }),
+        ] {
+            let other = DriveKey::Bay(Bay {
+                library_serial: "LIB".into(),
+                bay: 2,
+            });
+            let raise = Body::FenceRaised(FenceRaised {
+                detail: Bounded(vec![]),
+                kind: FenceKind::DriveFault,
+                scope: FenceScope::Drive(endpoint.clone()),
+                cause: FenceCause::Cleaning,
+                evidence: None,
+                at: None,
+                operation: None,
+            });
+            let mut live = LibraryFold::default();
+            let mut replay = LibraryFold::default();
+            for (i, body) in [raise.clone(), raise, release(1), release(2)]
+                .into_iter()
+                .enumerate()
+            {
+                feed(&mut live, body.clone(), &Present).unwrap();
+                let sequence = (i + 1) as u64;
+                let r = record(body, sequence);
+                replay
+                    .receive(
+                        sequence,
+                        r.clone(),
+                        receipt(&r, sequence),
+                        &Present,
+                        &History::default(),
+                    )
+                    .unwrap();
+                live.assert_same_state(&replay);
+                let expected: &[u64] = match i {
+                    0 => &[1],
+                    1 => &[1, 2],
+                    2 => &[2],
+                    _ => &[],
+                };
+                assert_eq!(
+                    live.active_drive_fences(&endpoint)
+                        .map(|(s, _)| s)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(live.active_drive_fences(&other).count(), 0);
+            }
+        }
     }
 }
