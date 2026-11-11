@@ -13,6 +13,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+/// Path shared by lost-fence recording and runtime reconciliation.
+pub(crate) fn fence_reconcile_path(library_root: &Path) -> PathBuf {
+    library_root.join("library-log.fence-reconcile")
+}
+
 /// Origin attribution injected by the eventual authority owner.
 #[derive(Clone, Debug)]
 pub struct Origin {
@@ -654,12 +659,12 @@ impl LibraryLog {
         self.clear_ambiguity(view)
     }
     /// Durably name a tape whose safety fence could not be published.
-    pub(crate) fn record_lost_fence(&self, tape: TapeRef) {
+    fn record_lost_fence(&self, tape: TapeRef) {
         let result = (|| -> io::Result<()> {
             let mut file = File::options()
                 .create(true)
                 .append(true)
-                .open(self.identity.with_extension("fence-reconcile"))?;
+                .open(fence_reconcile_path(&self.dir))?;
             file.write_all(&tape.uuid)?;
             file.sync_all()?;
             File::open(&self.dir)?.sync_all()
@@ -669,8 +674,8 @@ impl LibraryLog {
         }
     }
     /// Read the lost-tape trigger; malformed entries must keep runtime admission closed.
-    pub(crate) fn fence_reconciliation_tapes(&self) -> Result<Vec<Id>, StoreError> {
-        let bytes = match fs::read(self.identity.with_extension("fence-reconcile")) {
+    pub(super) fn fence_reconciliation_tapes(&self) -> Result<Vec<Id>, StoreError> {
+        let bytes = match fs::read(fence_reconcile_path(&self.dir)) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
@@ -688,8 +693,8 @@ impl LibraryLog {
             .collect())
     }
     /// Remove the trigger only after all owed fences have been durably reconciled.
-    pub(crate) fn finish_fence_reconciliation(&self) -> Result<(), StoreError> {
-        match fs::remove_file(self.identity.with_extension("fence-reconcile")) {
+    pub(super) fn finish_fence_reconciliation(&self) -> Result<(), StoreError> {
+        match fs::remove_file(fence_reconcile_path(&self.dir)) {
             Ok(()) => (),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),

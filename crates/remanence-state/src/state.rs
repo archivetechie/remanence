@@ -1441,7 +1441,7 @@ impl StateHandle {
         }
         // A native write session has no endpoint or restart-ending vocabulary.
         // Preserve its unresolved source; never manufacture a read-session row
-        // or a classified fence from broad native end reasons. Only ruling 21,
+        // or a classified fence from broad native end reasons (C8-G2). Only ruling 21,
         // at open, derives a fence for a tape whose fence append was lost.
         if endpoint.is_none() {
             for session in self.library.open_native_sessions() {

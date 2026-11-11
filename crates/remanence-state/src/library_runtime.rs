@@ -233,9 +233,7 @@ impl LibraryRuntime {
         )?;
         let snapshot = authority.snapshot()?;
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
-        if manifest
-            .library_root()
-            .join("library-log.fence-reconcile")
+        if lib::store::fence_reconcile_path(manifest.library_root())
             .try_exists()
             .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
         {

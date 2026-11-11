@@ -518,3 +518,156 @@ fn s11_only_lost_tape_is_fenced() {
     assert_eq!(f.live(T).len(), 1);
     assert!(f.live(B).is_empty());
 }
+
+/// New recovery tests require the complete D4 record, not just a fence count.
+fn assert_ending_fence(record: &lib::Record, digest: lib::Hash) {
+    assert_eq!(record.envelope.actor, lib::AuditActor::System);
+    assert_eq!(record.envelope.source_layer, lib::SourceLayer::Layer4);
+    let lib::BodyView::FenceRaised(fence) = record.body_view() else {
+        panic!("expected fence");
+    };
+    assert_eq!(
+        fence,
+        &lib::FenceRaised {
+            kind: lib::FenceKind::Write,
+            scope: lib::FenceScope::Tape(tape(T)),
+            cause: lib::FenceCause::AuthorityAmbiguous,
+            evidence: None,
+            at: Some(lib::TapeAt {
+                tape: tape(T),
+                sequence: 3,
+                record_digest: digest,
+            }),
+            operation: None,
+            detail: lib::Bounded(vec![]),
+        }
+    );
+}
+
+/// S12: a released fence stops covering when its native record is replaced.
+#[test]
+fn s12_released_fence_on_replaced_native_record_does_not_cover() {
+    let (mut f, native) = Fixture::failed();
+    let original = native.record_evidence(3).unwrap().unwrap();
+    assert_eq!(original.kind, Tag::SessionEnded);
+    let id = f.accepted_fence(Some(lib::TapeAt {
+        tape: tape(T),
+        sequence: 3,
+        record_digest: original.digest,
+    }));
+    f.release(&id);
+
+    drop(f.runtime.take());
+    std::fs::remove_file(
+        f.paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", uuid::Uuid::from_bytes(T).simple())),
+    )
+    .unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", f.paths.sqlite_path.display()));
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    f.reopen().unwrap();
+    let replacement = f.native(T, Some(SessionEndReason::FailedAppend));
+    let replaced = replacement.record_evidence(3).unwrap().unwrap();
+    assert_eq!(replaced.kind, Tag::SessionEnded);
+    assert_ne!(replaced.digest, original.digest);
+
+    f.lose(T);
+    f.recover();
+    let raises = f.raises();
+    assert_eq!(raises.len(), 2);
+    assert_ending_fence(&raises[1], replaced.digest);
+    let live = f.live(T);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].reason, "authority_ambiguous");
+    assert_eq!(live[0].tape_uuid, T);
+    assert!(!f.marker().exists());
+
+    f.lose(T);
+    f.recover();
+    assert_eq!(f.raises().len(), 2);
+    assert_eq!(f.live(T).len(), 1);
+}
+
+/// S4c: released evidence at the session's opening frame meets D5(b)'s lower bound.
+#[test]
+fn s4c_released_fence_at_session_open_covers() {
+    let (mut f, native) = Fixture::failed();
+    let opened = native.record_evidence(2).unwrap().unwrap();
+    assert_eq!(opened.kind, Tag::SessionOpened);
+    let id = f.accepted_fence(Some(lib::TapeAt {
+        tape: tape(T),
+        sequence: 2,
+        record_digest: opened.digest,
+    }));
+    f.release(&id);
+    f.lose(T);
+    f.recover();
+    assert_eq!(f.raises().len(), 1);
+    assert!(f.live(T).is_empty());
+    assert!(!f.marker().exists());
+}
+
+/// S13: a later metadata commit leaves the failed ending at its earlier frame.
+#[test]
+fn s13_ending_found_by_frame_scan_not_last_closed_sequence() {
+    let (mut f, native) = Fixture::failed();
+    let ending = native.record_evidence(3).unwrap().unwrap();
+    assert_eq!(ending.kind, Tag::SessionEnded);
+    let store = crate::tape_log::store::Store::new_fixture(
+        f.paths.journal_dir.join("tapes"),
+        native.header().clone(),
+    )
+    .unwrap();
+    let mut owner = store.acquire(false).unwrap();
+    let summary = owner.summary().clone();
+    assert!(summary.open_session.is_none());
+    let group = owner.prepare().unwrap();
+    let commit = Record::Committed(crate::tape_log::Committed {
+        group: group.reference(0),
+        cursor: summary.cursor,
+        protected: summary.protected,
+        total: summary.total,
+        check: summary.check,
+        provenance: summary.provenance,
+        next_epoch: summary.next_epoch,
+        next_file: summary.next_file,
+        object_count: summary.object_count,
+        batch_id: [0x73; 16],
+        session_id: None,
+        seal_due: summary.seal_due,
+        committed_at_utc: TIME.into(),
+    });
+    owner.append(group.close(&commit).unwrap()).unwrap();
+    let later = owner.snapshot().unwrap();
+    assert!(later.summary().last_closed_sequence > 3);
+    assert_eq!(
+        later.summary().last_session_end,
+        native.summary().last_session_end
+    );
+    assert!(later.summary().last_session_end.is_some());
+    assert_eq!(
+        later
+            .record_evidence(later.summary().last_closed_sequence)
+            .unwrap()
+            .unwrap()
+            .kind,
+        Tag::Committed
+    );
+    let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(later).unwrap();
+    f.rt().refresh_native(&snapshot).unwrap();
+    drop(owner);
+
+    f.lose(T);
+    f.recover();
+    let raises = f.raises();
+    assert_eq!(raises.len(), 1);
+    assert_ending_fence(&raises[0], ending.digest);
+    assert_eq!(f.live(T).len(), 1);
+    assert!(!f.marker().exists());
+}
