@@ -727,6 +727,64 @@ Authoritative prefix end: 821 bytes; tail Complete.
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
 | 3 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 566 | 821 | `a3c70ce653e6d8d3cee7ec908b90f2be96c677836cf633869d8337bbbe69c3fe` |
+## readiness-owner-close-keeps-chain
+
+Tail: `Some(Complete)`. Authoritative sequence 6; applied 6; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1588 bytes, SHA-256 `922de1e74aaf0200c0fb4c216ed016f4eef8f466671c6fdfa789288e8e635122`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1588 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 566 | 776 | `f39652b76b12ab9cba3f77177b3a86084396bc3f90e1c2871c01ecfcc03ac1ba` |
+| 4 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 776 | 1046 | `8f808a2f55b1afea411eaa8989292be445b82a66e42715fe5b9b49c8196f017e` |
+| 5 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 1046 | 1299 | `324816ff4435ea498ea7cbc0d3056642dc6b686bde0956b5e0fbb42aef7f15bc` |
+| 6 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 1299 | 1588 | `f4d389a42d760e63dd3690d3e640c25f5c252accf982c521d36cacce56b556a6` |
+## readiness-result-clears-load-count
+
+Tail: `Some(Complete)`. Authoritative sequence 5; applied 5; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1353 bytes, SHA-256 `8260a22718a17263332b769b4e722269f5d845766f2569a1ed99167fa568e134`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1353 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 566 | 825 | `fb38d6dfdfa2a9bb47c6fca0e1ce51a1c4eab164b334638a53f5e1572704b0c4` |
+| 4 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 825 | 1094 | `3418fa9ac56165d2a21dc7e524916a9d463b5694856c9cc3a3b7589ad7ee21b6` |
+| 5 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 1094 | 1353 | `0888a2fe62f247004e42b2687e48a752dd2f45deaa690619e31fd3e58694a455` |
+## readiness-successor-after-ready
+
+Tail: `Some(Complete)`. Authoritative sequence 5; applied 5; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1395 bytes, SHA-256 `e0e8bde980e6c673910f9aaa6f1610f6047846701e7e28da78c28124c263b835`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1395 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 566 | 836 | `3319f4a18cadf9d7907ad5c57c6ee494b8efbf1852cf2aa321e8c3f98bbb7768` |
+| 4 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 836 | 1125 | `a2278124cd37e88972fffb46b44fa609838b065634a355e31e56a2f37b43525f` |
+| 5 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 1125 | 1395 | `688add0b2bb48bc122712fef4bc90084130ade62d49064057bb7359f27deaf44` |
 ## readiness-unprovisioned-family
 
 Tail: `Some(Complete)`. Authoritative sequence 3; applied 3; pending 0; tapes 2; fences 0; duplicates 0.
@@ -6160,6 +6218,27 @@ Authoritative prefix end: 915 bytes; tail Complete.
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
 | 3 | VerificationProgress | 00000000000000000001-2026-11-03.remlib | 566 | 915 | `21cb6c064d3852ea8fa1311c85e24db6576936492fbf9738ae0cbad47e98c07e` |
 | 4 | VerificationProgress | 00000000000000000001-2026-11-03.remlib | 915 | 1240 | `21a8605ff3b2907bef9bea3ff80d553be0a70141e5cc0bcaa498277aab9c473e` |
+## rejected/readiness-after-released
+
+Tail: `00000000000000000001-2026-11-03.remlib@1588:Some(7):OperationState`. Authoritative sequence 6; applied 6; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1854 bytes, SHA-256 `f2002e9d1cfc77c3f3688c9df4f8851eee190e931f854ee2304c945b2ea76c2e`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1588 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 566 | 776 | `f39652b76b12ab9cba3f77177b3a86084396bc3f90e1c2871c01ecfcc03ac1ba` |
+| 4 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 776 | 1046 | `8f808a2f55b1afea411eaa8989292be445b82a66e42715fe5b9b49c8196f017e` |
+| 5 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 1046 | 1299 | `324816ff4435ea498ea7cbc0d3056642dc6b686bde0956b5e0fbb42aef7f15bc` |
+| 6 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 1299 | 1588 | `f4d389a42d760e63dd3690d3e640c25f5c252accf982c521d36cacce56b556a6` |
+| 7 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 1588 | 1854 | `28346ee77599a14099eb64f1e0c6773d9193f65b9864b50247bcd19f29250445` |
 ## rejected/readiness-family-with-tape
 
 Tail: `00000000000000000001-2026-11-03.remlib@566:Some(3):InvalidSchema`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
@@ -6209,6 +6288,27 @@ Authoritative prefix end: 324 bytes; tail Complete.
 | Sequence | Tag | Segment | Offset | End | Record hash |
 |---:|---|---|---:|---:|---|
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 324 | `6454efbb71f12d98b931398275d958c5e93c724deac5e890e9a97b0af504dec4` |
+## rejected/readiness-owner-close-keeps-load-count
+
+Tail: `00000000000000000001-2026-11-03.remlib@1558:Some(7):LoadAttempt`. Authoritative sequence 6; applied 6; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1793 bytes, SHA-256 `7919f92e48fad5edd1e4c9372836cc5e7f20f15d3c409a06abcef7bd7e6f0c3d`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1558 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 566 | 776 | `f39652b76b12ab9cba3f77177b3a86084396bc3f90e1c2871c01ecfcc03ac1ba` |
+| 4 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 776 | 1046 | `8f808a2f55b1afea411eaa8989292be445b82a66e42715fe5b9b49c8196f017e` |
+| 5 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 1046 | 1305 | `c6869ee09307acc3e5f101b195f833f7b462f4045b1607c83792bba155864020` |
+| 6 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 1305 | 1558 | `69946fd86d6b4a47a81bbff626d237a8513a9e48e5831b56162c7b831b6693c6` |
+| 7 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 1558 | 1793 | `48c1fd8d67c495080649159affe409f0daff8b11b1bc6ce940a6bd398526e846` |
 ## rejected/readiness-phase-fifty-one
 
 Tail: `00000000000000000001-2026-11-03.remlib@324:Some(2):NoncanonicalCbor`. Authoritative sequence 1; applied 1; pending 0; tapes 1; fences 0; duplicates 0.
@@ -7837,6 +7937,18 @@ Default: NotYet.
 
 Default: Present(FinalizationPrepared, reference digest).
 
+### readiness-owner-close-keeps-chain
+
+Default: Present(FinalizationPrepared, reference digest).
+
+### readiness-result-clears-load-count
+
+Default: Present(FinalizationPrepared, reference digest).
+
+### readiness-successor-after-ready
+
+Default: Present(FinalizationPrepared, reference digest).
+
 ### readiness-unprovisioned-family
 
 Default: Present(FinalizationPrepared, reference digest).
@@ -8143,6 +8255,10 @@ Default: Present(FinalizationPrepared, reference digest).
 
 Default: Present(FinalizationPrepared, reference digest).
 
+### rejected/readiness-after-released
+
+Default: Present(FinalizationPrepared, reference digest).
+
 ### rejected/readiness-family-with-tape
 
 Default: Present(FinalizationPrepared, reference digest).
@@ -8152,6 +8268,10 @@ Default: Present(FinalizationPrepared, reference digest).
 Default: Present(FinalizationPrepared, reference digest).
 
 ### rejected/readiness-limit-bool
+
+Default: Present(FinalizationPrepared, reference digest).
+
+### rejected/readiness-owner-close-keeps-load-count
 
 Default: Present(FinalizationPrepared, reference digest).
 

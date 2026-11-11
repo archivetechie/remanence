@@ -760,13 +760,25 @@ impl LibraryFold {
         }
         self.latest.insert(key, held);
     }
+    /// An owner's end preserves its pending readiness chain and consumed LOAD budget.
     fn close_operation(&mut self, operation: Id) {
-        if let Some(keys) = self.operation_slots.remove(&operation) {
+        let readiness = (Tag::ReadinessObserved, Scope::Operation(operation), None);
+        let keep_readiness = self.latest.contains_key(&readiness);
+        if let Some(mut keys) = self.operation_slots.remove(&operation) {
+            if keep_readiness {
+                keys.remove(&readiness);
+                self.operation_slots
+                    .entry(operation)
+                    .or_default()
+                    .insert(readiness);
+            }
             for key in keys {
                 self.remove_latest(&key);
             }
         }
-        self.close_loads(operation);
+        if !keep_readiness {
+            self.close_loads(operation);
+        }
     }
     fn close_loads(&mut self, operation: Id) {
         if let Some(endpoints) = self.load_endpoints.remove(&operation) {
@@ -2953,6 +2965,142 @@ mod retention_tests {
             FoldError::ReservedNotYetUsed
         );
         f.assert_same_state(&before);
+    }
+
+    /// Build the owner and its consumed LOAD budget, with an optional readiness head.
+    fn failed_load_owner(pending: bool) -> (LibraryFold, ReadinessObserved) {
+        let mut fold = LibraryFold::default();
+        let operation = [8; 16];
+        feed(
+            &mut fold,
+            Body::OperationRecorded(OperationRecorded {
+                operation,
+                kind: OperationKind::LoadDrive,
+                previous: None,
+                event: OperationEvent::Started(Unit),
+            }),
+            &Present,
+        )
+        .unwrap();
+        let started = fold
+            .last(Tag::OperationRecorded, Scope::Operation(operation))
+            .unwrap()
+            .record
+            .reference(1);
+        let mut readiness = ReadinessObserved {
+            source_slot: None,
+            run: None,
+            cancel_source: None,
+            scope: ReadinessScope::Endpoint,
+            media: None,
+            operation,
+            endpoint: endpoint("LIBA0001"),
+            tape: None,
+            barcode: None,
+            phase: ReadinessPhase::LoadDriveReadiness,
+            state: ReadinessState::Planned,
+            previous: None,
+            started_unix_ns: 0,
+            limit_ms: Some(1),
+            evidence: None,
+            load_intent: None,
+            ready_generation: 1,
+            result: ReadinessResult::Pending,
+        };
+        if pending {
+            feed(
+                &mut fold,
+                Body::ReadinessObserved(readiness.clone()),
+                &Present,
+            )
+            .unwrap();
+            readiness.previous = fold
+                .readiness_head(operation)
+                .map(|(reference, _)| reference);
+        }
+        feed(
+            &mut fold,
+            Body::MotionIntent(MotionIntent {
+                command: [1; 16],
+                parent_operation: Some(operation),
+                motion: Motion::Load(Load {
+                    endpoint: readiness.endpoint.clone(),
+                    attempt: 1,
+                }),
+                tape: None,
+                inventory_generation: None,
+                readiness_generation: None,
+            }),
+            &Present,
+        )
+        .unwrap();
+        feed(
+            &mut fold,
+            Body::OperationRecorded(OperationRecorded {
+                operation,
+                kind: OperationKind::LoadDrive,
+                previous: Some(started),
+                event: OperationEvent::Failed(Failed {
+                    retry: None,
+                    refusal_code: None,
+                    summary: "load failed".into(),
+                }),
+            }),
+            &Present,
+        )
+        .unwrap();
+        (fold, readiness)
+    }
+
+    /// Failed owners leave readiness releasable, with no refund of their LOAD budget.
+    #[test]
+    fn owner_close_keeps_readiness_and_load_attempts_until_released() {
+        let (mut fold, mut readiness) = failed_load_owner(true);
+        let operation = readiness.operation;
+        assert_eq!(
+            fold.readiness_head(operation)
+                .map(|(reference, _)| reference),
+            readiness.previous
+        );
+        assert!(fold
+            .last(Tag::OperationRecorded, Scope::Operation(operation))
+            .is_none());
+        assert_eq!(fold.operation_slots.get(&operation).unwrap().len(), 1);
+        assert_eq!(fold.readiness_load_attempts(operation), Ok(1));
+        assert_eq!(
+            fold.next_load_attempt(Some(operation), &readiness.endpoint),
+            Ok(2)
+        );
+        readiness.phase = ReadinessPhase::QuarantineRelease;
+        readiness.state = ReadinessState::Released;
+        readiness.result = ReadinessResult::Released;
+        readiness.ready_generation = 2;
+        feed(
+            &mut fold,
+            Body::ReadinessObserved(readiness.clone()),
+            &Present,
+        )
+        .unwrap();
+        assert_eq!(fold.readiness_head(operation), None);
+        assert_eq!(fold.readiness_load_attempts(operation), Ok(0));
+        assert_eq!(
+            fold.next_load_attempt(Some(operation), &readiness.endpoint),
+            Ok(1)
+        );
+        assert!(!fold.operation_slots.contains_key(&operation));
+    }
+
+    /// Closing an owner with no readiness head still clears its LOAD indexes.
+    #[test]
+    fn owner_close_without_readiness_clears_load_attempts() {
+        let (fold, readiness) = failed_load_owner(false);
+        assert_eq!(fold.readiness_head(readiness.operation), None);
+        assert_eq!(fold.readiness_load_attempts(readiness.operation), Ok(0));
+        assert_eq!(
+            fold.next_load_attempt(Some(readiness.operation), &readiness.endpoint),
+            Ok(1)
+        );
+        assert!(!fold.operation_slots.contains_key(&readiness.operation));
     }
 
     /// Readiness can terminate without a separate OperationRecorded chain.

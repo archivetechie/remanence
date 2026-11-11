@@ -9,6 +9,7 @@ use remanence_library::motion::{
     PendingMotion,
 };
 use remanence_library::outcome::CompletionEvidence;
+use remanence_library::{transport::TransferOutcome, ScsiError, TimeoutClass};
 use remanence_state::library_runtime::LibraryRuntime;
 use std::sync::atomic::AtomicUsize;
 
@@ -1012,5 +1013,569 @@ fn readiness_successor_fence_survives_two_daemon_starts_and_release() {
     assert_eq!(
         released.last().unwrap().result,
         remanence_state::library_log::ReadinessResult::Released
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1c §7.1: a failed LoadDrive retains its independent readiness chain.
+// ---------------------------------------------------------------------------
+
+/// Keep the model's command log, while reporting the drive's controlled SSC outcome.
+struct LifecycleDrive {
+    inner: ModelTransport,
+    sense: Arc<Mutex<Option<(u8, u8, u8)>>>,
+    fail_load: bool,
+}
+impl SgTransport for LifecycleDrive {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_in(cdb, buf)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        let result = self.inner.execute_none(cdb);
+        if self.inner.role() == remanence_chaos::model::DeviceRole::Changer {
+            return result;
+        }
+        if cdb.first() == Some(&0x1b)
+            && cdb.get(4).is_some_and(|flags| flags & 1 != 0)
+            && self.fail_load
+        {
+            return Err(ScsiError::CheckCondition {
+                sense: readiness_fixed_sense(5, 0x20, 0),
+                bytes_transferred: 0,
+            });
+        }
+        if cdb.first() == Some(&0) && result.is_ok() {
+            if let Some((key, asc, ascq)) = *self.sense.lock().unwrap() {
+                return Err(ScsiError::CheckCondition {
+                    sense: readiness_fixed_sense(key, asc, ascq),
+                    bytes_transferred: 0,
+                });
+            }
+        }
+        result
+    }
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+/// LTO-8 keeps 02/04/01 in BecomingReady; LTO-9 labels it MediaInitializing.
+fn lifecycle_world() -> Arc<Mutex<VirtualWorld>> {
+    let mut model = VirtualWorld::single_drive(SERIAL, BAY_A, "DRV-R1C2", 0x400, 1);
+    model.put_tape_in_slot(0x400, "R1C2L01L8", VirtualTape::default());
+    Arc::new(Mutex::new(model))
+}
+
+/// Exercise the production owned begin and terminal event, interrupted after a real poll.
+fn failed_waited_load(
+    root: &Root,
+    world: &Arc<Mutex<VirtualWorld>>,
+    fail_load: bool,
+    cancel: bool,
+) -> (Uuid, [u8; 16], u32) {
+    let state = root.open();
+    let mut index = state.write_handle();
+    let model = world.lock().unwrap().library_snapshot();
+    let open_world = world.clone();
+    let mut library = model
+        .open_with(
+            &remanence_library::StaticAllowlist::new([SERIAL]),
+            move |path| {
+                let role = open_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(LifecycleDrive {
+                    inner: ModelTransport::new(open_world.clone(), role),
+                    sense: Arc::new(Mutex::new(Some((2, 4, 1)))),
+                    fail_load,
+                }) as Box<dyn SgTransport>)
+            },
+        )
+        .unwrap();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from([SERIAL.to_string()]),
+    )
+    .unwrap();
+    let mut cfg = test_write_owner_config(
+        root.paths.sqlite_path.clone(),
+        root.paths.audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.catalog = state.projection_client();
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
+    let api = crate::ApiState::new(state.projection_client());
+    let operation = api
+        .accept_owner_request(
+            AuditActor::User("loader".into()),
+            "load_drive",
+            "library",
+            SERIAL.into(),
+            [0x35; 32],
+        )
+        .unwrap();
+    let registry = crate::operations::OperationRegistry::default();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handle = registry
+        .register(operation, "load_drive")
+        .with_readiness_lifetime(
+            shutdown.clone(),
+            Arc::new(crate::drive_pool::ReadinessWake::default()),
+        );
+    cfg.configure_operation_library(&mut library, &handle);
+    let before_shutdown = std::thread::scope(|scope| {
+        let interrupt = (!fail_load).then(|| {
+            scope.spawn(|| {
+                let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+                while !registry
+                    .latest(&operation)
+                    .is_some_and(|s| s.progress.contains_key("sense"))
+                {
+                    if std::time::Instant::now() >= deadline {
+                        shutdown.store(true, Ordering::Release);
+                        panic!("LoadDrive never reached its first readiness poll");
+                    }
+                    std::thread::sleep(StdDuration::from_millis(5));
+                }
+                let row = state
+                    .catalog()
+                    .media_readiness_operation(operation)
+                    .unwrap()
+                    .unwrap();
+                if cancel {
+                    registry.request_cancel(&operation).unwrap();
+                } else {
+                    shutdown.store(true, Ordering::Release);
+                }
+                row
+            })
+        });
+        let result = super::robotics::run_load_sequence(
+            &mut index,
+            &cfg,
+            &handle,
+            &mut library,
+            0x400,
+            BAY_A,
+            true,
+        );
+        assert!(result.is_err(), "the waited LOAD must end not ready");
+        super::robotics::finish_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            SERIAL,
+            result,
+            Ok(()),
+        );
+        interrupt.map(|thread| thread.join().unwrap())
+    });
+    let terminal = registry.latest(&operation).unwrap();
+    assert_eq!(terminal.state, pb::OperationState::Failed as i32);
+    if !fail_load && !cancel {
+        assert_eq!(
+            terminal.progress.get("phase").map(String::as_str),
+            Some("shutdown")
+        );
+        assert_eq!(
+            index.media_readiness_operation(operation).unwrap(),
+            before_shutdown,
+            "shutdown and owner failure append no readiness observation"
+        );
+    }
+    let row = index.media_readiness_operation(operation).unwrap().unwrap();
+    if !fail_load {
+        assert_eq!(row.state, "becoming_ready");
+    }
+    if cancel {
+        assert_eq!(row.cancel_source.as_deref(), Some("operator"));
+    }
+    assert_eq!(
+        index
+            .get_operation(&operation.to_string())
+            .unwrap()
+            .unwrap()
+            .state,
+        "failed"
+    );
+    let runtime = state.library_runtime();
+    (
+        operation,
+        runtime.manifest().library_uuid(),
+        runtime
+            .readiness_load_attempts(*operation.as_bytes())
+            .unwrap(),
+    )
+}
+
+/// Wait for background owners to release the state root before reopening it in this test.
+fn wait_for_lifecycle_close(root: &Root) {
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    loop {
+        match remanence_state::StateLockGuard::acquire(&root.paths.state_dir) {
+            Ok(guard) => {
+                drop(guard);
+                return;
+            }
+            Err(error) if error.is_state_lock_held() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(StdDuration::from_millis(10));
+            }
+            Err(error) => panic!("state root remains locked after shutdown: {error}"),
+        }
+    }
+}
+
+/// Read typed owner/readiness chains after their process releases the log lock.
+fn lifecycle_history(
+    root: &Root,
+    library: [u8; 16],
+    id: Uuid,
+) -> (
+    Vec<remanence_state::library_log::OperationRecorded>,
+    Vec<remanence_state::library_log::ReadinessObserved>,
+) {
+    wait_for_lifecycle_close(root);
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+    loop {
+        match crate::tests::read_library_records(&root.paths, library, &mut |record| {
+            let owner = record
+                .operation_recorded()
+                .filter(|v| v.operation == *id.as_bytes())
+                .cloned();
+            let ready = record
+                .readiness_observation()
+                .filter(|v| v.operation == *id.as_bytes())
+                .cloned();
+            (owner.is_some() || ready.is_some()).then_some((owner, ready))
+        }) {
+            Ok(records) => {
+                return (
+                    records.iter().filter_map(|r| r.0.clone()).collect(),
+                    records.into_iter().filter_map(|r| r.1).collect(),
+                )
+            }
+            Err(crate::tests::ChainRead::Busy(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(StdDuration::from_millis(10));
+            }
+            Err(crate::tests::ChainRead::Busy(errno)) => {
+                panic!("library log remains locked: {errno}")
+            }
+            Err(crate::tests::ChainRead::Failed(message)) => panic!("{message}"),
+        }
+    }
+}
+
+/// Release through the catalog transition used by quarantine release, refunding the count.
+fn release_lifecycle_owner(root: &Root, id: Uuid) {
+    wait_for_lifecycle_close(root);
+    let state = root.open();
+    let mut index = state.write_handle();
+    let release = remanence_state::MediaReadinessTransitionInput {
+        operation_id: id,
+        phase: Some("quarantine_release".into()),
+        state: "released".into(),
+        dirty_scope: Some("none".into()),
+        cancel_source: Some("operator".into()),
+        last_cdb_opcode: None,
+        completion_evidence: None,
+        last_sense_raw: None,
+        last_sense_key: None,
+        last_asc: None,
+        last_ascq: None,
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: None,
+        signal: None,
+        evidence_path: None,
+        last_error_json: None,
+        quarantine_id: None,
+    };
+    index.record_media_readiness_transition(release).unwrap();
+    assert_eq!(
+        state
+            .library_runtime()
+            .readiness_load_attempts(*id.as_bytes())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        index.media_readiness_operation(id).unwrap().unwrap().state,
+        "released"
+    );
+}
+
+/// A failed SSC LOAD leaves a typed Failed owner that can restart twice and release.
+#[test]
+fn readiness_owner_failed_load_restarts_twice_and_releases() {
+    let root = root();
+    let world = lifecycle_world();
+    let (id, library, attempts) = failed_waited_load(&root, &world, true, false);
+    let (owner, _) = lifecycle_history(&root, library, id);
+    assert!(matches!(
+        owner.last().unwrap().event,
+        remanence_state::library_log::OperationEvent::Failed(_)
+    ));
+    for start in 1..=2 {
+        let (state, api, runtime) = start_daemon(&root, &world, |inner| {
+            Box::new(LifecycleDrive {
+                inner,
+                sense: Arc::new(Mutex::new(Some((2, 4, 1)))),
+                fail_load: false,
+            })
+        })
+        .unwrap_or_else(|error| panic!("startup {start} refused failed LOAD readiness: {error}"));
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            state
+                .library_runtime()
+                .readiness_load_attempts(*id.as_bytes())
+                .unwrap(),
+            1
+        );
+        runtime.block_on(api.shutdown_drive_pool()).unwrap();
+        drop(api);
+        drop(runtime);
+        drop(state);
+        wait_for_lifecycle_close(&root);
+    }
+    release_lifecycle_owner(&root, id);
+}
+
+/// Operator cancellation survives two reconciles and remains excluded from auto-resume.
+#[test]
+fn readiness_owner_operator_cancel_restarts_twice_and_releases() {
+    let root = root();
+    let world = lifecycle_world();
+    let (id, library, attempts) = failed_waited_load(&root, &world, false, true);
+    let (owner, observations) = lifecycle_history(&root, library, id);
+    assert!(matches!(
+        owner.last().unwrap().event,
+        remanence_state::library_log::OperationEvent::Failed(_)
+    ));
+    assert_eq!(
+        observations.last().unwrap().cancel_source,
+        Some(remanence_state::library_log::CancelSource::Operator)
+    );
+    for start in 1..=2 {
+        let (state, api, runtime) = start_daemon(&root, &world, |inner| {
+            Box::new(LifecycleDrive {
+                inner,
+                sense: Arc::new(Mutex::new(Some((2, 4, 1)))),
+                fail_load: false,
+            })
+        })
+        .unwrap_or_else(|error| panic!("startup {start} refused cancelled readiness: {error}"));
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            state
+                .library_runtime()
+                .readiness_load_attempts(*id.as_bytes())
+                .unwrap(),
+            1
+        );
+        runtime.block_on(async {
+            tokio::time::timeout(StdDuration::from_secs(5), async {
+                while api
+                    .drive_pool()
+                    .unwrap()
+                    .readiness_wake
+                    .scans
+                    .load(Ordering::Relaxed)
+                    == 0
+                {
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+                tokio::task::yield_now().await;
+            })
+            .await
+            .expect("auto-resume must scan the cancelled row");
+        });
+        assert!(
+            api.operations.latest(&id).is_none(),
+            "auto-resume must skip operator cancellation"
+        );
+        assert_eq!(
+            state
+                .catalog()
+                .media_readiness_operation(id)
+                .unwrap()
+                .unwrap()
+                .cancel_source
+                .as_deref(),
+            Some("operator")
+        );
+        runtime.block_on(api.shutdown_drive_pool()).unwrap();
+        drop(api);
+        drop(runtime);
+        drop(state);
+        wait_for_lifecycle_close(&root);
+    }
+    release_lifecycle_owner(&root, id);
+}
+
+/// Shutdown leaves the last poll intact; auto-resume can finish without rewriting the owner.
+#[test]
+fn readiness_owner_shutdown_restarts_twice_and_auto_resumes() {
+    let root = root();
+    let world = lifecycle_world();
+    let (id, library, attempts) = failed_waited_load(&root, &world, false, false);
+    let (owner, observations) = lifecycle_history(&root, library, id);
+    assert!(matches!(
+        owner.last().unwrap().event,
+        remanence_state::library_log::OperationEvent::Failed(_)
+    ));
+    assert_eq!(
+        observations.len(),
+        2,
+        "planned and first poll, no shutdown observation"
+    );
+    assert_eq!(
+        observations.last().unwrap().state,
+        remanence_state::library_log::ReadinessState::BecomingReady
+    );
+    assert_eq!(observations.last().unwrap().cancel_source, None);
+    let loads = drive_load_commands_on(&world, BAY_A);
+    assert_eq!(loads, 1);
+    for start in 1..=2 {
+        let sense = Arc::new(Mutex::new(Some((2, 4, 1))));
+        let drive_sense = sense.clone();
+        let (state, api, runtime) = start_daemon(&root, &world, move |inner| {
+            Box::new(LifecycleDrive {
+                inner,
+                sense: drive_sense.clone(),
+                fail_load: false,
+            })
+        })
+        .unwrap_or_else(|error| panic!("startup {start} refused shutdown readiness: {error}"));
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            state
+                .library_runtime()
+                .readiness_load_attempts(*id.as_bytes())
+                .unwrap(),
+            1
+        );
+        runtime.block_on(async {
+            tokio::time::timeout(StdDuration::from_secs(5), async {
+                while !api.operations.latest(&id).is_some_and(|status| {
+                    status.operation_kind == "media_readiness_wait"
+                        && status.progress.contains_key("sense")
+                }) {
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("auto-resume must admit the stranded LoadDrive id");
+            if start == 2 {
+                *sense.lock().unwrap() = None;
+                tokio::time::timeout(StdDuration::from_secs(45), async {
+                    while state
+                        .catalog()
+                        .media_readiness_operation(id)
+                        .unwrap()
+                        .unwrap()
+                        .state
+                        != "ready"
+                    {
+                        tokio::time::sleep(StdDuration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("auto-resume must record Ready");
+                let status = pb::daemon_server::Daemon::get_operation(
+                    &api.daemon_service(),
+                    tonic::Request::new(pb::GetOperationRequest {
+                        operation_id: id.as_bytes().to_vec(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                assert_eq!(status.operation_kind, "load_drive");
+                assert_eq!(
+                    status.state,
+                    pb::OperationState::Failed as i32,
+                    "registry reuse must preserve durable LoadDrive failure"
+                );
+            }
+            api.shutdown_drive_pool().await.unwrap();
+        });
+        assert_eq!(
+            drive_load_commands_on(&world, BAY_A),
+            loads,
+            "auto-resume sends no SSC LOAD"
+        );
+        drop(api);
+        drop(runtime);
+        drop(state);
+        wait_for_lifecycle_close(&root);
+    }
+    let (after_owner, after_readiness) = lifecycle_history(&root, library, id);
+    assert_eq!(
+        after_owner, owner,
+        "auto-resume cannot overwrite the typed owner chain"
+    );
+    assert_eq!(
+        after_readiness.last().unwrap().result,
+        remanence_state::library_log::ReadinessResult::Ready
+    );
+}
+
+/// A stranded owner's spent budget applies to both startup's probe and the resumed daemon poll.
+#[test]
+fn readiness_owner_shutdown_keeps_initializing_load_budget_spent() {
+    let root = root();
+    let world = lifecycle_world();
+    let (id, library, _) = failed_waited_load(&root, &world, false, false);
+    let loads = drive_load_commands_on(&world, BAY_A);
+    assert_eq!(loads, 1);
+    let (state, api, runtime) = start_daemon(&root, &world, |inner| {
+        Box::new(LifecycleDrive {
+            inner,
+            sense: Arc::new(Mutex::new(Some((2, 4, 2)))),
+            fail_load: false,
+        })
+    })
+    .expect("startup must probe the stranded row");
+    assert_eq!(
+        drive_load_commands_on(&world, BAY_A),
+        loads,
+        "startup must not refund the LOAD budget"
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while !api.operations.latest(&id).is_some_and(|status| {
+                status.operation_kind == "media_readiness_wait"
+                    && status
+                        .progress
+                        .get("sense")
+                        .is_some_and(|v| v == "02/04/02")
+            }) {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("auto-resume must poll initializing-command-required");
+        assert_eq!(
+            drive_load_commands_on(&world, BAY_A),
+            loads,
+            "daemon poll must not refund the LOAD budget"
+        );
+        api.shutdown_drive_pool().await.unwrap();
+    });
+    assert_eq!(drive_load_commands_on(&world, BAY_A), loads);
+    drop(api);
+    drop(runtime);
+    drop(state);
+    wait_for_lifecycle_close(&root);
+    let (_, observations) = lifecycle_history(&root, library, id);
+    assert!(
+        observations.iter().any(|value| value.phase
+            == remanence_state::library_log::ReadinessPhase::StartupReconcileTur),
+        "the startup probe is durable"
     );
 }

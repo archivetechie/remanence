@@ -45,6 +45,9 @@ pending-cross-log	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	7	Present	PayloadContinuation
 pending-cross-log	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	8	Present	SessionEnded	9d01be0662f6b7190a0bc1a44c2cb9dff6b86220436aef08b168a40240731a71
 queued-successor-fence	*	*	NotYet		
 readiness-library-scope	*	*	Present	FinalizationPrepared	echo
+readiness-owner-close-keeps-chain	*	*	Present	FinalizationPrepared	echo
+readiness-result-clears-load-count	*	*	Present	FinalizationPrepared	echo
+readiness-successor-after-ready	*	*	Present	FinalizationPrepared	echo
 readiness-unprovisioned-family	*	*	Present	FinalizationPrepared	echo
 rejected/alarm-clear-absent	*	*	Present	FinalizationPrepared	echo
 rejected/alarm-kind-thirteen	*	*	Present	FinalizationPrepared	echo
@@ -122,9 +125,11 @@ rejected/progress-cursor-regressed	*	*	Present	FinalizationPrepared	echo
 rejected/progress-modes-bit7	*	*	Present	FinalizationPrepared	echo
 rejected/progress-modes-zero	*	*	Present	FinalizationPrepared	echo
 rejected/progress-regressed	*	*	Present	FinalizationPrepared	echo
+rejected/readiness-after-released	*	*	Present	FinalizationPrepared	echo
 rejected/readiness-family-with-tape	*	*	Present	FinalizationPrepared	echo
 rejected/readiness-library-scope-standalone	*	*	Present	FinalizationPrepared	echo
 rejected/readiness-limit-bool	*	*	Present	FinalizationPrepared	echo
+rejected/readiness-owner-close-keeps-load-count	*	*	Present	FinalizationPrepared	echo
 rejected/readiness-phase-fifty-one	*	*	Present	FinalizationPrepared	echo
 rejected/readiness-run-short	*	*	Present	FinalizationPrepared	echo
 rejected/readiness-slot-overflow	*	*	Present	FinalizationPrepared	echo
