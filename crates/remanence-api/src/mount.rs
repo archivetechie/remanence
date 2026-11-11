@@ -53,6 +53,8 @@ pub enum LoadByUuidError {
         /// Underlying drive-open failure.
         cause: remanence_library::OpenError,
     },
+    /// Typed drive admission refused the endpoint before loading or opening it.
+    DriveFenced(String),
     /// The catalog returned an error.
     State(StateError),
 }
@@ -81,6 +83,7 @@ impl std::fmt::Display for LoadByUuidError {
             Self::OpenDriveFailed { bay, cause } => {
                 write!(f, "open drive bay 0x{bay:04x} failed: {cause}")
             }
+            Self::DriveFenced(refusal) => f.write_str(refusal),
             Self::State(err) => write!(f, "catalog error: {err}"),
         }
     }
@@ -133,7 +136,40 @@ pub(crate) fn load_tape_by_uuid_with_admission(
     // Clone the inventory snapshot so resolving the load plan does not hold a
     // borrow into `library` when the live load/open calls happen below.
     let lib_snapshot = library.library().clone();
-    let plan = resolve_load_target(&lib_snapshot, voltag.as_str()).map_err(|err| match err {
+    let unmasked = resolve_load_target(&lib_snapshot, voltag.as_str());
+    let plan = if let Some(runtime) = state.library_runtime() {
+        let admit_bay = |bay| {
+            runtime
+                .admit_drive_data(
+                    &remanence_state::DriveKey::new(&lib_snapshot.serial, bay),
+                    remanence_state::library_runtime::RefusalSubject::Tape(Some(*tape_uuid)),
+                    remanence_state::library_log::AuditActor::System,
+                )
+                .map_err(|refusal| LoadByUuidError::DriveFenced(refusal.to_string()))
+        };
+        if let Some(bay) = lib_snapshot
+            .drive_bays
+            .iter()
+            .find(|bay| bay.loaded && bay.loaded_tape.as_deref() == Some(voltag.as_str()))
+        {
+            admit_bay(bay.element_address)?;
+        }
+        let fenced = drive_fenced_bays(&runtime, &lib_snapshot);
+        let masked = library_with_pool_busy_bays_hidden(&lib_snapshot, &fenced);
+        match resolve_load_target(&masked, voltag.as_str()) {
+            Ok(plan) => Ok(plan),
+            Err(_) => {
+                if let Ok(LoadPlan::AlreadyLoaded { bay } | LoadPlan::Load { bay, .. }) = &unmasked
+                {
+                    admit_bay(*bay)?;
+                }
+                unmasked
+            }
+        }
+    } else {
+        unmasked
+    };
+    let plan = plan.map_err(|err| match err {
         LoadError::NotInLibrary => LoadByUuidError::NotInLibrary {
             voltag: voltag.clone(),
         },
@@ -3683,6 +3719,37 @@ fn resolve_actor_mount(
         .drive_bays
         .iter()
         .find(|bay| bay.loaded && bay.loaded_tape.as_deref() == Some(voltag.as_str()));
+    // Drive admission precedes readiness. Keep the unmasked error when fencing
+    // did not prevent an otherwise valid plan, including existing reservations.
+    let plan = if let Some(runtime) = state.catalog.library_runtime() {
+        let admit_bay = |bay| {
+            runtime
+                .admit_drive_data(
+                    &remanence_state::DriveKey::new(library_serial, bay),
+                    remanence_state::library_runtime::RefusalSubject::Tape(Some(*tape_uuid)),
+                    remanence_state::library_log::AuditActor::System,
+                )
+                .map_err(|refusal| Status::failed_precondition(refusal.to_string()))
+        };
+        if let Some(seated) = seated {
+            admit_bay(seated.element_address)?;
+        }
+        let mut excluded = busy_bays.clone();
+        excluded.extend(drive_fenced_bays(&runtime, library));
+        match resolve_actor_mount_plan_from_library(library, voltag.as_str(), &excluded) {
+            Ok(plan) => Ok(plan),
+            Err(_) => {
+                let mut unmasked =
+                    resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays);
+                if let Ok(plan) = &mut unmasked {
+                    admit_bay(plan.mount_mut().bay)?;
+                }
+                unmasked
+            }
+        }
+    } else {
+        resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays)
+    };
     crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
         state.catalog.library_runtime().as_ref(),
@@ -3692,7 +3759,7 @@ fn resolve_actor_mount(
         barcode.as_deref(),
         seated.is_none_or(|bay| bay.source_slot.is_some()),
     )?;
-    let mut plan = resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays)?;
+    let mut plan = plan?;
     let mount = plan.mount_mut();
     mount.library_serial = library_serial.to_string();
     mount.barcode = barcode;
@@ -3756,6 +3823,15 @@ fn resolve_pinned_actor_mount(
         return Err(Status::failed_precondition(format!(
             "drive bay 0x{bay:04x} tape identity cannot be proven: expected barcode {expected_barcode}, observed {observed_barcode}"
         )));
+    }
+    if let Some(runtime) = state.catalog.library_runtime() {
+        runtime
+            .admit_drive_data(
+                &remanence_state::DriveKey::new(library_serial, bay),
+                remanence_state::library_runtime::RefusalSubject::Tape(Some(*tape_uuid)),
+                remanence_state::library_log::AuditActor::System,
+            )
+            .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
     }
     let mut mount = ActorMount {
         bay,
@@ -3979,6 +4055,26 @@ fn resolve_actor_mount_from_library(
             "no free drive bay available to load cartridge {voltag}"
         ))),
     }
+}
+
+/// Planning exclusions read typed endpoint fences without recording a refusal.
+fn drive_fenced_bays(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    library: &Library,
+) -> HashSet<u16> {
+    library
+        .drive_bays
+        .iter()
+        .filter(|bay| {
+            runtime
+                .drive_fenced(&remanence_state::DriveKey::new(
+                    &library.serial,
+                    bay.element_address,
+                ))
+                .is_some()
+        })
+        .map(|bay| bay.element_address)
+        .collect()
 }
 
 fn library_with_pool_busy_bays_hidden(library: &Library, busy_bays: &HashSet<u16>) -> Library {
@@ -8571,6 +8667,9 @@ mod tests {
 
     #[path = "mount_planning_tests.rs"]
     mod planning_tests;
+
+    #[path = "drive_fence_tests.rs"]
+    mod drive_fence_tests;
 
     struct DismountHarness {
         _temp: tempfile::TempDir,
