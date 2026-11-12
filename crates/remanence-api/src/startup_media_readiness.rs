@@ -302,6 +302,7 @@ pub(crate) fn ensure_media_readiness_admitted_inner(
         .tape_io_is_fenced(None, barcode, endpoint.as_ref())
         .map_err(status_from_state_error)?
     {
+        // Only the supersede supplies its resolved tape UUID; a mismatch fails closed by scope.
         let allowed = match recovering_tape {
             Some(tape) => crate::tape_admission::only_recoverable_suffix_fences(
                 index,

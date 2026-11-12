@@ -8939,9 +8939,9 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
     for endpoint in [None, Some(remanence_state::DriveKey::new(&serial, 0x0100))] {
         let (tape_fence, drive_fence) = if let Some(endpoint) = endpoint.as_ref() {
             let sequence = drive_fence_api_tests::raise(&runtime, endpoint);
-            eprintln!(
-                "snapshot drive fence library:{sequence} {:?}",
-                runtime.active_fence(sequence)
+            assert!(
+                index.list_active_tape_io_fences().unwrap().is_empty(),
+                "drive fence must not project a tape-I/O fence row"
             );
             (None, Some(sequence))
         } else {
@@ -8958,12 +8958,6 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
                 None,
             )
             .unwrap();
-            eprintln!(
-                "snapshot tape fence {} {} {:?}",
-                fence.quarantine_id,
-                fence.reason,
-                runtime.fence_for_quarantine_id(&fence.quarantine_id)
-            );
             (Some(fence), None)
         };
         let commands_before = world.lock().unwrap().command_log.len();
@@ -11427,16 +11421,6 @@ pub(crate) async fn daemon_rollback_refusal(
         assert!(fences
             .iter()
             .any(|f| f.reason == "session_suffix_contradiction"));
-        for fence in &fences {
-            eprintln!(
-                "rollback suffix fence {} {} {:?}",
-                fence.quarantine_id,
-                fence.reason,
-                state
-                    .library_runtime()
-                    .fence_for_quarantine_id(&fence.quarantine_id)
-            );
-        }
         return error.to_string();
     }
     assert!(error.message().contains("TailBeyondKnownState"), "{error}");
@@ -11462,10 +11446,6 @@ pub(crate) async fn daemon_rollback_refusal(
     assert_eq!(
         source.cause,
         remanence_state::library_log::FenceCause::SessionSuffixContradiction
-    );
-    eprintln!(
-        "rollback tail fence {} {} {:?}",
-        fence.quarantine_id, fence.reason, source
     );
     error.to_string()
 }
@@ -11674,14 +11654,10 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
         "ready"
     );
     // Ruling 13: the durable suffix fence replaces the recovery_required flag.
-    let fences: Vec<_> = index
-        .list_active_tape_io_fences()
-        .unwrap()
-        .into_iter()
-        .filter(|f| f.tape_uuid == selected.tape_uuid)
-        .collect();
-    assert_eq!(fences.len(), 1);
+    let fences = index.list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1, "exactly one global active suffix fence");
     let fence = &fences[0];
+    assert_eq!(fence.tape_uuid, selected.tape_uuid);
     assert_eq!(fence.reason, "session_suffix_contradiction");
     let runtime = state.library_runtime();
     let source = runtime
@@ -11696,10 +11672,6 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
     assert_eq!(
         source.cause,
         remanence_state::library_log::FenceCause::SessionSuffixContradiction
-    );
-    eprintln!(
-        "roundtrip parity={:?} fence {} {} {:?}",
-        selected.parity_config, fence.quarantine_id, fence.reason, source
     );
     crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
     let mut request = pb::SupersedeTailRequest {
@@ -11767,6 +11739,17 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
             }
         }
     }
+    assert!(
+        runtime
+            .fence_for_quarantine_id(&fence.quarantine_id)
+            .is_none(),
+        "confirmed supersede must release the original suffix fence"
+    );
+    assert!(index
+        .list_active_tape_io_fences()
+        .unwrap()
+        .iter()
+        .all(|f| f.tape_uuid != selected.tape_uuid));
     assert_eq!(
         index.get_tape(&selected.tape_uuid).unwrap().unwrap().state,
         "ready"

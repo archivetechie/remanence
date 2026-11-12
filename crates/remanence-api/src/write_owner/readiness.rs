@@ -33,10 +33,7 @@ pub(crate) fn session_open_short_probe_or_load_inner(
     ctx: SessionOpenReadinessContext<'_>,
     recovering_tape: Option<crate::TapeUuid>,
 ) -> Result<(), Status> {
-    match recovering_tape {
-        None => session_open_reject_admission_conflicts(index, &ctx)?,
-        Some(_) => session_open_reject_admission_conflicts_inner(index, &ctx, recovering_tape)?,
-    }
+    session_open_reject_admission_conflicts_inner(index, &ctx, recovering_tape)?;
     let family = session_open_media_family(
         index
             .readiness_media_observation(ctx.barcode)
@@ -450,6 +447,7 @@ fn record_refused_load(
         .map_err(|error| format!("record media readiness LOAD refusal: {error}"))
 }
 
+#[cfg(test)]
 pub(crate) fn session_open_reject_admission_conflicts(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
@@ -477,6 +475,7 @@ pub(crate) fn session_open_reject_admission_conflicts_inner(
         .tape_io_is_fenced(None, ctx.barcode, Some(&endpoint))
         .map_err(status_from_state_error)?
     {
+        // Only the supersede supplies its resolved tape UUID; a mismatch fails closed by scope.
         let allowed = match recovering_tape {
             Some(tape) => crate::tape_admission::only_recoverable_suffix_fences(
                 index,

@@ -503,3 +503,92 @@ async fn c0b3c_supersede_mount_admits_only_own_suffix_fences() {
     assert!(changer.try_recv().is_err());
     assert!(drives.iter_mut().all(|rx| rx.try_recv().is_err()));
 }
+
+/// A suffix-fenced slot cartridge refuses before loading or evicting a healthy tape.
+#[tokio::test]
+async fn c0b3c_fr1_supersede_slot_refuses_without_motion() {
+    // Exercise eviction first so the red proof exposes its command before admission.
+    for occupied in [true, false] {
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+        let mut inventory = VirtualWorld::single_drive(SERIAL, BAY, "G4-DRIVE", SLOT, 2);
+        inventory.put_tape_in_slot(SLOT, LABEL, VirtualTape::default());
+        let world = Arc::new(Mutex::new(inventory));
+        if occupied {
+            world.lock().unwrap().put_tape_in_drive(
+                BAY,
+                "HEALTHYL9",
+                Some(SLOT + 1),
+                VirtualTape::default(),
+            );
+        }
+        let plan = resolve_actor_mount_plan_from_library(
+            &world.lock().unwrap().library_snapshot(),
+            LABEL,
+            &HashSet::new(),
+        )
+        .expect("slot fixture has a usable mount plan");
+        assert_eq!(matches!(plan, ActorMountPlan::Evict { .. }), occupied);
+        let (state, mut changer, mut drives) = actor_state(&root, &world);
+        let runtime = state.catalog.library_runtime().unwrap();
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(runtime.tape_state(TAPE).unwrap().tape),
+                        cause: lib::FenceCause::SessionSuffixContradiction,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            resolve_and_reserve_actor_mount_inner(
+                &state,
+                state.drive_pool().unwrap(),
+                SERIAL,
+                &TAPE,
+                Some(TAPE),
+            ),
+        )
+        .await;
+        assert!(
+            changer.try_recv().is_err(),
+            "slot recovery dispatched a changer command: occupied={occupied}"
+        );
+        assert!(
+            drives.iter_mut().all(|rx| rx.try_recv().is_err()),
+            "slot recovery dispatched a drive command: occupied={occupied}"
+        );
+        if occupied {
+            let snapshot = state.current_library_snapshot().unwrap();
+            assert_eq!(
+                snapshot.report.libraries[0].drive_bays[0]
+                    .loaded_tape
+                    .as_deref(),
+                Some("HEALTHYL9")
+            );
+            assert_eq!(
+                world.lock().unwrap().library_snapshot().drive_bays[0]
+                    .loaded_tape
+                    .as_deref(),
+                Some("HEALTHYL9")
+            );
+        }
+        let error = result
+            .expect("slot recovery refuses without waiting for motion")
+            .expect_err("slot recovery must refuse its suffix fence");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "open session blocked by active tape-I/O fence; inspect rem tape quarantine list"
+        );
+    }
+}

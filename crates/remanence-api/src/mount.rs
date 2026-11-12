@@ -3636,7 +3636,7 @@ async fn resolve_and_reserve_actor_mount_with_resource_inner<R>(
                             state,
                             library_serial,
                             &mount,
-                            recovering_tape,
+                            recovering_tape.filter(|_| mount.source_slot.is_none()),
                         )?;
                         return Ok((mount, reservation, resource));
                     }
@@ -3645,7 +3645,7 @@ async fn resolve_and_reserve_actor_mount_with_resource_inner<R>(
                             state,
                             library_serial,
                             &mount,
-                            recovering_tape,
+                            None,
                         )?;
                         if let Some(parked) = pool.parked_at(&seated.drive_key()) {
                             if parked.seated.library_serial == seated.library_serial
@@ -3809,6 +3809,7 @@ fn resolve_actor_mount_inner(
     } else {
         resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays)
     };
+    // D7: recovered only while in a drive; next landing: the supersede's own MOVE.
     crate::startup_media_readiness::ensure_media_readiness_admitted_inner(
         &index,
         state.catalog.library_runtime().as_ref(),
@@ -3817,7 +3818,7 @@ fn resolve_actor_mount_inner(
         seated.map(|bay| bay.element_address),
         barcode.as_deref(),
         seated.is_none_or(|bay| bay.source_slot.is_some()),
-        recovering_tape,
+        recovering_tape.filter(|_| seated.is_some()),
     )?;
     let mut plan = plan?;
     let mount = plan.mount_mut();
