@@ -1361,6 +1361,7 @@ fn crash_cases(cuts: &[Cut], full: bool) -> Vec<CrashCase> {
     cases
 }
 
+#[allow(dead_code)] // Retained legacy entry point; property now uses the typed engine.
 async fn run_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result<Coverage, String> {
     let cut = &cuts[case.cut];
     let mut coverage = Coverage::default();
@@ -1421,9 +1422,1046 @@ impl Coverage {
     }
 }
 
+/// Build a session config over a reopened typed catalog without a new fixture constructor.
+fn crash_typed_config(
+    paths: &remanence_state::StatePaths,
+    catalog: &remanence_state::ProjectionClient,
+    library: &remanence_library::LibraryHandle,
+) -> WriteOwnerConfig {
+    let mut cfg = test_write_owner_config(
+        paths.sqlite_path.clone(),
+        paths.audit_dir.clone(),
+        library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(
+        catalog
+            .library_runtime()
+            .expect("crash catalog has a runtime"),
+    );
+    cfg.catalog = catalog.clone();
+    cfg.checkpoint_journal_dir = paths.journal_dir.join("tapes");
+    cfg.calibration_store = CalibrationControlStore::open(&paths.calibration_dir).unwrap();
+    cfg.checkpoint_max_objects = 100;
+    cfg.checkpoint_max_age_seconds = 3600;
+    cfg
+}
+
+/// Seed all pre-registration files, including locks and the two closed SQLite catalogs.
+fn seed_typed_crash_files(root: &Path, files: &MemoryDirectory) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            seed_typed_crash_files(&path, files);
+        } else {
+            files.seed(path.clone(), std::fs::read(path).unwrap());
+        }
+    }
+}
+
+/// Open a writer using the reopened runtime and its typed catalog.
+async fn open_crash_typed_writer(
+    paths: &remanence_state::StatePaths,
+    catalog: &remanence_state::ProjectionClient,
+    mut library: remanence_library::LibraryHandle,
+) -> (
+    mpsc::Sender<DriveCommand>,
+    Result<Uuid, Status>,
+    std::thread::JoinHandle<()>,
+) {
+    let cfg = crash_typed_config(paths, catalog, &library);
+    let mut index = catalog.write_handle();
+    let pool_cfg = pool();
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let actor_tx = tx.clone();
+    let (reply, received) = oneshot::channel();
+    let request = super::super::actor_runtime::OpenWriteActorRequest {
+        actor: AuditActor::System,
+        pool_cfg,
+        selected: selected(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: Some(LIBRARY.into()),
+        barcode: index.get_tape(&TAPE).unwrap().unwrap().voltag,
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: Some(DRIVE.into()),
+        reply,
+    };
+    // The actor's log lines reach the caller's subscriber, when it has one.
+    let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+    let thread = std::thread::spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            handle_drive_open_write(
+                BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
+            );
+        });
+    });
+    let opened = received
+        .await
+        .expect("writer replies without panic")
+        .map(|session| Uuid::from_slice(&session.session_id).unwrap());
+    (tx, opened, thread)
+}
+
+/// Trace a typed session with every authority handle opened inside the registration.
+async fn trace_typed_session(skip_barrier: bool) -> (crate::tests::TypedRoot, PathBuf, Vec<Cut>) {
+    let (mut typed, root) = typed_root();
+    let paths = typed.paths().clone();
+    let world = setup(&root);
+    typed.release();
+    let files = MemoryDirectory::default();
+    seed_typed_crash_files(&root, &files);
+    let trace = Arc::new(Mutex::new(Trace {
+        active: true,
+        ..Trace::default()
+    }));
+    let _registration = register(root.to_owned(), Arc::new(files.clone()));
+    files.observe(Some(Arc::new({
+        let trace = trace.clone();
+        let world = world.clone();
+        let files = files.clone();
+        let root = root.to_owned();
+        move |event: FileEvent| {
+            let before_sync = if let FileEvent::BeforeSync(path) = &event {
+                Some(path.clone())
+            } else {
+                None
+            };
+            capture(
+                &trace,
+                &world,
+                &files,
+                &root,
+                format!("{event:?}"),
+                before_sync,
+            )
+        }
+    })));
+    let model = world.lock().unwrap().library_snapshot();
+    let library = model
+        .open_with(&remanence_library::StaticAllowlist::new([LIBRARY]), {
+            let world = world.clone();
+            let files = files.clone();
+            let trace = trace.clone();
+            let root = root.to_owned();
+            move |path| {
+                let role = world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(CrashTransport {
+                    inner: ModelTransport::new(world.clone(), role),
+                    world: world.clone(),
+                    files: files.clone(),
+                    trace: trace.clone(),
+                    root: root.clone(),
+                    skip_barrier,
+                }))
+            }
+        })
+        .unwrap();
+    let runtime = remanence_state::library_runtime::LibraryRuntime::open(
+        &paths,
+        true,
+        Arc::new(remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap()),
+    )
+    .unwrap();
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime.clone());
+    let (tx, opened, thread) = open_crash_typed_writer(&paths, &catalog, library).await;
+    let id = opened.unwrap();
+    for number in 0..3 {
+        let payload = format!("durable object {number}: exact bytes\0\u{ff}").into_bytes();
+        let outcome = append_actor_test_file(
+            &tx,
+            id,
+            root.join(format!("input-{number}")),
+            &format!("file-{number}"),
+            &format!("caller-{number}"),
+            &payload,
+        )
+        .await;
+        assert_eq!(
+            outcome
+                .record
+                .append_commit_info
+                .as_ref()
+                .unwrap()
+                .durability,
+            pb::AppendDurability::Written as i32
+        );
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::Checkpoint {
+            session_id: id,
+            trigger: CheckpointTrigger::Explicit,
+            expected_batch_id: None,
+            reply: Some(reply),
+        })
+        .await
+        .unwrap();
+        let checkpoint = received.await.unwrap().unwrap();
+        assert_eq!(checkpoint.committed_objects.len(), 1);
+        let object = &checkpoint.committed_objects[0];
+        assert_eq!(
+            object.append_commit_info.as_ref().unwrap().durability,
+            pb::AppendDurability::Checkpointed as i32
+        );
+        let index = catalog.write_handle();
+        let object_id = Uuid::from_slice(&object.object_id).unwrap().to_string();
+        let copy = &index.find_native_object_instances(&object_id).unwrap()[0];
+        let start = copy.global_start_block.unwrap() as usize;
+        let end = copy.global_end_block.unwrap() as usize + 1;
+        let records = world.lock().unwrap().tapes[BARCODE].records[start..end].to_vec();
+        trace.lock().unwrap().receipts.push(Receipt {
+            id: object_id,
+            payload,
+            start,
+            records,
+        });
+        capture(
+            &trace,
+            &world,
+            &files,
+            &root,
+            format!("client commit {number}"),
+            None,
+        );
+    }
+    close_writer(&tx, id, thread).await;
+    trace.lock().unwrap().active = false;
+    files.observe(None);
+    let cuts = std::mem::take(&mut trace.lock().unwrap().cuts);
+    drop(tx);
+    drop(catalog);
+    drop(runtime);
+    (typed, root, cuts)
+}
+
+/// Read acknowledged bytes through a read actor attached to the reopened runtime.
+async fn read_typed_receipts(
+    paths: &remanence_state::StatePaths,
+    catalog: &remanence_state::ProjectionClient,
+    world: Arc<Mutex<VirtualWorld>>,
+    receipts: &[Receipt],
+) -> Result<(), serde_json::Value> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    let mut library = open_model_library(world);
+    let cfg = crash_typed_config(paths, catalog, &library);
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let (reply, received) = oneshot::channel();
+    let request = super::super::actor_runtime::OpenReadActorRequest {
+        tape_uuid: TAPE,
+        needs_drive_load: false,
+        library_serial: LIBRARY.into(),
+        barcode: Some(BARCODE.into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: Some(DRIVE.into()),
+        resume_target: None,
+        daemon_epoch: 2,
+        reply,
+    };
+    let mut index = catalog.write_handle();
+    let thread = std::thread::spawn(move || {
+        handle_drive_open_read(
+            BAY, &mut index, &cfg, &mut rx, &mut drive, &mut 0, None, request,
+        );
+    });
+    let opened = received.await.expect("read engine replies without panic");
+    let session = match opened {
+        Ok(session) => Uuid::from_slice(&session.session_id).unwrap(),
+        Err(status) => {
+            thread.join().unwrap();
+            return Err(typed_record_refusal(
+                "read open",
+                &status,
+                receipts.is_empty(),
+            ));
+        }
+    };
+    let index = catalog.write_handle();
+    let mut outcome = Ok(());
+    for receipt in receipts {
+        let members = match index.list_native_object_files(&receipt.id) {
+            Ok(members) if !members.is_empty() => members,
+            other => {
+                outcome = Err(typed_violation(
+                    "read catalog",
+                    format!(
+                        "acknowledged object {} has no readable member: {other:?}",
+                        receipt.id
+                    ),
+                ));
+                break;
+            }
+        };
+        let member = &members[0];
+        let (chunk_tx, chunk_rx) = crate::read_core::read_stream_channel(BLOCK as usize);
+        tx.send(DriveCommand::ReadObjectRange {
+            session_id: session,
+            object_id: receipt.id.clone(),
+            file_id: member.file_id.clone(),
+            start_byte: 0,
+            end_byte: member.size_bytes,
+            stream_chunk_bytes: BLOCK,
+            chunk_tx,
+        })
+        .await
+        .unwrap();
+        match collect_stream_chunks(chunk_rx).await {
+            Ok(bytes) if bytes == receipt.payload => {}
+            other => {
+                outcome = Err(typed_violation(
+                    "read bytes",
+                    format!(
+                        "acknowledged object {} fails byte-for-byte read: {other:?}",
+                        receipt.id
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::CloseRead {
+        session_id: session,
+        reply,
+    })
+    .await
+    .unwrap();
+    let closed = received.await.unwrap();
+    thread.join().expect("read-session engine does not panic");
+    if outcome.is_ok() {
+        closed.map_err(|status| typed_violation("read close", status.to_string()))?;
+    }
+    outcome
+}
+
+/// Preview and confirm tail recovery using the typed terminal authority.
+fn acknowledge_typed_tail(
+    paths: &remanence_state::StatePaths,
+    catalog: &remanence_state::ProjectionClient,
+    world: Arc<Mutex<VirtualWorld>>,
+    no_receipts: bool,
+) -> Result<(), serde_json::Value> {
+    use super::super::terminal_types::TerminalConfig;
+    let mut library = open_model_library(world.clone());
+    let cfg = crash_typed_config(paths, catalog, &library);
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let mut index = catalog.write_handle();
+    prepare_drive_for_write(
+        &mut drive,
+        &TAPE,
+        BLOCK,
+        Uuid::new_v4(),
+        WriteMediaPolicy::RewritableObject,
+    )
+    .map_err(|error| typed_violation("supersede prepare", error.to_string()))?;
+    let generation = drive.identity_generation();
+    let before = world.lock().unwrap().tapes[BARCODE].records.clone();
+    let mut preview = None;
+    let preview_result = crate::write_owner::supersede_mounted_tail(
+        &mut index,
+        &cfg.terminal_config(),
+        &mut drive,
+        TAPE,
+        generation,
+        BARCODE,
+        AuditActor::System,
+        |required, found, sequence| {
+            preview = Some((required.to_owned(), found.to_vec(), sequence));
+            Err("confirmation required".into())
+        },
+    );
+    let refusal = preview_result.map_or_else(Ok, |_| {
+        Err(typed_violation(
+            "supersede preview",
+            "preview accepted without confirmation",
+        ))
+    })?;
+    if world.lock().unwrap().tapes[BARCODE].records != before {
+        return Err(typed_violation("supersede preview", "preview changed tape"));
+    }
+    let Some((confirmation, found, sequence)) = preview else {
+        return Err(typed_record_refusal("supersede", &refusal, no_receipts));
+    };
+    crate::write_owner::supersede_mounted_tail(
+        &mut index,
+        &cfg.terminal_config(),
+        &mut drive,
+        TAPE,
+        generation,
+        BARCODE,
+        AuditActor::System,
+        |required, current, current_sequence| {
+            if current_sequence != sequence || required != confirmation || current != found {
+                return Err("supersede preview changed before confirmation".into());
+            }
+            Ok(())
+        },
+    )
+    .map(|_| ())
+    .map_err(|status| typed_record_refusal("supersede", &status, no_receipts))
+}
+
+/// Describe a refusal without deciding whether its category or code is acceptable.
+fn typed_record_refusal(step: &str, status: &Status, no_receipts: bool) -> serde_json::Value {
+    let message = status.message();
+    let category = if message.contains("TailBeyondKnownState") {
+        "uncommitted tape tail"
+    } else if message.contains("valid bundle(s) beyond its last checkpoint marker") {
+        "orphan parity bundle"
+    } else if message.contains("open parity tape journal")
+        && message.contains("failed to fill whole buffer")
+    {
+        "short parity header"
+    } else if message.contains("journal recovery required: torn record") {
+        "torn parity frame"
+    } else if message.contains("tape identity: bootstrap I/O")
+        || message.contains("bootstrap is not followed by a filemark")
+        || no_receipts && message.contains("locate parity checkpoint EOD:")
+    {
+        "missing bootstrap"
+    } else if message.contains("read audit segment header") {
+        "short audit header"
+    } else {
+        "new"
+    };
+    let expected_code = if message.contains("locate parity checkpoint EOD:") {
+        tonic::Code::Unavailable
+    } else if category == "short audit header" {
+        tonic::Code::Internal
+    } else if category == "torn parity frame" && !message.contains("open parity tape journal") {
+        tonic::Code::Unavailable
+    } else {
+        tonic::Code::FailedPrecondition
+    };
+    let end = (0..=message.len().min(200))
+        .rev()
+        .find(|&end| message.is_char_boundary(end))
+        .unwrap();
+    serde_json::json!({
+        "outcome": "refused", "step": step,
+        "status_code": format!("{:?}", status.code()),
+        "status_number": status.code() as i32,
+        "legacy_status_matches": category != "new" && status.code() == expected_code,
+        "message": &message[..end], "full_message": message,
+        "category": category,
+        "names_tape": message.contains(&Uuid::from_bytes(TAPE).to_string()) || message.contains(BARCODE),
+    })
+}
+
+/// Keep a first failing step and its full diagnostic, without asserting a case outcome.
+fn typed_violation(step: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({"outcome": "property_violation", "step": step, "message": message.into()})
+}
+
+/// Relocate only the manifest binding; empty fixture directories are not represented by disk_image.
+fn rebind_typed_crash_root(root: &Path) -> Result<remanence_state::StatePaths, serde_json::Value> {
+    let paths = remanence_state::StatePaths {
+        config_path: root.join("config"),
+        state_dir: root.join("state"),
+        audit_dir: root.join("library"),
+        journal_dir: root.join("native"),
+        sqlite_path: root.join("catalog.sqlite"),
+        tape_cache_dir: root.join("cache"),
+        calibration_dir: root.join("calibration"),
+    };
+    let rebind = || -> Result<(), Box<dyn std::error::Error>> {
+        let path = paths.state_dir.join("authority-manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        for (key, directory) in [
+            ("state_root", paths.state_dir.clone()),
+            ("tape_root", paths.journal_dir.join("tapes")),
+            ("library_root", paths.audit_dir.clone()),
+        ] {
+            // These directories existed before every source cut, including an empty tapes/.
+            std::fs::create_dir_all(&directory)?;
+            manifest[key] = serde_json::to_value(directory.canonicalize()?)?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+        Ok(())
+    };
+    rebind().map_err(|error| typed_violation("manifest rebind", error.to_string()))?;
+    Ok(paths)
+}
+
+/// Native runtime errors do not carry a tonic status; retain that distinction in the census.
+fn typed_runtime_refusal(
+    step: &str,
+    error: impl std::fmt::Display,
+    no_receipts: bool,
+) -> serde_json::Value {
+    let mut refusal = typed_record_refusal(
+        step,
+        &Status::failed_precondition(error.to_string()),
+        no_receipts,
+    );
+    refusal["status_code"] = serde_json::Value::Null;
+    refusal["status_number"] = serde_json::Value::Null;
+    refusal["status_source"] = "RuntimeError (no RPC status)".into();
+    refusal["legacy_status_matches"] = false.into();
+    refusal
+}
+
+/// Retain all refusals and violations even when a later recovery step succeeds.
+fn note_typed_failure(evidence: &mut serde_json::Value, failure: serde_json::Value) {
+    let key = if failure["outcome"] == "refused" {
+        "refusals"
+    } else {
+        "violations"
+    };
+    evidence[key].as_array_mut().unwrap().push(failure);
+}
+
+/// Exercise restored authority, admission, recovery and exact-byte reads through production funnels.
+async fn check_typed_crash(
+    source: &Path,
+    cut: &Cut,
+    case: &CrashCase,
+    evidence: &mut serde_json::Value,
+) -> Result<(), serde_json::Value> {
+    evidence["step"] = "restore".into();
+    let temp = tempfile::tempdir().unwrap();
+    restore_disk(temp.path(), &cut.disk);
+    let mut files = cut.files.clone();
+    files
+        .crash(&case.tails, case.keep_entries)
+        .map_err(|e| typed_violation("file crash", e.to_string()))?;
+    files
+        .materialize(source, temp.path())
+        .map_err(|e| typed_violation("materialize", e.to_string()))?;
+    let paths = rebind_typed_crash_root(temp.path())?;
+    let mut world = cut.world.clone();
+    world.tapes.get_mut(BARCODE).unwrap().records = cut.records.as_ref().clone();
+    world
+        .power_cut(BAY, case.keep)
+        .map_err(|e| typed_violation("power cut", e.to_string()))?;
+    for receipt in &cut.receipts {
+        if world.tapes[BARCODE]
+            .records
+            .get(receipt.start..receipt.start + receipt.records.len())
+            != Some(receipt.records.as_slice())
+        {
+            return Err(typed_violation(
+                "receipt frontier",
+                format!(
+                    "{}: acknowledged object {} loses tape bytes at keep={}",
+                    cut.boundary, receipt.id, case.keep
+                ),
+            ));
+        }
+    }
+    let world = Arc::new(Mutex::new(world));
+    evidence["step"] = "runtime open".into();
+    let lease = remanence_state::StateLockGuard::acquire(&paths.state_dir)
+        .map_err(|e| typed_runtime_refusal("runtime open", e, cut.receipts.is_empty()))?;
+    let runtime =
+        remanence_state::library_runtime::LibraryRuntime::open(&paths, true, Arc::new(lease))
+            .map_err(|e| typed_runtime_refusal("runtime open", e, cut.receipts.is_empty()))?;
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .map_err(|e| typed_violation("catalog open", e.to_string()))?
+        .with_library_runtime(runtime.clone());
+    evidence["runtime_reopened"] = true.into();
+    let index = catalog.write_handle();
+    let initial_fences = index
+        .list_active_tape_io_fences()
+        .map_err(|e| typed_violation("reopen fences", e.to_string()))?;
+    let initial_ids: BTreeSet<_> = initial_fences
+        .iter()
+        .map(|f| f.quarantine_id.clone())
+        .collect();
+    let mut fences = initial_fences;
+    evidence["step"] = "catalog prefix".into();
+    // The summary comes from the production native authority, never an AuthorityBuilder.
+    let summary = remanence_state::TapeAuthority::open(
+        paths.journal_dir.join("tapes"),
+        TAPE,
+        &paths.sqlite_path,
+    )
+    .and_then(|authority| authority.observe_summary());
+    let listed = index
+        .list_native_objects()
+        .map_err(|e| typed_violation("catalog prefix", e.to_string()))?;
+    if let Ok(summary) = &summary {
+        if listed.len() as u64 != summary.object_count {
+            note_typed_failure(
+                evidence,
+                typed_violation(
+                    "catalog prefix",
+                    format!(
+                        "catalog has {} objects; durable native prefix has {}",
+                        listed.len(),
+                        summary.object_count
+                    ),
+                ),
+            );
+        }
+    }
+    // A torn native log may be fenced rather than readable. The production writer below
+    // decides admission; keep the observation error as evidence without accepting it.
+    evidence["native_summary_error"] = summary.as_ref().err().map(ToString::to_string).into();
+    for receipt in &cut.receipts {
+        if !listed.iter().any(|object| object.object_id == receipt.id) {
+            note_typed_failure(
+                evidence,
+                typed_violation(
+                    "catalog receipt",
+                    format!("acknowledged object {} is not listed", receipt.id),
+                ),
+            );
+        }
+        let members = index
+            .list_native_object_files(&receipt.id)
+            .map_err(|e| typed_violation("catalog receipt", e.to_string()))?;
+        if members.first().map(|member| member.size_bytes) != Some(receipt.payload.len() as u64) {
+            note_typed_failure(
+                evidence,
+                typed_violation(
+                    "catalog receipt",
+                    format!(
+                        "acknowledged object {} has missing or wrong-sized member",
+                        receipt.id
+                    ),
+                ),
+            );
+        }
+    }
+    drop(index);
+    for attempt in 0..2 {
+        evidence["step"] = "writer open".into();
+        let (tx, opened, thread) =
+            open_crash_typed_writer(&paths, &catalog, open_model_library(world.clone())).await;
+        match opened {
+            Err(status) => {
+                thread.join().expect("typed recovery writer never panics");
+                let refusal = typed_record_refusal("writer open", &status, cut.receipts.is_empty());
+                let needs_ack = refusal["category"] == "uncommitted tape tail";
+                note_typed_failure(evidence, refusal);
+                if needs_ack && attempt == 0 {
+                    evidence["step"] = "supersede".into();
+                    match acknowledge_typed_tail(
+                        &paths,
+                        &catalog,
+                        world.clone(),
+                        cut.receipts.is_empty(),
+                    ) {
+                        Ok(()) => evidence["tail_acknowledged"] = true.into(),
+                        Err(failure) => {
+                            note_typed_failure(evidence, failure);
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok(id) => {
+                evidence["writer_reopened"] = true.into();
+                evidence["step"] = "next append".into();
+                // Always close the actor after admission, including a failing append/checkpoint.
+                let appended = async {
+                    let index = catalog.write_handle();
+                    let expected_start = index
+                        .get_tape(&TAPE)
+                        .map_err(|e| typed_violation("append cursor", e.to_string()))?
+                        .and_then(|tape| tape.written_extent_lba)
+                        .ok_or_else(|| {
+                            typed_violation("append cursor", "admitted tape has no written extent")
+                        })?;
+                    let protected_start = summary.as_ref().map_or(2, |s| s.cursor.lba);
+                    let before = world.lock().unwrap().tapes[BARCODE]
+                        .records
+                        .get(..protected_start as usize)
+                        .map(<[Record]>::to_vec)
+                        .ok_or_else(|| {
+                            typed_violation(
+                                "append cursor",
+                                "recovery admits an append beyond surviving tape",
+                            )
+                        })?;
+                    append_actor_test_file_result(
+                        &tx,
+                        id,
+                        temp.path().join("next-input"),
+                        "next-file",
+                        "next-caller",
+                        b"next append",
+                    )
+                    .await
+                    .map_err(|s| typed_violation("next append", s.to_string()))?;
+                    evidence["step"] = "next checkpoint".into();
+                    let (reply, received) = oneshot::channel();
+                    tx.send(DriveCommand::Checkpoint {
+                        session_id: id,
+                        trigger: CheckpointTrigger::Explicit,
+                        expected_batch_id: None,
+                        reply: Some(reply),
+                    })
+                    .await
+                    .map_err(|e| typed_violation("next checkpoint", e.to_string()))?;
+                    let response = received
+                        .await
+                        .map_err(|e| typed_violation("next checkpoint", e.to_string()))?
+                        .map_err(|s| typed_violation("next checkpoint", s.to_string()))?;
+                    let object = response
+                        .committed_objects
+                        .first()
+                        .ok_or_else(|| typed_violation("next checkpoint", "no committed object"))?;
+                    let next_id = Uuid::from_slice(&object.object_id)
+                        .map_err(|e| typed_violation("next checkpoint", e.to_string()))?
+                        .to_string();
+                    let next = index
+                        .find_native_object_instances(&next_id)
+                        .map_err(|e| typed_violation("next append position", e.to_string()))?;
+                    if next.first().and_then(|copy| copy.global_start_block) != Some(expected_start)
+                    {
+                        return Err(typed_violation(
+                            "next append position",
+                            "next append does not immediately follow committed prefix",
+                        ));
+                    }
+                    if world.lock().unwrap().tapes[BARCODE]
+                        .records
+                        .get(..before.len())
+                        != Some(before.as_slice())
+                    {
+                        return Err(typed_violation(
+                            "protected prefix",
+                            "next append changed committed tape prefix",
+                        ));
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(failure) = appended {
+                    note_typed_failure(evidence, failure);
+                }
+                evidence["step"] = "writer close".into();
+                let (reply, received) = oneshot::channel();
+                tx.send(DriveCommand::Close {
+                    session_id: id,
+                    reply,
+                })
+                .await
+                .map_err(|e| typed_violation("writer close", e.to_string()))?;
+                let closed = received
+                    .await
+                    .map_err(|e| typed_violation("writer close", e.to_string()))?;
+                thread.join().expect("typed recovery writer never panics");
+                if let Err(status) = closed {
+                    note_typed_failure(
+                        evidence,
+                        typed_violation("writer close", status.to_string()),
+                    );
+                }
+                break;
+            }
+        }
+    }
+    evidence["step"] = "fence release".into();
+    let index = catalog.write_handle();
+    for fence in index
+        .list_active_tape_io_fences()
+        .map_err(|e| typed_violation("list fences", e.to_string()))?
+    {
+        if !fences
+            .iter()
+            .any(|old| old.quarantine_id == fence.quarantine_id)
+        {
+            fences.push(fence);
+        }
+    }
+    drop(index);
+    for fence in fences {
+        let cause = runtime
+            .fence_for_quarantine_id(&fence.quarantine_id)
+            .map(|f| format!("{:?}", f.cause));
+        let result = runtime.release_tape_fence(
+            &fence.quarantine_id,
+            "crash census: inspect acknowledged records after recovery",
+            false,
+            AuditActor::System,
+        );
+        let (released, release_error) = match result {
+            Ok(released) => (released.is_some(), serde_json::Value::Null),
+            Err(error) => (
+                false,
+                typed_runtime_refusal("fence release", error, cut.receipts.is_empty()),
+            ),
+        };
+        evidence["fences"].as_array_mut().unwrap().push(serde_json::json!({
+            "quarantine_id": fence.quarantine_id, "at_reopen": initial_ids.contains(&fence.quarantine_id),
+            "cause": cause, "reason": fence.reason, "evidence": fence.evidence_json,
+            "released": released, "force": false, "release_error": release_error,
+            "receipts_read": null,
+        }));
+    }
+    evidence["step"] = "read open".into();
+    let read = read_typed_receipts(&paths, &catalog, world, &cut.receipts).await;
+    evidence["receipts_read"] = read.is_ok().into();
+    for fence in evidence["fences"].as_array_mut().unwrap() {
+        fence["receipts_read"] = read.is_ok().into();
+        fence["read_attempted"] = (!cut.receipts.is_empty()).into();
+    }
+    read?;
+    Ok(())
+}
+
+/// Execute the same failed-sync choice as the legacy runner, retaining a complete observation.
+async fn observe_typed_case(
+    source: &Path,
+    cuts: &[Cut],
+    case: &CrashCase,
+    evidence: &mut serde_json::Value,
+) {
+    let cut = &cuts[case.cut];
+    let failed_cut;
+    let cut = if case.fail_sync {
+        use remanence_library::durable_file::DurableDirectory;
+        let path = cut.before_sync.as_ref().unwrap();
+        let failed = MemoryDirectory::from_snapshot(cut.files.clone());
+        failed.fail_next_sync(path).unwrap();
+        let mut file = failed.open(path).unwrap();
+        assert!(file.sync().is_err());
+        file.sync().unwrap();
+        failed_cut = Cut {
+            files: failed.snapshot(),
+            ..cut.clone()
+        };
+        &failed_cut
+    } else {
+        cut
+    };
+    if let Err(failure) = check_typed_crash(source, cut, case, evidence).await {
+        note_typed_failure(evidence, failure);
+    }
+}
+
+/// Case identity includes every crash choice and the affected file family, not just its cut.
+fn typed_case_evidence(
+    source: &Path,
+    cuts: &[Cut],
+    case: &CrashCase,
+    index: usize,
+) -> serde_json::Value {
+    let cut = &cuts[case.cut];
+    let file_kind = |path: &Path| {
+        let relative = path.strip_prefix(source).unwrap();
+        if relative.starts_with("library") {
+            "library log"
+        } else if relative.starts_with("native/tapes") {
+            "tape log"
+        } else {
+            "other"
+        }
+    };
+    let tails: Vec<_> = case.tails.iter().map(|(path, bytes)| serde_json::json!({
+        "file": path.strip_prefix(source).unwrap(), "file_kind": file_kind(path), "bytes": bytes,
+    })).collect();
+    serde_json::json!({
+        "case_index": index, "cut_index": case.cut, "cut_number": cut.number, "boundary": cut.boundary,
+        "kind": if case.fail_sync { "fail_sync" } else if !tails.is_empty() { "torn_tail" } else { "frontier" },
+        "fail_sync": case.fail_sync, "frontier": cut.world.tapes[BARCODE].durable_frontier,
+        "keep_records": case.keep, "written_records": cut.records.len(), "keep_entries": case.keep_entries,
+        "sync_file": cut.before_sync.as_ref().map(|p| p.strip_prefix(source).unwrap()),
+        "sync_file_kind": cut.before_sync.as_deref().map(file_kind), "tails": tails,
+        "receipt_count": cut.receipts.len(), "runtime_reopened": false, "writer_reopened": false,
+        "tail_acknowledged": false, "receipts_read": null,
+        "step": "failed sync", "refusals": [], "fences": [], "violations": [],
+    })
+}
+
+/// Classify observed results only; this deliberately defines no accepted outcome set.
+fn finish_typed_case(evidence: &mut serde_json::Value) {
+    let outcome = if !evidence["violations"].as_array().unwrap().is_empty() {
+        "property_violation"
+    } else if !evidence["fences"].as_array().unwrap().is_empty() {
+        "fence"
+    } else if evidence["writer_reopened"] == true && evidence["receipts_read"] == true {
+        "reopened"
+    } else {
+        "refused"
+    };
+    evidence["outcome"] = outcome.into();
+}
+
+/// Preserve the property's legacy refusal and status assertions; the census does not call this.
+async fn run_typed_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result<Coverage, String> {
+    let mut evidence = typed_case_evidence(source, cuts, case, 0);
+    observe_typed_case(source, cuts, case, &mut evidence).await;
+    finish_typed_case(&mut evidence);
+    let cut = &cuts[case.cut];
+    let context = format!(
+        "C{:03} {}; keep={}; entries={}; tails={:?}",
+        cut.number, cut.boundary, case.keep, case.keep_entries, case.tails
+    );
+    if let Some(failure) = evidence["violations"].as_array().unwrap().first() {
+        return Err(format!(
+            "{context}: {}: {}",
+            failure["step"], failure["message"]
+        ));
+    }
+    let mut coverage = Coverage {
+        crashes: 1,
+        failed_syncs: usize::from(case.fail_sync),
+        torn_tails: usize::from(!case.tails.is_empty()),
+        completed: usize::from(evidence["writer_reopened"] == true),
+        acknowledged_tails: usize::from(evidence["tail_acknowledged"] == true),
+        ..Coverage::default()
+    };
+    for refusal in evidence["refusals"].as_array().unwrap() {
+        if refusal["step"] == "read open" {
+            return Err(format!(
+                "{context}: read open refuses acknowledged object: {}",
+                refusal["full_message"]
+            ));
+        }
+        let Some(code) = refusal["status_number"].as_i64() else {
+            return Err(format!(
+                "{context}: {}: {}",
+                refusal["step"], refusal["full_message"]
+            ));
+        };
+        // Call the unchanged classifier for its original status assertions and accepted set.
+        let status = Status::new(
+            tonic::Code::from_i32(code as i32),
+            refusal["full_message"].as_str().unwrap(),
+        );
+        record_refusal(&mut coverage, &status, cut, case.keep)?;
+    }
+    for fence in evidence["fences"].as_array().unwrap() {
+        if fence["released"] != true {
+            return Err(format!(
+                "{context}: fence {}: {}",
+                fence["cause"], fence["release_error"]
+            ));
+        }
+        coverage.released_fences += 1;
+    }
+    Ok(coverage)
+}
+
+/// Census coverage assertions concern instrumentation only; case outcomes are not pinned.
+#[tokio::test]
+#[ignore = "typed crash census; writes C0b-2c-1 evidence/census.json"]
+async fn typed_crash_census() {
+    let (_typed, root, cuts) = trace_typed_session(false).await;
+    assert!(cuts.iter().any(|cut| cut.boundary.starts_with("Append")));
+    for directory in ["library", "native/tapes"] {
+        assert!(
+            cuts.iter().any(|cut| cut
+                .before_sync
+                .as_ref()
+                .is_some_and(|path| path.starts_with(root.join(directory)))),
+            "BeforeSync on {directory}"
+        );
+    }
+    assert_eq!(cuts.last().unwrap().receipts.len(), 3);
+    let cases = crash_cases(&cuts, false);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut observations = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let mut results = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(case) = cases.get(index) else {
+                            break;
+                        };
+                        let mut evidence = typed_case_evidence(&root, &cuts, case, index);
+                        // A case panic is itself a finding; it must not erase later cases from the census.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            runtime.block_on(observe_typed_case(&root, &cuts, case, &mut evidence));
+                        }));
+                        if let Err(panic) = result {
+                            let message = panic
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                                .unwrap_or_else(|| "non-string panic".into());
+                            let step = evidence["step"].as_str().unwrap().to_owned();
+                            note_typed_failure(
+                                &mut evidence,
+                                typed_violation(&step, format!("panic: {message}")),
+                            );
+                        }
+                        finish_typed_case(&mut evidence);
+                        results.push(evidence);
+                    }
+                    results
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("census worker never panics"))
+            .collect::<Vec<_>>()
+    });
+    observations.sort_by_key(|row| row["case_index"].as_u64().unwrap());
+    assert_eq!(
+        observations.len(),
+        cases.len(),
+        "every default case has an observation"
+    );
+    let mut summary = BTreeMap::<(String, String), usize>::new();
+    for row in &observations {
+        *summary
+            .entry((
+                row["outcome"].as_str().unwrap().into(),
+                row["kind"].as_str().unwrap().into(),
+            ))
+            .or_default() += 1;
+    }
+    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.orders/C0b-2c-1/attempt-1");
+    std::fs::create_dir_all(report_dir.join("evidence")).unwrap();
+    let census = serde_json::json!({
+        "schema": 1, "order": "C0b-2c-1", "default_matrix": true,
+        "cut_count": cuts.len(), "case_count": cases.len(),
+        "status_note": "RPC codes are captured unchanged; RuntimeError has no RPC status and is null.",
+        "seed_note": "R2 seeds every file, including SQLite; materialize overlays that seed as well as modelled log writes.",
+        "cases": observations,
+    });
+    std::fs::write(
+        report_dir.join("evidence/census.json"),
+        serde_json::to_vec_pretty(&census).unwrap(),
+    )
+    .unwrap();
+    let mut table = format!("Census: {} cuts, {} cases, three receipts; four workers.\n\n| Outcome | Case kind | Count |\n|---|---|---:|\n", cuts.len(), cases.len());
+    for ((outcome, kind), count) in summary {
+        table.push_str(&format!("| {outcome} | {kind} | {count} |\n"));
+    }
+    // Preserve report prose on a rerun; replace only the generated census table.
+    let report = report_dir.join("REPORT.md");
+    let previous = std::fs::read_to_string(&report).unwrap_or_default();
+    let begin = "<!-- census table -->";
+    let end = "<!-- /census table -->";
+    let section = format!("{begin}\n{table}{end}");
+    let updated = if let Some((prefix, rest)) = previous.split_once(begin) {
+        let (_, suffix) = rest
+            .split_once(end)
+            .expect("complete generated census table");
+        format!("{prefix}{section}{suffix}")
+    } else {
+        format!("{previous}{section}\n")
+    };
+    std::fs::write(report, updated).unwrap();
+    eprintln!(
+        "{table}census written to {}",
+        report_dir.join("evidence/census.json").display()
+    );
+}
+
 async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
-    let root = tempfile::tempdir().unwrap();
-    let cuts = trace_session(root.path(), skip_barrier).await;
+    let (_typed, root, cuts) = trace_typed_session(skip_barrier).await;
     assert!(cuts.iter().any(|cut| cut.boundary.starts_with("Append")));
     assert!(cuts
         .iter()
@@ -1459,7 +2497,7 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
         // Keep the full matrix sequential and stop the negative control at its
         // first actual data-loss finding. Both use the identical restart checks.
         for case in &cases {
-            coverage.merge(run_case(root.path(), &cuts, case).await?);
+            coverage.merge(run_typed_case(&root, &cuts, case).await?);
         }
     } else {
         // Four independent state directories and worlds bound concurrent engine
@@ -1481,7 +2519,7 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
                             };
                             results.push((
                                 index,
-                                runtime.block_on(run_case(root.path(), &cuts, case)),
+                                runtime.block_on(run_typed_case(&root, &cuts, case)),
                             ));
                         }
                         results
