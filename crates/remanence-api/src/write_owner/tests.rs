@@ -3811,14 +3811,22 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
 
 #[test]
 fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-first-parity-raw-fence-")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open test index");
+    let tape_uuid = [0x45; 16];
+    let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid,
+            voltag: "PARITY-FENCE".into(),
+            block_size: 4096,
+            parity: ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        Some(remanence_state::MediaObservation {
+            generation: crate::LtoGen::Lto9,
+            source: remanence_state::GenerationSource::Operator,
+        }),
+    )]);
+    let mut index = typed.catalog().write_handle();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-PARITY-FENCE",
         0x0100,
@@ -3828,10 +3836,7 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
     )));
     let library = open_model_library(Arc::clone(&world));
     let snapshot = library_snapshot_cell(library.library().clone());
-    let audit_dir = temp.path().join("audit");
-    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-    let cfg = test_write_owner_config(index_path, audit_dir.clone(), &library, snapshot);
-    let tape_uuid = [0x45; 16];
+    let cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let selected = SelectedTape {
         standalone_endpoint: None,
         pool_id: "parity-fence-test".to_string(),
@@ -3866,7 +3871,6 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
 
     assert_eq!(status.code(), tonic::Code::Internal);
     assert!(audited, "the exact persisted fence must be audited");
-    crate::tests::assert_fences_survive_empty_rebuild(&index, &audit_dir);
     let active = index
         .tape_io_admission_conflicts(&tape_uuid, None)
         .expect("active tape-I/O fence");
@@ -3886,11 +3890,37 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
     )
     .expect_err("the durable partial fence must block the next session");
 
-    let records = FileAuditLog::replay(audit_dir.as_path()).expect("replay fence audit");
-    assert!(records.iter().any(|record| {
-        record.event == AuditEvent::TapeIoFenceRaised
-            && record.subject.id.as_deref() == Some(active[0].quarantine_id.as_str())
-    }));
+    let expected = index.list_active_tape_io_fences().unwrap();
+    let library_uuid = typed
+        .catalog()
+        .library_runtime()
+        .unwrap()
+        .manifest()
+        .library_uuid();
+    drop(index);
+    drop(cfg);
+    typed.release();
+    let records = crate::tests::assert_fences_survive_empty_rebuild(
+        typed.paths(),
+        typed.config(),
+        library_uuid,
+        &expected,
+    );
+    let sequence: u64 = active[0]
+        .quarantine_id
+        .strip_prefix("library:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(at, record)| {
+                *at == sequence && record.tag() == remanence_state::library_log::Tag::FenceRaised
+            })
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -15523,11 +15553,22 @@ pub(crate) async fn unload_adopted_cartridge(
 fn cursor_predecessor_records_and_eod_are_durably_fenced() {
     let size = 4096;
     for length in [None, Some(size), Some(7), Some(size * 2)] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state.sqlite");
-        let mut index = remanence_state::projector::open(&path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
+        let uuid = [0x42; 16];
+        let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+            ProvisionTapeInput {
+                tape_uuid: uuid,
+                voltag: "CURSOR".into(),
+                block_size: size as u32,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Changer,
+            Some(remanence_state::MediaObservation {
+                generation: crate::LtoGen::Lto9,
+                source: remanence_state::GenerationSource::Operator,
+            }),
+        )]);
+        let mut index = typed.catalog().write_handle();
         let mut world = VirtualWorld::single_drive("LIB-CURSOR", 0x100, "DRV-CURSOR", 0x400, 0);
         let mut tape = VirtualTape::empty(16 * 1024 * 1024, size as u32);
         tape.records.push(Record::Block(vec![0; size]));
@@ -15537,22 +15578,11 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
         world.put_tape_in_drive(0x100, "CURSOR", None, tape);
         let world = Arc::new(Mutex::new(world));
         let mut library = open_model_library(world.clone());
-        let cfg = test_write_owner_config(
-            path,
-            temp.path().join("audit"),
+        let cfg = test_typed_write_owner_config(
+            &typed,
             &library,
             library_snapshot_cell(library.library().clone()),
         );
-        let uuid = [0x42; 16];
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: uuid,
-                voltag: "CURSOR".into(),
-                block_size: size as u32,
-                parity: remanence_parity::ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
         let mut drive = library.open_drive(0x100, &cfg.policy).unwrap();
         let error = drive
             .prove_cursor(
@@ -15582,14 +15612,28 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
         ));
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1, "predecessor length={length:?}");
-        assert_eq!(fences[0].reason, "SessionSuffixContradiction");
-        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.fixture_audit().audit_dir);
+        assert_eq!(fences[0].reason, "session_suffix_contradiction");
         assert!(world
             .lock()
             .unwrap()
             .command_log
             .iter()
             .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
+        let library_uuid = typed
+            .catalog()
+            .library_runtime()
+            .unwrap()
+            .manifest()
+            .library_uuid();
+        drop(index);
+        drop(cfg);
+        typed.release();
+        crate::tests::assert_fences_survive_empty_rebuild(
+            typed.paths(),
+            typed.config(),
+            library_uuid,
+            &fences,
+        );
     }
 }
 
@@ -15597,28 +15641,28 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
 #[test]
 fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
     for range in [None, Some((3, 3)), Some((3, 5))] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state.sqlite");
-        let mut index = remanence_state::projector::open(&path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        let (_, library) = unthreaded_cartridge_world("LIB-ADMISSION");
-        let cfg = test_write_owner_config(
-            path,
-            temp.path().join("audit"),
-            &library,
-            library_snapshot_cell(library.library().clone()),
-        );
         let uuid = [0x42; 16];
-        index
-            .provision_tape(ProvisionTapeInput {
+        let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+            ProvisionTapeInput {
                 tape_uuid: uuid,
                 voltag: "ADMISSION".into(),
                 block_size: 262144,
                 parity: remanence_parity::ParityConfig::None,
                 force: false,
-            })
-            .unwrap();
+            },
+            remanence_state::LabelProvenance::Changer,
+            Some(remanence_state::MediaObservation {
+                generation: crate::LtoGen::Lto9,
+                source: remanence_state::GenerationSource::Operator,
+            }),
+        )]);
+        let mut index = typed.catalog().write_handle();
+        let (_, library) = unthreaded_cartridge_world("LIB-ADMISSION");
+        let cfg = test_typed_write_owner_config(
+            &typed,
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
         assert!(super::checkpoint::fence_admission_contradiction(
             &mut index,
             &cfg,
@@ -15635,8 +15679,7 @@ fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
         ));
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
-        assert_eq!(fences[0].reason, "SessionSuffixContradiction");
-        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.fixture_audit().audit_dir);
+        assert_eq!(fences[0].reason, "session_suffix_contradiction");
         let evidence: serde_json::Value =
             serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
         assert_eq!(evidence["phase"], "append_admission");
@@ -15647,6 +15690,21 @@ fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
         assert_eq!(
             evidence.get("open_epoch_end").is_some(),
             range == Some((3, 5))
+        );
+        let library_uuid = typed
+            .catalog()
+            .library_runtime()
+            .unwrap()
+            .manifest()
+            .library_uuid();
+        drop(index);
+        drop(cfg);
+        typed.release();
+        crate::tests::assert_fences_survive_empty_rebuild(
+            typed.paths(),
+            typed.config(),
+            library_uuid,
+            &fences,
         );
     }
 }

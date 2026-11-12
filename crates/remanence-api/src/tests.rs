@@ -10734,55 +10734,123 @@ async fn catalog_caller_id_requires_pool_when_two_pools_hold_it() {
     }
 }
 
-/// Compare every active fence field against a rebuild with no catalog fallback.
+/// Compare live fences with the typed rebuild after all caller-owned handles are released.
+/// The catalog is disposable; library records must remain identical through three rebuilds.
 pub(crate) fn assert_fences_survive_empty_rebuild(
-    index: &remanence_state::CatalogIndex,
-    audit_dir: &std::path::Path,
-) {
-    let records = remanence_state::FileAuditLog::replay(audit_dir).unwrap();
-    let expected = index.list_active_tape_io_fences().unwrap();
+    paths: &remanence_state::StatePaths,
+    config: remanence_state::RemConfig,
+    library_uuid: [u8; 16],
+    expected: &[remanence_state::TapeIoFenceRecord],
+) -> Vec<(u64, remanence_state::library_log::Record)> {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+
+    /// Retain source sequences, retrying only competing-owner failures as TypedRoot does.
+    fn records(
+        paths: &remanence_state::StatePaths,
+        library_uuid: [u8; 16],
+    ) -> Vec<(u64, remanence_state::library_log::Record)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let attempt = (|| {
+                let view =
+                    NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path)
+                        .map_err(|error| match error {
+                            remanence_state::tape_log::store::StoreError::Locked(errno)
+                                if errno == nix::errno::Errno::EWOULDBLOCK =>
+                            {
+                                ChainRead::Busy(errno)
+                            }
+                            other => {
+                                ChainRead::Failed(format!("probe the native tape logs: {other:?}"))
+                            }
+                        })?;
+                let mut records = Vec::new();
+                store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+                    records.push((applied.sequence(), applied.record().clone()));
+                    Ok(())
+                })
+                .map_err(|error| match error {
+                    store::StoreError::Locked(errno) if errno == nix::errno::Errno::EWOULDBLOCK => {
+                        ChainRead::Busy(errno)
+                    }
+                    other => ChainRead::Failed(format!("replay the library log: {other:?}")),
+                })?;
+                Ok::<_, ChainRead>(records)
+            })();
+            match attempt {
+                Ok(records) => return records,
+                Err(ChainRead::Busy(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(ChainRead::Busy(errno)) => panic!(
+                    "the library log was still locked ({errno}) 5 s after the test dropped its \
+                     states: a clone of the runtime outlived them"
+                ),
+                Err(ChainRead::Failed(message)) => panic!("{message}"),
+            }
+        }
+    }
+
     assert!(
         !expected.is_empty(),
         "the caller must exercise its fence path"
     );
-    let temp = tempfile::tempdir().unwrap();
-    let mut rebuilt = remanence_state::projector::open(temp.path().join("empty.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    rebuilt
-        .rebuild_from_authoritative_sources(&records, &[])
-        .unwrap();
+    let before_records = records(paths, library_uuid);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", paths.sqlite_path.display()));
+        match std::fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => panic!("remove disposable SQLite file {}: {error}", path.display()),
+        }
+    }
+    let mut rebuilt =
+        remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
+    rebuilt.rebuild_projection_from_tape_logs().unwrap();
     assert_eq!(
-        rebuilt.list_active_tape_io_fences().unwrap().len(),
+        rebuilt
+            .catalog()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .len(),
         expected.len()
     );
     for fence in expected {
         let mut actual = rebuilt
+            .catalog()
             .tape_io_fence_by_quarantine_id(&fence.quarantine_id)
             .unwrap()
             .unwrap();
         actual.fence_id = fence.fence_id;
-        assert_eq!(actual, fence);
-        assert_eq!(
-            records
-                .iter()
-                .filter(
-                    |record| record.event == remanence_state::AuditEvent::TapeIoFenceRaised
-                        && record.subject.id.as_deref() == Some(&fence.quarantine_id)
-                )
-                .count(),
-            1
+        assert_eq!(&actual, fence);
+        let sequence: u64 = fence
+            .quarantine_id
+            .strip_prefix("library:")
+            .expect("typed fence source")
+            .parse()
+            .unwrap();
+        let named: Vec<_> = before_records
+            .iter()
+            .filter(|(at, _)| *at == sequence)
+            .collect();
+        assert_eq!(named.len(), 1, "one record at {sequence}");
+        assert_eq!(named[0].1.tag(), Tag::FenceRaised);
+        eprintln!(
+            "rebuilt fence: reason={} quarantine_id={} sequence={sequence}",
+            fence.reason, fence.quarantine_id
         );
     }
-    let before = rebuilt.list_active_tape_io_fences().unwrap();
+    let before = rebuilt.catalog().list_active_tape_io_fences().unwrap();
     for _ in 0..2 {
-        remanence_state::fence::reconcile(&mut rebuilt, audit_dir).unwrap();
-        assert_eq!(rebuilt.list_active_tape_io_fences().unwrap(), before);
+        rebuilt.rebuild_projection_from_tape_logs().unwrap();
+        assert_eq!(
+            rebuilt.catalog().list_active_tape_io_fences().unwrap(),
+            before
+        );
     }
-    assert_eq!(
-        remanence_state::FileAuditLog::replay(audit_dir).unwrap(),
-        records
-    );
+    drop(rebuilt);
+    assert_eq!(records(paths, library_uuid), before_records);
+    before_records
 }
 
 /// Native actor data is irrelevant to these synthetic RPC delivery tests.

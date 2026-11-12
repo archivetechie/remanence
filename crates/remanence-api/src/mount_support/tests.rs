@@ -2393,8 +2393,18 @@ fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
         .unwrap()
         .pop()
         .unwrap();
-    let audit_dir = state.paths().audit_dir.clone();
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog(), &audit_dir);
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let expected = state.catalog().list_active_tape_io_fences().unwrap();
+    drop(state);
+    crate::tests::assert_fences_survive_empty_rebuild(
+        &paths,
+        config.clone(),
+        library_uuid,
+        &expected,
+    );
+    let mut state = StateHandle::open_with_config(paths, config).unwrap();
     assert!(standalone_fence_releasable(&fence));
     crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog()).unwrap();
     state
@@ -2527,11 +2537,15 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
     assert!(cut.lock().unwrap().is_none(), "the write fault must fire");
     let _ = actor.finish();
     let state = reopen_state();
-    let audit_dir = state.paths().audit_dir.clone();
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
     let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "supersede_tail_failed");
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog(), &audit_dir);
+    drop(state);
+    drop(actor);
+    crate::tests::assert_fences_survive_empty_rebuild(&paths, config, library_uuid, &fences);
 }
 
 /// Standalone initialization fences a failed WRITE from its stored outcome; cleanup adds only its CDB.

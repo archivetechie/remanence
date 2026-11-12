@@ -595,7 +595,6 @@ fn terminal_failure_preserves_object_checkpoint_and_structured_intent() {
     let _ = actor.finish();
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let index = f.index();
-    crate::tests::assert_fences_survive_empty_rebuild(&index, &f.config.audit.dir);
     let journal = checkpoint(&f);
     assert_eq!(journal.replay().unwrap().len(), 1);
     let recovery = journal
@@ -623,6 +622,20 @@ fn terminal_failure_preserves_object_checkpoint_and_structured_intent() {
         .get_native_object_by_unique_caller_object_id("terminal-failure")
         .unwrap()
         .is_some());
+    let expected = index.list_active_tape_io_fences().unwrap();
+    drop(index);
+    drop(journal);
+    drop(actor);
+    let state = f.reopen().unwrap();
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    drop(state);
+    crate::tests::assert_fences_survive_empty_rebuild(
+        &paths,
+        f.config.clone(),
+        library_uuid,
+        &expected,
+    );
 }
 
 #[test]
