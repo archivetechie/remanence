@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use ciborium::value::Value;
 use remanence_api::pb::catalog_server::Catalog;
 use remanence_api::pb::library_service_server::LibraryService;
 use remanence_api::pb::read_session_service_server::ReadSessionService;
@@ -21,11 +20,7 @@ use remanence_chaos::model::{
 use remanence_library::transport::TransferOutcome;
 use remanence_library::{DiscoveryReport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass};
 use remanence_parity::{bootstrap::write_bootstrap_block, parse_parity_arg, ParityConfig};
-use remanence_state::AuditSink as _;
-use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, ProvisionTapeInput, RemConfig,
-    SourceLayer, StateHandle, StatePaths,
-};
+use remanence_state::{ProvisionTapeInput, RemConfig, StateHandle, StatePaths};
 use tonic::{Code, Request, Status};
 
 const BAY: u16 = 0x100;
@@ -249,6 +244,29 @@ fn start(
     .unwrap()
 }
 
+/// Reopen after asynchronous daemon teardown, allowing at most 30 s for its owners to drop.
+async fn reopen_after_shutdown(paths: StatePaths, config: &RemConfig) -> (StateHandle, Duration) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "state lock still held at the 30 s reopen bound after shutdown"
+        );
+        match StateHandle::open_with_config(paths.clone(), config.clone()) {
+            Ok(state) => return (state, started.elapsed()),
+            Err(error) if error.is_state_lock_held() => {
+                tokio::time::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await;
+            }
+            Err(error) => panic!("reopen after shutdown failed: {error}"),
+        }
+    }
+}
+
 impl Rig {
     fn new(libraries: usize) -> Self {
         Self::with_root(tempfile::tempdir().unwrap(), libraries)
@@ -341,7 +359,7 @@ impl Rig {
     }
 
     /// Reopen the same root after the test has shut down the old daemon.
-    fn restart(self) -> Self {
+    async fn restart(self) -> Self {
         let Self {
             root,
             config,
@@ -353,7 +371,8 @@ impl Rig {
         drop(api);
         drop(state);
         let paths = StatePaths::from_config(root.path().join("config.toml"), &config);
-        let state = StateHandle::open_with_config(paths, config.clone()).unwrap();
+        let (state, elapsed) = reopen_after_shutdown(paths, &config).await;
+        eprintln!("seated restart release time: {elapsed:?}");
         let api = start(&state, &worlds, &controls);
         Self {
             root,
@@ -827,67 +846,94 @@ async fn restart_with_seated_cartridge_does_not_repeat_load() {
         rig.worlds[0].lock().unwrap().loaded_barcode(BAY),
         Some(barcode(0).as_str())
     );
-    rig = rig.restart();
+    rig = rig.restart().await;
     let session = rig.open(0).await;
     rig.close(&session).await;
     rig.finish().await;
 }
 
-/// Read-only daemon construction also leaves standalone ownership to its caller.
+/// Read-only startup leaves a standalone session to its caller.
+/// This typed form uses a read session because the typed library log has no write sessions.
 #[test]
 fn daemon_startup_leaves_standalone_session_open() {
+    use remanence_state::library_log as lib;
+
     let root = tempfile::tempdir().unwrap();
     let mut config = config(root.path(), 1);
     config.daemon.read_only = true;
     let paths = StatePaths::from_config(root.path().join("config.toml"), &config);
     let id = uuid::Uuid::new_v4();
-    {
-        let mut state = StateHandle::open_with_config(paths, config.clone()).unwrap();
-        remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
-            .unwrap()
-            .append(AuditEventRecord {
-                actor: AuditActor::System,
-                source_layer: SourceLayer::Layer5,
-                operation_id: None,
-                session_id: Some(id),
-                idempotency_key: None,
-                event: AuditEvent::SessionOpened,
-                subject: AuditSubject {
-                    kind: "write".into(),
-                    id: Some(id.to_string()),
-                },
-                detail: BTreeMap::from([
-                    ("session_kind".into(), Value::Text("write".into())),
-                    (
-                        "endpoint_key".into(),
-                        Value::Text(
-                            remanence_state::DriveKey::Standalone {
-                                drive_serial: "DIRECT".into(),
-                            }
-                            .encode(),
-                        ),
-                    ),
-                ]),
-            })
-            .unwrap();
-        state.replay_audit_projection().unwrap();
-    }
-    let _lock = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
+    let state = StateHandle::open_with_config(paths, config.clone()).unwrap();
+    let drives = state
+        .library_runtime()
+        .observe_drives(vec![remanence_state::DriveObservationInput {
+            serial: "DIRECT".into(),
+            identity_source: "DvcidInline".into(),
+            vendor: Some("MODEL".into()),
+            product: Some("DRIVE".into()),
+            firmware_rev: None,
+            managed: "rem".into(),
+            library_serial: None,
+            element_address: None,
+            observed_at_utc: None,
+        }])
+        .unwrap();
+    let drive_id = <lib::Id>::try_from(drives[0].drive_uuid.as_slice()).unwrap();
+    state
+        .library_runtime()
+        .observe_session(
+            *id.as_bytes(),
+            lib::SessionKind::Read,
+            Some(&remanence_state::DriveKey::Standalone {
+                drive_serial: "DIRECT".into(),
+            }),
+            None,
+            lib::SessionEvent::Opened,
+            None,
+            lib::AuditActor::User("reader".into()),
+            (Some(drive_id), Some("DIRECT".into())),
+        )
+        .unwrap();
     let index = remanence_state::projector::open(&config.index.sqlite_path)
         .map(|catalog| catalog.write_handle())
         .unwrap();
-    let _api = ApiState::new_with_config(
-        remanence_state::projector::open(&config.index.sqlite_path).unwrap(),
-        &config,
-    )
-    .unwrap();
+    let _api = ApiState::new_with_config(state.projection_client(), &config).unwrap();
     assert_eq!(index.session_state(id).unwrap().as_deref(), Some("open"));
-    assert!(!remanence_state::FileAuditLog::replay(&config.audit.dir)
-        .unwrap()
-        .iter()
-        .any(|record| record.event == AuditEvent::SessionLostByRestart));
+    assert_eq!(lost_restart_count(&state), 0);
 }
 
+/// Decode the tape source after the writer has closed and the drive pool has stopped.
+fn restart_native_records(config: &RemConfig) -> Vec<remanence_state::tape_log::Record> {
+    let path = config.journal.dir.join("tapes").join(format!(
+        "{}.remtape",
+        uuid::Uuid::from_bytes(uuid(0)).simple()
+    ));
+    let mut file = std::fs::File::open(path).expect("read restart tape source");
+    remanence_state::tape_log::store::Header::decode(&mut file, uuid(0)).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+    let mut records = Vec::new();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        records.push(frame.record.clone());
+    }
+    records
+}
+
+/// Read typed restart losses only after the shared runtime has caught its projection up.
+fn lost_restart_count(state: &StateHandle) -> u64 {
+    state.library_runtime().catch_up().unwrap();
+    let connection = rusqlite::Connection::open(&state.config().index.sqlite_path).unwrap();
+    connection
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE state = 'lost_restart'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// On typed state, "lost" means the next tape open ends the crashed native session.
+/// Startup leaves it open; recovery writes one CrashRecovered end before the new open.
 /// A process exit drops the old actor's lease without closing its durable session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_marks_open_library_session_lost_before_admitting_writes() {
@@ -950,9 +996,10 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
     let worlds = vec![Arc::new(Mutex::new(world))];
     let controls = vec![Arc::new(Control::default())];
     let api = start(&state, &worlds, &controls);
+    // Typed startup cannot end a native write session; the next open of its tape does.
     assert_eq!(
         index.session_state(previous).unwrap().as_deref(),
-        Some("lost_by_restart")
+        Some("open")
     );
     assert!(!index.tape_io_is_fenced(Some(&uuid(0)), None, None).unwrap());
     let session = tokio::time::timeout(BOUND, open(&api, 0))
@@ -960,6 +1007,8 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
         .unwrap()
         .unwrap();
     assert_eq!(session.drive_element_address, Some(u32::from(BAY)));
+    // A derived read follows production's catch-up, as in Rig::assert_released.
+    state.library_runtime().catch_up().unwrap();
     assert_eq!(
         index
             .session_state(uuid::Uuid::from_slice(&session.session_id).unwrap())
@@ -968,6 +1017,7 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
         Some("open"),
         "startup recovery leaves the new process's session open"
     );
+    let next = uuid::Uuid::from_slice(&session.session_id).unwrap();
     api.write_session_service()
         .close_write_session(Request::new(pb::CloseWriteSessionRequest {
             session_id: session.session_id,
@@ -976,16 +1026,65 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
         .await
         .unwrap();
     api.shutdown_drive_pool().await.unwrap();
-    let lost_count = || {
-        remanence_state::FileAuditLog::replay(&config.audit.dir)
-            .unwrap()
+    let crash_end_count = || {
+        use remanence_state::tape_log::{Record as TapeRecord, SessionEndReason};
+        let records = restart_native_records(&config);
+        let ends = records
             .iter()
-            .filter(|record| record.event == AuditEvent::SessionLostByRestart)
-            .count()
+            .enumerate()
+            .filter_map(|(position, record)| match record {
+                TapeRecord::SessionEnded(end) if end.session_id == *previous.as_bytes() => {
+                    Some((position, end))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ends.len(),
+            1,
+            "the crashed session has exactly one native end"
+        );
+        assert_eq!(ends[0].1.reason, SessionEndReason::CrashRecovered);
+        let opened = records
+            .iter()
+            .position(|record| matches!(record, TapeRecord::SessionOpened(open) if open.session_id == *next.as_bytes()))
+            .expect("the new session has a native open");
+        assert!(
+            ends[0].0 < opened,
+            "crash recovery ends the previous session before the new open"
+        );
+        ends.len()
     };
-    assert_eq!(lost_count(), 1);
+    assert_eq!(crash_end_count(), 1);
+    assert_eq!(lost_restart_count(&state), 0);
+    assert_eq!(
+        index.session_state(previous).unwrap().as_deref(),
+        Some("closed")
+    );
+    assert!(!index.tape_io_is_fenced(Some(&uuid(0)), None, None).unwrap());
+
+    api.begin_shutdown();
+    drop(api);
+    drop(index);
+    drop(state);
+    let paths = StatePaths::from_config(Path::new(&config_path), &config);
+    let (state, elapsed) = reopen_after_shutdown(paths, &config).await;
+    eprintln!("native-session restart release time: {elapsed:?}");
     let restarted = start(&state, &worlds, &controls);
-    assert_eq!(lost_count(), 1, "a second restart marks zero sessions");
+    let index = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
+    assert_eq!(crash_end_count(), 1, "a second restart adds no crash end");
+    assert_eq!(
+        lost_restart_count(&state),
+        0,
+        "a second restart adds no typed loss"
+    );
+    assert_eq!(
+        index.session_state(next).unwrap().as_deref(),
+        Some("closed")
+    );
+    assert!(!index.tape_io_is_fenced(Some(&uuid(0)), None, None).unwrap());
     restarted.shutdown_drive_pool().await.unwrap();
 }
 
