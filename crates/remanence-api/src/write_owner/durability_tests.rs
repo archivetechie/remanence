@@ -1702,7 +1702,7 @@ async fn read_typed_receipts(
                         receipt.id
                     ),
                 ));
-                break;
+                continue;
             }
         };
         let member = &members[0];
@@ -1728,7 +1728,7 @@ async fn read_typed_receipts(
                         receipt.id
                     ),
                 ));
-                break;
+                continue;
             }
         }
     }
@@ -1747,14 +1747,66 @@ async fn read_typed_receipts(
     outcome
 }
 
+/// Match the production preview to immutable receipts before confirmation can discard data.
+/// Object entries carry IDs; foreign entries carry an LBA, bounded by the next filemark.
+fn typed_tail_preview(
+    required: &str,
+    found: &[String],
+    sequence: u64,
+    receipts: &[Receipt],
+    records: &[Record],
+) -> serde_json::Value {
+    let mut matches = BTreeSet::new();
+    let mut unlocated = Vec::new();
+    for entry in found {
+        if Uuid::parse_str(entry).is_ok() {
+            matches.extend(
+                receipts
+                    .iter()
+                    .filter(|r| r.id == *entry)
+                    .map(|r| r.id.clone()),
+            );
+        } else if let Some(start) = entry
+            .split_once(" at LBA ")
+            .and_then(|(_, rest)| {
+                rest.split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .filter(|&start| start < records.len())
+        {
+            let end = records[start..]
+                .iter()
+                .position(|r| matches!(r, Record::Filemark))
+                .map_or(records.len(), |offset| start + offset + 1);
+            matches.extend(
+                receipts
+                    .iter()
+                    .filter(|r| r.start < end && start < r.start + r.records.len())
+                    .map(|r| r.id.clone()),
+            );
+        } else {
+            unlocated.push(entry.clone());
+        }
+    }
+    serde_json::json!({
+        "required_confirmation": required, "found": found, "sequence": sequence,
+        "acknowledged_record_found": if unlocated.is_empty() || !matches.is_empty() { Some(!matches.is_empty()) } else { None },
+        "acknowledged_object_ids": matches, "unlocated_found": unlocated,
+    })
+}
+
 /// Preview and confirm tail recovery using the typed terminal authority.
 fn acknowledge_typed_tail(
     paths: &remanence_state::StatePaths,
     catalog: &remanence_state::ProjectionClient,
     world: Arc<Mutex<VirtualWorld>>,
-    no_receipts: bool,
+    receipts: &[Receipt],
+    recovery: &mut serde_json::Value,
 ) -> Result<(), serde_json::Value> {
     use super::super::terminal_types::TerminalConfig;
+    *recovery = serde_json::json!({"preview": null, "confirmed": false});
     let mut library = open_model_library(world.clone());
     let cfg = crash_typed_config(paths, catalog, &library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
@@ -1779,6 +1831,7 @@ fn acknowledge_typed_tail(
         BARCODE,
         AuditActor::System,
         |required, found, sequence| {
+            recovery["preview"] = typed_tail_preview(required, found, sequence, receipts, &before);
             preview = Some((required.to_owned(), found.to_vec(), sequence));
             Err("confirmation required".into())
         },
@@ -1793,7 +1846,11 @@ fn acknowledge_typed_tail(
         return Err(typed_violation("supersede preview", "preview changed tape"));
     }
     let Some((confirmation, found, sequence)) = preview else {
-        return Err(typed_record_refusal("supersede", &refusal, no_receipts));
+        return Err(typed_record_refusal(
+            "supersede",
+            &refusal,
+            receipts.is_empty(),
+        ));
     };
     crate::write_owner::supersede_mounted_tail(
         &mut index,
@@ -1810,8 +1867,10 @@ fn acknowledge_typed_tail(
             Ok(())
         },
     )
-    .map(|_| ())
-    .map_err(|status| typed_record_refusal("supersede", &status, no_receipts))
+    .map(|_| {
+        recovery["confirmed"] = true.into();
+    })
+    .map_err(|status| typed_record_refusal("supersede", &status, receipts.is_empty()))
 }
 
 /// Describe a refusal without deciding whether its category or code is acceptable.
@@ -1922,6 +1981,33 @@ fn note_typed_failure(evidence: &mut serde_json::Value, failure: serde_json::Val
         "violations"
     };
     evidence[key].as_array_mut().unwrap().push(failure);
+}
+
+/// Capture admission and active source identities before any post-open append or recovery.
+fn record_typed_writer_open(
+    catalog: &remanence_state::ProjectionClient,
+    evidence: &mut serde_json::Value,
+    admitted: bool,
+    step: &str,
+) {
+    match catalog.write_handle().list_active_tape_io_fences() {
+        Ok(fences) => {
+            let ids: Vec<_> = fences
+                .into_iter()
+                .map(|fence| fence.quarantine_id)
+                .collect();
+            evidence["writer_opens"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "step": step, "admitted": admitted, "active_fence_ids": ids,
+                }));
+        }
+        Err(error) => note_typed_failure(
+            evidence,
+            typed_violation("writer open fences", error.to_string()),
+        ),
+    }
 }
 
 /// Exercise restored authority, admission, recovery and exact-byte reads through production funnels.
@@ -2053,6 +2139,7 @@ async fn check_typed_crash(
         evidence["step"] = "writer open".into();
         let (tx, opened, thread) =
             open_crash_typed_writer(&paths, &catalog, open_model_library(world.clone())).await;
+        record_typed_writer_open(&catalog, evidence, opened.is_ok(), "writer open");
         match opened {
             Err(status) => {
                 thread.join().expect("typed recovery writer never panics");
@@ -2061,12 +2148,19 @@ async fn check_typed_crash(
                 note_typed_failure(evidence, refusal);
                 if needs_ack && attempt == 0 {
                     evidence["step"] = "supersede".into();
-                    match acknowledge_typed_tail(
+                    let mut recovery = serde_json::Value::Null;
+                    let result = acknowledge_typed_tail(
                         &paths,
                         &catalog,
                         world.clone(),
-                        cut.receipts.is_empty(),
-                    ) {
+                        &cut.receipts,
+                        &mut recovery,
+                    );
+                    evidence["tail_recoveries"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(recovery);
+                    match result {
                         Ok(()) => evidence["tail_acknowledged"] = true.into(),
                         Err(failure) => {
                             note_typed_failure(evidence, failure);
@@ -2194,29 +2288,152 @@ async fn check_typed_crash(
         }
     }
     drop(index);
-    for fence in fences {
-        let cause = runtime
-            .fence_for_quarantine_id(&fence.quarantine_id)
-            .map(|f| format!("{:?}", f.cause));
-        let result = runtime.release_tape_fence(
-            &fence.quarantine_id,
-            "crash census: inspect acknowledged records after recovery",
-            false,
-            AuditActor::System,
-        );
-        let (released, release_error) = match result {
-            Ok(released) => (released.is_some(), serde_json::Value::Null),
-            Err(error) => (
-                false,
-                typed_runtime_refusal("fence release", error, cut.receipts.is_empty()),
-            ),
-        };
-        evidence["fences"].as_array_mut().unwrap().push(serde_json::json!({
+    // Resolve typed causes before a confirmed supersede can release several suffix fences.
+    let fences: Vec<_> = fences
+        .into_iter()
+        .map(|fence| {
+            let typed = runtime.fence_for_quarantine_id(&fence.quarantine_id);
+            (fence, typed)
+        })
+        .collect();
+    for (fence, typed) in fences {
+        let cause = typed.as_ref().map(|f| format!("{:?}", f.cause));
+        let suffix = typed.as_ref().is_some_and(|f| {
+            f.cause == remanence_state::library_log::FenceCause::SessionSuffixContradiction
+        });
+        let mut row = serde_json::json!({
             "quarantine_id": fence.quarantine_id, "at_reopen": initial_ids.contains(&fence.quarantine_id),
             "cause": cause, "reason": fence.reason, "evidence": fence.evidence_json,
-            "released": released, "force": false, "release_error": release_error,
-            "receipts_read": null,
-        }));
+            "released": false, "force": false, "release_error": null, "receipts_read": null,
+            "lift_method": if suffix { "supersede" } else { "RPC" },
+        });
+        if suffix {
+            let opens = evidence["writer_opens"].as_array().unwrap();
+            let under_fence = |open: &&serde_json::Value| {
+                open["active_fence_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == &fence.quarantine_id)
+            };
+            row["writer_refused_while_active"] = opens
+                .iter()
+                .filter(under_fence)
+                .any(|o| o["admitted"] == false)
+                .into();
+            let admitted = opens
+                .iter()
+                .filter(under_fence)
+                .any(|o| o["admitted"] == true);
+            row["writer_admitted_while_active"] = admitted.into();
+            if admitted {
+                note_typed_failure(
+                    evidence,
+                    typed_violation(
+                        "writer open",
+                        format!(
+                            "writer admitted under active suffix fence {}",
+                            fence.quarantine_id
+                        ),
+                    ),
+                );
+            }
+            if runtime
+                .fence_for_quarantine_id(&fence.quarantine_id)
+                .is_some()
+            {
+                evidence["step"] = "suffix supersede".into();
+                let mut recovery = serde_json::Value::Null;
+                let result = acknowledge_typed_tail(
+                    &paths,
+                    &catalog,
+                    world.clone(),
+                    &cut.receipts,
+                    &mut recovery,
+                );
+                row["supersede"] = recovery;
+                if let Err(failure) = result {
+                    row["release_error"] = failure.clone();
+                    note_typed_failure(evidence, failure);
+                }
+                row["released"] = runtime
+                    .fence_for_quarantine_id(&fence.quarantine_id)
+                    .is_none()
+                    .into();
+                if row["released"] == true {
+                    evidence["tail_acknowledged"] = true.into();
+                    evidence["step"] = "writer retry after suffix supersede".into();
+                    let (tx, opened, thread) = open_crash_typed_writer(
+                        &paths,
+                        &catalog,
+                        open_model_library(world.clone()),
+                    )
+                    .await;
+                    record_typed_writer_open(
+                        &catalog,
+                        evidence,
+                        opened.is_ok(),
+                        "writer retry after suffix supersede",
+                    );
+                    row["writer_retry_admitted"] = opened.is_ok().into();
+                    match opened {
+                        Err(status) => note_typed_failure(
+                            evidence,
+                            typed_record_refusal(
+                                "writer retry after suffix supersede",
+                                &status,
+                                cut.receipts.is_empty(),
+                            ),
+                        ),
+                        Ok(id) => {
+                            evidence["writer_reopened"] = true.into();
+                            let (reply, received) = oneshot::channel();
+                            tx.send(DriveCommand::Close {
+                                session_id: id,
+                                reply,
+                            })
+                            .await
+                            .unwrap();
+                            if let Err(status) = received.await.unwrap() {
+                                note_typed_failure(
+                                    evidence,
+                                    typed_violation("writer retry close", status.to_string()),
+                                );
+                            }
+                        }
+                    }
+                    thread.join().expect("typed retry writer never panics");
+                }
+            } else {
+                // A previous confirmed recovery released this fence in the same operator action.
+                let previous = evidence["fences"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|old| old["lift_method"] == "supersede" && old["released"] == true)
+                    .expect("suffix fence released by an observed supersede");
+                row["released"] = true.into();
+                row["supersede"] = previous["supersede"].clone();
+                row["released_with"] = previous["quarantine_id"].clone();
+            }
+        } else {
+            evidence["step"] = "fence release".into();
+            match runtime.release_tape_fence(
+                &fence.quarantine_id,
+                "crash census: inspect acknowledged records after recovery",
+                false,
+                AuditActor::System,
+            ) {
+                Ok(released) => row["released"] = released.is_some().into(),
+                Err(error) => {
+                    let refusal =
+                        typed_runtime_refusal("fence release", error, cut.receipts.is_empty());
+                    row["release_error"] = refusal.clone();
+                    note_typed_failure(evidence, refusal);
+                }
+            }
+        }
+        evidence["fences"].as_array_mut().unwrap().push(row);
     }
     evidence["step"] = "read open".into();
     let read = read_typed_receipts(&paths, &catalog, world, &cut.receipts).await;
@@ -2288,7 +2505,7 @@ fn typed_case_evidence(
         "sync_file": cut.before_sync.as_ref().map(|p| p.strip_prefix(source).unwrap()),
         "sync_file_kind": cut.before_sync.as_deref().map(file_kind), "tails": tails,
         "receipt_count": cut.receipts.len(), "runtime_reopened": false, "writer_reopened": false,
-        "tail_acknowledged": false, "receipts_read": null,
+        "tail_acknowledged": false, "receipts_read": null, "writer_opens": [], "tail_recoveries": [],
         "step": "failed sync", "refusals": [], "fences": [], "violations": [],
     })
 }
@@ -2363,10 +2580,8 @@ async fn run_typed_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result
     Ok(coverage)
 }
 
-/// Census coverage assertions concern instrumentation only; case outcomes are not pinned.
-#[tokio::test]
-#[ignore = "typed crash census; see design-c0b-2c-crash-matrix.md"]
-async fn typed_crash_census() {
+/// Census both matrices through the property engine, retaining every case outcome.
+async fn census_typed_crashes(full: bool) {
     let (_typed, root, cuts) = trace_typed_session(false).await;
     assert!(cuts.iter().any(|cut| cut.boundary.starts_with("Append")));
     for directory in ["library", "native/tapes"] {
@@ -2379,10 +2594,11 @@ async fn typed_crash_census() {
         );
     }
     assert_eq!(cuts.last().unwrap().receipts.len(), 3);
-    let cases = crash_cases(&cuts, false);
+    let cases = crash_cases(&cuts, full);
+    let worker_count = if full { 1 } else { 4 };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut observations = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..4)
+        let workers: Vec<_> = (0..worker_count)
             .map(|_| {
                 scope.spawn(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2428,7 +2644,7 @@ async fn typed_crash_census() {
     assert_eq!(
         observations.len(),
         cases.len(),
-        "every default case has an observation"
+        "every case has an observation"
     );
     let mut summary = BTreeMap::<(String, String), usize>::new();
     for row in &observations {
@@ -2439,43 +2655,50 @@ async fn typed_crash_census() {
             ))
             .or_default() += 1;
     }
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.orders/C0b-2c-1/attempt-1");
-    std::fs::create_dir_all(report_dir.join("evidence")).unwrap();
+    let report_dir = std::env::var_os("REM_CRASH_CENSUS_DIR").map_or_else(
+        || {
+            tempfile::Builder::new()
+                .prefix("remanence-crash-census-")
+                .tempdir()
+                .unwrap()
+                .keep()
+        },
+        PathBuf::from,
+    );
+    std::fs::create_dir_all(&report_dir).unwrap();
     let census = serde_json::json!({
-        "schema": 1, "order": "C0b-2c-1", "default_matrix": true,
+        "schema": 2, "default_matrix": !full,
         "cut_count": cuts.len(), "case_count": cases.len(),
         "status_note": "RPC codes are captured unchanged; RuntimeError has no RPC status and is null.",
-        "seed_note": "R2 seeds every file, including SQLite; materialize overlays that seed as well as modelled log writes.",
+        "seed_note": "Every file, including SQLite, is seeded; materialize overlays modelled log writes.",
         "cases": observations,
     });
     std::fs::write(
-        report_dir.join("evidence/census.json"),
+        report_dir.join("census.json"),
         serde_json::to_vec_pretty(&census).unwrap(),
     )
     .unwrap();
-    let mut table = format!("Census: {} cuts, {} cases, three receipts; four workers.\n\n| Outcome | Case kind | Count |\n|---|---|---:|\n", cuts.len(), cases.len());
+    let mut table = format!("Census: {} cuts, {} cases, three receipts; {worker_count} workers; full={full}.\n\n| Outcome | Case kind | Count |\n|---|---|---:|\n", cuts.len(), cases.len());
     for ((outcome, kind), count) in summary {
         table.push_str(&format!("| {outcome} | {kind} | {count} |\n"));
     }
-    // Preserve report prose on a rerun; replace only the generated census table.
-    let report = report_dir.join("REPORT.md");
-    let previous = std::fs::read_to_string(&report).unwrap_or_default();
-    let begin = "<!-- census table -->";
-    let end = "<!-- /census table -->";
-    let section = format!("{begin}\n{table}{end}");
-    let updated = if let Some((prefix, rest)) = previous.split_once(begin) {
-        let (_, suffix) = rest
-            .split_once(end)
-            .expect("complete generated census table");
-        format!("{prefix}{section}{suffix}")
-    } else {
-        format!("{previous}{section}\n")
-    };
-    std::fs::write(report, updated).unwrap();
+    std::fs::write(report_dir.join("summary.md"), &table).unwrap();
     eprintln!(
         "{table}census written to {}",
-        report_dir.join("evidence/census.json").display()
+        report_dir.join("census.json").display()
     );
+}
+
+#[tokio::test]
+#[ignore = "default crash census; set REM_CRASH_CENSUS_DIR or inspect the printed temporary directory"]
+async fn typed_crash_census() {
+    census_typed_crashes(false).await;
+}
+
+#[tokio::test]
+#[ignore = "full crash census; set REM_CRASH_CENSUS_DIR or inspect the printed temporary directory"]
+async fn typed_crash_full_census() {
+    census_typed_crashes(true).await;
 }
 
 async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
