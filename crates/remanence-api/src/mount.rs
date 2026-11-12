@@ -6918,17 +6918,7 @@ mod tests {
             .project_tape_pool_membership(tape_uuid, pool_id)
             .expect("assign host-only route tape");
 
-        let mut checkpoint = manual_finalize_checkpoint(tape_uuid, block_size);
-        let object_id = Uuid::from_bytes(tape_uuid).to_string();
-        checkpoint.objects[0]
-            .object
-            .object_id
-            .clone_from(&object_id);
-        checkpoint.objects[0]
-            .instance
-            .object_id
-            .clone_from(&object_id);
-        checkpoint.objects[0].object_recovery_row.object_id = object_id.into_bytes();
+        let checkpoint = automatic_after_c_checkpoint(tape_uuid, block_size);
         let checkpoint_dir = index_path.parent().expect("catalog parent").join("tapes");
         let journal =
             remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
@@ -6941,6 +6931,35 @@ mod tests {
             .project_checkpoint_record(&checkpoint)
             .expect("project host-only route checkpoint");
 
+        seed_automatic_after_c_intent(&mut index, &journal, &checkpoint);
+        pool_config
+    }
+
+    /// Give each host-only route its own object identity in the same native checkpoint.
+    fn automatic_after_c_checkpoint(tape_uuid: TapeUuid, block_size: u32) -> CommitFixture {
+        let mut checkpoint = manual_finalize_checkpoint(tape_uuid, block_size);
+        let object_id = Uuid::from_bytes(tape_uuid).to_string();
+        checkpoint.objects[0]
+            .object
+            .object_id
+            .clone_from(&object_id);
+        checkpoint.objects[0]
+            .instance
+            .object_id
+            .clone_from(&object_id);
+        checkpoint.objects[0].object_recovery_row.object_id = object_id.into_bytes();
+        checkpoint
+    }
+
+    /// Leave an automatic native finalization after replica C with recovery required,
+    /// projecting the same terminal progress for historical and typed route fixtures.
+    fn seed_automatic_after_c_intent(
+        index: &mut CatalogIndex,
+        journal: &remanence_state::TapeAuthority,
+        checkpoint: &CommitFixture,
+    ) {
+        let tape_uuid = checkpoint.tape_uuid;
+        let block_size = checkpoint.block_size;
         let mut lease = journal
             .acquire_exclusive()
             .expect("acquire host-only route checkpoint");
@@ -7040,7 +7059,6 @@ mod tests {
                 updated_at_utc: None,
             })
             .expect("project host-only route recovery");
-        pool_config
     }
 
     #[tokio::test]
@@ -7062,7 +7080,6 @@ mod tests {
         let pool_id = "after-c-host-only";
         let pool_config =
             seed_automatic_after_replica_c(&index_path, OPEN_TAPE, "HST001L9", pool_id, BLOCK_SIZE);
-        seed_automatic_after_replica_c(&index_path, STARTUP_TAPE, "HST002L9", pool_id, BLOCK_SIZE);
         seed_automatic_after_replica_c(
             &index_path,
             STALE_COMPANION_TAPE,
@@ -7393,31 +7410,59 @@ mod tests {
             "sealed no-companion route reached changer actor"
         );
 
+        // Startup recovery uses its own typed identity, assignment and tape log.
+        let mut typed = crate::tests::TypedRoot::open_with_tapes(&[(STARTUP_TAPE, "HST002L9")]);
+        let mut config = typed.config();
+        config.tape_pools.push(pool_config.clone());
+        typed.release();
+        let mut handle =
+            remanence_state::StateHandle::open_with_config(typed.paths().clone(), config).unwrap();
+        let generation = handle
+            .library_runtime()
+            .tape_state(STARTUP_TAPE)
+            .unwrap()
+            .assignment_generation;
+        handle
+            .assign_tape_pool(STARTUP_TAPE, generation, Some(pool_id))
+            .expect("assign typed startup tape");
+        let checkpoint_dir = handle.paths().journal_dir.join("tapes");
+        let checkpoint = automatic_after_c_checkpoint(STARTUP_TAPE, BLOCK_SIZE);
+        let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &checkpoint_dir,
+            STARTUP_TAPE,
+        )
+        .build()
+        .expect("open typed startup checkpoint");
+        journal
+            .append(&checkpoint)
+            .expect("append typed startup checkpoint");
+        seed_automatic_after_c_intent(&mut handle.write_handle(), &journal, &checkpoint);
+
         let mut lowered = pool_config;
         lowered.capacity_cap_bytes = Some(u64::from(BLOCK_SIZE));
-        let lowered_index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("open lowered-cap catalog");
-        let mut lowered_state = ApiState::new_with_pool_configs(
-            {
-                let index = lowered_index;
-                let catalog = remanence_state::projector::open(index.path()).unwrap();
-                drop(index);
-                catalog
-            },
-            [lowered],
-        );
+        let mut lowered_state =
+            ApiState::new_with_pool_configs(handle.projection_client(), [lowered]);
+        lowered_state.checkpoint_journal_dir = Arc::new(checkpoint_dir.clone());
         lowered_state.drive_pool = Some(pool);
-        let fence = lowered_state
-            .catalog
-            .write_handle()
-            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+        let fence_config = crate::write_owner::TerminalWriteConfig {
+            authority: crate::write_owner::TerminalAuthority::Typed(handle.library_runtime()),
+            io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: checkpoint_dir.clone(),
+        };
+        let fence = crate::write_owner::raise_tape_io_fence(
+            &mut handle.write_handle(),
+            &fence_config,
+            remanence_state::TapeIoFenceInput {
                 tape_uuid: STARTUP_TAPE,
                 barcode: None,
-                reason: "terminal_finalization".into(),
+                reason: "transfer_error".into(),
                 evidence_json: None,
-            })
-            .unwrap();
+            },
+            None,
+            None,
+        )
+        .unwrap();
         let before = lowered_state
             .index()
             .unwrap()
@@ -7462,14 +7507,20 @@ mod tests {
         let final_index = remanence_state::projector::open(&index_path)
             .map(|catalog| catalog.write_handle())
             .expect("read host-only route results");
+        let startup_index = handle.write_handle();
         for tape_uuid in [
             OPEN_TAPE,
             STARTUP_TAPE,
             STALE_COMPANION_TAPE,
             SEALED_NO_COMPANION_TAPE,
         ] {
+            let result_index = if tape_uuid == STARTUP_TAPE {
+                &startup_index
+            } else {
+                &final_index
+            };
             assert_eq!(
-                final_index
+                result_index
                     .terminal_finalization(&tape_uuid)
                     .expect("read terminal result")
                     .expect("terminal result")
