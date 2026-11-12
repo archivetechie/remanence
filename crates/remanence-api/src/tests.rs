@@ -10450,27 +10450,42 @@ fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
     assert!(evidence.is_unchanged().unwrap());
 }
 
-/// Release RPC validates requests, preserves evidence, and refreshes admission without restart.
+/// The typed release RPC refreshes tape admission and refuses to release drive fences.
 #[tokio::test]
 async fn release_fence_rpc_and_live_admission() {
     use pb::{daemon_server::Daemon, library_service_server::LibraryService};
-    let mut index = test_index();
-    project_pool(&mut index, "camera.copy-a");
-    project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
-    let fence = index
-        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
-            tape_uuid: POOL_WRITE_TAPE_UUID,
-            barcode: None,
-            reason: "position_drift".into(),
-            evidence_json: None,
+    use remanence_state::library_log as lib;
+
+    let typed = TypedRoot::open_with_tapes(&[(POOL_WRITE_TAPE_UUID, "RMN004L9")]);
+    {
+        let mut index = typed.catalog().write_handle();
+        project_pool(&mut index, "camera.copy-a");
+        index
+            .project_tape_pool_membership(POOL_WRITE_TAPE_UUID, "camera.copy-a")
+            .unwrap();
+    }
+    let runtime = typed.catalog().library_runtime().unwrap();
+    let tape = runtime.tape_state(POOL_WRITE_TAPE_UUID).unwrap().tape;
+    let fence = runtime
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    detail: lib::Bounded(vec![]),
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape),
+                    cause: lib::FenceCause::PositionDrift,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
         })
         .unwrap();
-    let state = ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let fence_id = format!("library:{}", fence.sequence);
+    let state = ApiState::new(typed.catalog());
     let daemon = state.daemon_service();
     let library = state.library_service();
     let request = |id: &str, ack: &str| {
@@ -10482,21 +10497,29 @@ async fn release_fence_rpc_and_live_admission() {
     };
     assert_eq!(
         library
-            .release_tape_io_fence(request("missing", "checked"))
+            .release_tape_io_fence(request("library:18446744073709551615", "checked"))
             .await
             .unwrap_err()
             .code(),
         tonic::Code::NotFound
     );
+    let legacy_id = library
+        .release_tape_io_fence(request("missing", "checked"))
+        .await
+        .unwrap_err();
+    assert_eq!(legacy_id.code(), tonic::Code::FailedPrecondition);
+    assert!(legacy_id
+        .message()
+        .contains("fence has no typed library source identity"));
     assert_eq!(
         library
-            .release_tape_io_fence(request(&fence.quarantine_id, " "))
+            .release_tape_io_fence(request(&fence_id, " "))
             .await
             .unwrap_err()
             .code(),
         tonic::Code::InvalidArgument
     );
-    let mut denied = request(&fence.quarantine_id, "checked");
+    let mut denied = request(&fence_id, "checked");
     denied
         .metadata_mut()
         .insert("x-remanence-role", "readonly".parse().unwrap());
@@ -10523,12 +10546,12 @@ async fn release_fence_rpc_and_live_admission() {
         1
     );
     let first = library
-        .release_tape_io_fence(request(&fence.quarantine_id, "verified"))
+        .release_tape_io_fence(request(&fence_id, "verified"))
         .await
         .unwrap()
         .into_inner();
     let second = library
-        .release_tape_io_fence(request(&fence.quarantine_id, "changed"))
+        .release_tape_io_fence(request(&fence_id, "changed"))
         .await
         .unwrap()
         .into_inner();
@@ -10548,39 +10571,51 @@ async fn release_fence_rpc_and_live_admission() {
         0
     );
     let endpoint = remanence_state::DriveKey::new("LIB", 1);
-    let fence = {
-        let mut index = state.catalog.write_handle();
-        if let Some(pool) = &state.drive_pool {
-            index.set_readiness_observer(pool.readiness_wake.clone());
-        }
-        index
-    }
-    .record_tape_io_fence_at_endpoint(
-        remanence_state::TapeIoFenceInput {
-            tape_uuid: [0; 16],
-            barcode: None,
-            reason: "drive uncertainty".into(),
-            evidence_json: None,
-        },
-        Some(&endpoint),
-    )
-    .unwrap();
-    assert!(state
-        .index()
-        .unwrap()
-        .tape_io_is_fenced(None, None, Some(&endpoint))
-        .unwrap());
-    let released = library
-        .release_tape_io_fence(request(&fence.quarantine_id, "drive checked"))
+    let drive_fence = runtime
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    detail: lib::Bounded(vec![]),
+                    kind: lib::FenceKind::DriveFault,
+                    scope: lib::FenceScope::Drive(lib::DriveKey::Bay(lib::Bay {
+                        library_serial: "LIB".into(),
+                        bay: 1,
+                    })),
+                    cause: lib::FenceCause::TransferError,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    assert!(runtime
+        .admit_drive_data(
+            &endpoint,
+            remanence_state::library_runtime::RefusalSubject::Tape(None),
+            lib::AuditActor::System,
+        )
+        .is_err());
+    let refused = library
+        .release_tape_io_fence(request(
+            &format!("library:{}", drive_fence.sequence),
+            "drive checked",
+        ))
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(released.endpoint_key, Some(endpoint.encode()));
-    assert!(!state
-        .index()
-        .unwrap()
-        .tape_io_is_fenced(None, None, Some(&endpoint))
-        .unwrap());
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("fence is not tape-scoped"));
+    assert!(runtime.active_fence(drive_fence.sequence).is_some());
+    assert!(runtime
+        .admit_drive_data(
+            &endpoint,
+            remanence_state::library_runtime::RefusalSubject::Tape(None),
+            lib::AuditActor::System,
+        )
+        .is_err());
 }
 
 /// Startup logs one warning per scoped fence and rejects malformed endpoint evidence.
