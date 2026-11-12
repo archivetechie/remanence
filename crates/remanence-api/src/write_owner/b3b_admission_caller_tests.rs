@@ -4,6 +4,7 @@
 use super::*;
 use crate::append_admission::{b3b_caller_injection, AdmissionError, AdmissionErrorKind};
 use remanence_library::outcome::{census, CommandClass, OperationContext, Phase};
+use remanence_state::library_log as lib;
 
 /// The object-session caller preserves the three admission consequences and classifies each once.
 #[tokio::test]
@@ -23,37 +24,58 @@ async fn b3b_terminal_admission_caller_regression() {
     caller_matrix("terminal").await;
 }
 
-/// Audit-failure rows prove recovery precedes audit, while fence projection follows audit.
+/// Each caller keeps ruling 13's typed fence and transient refusal consequences.
+/// A projection failure leaves the library fence durable, with arm-specific status handling.
 async fn caller_matrix(caller: &str) {
-    for (kind, fail_audit) in [
+    for (kind, fail_projection) in [
         ("suffix", false),
         ("io", false),
         ("structural", false),
         ("suffix", true),
         ("structural", true),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let world = if caller == "terminal" {
-            setup(root.path())
-        } else {
-            b7_tests::due_tape(root.path()).await
-        };
-        let mut library = open_model_library(world.clone());
-        let cfg = config(root.path(), &library);
-        let mut index = remanence_state::projector::open(&cfg.index_path)
-            .map(|catalog| catalog.write_handle())
+        let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+            ProvisionTapeInput {
+                tape_uuid: TAPE,
+                voltag: BARCODE.into(),
+                block_size: BLOCK,
+                parity: ParityConfig::Scheme(scheme()),
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            Some(MediaObservation {
+                generation: LtoGen::Lto9,
+                source: GenerationSource::Operator,
+            }),
+        )]);
+        let root = typed.paths().sqlite_path.parent().unwrap().to_owned();
+        let mut index = typed.catalog().write_handle();
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: POOL.into(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
             .unwrap();
+        index.project_tape_pool_membership(TAPE, POOL).unwrap();
+        // setup supplies only the virtual world; its legacy catalog is never read.
+        let world = setup(&root);
+        if caller != "terminal" {
+            typed_due_tape(&typed, &root, world.clone()).await;
+        }
+        let mut library = open_model_library(world.clone());
+        let cfg = typed_config(&typed, &library);
         let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
         let mut selection = selected();
-        // The terminal caller needs a valid plan, but its admission refuses
-        // before any component is written. An empty initialized authority is sufficient.
+        // Terminal admission refuses before writing any component; initialize its plan authority.
         if caller == "terminal" {
             selection.parity_config = ParityConfig::None;
             let authority =
                 TapeAuthority::open(&cfg.checkpoint_journal_dir, TAPE, index.path()).unwrap();
-            authority
-                .acquire_exclusive()
-                .unwrap()
+            let mut lease = authority.acquire_exclusive().unwrap();
+            lease
                 .publish_initialized(
                     BLOCK,
                     None,
@@ -63,36 +85,47 @@ async fn caller_matrix(caller: &str) {
                     },
                 )
                 .unwrap();
+            cfg.authority
+                .runtime()
+                .unwrap()
+                .refresh_native(&lease.freeze().unwrap())
+                .unwrap();
         }
-        let audit_before = FileAuditLog::replay(&cfg.fixture_audit().audit_dir)
-            .unwrap()
-            .len();
-        rusqlite::Connection::open(&cfg.index_path)
-            .unwrap()
+        let connection = rusqlite::Connection::open(&cfg.index_path).unwrap();
+        connection
             .execute_batch(
                 "CREATE TABLE b3b_mutations(kind TEXT NOT NULL);
-             CREATE TRIGGER b3b_recovery AFTER UPDATE OF state ON tapes
-             WHEN NEW.state = 'recovery_required'
-             BEGIN INSERT INTO b3b_mutations VALUES ('recovery'); END;
-             CREATE TRIGGER b3b_fence AFTER INSERT ON tape_io_fences
-             BEGIN INSERT INTO b3b_mutations VALUES ('fence'); END;",
+                 CREATE TRIGGER b3b_fence AFTER INSERT ON tape_io_fences
+                 BEGIN INSERT INTO b3b_mutations VALUES ('fence'); END;",
             )
             .unwrap();
-        let before_state = index.get_tape(&TAPE).unwrap().unwrap().state;
-        assert_eq!(before_state, "ready");
+        if fail_projection {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER b3b_projection_fault BEFORE INSERT ON tape_io_fences
+                     BEGIN SELECT RAISE(FAIL, 'injected b3b fence projection failure'); END;",
+                )
+                .unwrap();
+        }
+        let runtime = cfg.authority.runtime().expect("R5: shared runtime");
+        assert!(
+            runtime.tape_state(TAPE).is_some(),
+            "R5: Reprovision identity"
+        );
+        assert!(
+            runtime.current_native_reference(TAPE).is_ok(),
+            "R5: native reference"
+        );
+        assert!(index
+            .tape_io_admission_conflicts(&TAPE, Some(BARCODE))
+            .unwrap()
+            .is_empty());
+        assert_eq!(index.get_tape(&TAPE).unwrap().unwrap().state, "ready");
+        println!("R5 {caller}/{kind}/{fail_projection} ready");
         let observed = Arc::new(Mutex::new(None));
         let capture = observed.clone();
-        let audit_path = cfg.fixture_audit().audit_dir.clone();
         b3b_caller_injection::set(move || {
-            *capture.lock().unwrap() = Some((
-                census::total(),
-                FileAuditLog::replay(&audit_path).unwrap().len(),
-            ));
-            if fail_audit {
-                // Keep the earlier audits intact and fail only the caller's new append.
-                std::fs::rename(&audit_path, audit_path.with_extension("saved")).unwrap();
-                std::fs::write(&audit_path, b"injected audit open failure").unwrap();
-            }
+            *capture.lock().unwrap() = Some(census::total());
             match kind {
                 "suffix" => AdmissionError::new(AdmissionErrorKind::SessionSuffixContradiction {
                     tape_uuid: Uuid::from_bytes(TAPE),
@@ -218,32 +251,31 @@ async fn caller_matrix(caller: &str) {
         };
         assert!(
             !b3b_caller_injection::pending(),
-            "{caller}/{kind}: admission was not reached: {status}"
+            "{caller}/{kind}/{fail_projection}: admission was not reached: {status}"
         );
         assert_eq!(
-            census::total() - observed.lock().unwrap().unwrap().0,
+            census::total() - observed.lock().unwrap().unwrap(),
             1,
-            "{caller}/{kind}"
+            "{caller}/{kind}/{fail_projection}"
         );
+        let fencing = kind != "io";
+        let expected_sql_fence = fencing && !fail_projection;
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(
             fences.len(),
-            usize::from(kind == "suffix" && !fail_audit),
-            "{caller}/{kind}"
+            usize::from(expected_sql_fence),
+            "{caller}/{kind}/{fail_projection}: active SQL fences"
         );
         if let Some(fence) = fences.first() {
-            assert_eq!(fence.reason, "SessionSuffixContradiction");
+            assert_eq!(fence.tape_uuid, TAPE);
+            assert_eq!(fence.reason, "session_suffix_contradiction");
         }
         assert_eq!(
-            index.get_tape(&TAPE).unwrap().unwrap().state,
-            if kind == "structural" {
-                "recovery_required"
-            } else {
-                "ready"
-            },
-            "{caller}/{kind}"
+            index.tape_io_is_fenced(Some(&TAPE), None, None).unwrap(),
+            expected_sql_fence,
+            "{caller}/{kind}/{fail_projection}: tape exclusion"
         );
-        let connection = rusqlite::Connection::open(&cfg.index_path).unwrap();
+        assert_eq!(index.get_tape(&TAPE).unwrap().unwrap().state, "ready");
         let mutations: Vec<String> = connection
             .prepare("SELECT kind FROM b3b_mutations ORDER BY rowid")
             .unwrap()
@@ -253,34 +285,42 @@ async fn caller_matrix(caller: &str) {
             .unwrap();
         assert_eq!(
             mutations,
-            match kind {
-                "suffix" if !fail_audit => vec!["fence"],
-                "structural" => vec!["recovery"],
-                _ => vec![],
+            if expected_sql_fence {
+                vec!["fence"]
+            } else {
+                vec![]
             },
-            "{caller}/{kind}: each durable mutation occurs exactly once"
+            "{caller}/{kind}/{fail_projection}: each durable mutation occurs exactly once"
         );
-        if !fail_audit {
-            let audit = FileAuditLog::replay(&cfg.fixture_audit().audit_dir).unwrap();
-            let consequences: Vec<_> = audit[audit_before..]
-                .iter()
-                .filter(|r| {
-                    matches!(
-                        r.event,
-                        AuditEvent::RecoveryEvent | AuditEvent::TapeIoFenceRaised
-                    )
-                })
-                .map(|r| r.event.clone())
-                .collect();
+        assert_eq!(
+            status.code(),
+            if kind == "io" {
+                tonic::Code::Unavailable
+            } else {
+                tonic::Code::FailedPrecondition
+            }
+        );
+        if fail_projection {
             assert_eq!(
-                consequences,
-                match kind {
-                    "suffix" => vec![AuditEvent::TapeIoFenceRaised],
-                    "structural" => vec![AuditEvent::RecoveryEvent],
-                    _ => vec![],
-                },
-                "{caller}/{kind}"
+                status
+                    .message()
+                    .contains("injected b3b fence projection failure"),
+                kind == "structural",
+                "{caller}/{kind}: projection status handling"
             );
+        }
+        if kind == "suffix" {
+            assert!(status
+                .message()
+                .contains("SessionSuffixContradiction: tape "));
+            assert!(status
+                .message()
+                .contains("does not match tape-log sequence 7"));
+            assert!(!status
+                .message()
+                .contains("injected b3b fence projection failure"));
+        }
+        if !(kind == "structural" && fail_projection) {
             assert_eq!(
                 status.metadata().get("remanence-retry").unwrap(),
                 if kind == "io" {
@@ -289,14 +329,134 @@ async fn caller_matrix(caller: &str) {
                     "operator"
                 }
             );
-        } else {
-            assert_eq!(
-                FileAuditLog::replay(cfg.fixture_audit().audit_dir.with_extension("saved"))
-                    .unwrap()
-                    .len(),
-                observed.lock().unwrap().unwrap().1,
-                "failed audit leaves prior history unchanged"
-            );
         }
+        let retry = status
+            .metadata()
+            .get("remanence-retry")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let library_uuid = cfg.authority.runtime().unwrap().manifest().library_uuid();
+        drop((index, cfg, drive, library, connection));
+        let raised = typed
+            .records(|record| (record.tag() == lib::Tag::FenceRaised).then_some(()))
+            .await;
+        assert_eq!(
+            raised.len(),
+            usize::from(fencing),
+            "{caller}/{kind}/{fail_projection}: durable FenceRaised count"
+        );
+        // Inspect the durable fold's typed sources; Record exposes only the tag for fences.
+        let view = lib::native_view::NativeTapeView::probe(
+            &typed.paths().journal_dir.join("tapes"),
+            &typed.paths().sqlite_path,
+        )
+        .unwrap();
+        let replay = lib::store::replay(&typed.paths().audit_dir, library_uuid, &view).unwrap();
+        let sources: Vec<_> = replay.fold.active_tape_fences(&TAPE).collect();
+        assert_eq!(sources.len(), raised.len());
+        for (_, fence) in sources {
+            assert_eq!(fence.kind, lib::FenceKind::Write);
+            assert!(matches!(fence.scope, lib::FenceScope::Tape(tape) if tape.uuid == TAPE));
+            assert_eq!(fence.cause, lib::FenceCause::SessionSuffixContradiction);
+        }
+        println!("ROW {caller}/{kind}/{fail_projection} code={:?} retry={retry:?} fences={} mutations={mutations:?} FenceRaised={} status={:?}", status.code(), fences.len(), raised.len(), status.message());
     }
+}
+
+/// Match the durability config's overrides while retaining the typed authority and native paths.
+fn typed_config(
+    typed: &crate::tests::TypedRoot,
+    library: &remanence_library::LibraryHandle,
+) -> WriteOwnerConfig {
+    let mut cfg = test_typed_write_owner_config(
+        typed,
+        library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
+    cfg.calibration_store = CalibrationControlStore::open(&typed.paths().calibration_dir).unwrap();
+    cfg.checkpoint_max_objects = 100;
+    cfg.checkpoint_max_age_seconds = 3600;
+    cfg
+}
+
+/// Leave real typed pool-session debt by checkpointing a file and aborting at the shutdown deadline.
+async fn typed_due_tape(
+    typed: &crate::tests::TypedRoot,
+    root: &Path,
+    world: Arc<Mutex<VirtualWorld>>,
+) {
+    let mut library = open_model_library(world);
+    let mut cfg = typed_config(typed, &library);
+    let lifecycle = DrivePoolLifecycle::default();
+    cfg.lifecycle = Some(lifecycle.clone());
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let mut index = typed.catalog().write_handle();
+    let (tx, mut rx) = mpsc::channel(16);
+    let actor_tx = tx.clone();
+    let (reply, received) = oneshot::channel();
+    let request = super::super::super::actor_runtime::OpenWriteActorRequest {
+        actor: AuditActor::System,
+        pool_cfg: pool(),
+        selected: selected(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: Some(LIBRARY.into()),
+        barcode: Some(BARCODE.into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: Some(DRIVE.into()),
+        reply,
+    };
+    let thread = std::thread::spawn(move || {
+        handle_drive_open_write(
+            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
+        );
+    });
+    let opened = received
+        .await
+        .expect("typed writer replies without panic")
+        .unwrap();
+    let id = Uuid::from_slice(&opened.session_id).unwrap();
+    append_actor_test_file(&tx, id, root.join("saved"), "saved", "saved", b"committed").await;
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Checkpoint {
+        session_id: id,
+        trigger: CheckpointTrigger::Explicit,
+        expected_batch_id: None,
+        reply: Some(reply),
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    let mut state = crate::ApiState::new_with_pool_configs(typed.catalog(), vec![pool()]);
+    state.checkpoint_journal_dir = Arc::new(typed.paths().journal_dir.join("tapes"));
+    state.audit_dir = Arc::new(typed.paths().audit_dir.clone());
+    state.drive_idle_unload_seconds = 0;
+    crate::closeout_obligation::scan(&state).unwrap();
+    assert!(
+        state.closeout_work.contains((TAPE, 1)),
+        "live owner debt is observable without stealing its lease"
+    );
+    assert!(crate::closeout_obligation::summary(&state, TAPE)
+        .unwrap()
+        .open_session
+        .is_some());
+    lifecycle
+        .shutdown_deadline
+        .set(std::time::Instant::now())
+        .unwrap();
+    lifecycle.shutting_down.store(true, Ordering::SeqCst);
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Abort {
+        session_id: id,
+        reason: Some("deadline test".into()),
+        reply,
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    thread.join().unwrap();
+    assert!(crate::closeout_obligation::summary(&state, TAPE)
+        .unwrap()
+        .closeout_due());
 }
