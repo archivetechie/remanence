@@ -1018,6 +1018,7 @@ struct Coverage {
     completed: usize,
     acknowledged_tails: usize,
     released_fences: usize,
+    lifted_fences: BTreeSet<(String, String, String)>,
     unnamed_refusals: BTreeMap<String, usize>,
     refused: BTreeMap<String, usize>,
     refusal_examples: BTreeMap<String, String>,
@@ -1410,6 +1411,7 @@ impl Coverage {
         self.completed += other.completed;
         self.acknowledged_tails += other.acknowledged_tails;
         self.released_fences += other.released_fences;
+        self.lifted_fences.extend(other.lifted_fences);
         for (category, count) in other.unnamed_refusals {
             *self.unnamed_refusals.entry(category).or_default() += count;
         }
@@ -1797,6 +1799,45 @@ fn typed_tail_preview(
     })
 }
 
+/// Require the same tape identity and fenced read admission as the legacy crash check.
+fn check_typed_fence_before_lift(
+    index: &remanence_state::CatalogIndex,
+    fence: &remanence_state::TapeIoFenceRecord,
+) -> Result<serde_json::Value, serde_json::Value> {
+    if fence.tape_uuid != TAPE && fence.barcode.as_deref() != Some(BARCODE) {
+        return Err(typed_violation(
+            "fence tape",
+            format!(
+                "fence {} does not name the case's tape: {fence:?}",
+                fence.quarantine_id
+            ),
+        ));
+    }
+    let read = session_open_reject_tape_io_fences(index, &TAPE, Some(BARCODE), "open read session");
+    match read {
+        Err(status)
+            if status.code() == tonic::Code::FailedPrecondition
+                && (status
+                    .message()
+                    .contains(&Uuid::from_bytes(TAPE).to_string())
+                    || status.message().contains(BARCODE)) =>
+        {
+            Ok(serde_json::json!({
+                "quarantine_id": fence.quarantine_id, "tape_uuid": fence.tape_uuid,
+                "barcode": fence.barcode, "read_refused": true,
+                "read_refusal": typed_record_refusal("pre-lift read admission", &status, false),
+            }))
+        }
+        other => Err(typed_violation(
+            "pre-lift read admission",
+            format!(
+                "fence {}: expected FailedPrecondition naming the tape, got {other:?}",
+                fence.quarantine_id
+            ),
+        )),
+    }
+}
+
 /// Preview and confirm tail recovery using the typed terminal authority.
 fn acknowledge_typed_tail(
     paths: &remanence_state::StatePaths,
@@ -1806,11 +1847,25 @@ fn acknowledge_typed_tail(
     recovery: &mut serde_json::Value,
 ) -> Result<(), serde_json::Value> {
     use super::super::terminal_types::TerminalConfig;
-    *recovery = serde_json::json!({"preview": null, "confirmed": false});
+    *recovery = serde_json::json!({"preview": null, "confirmed": false, "fence_checks": []});
     let mut library = open_model_library(world.clone());
     let cfg = crash_typed_config(paths, catalog, &library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let mut index = catalog.write_handle();
+    for fence in index
+        .list_active_tape_io_fences()
+        .map_err(|error| typed_violation("supersede fences", error.to_string()))?
+    {
+        let check = check_typed_fence_before_lift(&index, &fence);
+        recovery["fence_checks"]
+            .as_array_mut()
+            .unwrap()
+            .push(match &check {
+                Ok(observation) => observation.clone(),
+                Err(failure) => failure.clone(),
+            });
+        check?;
+    }
     prepare_drive_for_write(
         &mut drive,
         &TAPE,
@@ -1852,6 +1907,15 @@ fn acknowledge_typed_tail(
             receipts.is_empty(),
         ));
     };
+    if recovery["preview"]["acknowledged_record_found"].as_bool() != Some(false) {
+        return Err(typed_violation(
+            "supersede preview",
+            format!(
+                "preview may discard an acknowledged record or contains an unlocated entry: {}",
+                recovery["preview"]
+            ),
+        ));
+    }
     crate::write_owner::supersede_mounted_tail(
         &mut index,
         &cfg.terminal_config(),
@@ -2105,9 +2169,19 @@ async fn check_typed_crash(
             );
         }
     }
-    // A torn native log may be fenced rather than readable. The production writer below
-    // decides admission; keep the observation error as evidence without accepting it.
+    // A missing log before any receipt is observable; after a receipt it is a violation.
     evidence["native_summary_error"] = summary.as_ref().err().map(ToString::to_string).into();
+    if let Err(error) = &summary {
+        if !cut.receipts.is_empty() {
+            note_typed_failure(
+                evidence,
+                typed_violation(
+                    "native summary",
+                    format!("native summary failed at a cut with acknowledged receipts: {error}"),
+                ),
+            );
+        }
+    }
     for receipt in &cut.receipts {
         if !listed.iter().any(|object| object.object_id == receipt.id) {
             note_typed_failure(
@@ -2304,6 +2378,7 @@ async fn check_typed_crash(
         let mut row = serde_json::json!({
             "quarantine_id": fence.quarantine_id, "at_reopen": initial_ids.contains(&fence.quarantine_id),
             "cause": cause, "reason": fence.reason, "evidence": fence.evidence_json,
+            "tape_uuid": fence.tape_uuid, "barcode": fence.barcode,
             "released": false, "force": false, "release_error": null, "receipts_read": null,
             "lift_method": if suffix { "supersede" } else { "RPC" },
         });
@@ -2351,6 +2426,7 @@ async fn check_typed_crash(
                     &cut.receipts,
                     &mut recovery,
                 );
+                let confirmation_failed = result.is_err() || recovery["confirmed"] != true;
                 row["supersede"] = recovery;
                 if let Err(failure) = result {
                     row["release_error"] = failure.clone();
@@ -2360,6 +2436,11 @@ async fn check_typed_crash(
                     .fence_for_quarantine_id(&fence.quarantine_id)
                     .is_none()
                     .into();
+                if confirmation_failed || row["released"] != true {
+                    note_typed_failure(evidence, typed_violation("suffix supersede", format!(
+                        "suffix confirmation failed or fence {} is still active: confirmed={}, released={}",
+                        fence.quarantine_id, row["supersede"]["confirmed"], row["released"])));
+                }
                 if row["released"] == true {
                     evidence["tail_acknowledged"] = true.into();
                     evidence["step"] = "writer retry after suffix supersede".into();
@@ -2377,14 +2458,23 @@ async fn check_typed_crash(
                     );
                     row["writer_retry_admitted"] = opened.is_ok().into();
                     match opened {
-                        Err(status) => note_typed_failure(
-                            evidence,
-                            typed_record_refusal(
-                                "writer retry after suffix supersede",
-                                &status,
-                                cut.receipts.is_empty(),
-                            ),
-                        ),
+                        Err(status) => {
+                            note_typed_failure(
+                                evidence,
+                                typed_violation(
+                                    "writer retry after suffix supersede",
+                                    format!("writer retry refused: {status}"),
+                                ),
+                            );
+                            note_typed_failure(
+                                evidence,
+                                typed_record_refusal(
+                                    "writer retry after suffix supersede",
+                                    &status,
+                                    cut.receipts.is_empty(),
+                                ),
+                            );
+                        }
                         Ok(id) => {
                             evidence["writer_reopened"] = true.into();
                             let (reply, received) = oneshot::channel();
@@ -2417,6 +2507,17 @@ async fn check_typed_crash(
                 row["released_with"] = previous["quarantine_id"].clone();
             }
         } else {
+            evidence["step"] = "pre-lift read admission".into();
+            match check_typed_fence_before_lift(&catalog.write_handle(), &fence) {
+                Ok(check) => row["pre_lift"] = check,
+                Err(failure) => {
+                    row["pre_lift"] = failure.clone();
+                    row["release_error"] = failure.clone();
+                    note_typed_failure(evidence, failure);
+                    evidence["fences"].as_array_mut().unwrap().push(row);
+                    continue;
+                }
+            }
             evidence["step"] = "fence release".into();
             match runtime.release_tape_fence(
                 &fence.quarantine_id,
@@ -2524,8 +2625,28 @@ fn finish_typed_case(evidence: &mut serde_json::Value) {
     evidence["outcome"] = outcome.into();
 }
 
-/// Preserve the property's legacy refusal and status assertions; the census does not call this.
-async fn run_typed_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result<Coverage, String> {
+// Both matrices permit only the refusal categories observed by their censuses.
+const TYPED_REFUSAL_CATEGORIES: &[&str] = &["missing bootstrap", "uncommitted tape tail"];
+
+/// Pin the observed lift protocol, including its presence in the full matrix.
+fn decided_typed_fences(full: bool) -> BTreeSet<(String, String, String)> {
+    if full {
+        BTreeSet::from([(
+            "SessionSuffixContradiction".into(),
+            "session_suffix_contradiction".into(),
+            "supersede".into(),
+        )])
+    } else {
+        BTreeSet::new()
+    }
+}
+
+/// Enforce typed refusal/violation rules; return evidence for focused assertions, never census pins.
+async fn run_typed_case(
+    source: &Path,
+    cuts: &[Cut],
+    case: &CrashCase,
+) -> Result<(Coverage, serde_json::Value), String> {
     let mut evidence = typed_case_evidence(source, cuts, case, 0);
     observe_typed_case(source, cuts, case, &mut evidence).await;
     finish_typed_case(&mut evidence);
@@ -2549,10 +2670,16 @@ async fn run_typed_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result
         ..Coverage::default()
     };
     for refusal in evidence["refusals"].as_array().unwrap() {
-        if refusal["step"] == "read open" {
+        if refusal["step"] != "writer open" {
             return Err(format!(
-                "{context}: read open refuses acknowledged object: {}",
-                refusal["full_message"]
+                "{context}: unexpected refusal step {}: {}",
+                refusal["step"], refusal["full_message"]
+            ));
+        }
+        if !TYPED_REFUSAL_CATEGORIES.contains(&refusal["category"].as_str().unwrap()) {
+            return Err(format!(
+                "{context}: unexpected refusal category {} at {}",
+                refusal["category"], refusal["step"]
             ));
         }
         let Some(code) = refusal["status_number"].as_i64() else {
@@ -2576,8 +2703,16 @@ async fn run_typed_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result
             ));
         }
         coverage.released_fences += 1;
+        coverage.lifted_fences.insert((
+            fence["cause"]
+                .as_str()
+                .ok_or_else(|| format!("{context}: lifted fence has no typed cause"))?
+                .into(),
+            fence["reason"].as_str().unwrap().into(),
+            fence["lift_method"].as_str().unwrap().into(),
+        ));
     }
-    Ok(coverage)
+    Ok((coverage, evidence))
 }
 
 /// Census both matrices through the property engine, retaining every case outcome.
@@ -2738,7 +2873,7 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
         // Keep the full matrix sequential and stop the negative control at its
         // first actual data-loss finding. Both use the identical restart checks.
         for case in &cases {
-            coverage.merge(run_typed_case(&root, &cuts, case).await?);
+            coverage.merge(run_typed_case(&root, &cuts, case).await?.0);
         }
     } else {
         // Four independent state directories and worlds bound concurrent engine
@@ -2760,7 +2895,9 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
                             };
                             results.push((
                                 index,
-                                runtime.block_on(run_typed_case(&root, &cuts, case)),
+                                runtime
+                                    .block_on(run_typed_case(&root, &cuts, case))
+                                    .map(|(coverage, _)| coverage),
                             ));
                         }
                         results
@@ -2778,6 +2915,17 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
             coverage.merge(result?);
         }
     }
+    let refused: BTreeSet<_> = coverage.refused.keys().map(String::as_str).collect();
+    let allowed = TYPED_REFUSAL_CATEGORIES.iter().copied().collect();
+    assert!(
+        refused.is_subset(&allowed),
+        "unexpected refusal categories: {refused:?}"
+    );
+    assert_eq!(
+        coverage.lifted_fences,
+        decided_typed_fences(full),
+        "lifted fence set differs from the decided matrix set"
+    );
     assert_eq!(coverage.cuts, cuts.len());
     assert_eq!(coverage.crashes, cases.len());
     assert!(coverage.failed_syncs > 0);
@@ -2793,6 +2941,75 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
         "existing refusal identity defects change; review the findings"
     );
     Ok(coverage)
+}
+
+/// Exercise loss of the initial Bootstrap delimiter at a WRITE(6)/WRITE FILEMARKS boundary.
+/// Select by physical shape and crash choices, independently of cut numbers and case indices.
+#[tokio::test]
+async fn typed_crash_operator_recovers_bootstrap_suffix() {
+    let start = std::time::Instant::now();
+    let (_typed, root, cuts) = trace_typed_session(false).await;
+    let cases = crash_cases(&cuts, true);
+    let selected: Vec<_> = cases
+        .iter()
+        .filter(|case| {
+            let cut = &cuts[case.cut];
+            case.keep == 1
+                && !case.keep_entries
+                && case.tails.is_empty()
+                && !case.fail_sync
+                && cut.receipts.is_empty()
+                && cut.world.tapes[BARCODE].durable_frontier == 0
+                && (cut.boundary.starts_with("command [0a,")
+                    || cut.boundary.starts_with("command [10,"))
+                && matches!(
+                    cut.records.as_slice(),
+                    [Record::Block(_)] | [Record::Block(_), Record::Filemark]
+                )
+                && matches!(&cut.records[0], Record::Block(block)
+                if remanence_parity::bootstrap::parse_bootstrap_block(block).is_ok())
+        })
+        .collect();
+    assert!(
+        !selected.is_empty(),
+        "Bootstrap delimiter crash shape must remain covered"
+    );
+    for case in &selected {
+        let (coverage, evidence) = run_typed_case(&root, &cuts, case)
+            .await
+            .expect("operator recovers the Bootstrap suffix fence");
+        assert_eq!(coverage.released_fences, 1, "{evidence}");
+        assert_eq!(
+            coverage.lifted_fences,
+            decided_typed_fences(true),
+            "{evidence}"
+        );
+        let fences = evidence["fences"].as_array().unwrap();
+        assert_eq!(fences.len(), 1, "{evidence}");
+        let fence = &fences[0];
+        assert_eq!(fence["writer_refused_while_active"], true, "{evidence}");
+        assert_eq!(fence["writer_admitted_while_active"], false, "{evidence}");
+        assert_eq!(
+            fence["supersede"]["preview"]["required_confirmation"],
+            format!("SUPERSEDE {BARCODE}"),
+            "{evidence}"
+        );
+        assert_eq!(
+            fence["supersede"]["preview"]["acknowledged_record_found"], false,
+            "{evidence}"
+        );
+        assert_eq!(fence["supersede"]["confirmed"], true, "{evidence}");
+        assert_eq!(fence["writer_retry_admitted"], true, "{evidence}");
+        eprintln!(
+            "operator case C{:03} {}; keep={}",
+            cuts[case.cut].number, cuts[case.cut].boundary, case.keep
+        );
+    }
+    eprintln!(
+        "focused operator coverage: {} cases; elapsed {:?}",
+        selected.len(),
+        start.elapsed()
+    );
 }
 
 #[tokio::test]
