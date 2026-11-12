@@ -23,8 +23,8 @@ use remanence_library::{DiscoveryReport, ScsiError, SgTransport, StaticAllowlist
 use remanence_parity::{bootstrap::write_bootstrap_block, parse_parity_arg, ParityConfig};
 use remanence_state::AuditSink as _;
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, RemConfig, SourceLayer, StateHandle,
-    StatePaths,
+    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, ProvisionTapeInput, RemConfig,
+    SourceLayer, StateHandle, StatePaths,
 };
 use tonic::{Code, Request, Status};
 
@@ -149,6 +149,7 @@ struct Rig {
     worlds: Vec<SharedVirtualWorld>,
     controls: Vec<Arc<Control>>,
     api: ApiState,
+    state: StateHandle,
 }
 
 fn uuid(n: usize) -> [u8; 16] {
@@ -199,7 +200,13 @@ tape_catalog_dir = "{0}/cache"
     remanence_state::parse_config_toml(&text).unwrap()
 }
 
-fn start(config: &RemConfig, worlds: &[SharedVirtualWorld], controls: &[Arc<Control>]) -> ApiState {
+/// Start the virtual daemon on the same library authority the rig uses to seed tapes.
+fn start(
+    state: &StateHandle,
+    worlds: &[SharedVirtualWorld],
+    controls: &[Arc<Control>],
+) -> ApiState {
+    let config = state.config();
     std::fs::create_dir_all(config.daemon.state_dir.join("spool")).unwrap();
     let report = DiscoveryReport {
         libraries: worlds
@@ -213,7 +220,7 @@ fn start(config: &RemConfig, worlds: &[SharedVirtualWorld], controls: &[Arc<Cont
     };
     let policy = StaticAllowlist::new((0..worlds.len()).map(serial));
     ApiState::with_drive_pool_opener(
-        remanence_state::projector::open(&config.index.sqlite_path).unwrap(),
+        state.projection_client(),
         config,
         report,
         policy,
@@ -258,30 +265,13 @@ impl Rig {
             } else {
                 ParityConfig::None
             };
-            let geometry = if n == 1 {
-                "scheme=rs-cauchy-gf256-v1 data=4 parity=2 stripes=1"
-            } else {
-                "no-parity"
-            };
-            remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::System,
-                    source_layer: SourceLayer::Layer4,
-                    operation_id: None,
-                    session_id: None,
-                    idempotency_key: None,
-                    event: AuditEvent::TapeProvisioned,
-                    subject: AuditSubject {
-                        kind: "tape".into(),
-                        id: Some(uuid::Uuid::from_bytes(uuid(n)).to_string()),
-                    },
-                    detail: BTreeMap::from([
-                        ("tape_uuid".into(), Value::Bytes(uuid(n).to_vec())),
-                        ("voltag".into(), Value::Text(barcode(n))),
-                        ("block_size".into(), Value::Integer(BLOCK.into())),
-                        ("geometry".into(), Value::Text(geometry.into())),
-                    ]),
+            state
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid: uuid(n),
+                    voltag: barcode(n),
+                    block_size: BLOCK,
+                    parity: parity.clone(),
+                    force: false,
                 })
                 .unwrap();
             let payload = build_tape_bootstrap(
@@ -313,36 +303,22 @@ impl Rig {
             write_bootstrap_block(&payload, &mut block).unwrap();
             tape.records[0] = Record::Block(block);
             world.put_tape_in_slot(SLOT + 1, barcode(n + 10), tape);
-            remanence_state::FileAuditLog::open(&state.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::System,
-                    source_layer: SourceLayer::Layer4,
-                    operation_id: None,
-                    session_id: None,
-                    idempotency_key: None,
-                    event: AuditEvent::TapeProvisioned,
-                    subject: AuditSubject {
-                        kind: "tape".into(),
-                        id: Some(uuid::Uuid::from_bytes(spare_id).to_string()),
-                    },
-                    detail: BTreeMap::from([
-                        ("tape_uuid".into(), Value::Bytes(spare_id.to_vec())),
-                        ("voltag".into(), Value::Text(barcode(n + 10))),
-                        ("block_size".into(), Value::Integer(BLOCK.into())),
-                        ("geometry".into(), Value::Text(geometry.into())),
-                    ]),
+            state
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid: spare_id,
+                    voltag: barcode(n + 10),
+                    block_size: BLOCK,
+                    parity: parity.clone(),
+                    force: false,
                 })
                 .unwrap();
             worlds.push(Arc::new(Mutex::new(world)));
         }
-        state.replay_audit_projection().unwrap();
         for n in 0..libraries {
             for tape in [n, n + 10] {
                 let generation = state
-                    .catalog()
-                    .get_tape_assignment_snapshot(&uuid(tape))
-                    .unwrap()
+                    .library_runtime()
+                    .tape_state(uuid(tape))
                     .unwrap()
                     .assignment_generation;
                 state
@@ -350,17 +326,42 @@ impl Rig {
                     .unwrap();
             }
         }
-        drop(state);
         let controls = (0..libraries)
             .map(|_| Arc::new(Control::default()))
             .collect::<Vec<_>>();
-        let api = start(&config, &worlds, &controls);
+        let api = start(&state, &worlds, &controls);
         Self {
             root,
             config,
             worlds,
             controls,
             api,
+            state,
+        }
+    }
+
+    /// Reopen the same root after the test has shut down the old daemon.
+    fn restart(self) -> Self {
+        let Self {
+            root,
+            config,
+            worlds,
+            controls,
+            api,
+            state,
+        } = self;
+        drop(api);
+        drop(state);
+        let paths = StatePaths::from_config(root.path().join("config.toml"), &config);
+        let state = StateHandle::open_with_config(paths, config.clone()).unwrap();
+        let api = start(&state, &worlds, &controls);
+        Self {
+            root,
+            config,
+            worlds,
+            controls,
+            api,
+            state,
         }
     }
 
@@ -461,6 +462,8 @@ impl Rig {
                 );
             }
         }
+        // Observe durable tape-log session endings through the production catch-up.
+        self.state.library_runtime().catch_up().unwrap();
         let index = remanence_state::projector::open(&self.config.index.sqlite_path)
             .map(|catalog| catalog.write_handle())
             .unwrap();
@@ -824,7 +827,7 @@ async fn restart_with_seated_cartridge_does_not_repeat_load() {
         rig.worlds[0].lock().unwrap().loaded_barcode(BAY),
         Some(barcode(0).as_str())
     );
-    rig.api = start(&rig.config, &rig.worlds, &rig.controls);
+    rig = rig.restart();
     let session = rig.open(0).await;
     rig.close(&session).await;
     rig.finish().await;
@@ -926,7 +929,8 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
     let config = remanence_state::load_config(Path::new(&config_path)).unwrap();
     let previous =
         uuid::Uuid::from_slice(&std::fs::read(root.path().join("session")).unwrap()).unwrap();
-    let _state_lock = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
+    let paths = StatePaths::from_config(Path::new(&config_path), &config);
+    let state = StateHandle::open_with_config(paths, config.clone()).unwrap();
     let index = remanence_state::projector::open(&config.index.sqlite_path)
         .map(|catalog| catalog.write_handle())
         .unwrap();
@@ -945,7 +949,7 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
     world.put_tape_in_drive(BAY, barcode(0), Some(SLOT), tape);
     let worlds = vec![Arc::new(Mutex::new(world))];
     let controls = vec![Arc::new(Control::default())];
-    let api = start(&config, &worlds, &controls);
+    let api = start(&state, &worlds, &controls);
     assert_eq!(
         index.session_state(previous).unwrap().as_deref(),
         Some("lost_by_restart")
@@ -980,7 +984,7 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
             .count()
     };
     assert_eq!(lost_count(), 1);
-    let restarted = start(&config, &worlds, &controls);
+    let restarted = start(&state, &worlds, &controls);
     assert_eq!(lost_count(), 1, "a second restart marks zero sessions");
     restarted.shutdown_drive_pool().await.unwrap();
 }
