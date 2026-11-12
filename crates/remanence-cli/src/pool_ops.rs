@@ -219,6 +219,15 @@ fn run_archive_write_with_lock_root(
         }
     };
 
+    if let Err(e) = remanence_api::mount_support::require_configured_library(
+        state_handle.config(),
+        &args.config,
+        &lib.serial,
+    ) {
+        let _ = writeln!(err, "error: {e}");
+        return ExitCode::from(2);
+    }
+
     let mut policy = StaticAllowlist::new(allow.iter().cloned());
     for s in allow_derived {
         policy = policy.with_derived_allowed(s.clone());

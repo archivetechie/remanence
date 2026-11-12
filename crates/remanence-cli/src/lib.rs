@@ -25519,7 +25519,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             }));
         });
         let root = tempfile::tempdir().unwrap();
-        let config = write_retire_test_config(root.path());
+        let config = write_retire_test_config_with_library(root.path(), "UNLOAD-LIB");
         let cli = DebugCli::try_parse_from([
             "rem-debug",
             "unload",
@@ -25563,6 +25563,83 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert_eq!(controls, [0x1b, 0xa5]);
     }
 
+    /// The debug unload route adds exactly one authority prefix to an unlisted refusal.
+    #[test]
+    fn plain_debug_unload_refuses_unlisted_library_with_one_authority_prefix() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::Mutex;
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "UNLOAD-LIB",
+            256,
+            "UNLOAD-DRIVE",
+            1024,
+            1,
+        )));
+        let library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(256, "TAPE", Some(1024), VirtualTape::default());
+            world.library_snapshot()
+        };
+        let factory_world = world.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            }));
+        });
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let cli = DebugCli::try_parse_from([
+            "rem-debug",
+            "unload",
+            "--config",
+            config.to_str().unwrap(),
+            "--allow",
+            "UNLOAD-LIB",
+            "--bay",
+            "256",
+            "--dest",
+            "1024",
+            "UNLOAD-LIB",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_debug(
+            cli,
+            || {
+                Ok(DiscoveryReport {
+                    libraries: vec![library],
+                    unattached_drives: vec![],
+                    complete: true,
+                    incomplete_evidence: vec![],
+                    warnings: vec![],
+                })
+            },
+            &mut out,
+            &mut err,
+        );
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+        let text = String::from_utf8_lossy(&err);
+        assert_eq!(code, ExitCode::FAILURE, "{text}");
+        assert!(
+            text.contains(&format!(
+                "error: motion authority: library UNLOAD-LIB is not listed in {}",
+                config.display()
+            )),
+            "{text}"
+        );
+        assert_eq!(text.matches("motion authority:").count(), 1, "{text}");
+        assert!(out.is_empty());
+        assert!(world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x1e | 0x1b | 0xa5)));
+    }
+
     #[test]
     fn unload_stranded_lock_refuses_interrupted_reset_without_sqlite() {
         use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
@@ -25575,7 +25652,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             1,
         )));
         let root = tempfile::tempdir().unwrap();
-        let config = write_retire_test_config(root.path());
+        let config = write_retire_test_config_with_library(root.path(), "UNLOAD-LIB");
         TEST_CLI_DEVICE_LOCK_ROOT.with(|slot| *slot.borrow_mut() = Some(root.path().join("locks")));
         fs::write(
             root.path().join("catalog-reset.in-progress"),
@@ -25991,6 +26068,15 @@ tape_catalog_dir = "{0}/cache/tapes"
         );
         fs::write(&config_path, toml).expect("write retire test config");
         config_path
+    }
+
+    /// Add one library to the retire fixture for tests that bind motion authority.
+    pub(super) fn write_retire_test_config_with_library(root: &Path, serial: &str) -> PathBuf {
+        let path = write_retire_test_config(root);
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("\n[[libraries]]\nserial = \"{serial}\"\n"));
+        fs::write(&path, text).unwrap();
+        path
     }
 
     fn provision_retire_test_tape(config_path: &Path, tape_uuid: [u8; 16], voltag: &str) {
@@ -30152,7 +30238,7 @@ mod tape_log_cli_tests {
         use remanence_state::library_log as lib;
         use std::sync::Mutex;
         let root = tempfile::tempdir().unwrap();
-        let config = crate::tests::write_retire_test_config(root.path());
+        let config = crate::tests::write_retire_test_config_with_library(root.path(), "BOT-MODEL");
         let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
         let paths = state.paths().clone();
         let runtime = state.library_runtime();

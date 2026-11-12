@@ -48,6 +48,8 @@ fsync = true
 sqlite_path = "{0}/index.sqlite"
 [cache]
 tape_catalog_dir = "{0}/cache"
+[[libraries]]
+serial = "POOL-WRITE-LIBRARY"
 "#,
         root.path().display()
     );
@@ -100,6 +102,25 @@ tape_catalog_dir = "{0}/cache"
         world,
         report,
     }
+}
+
+/// The selected library must belong to the configuration before the writer opens hardware.
+#[test]
+fn archive_write_refuses_unlisted_library_and_releases_state_lock() {
+    let fx = fixture_seated(Seat::Slot);
+    let text = std::fs::read_to_string(&fx.config_path).unwrap();
+    std::fs::write(&fx.config_path, text.replace(LIBRARY, "OTHER-LIB")).unwrap();
+
+    let (code, out, err) = run_with_factory(&fx, model_factory(&fx));
+    let text = String::from_utf8_lossy(&err);
+    assert_eq!(code, ExitCode::from(2), "{text}");
+    assert!(
+        text.contains("library POOL-WRITE-LIBRARY is not listed in"),
+        "{text}"
+    );
+    assert!(out.is_empty());
+    assert!(opcodes(&fx).is_empty(), "no SCSI command before refusal");
+    let _state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
 }
 
 #[test]

@@ -27,11 +27,21 @@ fsync = false
 sqlite_path = "{0}/index.sqlite"
 [cache]
 tape_catalog_dir = "{0}/cache"
+[[libraries]]
+serial = "UNLOAD-LIB"
 "#,
             root.display()
         ),
     )
     .unwrap();
+    path
+}
+
+/// The same state fixture configured for a different library.
+fn unlisted_config(root: &Path) -> PathBuf {
+    let path = config(root);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("UNLOAD-LIB", "OTHER-LIB")).unwrap();
     path
 }
 
@@ -76,6 +86,45 @@ fn controls(log: &RecordingLog) -> Vec<u8> {
         .filter(|cdb| matches!(cdb[0], 0x1e | 0x1b | 0xa5))
         .map(|cdb| cdb[0])
         .collect()
+}
+
+/// An unlisted library is refused before authority installation or taking the state lock.
+#[test]
+fn bind_unlisted_library_without_authority_refuses_before_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let config = unlisted_config(root.path());
+    let (mut library, _, _, log) = fixture();
+    assert!(library.motion_authority_identity().is_none());
+    log.borrow_mut().clear();
+
+    let error = bind_library_motion_authority(&mut library, Some(&config)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("library UNLOAD-LIB is not listed in {}", config.display())
+    );
+    assert!(controls(&log).is_empty());
+    assert!(library.motion_authority_identity().is_none());
+    let _lock = remanence_state::StateLockGuard::acquire(root.path()).unwrap();
+}
+
+/// A matching installed authority cannot bypass the supplied configuration's library list.
+#[test]
+fn bind_unlisted_library_with_authority_preserves_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let (mut library, _, _, log) = fixture();
+    bind_library_motion_authority(&mut library, Some(&config)).unwrap();
+    let identity = library.motion_authority_identity().unwrap();
+    let unlisted = unlisted_config(root.path());
+    log.borrow_mut().clear();
+
+    let error = bind_library_motion_authority(&mut library, Some(&unlisted)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("library UNLOAD-LIB is not listed in {}", unlisted.display())
+    );
+    assert_eq!(library.motion_authority_identity(), Some(identity));
+    assert!(controls(&log).is_empty());
 }
 
 #[test]

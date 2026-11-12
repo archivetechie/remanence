@@ -386,6 +386,28 @@ impl UnloadRecoveryGuard {
     }
 }
 
+/// Refuse a library serial that `config` does not list. Motion authority comes from one
+/// state's configuration; installing it on a library that configuration does not own would
+/// take that state's lock and write into its library log.
+pub fn require_configured_library(
+    config: &remanence_state::RemConfig,
+    config_path: &Path,
+    serial: &str,
+) -> Result<(), MountError> {
+    if config
+        .libraries
+        .iter()
+        .any(|entry| serial == entry.serial.trim())
+    {
+        Ok(())
+    } else {
+        Err(MountError::Refused(format!(
+            "library {serial} is not listed in {}",
+            config_path.display()
+        )))
+    }
+}
+
 /// Install invocation authority under the state lease before any physical unload.
 /// Existing daemon/mount owners already carry this capability. A direct caller
 /// supplies its configuration; startup reconciliation occurs before admission.
@@ -403,6 +425,7 @@ pub fn bind_library_motion_authority(
         };
     };
     let config = remanence_state::load_config(path).map_err(refusal)?;
+    require_configured_library(&config, path, &library.library().serial)?;
     let paths = remanence_state::StatePaths::from_config(path, &config);
     let manifest = remanence_state::authority_manifest::AuthorityManifest::preflight(&paths)
         .map_err(refusal)?;
