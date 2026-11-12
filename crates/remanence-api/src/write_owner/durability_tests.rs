@@ -2365,7 +2365,7 @@ async fn run_typed_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result
 
 /// Census coverage assertions concern instrumentation only; case outcomes are not pinned.
 #[tokio::test]
-#[ignore = "typed crash census; writes C0b-2c-1 evidence/census.json"]
+#[ignore = "typed crash census; see design-c0b-2c-crash-matrix.md"]
 async fn typed_crash_census() {
     let (_typed, root, cuts) = trace_typed_session(false).await;
     assert!(cuts.iter().any(|cut| cut.boundary.starts_with("Append")));
@@ -2566,7 +2566,7 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["missing bootstrap", "short audit header",]),
+        BTreeSet::from(["missing bootstrap"]),
         "existing refusal identity defects change; review the findings"
     );
     Ok(coverage)
