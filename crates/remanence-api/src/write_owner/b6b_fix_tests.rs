@@ -6,11 +6,14 @@ use remanence_state::tape_log::{
 
 /// Read every native record, including endings later superseded by ClosedOut.
 pub(super) fn native_records(root: &Path) -> Vec<NativeRecord> {
-    let bytes = std::fs::read(
-        root.join("journals/tapes")
-            .join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple())),
-    )
-    .unwrap();
+    native_records_in(&root.join("journals/tapes"))
+}
+
+/// Read native records from a fixture's explicit tape-log directory.
+fn native_records_in(directory: &Path) -> Vec<NativeRecord> {
+    let bytes =
+        std::fs::read(directory.join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple())))
+            .unwrap();
     let mut input = std::io::Cursor::new(&bytes);
     Header::decode(&mut input, TAPE).unwrap();
     let mut decoder = Decoder::at(&bytes[input.position() as usize..], 1, input.position());
@@ -263,27 +266,19 @@ async fn stale_idle_and_wrong_abort_do_not_change_end_reason() {
 #[tokio::test]
 async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row() {
     for fail_end in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
+        let (mut typed, root) = typed_root();
+        let world = setup(&root);
+        let tape_dir = typed.paths().journal_dir.join("tapes");
         let files = MemoryDirectory::default();
-        let _registration = register(root.path().join("journals/tapes"), Arc::new(files.clone()));
-        let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+        let _registration = register(tape_dir.clone(), Arc::new(files.clone()));
+        let (tx, opened, thread) =
+            open_typed_writer_configured(&typed, open_model_library(world), selected(), |_, _| {})
+                .await;
         let id = opened.unwrap();
-        let object = append_actor_test_file(
-            &tx,
-            id,
-            root.path().join("object"),
-            "object",
-            "object",
-            b"saved",
-        )
-        .await;
-        let authority = TapeAuthority::open(
-            root.path().join("journals/tapes"),
-            TAPE,
-            &root.path().join("state.sqlite"),
-        )
-        .unwrap();
+        let object =
+            append_actor_test_file(&tx, id, root.join("object"), "object", "object", b"saved")
+                .await;
+        let authority = TapeAuthority::open(&tape_dir, TAPE, &typed.paths().sqlite_path).unwrap();
         let target = remanence_state::authority::fixtures::publication_target(&authority);
         let backend = files.clone();
         let syncs = Arc::new(AtomicU64::new(0));
@@ -316,22 +311,27 @@ async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row(
         );
         thread.join().unwrap();
         files.observe(None);
-        let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
+        let index = typed.catalog().write_handle();
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1, "syncs={}", syncs.load(Ordering::SeqCst));
-        assert_eq!(fences[0].reason, "AuthorityAmbiguous");
+        assert_eq!(fences[0].reason, "authority_ambiguous");
+        println!(
+            "R4 fail_end={fail_end} fences={} reason={} syncs={}",
+            fences.len(),
+            fences[0].reason,
+            syncs.load(Ordering::SeqCst)
+        );
+        // Release every runtime and native holder before the file registration drops.
+        drop(authority);
+        drop(index);
+        typed.release();
         // A lost fsync is modelled as losing its dirty bytes on restart.
         let mut snapshot = files.snapshot();
         snapshot.crash(&BTreeMap::new(), false).unwrap();
-        snapshot.materialize(root.path(), root.path()).unwrap();
-        let bytes = std::fs::read(
-            root.path()
-                .join("journals/tapes")
-                .join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple())),
-        )
-        .unwrap();
+        snapshot.materialize(&tape_dir, &tape_dir).unwrap();
+        let bytes =
+            std::fs::read(tape_dir.join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple())))
+                .unwrap();
         let mut input = std::io::Cursor::new(&bytes);
         Header::decode(&mut input, TAPE).unwrap();
         let mut decoder = Decoder::at(&bytes[input.position() as usize..], 1, input.position());
@@ -651,10 +651,10 @@ async fn failed_shutdown_barrier_waits_for_durable_named_end() {
 #[tokio::test]
 async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
     for action in [12, 13] {
-        let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
-        let (tx, opened, thread) = open_writer_configured(
-            root.path(),
+        let (typed, root) = typed_root();
+        let world = setup(&root);
+        let (tx, opened, thread) = open_typed_writer_configured(
+            &typed,
             open_model_library(world),
             selected(),
             |cfg, _| {
@@ -668,7 +668,7 @@ async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
         let object = append_actor_test_file(
             &tx,
             id,
-            root.path().join("object"),
+            root.join("object"),
             "object",
             "object",
             b"durable before host failure",
@@ -691,20 +691,21 @@ async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
             object.record.object_id
         );
         thread.join().unwrap();
-        let records = native_records(root.path());
+        let records = native_records_in(&typed.paths().journal_dir.join("tapes"));
         assert!(records
             .iter()
             .any(|r| matches!(r, NativeRecord::Committed(_))));
         assert!(!records
             .iter()
             .any(|r| matches!(r, NativeRecord::SessionEnded(_))));
-        let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        assert_eq!(
-            index.list_active_tape_io_fences().unwrap()[0].reason,
-            "AuthorityAmbiguous"
+        let index = typed.catalog().write_handle();
+        let fences = index.list_active_tape_io_fences().unwrap();
+        println!(
+            "R3 action={action} fences={} reasons={:?}",
+            fences.len(),
+            fences.iter().map(|f| f.reason.as_str()).collect::<Vec<_>>()
         );
+        assert_eq!(fences[0].reason, "authority_ambiguous");
     }
 }
 

@@ -34,32 +34,8 @@ async fn caller_matrix(caller: &str) {
         ("suffix", true),
         ("structural", true),
     ] {
-        let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
-            ProvisionTapeInput {
-                tape_uuid: TAPE,
-                voltag: BARCODE.into(),
-                block_size: BLOCK,
-                parity: ParityConfig::Scheme(scheme()),
-                force: false,
-            },
-            remanence_state::LabelProvenance::Operator,
-            Some(MediaObservation {
-                generation: LtoGen::Lto9,
-                source: GenerationSource::Operator,
-            }),
-        )]);
-        let root = typed.paths().sqlite_path.parent().unwrap().to_owned();
+        let (mut typed, root) = typed_root();
         let mut index = typed.catalog().write_handle();
-        index
-            .upsert_tape_pool_projection(TapePoolProjectionInput {
-                pool_id: POOL.into(),
-                display_name: None,
-                copy_class: None,
-                content_class: None,
-                created_at_utc: None,
-            })
-            .unwrap();
-        index.project_tape_pool_membership(TAPE, POOL).unwrap();
         // setup supplies only the virtual world; its legacy catalog is never read.
         let world = setup(&root);
         if caller != "terminal" {
@@ -360,103 +336,4 @@ async fn caller_matrix(caller: &str) {
         }
         println!("ROW {caller}/{kind}/{fail_projection} code={:?} retry={retry:?} fences={} mutations={mutations:?} FenceRaised={} status={:?}", status.code(), fences.len(), raised.len(), status.message());
     }
-}
-
-/// Match the durability config's overrides while retaining the typed authority and native paths.
-fn typed_config(
-    typed: &crate::tests::TypedRoot,
-    library: &remanence_library::LibraryHandle,
-) -> WriteOwnerConfig {
-    let mut cfg = test_typed_write_owner_config(
-        typed,
-        library,
-        library_snapshot_cell(library.library().clone()),
-    );
-    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
-    cfg.calibration_store = CalibrationControlStore::open(&typed.paths().calibration_dir).unwrap();
-    cfg.checkpoint_max_objects = 100;
-    cfg.checkpoint_max_age_seconds = 3600;
-    cfg
-}
-
-/// Leave real typed pool-session debt by checkpointing a file and aborting at the shutdown deadline.
-async fn typed_due_tape(
-    typed: &crate::tests::TypedRoot,
-    root: &Path,
-    world: Arc<Mutex<VirtualWorld>>,
-) {
-    let mut library = open_model_library(world);
-    let mut cfg = typed_config(typed, &library);
-    let lifecycle = DrivePoolLifecycle::default();
-    cfg.lifecycle = Some(lifecycle.clone());
-    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
-    let mut index = typed.catalog().write_handle();
-    let (tx, mut rx) = mpsc::channel(16);
-    let actor_tx = tx.clone();
-    let (reply, received) = oneshot::channel();
-    let request = super::super::super::actor_runtime::OpenWriteActorRequest {
-        actor: AuditActor::System,
-        pool_cfg: pool(),
-        selected: selected(),
-        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
-        needs_drive_load: false,
-        library_serial: Some(LIBRARY.into()),
-        barcode: Some(BARCODE.into()),
-        source_slot: None,
-        drive_uuid: None,
-        drive_serial: Some(DRIVE.into()),
-        reply,
-    };
-    let thread = std::thread::spawn(move || {
-        handle_drive_open_write(
-            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
-        );
-    });
-    let opened = received
-        .await
-        .expect("typed writer replies without panic")
-        .unwrap();
-    let id = Uuid::from_slice(&opened.session_id).unwrap();
-    append_actor_test_file(&tx, id, root.join("saved"), "saved", "saved", b"committed").await;
-    let (reply, received) = oneshot::channel();
-    tx.send(DriveCommand::Checkpoint {
-        session_id: id,
-        trigger: CheckpointTrigger::Explicit,
-        expected_batch_id: None,
-        reply: Some(reply),
-    })
-    .await
-    .unwrap();
-    received.await.unwrap().unwrap();
-    let mut state = crate::ApiState::new_with_pool_configs(typed.catalog(), vec![pool()]);
-    state.checkpoint_journal_dir = Arc::new(typed.paths().journal_dir.join("tapes"));
-    state.audit_dir = Arc::new(typed.paths().audit_dir.clone());
-    state.drive_idle_unload_seconds = 0;
-    crate::closeout_obligation::scan(&state).unwrap();
-    assert!(
-        state.closeout_work.contains((TAPE, 1)),
-        "live owner debt is observable without stealing its lease"
-    );
-    assert!(crate::closeout_obligation::summary(&state, TAPE)
-        .unwrap()
-        .open_session
-        .is_some());
-    lifecycle
-        .shutdown_deadline
-        .set(std::time::Instant::now())
-        .unwrap();
-    lifecycle.shutting_down.store(true, Ordering::SeqCst);
-    let (reply, received) = oneshot::channel();
-    tx.send(DriveCommand::Abort {
-        session_id: id,
-        reason: Some("deadline test".into()),
-        reply,
-    })
-    .await
-    .unwrap();
-    received.await.unwrap().unwrap();
-    thread.join().unwrap();
-    assert!(crate::closeout_obligation::summary(&state, TAPE)
-        .unwrap()
-        .closeout_due());
 }

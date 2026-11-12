@@ -293,6 +293,160 @@ fn config(root: &Path, library: &remanence_library::LibraryHandle) -> WriteOwner
     cfg
 }
 
+/// Provision the durability tape before opening its typed runtime, then attach its pool.
+/// The returned directory also hosts setup's unused legacy catalog and virtual-media inputs.
+fn typed_root() -> (crate::tests::TypedRoot, PathBuf) {
+    let typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: TAPE,
+            voltag: BARCODE.into(),
+            block_size: BLOCK,
+            parity: ParityConfig::Scheme(scheme()),
+            force: false,
+        },
+        remanence_state::LabelProvenance::Operator,
+        Some(MediaObservation {
+            generation: LtoGen::Lto9,
+            source: GenerationSource::Operator,
+        }),
+    )]);
+    let root = typed.paths().sqlite_path.parent().unwrap().to_owned();
+    let mut index = typed.catalog().write_handle();
+    index
+        .upsert_tape_pool_projection(TapePoolProjectionInput {
+            pool_id: POOL.into(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        })
+        .unwrap();
+    index.project_tape_pool_membership(TAPE, POOL).unwrap();
+    drop(index);
+    (typed, root)
+}
+
+/// Match the durability config's overrides while retaining the typed authority and native paths.
+fn typed_config(
+    typed: &crate::tests::TypedRoot,
+    library: &remanence_library::LibraryHandle,
+) -> WriteOwnerConfig {
+    let mut cfg = test_typed_write_owner_config(
+        typed,
+        library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
+    cfg.calibration_store = CalibrationControlStore::open(&typed.paths().calibration_dir).unwrap();
+    cfg.checkpoint_max_objects = 100;
+    cfg.checkpoint_max_age_seconds = 3600;
+    cfg
+}
+
+/// Configure a typed actor with its catalog and forward the caller's tracing subscriber.
+async fn open_typed_writer_configured(
+    typed: &crate::tests::TypedRoot,
+    mut library: remanence_library::LibraryHandle,
+    selection: SelectedTape,
+    configure: impl FnOnce(&mut WriteOwnerConfig, &mut TapePoolConfig),
+) -> (
+    mpsc::Sender<DriveCommand>,
+    Result<Uuid, Status>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut cfg = typed_config(typed, &library);
+    let mut index = typed.catalog().write_handle();
+    let mut pool_cfg = pool();
+    configure(&mut cfg, &mut pool_cfg);
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let actor_tx = tx.clone();
+    let (reply, received) = oneshot::channel();
+    let request = super::super::actor_runtime::OpenWriteActorRequest {
+        actor: AuditActor::System,
+        pool_cfg,
+        selected: selection,
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: Some(LIBRARY.into()),
+        barcode: index.get_tape(&TAPE).unwrap().unwrap().voltag,
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: Some(DRIVE.into()),
+        reply,
+    };
+    // The actor's log lines reach the caller's subscriber, when it has one.
+    let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+    let thread = std::thread::spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            handle_drive_open_write(
+                BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
+            );
+        });
+    });
+    let opened = received
+        .await
+        .expect("writer replies without panic")
+        .map(|session| Uuid::from_slice(&session.session_id).unwrap());
+    (tx, opened, thread)
+}
+
+/// Leave real typed pool-session debt by checkpointing a file and aborting at the shutdown deadline.
+async fn typed_due_tape(
+    typed: &crate::tests::TypedRoot,
+    root: &Path,
+    world: Arc<Mutex<VirtualWorld>>,
+) {
+    let lifecycle = DrivePoolLifecycle::default();
+    let (tx, opened, thread) =
+        open_typed_writer_configured(typed, open_model_library(world), selected(), |cfg, _| {
+            cfg.lifecycle = Some(lifecycle.clone())
+        })
+        .await;
+    let id = opened.unwrap();
+    append_actor_test_file(&tx, id, root.join("saved"), "saved", "saved", b"committed").await;
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Checkpoint {
+        session_id: id,
+        trigger: CheckpointTrigger::Explicit,
+        expected_batch_id: None,
+        reply: Some(reply),
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    let mut state = crate::ApiState::new_with_pool_configs(typed.catalog(), vec![pool()]);
+    state.checkpoint_journal_dir = Arc::new(typed.paths().journal_dir.join("tapes"));
+    state.drive_idle_unload_seconds = 0;
+    crate::closeout_obligation::scan(&state).unwrap();
+    assert!(
+        state.closeout_work.contains((TAPE, 1)),
+        "live owner debt is observable without stealing its lease"
+    );
+    assert!(crate::closeout_obligation::summary(&state, TAPE)
+        .unwrap()
+        .open_session
+        .is_some());
+    lifecycle
+        .shutdown_deadline
+        .set(std::time::Instant::now())
+        .unwrap();
+    lifecycle.shutting_down.store(true, Ordering::SeqCst);
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Abort {
+        session_id: id,
+        reason: Some("deadline test".into()),
+        reply,
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    thread.join().unwrap();
+    assert!(crate::closeout_obligation::summary(&state, TAPE)
+        .unwrap()
+        .closeout_due());
+}
+
 /// A lost open reply still has a durable owner and must end it before releasing
 /// the drive; it cannot leave an anonymous epoch for the next session.
 #[test]
