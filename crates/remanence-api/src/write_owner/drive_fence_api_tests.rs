@@ -1,7 +1,7 @@
 use super::*;
 use remanence_state::{library_log as lib, library_runtime::LibraryRuntime};
 
-fn raise(runtime: &LibraryRuntime, endpoint: &remanence_state::DriveKey) -> u64 {
+pub(super) fn raise(runtime: &LibraryRuntime, endpoint: &remanence_state::DriveKey) -> u64 {
     let endpoint = match endpoint {
         remanence_state::DriveKey::Bay {
             library_serial,

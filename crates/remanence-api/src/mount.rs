@@ -3518,12 +3518,24 @@ async fn resolve_and_reserve_actor_mount(
     library_serial: &str,
     tape_uuid: &TapeUuid,
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
-    let (mount, drive, ()) = resolve_and_reserve_actor_mount_with_resource(
+    resolve_and_reserve_actor_mount_inner(state, pool, library_serial, tape_uuid, None).await
+}
+
+/// Carry the supersede's identity through the same reservation and readiness path.
+async fn resolve_and_reserve_actor_mount_inner(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
+    tape_uuid: &TapeUuid,
+    recovering_tape: Option<TapeUuid>,
+) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
+    let (mount, drive, ()) = resolve_and_reserve_actor_mount_with_resource_inner(
         state,
         pool,
         library_serial,
         tape_uuid,
         || Ok(()),
+        recovering_tape,
     )
     .await?;
     Ok((mount, drive))
@@ -3538,6 +3550,26 @@ async fn resolve_and_reserve_actor_mount_with_resource<R>(
     tape_uuid: &TapeUuid,
     resource: impl FnOnce() -> Result<R, Status>,
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation, R), Status> {
+    resolve_and_reserve_actor_mount_with_resource_inner(
+        state,
+        pool,
+        library_serial,
+        tape_uuid,
+        resource,
+        None,
+    )
+    .await
+}
+
+/// The optional recovery identity changes only the tape-fence decision at G1.
+async fn resolve_and_reserve_actor_mount_with_resource_inner<R>(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
+    tape_uuid: &TapeUuid,
+    resource: impl FnOnce() -> Result<R, Status>,
+    recovering_tape: Option<TapeUuid>,
+) -> Result<(ActorMount, crate::write_owner::DriveReservation, R), Status> {
     let mut resource = Some(resource);
     loop {
         let busy_bays = pool.busy_bays(library_serial);
@@ -3548,7 +3580,13 @@ async fn resolve_and_reserve_actor_mount_with_resource<R>(
                 hook(pool);
             }
         }
-        let resolved = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays);
+        let resolved = resolve_actor_mount_inner(
+            state,
+            library_serial,
+            tape_uuid,
+            &busy_bays,
+            recovering_tape,
+        );
         if resolved.as_ref().is_err_and(|error| {
             error.code() == tonic::Code::FailedPrecondition
                 && (error.message().contains("busy") || error.message().contains("no free drive"))
@@ -3594,11 +3632,21 @@ async fn resolve_and_reserve_actor_mount_with_resource<R>(
                 let resource = resource.take().expect("resource admitted once")()?;
                 match plan {
                     ActorMountPlan::Ready(mount) => {
-                        ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                        ensure_actor_mount_media_readiness_admitted_inner(
+                            state,
+                            library_serial,
+                            &mount,
+                            recovering_tape,
+                        )?;
                         return Ok((mount, reservation, resource));
                     }
                     ActorMountPlan::Evict { mount, mut seated } => {
-                        ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                        ensure_actor_mount_media_readiness_admitted_inner(
+                            state,
+                            library_serial,
+                            &mount,
+                            recovering_tape,
+                        )?;
                         if let Some(parked) = pool.parked_at(&seated.drive_key()) {
                             if parked.seated.library_serial == seated.library_serial
                                 && parked.seated.barcode == seated.barcode
@@ -3644,6 +3692,17 @@ fn resolve_actor_mount(
     library_serial: &str,
     tape_uuid: &TapeUuid,
     busy_bays: &HashSet<u16>,
+) -> Result<ActorMountPlan, Status> {
+    resolve_actor_mount_inner(state, library_serial, tape_uuid, busy_bays, None)
+}
+
+/// Planning applies the same supersede-only suffix exception as reserved mounting.
+fn resolve_actor_mount_inner(
+    state: &ApiState,
+    library_serial: &str,
+    tape_uuid: &TapeUuid,
+    busy_bays: &HashSet<u16>,
+    recovering_tape: Option<TapeUuid>,
 ) -> Result<ActorMountPlan, Status> {
     let index = remanence_state::CatalogReader::open(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -3750,7 +3809,7 @@ fn resolve_actor_mount(
     } else {
         resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays)
     };
-    crate::startup_media_readiness::ensure_media_readiness_admitted(
+    crate::startup_media_readiness::ensure_media_readiness_admitted_inner(
         &index,
         state.catalog.library_runtime().as_ref(),
         "open session",
@@ -3758,6 +3817,7 @@ fn resolve_actor_mount(
         seated.map(|bay| bay.element_address),
         barcode.as_deref(),
         seated.is_none_or(|bay| bay.source_slot.is_some()),
+        recovering_tape,
     )?;
     let mut plan = plan?;
     let mount = plan.mount_mut();
@@ -3883,9 +3943,19 @@ fn ensure_actor_mount_media_readiness_admitted(
     library_serial: &str,
     mount: &ActorMount,
 ) -> Result<(), Status> {
+    ensure_actor_mount_media_readiness_admitted_inner(state, library_serial, mount, None)
+}
+
+/// Resolve G1 against the state's runtime even though this catalog reader is raw.
+fn ensure_actor_mount_media_readiness_admitted_inner(
+    state: &ApiState,
+    library_serial: &str,
+    mount: &ActorMount,
+    recovering_tape: Option<TapeUuid>,
+) -> Result<(), Status> {
     let index = remanence_state::CatalogReader::open(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
-    crate::startup_media_readiness::ensure_media_readiness_admitted(
+    crate::startup_media_readiness::ensure_media_readiness_admitted_inner(
         &index,
         state.catalog.library_runtime().as_ref(),
         "open session",
@@ -3893,6 +3963,7 @@ fn ensure_actor_mount_media_readiness_admitted(
         Some(mount.bay),
         mount.barcode.as_deref(),
         actor_mount_may_use_library_robotics(mount),
+        recovering_tape,
     )
 }
 
@@ -4124,8 +4195,14 @@ pub(crate) async fn supersede_tail(
         pool.wait_tape_closeout(tape_uuid).await;
         let _tape_reservation = pool.reserve_tape(tape_uuid)?;
         let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
-        let (mount, _drive_reservation) =
-            resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+        let (mount, _drive_reservation) = resolve_and_reserve_actor_mount_inner(
+            &state,
+            &pool,
+            &library_serial,
+            &tape_uuid,
+            Some(tape_uuid),
+        )
+        .await?;
         pool.set_internal_holder(
             &mount.drive_key(),
             mount.drive_serial.as_deref(),

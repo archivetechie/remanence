@@ -23,7 +23,20 @@ pub(crate) fn session_open_short_probe_or_load(
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
-    session_open_reject_admission_conflicts(index, &ctx)?;
+    session_open_short_probe_or_load_inner(index, drive, ctx, None)
+}
+
+/// The supersede alone supplies a recovery identity; all probing stays shared.
+pub(crate) fn session_open_short_probe_or_load_inner(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    ctx: SessionOpenReadinessContext<'_>,
+    recovering_tape: Option<crate::TapeUuid>,
+) -> Result<(), Status> {
+    match recovering_tape {
+        None => session_open_reject_admission_conflicts(index, &ctx)?,
+        Some(_) => session_open_reject_admission_conflicts_inner(index, &ctx, recovering_tape)?,
+    }
     let family = session_open_media_family(
         index
             .readiness_media_observation(ctx.barcode)
@@ -441,6 +454,15 @@ pub(crate) fn session_open_reject_admission_conflicts(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
+    session_open_reject_admission_conflicts_inner(index, ctx, None)
+}
+
+/// Keep drive, readiness and motion admission intact around the suffix exception.
+pub(crate) fn session_open_reject_admission_conflicts_inner(
+    index: &mut CatalogIndex,
+    ctx: &SessionOpenReadinessContext<'_>,
+    recovering_tape: Option<crate::TapeUuid>,
+) -> Result<(), Status> {
     let endpoint = remanence_state::DriveKey::new(ctx.library_serial, ctx.bay);
     if let Some(runtime) = index.library_runtime() {
         runtime
@@ -455,9 +477,22 @@ pub(crate) fn session_open_reject_admission_conflicts(
         .tape_io_is_fenced(None, ctx.barcode, Some(&endpoint))
         .map_err(status_from_state_error)?
     {
-        return Err(Status::failed_precondition(
-            "readiness blocked by active tape-I/O fence",
-        ));
+        let allowed = match recovering_tape {
+            Some(tape) => crate::tape_admission::only_recoverable_suffix_fences(
+                index,
+                index.library_runtime().as_ref(),
+                &tape,
+                ctx.barcode,
+                Some(&endpoint),
+            )
+            .map_err(status_from_state_error)?,
+            None => false,
+        };
+        if !allowed {
+            return Err(Status::failed_precondition(
+                "readiness blocked by active tape-I/O fence",
+            ));
+        }
     }
     let conflicts = index
         .media_readiness_admission_conflicts(ctx.library_serial, Some(ctx.bay), ctx.barcode, false)

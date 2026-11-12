@@ -273,14 +273,51 @@ pub(crate) fn ensure_media_readiness_admitted(
     barcode: Option<&str>,
     library_robotics: bool,
 ) -> Result<(), Status> {
+    ensure_media_readiness_admitted_inner(
+        index,
+        motion,
+        action,
+        library_serial,
+        drive_element,
+        barcode,
+        library_robotics,
+        None,
+    )
+}
+
+/// Only explicit tail recovery may admit its own typed suffix fences at G1.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_media_readiness_admitted_inner(
+    index: &CatalogIndex,
+    motion: Option<&remanence_state::library_runtime::LibraryRuntime>,
+    action: &str,
+    library_serial: &str,
+    drive_element: Option<u16>,
+    barcode: Option<&str>,
+    library_robotics: bool,
+    recovering_tape: Option<crate::TapeUuid>,
+) -> Result<(), Status> {
     let endpoint = drive_element.map(|bay| remanence_state::DriveKey::new(library_serial, bay));
     if index
         .tape_io_is_fenced(None, barcode, endpoint.as_ref())
         .map_err(status_from_state_error)?
     {
-        return Err(Status::failed_precondition(format!(
-            "{action} blocked by active tape-I/O fence; inspect rem tape quarantine list"
-        )));
+        let allowed = match recovering_tape {
+            Some(tape) => crate::tape_admission::only_recoverable_suffix_fences(
+                index,
+                motion,
+                &tape,
+                barcode,
+                endpoint.as_ref(),
+            )
+            .map_err(status_from_state_error)?,
+            None => false,
+        };
+        if !allowed {
+            return Err(Status::failed_precondition(format!(
+                "{action} blocked by active tape-I/O fence; inspect rem tape quarantine list"
+            )));
+        }
     }
     ensure_media_readiness_unconflicted(
         index,

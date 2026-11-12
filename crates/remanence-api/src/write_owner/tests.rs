@@ -5629,6 +5629,104 @@ fn test_typed_write_owner_config(
     cfg
 }
 
+/// Use one StateHandle authority for the actor, its projection, and its tape logs.
+fn test_state_write_owner_config(
+    state: &StateHandle,
+    library: &remanence_library::LibraryHandle,
+    library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
+) -> WriteOwnerConfig {
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        library,
+        library_snapshot,
+    );
+    cfg.authority = TerminalAuthority::Typed(state.library_runtime());
+    cfg.catalog = state.projection_client();
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("tapes");
+    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
+    cfg
+}
+
+/// G3 preserves ordinary admission and unrelated tape/drive fences during recovery.
+#[test]
+fn c0b3c_supersede_readiness_admits_only_own_suffix_fences() {
+    let tape_uuid = [0x71; 16];
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "SUFFIX001L9")]);
+    let mut index = typed.catalog().write_handle();
+    let runtime = index.library_runtime().unwrap();
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        "LIB-SUFFIX",
+        0x100,
+        "DRV-SUFFIX",
+        0x400,
+        1,
+    )));
+    let library = open_model_library(world.clone());
+    let cfg = test_typed_write_owner_config(
+        &typed,
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let ctx = SessionOpenReadinessContext {
+        action: "supersede tape tail",
+        bay: 0x100,
+        library_serial: "LIB-SUFFIX",
+        barcode: Some("SUFFIX001L9"),
+        source_slot: None,
+        drive_serial: Some("DRV-SUFFIX"),
+        needs_drive_load: false,
+        load_continues_move: false,
+        lifecycle: None,
+    };
+    let raise = |index: &mut CatalogIndex, reason: &str| {
+        raise_tape_io_fence(
+            index,
+            &cfg,
+            TapeIoFenceInput {
+                tape_uuid,
+                barcode: None,
+                reason: reason.into(),
+                evidence_json: None,
+            },
+            None,
+            None,
+        )
+        .unwrap()
+    };
+    let suffix = raise(&mut index, "session_suffix_contradiction");
+    session_open_reject_admission_conflicts_inner(&mut index, &ctx, Some(tape_uuid))
+        .expect("supersede readiness admits its suffix fence");
+    let error = session_open_reject_admission_conflicts(&mut index, &ctx)
+        .expect_err("ordinary open must refuse the suffix fence even with the same action text");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "readiness blocked by active tape-I/O fence"
+    );
+    raise(&mut index, "transfer_error");
+    let error = session_open_reject_admission_conflicts_inner(&mut index, &ctx, Some(tape_uuid))
+        .expect_err("supersede must refuse an unrelated tape fence");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "readiness blocked by active tape-I/O fence"
+    );
+    drive_fence_api_tests::raise(
+        &runtime,
+        &remanence_state::DriveKey::new("LIB-SUFFIX", 0x100),
+    );
+    let before = world.lock().unwrap().command_log.len();
+    let error = session_open_reject_admission_conflicts_inner(&mut index, &ctx, Some(tape_uuid))
+        .expect_err("drive admission still precedes the suffix exception");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().starts_with("DriveFenced: "), "{error}");
+    assert_eq!(world.lock().unwrap().command_log.len(), before);
+    assert!(runtime
+        .fence_for_quarantine_id(&suffix.quarantine_id)
+        .is_some());
+}
+
 fn test_io_memory() -> Arc<crate::io_memory::IoMemoryReservation> {
     crate::io_memory::IoMemoryReservation::new(remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES)
         .expect("test I/O memory manager")
@@ -8698,11 +8796,25 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         .prefix("remanence-api-induced-failure-snapshots")
         .tempdir()
         .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
+    use remanence_state::library_log as lib;
     let tape_uuid = [0x78; 16];
+    let typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid,
+            voltag: "FAIL002L9".into(),
+            block_size: 262144,
+            parity: ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        Some(remanence_state::MediaObservation {
+            generation: crate::LtoGen::Lto9,
+            source: remanence_state::GenerationSource::Operator,
+        }),
+    )]);
+    let index_path = typed.paths().sqlite_path.clone();
+    let mut index = typed.catalog().write_handle();
+    let runtime = index.library_runtime().unwrap();
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: "failure-test".to_string(),
@@ -8712,15 +8824,6 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             created_at_utc: None,
         })
         .expect("project pool");
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid,
-            voltag: "FAIL002L9".to_string(),
-            block_size: 262144,
-            parity: ParityConfig::None,
-            force: false,
-        })
-        .expect("provision tape");
     index
         .project_tape_pool_membership(tape_uuid, "failure-test")
         .expect("assign pool");
@@ -8734,7 +8837,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             managed: "rem".to_string(),
             library_serial: Some("LIB-INDUCED-FAIL".to_string()),
             element_address: Some(0x0100),
-            observed_at_utc: Some("2026-07-18T00:00:00Z".to_string()),
+            observed_at_utc: None,
         })
         .expect("observe drive")
         .drive_uuid;
@@ -8761,15 +8864,13 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
     let world = Arc::new(Mutex::new(world));
     let mut library = open_model_library(Arc::clone(&world));
     let snapshot = library_snapshot_cell(library.library().clone());
-    let audit_dir = temp.path().join("audit");
-    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-    let cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
+    let cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let serial = library.library().serial.clone();
     let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
     let drive = library
         .open_drive(0x0100, &policy)
         .expect("open model drive");
-    let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+    let drive_tx = spawn_drive_actor(0x0100, drive, cfg.clone());
 
     let (open_read_tx, open_read_rx) = oneshot::channel();
     drive_tx
@@ -8834,23 +8935,37 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         block_size_bytes: 262144,
         min_object_size_bytes: 0,
     };
-    // A live actor observes the RPC release through its existing catalog connection.
+    // The live actor observes both typed releases through its existing catalog connection.
     for endpoint in [None, Some(remanence_state::DriveKey::new(&serial, 0x0100))] {
-        let fence = index
-            .record_tape_io_fence_at_endpoint(
-                remanence_state::TapeIoFenceInput {
-                    tape_uuid: if endpoint.is_some() {
-                        [0; 16]
-                    } else {
-                        tape_uuid
-                    },
+        let (tape_fence, drive_fence) = if let Some(endpoint) = endpoint.as_ref() {
+            let sequence = drive_fence_api_tests::raise(&runtime, endpoint);
+            eprintln!(
+                "snapshot drive fence library:{sequence} {:?}",
+                runtime.active_fence(sequence)
+            );
+            (None, Some(sequence))
+        } else {
+            let fence = raise_tape_io_fence(
+                &mut index,
+                &cfg,
+                TapeIoFenceInput {
+                    tape_uuid,
                     barcode: None,
                     reason: "transfer_error".into(),
                     evidence_json: None,
                 },
-                endpoint.as_ref(),
+                None,
+                None,
             )
             .unwrap();
+            eprintln!(
+                "snapshot tape fence {} {} {:?}",
+                fence.quarantine_id,
+                fence.reason,
+                runtime.fence_for_quarantine_id(&fence.quarantine_id)
+            );
+            (Some(fence), None)
+        };
         let commands_before = world.lock().unwrap().command_log.len();
         let (reply, received) = oneshot::channel();
         drive_tx
@@ -8904,8 +9019,9 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             commands_before,
             "fenced opens issue no tape commands or append recovery"
         );
-        let api = crate::ApiState::new(remanence_state::projector::open(&index_path).unwrap());
-        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+        if let Some(fence) = tape_fence {
+            let api = crate::ApiState::new(typed.catalog());
+            <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &api.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
@@ -8915,6 +9031,54 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         )
         .await
         .unwrap();
+        } else {
+            // Ruling 33: the first landing releases a drive fence only through its owner.
+            runtime
+                .append(|a, v| {
+                    a.fence_released(
+                        lib::FenceReleased {
+                            fence: drive_fence.unwrap(),
+                            evidence: "test owner verified drive".into(),
+                            forced: false,
+                            detail: lib::Bounded(vec![]),
+                        },
+                        lib::AuditActor::System,
+                        lib::SourceLayer::Layer4,
+                        v,
+                    )
+                })
+                .unwrap();
+            // Read admission recovers on this actor too; the write open below covers the other half.
+            let (reply, received) = oneshot::channel();
+            drive_tx
+                .send(DriveCommand::OpenRead {
+                    tape_uuid,
+                    needs_drive_load: false,
+                    library_serial: serial.clone(),
+                    barcode: Some("FAIL002L9".into()),
+                    source_slot: None,
+                    drive_uuid: Some(drive_uuid.clone()),
+                    drive_serial: Some("DRV-INDUCED-FAIL".into()),
+                    resume_target: None,
+                    daemon_epoch: 1,
+                    reply,
+                })
+                .await
+                .unwrap();
+            let reopened = received
+                .await
+                .unwrap()
+                .expect("read admission after owner drive release");
+            let (reply, received) = oneshot::channel();
+            drive_tx
+                .send(DriveCommand::CloseRead {
+                    session_id: Uuid::from_slice(&reopened.session_id).unwrap(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            received.await.unwrap().unwrap();
+        }
     }
     let (open_write_tx, open_write_rx) = oneshot::channel();
     drive_tx
@@ -11223,36 +11387,13 @@ pub(crate) async fn daemon_rollback_refusal(
     selected: SelectedTape,
 ) -> String {
     let mut library = open_model_library(world.clone());
-    let mut cfg = test_write_owner_config(
-        state.paths().sqlite_path.clone(),
-        state.paths().audit_dir.clone(),
+    let cfg = test_state_write_owner_config(
+        state,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("tapes");
-    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
-    let mut index = remanence_state::projector::open(&state.paths().sqlite_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    let session_id = Uuid::new_v4();
-    for event in [AuditEvent::SessionOpened, AuditEvent::SessionOrphaned] {
-        record_session_event(
-            &mut index,
-            &cfg,
-            SessionAuditInput {
-                session_id,
-                session_kind: "write",
-                event,
-                tape_uuid: Some(selected.tape_uuid),
-                library_serial: Some(library.library().serial.clone()),
-                drive_bay: Some(0x100),
-                drive_uuid: None,
-                drive_serial: None,
-                abort_reason: None,
-            },
-        )
-        .unwrap();
-    }
+    // D-C0b-3c-1 fact 4: the write-session audit seed is inert on typed authority.
+    // Admission uses the restored native tape log, not legacy audit sessions.
     let serial = library.library().serial.clone();
     let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
     let drive = library.open_drive(0x100, &policy).unwrap();
@@ -11282,11 +11423,20 @@ pub(crate) async fn daemon_rollback_refusal(
         let index = remanence_state::projector::open(&state.paths().sqlite_path)
             .map(|catalog| catalog.write_handle())
             .unwrap();
-        assert!(index
-            .list_active_tape_io_fences()
-            .unwrap()
+        let fences = index.list_active_tape_io_fences().unwrap();
+        assert!(fences
             .iter()
-            .any(|f| f.reason == "SessionSuffixContradiction"));
+            .any(|f| f.reason == "session_suffix_contradiction"));
+        for fence in &fences {
+            eprintln!(
+                "rollback suffix fence {} {} {:?}",
+                fence.quarantine_id,
+                fence.reason,
+                state
+                    .library_runtime()
+                    .fence_for_quarantine_id(&fence.quarantine_id)
+            );
+        }
         return error.to_string();
     }
     assert!(error.message().contains("TailBeyondKnownState"), "{error}");
@@ -11294,14 +11444,29 @@ pub(crate) async fn daemon_rollback_refusal(
         .map(|catalog| catalog.write_handle())
         .unwrap();
     let fences = index.list_active_tape_io_fences().unwrap();
-    assert!(fences.iter().all(|f| f.tape_uuid != tape_uuid));
-    assert_eq!(
-        index.get_tape(&tape_uuid).unwrap().unwrap().state,
-        "recovery_required"
-    );
+    // Ruling 13: a typed suffix fence protects the ready tape until physical recovery.
+    let fences: Vec<_> = fences.iter().filter(|f| f.tape_uuid == tape_uuid).collect();
+    assert_eq!(fences.len(), 1);
+    let fence = fences[0];
+    assert_eq!(fence.reason, "session_suffix_contradiction");
+    assert_eq!(index.get_tape(&tape_uuid).unwrap().unwrap().state, "ready");
     crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
-    let audit = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    assert!(audit.iter().any(|r| r.event == AuditEvent::RecoveryEvent));
+    let runtime = state.library_runtime();
+    let source = runtime
+        .fence_for_quarantine_id(&fence.quarantine_id)
+        .expect("live typed suffix fence");
+    assert_eq!(
+        source.scope,
+        remanence_state::library_log::FenceScope::Tape(runtime.tape_state(tape_uuid).unwrap().tape)
+    );
+    assert_eq!(
+        source.cause,
+        remanence_state::library_log::FenceCause::SessionSuffixContradiction
+    );
+    eprintln!(
+        "rollback tail fence {} {} {:?}",
+        fence.quarantine_id, fence.reason, source
+    );
     error.to_string()
 }
 
@@ -11314,14 +11479,11 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
     root: &Path,
 ) {
     let mut library = open_model_library(world.clone());
-    let mut cfg = test_write_owner_config(
-        state.paths().sqlite_path.clone(),
-        state.paths().audit_dir.clone(),
+    let mut cfg = test_state_write_owner_config(
+        state,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("tapes");
-    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
     cfg.checkpoint_max_objects = 100;
     cfg.checkpoint_max_age_seconds = 3600;
     let serial = library.library().serial.clone();
@@ -11509,9 +11671,36 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
         .unwrap();
     assert_eq!(
         index.get_tape(&selected.tape_uuid).unwrap().unwrap().state,
-        "recovery_required"
+        "ready"
     );
-    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+    // Ruling 13: the durable suffix fence replaces the recovery_required flag.
+    let fences: Vec<_> = index
+        .list_active_tape_io_fences()
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.tape_uuid == selected.tape_uuid)
+        .collect();
+    assert_eq!(fences.len(), 1);
+    let fence = &fences[0];
+    assert_eq!(fence.reason, "session_suffix_contradiction");
+    let runtime = state.library_runtime();
+    let source = runtime
+        .fence_for_quarantine_id(&fence.quarantine_id)
+        .expect("live typed suffix fence");
+    assert_eq!(
+        source.scope,
+        remanence_state::library_log::FenceScope::Tape(
+            runtime.tape_state(selected.tape_uuid).unwrap().tape
+        )
+    );
+    assert_eq!(
+        source.cause,
+        remanence_state::library_log::FenceCause::SessionSuffixContradiction
+    );
+    eprintln!(
+        "roundtrip parity={:?} fence {} {} {:?}",
+        selected.parity_config, fence.quarantine_id, fence.reason, source
+    );
     crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
     let mut request = pb::SupersedeTailRequest {
         observed_tape_log_sequence: None,
@@ -14647,20 +14836,14 @@ pub(crate) async fn check_overlap_batch_receipts(
     if serial_mode {
         config.daemon.append_staging_mode = remanence_state::AppendStagingMode::Serial;
     }
-    let mut api_state = crate::ApiState::new_with_config(
-        remanence_state::projector::open(&state.paths().sqlite_path).unwrap(),
-        &config,
-    )
-    .unwrap();
+    let mut api_state =
+        crate::ApiState::new_with_config(state.projection_client(), &config).unwrap();
     let mut library = open_model_library(world);
-    let mut cfg = test_write_owner_config(
-        state.paths().sqlite_path.clone(),
-        state.paths().audit_dir.clone(),
+    let mut cfg = test_state_write_owner_config(
+        state,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("tapes");
-    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
     cfg.checkpoint_max_objects = 100;
     cfg.checkpoint_max_age_seconds = 3600;
     let serial = library.library().serial.clone();

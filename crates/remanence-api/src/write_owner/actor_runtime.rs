@@ -722,7 +722,7 @@ pub(super) fn drive_loop(
                         &request.tape_uuid,
                         "tape_uuid",
                     )?;
-                    super::readiness::session_open_short_probe_or_load(
+                    super::readiness::session_open_short_probe_or_load_inner(
                         &mut index,
                         drive,
                         super::SessionOpenReadinessContext {
@@ -736,6 +736,7 @@ pub(super) fn drive_loop(
                             load_continues_move: needs_drive_load,
                             lifecycle: cfg.lifecycle.as_ref(),
                         },
+                        Some(tape_uuid),
                     )?;
                     let tape = index
                         .get_tape(&tape_uuid)

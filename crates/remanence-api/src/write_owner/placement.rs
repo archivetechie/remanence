@@ -120,42 +120,15 @@ impl super::WriteOwnerConfig {
             .map_err(crate::status_from_state_error)?
         {
             use remanence_state::library_log as lib;
-            let allowed = if recovering_tail {
-                if let Some(library) = self.authority.runtime() {
-                    let mut fences = index
-                        .tape_io_admission_conflicts(&mounted.tape_uuid, mounted.barcode.as_deref())
-                        .map_err(crate::status_from_state_error)?;
-                    fences.extend(
-                        index
-                            .list_active_tape_io_fences()
-                            .map_err(crate::status_from_state_error)?
-                            .into_iter()
-                            .filter(|f| f.endpoint.as_ref() == Some(&mounted.endpoint)),
-                    );
-                    !fences.is_empty()
-                        && fences.into_iter().all(|fence| {
-                            fence
-                                .quarantine_id
-                                .strip_prefix("library:")
-                                .and_then(|n| n.parse::<u64>().ok())
-                                .and_then(|n| library.active_fence(n))
-                                .is_some_and(|raise| {
-                                    raise.scope
-                                        == lib::FenceScope::Tape(lib::TapeRef {
-                                            uuid: mounted.tape_uuid,
-                                            incarnation: 1,
-                                        })
-                                        && raise.kind == lib::FenceKind::Write
-                                        && raise.cause
-                                            == lib::FenceCause::SessionSuffixContradiction
-                                })
-                        })
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let allowed = recovering_tail
+                && crate::tape_admission::only_recoverable_suffix_fences(
+                    index,
+                    self.authority.runtime(),
+                    &mounted.tape_uuid,
+                    mounted.barcode.as_deref(),
+                    Some(&mounted.endpoint),
+                )
+                .map_err(crate::status_from_state_error)?;
             if !allowed {
                 let mut conflicts = index
                     .tape_io_admission_conflicts(&mounted.tape_uuid, mounted.barcode.as_deref())

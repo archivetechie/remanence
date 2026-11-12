@@ -4,6 +4,43 @@ use remanence_state::{
     library_log as lib, library_runtime::RefusalSubject, CatalogIndex, TapeIoFenceRecord,
 };
 
+/// Recovery may pass only a nonempty set of this tape's live typed suffix fences.
+/// SQL locates tape, barcode and endpoint conflicts; the authority validates each raise.
+pub(crate) fn only_recoverable_suffix_fences(
+    index: &CatalogIndex,
+    runtime: Option<&remanence_state::library_runtime::LibraryRuntime>,
+    tape_uuid: &crate::TapeUuid,
+    barcode: Option<&str>,
+    endpoint: Option<&remanence_state::DriveKey>,
+) -> Result<bool, remanence_state::StateError> {
+    let Some(runtime) = runtime else {
+        return Ok(false);
+    };
+    let Some(identity) = runtime.tape_state(*tape_uuid) else {
+        return Ok(false);
+    };
+    let mut fences = index.tape_io_admission_conflicts(tape_uuid, barcode)?;
+    fences.extend(
+        index
+            .list_active_tape_io_fences()?
+            .into_iter()
+            .filter(|f| endpoint.is_some_and(|endpoint| f.endpoint.as_ref() == Some(endpoint))),
+    );
+    Ok(!fences.is_empty()
+        && fences.into_iter().all(|fence| {
+            fence
+                .quarantine_id
+                .strip_prefix("library:")
+                .and_then(|n| n.parse::<u64>().ok())
+                .and_then(|n| runtime.active_fence(n))
+                .is_some_and(|raise| {
+                    raise.scope == lib::FenceScope::Tape(identity.tape)
+                        && raise.kind == lib::FenceKind::Write
+                        && raise.cause == lib::FenceCause::SessionSuffixContradiction
+                })
+        }))
+}
+
 pub(crate) fn typed_cause(
     index: &CatalogIndex,
     fence: &TapeIoFenceRecord,
@@ -444,6 +481,105 @@ mod tests {
     use pb::write_session_service_server::WriteSessionService;
     use remanence_state::authority::TapeAuthorityView;
     use tonic::{Code, Request};
+
+    /// Recovery checks every typed cause and fails closed without live identity.
+    #[test]
+    fn c0b3c_suffix_predicate_cause_matrix() {
+        use lib::FenceCause::{
+            NativeLogBehindProjection, SessionSuffixContradiction, TransferError,
+        };
+        let cases = [
+            vec![],
+            vec![SessionSuffixContradiction],
+            vec![SessionSuffixContradiction, TransferError],
+            vec![TransferError],
+            vec![NativeLogBehindProjection],
+        ];
+        let mut actual = Vec::new();
+        for causes in cases {
+            let fixture = Fixture::new();
+            let runtime = fixture.state.as_ref().unwrap().library_runtime();
+            for cause in causes {
+                fixture.raise(T, cause);
+            }
+            let index = fixture.index();
+            let endpoint = remanence_state::DriveKey::new("SUFFIX", 0x100);
+            actual.push(
+                super::only_recoverable_suffix_fences(
+                    &index,
+                    Some(&runtime),
+                    &T,
+                    None,
+                    Some(&endpoint),
+                )
+                .unwrap(),
+            );
+            assert!(!super::only_recoverable_suffix_fences(
+                &index,
+                None,
+                &T,
+                None,
+                Some(&endpoint)
+            )
+            .unwrap());
+            assert!(!super::only_recoverable_suffix_fences(
+                &index,
+                Some(&runtime),
+                &[0xff; 16],
+                None,
+                Some(&endpoint)
+            )
+            .unwrap());
+        }
+        assert_eq!(actual, [false, true, false, false, false]);
+    }
+
+    /// Endpoint conflicts participate even when their tape and barcode do not match.
+    #[test]
+    fn c0b3c_suffix_predicate_includes_other_tape_endpoint_fences() {
+        let mut actual = Vec::new();
+        for cause in [
+            lib::FenceCause::TransferError,
+            lib::FenceCause::SessionSuffixContradiction,
+        ] {
+            let fixture = Fixture::new();
+            let runtime = fixture.state.as_ref().unwrap().library_runtime();
+            fixture.raise(T, lib::FenceCause::SessionSuffixContradiction);
+            let other = fixture.raise(B, cause);
+            let endpoint = remanence_state::DriveKey::new("SUFFIX", 0x100);
+            // Typed tape raises have no endpoint column. Attach the legacy locator
+            // to this real typed raise to exercise the union with endpoint conflicts.
+            let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE tape_io_fences SET endpoint_key = ?1 WHERE quarantine_id = ?2",
+                    rusqlite::params![endpoint.encode(), format!("library:{other}")]
+                )
+                .unwrap(),
+                1
+            );
+            let index = fixture.index();
+            assert_eq!(
+                index.tape_io_admission_conflicts(&T, None).unwrap().len(),
+                1
+            );
+            assert!(
+                super::only_recoverable_suffix_fences(&index, Some(&runtime), &T, None, None)
+                    .unwrap()
+            );
+            actual.push(
+                super::only_recoverable_suffix_fences(
+                    &index,
+                    Some(&runtime),
+                    &T,
+                    None,
+                    Some(&endpoint),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(actual, [false, false]);
+    }
 
     /// Reach admission through the same TapeTarget RPC as a daemon client.
     async fn open_tape(api: &crate::ApiState, tape: lib::Id) -> tonic::Status {

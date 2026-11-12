@@ -432,3 +432,76 @@ async fn l1r3eg4_mounted_drive_precedes_cause14_once() {
     crate::tape_admission::test_support::assert_code(&records[1], T, 1);
     assert!(world.lock().unwrap().command_log.is_empty());
 }
+
+/// G1 admits the seated supersede's exact suffix fence, never an ordinary open.
+#[tokio::test]
+async fn c0b3c_supersede_mount_admits_only_own_suffix_fences() {
+    let root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let world = world(true, false);
+    let (state, mut changer, mut drives) = actor_state(&root, &world);
+    let runtime = state.catalog.library_runtime().unwrap();
+    let raise = |cause| {
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(runtime.tape_state(TAPE).unwrap().tape),
+                        cause,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+    };
+    let suffix = raise(lib::FenceCause::SessionSuffixContradiction).sequence;
+    let (mount, reservation) = resolve_and_reserve_actor_mount_inner(
+        &state,
+        state.drive_pool().unwrap(),
+        SERIAL,
+        &TAPE,
+        Some(TAPE),
+    )
+    .await
+    .expect("supersede mount admits its suffix fence");
+    assert_eq!(mount.bay, BAY);
+    assert_eq!(mount.source_slot, None, "seated recovery does not reach G2");
+    drop(reservation);
+    let error = resolve_and_reserve_actor_mount(&state, state.drive_pool().unwrap(), SERIAL, &TAPE)
+        .await
+        .err()
+        .expect("ordinary mount must refuse the suffix fence");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "open session blocked by active tape-I/O fence; inspect rem tape quarantine list"
+    );
+    raise(lib::FenceCause::TransferError);
+    let error = resolve_and_reserve_actor_mount_inner(
+        &state,
+        state.drive_pool().unwrap(),
+        SERIAL,
+        &TAPE,
+        Some(TAPE),
+    )
+    .await
+    .err()
+    .expect("supersede mount must refuse an unrelated tape fence");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "open session blocked by active tape-I/O fence; inspect rem tape quarantine list"
+    );
+    assert!(
+        runtime.active_fence(suffix).is_some(),
+        "resolution never releases the fence"
+    );
+    assert!(changer.try_recv().is_err());
+    assert!(drives.iter_mut().all(|rx| rx.try_recv().is_err()));
+}
