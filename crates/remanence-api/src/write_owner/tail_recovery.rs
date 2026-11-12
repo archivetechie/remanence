@@ -27,6 +27,11 @@ pub(crate) fn supersede_mounted_tail(
         .ensure_motion_allowed()
         .map_err(|e| failure(e.to_string()))?;
     library.catch_up().map_err(|e| failure(e.to_string()))?;
+    if let Some(lag) = library.projection_lag(tape_uuid) {
+        return Err(failure(format!(
+            "the tape's catalog is behind its native log; retry after it catches up: {lag}"
+        )));
+    }
     let tape = index
         .get_tape(&tape_uuid)
         .map_err(crate::status_from_state_error)?

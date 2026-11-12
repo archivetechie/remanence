@@ -149,6 +149,11 @@ impl lib::authority::FinalizationView for NativeIdentityView {
 /// native view and sticky motion fence; it does not open an audit writer.
 #[derive(Clone)]
 pub struct LibraryRuntime(Arc<Inner>);
+/// A failed tape apply, retained until projection reaches its frozen prefix.
+struct ProjectionLag {
+    error: String,
+    last_closed_sequence: u64,
+}
 struct Inner {
     authority: LibraryAuthority,
     view: Mutex<NativeTapeView>,
@@ -159,6 +164,7 @@ struct Inner {
     manifest: AuthorityManifest,
     motion_fenced: AtomicBool,
     projection_dirty: AtomicBool,
+    projection_lag: Mutex<std::collections::BTreeMap<lib::Id, ProjectionLag>>,
     #[cfg(any(test, feature = "fixtures"))]
     source_projection_lag: Mutex<Vec<std::time::Duration>>,
     #[cfg(test)]
@@ -270,16 +276,37 @@ impl LibraryRuntime {
         // Library identities/assignments precede native sessions and terminal
         // state. Every native prefix was validated before either replay starts.
         let fenced = authority.with_fold(native_floor::fenced_tapes);
+        let mut projection_lag = std::collections::BTreeMap::new();
         for native in view.snapshots() {
             if fenced.contains(&native.header().tape_uuid) {
                 continue;
             }
+            let tape = native.header().tape_uuid;
+            let last_closed_sequence = native.summary().last_closed_sequence;
             let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
-            if let ProjectionResult::Failed { error, .. } = projector.project(
+            match projector.project(
                 AuthorityRecord::Tape(Box::new(snapshot)),
                 ApplyPath::Startup,
             )? {
-                return Err(error.into());
+                ProjectionResult::Failed {
+                    error: ApplyError::Catalog(error),
+                    ..
+                } if error.is_deferrable_projection_failure() => {
+                    projection_lag.insert(
+                        tape,
+                        ProjectionLag {
+                            error: error.to_string(),
+                            last_closed_sequence,
+                        },
+                    );
+                }
+                ProjectionResult::Failed { error, .. } => {
+                    projection_lag.remove(&tape);
+                    return Err(error.into());
+                }
+                _ => {
+                    projection_lag.remove(&tape);
+                }
             }
         }
         let ack_progress = view
@@ -306,6 +333,7 @@ impl LibraryRuntime {
             manifest,
             motion_fenced: AtomicBool::new(false),
             projection_dirty: AtomicBool::new(false),
+            projection_lag: Mutex::new(projection_lag),
             #[cfg(any(test, feature = "fixtures"))]
             source_projection_lag: Mutex::new(Vec::new()),
         })))
@@ -443,13 +471,45 @@ impl LibraryRuntime {
             if fenced.contains(&native.header().tape_uuid) {
                 continue;
             }
+            let tape = native.header().tape_uuid;
+            let last_closed_sequence = native.summary().last_closed_sequence;
             let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
-            if let ProjectionResult::Failed { error, .. } = self
+            match self
                 .0
                 .projector
                 .project(AuthorityRecord::Tape(Box::new(snapshot)), ApplyPath::Live)?
             {
-                return Err(error.into());
+                ProjectionResult::Failed {
+                    error: ApplyError::Catalog(error),
+                    ..
+                } if error.is_deferrable_projection_failure() => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            tape,
+                            ProjectionLag {
+                                error: error.to_string(),
+                                last_closed_sequence,
+                            },
+                        );
+                }
+                ProjectionResult::Failed { error, .. } => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    return Err(error.into());
+                }
+                _ => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                }
             }
         }
         self.0.projection_dirty.store(false, Ordering::Release);
@@ -460,6 +520,16 @@ impl LibraryRuntime {
     pub fn catch_up(&self) -> Result<(), RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         self.catch_up_locked()
+    }
+
+    /// Last deferrable catalog failure for this tape, if projection still lags.
+    pub fn projection_lag(&self, tape: lib::Id) -> Option<String> {
+        self.0
+            .projection_lag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&tape)
+            .map(|lag| lag.error.clone())
     }
 
     /// Rebuild from the shared writer's immutable prefixes under dispatch
@@ -723,90 +793,141 @@ impl LibraryRuntime {
         self.0
             .native_projection_waiters
             .fetch_sub(1, Ordering::SeqCst);
-        {
-            let mut view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
-            if !view
-                .accepts_snapshot(&snapshot.raw)
-                .map_err(|e| ApplyError::Catalog(StateError::from(e)))?
+        let tape = snapshot.raw.header().tape_uuid;
+        // Pre-apply errors must discard any earlier deferrable classification,
+        // including errors from the nested catch-up. Keep snapshot selection
+        // based on the same prior progress as before.
+        let current = (|| {
             {
-                return Err(ApplyError::Catalog(StateError::JournalReplayFailed(
-                    "native snapshot belongs to a replaced repair source".into(),
-                )));
-            }
-            view.refresh(snapshot.raw.clone())
-                .map_err(|e| ApplyError::Catalog(StateError::from(e)))?;
-        }
-        before_apply();
-        let view = self
-            .0
-            .view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let source = self
-            .0
-            .authority
-            .snapshot()
-            .map_err(|e| ApplyError::Catalog(StateError::JournalReplayFailed(e.to_string())))?;
-        let prior = self
-            .0
-            .ack_progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&snapshot.raw.header().tape_uuid)
-            .copied();
-        let already_validated = prior
-            .is_some_and(|(through, _)| through >= snapshot.raw.summary().last_closed_sequence);
-        let checked = if already_validated {
-            0
-        } else {
-            match lib::session_ack::validate_new(snapshot.raw.clone(), prior, |applied| {
-                source.replay(&view, applied)
-            }) {
-                Ok(checked) => checked,
-                Err(error) => {
-                    self.0.motion_fenced.store(true, Ordering::Release);
-                    return Err(ApplyError::Catalog(error));
+                let mut view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                if !view
+                    .accepts_snapshot(&snapshot.raw)
+                    .map_err(|e| ApplyError::Catalog(StateError::from(e)))?
+                {
+                    return Err(ApplyError::Catalog(StateError::JournalReplayFailed(
+                        "native snapshot belongs to a replaced repair source".into(),
+                    )));
                 }
+                view.refresh(snapshot.raw.clone())
+                    .map_err(|e| ApplyError::Catalog(StateError::from(e)))?;
             }
-        };
-        #[cfg(test)]
-        self.0
-            .ack_frames_checked
-            .fetch_add(checked, Ordering::Relaxed);
-        #[cfg(not(test))]
-        let _ = checked;
-        if !already_validated {
-            self.0
+            before_apply();
+            let view = self
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let source =
+                self.0.authority.snapshot().map_err(|e| {
+                    ApplyError::Catalog(StateError::JournalReplayFailed(e.to_string()))
+                })?;
+            let prior = self
+                .0
                 .ack_progress
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    snapshot.raw.header().tape_uuid,
-                    (
-                        snapshot.raw.summary().last_closed_sequence,
-                        snapshot.raw.summary().closed_end,
-                    ),
-                );
-        }
-        if self.0.projection_dirty.load(Ordering::Acquire) {
-            self.catch_up_locked()
-                .map_err(|e| ApplyError::Catalog(StateError::JournalReplayFailed(e.to_string())))?;
-        }
-        self.0.projection_dirty.store(true, Ordering::Release);
-        let current = if prior
-            .is_some_and(|(through, _)| through > snapshot.raw.summary().last_closed_sequence)
-        {
-            view.snapshots()
-                .find(|s| s.header().tape_uuid == snapshot.raw.header().tape_uuid)
-                .map(crate::tape_log::authority::AuthoritySnapshot::new)
-                .transpose()
-                .map_err(ApplyError::Catalog)?
-                .unwrap_or_else(|| snapshot.clone())
-        } else {
-            snapshot.clone()
+                .get(&snapshot.raw.header().tape_uuid)
+                .copied();
+            let already_validated = prior
+                .is_some_and(|(through, _)| through >= snapshot.raw.summary().last_closed_sequence);
+            let checked = if already_validated {
+                0
+            } else {
+                match lib::session_ack::validate_new(snapshot.raw.clone(), prior, |applied| {
+                    source.replay(&view, applied)
+                }) {
+                    Ok(checked) => checked,
+                    Err(error) => {
+                        self.0.motion_fenced.store(true, Ordering::Release);
+                        return Err(ApplyError::Catalog(error));
+                    }
+                }
+            };
+            #[cfg(test)]
+            self.0
+                .ack_frames_checked
+                .fetch_add(checked, Ordering::Relaxed);
+            #[cfg(not(test))]
+            let _ = checked;
+            if !already_validated {
+                self.0
+                    .ack_progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        snapshot.raw.header().tape_uuid,
+                        (
+                            snapshot.raw.summary().last_closed_sequence,
+                            snapshot.raw.summary().closed_end,
+                        ),
+                    );
+            }
+            if self.0.projection_dirty.load(Ordering::Acquire) {
+                self.catch_up_locked().map_err(|e| {
+                    ApplyError::Catalog(StateError::JournalReplayFailed(e.to_string()))
+                })?;
+            }
+            self.0.projection_dirty.store(true, Ordering::Release);
+            let current = if prior
+                .is_some_and(|(through, _)| through > snapshot.raw.summary().last_closed_sequence)
+            {
+                view.snapshots()
+                    .find(|s| s.header().tape_uuid == snapshot.raw.header().tape_uuid)
+                    .map(crate::tape_log::authority::AuthoritySnapshot::new)
+                    .transpose()
+                    .map_err(ApplyError::Catalog)?
+                    .unwrap_or_else(|| snapshot.clone())
+            } else {
+                snapshot.clone()
+            };
+            Ok(current)
+        })();
+        let current = match current {
+            Ok(current) => current,
+            Err(error) => {
+                self.0
+                    .projection_lag
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&tape);
+                return Err(error);
+            }
         };
-        let result = index.apply_frozen(&AuthorityRecord::Tape(Box::new(current)), path)?;
+        let last_closed_sequence = current.raw.summary().last_closed_sequence;
+        let result = index.apply_frozen(&AuthorityRecord::Tape(Box::new(current)), path);
+        {
+            let mut lags = self
+                .0
+                .projection_lag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match &result {
+                Ok(_) => {
+                    // Catch-up may have failed on a newer view while this call
+                    // still selects the older requested snapshot (D-N2-2).
+                    if lags
+                        .get(&tape)
+                        .is_some_and(|lag| last_closed_sequence >= lag.last_closed_sequence)
+                    {
+                        lags.remove(&tape);
+                    }
+                }
+                Err(ApplyError::Catalog(error)) if error.is_deferrable_projection_failure() => {
+                    lags.insert(
+                        tape,
+                        ProjectionLag {
+                            error: error.to_string(),
+                            last_closed_sequence,
+                        },
+                    );
+                }
+                Err(_) => {
+                    lags.remove(&tape);
+                }
+            }
+        }
+        let result = result?;
         self.0.projection_dirty.store(false, Ordering::Release);
         Ok(result)
     }
@@ -1039,3 +1160,6 @@ mod verdict_tests;
 
 #[cfg(test)]
 mod measurements;
+
+#[cfg(test)]
+mod projection_lag_tests;

@@ -128,9 +128,31 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
         // Ambiguous publication is reconciled explicitly by the authority
         // owner; startup does not use a disposable SQL mark to clear it.
         let snapshot = journal.freeze().map_err(status_from_state_error)?;
-        index
-            .project_tape_log(&snapshot)
-            .map_err(status_from_state_error)?;
+        if let Err(error) = index.project_tape_log(&snapshot) {
+            let deferrable = index.library_runtime().map_or_else(
+                || error.is_deferrable_projection_failure(),
+                |runtime| runtime.projection_lag(tape_uuid).is_some(),
+            );
+            let summary = snapshot.tape_summary();
+            if deferrable
+                && (summary.closeout_due()
+                    || summary.seal_due.is_some()
+                    || summary.finalization.is_some())
+            {
+                tracing::warn!(
+                    tape_uuid = %uuid::Uuid::from_bytes(tape_uuid),
+                    %error,
+                    "startup projection deferred; native closeout obligation retained"
+                );
+                continue;
+            }
+            tracing::error!(
+                tape_uuid = %uuid::Uuid::from_bytes(tape_uuid),
+                %error,
+                "startup tape projection failed"
+            );
+            return Err(status_from_state_error(error));
+        }
         let pending_intent = journal
             .pending_finalization()
             .map_err(status_from_state_error)?;
@@ -261,3 +283,6 @@ pub(crate) fn live_status_config_from(config: &remanence_state::LiveStatusConfig
     parse_simple_duration(config.min_poll_interval.as_str())
         .unwrap_or_else(|| Duration::from_millis(250))
 }
+
+#[cfg(test)]
+mod projection_lag_tests;

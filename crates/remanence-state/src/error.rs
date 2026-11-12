@@ -132,6 +132,14 @@ fn io_path_suffix(path: &Option<PathBuf>) -> IoPathSuffix<'_> {
 }
 
 impl StateError {
+    /// A tape's catalog update can be retried without stopping other tapes.
+    pub fn is_deferrable_projection_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Index { .. } | Self::Io { .. } | Self::DiskFull(_)
+        )
+    }
+
     /// Build an I/O error with operation context and a path.
     pub fn io_at(
         context: impl Into<String>,
