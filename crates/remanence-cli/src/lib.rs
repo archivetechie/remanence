@@ -8495,7 +8495,7 @@ fn run_tape_quarantine(
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            if quarantine.starts_with("tioq-") {
+            if quarantine.starts_with("tioq-") || quarantine.starts_with("library:") {
                 match release_fence_via_daemon(&config, quarantine, ack, *force) {
                     Ok(Some(record)) => {
                         return print_tape_io_quarantine_released(&record, *json, out, err)
