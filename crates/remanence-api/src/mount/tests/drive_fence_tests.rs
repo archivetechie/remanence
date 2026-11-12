@@ -475,8 +475,7 @@ async fn c0b3c_supersede_mount_admits_only_own_suffix_fences() {
     drop(reservation);
     let error = resolve_and_reserve_actor_mount(&state, state.drive_pool().unwrap(), SERIAL, &TAPE)
         .await
-        .err()
-        .expect("ordinary mount must refuse the suffix fence");
+        .expect_err("ordinary mount must refuse the suffix fence");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         error.message(),
@@ -491,8 +490,7 @@ async fn c0b3c_supersede_mount_admits_only_own_suffix_fences() {
         Some(TAPE),
     )
     .await
-    .err()
-    .expect("supersede mount must refuse an unrelated tape fence");
+    .expect_err("supersede mount must refuse an unrelated tape fence");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         error.message(),
