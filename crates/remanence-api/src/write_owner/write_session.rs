@@ -2889,7 +2889,10 @@ pub(crate) fn raise_tape_io_fence(
         .append(|authority, view| {
             authority.fence_raised(
                 lib::FenceRaised {
-                    detail: lib::Bounded(vec![]),
+                    detail: crate::append_admission::tape_fence_detail(
+                        input.barcode.as_deref(),
+                        input.evidence_json.as_deref(),
+                    ),
                     kind: lib::FenceKind::Write,
                     scope: lib::FenceScope::Tape(tape.tape),
                     cause,

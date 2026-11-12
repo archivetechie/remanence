@@ -649,6 +649,34 @@ fn finish_admission_refusal(
     })
 }
 
+/// Preserve the tape fence producer's label and evidence within the library log's
+/// Text bound, so live projection and replay copy the same diagnostic values.
+pub(crate) fn tape_fence_detail(
+    barcode: Option<&str>,
+    evidence_json: Option<&str>,
+) -> remanence_state::library_log::Bounded<remanence_state::library_log::DiagnosticEntry, 256> {
+    use remanence_state::library_log as lib;
+    let mut detail = std::collections::BTreeMap::<lib::Text, lib::DiagnosticValue>::new();
+    for (key, value) in [
+        ("barcode", barcode.map(str::trim)),
+        ("evidence_json", evidence_json),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            let mut end = value.len().min(4096);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.insert(key.into(), lib::DiagnosticValue::Text(value[..end].into()));
+        }
+    }
+    lib::Bounded(
+        detail
+            .into_iter()
+            .map(|(key, value)| lib::DiagnosticEntry(key, value))
+            .collect(),
+    )
+}
+
 /// A stale physical tail disables this tape alone. Probe failures without writes
 /// remain retryable and do not create durable quarantine or recovery state.
 pub(crate) fn daemon_admission_error(
@@ -693,10 +721,21 @@ pub(crate) fn daemon_admission_error(
             "append refusal cannot be durably fenced: tape has no Reprovision authority",
         );
     };
+    let barcode = match index.get_tape(&tape_uuid) {
+        Ok(Some(tape)) => tape.voltag,
+        other => {
+            tracing::error!(
+                ?other,
+                "cannot resolve barcode for admission fence; retain UUID identity"
+            );
+            None
+        }
+    };
+    let evidence = serde_json::json!({"error": detail}).to_string();
     match library.append(|authority, view| {
         authority.fence_raised(
             lib::FenceRaised {
-                detail: lib::Bounded(vec![]),
+                detail: tape_fence_detail(barcode.as_deref(), Some(&evidence)),
                 kind: lib::FenceKind::Write,
                 scope: lib::FenceScope::Tape(tape.tape),
                 cause: lib::FenceCause::SessionSuffixContradiction,

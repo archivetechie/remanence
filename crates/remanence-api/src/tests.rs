@@ -10847,9 +10847,36 @@ impl TypedRoot {
     }
 
     /// A root whose library log already holds a Reprovision for each `(tape_uuid, label)`. The
-    /// tapes are provisioned through `StateHandle::provision_tape`, the operator command's funnel,
+    /// tapes are provisioned with Changer provenance and label-derived media evidence,
     /// before the runtime opens, so a typed write fence can name them.
     pub(crate) fn open_with_tapes(tapes: &[([u8; 16], &str)]) -> Self {
+        Self::open_with_tape_inputs(tapes.iter().map(|(tape_uuid, label)| {
+            (
+                ProvisionTapeInput {
+                    tape_uuid: *tape_uuid,
+                    voltag: (*label).into(),
+                    block_size: 256 * 1024,
+                    parity: ParityConfig::None,
+                    force: false,
+                },
+                remanence_state::LabelProvenance::Changer,
+                remanence_state::MediaObservation::label_hint(label),
+            )
+        }))
+    }
+
+    /// Provision each tape's geometry, label provenance and media evidence through typed authority
+    /// before opening the runtime.
+    pub(crate) fn open_with_tape_inputs(
+        tapes: impl IntoIterator<
+            Item = (
+                ProvisionTapeInput,
+                remanence_state::LabelProvenance,
+                Option<remanence_state::MediaObservation>,
+            ),
+        >,
+    ) -> Self {
+        let tapes: Vec<_> = tapes.into_iter().collect();
         let root = tempfile::tempdir().unwrap();
         let paths = remanence_state::StatePaths {
             config_path: root.path().join("config"),
@@ -10864,15 +10891,9 @@ impl TypedRoot {
             let config = Self::config_for(root.path());
             let mut state =
                 remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
-            for (tape_uuid, label) in tapes {
+            for (tape, provenance, observation) in tapes {
                 state
-                    .provision_tape(ProvisionTapeInput {
-                        tape_uuid: *tape_uuid,
-                        voltag: (*label).into(),
-                        block_size: 256 * 1024,
-                        parity: ParityConfig::None,
-                        force: false,
-                    })
+                    .provision_tape_with_media(tape, provenance, observation)
                     .unwrap();
             }
         }

@@ -1275,6 +1275,8 @@ modes is u32, nonzero; bits 7–31 must be zero (InvalidSchema).
 
 All detail arrays reuse DiagnosticEntry and are limited to 256 entries. Keys are unique and strictly ascending in UTF-8 byte order; producers construct them through BTreeMap<Text, DiagnosticValue>. Human-readable reason is presentation only and never selects a decision.
 
+Write fences on a tape scope other than cause 14 may carry `barcode` (Text: the tape's label when the producer could read it) and `evidence_json` (Text: the producer's evidence as compact JSON). The barcode is stored trimmed. Each value is cut to at most 4096 bytes at a UTF-8 character boundary; cut evidence need not remain valid JSON. The projector copies these entries into the fence row without looking up the tape.
+
 FenceRaised cause 14 uses the following typed evidence keys (in byte order):
 
 | Key | DiagnosticValue type / meaning |

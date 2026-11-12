@@ -139,7 +139,7 @@ fn checked_closeout_terminal_retry_fence_legacy_and_reservation() {
     check_closeout_route(true, None);
 }
 
-/// Exercise real catalog and audit failures after both readback passes disagree.
+/// Exercise real catalog lookup and projection failures after both readback passes disagree.
 #[derive(Clone, Copy)]
 enum FenceFailure {
     BarcodeLookup,
@@ -157,7 +157,7 @@ fn checked_closeout_fence_write_failure_preserves_mismatch_and_detail() {
 }
 
 fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
-    check_closeout_route_case(terminal, fence_failure, None);
+    check_closeout_route_case(terminal, fence_failure, None, false);
 }
 
 /// Inject only after committed data has been read: initial admission is good.
@@ -165,7 +165,7 @@ fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
 fn checked_rebuild_routes_refuse_bad_cursor_before_write() {
     for terminal in [false, true] {
         for fault in ["data", "short", "missing", "io", "lba", "partition"] {
-            check_closeout_route_case(terminal, None, Some(fault));
+            check_closeout_route_case(terminal, None, Some(fault), false);
         }
     }
 }
@@ -187,7 +187,7 @@ fn checked_rebuild_read_fault_classification() {
             "read_transport",
             "read_timeout",
         ] {
-            check_closeout_route_case(terminal, None, Some(fault));
+            check_closeout_route_case(terminal, None, Some(fault), false);
         }
     }
 }
@@ -196,8 +196,11 @@ fn check_closeout_route_case(
     terminal: bool,
     fence_failure: Option<FenceFailure>,
     cursor_fault: Option<&'static str>,
+    rebuild: bool,
 ) {
-    let cases = if cursor_fault.is_some() {
+    let cases = if rebuild {
+        &[(2, false, false)][..]
+    } else if cursor_fault.is_some() {
         &[(0, false, false)][..]
     } else if fence_failure.is_some() {
         &[(2, false, false)][..]
@@ -216,15 +219,6 @@ fn check_closeout_route_case(
         let root = tempfile::tempdir().unwrap();
         let (_drive, world, _) = crate::resume_vectors::model(&vector, &input);
         let library = open_model_library(Arc::clone(&world));
-        let mut cfg = test_write_owner_config(
-            root.path().join("index.sqlite"),
-            root.path().join("audit"),
-            &library,
-            library_snapshot_cell(library.library().clone()),
-        );
-        let mut index = remanence_state::projector::open(&cfg.index_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
         let selected = SelectedTape {
             standalone_endpoint: None,
             pool_id: "closeout".into(),
@@ -232,15 +226,26 @@ fn check_closeout_route_case(
             block_size: crate::tape_image_vectors::BLOCK,
             parity_config: ParityConfig::Scheme(vector.written.inputs.scheme.clone()),
         };
-        index
-            .provision_tape(ProvisionTapeInput {
+        let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+            ProvisionTapeInput {
                 tape_uuid: selected.tape_uuid,
                 voltag: "RESUME001".into(),
                 block_size: selected.block_size,
                 parity: selected.parity_config.clone(),
                 force: false,
-            })
-            .unwrap();
+            },
+            remanence_state::LabelProvenance::Operator,
+            Some(remanence_state::MediaObservation {
+                generation: remanence_state::LtoGen::Lto9,
+                source: remanence_state::GenerationSource::Operator,
+            }),
+        )]);
+        let mut cfg = test_typed_write_owner_config(
+            &typed,
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        let mut index = typed.catalog().write_handle();
         let mut journal =
             crate::resume_vectors::adapt(&input, &vector, &root.path().join("rows")).unwrap();
         let snapshot = journal.committed_snapshot_bounded().unwrap();
@@ -332,7 +337,13 @@ fn check_closeout_route_case(
             assert!(index.get_tape(&selected.tape_uuid).is_err());
         }
         if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
-            std::fs::write(&cfg.fixture_audit().audit_dir, b"not an audit directory").unwrap();
+            rusqlite::Connection::open(&cfg.index_path)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER closeout_fence_projection_fault BEFORE INSERT ON tape_io_fences
+                     BEGIN SELECT RAISE(FAIL, 'injected closeout fence projection failure'); END;",
+                )
+                .unwrap();
         }
         let result = if terminal {
             let mut permit = None;
@@ -413,11 +424,10 @@ fn check_closeout_route_case(
                         .contains("additionally failed to persist the required tape fence:"),
                     "{status}"
                 );
-                assert!(status.message().contains("create audit dir"), "{status}");
                 assert!(
                     status
                         .message()
-                        .contains(cfg.fixture_audit().audit_dir.to_str().unwrap()),
+                        .contains("injected closeout fence projection failure"),
                     "{status}"
                 );
             }
@@ -451,18 +461,55 @@ fn check_closeout_route_case(
                 .execute_batch("ALTER TABLE closeout_hidden_objects RENAME TO objects")
                 .unwrap();
         }
+        let paths = typed.paths().clone();
+        let live_fences = if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
+            assert!(index
+                .tape_io_admission_conflicts(&selected.tape_uuid, Some("RESUME001"))
+                .unwrap()
+                .is_empty());
+            rusqlite::Connection::open(&cfg.index_path)
+                .unwrap()
+                .execute_batch("DROP TRIGGER closeout_fence_projection_fault")
+                .unwrap();
+            None
+        } else {
+            Some(
+                index
+                    .tape_io_admission_conflicts(&selected.tape_uuid, Some("RESUME001"))
+                    .unwrap(),
+            )
+        };
         drop(index);
-        let reopened = remanence_state::projector::open(&cfg.index_path)
+        drop(cfg);
+        typed.release();
+        // A projection failure leaves a durable record; startup replays it after the fault is removed.
+        let recovered = matches!(fence_failure, Some(FenceFailure::FenceWrite)).then(|| {
+            remanence_state::library_runtime::LibraryRuntime::open(
+                &paths,
+                true,
+                Arc::new(remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap()),
+            )
+            .unwrap()
+        });
+        let reopened = remanence_state::projector::open(&paths.sqlite_path)
             .map(|catalog| catalog.write_handle())
             .unwrap();
         let fences = reopened
             .tape_io_admission_conflicts(&selected.tape_uuid, Some("RESUME001"))
             .unwrap();
-        if corrupt == 2 && !legacy && !matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
+        if let Some(live) = live_fences {
+            assert_eq!(
+                fences, live,
+                "reopened catalog must retain the live fence rows"
+            );
+        }
+        if corrupt == 2 && !legacy {
             assert_eq!(fences.len(), 1);
-            assert_eq!(fences[0].reason, "CloseoutCheckMismatch");
+            assert_eq!(fences[0].reason, "closeout_check_mismatch");
             if matches!(fence_failure, Some(FenceFailure::BarcodeLookup)) {
                 assert!(fences[0].barcode.is_none());
+            } else {
+                assert_eq!(fences[0].barcode.as_deref(), Some("RESUME001"));
             }
             assert!(fences[0]
                 .evidence_json
@@ -480,10 +527,238 @@ fn check_closeout_route_case(
                 "{cursor_fault:?}, terminal={terminal}"
             );
             if contradiction {
-                assert_eq!(fences[0].reason, "CloseoutReadContradiction");
+                assert_eq!(fences[0].reason, "closeout_read_contradiction");
             }
         } else if cursor_fault.is_none() {
             assert!(fences.is_empty());
         }
+        if rebuild {
+            drop(reopened);
+            drop(recovered);
+            let rebuilt = rebuild_fence_catalog(&paths);
+            let replayed = rebuilt
+                .write_handle()
+                .tape_io_admission_conflicts(&selected.tape_uuid, Some("RESUME001"))
+                .unwrap();
+            assert_eq!(
+                replayed, fences,
+                "library-log rebuild must preserve producer diagnostics"
+            );
+        }
+    }
+}
+
+/// A real two-read mismatch keeps the producer's diagnostics through an empty-catalog rebuild.
+#[test]
+fn typed_closeout_fence_diagnostics_survive_catalog_rebuild() {
+    check_closeout_route_case(false, None, None, true);
+}
+
+/// Recreate the disposable projection from the durable library log, with no old SQLite state.
+fn rebuild_fence_catalog(paths: &remanence_state::StatePaths) -> remanence_state::ProjectionClient {
+    for path in [
+        paths.sqlite_path.clone(),
+        PathBuf::from(format!("{}-wal", paths.sqlite_path.display())),
+        PathBuf::from(format!("{}-shm", paths.sqlite_path.display())),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => panic!("remove catalog: {error}"),
+        }
+    }
+    let runtime = remanence_state::library_runtime::LibraryRuntime::open(
+        paths,
+        true,
+        Arc::new(remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap()),
+    )
+    .unwrap();
+    remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime)
+}
+
+/// Oversized diagnostics must not lose the fence when a UTF-8 character straddles the wire bound.
+#[test]
+fn typed_tape_fence_cuts_diagnostics_at_utf8_boundary() {
+    let tape_uuid = [0xc1; 16];
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "DIAG01L9")]);
+    let mut index = typed.catalog().write_handle();
+    let cfg = TerminalWriteConfig {
+        authority: TerminalAuthority::Typed(typed.catalog().library_runtime().unwrap()),
+        io_memory: test_io_memory(),
+        mounted_endpoint: None,
+        checkpoint_journal_dir: typed.paths().journal_dir.join("tapes"),
+    };
+    let evidence = format!("{{\"error\":\"{}é trailing\"}}", "x".repeat(4085));
+    assert_eq!(&evidence.as_bytes()[4095..4097], "é".as_bytes());
+    let barcode = format!("{}é trailing", "b".repeat(4095));
+    let fence = raise_tape_io_fence(
+        &mut index,
+        &cfg,
+        remanence_state::TapeIoFenceInput {
+            tape_uuid,
+            barcode: Some(barcode),
+            reason: "closeout_check_mismatch".into(),
+            evidence_json: Some(evidence.clone()),
+        },
+        None,
+        None,
+    )
+    .expect("oversized diagnostics must still persist the fence");
+    assert_eq!(fence.evidence_json.as_deref(), Some(&evidence[..4095]));
+    assert_eq!(fence.barcode.as_deref(), Some("b".repeat(4095).as_str()));
+}
+
+/// An ASCII value at the wire bound must survive in full, rather than lose its last byte.
+#[test]
+fn typed_tape_fence_keeps_4096_byte_ascii_evidence() {
+    let evidence = "x".repeat(4096);
+    check_typed_tape_fence_diagnostics("DIAG01L9", &evidence, Some("DIAG01L9"), Some(&evidence));
+}
+
+/// One ASCII byte beyond the wire bound must be cut without losing the fence.
+#[test]
+fn typed_tape_fence_cuts_4097_byte_ascii_evidence() {
+    let evidence = "x".repeat(4097);
+    check_typed_tape_fence_diagnostics(
+        "DIAG01L9",
+        &evidence,
+        Some("DIAG01L9"),
+        Some(&evidence[..4096]),
+    );
+}
+
+/// Empty producer evidence is absent from the record and NULL in the projected row.
+#[test]
+fn typed_tape_fence_omits_empty_evidence() {
+    check_typed_tape_fence_diagnostics("DIAG01L9", "", Some("DIAG01L9"), None);
+}
+
+/// A label containing only spaces contributes no barcode entry or projected barcode.
+#[test]
+fn typed_tape_fence_omits_blank_barcode() {
+    let evidence = r#"{"attempts":2}"#;
+    check_typed_tape_fence_diagnostics("  ", evidence, None, Some(evidence));
+}
+
+/// Check both the durable detail entries and their projection through the typed write funnel.
+fn check_typed_tape_fence_diagnostics(
+    barcode: &str,
+    evidence: &str,
+    expected_barcode: Option<&str>,
+    expected_evidence: Option<&str>,
+) {
+    use remanence_state::library_log as lib;
+
+    let tape_uuid = [0xc3; 16];
+    let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "DIAG01L9")]);
+    let mut index = typed.catalog().write_handle();
+    let cfg = TerminalWriteConfig {
+        authority: TerminalAuthority::Typed(typed.catalog().library_runtime().unwrap()),
+        io_memory: test_io_memory(),
+        mounted_endpoint: None,
+        checkpoint_journal_dir: typed.paths().journal_dir.join("tapes"),
+    };
+    let fence = raise_tape_io_fence(
+        &mut index,
+        &cfg,
+        remanence_state::TapeIoFenceInput {
+            tape_uuid,
+            barcode: Some(barcode.into()),
+            reason: "closeout_check_mismatch".into(),
+            evidence_json: Some(evidence.into()),
+        },
+        None,
+        None,
+    )
+    .expect("boundary diagnostics must still persist the fence");
+    assert_eq!(fence.evidence_json.as_deref(), expected_evidence);
+    assert_eq!(fence.barcode.as_deref(), expected_barcode);
+    let source = cfg
+        .authority
+        .runtime()
+        .unwrap()
+        .fence_for_quarantine_id(&fence.quarantine_id)
+        .expect("the projected fence has a durable typed source");
+    let expected = [
+        ("barcode", expected_barcode),
+        ("evidence_json", expected_evidence),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| {
+        value
+            .map(|value| lib::DiagnosticEntry(key.into(), lib::DiagnosticValue::Text(value.into())))
+    })
+    .collect();
+    assert_eq!(source.detail, lib::Bounded(expected));
+}
+
+/// The recovery-required admission branch bypasses the funnel but must keep its own error text.
+#[test]
+fn typed_admission_recovery_fence_records_error() {
+    use crate::append_admission::{
+        admission_error_outcome, daemon_admission_error, AdmissionError,
+    };
+    let tape_uuid = [0xc2; 16];
+    for fail_lookup in [false, true] {
+        let mut typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "DIAG01L9")]);
+        let mut index = typed.catalog().write_handle();
+        let cfg = TerminalWriteConfig {
+            authority: TerminalAuthority::Typed(typed.catalog().library_runtime().unwrap()),
+            io_memory: test_io_memory(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: typed.paths().journal_dir.join("tapes"),
+        };
+        if fail_lookup {
+            rusqlite::Connection::open(&typed.paths().sqlite_path)
+                .unwrap()
+                .execute_batch("ALTER TABLE objects RENAME TO admission_hidden_objects")
+                .unwrap();
+            assert!(index.get_tape(&tape_uuid).is_err());
+        }
+        let error = AdmissionError::from("injected recovery refusal \"detail\"".to_owned());
+        let expected = serde_json::json!({"error": error.to_string()}).to_string();
+        let outcome = admission_error_outcome(&error);
+        assert!(outcome.recovery_required);
+        assert!(!matches!(
+            outcome.effect,
+            remanence_library::outcome::Effect::WriteFence(_)
+        ));
+        let status = daemon_admission_error(
+            AuditActor::System,
+            &mut index,
+            &cfg,
+            tape_uuid,
+            error,
+            &outcome,
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let fences = index.tape_io_admission_conflicts(&tape_uuid, None).unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, "session_suffix_contradiction");
+        assert_eq!(fences[0].evidence_json.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            fences[0].barcode.as_deref(),
+            (!fail_lookup).then_some("DIAG01L9")
+        );
+        if fail_lookup {
+            rusqlite::Connection::open(&typed.paths().sqlite_path)
+                .unwrap()
+                .execute_batch("ALTER TABLE admission_hidden_objects RENAME TO objects")
+                .unwrap();
+        }
+        drop(index);
+        drop(cfg);
+        typed.release();
+        let rebuilt = rebuild_fence_catalog(typed.paths());
+        let replayed = rebuilt
+            .write_handle()
+            .tape_io_admission_conflicts(&tape_uuid, None)
+            .unwrap();
+        assert_eq!(
+            replayed, fences,
+            "admission error and producer barcode survive log replay"
+        );
     }
 }

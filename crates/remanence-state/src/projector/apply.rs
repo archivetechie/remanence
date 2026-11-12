@@ -949,13 +949,24 @@ impl CatalogCore {
             }
             Body::FenceRaised(v) => match &v.scope {
                 lib::FenceScope::Tape(tape) => {
+                    let text_detail = |key: &str| {
+                        if v.cause == lib::FenceCause::NativeLogBehindProjection {
+                            return None;
+                        }
+                        v.detail.0.iter().find_map(|entry| match &entry.1 {
+                            lib::DiagnosticValue::Text(text) if entry.0.as_str() == key => {
+                                Some(text.0.clone())
+                            }
+                            _ => None,
+                        })
+                    };
                     project_fence_core(
                         &self.conn,
                         TapeIoFenceInput {
                             tape_uuid: tape.uuid,
-                            barcode: None,
+                            barcode: text_detail("barcode"),
                             reason: spelling(v.cause),
-                            evidence_json: None,
+                            evidence_json: text_detail("evidence_json"),
                         },
                         &format!("library:{}", value.sequence),
                         &at,
