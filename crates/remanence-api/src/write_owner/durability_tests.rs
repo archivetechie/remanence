@@ -678,123 +678,6 @@ async fn close_writer(
     thread.join().expect("write-session engine does not panic");
 }
 
-async fn trace_session(root: &Path, skip_barrier: bool) -> Vec<Cut> {
-    let world = setup(root);
-    let files = MemoryDirectory::default();
-    let trace = Arc::new(Mutex::new(Trace {
-        active: true,
-        ..Trace::default()
-    }));
-    let _registration = register(root.to_owned(), Arc::new(files.clone()));
-    files.observe(Some(Arc::new({
-        let trace = trace.clone();
-        let world = world.clone();
-        let files = files.clone();
-        let root = root.to_owned();
-        move |event: FileEvent| {
-            let before_sync = if let FileEvent::BeforeSync(path) = &event {
-                Some(path.clone())
-            } else {
-                None
-            };
-            capture(
-                &trace,
-                &world,
-                &files,
-                &root,
-                format!("{event:?}"),
-                before_sync,
-            )
-        }
-    })));
-    let model = world.lock().unwrap().library_snapshot();
-    let library = model
-        .open_with(&remanence_library::StaticAllowlist::new([LIBRARY]), {
-            let world = world.clone();
-            let files = files.clone();
-            let trace = trace.clone();
-            let root = root.to_owned();
-            move |path| {
-                let role = world.lock().unwrap().role_for_path(path).unwrap();
-                Ok(Box::new(CrashTransport {
-                    inner: ModelTransport::new(world.clone(), role),
-                    world: world.clone(),
-                    files: files.clone(),
-                    trace: trace.clone(),
-                    root: root.clone(),
-                    skip_barrier,
-                }))
-            }
-        })
-        .unwrap();
-    let (tx, opened, thread) = open_writer(root, library).await;
-    let id = opened.unwrap();
-    for number in 0..3 {
-        let payload = format!("durable object {number}: exact bytes\0\u{ff}").into_bytes();
-        let outcome = append_actor_test_file(
-            &tx,
-            id,
-            root.join(format!("input-{number}")),
-            &format!("file-{number}"),
-            &format!("caller-{number}"),
-            &payload,
-        )
-        .await;
-        assert_eq!(
-            outcome
-                .record
-                .append_commit_info
-                .as_ref()
-                .unwrap()
-                .durability,
-            pb::AppendDurability::Written as i32
-        );
-        let (reply, received) = oneshot::channel();
-        tx.send(DriveCommand::Checkpoint {
-            session_id: id,
-            trigger: CheckpointTrigger::Explicit,
-            expected_batch_id: None,
-            reply: Some(reply),
-        })
-        .await
-        .unwrap();
-        let checkpoint = received.await.unwrap().unwrap();
-        assert_eq!(checkpoint.committed_objects.len(), 1);
-        let object = &checkpoint.committed_objects[0];
-        assert_eq!(
-            object.append_commit_info.as_ref().unwrap().durability,
-            pb::AppendDurability::Checkpointed as i32
-        );
-        let index = remanence_state::projector::open(root.join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        let object_id = Uuid::from_slice(&object.object_id).unwrap().to_string();
-        let copy = &index.find_native_object_instances(&object_id).unwrap()[0];
-        let start = copy.global_start_block.unwrap() as usize;
-        let end = copy.global_end_block.unwrap() as usize + 1;
-        let records = world.lock().unwrap().tapes[BARCODE].records[start..end].to_vec();
-        trace.lock().unwrap().receipts.push(Receipt {
-            id: object_id,
-            payload,
-            start,
-            records,
-        });
-        capture(
-            &trace,
-            &world,
-            &files,
-            root,
-            format!("client commit {number}"),
-            None,
-        );
-    }
-    close_writer(&tx, id, thread).await;
-    trace.lock().unwrap().active = false;
-    files.observe(None);
-    let cuts = std::mem::take(&mut trace.lock().unwrap().cuts);
-    cuts
-}
-
 /// Read exact member bytes through the normal read-session engine after restart.
 async fn read_receipts(
     root: &Path,
@@ -1509,7 +1392,52 @@ async fn open_crash_typed_writer(
 
 /// Trace a typed session with every authority handle opened inside the registration.
 async fn trace_typed_session(skip_barrier: bool) -> (crate::tests::TypedRoot, PathBuf, Vec<Cut>) {
-    let (mut typed, root) = typed_root();
+    let (typed, root) = typed_root();
+    trace_typed_session_from_root(typed, root, skip_barrier).await
+}
+
+/// Finalization needs a source-backed pool assignment, made before any crash capture.
+async fn trace_pooled_typed_session() -> (crate::tests::TypedRoot, PathBuf, Vec<Cut>) {
+    let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: TAPE,
+            voltag: BARCODE.into(),
+            block_size: BLOCK,
+            parity: ParityConfig::Scheme(scheme()),
+            force: false,
+        },
+        remanence_state::LabelProvenance::Operator,
+        Some(MediaObservation {
+            generation: LtoGen::Lto9,
+            source: GenerationSource::Operator,
+        }),
+    )]);
+    let paths = typed.paths().clone();
+    let root = paths.sqlite_path.parent().unwrap().to_owned();
+    let mut config = typed.config();
+    config.tape_pools.push(
+        serde_json::from_value(serde_json::json!({"id": POOL, "block_size": BLOCK})).unwrap(),
+    );
+    typed.release();
+    let mut state = remanence_state::StateHandle::open_with_config(paths, config).unwrap();
+    let generation = state
+        .library_runtime()
+        .tape_state(TAPE)
+        .unwrap()
+        .assignment_generation;
+    state
+        .assign_tape_pool(TAPE, generation, Some(POOL))
+        .unwrap();
+    drop(state);
+    trace_typed_session_from_root(typed, root, false).await
+}
+
+/// Preserve the matrix's write trace while allowing finalization to supply its pooled root.
+async fn trace_typed_session_from_root(
+    mut typed: crate::tests::TypedRoot,
+    root: PathBuf,
+    skip_barrier: bool,
+) -> (crate::tests::TypedRoot, PathBuf, Vec<Cut>) {
     let paths = typed.paths().clone();
     let world = setup(&root);
     typed.release();

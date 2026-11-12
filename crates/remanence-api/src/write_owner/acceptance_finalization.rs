@@ -231,7 +231,7 @@ fn rpc_config(root: &Path) -> remanence_state::RemConfig {
     remanence_state::parse_config_toml(&format!(
         r#"
 [daemon]
-state_dir = "{0}"
+state_dir = "{0}/state"
 default_idle_timeout_seconds = 1800
 drive_idle_unload_seconds = 1800
 io_memory_ceiling = "128 MiB"
@@ -239,13 +239,13 @@ append_ring_bytes = "16 MiB"
 [tape_io]
 read_reservoir_bytes = "16 MiB"
 [journal]
-dir = "{0}/journals"
+dir = "{0}/native"
 require_trusted_volume = false
 [audit]
-dir = "{0}/audit"
+dir = "{0}/library"
 fsync = true
 [index]
-sqlite_path = "{0}/state.sqlite"
+sqlite_path = "{0}/catalog.sqlite"
 [cache]
 tape_catalog_dir = "{0}/cache"
 [[libraries]]
@@ -259,25 +259,40 @@ block_size = {BLOCK}
     .unwrap()
 }
 
+/// Keep the daemon and all startup ownership handles alive until pool shutdown.
+type Started = (
+    ApiState,
+    remanence_state::ProjectionClient,
+    remanence_state::library_runtime::LibraryRuntime,
+    Arc<remanence_state::StateLockGuard>,
+);
+
+/// Open a relocated typed crash image in the production daemon startup order.
 fn start(
     root: &Path,
     world: Arc<Mutex<VirtualWorld>>,
     trace: Arc<Mutex<FinalTrace>>,
     files: MemoryDirectory,
-) -> Result<ApiState, Status> {
+) -> Result<Started, Status> {
     let cfg = rpc_config(root);
-    // Crash images are relocated into an isolated temporary root. Rebind the
-    // fixture marker to that root, exactly as its config paths are rebased.
-    std::fs::create_dir_all(&cfg.journal.dir).unwrap();
-    std::fs::write(
-        root.join("authority-format"),
-        format!(
-            "{}\n{}\n",
-            remanence_state::authority_layout::FORMAT,
-            serde_json::to_string(&cfg.journal.dir.canonicalize().unwrap()).unwrap()
-        ),
+    let paths = remanence_state::StatePaths::from_config(root.join("config"), &cfg);
+    remanence_state::authority_manifest::AuthorityManifest::preflight(&paths)
+        .map_err(|e| Status::internal(format!("manifest preflight: {e}")))?;
+    let lock = Arc::new(
+        remanence_state::StateLockGuard::acquire(&paths.state_dir)
+            .map_err(|e| Status::internal(format!("state lock: {e}")))?,
+    );
+    remanence_state::authority_layout::admit_owned_config(&cfg)
+        .map_err(|e| Status::internal(format!("owned-config admission: {e}")))?;
+    let runtime = remanence_state::library_runtime::LibraryRuntime::open(
+        &paths,
+        cfg.audit.fsync,
+        lock.clone(),
     )
-    .unwrap();
+    .map_err(|e| Status::internal(format!("runtime open: {e}")))?;
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .map_err(|e| Status::internal(format!("catalog open: {e}")))?
+        .with_library_runtime(runtime.clone());
     std::fs::create_dir_all(root.join("spool")).unwrap();
     let report = remanence_library::DiscoveryReport {
         libraries: vec![world.lock().unwrap().library_snapshot()],
@@ -286,8 +301,8 @@ fn start(
         incomplete_evidence: vec![],
         warnings: vec![],
     };
-    ApiState::with_drive_pool_opener(
-        remanence_state::projector::open(root.join("state.sqlite")).unwrap(),
+    let api = ApiState::with_drive_pool_opener(
+        catalog.clone(),
         &cfg,
         report,
         remanence_library::StaticAllowlist::new([LIBRARY]),
@@ -312,7 +327,8 @@ fn start(
                 }
             })
         },
-    )
+    )?;
+    Ok((api, catalog, runtime, lock))
 }
 
 async fn request(api: &ApiState) -> Result<pb::TapeFinalization, Status> {
@@ -380,7 +396,8 @@ async fn settled(api: &ApiState) -> Result<pb::TapeFinalization, String> {
     .map_err(|_| "finalization remains in progress".to_string())?
 }
 
-async fn stop(api: &ApiState) {
+async fn stop(started: Started) {
+    let api = &started.0;
     api.begin_shutdown();
     if let Err(error) = api.shutdown_drive_pool().await {
         eprintln!("cleanup: {error}");
@@ -389,6 +406,7 @@ async fn stop(api: &ApiState) {
 
 struct Session {
     root: tempfile::TempDir,
+    seed_journal_root: PathBuf,
     cuts: Vec<FinalCut>,
     records: Vec<Record>,
     receipts: Vec<Receipt>,
@@ -398,23 +416,46 @@ struct Session {
     lost_cut: Option<usize>,
 }
 
+/// Relocate only the current format marker after validating its original seed binding.
+fn rebind_finalization_marker(root: &Path, seed_journal_root: &Path) -> Result<(), String> {
+    let marker_bytes = |journal_root: &Path| {
+        format!(
+            "remanence-tape-log-v2\n{}\n",
+            serde_json::to_string(journal_root).unwrap()
+        )
+        .into_bytes()
+    };
+    let marker = root.join("state/authority-format");
+    let original = std::fs::read(&marker).map_err(|e| format!("read format marker: {e}"))?;
+    if original != marker_bytes(seed_journal_root) {
+        return Err("format marker does not exactly match the typed seed's journal root".into());
+    }
+    let staged_journal_root = root
+        .join("native")
+        .canonicalize()
+        .map_err(|e| format!("resolve staged journal root: {e}"))?;
+    std::fs::write(marker, marker_bytes(&staged_journal_root))
+        .map_err(|e| format!("rebind format marker: {e}"))
+}
+
 async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
     // The write engine supplies three acknowledged Objects and a short epoch.
-    let seed = tempfile::tempdir().unwrap();
-    let baseline = trace_session(seed.path(), false).await.pop().unwrap();
+    let (seed, source, mut cuts) = trace_pooled_typed_session().await;
+    let baseline = cuts.pop().unwrap();
+    let seed_journal_root = source.join("native").canonicalize().unwrap();
     let root = tempfile::tempdir().unwrap();
     restore_disk(root.path(), &baseline.disk);
-    baseline
-        .files
-        .materialize(seed.path(), root.path())
-        .unwrap();
+    baseline.files.materialize(&source, root.path()).unwrap();
+    rebind_typed_crash_root(root.path()).unwrap();
+    rebind_finalization_marker(root.path(), &seed_journal_root).unwrap();
     let files = MemoryDirectory::default();
     for (path, bytes) in baseline.files.files() {
         files.seed(
-            root.path().join(path.strip_prefix(seed.path()).unwrap()),
+            root.path().join(path.strip_prefix(&source).unwrap()),
             bytes.written.clone(),
         );
     }
+    drop(seed);
     let mut world = baseline.world;
     world.tapes.get_mut(BARCODE).unwrap().records = baseline.records.as_ref().clone();
     world.tapes.get_mut(BARCODE).unwrap().capacity_bytes = 8 * 1024 * 1024 * 1024;
@@ -425,7 +466,8 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
         ..FinalTrace::default()
     }));
     let registration = register(root.path().to_owned(), Arc::new(files.clone()));
-    let api = start(root.path(), world.clone(), trace.clone(), files.clone()).unwrap();
+    let daemon = start(root.path(), world.clone(), trace.clone(), files.clone()).unwrap();
+    let api = &daemon.0;
     files.observe(Some(Arc::new({
         let world = world.clone();
         let trace = trace.clone();
@@ -455,8 +497,8 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
         "before FinalizeTape".into(),
         None,
     );
-    request(&api).await.unwrap();
-    let result = settled(&api).await.unwrap();
+    request(api).await.unwrap();
+    let result = settled(api).await.unwrap();
     if lose_filemark.is_none() {
         assert_eq!(
             result.outcome,
@@ -479,8 +521,7 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
     );
     trace.lock().unwrap().active = false;
     files.observe(None);
-    stop(&api).await;
-    drop(api);
+    stop(daemon).await;
     drop(registration);
     let cuts = std::mem::take(&mut trace.lock().unwrap().cuts);
     // Read the immutable decision from a snapshot before completion retires it.
@@ -491,11 +532,15 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
             let temp = tempfile::tempdir().unwrap();
             restore_disk(temp.path(), &cut.disk);
             cut.files.materialize(root.path(), temp.path()).unwrap();
-            remanence_state::authority::fixtures::AuthorityBuilder::new(
-                temp.path().join("journals/tapes"),
+            let paths = remanence_state::StatePaths::from_config(
+                temp.path().join("config"),
+                &rpc_config(temp.path()),
+            );
+            remanence_state::TapeAuthority::open(
+                paths.journal_dir.join("tapes"),
                 TAPE,
+                &paths.sqlite_path,
             )
-            .build()
             .ok()?
             .pending_finalization()
             .ok()
@@ -528,6 +573,7 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
     let lost_cut = trace.lock().unwrap().lost_cut;
     Session {
         root,
+        seed_journal_root,
         cuts,
         intent,
         prefix,
@@ -619,6 +665,8 @@ async fn check(
     let mut files = cut.files.as_ref().clone();
     files.crash(&tails, keep_entries).unwrap();
     files.materialize(session.root.path(), temp.path()).unwrap();
+    rebind_typed_crash_root(temp.path()).map_err(|e| e.to_string())?;
+    rebind_finalization_marker(temp.path(), &session.seed_journal_root)?;
     let mut world = cut.world.clone();
     world.tapes.get_mut(BARCODE).unwrap().records = session.records[..cut.end].to_vec();
     world.power_cut(BAY, keep).unwrap();
@@ -650,24 +698,25 @@ async fn check(
         allowed_files,
         ..FinalTrace::default()
     }));
-    let api = start(
+    let daemon = start(
         temp.path(),
         world.clone(),
         recovery_trace,
         MemoryDirectory::default(),
     )
     .map_err(|e| format!("startup: {e}"))?;
+    let api = &daemon.0;
     let outcome = async {
         let mut route = "startup";
         // Startup projects and schedules accepted intents. Before acceptance,
         // the operator repeats the same public request and idempotency key.
-        let mut result = match status(&api).await {
+        let mut result = match status(api).await {
             Err(error) if error.code() == tonic::Code::NotFound => {
                 route = "operator retry";
-                request(&api).await.map_err(|e| format!("operator retry: {e}"))?;
-                settled(&api).await?
+                request(api).await.map_err(|e| format!("operator retry: {e}"))?;
+                settled(api).await?
             }
-            _ => settled(&api).await?,
+            _ => settled(api).await?,
         };
         if result.outcome != pb::TapeFinalizationOutcome::Finalized as i32 {
             route = "operator retry";
@@ -681,8 +730,8 @@ async fn check(
                 })).await.map_err(|e| format!("operator release: {e}"))?;
                 route = "operator release and retry";
             }
-            request(&api).await.map_err(|e| format!("operator retry: {e}"))?;
-            result = settled(&api).await?;
+            request(api).await.map_err(|e| format!("operator retry: {e}"))?;
+            result = settled(api).await?;
         }
         if result.outcome != pb::TapeFinalizationOutcome::Finalized as i32 {
             return Err(format!("unfinished: {result:?}"));
@@ -753,8 +802,8 @@ async fn check(
         }
         Ok(route)
     }.await;
-    let readable = read_objects(&api, &session.receipts).await;
-    stop(&api).await;
+    let readable = read_objects(api, &session.receipts).await;
+    stop(daemon).await;
     match (outcome, readable) {
         (Ok(route), Ok(())) => Ok(route),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
