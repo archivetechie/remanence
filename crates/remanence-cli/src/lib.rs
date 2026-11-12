@@ -17947,29 +17947,55 @@ mod tests {
         assert!(release_fence_via_daemon(&config, "tioq-missing", " ", false).is_err());
     }
 
+    /// Keep typed daemon ownership and raise a tape fence through its library authority.
+    fn fence_release_test_state(config: &Path) -> (remanence_state::StateHandle, String) {
+        use remanence_state::library_log as lib;
+
+        let mut state = remanence_state::StateHandle::open_from_config_file(config).unwrap();
+        let tape_uuid = [0x31; 16];
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CLI031L9".into(),
+                block_size: 262144,
+                parity: remanence_api::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let fence = state
+            .library_runtime()
+            .append(|a, view| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(lib::TapeRef {
+                            uuid: tape_uuid,
+                            incarnation: 1,
+                        }),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .unwrap()
+            .sequence;
+        (state, format!("library:{fence}"))
+    }
+
     /// A connected CLI releases through gRPC while the daemon retains the state lock.
     #[test]
     fn fence_release_cli_rpc_works_with_daemon_state_lock() {
         daemon_runtime().unwrap().block_on(async {
             let dir = tempfile::tempdir().unwrap();
-            let _lock = remanence_state::StateLockGuard::acquire(dir.path()).unwrap();
-            let mut index = remanence_state::projector::open(dir.path().join("state.sqlite"))
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
-            let fence = index
-                .record_tape_io_fence(remanence_state::TapeIoFenceInput {
-                    tape_uuid: [0x31; 16],
-                    barcode: None,
-                    reason: "transfer_error".into(),
-                    evidence_json: None,
-                })
-                .unwrap();
-            let state = remanence_api::ApiState::new({
-                let index = index;
-                let catalog = remanence_state::projector::open(index.path()).unwrap();
-                drop(index);
-                catalog
-            });
+            let config = write_retire_test_config(dir.path());
+            let (daemon_state, quarantine_id) = fence_release_test_state(&config);
+            let state = remanence_api::ApiState::new(daemon_state.projection_client());
             let (client, server) = tokio::io::duplex(65536);
             let task = tokio::spawn(
                 tonic::transport::Server::builder()
@@ -17987,7 +18013,7 @@ mod tests {
                 .await
                 .unwrap();
             let released =
-                release_fence_on_channel(channel.clone(), &fence.quarantine_id, "verified", false)
+                release_fence_on_channel(channel.clone(), &quarantine_id, "verified", false)
                     .await
                     .unwrap();
             assert_eq!(released.state, "released");
@@ -17999,6 +18025,7 @@ mod tests {
             );
             assert!(remanence_state::StateLockGuard::acquire(dir.path()).is_err());
             task.abort();
+            drop(daemon_state);
         });
     }
 
@@ -25858,18 +25885,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     fn read_only_commands_pass_layout_validation_beside_the_daemon_state_lock() {
         let root = tempfile::tempdir().unwrap();
         let config = write_retire_test_config(root.path());
-        drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
-        let sqlite = root.path().join("index/rem-state.sqlite");
-        let fence = remanence_state::projector::open(&sqlite)
-            .map(|catalog| catalog.write_handle())
-            .unwrap()
-            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
-                tape_uuid: [0x31; 16],
-                barcode: None,
-                reason: "transfer_error".into(),
-                evidence_json: None,
-            })
-            .unwrap();
+        let (daemon_state, quarantine_id) = fence_release_test_state(&config);
         let log = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/tape-log/parity-off-two-objects.remtape");
         fs::copy(
@@ -25880,20 +25896,14 @@ tape_catalog_dir = "{0}/cache/tapes"
         .unwrap();
 
         // The daemon: lifetime state lock, open catalog, served socket.
-        let _lock = remanence_state::StateLockGuard::acquire(root.path()).unwrap();
-        let _catalog = remanence_state::projector::open(&sqlite)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
         let listener =
             std::os::unix::net::UnixListener::bind(root.path().join("rem.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server_sqlite = sqlite.clone();
+        let server_catalog = daemon_state.projection_client();
         let server = std::thread::spawn(move || {
             daemon_runtime().unwrap().block_on(async move {
-                let state = remanence_api::ApiState::new(
-                    remanence_state::projector::open(&server_sqlite).unwrap(),
-                );
+                let state = remanence_api::ApiState::new(server_catalog);
                 let incoming = tokio_stream::wrappers::UnixListenerStream::new(
                     tokio::net::UnixListener::from_std(listener).unwrap(),
                 );
@@ -25976,7 +25986,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             "tape",
             "quarantine",
             "release",
-            &fence.quarantine_id,
+            &quarantine_id,
             "--after-settled-inventory",
             "--ack",
             "verified",
@@ -26039,6 +26049,7 @@ tape_catalog_dir = "{0}/cache/tapes"
 
         stop.send(()).unwrap();
         server.join().unwrap();
+        drop(daemon_state);
     }
 
     pub(super) fn write_retire_test_config(root: &Path) -> PathBuf {
