@@ -3728,30 +3728,102 @@ mod tests {
     /// Tape-I/O fencing suppresses automatic readiness until the daemon releases it.
     #[tokio::test]
     async fn auto_resume_skips_tape_io_fence_until_rpc_release() {
-        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
-        let record = state
-            .index()
-            .unwrap()
-            .media_readiness_operation(id)
-            .unwrap()
-            .unwrap();
-        let fence = {
+        use remanence_state::library_log as lib;
+
+        let tape_uuid = [0x31; 16];
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "S30002L9")]);
+        let mut state = root.api_state();
+        state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report: DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
+                    libraries: vec![mk_library()],
+                    warnings: Vec::new(),
+                },
+                captured_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        let (changer, _) = tokio::sync::mpsc::channel(1);
+        let (drive, mut rx) = tokio::sync::mpsc::channel(4);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer,
+            HashMap::from([(1, drive)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        ));
+        let runtime = root.catalog().library_runtime().unwrap();
+        let id = Uuid::from_bytes(
+            runtime
+                .start_owned_operation(
+                    lib::OperationKind::MediaReadinessWait,
+                    remanence_state::AuditActor::System,
+                )
+                .unwrap(),
+        );
+        {
             let mut index = state.catalog.write_handle();
+            index
+                .observe_drive(DriveObservationInput {
+                    serial: "8031BDC7D1".to_string(),
+                    identity_source: "DvcidInline".to_string(),
+                    vendor: Some("HPE".to_string()),
+                    product: Some("Ultrium 9-SCSI".to_string()),
+                    firmware_rev: Some("R1.0".to_string()),
+                    managed: "rem".to_string(),
+                    library_serial: Some("DEC418146K_LL02".to_string()),
+                    element_address: Some(1),
+                    observed_at_utc: None,
+                })
+                .unwrap();
             if let Some(pool) = &state.drive_pool {
                 index.set_readiness_observer(pool.readiness_wake.clone());
             }
             index
         }
-        .record_tape_io_fence_at_endpoint(
-            remanence_state::TapeIoFenceInput {
-                tape_uuid: [0; 16],
-                barcode: record.barcode,
-                reason: "transfer_error".into(),
-                evidence_json: None,
-            },
-            Some(&record.endpoint),
-        )
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("8031BDC7D1".into()),
+            barcode: Some("S30002L9".into()),
+            source_slot: Some(0x040a),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "session_open_short_probe".into(),
+            state: "becoming_ready".into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
         .unwrap();
+        // This RPC releases tape fences; typed drive fences have their own release path.
+        let fence = runtime
+            .append(|a, view| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(lib::TapeRef {
+                            uuid: tape_uuid,
+                            incarnation: 1,
+                        }),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .unwrap()
+            .sequence;
         crate::readiness_wait::spawn_auto_resume(state.clone());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(rx.try_recv().is_err());
@@ -3760,7 +3832,7 @@ mod tests {
             &state.library_service(),
             Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
-                quarantine_id: fence.quarantine_id,
+                quarantine_id: format!("library:{fence}"),
                 acknowledgment: "drive verified".into(),
             }),
         )
