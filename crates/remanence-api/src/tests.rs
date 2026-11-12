@@ -10450,11 +10450,12 @@ fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
     assert!(evidence.is_unchanged().unwrap());
 }
 
-/// The typed release RPC refreshes tape admission and refuses to release drive fences.
+/// The typed release RPC validates requests, preserves evidence, refreshes tape admission,
+/// and refuses to release drive fences.
 #[tokio::test]
 async fn release_fence_rpc_and_live_admission() {
     use pb::{daemon_server::Daemon, library_service_server::LibraryService};
-    use remanence_state::library_log as lib;
+    use remanence_state::{library_log as lib, library_runtime::DriveDataRefusal};
 
     let typed = TypedRoot::open_with_tapes(&[(POOL_WRITE_TAPE_UUID, "RMN004L9")]);
     {
@@ -10592,13 +10593,15 @@ async fn release_fence_rpc_and_live_admission() {
             )
         })
         .unwrap();
-    assert!(runtime
-        .admit_drive_data(
+    assert!(matches!(
+        runtime.admit_drive_data(
             &endpoint,
             remanence_state::library_runtime::RefusalSubject::Tape(None),
             lib::AuditActor::System,
-        )
-        .is_err());
+        ),
+        Err(DriveDataRefusal::Fenced(f))
+            if f.fence == drive_fence.sequence && f.cause == lib::FenceCause::TransferError
+    ));
     let refused = library
         .release_tape_io_fence(request(
             &format!("library:{}", drive_fence.sequence),
@@ -10609,13 +10612,15 @@ async fn release_fence_rpc_and_live_admission() {
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(refused.message().contains("fence is not tape-scoped"));
     assert!(runtime.active_fence(drive_fence.sequence).is_some());
-    assert!(runtime
-        .admit_drive_data(
+    assert!(matches!(
+        runtime.admit_drive_data(
             &endpoint,
             remanence_state::library_runtime::RefusalSubject::Tape(None),
             lib::AuditActor::System,
-        )
-        .is_err());
+        ),
+        Err(DriveDataRefusal::Fenced(f))
+            if f.fence == drive_fence.sequence && f.cause == lib::FenceCause::TransferError
+    ));
 }
 
 /// Startup logs one warning per scoped fence and rejects malformed endpoint evidence.
