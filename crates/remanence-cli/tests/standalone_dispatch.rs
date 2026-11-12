@@ -944,10 +944,15 @@ impl VersionFixture {
         fixture.ok(&["tape", "init", "--label", "FIRST", "--generation", "L9"]);
         fixture
     }
-    /// Use the same initialized tape, changer, and production actor setup for both transports.
-    fn daemon_state(&self, mode: remanence_state::AppendStagingMode) -> remanence_api::ApiState {
+    /// Start both transports on the initialized tape with the production shared runtime.
+    /// Keep the returned state handle alive until the daemon and its services are dropped.
+    fn daemon_state(
+        &self,
+        mode: remanence_state::AppendStagingMode,
+    ) -> (remanence_state::StateHandle, remanence_api::ApiState) {
         let f = self;
-        let mut config = remanence_state::load_config(f.config()).unwrap();
+        let handle = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+        let mut config = handle.config().clone();
         // The daemon owns a real changer slot for mount and shutdown dismount.
         {
             let mut world = f.world.lock().unwrap();
@@ -974,12 +979,7 @@ impl VersionFixture {
         std::fs::create_dir_all(&spool).unwrap();
         let world = f.world.clone();
         let state = remanence_api::ApiState::with_drive_pool_opener(
-            {
-                let index = f.index();
-                let catalog = remanence_state::projector::open(index.path()).unwrap();
-                drop(index);
-                catalog
-            },
+            handle.projection_client(),
             &config,
             remanence_library::DiscoveryReport {
                 libraries: vec![library.clone()],
@@ -1007,7 +1007,7 @@ impl VersionFixture {
             },
         )
         .unwrap();
-        state
+        (handle, state)
     }
     fn new_tape(&self, label: &str) {
         self.world.lock().unwrap().put_tape_in_drive(
@@ -2976,22 +2976,23 @@ fn daemon_put_get_preserves_mtime() {
             .unwrap();
         let socket = f.root.path().join("daemon.sock");
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let server = {
+        let (handle, server) = {
             let _entered = runtime.enter();
-            let state = f.daemon_state(mode);
+            let (handle, state) = f.daemon_state(mode);
             // Fail loudly at the actual socket operation when sandbox policy forbids it.
             let probe = std::os::unix::net::UnixListener::bind(&socket)
                 .expect("daemon test requires Unix sockets");
             drop(probe);
             std::fs::remove_file(&socket).unwrap();
             let socket = socket.clone();
-            runtime.spawn(async move {
+            let server = runtime.spawn(async move {
                 remanence_daemon::serve(state, &socket, None, async {
                     stopped.await.unwrap();
                 })
                 .await
                 .unwrap()
-            })
+            });
+            (handle, server)
         };
         for _ in 0..100 {
             if socket.exists() {
@@ -3045,6 +3046,8 @@ fn daemon_put_get_preserves_mtime() {
         );
         stop.send(()).unwrap();
         runtime.block_on(server).unwrap();
+        drop(runtime);
+        drop(handle);
     }
 }
 
@@ -3223,7 +3226,7 @@ async fn in_process_daemon_append_preserves_mtime() {
         remanence_state::AppendStagingMode::Overlap,
     ] {
         let f = VersionFixture::with_parity(false);
-        let state = f.daemon_state(mode);
+        let (handle, state) = f.daemon_state(mode);
         let service = state.write_session_service();
         let session = service
             .open_write_session(tonic::Request::new(pb::OpenWriteSessionRequest {
@@ -3325,6 +3328,11 @@ async fn in_process_daemon_append_preserves_mtime() {
             .await
             .unwrap();
         state.shutdown_drive_pool().await.unwrap();
+        drop(stream);
+        drop(reader);
+        drop(service);
+        drop(state);
+        drop(handle);
     }
 }
 
