@@ -19,6 +19,8 @@ use remanence_parity::{
     TerminalPrefixReconcileEvidence, TerminalTailStepOutcome, TerminalTailWriteError,
     TerminalTripleWritePlan,
 };
+use remanence_state::library_log::{authority::AuthorityError, store::StoreError, FoldError};
+use remanence_state::library_runtime::RuntimeError;
 use remanence_state::{
     AuditActor, AuditEvent, CatalogIndex, TapePoolConfig, TerminalFinalizationOutcome,
     TerminalFinalizationProjectionInput,
@@ -27,7 +29,8 @@ use tonic::Status;
 use uuid::Uuid;
 
 /// The refusal text for a `FinalizeTape` idempotency key already bound to a different request,
-/// wherever a bound request's fingerprint is compared (not yet the ConflictingDuplicate refusal).
+/// on every admission, preflight and replay path, the typed acceptance's `ConflictingDuplicate`
+/// included.
 pub(crate) const FINALIZE_TAPE_IDEMPOTENCY_CONFLICT: &str =
     "FinalizeTape idempotency key is already bound to a different request";
 
@@ -1067,8 +1070,13 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                     },
                     request.actor.clone(),
                 )
-                .map_err(|e| {
-                    Status::failed_precondition(format!("accept typed finalization request: {e}"))
+                .map_err(|e| match e {
+                    RuntimeError::Authority(AuthorityError::Store(StoreError::Fold(
+                        FoldError::ConflictingDuplicate,
+                    ))) => Status::already_exists(FINALIZE_TAPE_IDEMPOTENCY_CONFLICT),
+                    e => Status::failed_precondition(format!(
+                        "accept typed finalization request: {e}"
+                    )),
                 })?;
             request.candidate_operation_id = Uuid::from_bytes(operation);
         }

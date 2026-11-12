@@ -1371,7 +1371,7 @@ async fn run_started_manual_finalize_worker(
         }
         Err(error) => {
             let summary = format!(
-                "{}; finalization operation {id} remains incomplete",
+                "{}; finalization operation {id} remains incomplete; the tape keeps this request's finalization intent, so neither a retry with the same idempotency key nor a request with a new key can finish it in this release",
                 error.message()
             );
             let recorded = record_finalize_attempt(
@@ -8151,7 +8151,8 @@ mod tests {
             .unwrap();
         assert_eq!(failed.state, "failed");
         let summary = failed.error_summary.unwrap();
-        assert!(summary.contains("same idempotency key"));
+        assert!(summary.contains("remains incomplete"));
+        assert!(summary.contains("keeps this request's finalization intent"));
         let polled =
             <crate::CatalogService as crate::pb::catalog_server::Catalog>::get_tape_finalization(
                 &state.catalog_service(),
@@ -8243,7 +8244,10 @@ mod tests {
         .await
         .unwrap_err();
         assert!(deadline_error.message().contains("deadline expired"));
-        assert!(deadline_error.message().contains("same idempotency key"));
+        assert!(deadline_error.message().contains("remains incomplete"));
+        assert!(deadline_error
+            .message()
+            .contains("keeps this request's finalization intent"));
         assert_eq!(
             state
                 .index()
@@ -8310,7 +8314,10 @@ mod tests {
             typed_error.metadata().get("remanence-retry").unwrap(),
             "operator"
         );
-        assert!(typed_error.message().contains("same idempotency key"));
+        assert!(typed_error.message().contains("remains incomplete"));
+        assert!(typed_error
+            .message()
+            .contains("keeps this request's finalization intent"));
 
         let mut recovery_index = remanence_state::projector::open(&index_path)
             .map(|catalog| catalog.write_handle())

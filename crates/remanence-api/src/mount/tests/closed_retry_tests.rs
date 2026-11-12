@@ -1729,6 +1729,74 @@ fn preflight_of_a_same_key_request_with_another_fingerprint_is_refused_with_the_
     assert_eq!(durable_bytes(typed.paths()), before, "preflight wrote");
 }
 
+/// A crash after typed operation acceptance leaves path A to detect the conflicting body.
+#[test]
+fn preflight_conflicting_typed_acceptance_without_intent_uses_the_conflict_text() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let mut index = state.catalog.write_handle();
+    let (tape, mut request) = prepare_manual_finalize_request(&index, admission(0xF3), |pool_id| {
+        state.pool_config(pool_id)
+    })
+    .expect("no-motion admission before the conflicting acceptance");
+    let runtime = state.catalog.library_runtime().unwrap();
+    runtime
+        .begin_manual_finalization(
+            lib::Accepted {
+                actor_fingerprint: request.actor_fingerprint.as_str().into(),
+                idempotency_key: Some(*request.idempotency_key.as_bytes()),
+                request_fingerprint: [0xB4; 32],
+                subject: Some(
+                    Uuid::from_bytes(request.tape_uuid)
+                        .to_string()
+                        .as_str()
+                        .into(),
+                ),
+            },
+            request.actor.clone(),
+        )
+        .expect("plant only the conflicting OperationRecorded Accepted");
+    assert!(runtime
+        .manual_acceptance_by_request(
+            &request.actor_fingerprint,
+            *request.idempotency_key.as_bytes(),
+        )
+        .unwrap()
+        .is_none());
+    assert!(remanence_state::TapeAuthority::open(
+        state.checkpoint_journal_dir.as_ref(),
+        TAPE,
+        index.path(),
+    )
+    .unwrap()
+    .pending_finalization()
+    .unwrap()
+    .is_none());
+    let before = durable_bytes(typed.paths());
+    let error = crate::write_owner::preflight_manual_finalize_cancellable(
+        &mut index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::from_api(&state).unwrap(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+        },
+        tape.voltag.as_deref(),
+        &mut request,
+        None,
+        || false,
+    )
+    .expect_err("a conflicting typed acceptance under a bound key is refused");
+    drop(index);
+    assert_eq!(error.code(), tonic::Code::AlreadyExists, "{error}");
+    assert_eq!(
+        error.message(),
+        "FinalizeTape idempotency key is already bound to a different request"
+    );
+    assert_eq!(durable_bytes(typed.paths()), before, "preflight wrote");
+}
+
 #[test]
 fn the_finalize_rpc_with_a_changed_reason_under_a_bound_key_is_refused_with_the_conflict_text() {
     let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
