@@ -270,6 +270,154 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
     }
 }
 
+/// Exercise unknown completion with the shared runtime and release its tape fences by source ID.
+async fn typed_lost_interrupted_session() {
+    let (typed, root) = typed_root();
+    let world = setup(root.as_path());
+    let (entered, reached) = oneshot::channel();
+    let gate = Arc::new(CommandGate {
+        armed: AtomicBool::new(false),
+        entered: Mutex::new(Some(entered)),
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+        sidecar: false,
+        opcode: None,
+        lost: true,
+    });
+    let model = world.lock().unwrap().library_snapshot();
+    let w = world.clone();
+    let g = gate.clone();
+    let library = model
+        .open_with(
+            &remanence_library::StaticAllowlist::new([LIBRARY]),
+            move |path| {
+                let role = w.lock().unwrap().role_for_path(path).unwrap();
+                Ok::<Box<dyn SgTransport>, remanence_library::IoErrorKind>(Box::new(
+                    GatedTransport {
+                        inner: ModelTransport::new(w.clone(), role),
+                        gate: g.clone(),
+                    },
+                ))
+            },
+        )
+        .unwrap();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut typed.catalog().write_handle(),
+        [library.library()],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .unwrap();
+    let lifecycle = DrivePoolLifecycle::default();
+    let key = DriveKey::new(LIBRARY, BAY);
+    let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
+    let (tx, opened, thread) =
+        open_typed_writer_configured(&typed, library, selected(), |cfg, _| {
+            cfg.lifecycle = Some(lifecycle.clone());
+            cfg.reservations = reservations.clone();
+        })
+        .await;
+    let id = opened.unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.as_path().join("pending"),
+        "pending",
+        "pending",
+        b"deadline object",
+    )
+    .await;
+    gate.armed.store(true, Ordering::SeqCst);
+    let (reply, _received) = oneshot::channel();
+    tx.send(DriveCommand::Close {
+        session_id: id,
+        reply,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(StdDuration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = world.lock().unwrap().command_log.len();
+    // Graceful shutdown begins while the physical call is still in flight.
+    lifecycle
+        .shutdown_deadline
+        .set(std::time::Instant::now() + StdDuration::from_millis(30))
+        .unwrap();
+    let (changer, _rx) = mpsc::channel(1);
+    let pool = DrivePool::new_with_lifecycle(
+        HashMap::from([(LIBRARY.into(), changer)]),
+        HashMap::from([(key, tx)]),
+        reservations,
+        lifecycle,
+    );
+    pool.record_session(
+        id,
+        MountedSession {
+            bay: BAY,
+            library_serial: LIBRARY.into(),
+            barcode: Some(BARCODE.into()),
+            home_slot: None,
+            tape_uuid: TAPE,
+            drive_uuid: None,
+        },
+    );
+    let mut state = crate::ApiState::new_with_pool_configs(typed.catalog(), vec![super::pool()]);
+    state.checkpoint_journal_dir = Arc::new(typed.paths().journal_dir.join("tapes"));
+    state.drive_idle_unload_seconds = 0;
+    state.drive_pool = Some(pool);
+    let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
+    tokio::time::sleep(StdDuration::from_millis(60)).await;
+    assert!(
+        !shutdown.is_finished(),
+        "issued command must settle before shutdown returns"
+    );
+    assert_eq!(world.lock().unwrap().command_log.len(), before);
+    let settled_at = std::time::Instant::now();
+    gate.release();
+    let _ = tokio::time::timeout(StdDuration::from_secs(3), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    thread.join().unwrap();
+    assert!(settled_at.elapsed() < StdDuration::from_secs(3));
+    assert_eq!(
+        world.lock().unwrap().command_log.len(),
+        before,
+        "only the already issued command may reach the model"
+    );
+    let authority = TapeAuthority::open(
+        typed.paths().journal_dir.join("tapes"),
+        TAPE,
+        &typed.paths().sqlite_path,
+    )
+    .unwrap();
+    let snapshot = authority.freeze().unwrap();
+    let summary = snapshot.tape_summary();
+    let index = typed.catalog().write_handle();
+    assert!(
+        summary.open_session.is_some(),
+        "unknown completion keeps the crash row"
+    );
+    assert!(summary.last_session_end.is_none());
+    let runtime = typed.catalog().library_runtime().unwrap();
+    for fence in index.list_active_tape_io_fences().unwrap() {
+        runtime
+            .release_tape_fence(
+                &fence.quarantine_id,
+                "test transport restored",
+                false,
+                remanence_state::library_log::AuditActor::System,
+            )
+            .unwrap();
+    }
+    let (_tx, opened, thread) =
+        open_typed_writer_configured(&typed, open_model_library(world), selected(), |_, _| {})
+            .await;
+    let error = opened.unwrap_err();
+    assert!(error.message().contains("TailBeyondKnownState"), "{error}");
+    thread.join().unwrap();
+}
+
 #[tokio::test]
 async fn closeout_deadline_settles_sidecar_and_next_open_closes_due_range() {
     interrupted_session(true, false).await;
@@ -280,7 +428,7 @@ async fn final_barrier_deadline_settles_command_and_names_object_tail() {
 }
 #[tokio::test]
 async fn lost_transport_at_settle_bound_leaves_crash_row() {
-    interrupted_session(false, true).await;
+    typed_lost_interrupted_session().await;
 }
 
 /// Both actor requests must arrive before either responds: sequential shutdown

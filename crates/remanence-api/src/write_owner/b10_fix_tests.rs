@@ -88,6 +88,235 @@ fn actor_state(
     state
 }
 
+/// Provision every crash-test tape before opening the shared typed runtime.
+fn typed_crash_root(alternative: bool) -> (crate::tests::TypedRoot, PathBuf) {
+    let mut tapes = vec![(TAPE, BARCODE)];
+    if alternative {
+        tapes.push((OTHER, "ZZZ002L9"));
+    }
+    let typed = crate::tests::TypedRoot::open_with_tape_inputs(tapes.iter().map(|(id, label)| {
+        (
+            ProvisionTapeInput {
+                tape_uuid: *id,
+                voltag: (*label).into(),
+                block_size: BLOCK,
+                parity: ParityConfig::Scheme(scheme()),
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            Some(MediaObservation {
+                generation: LtoGen::Lto9,
+                source: GenerationSource::Operator,
+            }),
+        )
+    }));
+    let root = typed.paths().sqlite_path.parent().unwrap().to_owned();
+    let mut index = typed.catalog().write_handle();
+    index
+        .upsert_tape_pool_projection(TapePoolProjectionInput {
+            pool_id: POOL.into(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        })
+        .unwrap();
+    for (id, _) in tapes {
+        index.project_tape_pool_membership(id, POOL).unwrap();
+    }
+    (typed, root)
+}
+
+/// Start the same actors over the shared typed runtime, leaving worker startup explicit.
+fn typed_actor_state(
+    handle: &remanence_state::StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    policy: PoolSelectionPolicyName,
+) -> crate::ApiState {
+    let mut library = open_model_library(world.clone());
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut handle.write_handle(),
+        [library.library()],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .unwrap();
+    let mut state =
+        crate::ApiState::new_with_pool_configs(handle.projection_client(), vec![pool()]);
+    state.checkpoint_journal_dir = Arc::new(handle.paths().journal_dir.join("tapes"));
+    state.drive_idle_unload_seconds = 0;
+    let lifecycle = DrivePoolLifecycle::default();
+    let bays: Vec<_> = world
+        .lock()
+        .unwrap()
+        .drive_serials
+        .keys()
+        .copied()
+        .collect();
+    let reservations: Arc<HashMap<DriveKey, AtomicBool>> = Arc::new(
+        bays.iter()
+            .map(|b| (DriveKey::new(LIBRARY, *b), AtomicBool::new(false)))
+            .collect(),
+    );
+    let mut cfg = crash_typed_config(handle.paths(), &handle.projection_client(), &library);
+    cfg.lifecycle = Some(lifecycle.clone());
+    cfg.reservations = reservations.clone();
+    let mut policy_cfg = pool();
+    policy_cfg.selection_policy = policy;
+    cfg.tape_pools = vec![policy_cfg.clone()];
+    state.pool_configs = Arc::new(HashMap::from([(POOL.into(), policy_cfg)]));
+    state.library_snapshot = Some(library_snapshot_cell(library.library().clone()));
+    let mut drives = HashMap::new();
+    for bay in bays {
+        let drive = library.open_drive(bay, &cfg.policy).unwrap();
+        drives.insert(
+            DriveKey::new(LIBRARY, bay),
+            spawn_drive_actor(bay, drive, cfg.clone()),
+        );
+    }
+    let (changer, _rx) = mpsc::channel(2);
+    state.drive_pool = Some(DrivePool::new_with_lifecycle(
+        HashMap::from([(LIBRARY.into(), changer)]),
+        drives,
+        reservations,
+        lifecycle,
+    ));
+    state
+}
+
+/// Leave the same crash tail in the typed native journal, after discovery records all drives.
+async fn typed_crash_tail(
+    typed: &mut crate::tests::TypedRoot,
+    root: &Path,
+    alternative: bool,
+) -> (remanence_state::StateHandle, Arc<Mutex<VirtualWorld>>) {
+    let world = setup(root);
+    if alternative {
+        // Only setup's unused legacy catalog is written here; typed provisioning is above.
+        add_tape(root, &world, OTHER, "ZZZ002L9", BAY + 1);
+    }
+    let library = open_model_library(world.clone());
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut typed.catalog().write_handle(),
+        [library.library()],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .unwrap();
+    let lifecycle = DrivePoolLifecycle::default();
+    let (tx, opened, thread) =
+        open_typed_writer_configured(typed, library, selected(), |cfg, _| {
+            cfg.lifecycle = Some(lifecycle.clone())
+        })
+        .await;
+    let id = opened.unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.join("committed"),
+        "committed",
+        "committed",
+        b"committed",
+    )
+    .await;
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Checkpoint {
+        session_id: id,
+        trigger: CheckpointTrigger::Explicit,
+        expected_batch_id: None,
+        reply: Some(reply),
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.join("foreign"),
+        "foreign",
+        "foreign",
+        b"complete crash tail",
+    )
+    .await;
+    lifecycle
+        .shutdown_deadline
+        .set(std::time::Instant::now())
+        .unwrap();
+    lifecycle.shutting_down.store(true, Ordering::SeqCst);
+    // The writer is idle after the append reply. Preserve the catalog at this
+    // crash instant, including its WAL, as the typed crash matrix's disk_image does.
+    // The shared-memory file is regenerated by SQLite when the image is reopened.
+    let mut catalog_image = Vec::new();
+    for suffix in ["", "-wal"] {
+        let path = PathBuf::from(format!("{}{suffix}", typed.paths().sqlite_path.display()));
+        match std::fs::read(&path) {
+            Ok(bytes) => catalog_image.push((path, bytes)),
+            Err(error) if suffix == "-wal" && error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => panic!("copy catalog file {}: {error}", path.display()),
+        }
+    }
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Abort {
+        session_id: id,
+        reason: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    thread.join().unwrap();
+    // Remove the ending group to reproduce exactly the crash before publication.
+    let path = TapeAuthority::list_entries(typed.paths().journal_dir.join("tapes"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut cursor = std::io::Cursor::new(&bytes);
+    remanence_state::tape_log::store::Header::decode(&mut cursor, TAPE).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(
+        &bytes[cursor.position() as usize..],
+        1,
+        cursor.position(),
+    );
+    let mut cut = None;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        if matches!(
+            frame.record,
+            remanence_state::tape_log::Record::SessionEnded(_)
+        ) {
+            cut = Some(frame.offset);
+        }
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(cut.unwrap())
+        .unwrap();
+    // Abort projected an ending group that the simulated crash did not publish.
+    // Release every runtime handle before restoring the catalog from before Abort.
+    typed.release();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", typed.paths().sqlite_path.display()));
+        match std::fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => panic!("remove disposable SQLite file {}: {error}", path.display()),
+        }
+    }
+    for (path, bytes) in catalog_image {
+        std::fs::write(path, bytes).unwrap();
+    }
+    let handle =
+        remanence_state::StateHandle::open_with_config(typed.paths().clone(), typed.config())
+            .unwrap();
+    let library = open_model_library(world.clone());
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut handle.write_handle(),
+        [library.library()],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .unwrap();
+    (handle, world)
+}
 async fn open(state: &crate::ApiState, tape: Option<[u8; 16]>) -> Result<pb::WriteSession, Status> {
     let target = match tape {
         Some(tape_uuid) => crate::mount::WriteSessionTarget::PinnedTape {
@@ -279,19 +508,16 @@ async fn wait_parked(state: &crate::ApiState) {
 #[tokio::test]
 async fn b10_fix_parked_crash_tail_uses_other_tape_and_preserves_refusal() {
     for alternative in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let world = crash_tail(root.path()).await;
-        if alternative {
-            add_tape(root.path(), &world, OTHER, "ZZZ002L9", BAY + 1);
-        }
-        let state = actor_state(root.path(), world, PoolSelectionPolicyName::CompleteOrFill);
+        let (mut typed, root) = typed_crash_root(alternative);
+        let (handle, world) = typed_crash_tail(&mut typed, &root, alternative).await;
+        let state = typed_actor_state(&handle, world, PoolSelectionPolicyName::CompleteOrFill);
         crate::closeout_obligation::spawn(state.clone());
         wait_parked(&state).await;
         if alternative {
             for n in 0..3 {
                 let session = open(&state, None).await.unwrap();
                 assert_eq!(session.tape_uuid, Some(OTHER.to_vec()));
-                write(&state, &session, root.path(), &format!("other-{n}")).await;
+                write(&state, &session, &root, &format!("other-{n}")).await;
                 close(&state, &session).await;
             }
         } else {
@@ -318,9 +544,9 @@ async fn b10_fix_pool_reselects_on_operator_admission_refusal() {
 /// Confirmed tail recovery wakes parked debt and the existing worker closes it.
 #[tokio::test]
 async fn b10_fix_supersede_tail_wakes_parked_worker() {
-    let root = tempfile::tempdir().unwrap();
-    let world = crash_tail(root.path()).await;
-    let state = actor_state(root.path(), world, PoolSelectionPolicyName::CompleteOrFill);
+    let (mut typed, root) = typed_crash_root(false);
+    let (handle, world) = typed_crash_tail(&mut typed, &root, false).await;
+    let state = typed_actor_state(&handle, world, PoolSelectionPolicyName::CompleteOrFill);
     crate::closeout_obligation::spawn(state.clone());
     wait_parked(&state).await;
     let mut request = pb::SupersedeTailRequest {
