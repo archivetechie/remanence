@@ -3654,18 +3654,28 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
     );
 }
 
+/// A short fresh-bootstrap write must persist a typed fence without committing parity rows.
 #[test]
 fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
     const BLOCK_SIZE: u32 = 256 * 1024;
 
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-fresh-parity-bootstrap-fence-")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open test index");
+    let tape_uuid = [0x46; 16];
+    let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
+    let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid,
+            voltag: "PARITY001".into(),
+            block_size: BLOCK_SIZE,
+            parity: ParityConfig::Scheme(scheme.clone()),
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        Some(remanence_state::MediaObservation {
+            generation: crate::LtoGen::Lto9,
+            source: remanence_state::GenerationSource::Operator,
+        }),
+    )]);
+    let mut index = typed.catalog().write_handle();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-FRESH-PARITY-FENCE",
         0x0100,
@@ -3700,15 +3710,7 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
         })
         .expect("open model library");
     let snapshot = library_snapshot_cell(library.library().clone());
-    let audit_dir = temp.path().join("audit");
-    std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-    let mut cfg = test_write_owner_config(index_path, audit_dir.clone(), &library, snapshot);
-    cfg.checkpoint_journal_dir = temp.path().join("journals/tapes");
-    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
-    std::fs::create_dir_all(cfg.checkpoint_journal_dir.parent().expect("journal parent"))
-        .expect("create journal parent");
-    let tape_uuid = [0x46; 16];
-    let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
+    let cfg = test_typed_write_owner_config(&typed, &library, snapshot);
     let selected = SelectedTape {
         standalone_endpoint: None,
         pool_id: "fresh-parity-fence-test".to_string(),
@@ -3802,11 +3804,38 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
             .is_empty(),
         "a nonexact bootstrap completion must remain invisible to the committed journal"
     );
-    let audit = FileAuditLog::replay(audit_dir.as_path()).expect("replay fence audit");
-    assert!(audit.iter().any(|record| {
-        record.event == AuditEvent::TapeIoFenceRaised
-            && record.subject.id.as_deref() == Some(active[0].quarantine_id.as_str())
-    }));
+    let expected = index.list_active_tape_io_fences().unwrap();
+    let library_uuid = typed
+        .catalog()
+        .library_runtime()
+        .unwrap()
+        .manifest()
+        .library_uuid();
+    drop(journal);
+    drop(index);
+    drop(cfg);
+    typed.release();
+    let records = crate::tests::assert_fences_survive_empty_rebuild(
+        typed.paths(),
+        typed.config(),
+        library_uuid,
+        &expected,
+    );
+    let sequence: u64 = active[0]
+        .quarantine_id
+        .strip_prefix("library:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(at, record)| {
+                *at == sequence && record.tag() == remanence_state::library_log::Tag::FenceRaised
+            })
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -6262,6 +6291,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     );
 }
 
+/// Typed terminalization preserves the checkpoint atomically and fences a failed terminal tail.
 #[tokio::test]
 async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_fenced() {
     const BLOCK_SIZE: u32 = 256 * 1024;
@@ -6276,7 +6306,6 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             .prefix(&format!("remanence-daemon-terminal-{case}-"))
             .tempdir()
             .expect("tempdir");
-        let index_path = temp.path().join("rem-state.sqlite");
         let tape_uuid = if reject_terminal {
             [0x7C; 16]
         } else {
@@ -6290,9 +6319,18 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
         let pool_id = format!("terminal.{case}");
         let library_serial = format!("LIB-TERMINAL-{case}");
         let drive_serial = format!("DRV-TERMINAL-{case}");
-        let mut index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("open catalog");
+        let mut typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+            ProvisionTapeInput {
+                tape_uuid,
+                voltag: barcode.to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Changer,
+            remanence_state::MediaObservation::label_hint(barcode),
+        )]);
+        let mut index = typed.catalog().write_handle();
         index
             .upsert_tape_pool_projection(TapePoolProjectionInput {
                 pool_id: pool_id.clone(),
@@ -6302,15 +6340,6 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
                 created_at_utc: None,
             })
             .expect("project pool");
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: barcode.to_string(),
-                block_size: BLOCK_SIZE,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .expect("provision tape");
         index
             .project_tape_pool_membership(tape_uuid, &pool_id)
             .expect("assign pool");
@@ -6324,7 +6353,7 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
                 managed: "rem".to_string(),
                 library_serial: Some(library_serial.clone()),
                 element_address: Some(0x0100),
-                observed_at_utc: Some("2026-08-08T00:00:00Z".to_string()),
+                observed_at_utc: None,
             })
             .expect("observe drive")
             .drive_uuid;
@@ -6381,11 +6410,7 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             })
             .expect("open model library");
         let snapshot = library_snapshot_cell(library.library().clone());
-        let audit_dir = temp.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-        let mut cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
-        cfg.checkpoint_journal_dir = temp.path().join("tapes");
-        std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
+        let mut cfg = test_typed_write_owner_config(&typed, &library, snapshot);
         cfg.checkpoint_max_objects = 1;
         cfg.checkpoint_max_age_seconds = 3600;
         let drive = library
@@ -6462,13 +6487,36 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             .expect("close reply")
             .expect("close terminal session");
 
+        typed
+            .catalog()
+            .library_runtime()
+            .unwrap()
+            .catch_up()
+            .expect("project close records before reading the catalog");
+        // The actor owns the remaining runtime clone until its command channel closes.
+        drop(drive_tx);
+        typed.release();
         let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
-            temp.path().join("tapes"),
+            typed.paths().journal_dir.join("tapes"),
             tape_uuid,
         )
         .build()
         .expect("open checkpoint journal after lease release");
-        let read_only = remanence_state::CatalogReader::open(&index_path).expect("open catalog");
+        // A runtime snapshot may still hold the native log while the actor exits.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match checkpoint.replay() {
+                Ok(_) => break,
+                Err(error)
+                    if error.is_tape_log_busy() && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("read checkpoint after releasing the typed runtime: {error}"),
+            }
+        }
+        let read_only =
+            remanence_state::CatalogReader::open(&typed.paths().sqlite_path).expect("open catalog");
         let tape = read_only
             .get_tape(&tape_uuid)
             .expect("query tape")
@@ -6486,6 +6534,10 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
                 .expect("query terminal failure fence");
             assert_eq!(fences.len(), 1);
             assert_eq!(fences[0].reason, "transfer_error");
+            eprintln!(
+                "terminal failure fence: reason={} quarantine_id={}",
+                fences[0].reason, fences[0].quarantine_id
+            );
         } else {
             let records = checkpoint.replay().expect("replay terminal authority");
             assert_eq!(records.len(), 2);
@@ -16195,8 +16247,8 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
     }
     for errno in [nix::errno::Errno::ENOMEM, nix::errno::Errno::EINVAL] {
         for opcode in [0x0a, 0x10] {
-            let tmp = tempfile::tempdir().unwrap();
             let tape_uuid = [0x48; 16];
+            let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "KIT001L9")]);
             let mut position = vec![0; 32];
             position[8..16].copy_from_slice(&10u64.to_be_bytes());
             let fixture = FixtureTransport::new().with_responses([
@@ -16219,9 +16271,8 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
                 "LIB-KIT", 0x100, "KIT", 0x400, 1,
             )));
             let library = open_model_library(world);
-            let mut cfg = test_write_owner_config(
-                tmp.path().join("catalog.sqlite"),
-                tmp.path().join("audit"),
+            let mut cfg = test_typed_write_owner_config(
+                &typed,
                 &library,
                 library_snapshot_cell(library.library().clone()),
             );
@@ -16238,9 +16289,7 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
                 audit_session: Arc::new(Mutex::new(None)),
                 direct_replay_fault: None,
             });
-            let mut index = remanence_state::projector::open(&cfg.index_path)
-                .map(|catalog| catalog.write_handle())
-                .expect("open test index");
+            let mut index = typed.catalog().write_handle();
             let before = drive.media_write_dispatch_count();
             let mut attempted = false;
             let counts = (census::total(), census::normalizations());
