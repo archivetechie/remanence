@@ -1568,6 +1568,13 @@ async fn trace_typed_session(skip_barrier: bool) -> (crate::tests::TypedRoot, Pa
     let catalog = remanence_state::projector::open(&paths.sqlite_path)
         .unwrap()
         .with_library_runtime(runtime.clone());
+    // Discovery authenticates the drive before sessions use it; this append is modelled too.
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut catalog.write_handle(),
+        [library.library()],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .unwrap();
     let (tx, opened, thread) = open_crash_typed_writer(&paths, &catalog, library).await;
     let id = opened.unwrap();
     for number in 0..3 {
@@ -1966,6 +1973,17 @@ async fn check_typed_crash(
         .map_err(|e| typed_violation("catalog open", e.to_string()))?
         .with_library_runtime(runtime.clone());
     evidence["runtime_reopened"] = true.into();
+    // Restart discovery refreshes the same managed endpoint before writer or read admission.
+    evidence["step"] = "drive observation".into();
+    let library = world.lock().unwrap().library_snapshot();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut catalog.write_handle(),
+        [&library],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .map_err(|status| {
+        typed_record_refusal("drive observation", &status, cut.receipts.is_empty())
+    })?;
     let index = catalog.write_handle();
     let initial_fences = index
         .list_active_tape_io_fences()
