@@ -727,6 +727,26 @@ Authoritative prefix end: 821 bytes; tail Complete.
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
 | 3 | ReadinessObserved | 00000000000000000001-2026-11-03.remlib | 566 | 821 | `a3c70ce653e6d8d3cee7ec908b90f2be96c677836cf633869d8337bbbe69c3fe` |
+## readiness-owner-close-clears-load-count
+
+Tail: `Some(Complete)`. Authoritative sequence 6; applied 6; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1547 bytes, SHA-256 `cc5b436810661814abe3c00136d17068fd718af219e96d60bbef996e684780f4`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1547 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 325 | `e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 325 | 566 | `33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211` |
+| 3 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 566 | 776 | `f39652b76b12ab9cba3f77177b3a86084396bc3f90e1c2871c01ecfcc03ac1ba` |
+| 4 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 776 | 1035 | `c12bac5171ae46ac7730b048ad1224ab9c18b4965a92c8be3850862cae196158` |
+| 5 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 1035 | 1288 | `00a2b422860a298e9e9a7438a5a68ec037e4df0efb6bdfbdecdc03b4acb4774e` |
+| 6 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 1288 | 1547 | `803c4614ba6da4cbb1f7a1a53f3c237e58e244c2c4336fa2b7aaa980aa98c689` |
 ## readiness-owner-close-keeps-chain
 
 Tail: `Some(Complete)`. Authoritative sequence 6; applied 6; pending 0; tapes 2; fences 0; duplicates 0.
@@ -7934,6 +7954,10 @@ Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 8: Present(SessionEnded, 9d0
 Default: NotYet.
 
 ### readiness-library-scope
+
+Default: Present(FinalizationPrepared, reference digest).
+
+### readiness-owner-close-clears-load-count
 
 Default: Present(FinalizationPrepared, reference digest).
 

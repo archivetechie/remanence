@@ -45,6 +45,7 @@ pending-cross-log	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	7	Present	PayloadContinuation
 pending-cross-log	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	8	Present	SessionEnded	9d01be0662f6b7190a0bc1a44c2cb9dff6b86220436aef08b168a40240731a71
 queued-successor-fence	*	*	NotYet		
 readiness-library-scope	*	*	Present	FinalizationPrepared	echo
+readiness-owner-close-clears-load-count	*	*	Present	FinalizationPrepared	echo
 readiness-owner-close-keeps-chain	*	*	Present	FinalizationPrepared	echo
 readiness-result-clears-load-count	*	*	Present	FinalizationPrepared	echo
 readiness-successor-after-ready	*	*	Present	FinalizationPrepared	echo

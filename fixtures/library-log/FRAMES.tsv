@@ -288,6 +288,12 @@ queued-successor-fence	5	FenceRaised	00000000000000000001-2026-11-03.remlib	1116
 readiness-library-scope	1	Reprovision	00000000000000000001-2026-11-03.remlib	84	325	e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a
 readiness-library-scope	2	Reprovision	00000000000000000001-2026-11-03.remlib	325	566	33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211
 readiness-library-scope	3	ReadinessObserved	00000000000000000001-2026-11-03.remlib	566	821	a3c70ce653e6d8d3cee7ec908b90f2be96c677836cf633869d8337bbbe69c3fe
+readiness-owner-close-clears-load-count	1	Reprovision	00000000000000000001-2026-11-03.remlib	84	325	e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a
+readiness-owner-close-clears-load-count	2	Reprovision	00000000000000000001-2026-11-03.remlib	325	566	33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211
+readiness-owner-close-clears-load-count	3	OperationRecorded	00000000000000000001-2026-11-03.remlib	566	776	f39652b76b12ab9cba3f77177b3a86084396bc3f90e1c2871c01ecfcc03ac1ba
+readiness-owner-close-clears-load-count	4	MotionIntent	00000000000000000001-2026-11-03.remlib	776	1035	c12bac5171ae46ac7730b048ad1224ab9c18b4965a92c8be3850862cae196158
+readiness-owner-close-clears-load-count	5	OperationRecorded	00000000000000000001-2026-11-03.remlib	1035	1288	00a2b422860a298e9e9a7438a5a68ec037e4df0efb6bdfbdecdc03b4acb4774e
+readiness-owner-close-clears-load-count	6	MotionIntent	00000000000000000001-2026-11-03.remlib	1288	1547	803c4614ba6da4cbb1f7a1a53f3c237e58e244c2c4336fa2b7aaa980aa98c689
 readiness-owner-close-keeps-chain	1	Reprovision	00000000000000000001-2026-11-03.remlib	84	325	e6699adafa0211c8ee4bc1b292a472846ba31a4e173f5e5da764b793ad83215a
 readiness-owner-close-keeps-chain	2	Reprovision	00000000000000000001-2026-11-03.remlib	325	566	33c8dc2b414b584a7562dcaab75cac96fc111467bca84017f1f5bea9c94d7211
 readiness-owner-close-keeps-chain	3	OperationRecorded	00000000000000000001-2026-11-03.remlib	566	776	f39652b76b12ab9cba3f77177b3a86084396bc3f90e1c2871c01ecfcc03ac1ba

@@ -1377,19 +1377,16 @@ fn readiness_owner_operator_cancel_restarts_twice_and_releases() {
                 .unwrap(),
             1
         );
+        let readiness_wake = &api.drive_pool().unwrap().readiness_wake;
+        let scans = readiness_wake.scans.load(Ordering::Relaxed);
+        let start_attempts = readiness_wake.start_attempts.load(Ordering::Relaxed);
+        readiness_wake.notify.notify_one();
         runtime.block_on(async {
             tokio::time::timeout(StdDuration::from_secs(5), async {
-                while api
-                    .drive_pool()
-                    .unwrap()
-                    .readiness_wake
-                    .scans
-                    .load(Ordering::Relaxed)
-                    == 0
-                {
+                // Scans count entry, so two more entries prove a full sweep completed.
+                while readiness_wake.scans.load(Ordering::Relaxed) < scans + 2 {
                     tokio::time::sleep(StdDuration::from_millis(10)).await;
                 }
-                tokio::task::yield_now().await;
             })
             .await
             .expect("auto-resume must scan the cancelled row");
@@ -1397,6 +1394,11 @@ fn readiness_owner_operator_cancel_restarts_twice_and_releases() {
         assert!(
             api.operations.latest(&id).is_none(),
             "auto-resume must skip operator cancellation"
+        );
+        assert_eq!(
+            readiness_wake.start_attempts.load(Ordering::Relaxed),
+            start_attempts,
+            "auto-resume must not attempt to start an operator-cancelled row"
         );
         assert_eq!(
             state
@@ -1547,19 +1549,43 @@ fn readiness_owner_shutdown_keeps_initializing_load_budget_spent() {
         "startup must not refund the LOAD budget"
     );
     runtime.block_on(async {
-        tokio::time::timeout(StdDuration::from_secs(5), async {
-            while !api.operations.latest(&id).is_some_and(|status| {
-                status.operation_kind == "media_readiness_wait"
-                    && status
-                        .progress
-                        .get("sense")
-                        .is_some_and(|v| v == "02/04/02")
-            }) {
+        let initializing_attempts = tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                if let Some(status) = api.operations.latest(&id) {
+                    if status.operation_kind == "media_readiness_wait"
+                        && status
+                            .progress
+                            .get("sense")
+                            .is_some_and(|v| v == "02/04/02")
+                    {
+                        break status
+                            .progress
+                            .get("attempts")
+                            .expect("readiness poll must publish attempts")
+                            .parse::<u64>()
+                            .expect("readiness attempts must be a count");
+                    }
+                }
                 tokio::time::sleep(StdDuration::from_millis(10)).await;
             }
         })
         .await
         .expect("auto-resume must poll initializing-command-required");
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            // A later poll follows the initializing LOAD settle and possible dispatch.
+            while !api.operations.latest(&id).is_some_and(|status| {
+                status.operation_kind == "media_readiness_wait"
+                    && status
+                        .progress
+                        .get("attempts")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|attempts| attempts > initializing_attempts)
+            }) {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("auto-resume must poll again after the initializing LOAD settle");
         assert_eq!(
             drive_load_commands_on(&world, BAY_A),
             loads,
