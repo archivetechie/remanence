@@ -1704,7 +1704,7 @@ async fn read_typed_receipts(
                         receipt.id
                     ),
                 ));
-                continue;
+                break;
             }
         };
         let member = &members[0];
@@ -1730,7 +1730,7 @@ async fn read_typed_receipts(
                         receipt.id
                     ),
                 ));
-                continue;
+                break;
             }
         }
     }
@@ -1761,11 +1761,11 @@ fn typed_tail_preview(
     let mut matches = BTreeSet::new();
     let mut unlocated = Vec::new();
     for entry in found {
-        if Uuid::parse_str(entry).is_ok() {
+        if let Ok(id) = Uuid::parse_str(entry) {
             matches.extend(
                 receipts
                     .iter()
-                    .filter(|r| r.id == *entry)
+                    .filter(|r| Uuid::parse_str(&r.id).ok() == Some(id))
                     .map(|r| r.id.clone()),
             );
         } else if let Some(start) = entry
@@ -1799,12 +1799,105 @@ fn typed_tail_preview(
     })
 }
 
+/// A barcode supplements the case's UUID; it cannot stand in for that UUID.
+fn typed_fence_names_case_tape(fence: &remanence_state::TapeIoFenceRecord) -> bool {
+    fence.tape_uuid == TAPE
+        && (fence.barcode.is_none() || fence.barcode.as_deref() == Some(BARCODE))
+}
+
+/// Exercise positive, adjacent and unplaceable preview entries without a crash census.
+#[test]
+fn typed_tail_preview_matches_receipts() {
+    let id = "abcdef01-2345-6789-abcd-ef0123456789";
+    let records = vec![
+        Record::Block(vec![1]),
+        Record::Filemark,
+        Record::Block(vec![2]),
+        Record::Filemark,
+    ];
+    let receipts = [Receipt {
+        id: id.into(),
+        payload: vec![2],
+        start: 2,
+        records: records[2..].to_vec(),
+    }];
+    for (entry, expected, unlocated) in [
+        (id.to_owned(), Some(true), false),
+        ("foreign record at LBA 3".into(), Some(true), false),
+        ("foreign record at LBA 0".into(), Some(false), false),
+        ("foreign record at LBA 4".into(), None, true),
+        ("unparsable entry".into(), None, true),
+        (
+            Uuid::parse_str(id)
+                .unwrap()
+                .simple()
+                .to_string()
+                .to_uppercase(),
+            Some(true),
+            false,
+        ),
+    ] {
+        let found = [entry.clone()];
+        let preview = typed_tail_preview("SUPERSEDE fixture", &found, 7, &receipts, &records);
+        assert_eq!(
+            preview["acknowledged_record_found"].as_bool(),
+            expected,
+            "{entry}: {preview}"
+        );
+        assert_eq!(
+            preview["acknowledged_object_ids"],
+            if expected == Some(true) {
+                serde_json::json!([id])
+            } else {
+                serde_json::json!([])
+            },
+            "{entry}: {preview}"
+        );
+        assert_eq!(
+            preview["unlocated_found"],
+            if unlocated {
+                serde_json::json!([entry])
+            } else {
+                serde_json::json!([])
+            },
+            "{preview}"
+        );
+    }
+}
+
+/// Reject the right barcode on the wrong UUID, and accept only an absent or matching barcode.
+#[test]
+fn typed_fence_tape_identity() {
+    let mut fence = remanence_state::TapeIoFenceRecord {
+        fence_id: 1,
+        tape_uuid: TAPE.to_vec(),
+        barcode: Some(BARCODE.into()),
+        state: "active".into(),
+        reason: "session_suffix_contradiction".into(),
+        evidence_json: None,
+        quarantine_id: "library:1".into(),
+        created_at_utc: String::new(),
+        updated_at_utc: String::new(),
+        release_ack: None,
+        endpoint: None,
+        release_forced: None,
+    };
+    assert!(typed_fence_names_case_tape(&fence));
+    fence.tape_uuid = vec![0xe0; 16];
+    assert!(!typed_fence_names_case_tape(&fence));
+    fence.tape_uuid = TAPE.to_vec();
+    fence.barcode = None;
+    assert!(typed_fence_names_case_tape(&fence));
+    fence.barcode = Some("OTHER".into());
+    assert!(!typed_fence_names_case_tape(&fence));
+}
+
 /// Require the same tape identity and fenced read admission as the legacy crash check.
 fn check_typed_fence_before_lift(
     index: &remanence_state::CatalogIndex,
     fence: &remanence_state::TapeIoFenceRecord,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    if fence.tape_uuid != TAPE && fence.barcode.as_deref() != Some(BARCODE) {
+    if !typed_fence_names_case_tape(fence) {
         return Err(typed_violation(
             "fence tape",
             format!(
@@ -1817,10 +1910,9 @@ fn check_typed_fence_before_lift(
     match read {
         Err(status)
             if status.code() == tonic::Code::FailedPrecondition
-                && (status
+                && status
                     .message()
-                    .contains(&Uuid::from_bytes(TAPE).to_string())
-                    || status.message().contains(BARCODE)) =>
+                    .contains(&Uuid::from_bytes(TAPE).to_string()) =>
         {
             Ok(serde_json::json!({
                 "quarantine_id": fence.quarantine_id, "tape_uuid": fence.tape_uuid,
@@ -2047,31 +2139,201 @@ fn note_typed_failure(evidence: &mut serde_json::Value, failure: serde_json::Val
     evidence[key].as_array_mut().unwrap().push(failure);
 }
 
+/// Resolve each active fence once, before recovery can remove its typed source.
+fn record_typed_fence(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    evidence: &mut serde_json::Value,
+    fence: &remanence_state::TapeIoFenceRecord,
+    initial_ids: &BTreeSet<String>,
+) -> usize {
+    let rows = evidence["fences"].as_array_mut().unwrap();
+    if let Some(position) = rows
+        .iter()
+        .position(|row| row["quarantine_id"] == fence.quarantine_id)
+    {
+        return position;
+    }
+    let typed = runtime.fence_for_quarantine_id(&fence.quarantine_id);
+    rows.push(serde_json::json!({
+        "quarantine_id": fence.quarantine_id, "at_reopen": initial_ids.contains(&fence.quarantine_id),
+        "cause": typed.as_ref().map(|f| format!("{:?}", f.cause)),
+        "reason": fence.reason, "evidence": fence.evidence_json,
+        "tape_uuid": fence.tape_uuid, "barcode": fence.barcode,
+        "released": false, "force": false, "release_error": null, "receipts_read": null,
+        "lift_method": null, "lift_path": null,
+    }));
+    rows.len() - 1
+}
+
 /// Capture admission and active source identities before any post-open append or recovery.
 fn record_typed_writer_open(
     catalog: &remanence_state::ProjectionClient,
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
     evidence: &mut serde_json::Value,
-    admitted: bool,
+    refusal: Option<&serde_json::Value>,
     step: &str,
+    initial_ids: &BTreeSet<String>,
 ) {
     match catalog.write_handle().list_active_tape_io_fences() {
         Ok(fences) => {
             let ids: Vec<_> = fences
-                .into_iter()
-                .map(|fence| fence.quarantine_id)
+                .iter()
+                .map(|fence| fence.quarantine_id.clone())
                 .collect();
+            for fence in &fences {
+                record_typed_fence(runtime, evidence, fence, initial_ids);
+            }
             evidence["writer_opens"]
                 .as_array_mut()
                 .unwrap()
                 .push(serde_json::json!({
-                    "step": step, "admitted": admitted, "active_fence_ids": ids,
+                    "step": step, "admitted": refusal.is_none(), "active_fence_ids": ids,
                 }));
+            if let Some(refusal) = refusal {
+                let count_ok = match refusal["category"].as_str() {
+                    Some("uncommitted tape tail") => fences.len() == 1,
+                    Some("missing bootstrap") => fences.len() <= 1,
+                    _ => false,
+                };
+                let identities_ok = fences.iter().all(|fence| {
+                    fence.tape_uuid == TAPE && runtime.fence_for_quarantine_id(&fence.quarantine_id)
+                        .is_some_and(|f| f.cause == remanence_state::library_log::FenceCause::SessionSuffixContradiction)
+                });
+                if !count_ok || !identities_ok {
+                    note_typed_failure(evidence, typed_violation("writer refusal fences", format!(
+                        "{} refusal must leave {} SessionSuffixContradiction fence(s) on the case's tape; got {fences:?}",
+                        refusal["category"], if refusal["category"] == "uncommitted tape tail" { "exactly one" } else { "zero or one" }
+                    )));
+                }
+            }
         }
         Err(error) => note_typed_failure(
             evidence,
             typed_violation("writer open fences", error.to_string()),
         ),
     }
+}
+
+/// Snapshot the prefix before the append, or before reopening after a suffix rewrite.
+fn typed_protected_prefix(
+    world: &Arc<Mutex<VirtualWorld>>,
+    protected_start: u64,
+) -> Result<Vec<Record>, serde_json::Value> {
+    world.lock().unwrap().tapes[BARCODE]
+        .records
+        .get(..protected_start as usize)
+        .map(<[Record]>::to_vec)
+        .ok_or_else(|| {
+            typed_violation(
+                "append cursor",
+                "recovery admits an append beyond surviving tape",
+            )
+        })
+}
+
+/// Append, checkpoint and check the protected prefix after either successful writer admission.
+/// Close and join the actor even when the append or checkpoint reports a violation.
+async fn exercise_typed_admitted_writer(
+    catalog: &remanence_state::ProjectionClient,
+    world: &Arc<Mutex<VirtualWorld>>,
+    input_root: &Path,
+    protected_prefix: Result<Vec<Record>, serde_json::Value>,
+    writer: (
+        mpsc::Sender<DriveCommand>,
+        Uuid,
+        std::thread::JoinHandle<()>,
+    ),
+    evidence: &mut serde_json::Value,
+) -> Result<(), serde_json::Value> {
+    let (tx, id, thread) = writer;
+    evidence["writer_reopened"] = true.into();
+    evidence["step"] = "next append".into();
+    // Always close the actor after admission, including a failing append/checkpoint.
+    let appended = async {
+        let index = catalog.write_handle();
+        let expected_start = index
+            .get_tape(&TAPE)
+            .map_err(|e| typed_violation("append cursor", e.to_string()))?
+            .and_then(|tape| tape.written_extent_lba)
+            .ok_or_else(|| {
+                typed_violation("append cursor", "admitted tape has no written extent")
+            })?;
+        let before = protected_prefix?;
+        append_actor_test_file_result(
+            &tx,
+            id,
+            input_root.join("next-input"),
+            "next-file",
+            "next-caller",
+            b"next append",
+        )
+        .await
+        .map_err(|s| typed_violation("next append", s.to_string()))?;
+        evidence["step"] = "next checkpoint".into();
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::Checkpoint {
+            session_id: id,
+            trigger: CheckpointTrigger::Explicit,
+            expected_batch_id: None,
+            reply: Some(reply),
+        })
+        .await
+        .map_err(|e| typed_violation("next checkpoint", e.to_string()))?;
+        let response = received
+            .await
+            .map_err(|e| typed_violation("next checkpoint", e.to_string()))?
+            .map_err(|s| typed_violation("next checkpoint", s.to_string()))?;
+        let object = response
+            .committed_objects
+            .first()
+            .ok_or_else(|| typed_violation("next checkpoint", "no committed object"))?;
+        let next_id = Uuid::from_slice(&object.object_id)
+            .map_err(|e| typed_violation("next checkpoint", e.to_string()))?
+            .to_string();
+        let next = index
+            .find_native_object_instances(&next_id)
+            .map_err(|e| typed_violation("next append position", e.to_string()))?;
+        if next.first().and_then(|copy| copy.global_start_block) != Some(expected_start) {
+            return Err(typed_violation(
+                "next append position",
+                "next append does not immediately follow committed prefix",
+            ));
+        }
+        if world.lock().unwrap().tapes[BARCODE]
+            .records
+            .get(..before.len())
+            != Some(before.as_slice())
+        {
+            return Err(typed_violation(
+                "protected prefix",
+                "next append changed committed tape prefix",
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(failure) = appended {
+        note_typed_failure(evidence, failure);
+    }
+    evidence["step"] = "writer close".into();
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Close {
+        session_id: id,
+        reply,
+    })
+    .await
+    .map_err(|e| typed_violation("writer close", e.to_string()))?;
+    let closed = received
+        .await
+        .map_err(|e| typed_violation("writer close", e.to_string()))?;
+    thread.join().expect("typed recovery writer never panics");
+    if let Err(status) = closed {
+        note_typed_failure(
+            evidence,
+            typed_violation("writer close", status.to_string()),
+        );
+    }
+    Ok(())
 }
 
 /// Exercise restored authority, admission, recovery and exact-byte reads through production funnels.
@@ -2213,11 +2475,22 @@ async fn check_typed_crash(
         evidence["step"] = "writer open".into();
         let (tx, opened, thread) =
             open_crash_typed_writer(&paths, &catalog, open_model_library(world.clone())).await;
-        record_typed_writer_open(&catalog, evidence, opened.is_ok(), "writer open");
+        let refusal = opened
+            .as_ref()
+            .err()
+            .map(|status| typed_record_refusal("writer open", status, cut.receipts.is_empty()));
+        record_typed_writer_open(
+            &catalog,
+            &runtime,
+            evidence,
+            refusal.as_ref(),
+            "writer open",
+            &initial_ids,
+        );
         match opened {
-            Err(status) => {
+            Err(_) => {
                 thread.join().expect("typed recovery writer never panics");
-                let refusal = typed_record_refusal("writer open", &status, cut.receipts.is_empty());
+                let refusal = refusal.unwrap();
                 let needs_ack = refusal["category"] == "uncommitted tape tail";
                 note_typed_failure(evidence, refusal);
                 if needs_ack && attempt == 0 {
@@ -2230,6 +2503,25 @@ async fn check_typed_crash(
                         &cut.receipts,
                         &mut recovery,
                     );
+                    // All checked fences were recorded before the ordinary supersede.
+                    for check in recovery["fence_checks"].as_array().into_iter().flatten() {
+                        if let Some(row) = evidence["fences"]
+                            .as_array_mut()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|row| row["quarantine_id"] == check["quarantine_id"])
+                        {
+                            if runtime
+                                .fence_for_quarantine_id(row["quarantine_id"].as_str().unwrap())
+                                .is_none()
+                            {
+                                row["released"] = true.into();
+                                row["lift_method"] = "supersede".into();
+                                row["lift_path"] = "ordinary".into();
+                                row["supersede"] = recovery.clone();
+                            }
+                        }
+                    }
                     evidence["tail_recoveries"]
                         .as_array_mut()
                         .unwrap()
@@ -2246,104 +2538,15 @@ async fn check_typed_crash(
                 }
             }
             Ok(id) => {
-                evidence["writer_reopened"] = true.into();
-                evidence["step"] = "next append".into();
-                // Always close the actor after admission, including a failing append/checkpoint.
-                let appended = async {
-                    let index = catalog.write_handle();
-                    let expected_start = index
-                        .get_tape(&TAPE)
-                        .map_err(|e| typed_violation("append cursor", e.to_string()))?
-                        .and_then(|tape| tape.written_extent_lba)
-                        .ok_or_else(|| {
-                            typed_violation("append cursor", "admitted tape has no written extent")
-                        })?;
-                    let protected_start = summary.as_ref().map_or(2, |s| s.cursor.lba);
-                    let before = world.lock().unwrap().tapes[BARCODE]
-                        .records
-                        .get(..protected_start as usize)
-                        .map(<[Record]>::to_vec)
-                        .ok_or_else(|| {
-                            typed_violation(
-                                "append cursor",
-                                "recovery admits an append beyond surviving tape",
-                            )
-                        })?;
-                    append_actor_test_file_result(
-                        &tx,
-                        id,
-                        temp.path().join("next-input"),
-                        "next-file",
-                        "next-caller",
-                        b"next append",
-                    )
-                    .await
-                    .map_err(|s| typed_violation("next append", s.to_string()))?;
-                    evidence["step"] = "next checkpoint".into();
-                    let (reply, received) = oneshot::channel();
-                    tx.send(DriveCommand::Checkpoint {
-                        session_id: id,
-                        trigger: CheckpointTrigger::Explicit,
-                        expected_batch_id: None,
-                        reply: Some(reply),
-                    })
-                    .await
-                    .map_err(|e| typed_violation("next checkpoint", e.to_string()))?;
-                    let response = received
-                        .await
-                        .map_err(|e| typed_violation("next checkpoint", e.to_string()))?
-                        .map_err(|s| typed_violation("next checkpoint", s.to_string()))?;
-                    let object = response
-                        .committed_objects
-                        .first()
-                        .ok_or_else(|| typed_violation("next checkpoint", "no committed object"))?;
-                    let next_id = Uuid::from_slice(&object.object_id)
-                        .map_err(|e| typed_violation("next checkpoint", e.to_string()))?
-                        .to_string();
-                    let next = index
-                        .find_native_object_instances(&next_id)
-                        .map_err(|e| typed_violation("next append position", e.to_string()))?;
-                    if next.first().and_then(|copy| copy.global_start_block) != Some(expected_start)
-                    {
-                        return Err(typed_violation(
-                            "next append position",
-                            "next append does not immediately follow committed prefix",
-                        ));
-                    }
-                    if world.lock().unwrap().tapes[BARCODE]
-                        .records
-                        .get(..before.len())
-                        != Some(before.as_slice())
-                    {
-                        return Err(typed_violation(
-                            "protected prefix",
-                            "next append changed committed tape prefix",
-                        ));
-                    }
-                    Ok(())
-                }
-                .await;
-                if let Err(failure) = appended {
-                    note_typed_failure(evidence, failure);
-                }
-                evidence["step"] = "writer close".into();
-                let (reply, received) = oneshot::channel();
-                tx.send(DriveCommand::Close {
-                    session_id: id,
-                    reply,
-                })
-                .await
-                .map_err(|e| typed_violation("writer close", e.to_string()))?;
-                let closed = received
-                    .await
-                    .map_err(|e| typed_violation("writer close", e.to_string()))?;
-                thread.join().expect("typed recovery writer never panics");
-                if let Err(status) = closed {
-                    note_typed_failure(
-                        evidence,
-                        typed_violation("writer close", status.to_string()),
-                    );
-                }
+                exercise_typed_admitted_writer(
+                    &catalog,
+                    &world,
+                    temp.path(),
+                    typed_protected_prefix(&world, summary.as_ref().map_or(2, |s| s.cursor.lba)),
+                    (tx, id, thread),
+                    evidence,
+                )
+                .await?;
                 break;
             }
         }
@@ -2362,26 +2565,20 @@ async fn check_typed_crash(
         }
     }
     drop(index);
-    // Resolve typed causes before a confirmed supersede can release several suffix fences.
+    // Resolve every remaining source before one supersede can release several fences.
     let fences: Vec<_> = fences
         .into_iter()
         .map(|fence| {
-            let typed = runtime.fence_for_quarantine_id(&fence.quarantine_id);
-            (fence, typed)
+            let position = record_typed_fence(&runtime, evidence, &fence, &initial_ids);
+            (fence, position)
         })
         .collect();
-    for (fence, typed) in fences {
-        let cause = typed.as_ref().map(|f| format!("{:?}", f.cause));
-        let suffix = typed.as_ref().is_some_and(|f| {
-            f.cause == remanence_state::library_log::FenceCause::SessionSuffixContradiction
-        });
-        let mut row = serde_json::json!({
-            "quarantine_id": fence.quarantine_id, "at_reopen": initial_ids.contains(&fence.quarantine_id),
-            "cause": cause, "reason": fence.reason, "evidence": fence.evidence_json,
-            "tape_uuid": fence.tape_uuid, "barcode": fence.barcode,
-            "released": false, "force": false, "release_error": null, "receipts_read": null,
-            "lift_method": if suffix { "supersede" } else { "RPC" },
-        });
+    for (fence, position) in fences {
+        let mut row = evidence["fences"][position].clone();
+        if row["released"] == true {
+            continue;
+        }
+        let suffix = row["cause"] == "SessionSuffixContradiction";
         if suffix {
             let opens = evidence["writer_opens"].as_array().unwrap();
             let under_fence = |open: &&serde_json::Value| {
@@ -2442,7 +2639,15 @@ async fn check_typed_crash(
                         fence.quarantine_id, row["supersede"]["confirmed"], row["released"])));
                 }
                 if row["released"] == true {
+                    row["lift_method"] = "supersede".into();
+                    row["lift_path"] = "suffix".into();
+                    // Retain the completed lift even if a later writer retry fails.
+                    evidence["fences"][position] = row.clone();
                     evidence["tail_acknowledged"] = true.into();
+                    let protected_prefix = typed_protected_prefix(
+                        &world,
+                        summary.as_ref().map_or(2, |s| s.cursor.lba),
+                    );
                     evidence["step"] = "writer retry after suffix supersede".into();
                     let (tx, opened, thread) = open_crash_typed_writer(
                         &paths,
@@ -2450,15 +2655,25 @@ async fn check_typed_crash(
                         open_model_library(world.clone()),
                     )
                     .await;
+                    let retry_refusal = opened.as_ref().err().map(|status| {
+                        typed_record_refusal(
+                            "writer retry after suffix supersede",
+                            status,
+                            cut.receipts.is_empty(),
+                        )
+                    });
                     record_typed_writer_open(
                         &catalog,
+                        &runtime,
                         evidence,
-                        opened.is_ok(),
+                        retry_refusal.as_ref(),
                         "writer retry after suffix supersede",
+                        &initial_ids,
                     );
                     row["writer_retry_admitted"] = opened.is_ok().into();
                     match opened {
                         Err(status) => {
+                            thread.join().expect("typed retry writer never panics");
                             note_typed_failure(
                                 evidence,
                                 typed_violation(
@@ -2476,23 +2691,17 @@ async fn check_typed_crash(
                             );
                         }
                         Ok(id) => {
-                            evidence["writer_reopened"] = true.into();
-                            let (reply, received) = oneshot::channel();
-                            tx.send(DriveCommand::Close {
-                                session_id: id,
-                                reply,
-                            })
-                            .await
-                            .unwrap();
-                            if let Err(status) = received.await.unwrap() {
-                                note_typed_failure(
-                                    evidence,
-                                    typed_violation("writer retry close", status.to_string()),
-                                );
-                            }
+                            exercise_typed_admitted_writer(
+                                &catalog,
+                                &world,
+                                temp.path(),
+                                protected_prefix,
+                                (tx, id, thread),
+                                evidence,
+                            )
+                            .await?;
                         }
                     }
-                    thread.join().expect("typed retry writer never panics");
                 }
             } else {
                 // A previous confirmed recovery released this fence in the same operator action.
@@ -2500,11 +2709,24 @@ async fn check_typed_crash(
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|old| old["lift_method"] == "supersede" && old["released"] == true)
-                    .expect("suffix fence released by an observed supersede");
-                row["released"] = true.into();
-                row["supersede"] = previous["supersede"].clone();
-                row["released_with"] = previous["quarantine_id"].clone();
+                    .find(|old| old["lift_method"] == "supersede" && old["released"] == true);
+                if let Some(previous) = previous {
+                    row["released"] = true.into();
+                    row["lift_method"] = "supersede".into();
+                    row["lift_path"] = previous["lift_path"].clone();
+                    row["supersede"] = previous["supersede"].clone();
+                    row["released_with"] = previous["quarantine_id"].clone();
+                } else {
+                    let failure = typed_violation(
+                        "suffix supersede",
+                        format!(
+                            "fence {} disappeared without an observed supersede",
+                            fence.quarantine_id
+                        ),
+                    );
+                    row["release_error"] = failure.clone();
+                    note_typed_failure(evidence, failure);
+                }
             }
         } else {
             evidence["step"] = "pre-lift read admission".into();
@@ -2514,7 +2736,7 @@ async fn check_typed_crash(
                     row["pre_lift"] = failure.clone();
                     row["release_error"] = failure.clone();
                     note_typed_failure(evidence, failure);
-                    evidence["fences"].as_array_mut().unwrap().push(row);
+                    evidence["fences"][position] = row;
                     continue;
                 }
             }
@@ -2525,7 +2747,13 @@ async fn check_typed_crash(
                 false,
                 AuditActor::System,
             ) {
-                Ok(released) => row["released"] = released.is_some().into(),
+                Ok(released) => {
+                    row["released"] = released.is_some().into();
+                    if released.is_some() {
+                        row["lift_method"] = "RPC".into();
+                        row["lift_path"] = "RPC".into();
+                    }
+                }
                 Err(error) => {
                     let refusal =
                         typed_runtime_refusal("fence release", error, cut.receipts.is_empty());
@@ -2534,7 +2762,7 @@ async fn check_typed_crash(
                 }
             }
         }
-        evidence["fences"].as_array_mut().unwrap().push(row);
+        evidence["fences"][position] = row;
     }
     evidence["step"] = "read open".into();
     let read = read_typed_receipts(&paths, &catalog, world, &cut.receipts).await;
@@ -2628,17 +2856,13 @@ fn finish_typed_case(evidence: &mut serde_json::Value) {
 // Both matrices permit only the refusal categories observed by their censuses.
 const TYPED_REFUSAL_CATEGORIES: &[&str] = &["missing bootstrap", "uncommitted tape tail"];
 
-/// Pin the observed lift protocol, including its presence in the full matrix.
-fn decided_typed_fences(full: bool) -> BTreeSet<(String, String, String)> {
-    if full {
-        BTreeSet::from([(
-            "SessionSuffixContradiction".into(),
-            "session_suffix_contradiction".into(),
-            "supersede".into(),
-        )])
-    } else {
-        BTreeSet::new()
-    }
+/// Both matrices must observe the same production supersede protocol.
+fn decided_typed_fences(_full: bool) -> BTreeSet<(String, String, String)> {
+    BTreeSet::from([(
+        "SessionSuffixContradiction".into(),
+        "session_suffix_contradiction".into(),
+        "supersede".into(),
+    )])
 }
 
 /// Enforce typed refusal/violation rules; return evidence for focused assertions, never census pins.
