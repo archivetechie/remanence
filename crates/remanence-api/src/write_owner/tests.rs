@@ -17589,7 +17589,8 @@ fn typed_discovery_unsupported_batch_keeps_source_and_refuses_motion() {
 }
 
 /// The actual owner selects inventory-only media, persists its run and fence,
-/// then records the physical fast-eject refusal through typed sources.
+/// then records the physical fast-eject refusal through typed sources. An unknown
+/// LOAD is reconciled before further changer motion, preserving the drive fence.
 #[test]
 fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
     use remanence_state::{
@@ -17668,7 +17669,7 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
             .unwrap()
             .with_library_runtime(runtime.clone());
         let mut index = catalog.write_handle();
-        let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 1);
+        let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 3);
         model.put_tape_in_slot(
             0x400,
             "CLNU01L9",
@@ -17678,6 +17679,7 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
                 ..VirtualTape::default()
             },
         );
+        model.put_tape_in_slot(0x401, "DATA01L9", VirtualTape::default());
         let world = Arc::new(Mutex::new(model));
         let mut library = open_model_library(world.clone());
         crate::drive_collection::observe_drive_catalog_from_libraries(
@@ -17802,6 +17804,10 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
                 .iter()
                 .any(|c| matches!(c.opcode, 0xa5 | 0x1b | 0x0a | 0x10)));
         }
+        // A slot-to-slot MOVE shares the LOAD's library scope without entering
+        // the fenced drive. It must proceed before a restart can reconcile it.
+        let next_motion =
+            (expired && !before_move).then(|| library.move_medium(0x401, 0x402, &cfg.policy));
         let library_uuid = runtime.manifest().library_uuid();
         drop(api);
         drop(library);
@@ -17813,6 +17819,8 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
         let mut load_intents = Vec::new();
         let mut motion_outcomes = Vec::new();
         let mut inventories = Vec::new();
+        let mut reconciliations = Vec::new();
+        let mut next_move_intent = None;
         let mut expire_at = None;
         let mut finish_at = None;
         let view = lib::native_view::NativeTapeView::probe(
@@ -17826,9 +17834,15 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
                     assert_eq!(value.parent_operation, Some(*operation.as_bytes()));
                     load_intents.push(record.sequence());
                 }
+                if matches!(&value.motion, lib::Motion::Move(m)
+                    if m.source == 0x401 && m.destination == 0x402)
+                {
+                    next_move_intent = Some(record.sequence());
+                }
             }
-            if record.record().inventory_observation().is_some() {
+            if let Some(value) = record.record().inventory_observation() {
                 inventories.push(record.sequence());
+                reconciliations.push((record.sequence(), value.clone()));
             }
             if let Some(value) = record.record().motion_outcome() {
                 motion_outcomes.push((record.sequence(), value.clone()));
@@ -17869,13 +17883,35 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
             assert_eq!(
                 outcome.result,
                 if expired {
-                    lib::MotionResult::Failed
+                    // DEC-5: GOOD status followed by an eject gives no observed
+                    // CHECK CONDITION, so the LOAD is not known to have failed.
+                    lib::MotionResult::Unknown
                 } else {
                     lib::MotionResult::Done
                 }
             );
             if expired {
                 assert!(outcome.confirmation.is_none());
+                let next = next_motion.as_ref().unwrap();
+                assert!(
+                    next.is_ok(),
+                    "next motion must be admitted before reopen: {next:?}"
+                );
+                let next_intent = next_move_intent.expect("the next MOVE has an admitted intent");
+                assert!(
+                    reconciliations.iter().any(|(observed_at, observation)| {
+                        *sequence < *observed_at
+                            && *observed_at < next_intent
+                            && observation.subject
+                                == lib::InventorySubject::Library("LIB-CLEAN".into())
+                            && observation
+                                .resolves
+                                .0
+                                .iter()
+                                .any(|resolved| resolved.sequence == load_intents[0])
+                    }),
+                    "InventoryReconciled must resolve the Unknown LOAD before the next MOVE"
+                );
             } else {
                 let Some(lib::Confirmation::Inventory(observation)) = outcome.confirmation else {
                     panic!("cleaning LOAD requires inventory proof")

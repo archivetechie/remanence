@@ -420,6 +420,16 @@ fn run_cleaning_sequence_owned(
                 "warning",
                 Some("{\"reason\":\"fast-eject\"}"),
             )?;
+            // DEC-5: GOOD followed by an eject leaves the LOAD Unknown. Observe
+            // the changer through the shared funnel so later motion can proceed.
+            // Failure keeps this run Failed, its alarm and the original refusal.
+            if let Err(error) = library.reconcile_startup_motion() {
+                tracing::warn!(
+                    target: "remanence_cleaning",
+                    %error,
+                    "reconcile changer after cleaning cartridge fast-eject"
+                );
+            }
             return Err(Status::failed_precondition(
                 "cleaning cartridge fast-ejected before LOAD admission",
             ));
