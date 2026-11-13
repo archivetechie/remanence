@@ -11,7 +11,7 @@ daemon show the output format from the code, with illustrative values: barcode `
 pool `archive`, library serial `LIB001`, drive bay `0x0100`, slot `0x0400`, device
 `/dev/sg5`, and tape UUID `5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs crates/remanence-daemon/src/entry.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs crates/remanence-daemon/src/entry.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/mounted_commands.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-api/src/write_owner/actor_runtime.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## The binaries
 
 Remanence builds four programs that operators use. The first two come from the
@@ -94,7 +94,7 @@ Angle brackets mark a value you supply. The names below are used throughout this
 | `<REMP>`, `<REMR>` | A recipient private-key file and a recipient public-key file; see [Recipient key-file formats](#recipient-key-file-formats). |
 | `<JSON>` | The locator JSON that a tape write (`rem-debug archive write`) returns, passed as the value of `--locator`. |
 | `<MEMBER>` | A member's archive path inside the object, exactly as recorded in the catalog: the `objects[].archive_path` value that `rem put --json` prints (ingest strips a leading `/` or `./`, so `/data/file` is stored as `data/file`), or the member path in the object's manifest. |
-| `--idempotency-key <UUID>` | A UUID you generate, not nil, that identifies one finalization request. Reuse it after a lost response to recover the existing live or successful operation. An operation that ended without success requires a new key. It is not a tape UUID or an operation UUID. |
+| `--idempotency-key <UUID>` | A UUID you generate, not nil, that identifies one finalization request. Reuse it after a lost response to recover the existing live or successful operation. While a finalization intent is pending, a different key is refused with `ALREADY_EXISTS`; a daemon finalization that closed without success is also refused under its own key. It is not a tape UUID or an operation UUID. |
 | `<DURATION>`, `<BYTES>` | A duration or a size, in the units described under the conventions above. |
 | `<HEX>` | A SHA-256 digest written as 64 hexadecimal characters. |
 | `<SG>` | The Linux SCSI generic device path of a tape drive, for example `/dev/sg5`. |
@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
@@ -492,8 +492,8 @@ leave standalone reads available. Writes refuse active fences on the loaded tape
 or endpoint. A standalone initialization write that fails with an uncertain outcome
 raises no tape or drive fence. It is refused with
 `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
-restarts. Append admission also checks the physical tail:
+counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
+drive motion until it exits. Append admission also checks the physical tail:
 `TailBeyondKnownState` means local state cannot authorize overwriting complete
 data. Restore newer state or rescue with `tape restore --scan` before considering
 supersede-tail.
@@ -1088,7 +1088,7 @@ With `--json`, a failed, cancelled, or completion-unknown operation prints a
 `details.operation_id`, and `details.state`, and exits 1. Connection failures
 remain `daemon_client_error`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## Tape lifecycle
 
 Initialization, readiness and retirement run against local configuration and state, and
@@ -1259,7 +1259,7 @@ behaviour.
 
 For `native_log_behind_projection`, restore the exact tape log or rebuild the
 catalog with `rem rebuild-catalog-from-journals`, then run
-`rem tape quarantine release <ID> --ack <TEXT> --force`. Without `--force`, release
+`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`. Without `--force`, release
 is refused with `native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
 A forced release can still be refused if tape admission is contradicted or the
 log remains behind the catalog. This form uses the daemon when one listens;
@@ -1348,7 +1348,7 @@ Failures print to stderr and exit 1. JSON terminal failures include
 terminal operation state. Argument parsing failures exit 2. Each JSON message is
 one line, including the generated-key message preceding any error.
 
-<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs crates/remanence-state/src/library_runtime/terminal.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs crates/remanence-state/src/library_runtime/terminal.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ### rem tape finalize (library)
 
 Finalize one exact tape through the daemon.
@@ -1372,8 +1372,10 @@ resubmits. While the tape is `FINALIZING` it also checks the operation, and exit
 with its summary on `FAILED`, `CANCELLED` or `COMPLETION_UNKNOWN`. An attempt that
 ended without success is final under its idempotency key. Repeating that key is
 refused with `FAILED_PRECONDITION` and `ClosedOperationRetry: manual operation cannot resume from ...`.
-Use a new key to start a new operation. Matching retries of live or successful
-operations return the existing operation.
+A new key is refused too, with `ALREADY_EXISTS` and
+`pending terminal finalization belongs to a different exact request`, while the
+tape keeps its finalizing intent.
+Matching live or successful retries return the existing operation.
 
 Manual finalization refuses a due closeout. When the range retains its
 original-write check and has no closeout contradiction fence, the message is:
@@ -1382,8 +1384,9 @@ original-write check and has no closeout contradiction fence, the message is:
 CloseoutRequired: tape <UUID> has <N> unprotected bytes since <TIME>; run rem tape closeout <UUID> before finalization.
 ```
 
-Run the named closeout command, then submit finalization with a new idempotency
-key if the previous operation ended without success. An unprovable range instead produces
+Run the named closeout command, then submit finalization again; `CloseoutRequired`
+records no operation, so the same idempotency key still works.
+An unprovable range instead produces
 `CloseoutUnprotectedFinalizationUnavailable`; accepting unprotected
 finalization is not supported. See [Closeout debt](guide-troubleshooting.md#closeout-debt).
 

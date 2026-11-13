@@ -205,7 +205,7 @@ standalone refusals are:
 The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/library_runtime/terminal.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## Tape-I/O fences
 
 The daemon starts with tape-scoped and drive-scoped tape-I/O fences. Each fence
@@ -226,7 +226,7 @@ rem tape quarantine release <ID> --after-settled-inventory --ack "what was check
 
 A `native_log_behind_projection` fence requires restoration of the exact tape
 log or a catalog rebuild with `rem rebuild-catalog-from-journals`, followed by
-`rem tape quarantine release <ID> --ack <TEXT> --force` in library mode.
+`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` in library mode.
 Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
 Even a forced release refuses contradicted tape admission or a log still behind
@@ -254,9 +254,9 @@ and a new cleaning run on that drive refuses with `drive is already fenced`.
 A standalone initialization write that fails with an uncertain outcome raises no
 tape or drive fence. It is refused with
 `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
-restarts. Investigate the failed write before restarting; there is no standalone
-endpoint fence to acknowledge away.
+counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
+drive motion until it exits. Investigate the failed write before running another
+command; there is no standalone endpoint fence to acknowledge away.
 
 If a library-log write fails at the store, including while recording a refusal,
 motion stops for the rest of that process. This is a storage failure, rather
@@ -331,8 +331,8 @@ Detached verification and manual finalize workers wait up to 15 minutes for
 readiness. They keep waiting across failed readiness waits while the durable
 record stays resumable, but stop on daemon shutdown, operator cancellation,
 dispatch failure, release-only states, or their deadline. A stopped finalize attempt
-reports FAILED with a summary while the intent stays FINALIZING. Reuse the same
-idempotency key to resume it;
+reports FAILED with a summary while the intent stays FINALIZING. Neither its key
+(`ClosedOperationRetry`) nor a new key (`ALREADY_EXISTS`) resumes it;
 `rem tape finalize --wait` reports the stopped attempt and exits non-zero.
 
 `rem tape verify-index --tape-uuid <UUID>` resumes a media-readiness fence
@@ -610,7 +610,7 @@ mode. The dual aggregate row names the append leg's object and daemon rate;
 the client aggregate rate includes the concurrent restore. Missing diagnostics
 are `unavailable`; the kit never substitutes another object's latest event.
 
-<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/projector/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime/terminal.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## Closeout debt
 
 Committed data is on tape and has a durable record in the tape log. It is
@@ -645,7 +645,9 @@ consume it. The wake conditions above reset the budget. Unrecognized failures re
 After resolving the refusal, run `rem tape closeout <UUID>` to request and watch
 closeout for that exact tape. It succeeds without media work if nothing is due.
 An accepted finalization plan owns its uncovered range instead of ordinary
-closeout; resume that finalization with its original idempotency key. See the
+closeout. If its operation is still open, retry with the original idempotency key;
+an attempt that closed without success is refused under both its own key and a new
+key. See the
 [CLI reference](reference-cli.md#rem-tape-closeout) for retry arguments and
 [manual finalization](reference-cli.md#rem-tape-finalize-library) for the
 `CloseoutRequired` refusal.

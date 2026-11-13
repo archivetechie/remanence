@@ -217,6 +217,7 @@ The sessions also covered the following:
 
 The findings below come from these sessions.
 
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/library_runtime/terminal.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ### Robot moves wait while a drive becomes ready
 
 When a drive does not report its cartridge ready, the daemon records a
@@ -235,8 +236,10 @@ first readiness refusal before they stop their attempt. A stopped finalization
 attempt reports `FAILED` and keeps the tape's finalizing intent. That operation
 is final under its idempotency key: repeating it is refused with
 `FAILED_PRECONDITION` and `ClosedOperationRetry: manual operation cannot resume from ...`.
-A new key starts a new operation. Matching live or successful retries return
-the existing operation.
+A new key is refused too, with `ALREADY_EXISTS` and
+`pending terminal finalization belongs to a different exact request`, while the
+tape keeps its finalizing intent.
+Matching live or successful retries return the existing operation.
 `rem tape finalize --wait` exits with the attempt's error summary.
 
 <!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->

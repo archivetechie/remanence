@@ -785,8 +785,8 @@ service Catalog {
   // FINALIZING and detail carries that summary. An operation that ended without
   // success is final under its key: matching retries fail with FAILED_PRECONDITION
   // and ClosedOperationRetry: manual operation cannot resume from ... .
-  // A new key starts a new operation; matching live or successful retries return
-  // the existing operation.
+  // A new key fails with ALREADY_EXISTS while the finalizing intent stays pending;
+  // matching live or successful retries return the existing operation.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
   // Sealed tapes fail immediately with FAILED_PRECONDITION ("tape is sealed"),
   // except matching retries of live or successful operations, which return the

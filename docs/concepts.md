@@ -8,7 +8,7 @@ them, and each builds on the ones before it. The [glossary](reference-glossary.m
 short entry for every term, and the [architecture overview](architecture-overview.md) is the
 next step for a reader who wants the design in detail.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## 1. How a tape behaves
 
 Remanence's design only makes sense against the behaviour of the medium, so this page starts
@@ -228,8 +228,8 @@ There are two kinds of fence.
   standalone reads available. A standalone initialization write that fails with
   an uncertain outcome raises no tape or drive fence. It is refused with
   `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-  counted as `StandaloneFenceUnrecorded`, and motion stops until the command or
-  daemon restarts.
+  counted as `StandaloneFenceUnrecorded`, and the command stops all further robot
+  and drive motion until it exits.
 - A **media-readiness fence** (quarantine id beginning `mrq-`) records a readiness wait, the
   wait for a drive to become ready after a load, that was interrupted or ended without a clear
   answer. A wait that was still progressing (loading, becoming ready, busy) is resumable: the

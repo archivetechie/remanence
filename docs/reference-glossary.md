@@ -455,7 +455,7 @@ A standing, catalog-persisted condition raised against a drive, tape or library 
 example a repeated cleaning failure, or a fenced tape awaiting release) until an operator
 acknowledges or clears it. `rem alarms` lists and acknowledges alarms.
 
-<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/standalone_init.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/standalone_init.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## Safety and operations
 
 ### allowlist
@@ -500,8 +500,8 @@ including `--scan`. Reads under other fence causes remain available.
 A standalone initialization write that fails with an uncertain outcome raises no
 tape or drive fence. It is refused with
 `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
-restarts.
+counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
+drive motion until it exits.
 
 ### media-readiness fence
 

@@ -202,7 +202,7 @@ Init asks you to type `CLOBBER HOME01`. For a run without a prompt, add
 protection, the partition check, the label and identity swap checks, or the
 pool checks.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## 3. Put files on tape
 
 Write a directory to the loaded tape:
@@ -400,9 +400,9 @@ rem tape quarantine release <ID> --ack "checked drive and rescued readable files
 A standalone initialization write that fails with an uncertain outcome raises no
 tape or drive fence. It is refused with
 `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
-restarts. Investigate the write failure before restarting; there is no endpoint
-fence to release for this failure.
+counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
+drive motion until it exits. Investigate the write failure before running another
+command; there is no endpoint fence to release for this failure.
 
 Release records your acknowledgement; it does not prove that the append point
 is safe. Every append checks the physical tail. `TailBeyondKnownState` means
