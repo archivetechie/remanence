@@ -2059,16 +2059,6 @@ fn reset_helper_tripwire() {
         .with(|flag| assert!(!flag.get(), "projection rebuild reached reset helper"));
 }
 
-#[cfg(test)]
-fn hex_tape_uuid(tape_uuid: [u8; 16]) -> String {
-    let mut out = String::with_capacity(32);
-    for byte in tape_uuid {
-        use std::fmt::Write as _;
-        write!(&mut out, "{byte:02x}").expect("write to string");
-    }
-    out
-}
-
 fn configured_tape_pool_warnings(config: &RemConfig) -> Vec<StateConfigWarning> {
     let mut warnings = Vec::new();
     if config.tape_pool_rules.is_empty() && !config.tape_pools.is_empty() {
@@ -2426,6 +2416,8 @@ pool_id = "camera.copy-a"
         );
     }
 
+    /// D-C3a-S-1: typed adoption preserves operator label provenance, measured media
+    /// generation and explicit pool intent in the live catalog and typed rebuild.
     #[test]
     fn operator_adoption_records_media_and_explicit_pool_intent_for_replay() {
         let temp = tempfile::tempdir().unwrap();
@@ -2446,17 +2438,20 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
             )
             .unwrap();
-        let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
-        let mut restored = crate::projector::open(":memory:")
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        restored.replay_audit_records(&records).unwrap();
-        for index in [&mut handle.index, &mut restored] {
-            index
-                .reconcile_tape_pool_projection_from_rules(&[], &[])
+        for rebuild in [false, true] {
+            if rebuild {
+                handle.rebuild_index_from_journals().unwrap();
+            }
+            let tape = handle
+                .catalog()
+                .get_tape(&input.tape_uuid)
+                .unwrap()
                 .unwrap();
-            let tape = index.get_tape(&input.tape_uuid).unwrap().unwrap();
-            assert_eq!(tape.voltag_source, Some(crate::LabelProvenance::Operator));
+            assert_eq!(
+                tape.voltag_source,
+                Some(crate::LabelProvenance::Operator),
+                "label provenance with rebuild={rebuild}"
+            );
             assert_eq!(
                 crate::tape_generation(&tape),
                 Some((crate::LtoGen::Lto7, crate::GenerationSource::Measured))
@@ -3107,6 +3102,8 @@ pool_id = "camera.copy-a"
         assert!(control.calibration_generation > calibration_generation);
     }
 
+    /// D-C3a-S-1: typed provisioning and the Label record pin the rebind's prior
+    /// holder, whose label stays released after reopen and typed rebuild.
     #[test]
     fn rebind_is_audited_and_survives_state_reopen_and_rebuild() {
         let temp = tempfile::tempdir().unwrap();
@@ -3114,37 +3111,40 @@ pool_id = "camera.copy-a"
         fs::write(&config_path, config_text(temp.path())).unwrap();
         let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
         for (id, label) in [(1u8, "ACM001L9"), (2, "ACM002L9")] {
-            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::System,
-                    source_layer: SourceLayer::Layer4,
-                    operation_id: None,
-                    session_id: None,
-                    idempotency_key: None,
-                    event: AuditEvent::TapeProvisioned,
-                    subject: AuditSubject {
-                        kind: "tape".into(),
-                        id: Some(hex_tape_uuid([id; 16])),
-                    },
-                    detail: BTreeMap::from([("voltag".into(), CborValue::Text(label.into()))]),
+            handle
+                .provision_tape(crate::index::ProvisionTapeInput {
+                    tape_uuid: [id; 16],
+                    voltag: label.into(),
+                    block_size: 4096,
+                    parity: ParityConfig::None,
+                    force: false,
                 })
                 .unwrap();
         }
-        handle.replay_audit_projection().unwrap();
         handle
             .rebind_tape_label([2; 16], "ACM001L9", [1; 16])
             .unwrap();
-        let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
-        assert!(records
+        let records = handle.library_runtime().test_source_records();
+        let labels: Vec<_> = records
             .iter()
-            .any(|r| r.event == AuditEvent::TapeLabelRebound));
+            .filter_map(|record| match record.body_view() {
+                crate::library_log::BodyView::Label(label) => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].tape.uuid, [2; 16]);
+        assert_eq!(
+            labels[0].label.as_ref().map(|label| label.0.as_str()),
+            Some("ACM001L9")
+        );
+        assert_eq!(
+            labels[0].prior_holder.as_ref().map(|prior| prior.tape.uuid),
+            Some([1; 16])
+        );
         drop(handle);
         let mut reopened = StateHandle::open_from_config_file(&config_path).unwrap();
-        reopened
-            .index
-            .rebuild_from_authoritative_sources(&records, &[])
-            .unwrap();
+        reopened.rebuild_index_from_journals().unwrap();
         assert_eq!(
             reopened.index.get_tape(&[1; 16]).unwrap().unwrap().voltag,
             None
@@ -3257,6 +3257,8 @@ pool_id = "camera.copy-a"
             .is_empty());
     }
 
+    /// D-C3a-S-1: typed records pin identity-only, idempotent adoption, and typed
+    /// drive/readiness evidence makes an active physical operation refuse a no-op.
     #[test]
     fn bootstrap_adoption_is_audited_identity_only_and_idempotent() {
         let temp = tempfile::Builder::new()
@@ -3354,6 +3356,20 @@ pool_id = "camera.copy-a"
             .unwrap()
             .is_empty());
 
+        handle
+            .write_handle()
+            .observe_drive(crate::DriveObservationInput {
+                serial: "DRV001".into(),
+                identity_source: "DvcidInline".into(),
+                vendor: Some("V".into()),
+                product: Some("P".into()),
+                firmware_rev: None,
+                managed: "rem".into(),
+                library_serial: Some("LIB001".into()),
+                element_address: Some(0x0101),
+                observed_at_utc: None,
+            })
+            .unwrap();
         handle
             .write_handle()
             .begin_typed_media_readiness_operation(crate::index::MediaReadinessOperationInput {
@@ -4344,6 +4360,8 @@ pool_id = "camera.copy-a"
         authority.check_finalizing().unwrap();
     }
 
+    /// D-C3a-S-1: typed retirement records the operator, layer, tape and reason,
+    /// releases the label, and appends nothing on an idempotent rerun.
     #[test]
     fn retire_tape_appends_audit_event_and_idempotent_rerun_appends_nothing() {
         let temp = tempfile::Builder::new()
@@ -4355,7 +4373,6 @@ pool_id = "camera.copy-a"
         let tape_uuid = [0x5Eu8; 16];
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
         handle
-            .write_handle()
             .provision_tape(crate::index::ProvisionTapeInput {
                 tape_uuid,
                 voltag: "ACM001L9".to_string(),
@@ -4375,32 +4392,28 @@ pool_id = "camera.copy-a"
         assert!(outcome.newly_retired);
         assert_eq!(outcome.released_voltag.as_deref(), Some("ACM001L9"));
         assert_eq!(outcome.instances_marked_missing, 0);
-        let records = FileAuditLog::replay(handle.paths().audit_dir.clone()).expect("replay audit");
+        let records = handle.library_runtime().test_source_records();
         let retired = records
             .iter()
-            .filter(|record| record.event == AuditEvent::TapeRetired)
+            .filter(|record| matches!(record.body_view(), crate::library_log::BodyView::Retire(_)))
             .collect::<Vec<_>>();
         assert_eq!(retired.len(), 1);
         let record = retired[0];
-        assert_eq!(record.actor, AuditActor::local_user());
-        assert_eq!(record.source_layer, SourceLayer::Layer4);
-        assert_eq!(record.subject.kind, "tape");
+        assert_eq!(record.envelope.actor, AuditActor::local_user());
+        assert_eq!(record.envelope.source_layer, SourceLayer::Layer4);
+        let crate::library_log::BodyView::Retire(retire) = record.body_view() else {
+            unreachable!("filtered Retire record");
+        };
+        assert_eq!(retire.tape.uuid, tape_uuid);
         assert_eq!(
-            record.subject.id.as_deref(),
-            Some("5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e")
+            retire.reason,
+            crate::library_log::RetireReason::OperatorRequested
         );
         assert_eq!(
-            record.detail.get("voltag"),
-            Some(&CborValue::Text("ACM001L9".to_string()))
+            retire.detail.as_ref().map(|detail| detail.0.as_str()),
+            Some("recycled")
         );
-        assert_eq!(
-            record.detail.get("reason"),
-            Some(&CborValue::Text("recycled".to_string()))
-        );
-        assert_eq!(
-            record.detail.get("instances_marked_missing"),
-            Some(&CborValue::Integer(0.into()))
-        );
+        let record_count = records.len();
 
         // An idempotent rerun changed nothing and must append nothing: the
         // existing record already says who declared the medium dead.
@@ -4411,15 +4424,18 @@ pool_id = "camera.copy-a"
             })
             .expect("idempotent re-retire");
         assert!(!rerun.newly_retired);
-        let records =
-            FileAuditLog::replay(handle.paths().audit_dir.clone()).expect("replay audit again");
+        let records = handle.library_runtime().test_source_records();
         assert_eq!(
             records
                 .iter()
-                .filter(|record| record.event == AuditEvent::TapeRetired)
+                .filter(|record| matches!(
+                    record.body_view(),
+                    crate::library_log::BodyView::Retire(_)
+                ))
                 .count(),
             1
         );
+        assert_eq!(records.len(), record_count);
     }
 
     #[test]
