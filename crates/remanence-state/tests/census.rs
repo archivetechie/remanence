@@ -1900,7 +1900,7 @@ fn scanner_literal_operand_and_arm_shapes() {
     assert_eq!(found.values().sum::<usize>(), 11);
 }
 
-/// Lists every production use of the library authority so new consumers are added deliberately.
+/// Lists every production reference to `library_log` outside its module, so a new consumer is added deliberately.
 #[test]
 fn library_reserved_census() {
     census("library-reserved");

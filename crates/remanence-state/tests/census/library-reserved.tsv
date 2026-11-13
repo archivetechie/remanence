@@ -1,4 +1,4 @@
-# Every production use of the library authority outside its module and the two reserved bodies' fixture constructors.
+# Every production reference to library_log outside its module, and the two reserved bodies' fixture constructors.
 crates/remanence-state/src/lib.rs::<module>::library_log	1
 crates/remanence-state/src/library_log/mod.rs::fixture_progress::constructor::VerificationProgress	1
 crates/remanence-state/src/library_log/mod.rs::fixture_unprotected::constructor::AcceptUnprotectedFinalization	1
