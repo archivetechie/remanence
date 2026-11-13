@@ -23209,8 +23209,35 @@ mod tests {
         }
     }
 
+    /// Read typed provisioning evidence from a CLI fixture's real library log.
+    fn tape_init_reprovisions(root: &Path) -> Vec<remanence_state::library_log::Reprovision> {
+        use remanence_state::library_log as lib;
+
+        let state = remanence_state::StateHandle::open_from_config_file(root.join("config.toml"))
+            .expect("open CLI fixture state");
+        let paths = state.paths().clone();
+        let uuid = state.library_runtime().manifest().library_uuid();
+        drop(state);
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .expect("probe CLI fixture tape sources");
+        let mut records = Vec::new();
+        let replay = lib::store::replay_observed(&paths.audit_dir, uuid, &view, &mut |applied| {
+            if let Some(record) = applied.record().reprovision() {
+                records.push(record.clone());
+            }
+            Ok(())
+        })
+        .expect("replay CLI fixture library log");
+        assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+        records
+    }
+
     /// Exercise CLI parsing, hardware init, and real catalog provisioning with a
-    /// blank fixture tape whose WRITE returns GOOD with a controlled byte count.
+    /// blank fixture tape whose WRITE returns GOOD with a controlled byte count;
+    /// D-C3a-2b-1 pins the library log's typed provisioning count.
     #[cfg(target_os = "linux")]
     #[test]
     fn tape_init_cli_rejects_short_good_bootstrap_without_provisioning() {
@@ -23342,13 +23369,8 @@ pool_id = "init-test"
                 .list_tapes(None, remanence_state::TapeKindFilter::All)
                 .expect("list initialized tapes");
             assert_eq!(tapes.len(), usize::from(complete), "{stderr}");
-            let audit = remanence_state::FileAuditLog::replay(temp.path().join("audit"))
-                .expect("read real CLI audit");
             assert_eq!(
-                audit
-                    .iter()
-                    .filter(|record| record.event == remanence_state::AuditEvent::TapeProvisioned)
-                    .count(),
+                tape_init_reprovisions(temp.path()).len(),
                 usize::from(complete)
             );
             if complete {
@@ -23837,8 +23859,8 @@ pool_id = "init-test"
         (tape, audit)
     }
 
-    /// Real `rem tape init` dispatch on fixture transports must publish enough
-    /// audit evidence to recover a logless tape's geometry, pool and label.
+    /// D-C3a-2b-1: real `rem tape init` records a library-log `Reprovision`;
+    /// the production open recovers the logless tape's geometry, pool and label.
     #[cfg(target_os = "linux")]
     #[test]
     fn current_empty_rebuild_cli_logless_provision_geometry_pool_kept() {
@@ -23850,9 +23872,12 @@ pool_id = "init-test"
         );
         assert_eq!(run.code, ExitCode::SUCCESS, "{}", run.stderr);
         assert_eq!(run.writes, 2);
-        let (tape, audit) = unknown_tape_catalog_and_audit(&run);
-        assert_eq!(audit.len(), 1);
+        let (tape, _) = unknown_tape_catalog_and_audit(&run);
+        let provisioned = tape_init_reprovisions(run.temp.path());
+        assert_eq!(provisioned.len(), 1);
         let tape = tape.expect("real CLI provisioned tape");
+        assert_eq!(provisioned[0].tape.uuid.as_slice(), tape.tape_uuid);
+        assert_eq!(provisioned[0].label, Some("RMT001L9".into()));
         assert_eq!(tape.block_size, Some(262144));
         assert_eq!(tape.pool_id.as_deref(), Some("init-test"));
         assert_eq!(tape.voltag.as_deref(), Some("RMT001L9"));
@@ -23874,8 +23899,7 @@ pool_id = "init-test"
                 Err(e) => panic!("remove SQLite sidecar: {e}"),
             }
         }
-        let mut rebuilt = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
-        rebuilt.startup_replay().unwrap();
+        let rebuilt = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
         let after = rebuilt
             .catalog()
             .get_tape(&tape.tape_uuid)
@@ -23892,8 +23916,9 @@ pool_id = "init-test"
         );
     }
 
-    /// The named override erases an unknown Remanence identity only with the
-    /// exact UUID and the typed confirmation, then audits what it destroyed.
+    /// D-C3a-2b-1: the named override erases an unknown Remanence identity only
+    /// with the exact UUID and typed confirmation, then records the destroyed
+    /// identity in its `Reprovision`.
     #[cfg(target_os = "linux")]
     #[test]
     fn tape_init_cli_clobber_unknown_tape_erases_only_the_named_identity() {
@@ -23932,7 +23957,7 @@ pool_id = "init-test"
                 "{}",
                 run.stdout
             );
-            let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+            let (tape, _) = unknown_tape_catalog_and_audit(&run);
             let tape = tape.expect("fresh catalog row");
             assert_ne!(
                 tape.tape_uuid.as_slice(),
@@ -23942,49 +23967,39 @@ pool_id = "init-test"
                 "uuid: {}",
                 Uuid::from_slice(&tape.tape_uuid).unwrap()
             )));
-            assert_eq!(audit.len(), 1);
-            let detail = &audit[0].detail;
+            let provisioned = tape_init_reprovisions(run.temp.path());
+            assert_eq!(provisioned.len(), 1);
+            let record = &provisioned[0];
+            assert_eq!(record.tape.uuid.as_slice(), tape.tape_uuid);
             assert_eq!(
-                detail.get("forced"),
-                Some(&ciborium::value::Value::Bool(true))
+                record.replaced_bot,
+                Some(*Uuid::parse_str(UNKNOWN_BOT_UUID).unwrap().as_bytes())
             );
+            assert_eq!(record.predecessor, None);
             assert_eq!(
-                detail.get("clobbered_identity"),
-                Some(&ciborium::value::Value::Text("unknown-to-catalog".into()))
-            );
-            assert_eq!(
-                detail.get("clobbered_uuid"),
-                Some(&ciborium::value::Value::Text(simple.clone()))
-            );
-            assert_eq!(
-                audit[0].subject.id.as_deref(),
-                Some(bytes_to_hex(&tape.tape_uuid).as_str())
+                record.mode,
+                remanence_state::library_log::ProvisionMode::Initialize
             );
         }
     }
 
-    /// A wrong UUID, a failed confirmation, or no override writes nothing.
+    /// D-C3a-2b-1: a wrong UUID, failed confirmation or no override writes nothing.
+    /// Rows 1-3 pin the typed guard's refusal; the lost hint is a next-landing row.
     #[cfg(target_os = "linux")]
     #[test]
     fn tape_init_cli_clobber_unknown_tape_refusals_write_nothing() {
         let wrong = "0f0e0d0c-0b0a-4908-8706-050403020100";
-        let hint = format!(
-            "next: identity {UNKNOWN_BOT_UUID} is unknown to this catalog; adopt it (the default) with `rem-debug --allow LIB-INIT-UNKNOWN tape adopt-bootstrap RMT001L9 --library LIB-INIT-UNKNOWN --expected-home-slot 0x0400 --expected-existing-tape-uuid {UNKNOWN_BOT_UUID} --json --config "
-        );
-        let erase = format!(
-            "`, or erase it with `rem tape init RMT001L9 --library LIB-INIT-UNKNOWN --clobber-data --clobber-unknown-tape {UNKNOWN_BOT_UUID} --config "
-        );
+        let conflict = "tape provisioning conflict: observed BOT predecessor has no typed identity; no Bootstrap write admitted";
         let mismatch = format!(
             "--clobber-unknown-tape {wrong} does not match BOT uuid {UNKNOWN_BOT_UUID}; no write attempted"
         );
-        for (extra, input, stdout_text, stderr_text) in [
-            (vec![], "", Some(hint.as_str()), None),
-            (vec!["--clobber-data"], "", Some(hint.as_str()), None),
+        for (extra, input, stderr_text) in [
+            (vec![], "", Some(conflict)),
+            (vec!["--clobber-data"], "", Some(conflict)),
             (
                 vec!["--clobber-data", "--confirm-clobber", "CLOBBER RMT001L9"],
                 "",
-                Some(hint.as_str()),
-                None,
+                Some(conflict),
             ),
             (
                 vec![
@@ -23995,25 +24010,21 @@ pool_id = "init-test"
                     "CLOBBER RMT001L9",
                 ],
                 "",
-                None,
                 Some(mismatch.as_str()),
             ),
             (
                 vec!["--clobber-data", "--clobber-unknown-tape", wrong],
                 "CLOBBER RMT001L9\n",
-                None,
                 Some(mismatch.as_str()),
             ),
             (
                 vec!["--clobber-data", "--clobber-unknown-tape", UNKNOWN_BOT_UUID],
                 "WRONG\n",
-                None,
                 Some("clobber confirmation did not match; no write attempted"),
             ),
             (
                 vec!["--clobber-data", "--clobber-unknown-tape", UNKNOWN_BOT_UUID],
                 "",
-                None,
                 Some("no clobber confirmation received"),
             ),
             (
@@ -24025,28 +24036,18 @@ pool_id = "init-test"
                     "CLOBBER OTHER",
                 ],
                 "",
-                None,
                 Some("clobber confirmation did not match; no write attempted"),
             ),
         ] {
             let run = run_unknown_tape_init(&extra, input);
             assert_eq!(run.code, ExitCode::from(1), "{extra:?}\n{}", run.stdout);
             assert_eq!(run.writes, 0, "{extra:?}");
-            let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+            let (tape, _) = unknown_tape_catalog_and_audit(&run);
             assert!(tape.is_none(), "{extra:?}");
-            assert!(audit.is_empty(), "{extra:?}");
-            if let Some(text) = stdout_text {
-                assert!(run.stdout.contains("refused-no-write"), "{}", run.stdout);
-                assert!(
-                    run.stdout.contains(&format!(
-                        "decision: needs-explicit-rebuild: missing catalog row for {UNKNOWN_BOT_UUID}"
-                    )),
-                    "{}",
-                    run.stdout
-                );
-                assert!(run.stdout.contains(text), "{}", run.stdout);
-                assert!(run.stdout.contains(&erase), "{}", run.stdout);
-            }
+            assert!(
+                tape_init_reprovisions(run.temp.path()).is_empty(),
+                "{extra:?}"
+            );
             if let Some(text) = stderr_text {
                 assert!(run.stderr.contains(text), "{extra:?}\n{}", run.stderr);
                 assert!(run.stdout.is_empty(), "{}", run.stdout);
@@ -26384,6 +26385,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(stderr.contains("RMJ999L9"), "{stderr}");
     }
 
+    /// D-C3a-2b-1: the provisioning funnel records typed identity, geometry and
+    /// overwrite provenance in exactly one library-log `Reprovision`.
     #[test]
     fn provision_initialized_tape_appends_tape_provisioned_audit_event() {
         let temp = tempfile::Builder::new()
@@ -26408,37 +26411,15 @@ tape_catalog_dir = "{0}/cache/tapes"
             .expect("provision initialized tape");
         }
 
-        let records =
-            remanence_state::FileAuditLog::replay(temp.path().join("audit")).expect("replay");
-        let provisioned = records
-            .iter()
-            .filter(|record| record.event == remanence_state::AuditEvent::TapeProvisioned)
-            .collect::<Vec<_>>();
+        let provisioned = tape_init_reprovisions(temp.path());
         assert_eq!(provisioned.len(), 1);
-        let record = provisioned[0];
-        assert_eq!(record.subject.kind, "tape");
-        assert_eq!(
-            record.subject.id.as_deref(),
-            Some(bytes_to_hex(&tape_uuid).as_str())
-        );
-        assert_eq!(
-            record.detail.get("voltag"),
-            Some(&ciborium::value::Value::Text("RMJ107L9".to_string()))
-        );
-        assert_eq!(
-            record.detail.get("block_size"),
-            Some(&ciborium::value::Value::Integer(4096.into()))
-        );
-        assert_eq!(
-            record.detail.get("geometry"),
-            Some(&ciborium::value::Value::Text("no-parity".to_string()))
-        );
-        assert_eq!(
-            record.detail.get("forced"),
-            Some(&ciborium::value::Value::Bool(false))
-        );
-        assert!(!record.detail.contains_key("clobbered_identity"));
-        assert!(!record.detail.contains_key("clobbered_uuid"));
+        let record = &provisioned[0];
+        assert_eq!(record.tape.uuid, [0x42; 16]);
+        assert_eq!(record.label, Some("RMJ107L9".into()));
+        assert_eq!(record.medium.record_size, 4096);
+        assert_eq!(record.parity_scheme, None);
+        assert_eq!(record.replaced_bot, None);
+        assert_eq!(record.predecessor, None);
     }
 
     #[test]
