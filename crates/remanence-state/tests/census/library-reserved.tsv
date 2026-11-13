@@ -57,10 +57,8 @@ crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_au
 crates/remanence-api/src/closeout_progress.rs::for_owner::library_log	1
 crates/remanence-api/src/closeout_progress.rs::record::library_log	1
 crates/remanence-api/src/engine/drive_adapter.rs::standalone_tail_recovery_admission::library_log	1
-crates/remanence-api/src/mount.rs::publish_finalize_attempt::library_log	2
 crates/remanence-api/src/mount.rs::record_finalize_attempt::library_log	2
-crates/remanence-api/src/mount.rs::recover_manual_terminal_tape::library_log	2
-crates/remanence-api/src/mount.rs::run_started_manual_finalize_worker::library_log	2
+crates/remanence-api/src/mount.rs::run_started_manual_finalize_worker::library_log	5
 crates/remanence-api/src/operation_source.rs::<module>::library_log	1
 crates/remanence-api/src/tape_closeout.rs::start::library_log	1
 crates/remanence-api/src/write_owner/actor_runtime.rs::<module>::library_log	1
@@ -101,3 +99,9 @@ crates/remanence-state/src/state/authority_reset.rs::<module>::library_log	1
 crates/remanence-state/src/state/initialization.rs::<module>::library_log	1
 crates/remanence-state/src/state/initialization.rs::record_initialization_replacement::library_log	1
 crates/remanence-state/src/tape_log/projection.rs::rebuild_typed_sources::library_log	4
+# WBR-U7-FX1 (ff1bad7c) and WBR-U7-FX2 (8f86eac3)
+crates/remanence-api/src/daemon_catalog_services.rs::cancel_operation::library_log	1
+crates/remanence-api/src/mount.rs::continuable_finalize_head::library_log	1
+crates/remanence-api/src/mount.rs::finalize_operation_head::library_log	1
+crates/remanence-api/src/mount.rs::require_continuable_finalize_head::library_log	3
+crates/remanence-api/src/mount.rs::start_accepted_finalize_attempt::library_log	1

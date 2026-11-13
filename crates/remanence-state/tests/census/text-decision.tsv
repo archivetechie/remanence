@@ -33,7 +33,9 @@ crates/remanence-api/src/closeout_obligation.rs::transient::text-contains	2
 crates/remanence-api/src/closeout_obligation.rs::transient::text-equality	1
 crates/remanence-api/src/closeout_obligation.rs::wake_ready::text-matches	1
 crates/remanence-api/src/closeout_progress.rs::phase::text-equality	1
+crates/remanence-api/src/daemon_catalog_services.rs::cancel_operation::text-equality	1
 crates/remanence-api/src/daemon_catalog_services.rs::get_file::text-find	1
+crates/remanence-api/src/daemon_catalog_services.rs::get_tape_finalization::text-equality	1
 crates/remanence-api/src/daemon_catalog_services.rs::health::text-equality	2
 crates/remanence-api/src/daemon_catalog_services.rs::list_tapes::text-match	3
 crates/remanence-api/src/daemon_catalog_services.rs::overlay_operation::text-equality	1

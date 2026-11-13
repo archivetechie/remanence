@@ -621,6 +621,15 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/mount/tests/closed_retry_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) mount::tests module: U7ShortWrite forwards to \
+                      in-memory ModelTransport only",
+            },
+        ),
+        (
             "remanence-api/src/write_owner/r1c2_tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 2,
