@@ -487,7 +487,7 @@ fn durable_terminal_component_projection_failure_asks_for_replay_and_resumes() {
     );
 }
 
-/// Supersede-tail refuses on the log's own seal, even when SQLite has lost it.
+/// Typed catch-up restores a lost SQLite seal before supersede-tail can dispatch a write.
 #[test]
 fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
     let root = tempfile::tempdir().unwrap();
@@ -519,17 +519,22 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
         )
         .unwrap();
     let before = dispatched_writes(&world);
+    // On typed state, catch-up repairs a lost SQLite seal from the logs.
     let refusal = actor
         .supersede_tail_confirmed("HAND", |_, _| Ok(()))
         .unwrap_err()
         .to_string();
     assert!(
-        refusal.contains("tape log is sealed; supersede-tail cannot make a sealed tape writable"),
+        refusal.contains("terminal finalization prevents tail discard"),
         "{refusal}"
     );
     assert_eq!(dispatched_writes(&world), before);
     let _ = actor.finish();
-    drop(reopen_state());
+    let state = reopen_state();
+    assert_eq!(
+        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
+        "sealed"
+    );
 }
 #[test]
 fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
@@ -802,7 +807,23 @@ fn position_overflow_refuses_without_motion_and_reservation_is_opt_in() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
     let world = world();
-    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut mount = OperatorMount::with_transport_for_test(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: BAY }),
+            fault: fault(),
+            audit_cut: None,
+            hide_serial: false,
+            boundary: None,
+            commands: Some(Arc::clone(&commands)),
+            cut_after_prevent: false,
+        }),
+        &mut state,
+        &root.path().join("locks"),
+    )
+    .unwrap();
     let mut mounted = mount.mount(target()).unwrap();
     let count = world.lock().unwrap().command_log.len();
     assert!(
@@ -811,18 +832,21 @@ fn position_overflow_refuses_without_motion_and_reservation_is_opt_in() {
     );
     assert_eq!(world.lock().unwrap().command_log.len(), count);
     assert!(!mounted.reserved);
+    let reservations = || {
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|cdb| cdb[0])
+            .filter(|opcode| matches!(opcode, 0x16 | 0x17))
+            .collect::<Vec<_>>()
+    };
+    assert!(reservations().is_empty());
     mount.reserve(&mut mounted).unwrap();
+    assert_eq!(reservations(), [0x16]);
     assert!(mounted.reserved);
     mount.release(mounted);
-    let records = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    assert!(records.iter().any(|record| record
-        .detail
-        .values()
-        .any(|value| value == &ciborium::Value::Text("reserve_drive".into()))));
-    assert!(records.iter().any(|record| record
-        .detail
-        .values()
-        .any(|value| value == &ciborium::Value::Text("release_drive".into()))));
+    assert_eq!(reservations(), [0x16, 0x17]);
 }
 
 /// Ruling 32-L1: the refusal does not look at the source, so a missing log and a complete one are
@@ -1381,25 +1405,100 @@ fn seed_open_session(
     state.replay_audit_projection().unwrap();
     id
 }
+macro_rules! append_for_rollback {
+    (&mut $state:ident, $world:expr, $root:expr, $name:expr) => {{
+        let world = $world;
+        let root = $root;
+        let mut mount = backend(&mut $state, world, &root.join("locks"), fault()).unwrap();
+        let mounted = mount.mount(target()).unwrap();
+        let (mut actor, reopen_state) = own_mount!(mount, mounted, $state);
+        let result = actor.write_checkpointed(request(root, $name));
+        let _ = actor.finish();
+        $state = reopen_state();
+        let _ = &$state; // The caller regains state ownership even on refusal.
+        result
+    }};
+}
+/// Publish an endpoint operation through the producer used by pool_ops/write_tests.
+fn seed_operation_session(
+    state: &StateHandle,
+    endpoint: remanence_library::DriveKey,
+    tape: TapeUuid,
+) -> uuid::Uuid {
+    use remanence_state::library_log as lib;
+    let id = uuid::Uuid::new_v4();
+    state
+        .library_runtime()
+        .observe_session(
+            *id.as_bytes(),
+            lib::SessionKind::Operation,
+            Some(&endpoint),
+            Some(tape),
+            lib::SessionEvent::Opened,
+            None,
+            AuditActor::System,
+            (None, None),
+        )
+        .unwrap();
+    id
+}
+
 #[test]
 fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
+    // D-C3a-1c-1: prime a native media commit before opening the crash session.
+    let world = world();
+    set_rollback_bootstrap(&world, crate::ParityConfig::None);
+    append_for_rollback!(&mut state, &world, root.path(), "A").unwrap();
+
     let library_tape = [0x44; 16];
-    let library_session = seed_open_session(
-        &mut state,
+    // Accepted source fact (D-C3a-1c-1): state_with_parity supplies a recorded medium.
+    state
+        .provision_tape_with_media(
+            remanence_state::ProvisionTapeInput {
+                tape_uuid: library_tape,
+                voltag: "LIBRARY".into(),
+                block_size: BLOCK,
+                parity: crate::ParityConfig::None,
+                force: false,
+            },
+            remanence_state::LabelProvenance::Operator,
+            Some(remanence_state::MediaObservation {
+                generation: LtoGen::Lto9,
+                source: GenerationSource::Operator,
+            }),
+        )
+        .unwrap();
+    let library_session = seed_operation_session(
+        &state,
         remanence_library::DriveKey::new("LIB", 0x100),
         library_tape,
     );
-    let standalone_session = seed_open_session(
-        &mut state,
+    let standalone_session = seed_operation_session(
+        &state,
         remanence_library::DriveKey::Standalone {
             drive_serial: SERIAL.into(),
         },
         UUID,
     );
+    open_crash_fixture(&state);
+    // Like drive_adapter's passing automatic-terminal-completion fixture,
+    // refresh the external native producer's prefix before runtime catch-up.
+    {
+        use remanence_state::authority::TapeAuthorityView as _;
+        let authority = remanence_state::TapeAuthority::open(
+            state.paths().journal_dir.join("tapes"),
+            UUID,
+            &state.paths().sqlite_path,
+        )
+        .unwrap();
+        let snapshot = authority.freeze().unwrap();
+        state.library_runtime().refresh_native(&snapshot).unwrap();
+        state.library_runtime().catch_up().unwrap();
+    }
     let before = state.calibration_control().row(library_tape).write_epoch;
-    assert!(backend(&mut state, &world(), &root.path().join("locks"), fault()).is_ok());
+    assert!(backend(&mut state, &world, &root.path().join("locks"), fault()).is_ok());
     let open = state.catalog().non_terminal_sessions().unwrap();
     assert!(open.iter().any(|s| s.session_id == library_session));
     assert!(!open.iter().any(|s| s.session_id == standalone_session));
@@ -1407,13 +1506,14 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
         state.calibration_control().row(library_tape).write_epoch,
         before
     );
-    let fences = state.catalog().list_active_tape_io_fences().unwrap();
-    assert!(!fences.is_empty());
-    assert!(fences.iter().all(|f| f.tape_uuid == UUID
-        && f.endpoint
-            == Some(remanence_library::DriveKey::Standalone {
-                drive_serial: SERIAL.into()
-            })));
+    // C8-G2 / DEC-2: endpoint recovery ends only its library sessions and
+    // raises no native-write restart fence; the tape's next open resolves that write.
+    assert!(state
+        .catalog()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    let native_before_global = state.calibration_control().row(UUID).write_epoch;
     // The daemon uses exactly this boundary with global state ownership.
     assert_eq!(
         state
@@ -1421,8 +1521,20 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
             .unwrap(),
         1
     );
-    assert!(state.catalog().non_terminal_sessions().unwrap().is_empty());
-    assert!(state.calibration_control().row(library_tape).write_epoch > before);
+    let open = state.catalog().non_terminal_sessions().unwrap();
+    assert!(open.iter().all(|session| session.session_kind == "write"));
+    assert_eq!(open.len(), 1);
+    let native_session = uuid::Uuid::from_bytes([0xc7; 16]);
+    assert_eq!(open[0].session_id, native_session);
+    assert_eq!(
+        state
+            .catalog()
+            .session_state(native_session)
+            .unwrap()
+            .as_deref(),
+        Some("open")
+    );
+    assert!(state.calibration_control().row(UUID).write_epoch > native_before_global);
 }
 
 /// Ruling 32-L1: the refusal does not depend on the tape's fence or seal, and an import that is
@@ -1609,13 +1721,13 @@ fn mounted_positioning_reuses_only_current_bootstrap_evidence_and_releases_once(
     assert_eq!(*commands.lock().unwrap(), vec![vec![0x1e, 0, 0, 0, 0, 0]]);
 }
 
-/// Physical release must leave unfinished writes for startup recovery; it cannot recover sessions or clear their fences itself.
+/// Physical release leaves endpoint sessions for startup recovery and cannot clear fences.
 #[test]
 fn release_context_does_not_run_write_owner_recovery() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
-    let session = seed_open_session(
-        &mut state,
+    let session = seed_operation_session(
+        &state,
         remanence_library::DriveKey::Standalone {
             drive_serial: SERIAL.into(),
         },
@@ -1653,9 +1765,9 @@ fn release_context_does_not_run_write_owner_recovery() {
         let mut reopened =
             backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
         let mounted = reopened.mount(target()).unwrap();
-        assert!(
-            matches!(reopened.mutate_catalog(&mounted, |_| Ok(())), Err(MountError::Refused(message)) if message.contains("fence"))
-        );
+        // C8-G2 / DEC-2: endpoint recovery ends library sessions without a
+        // restart fence; native writes await their tape's next open.
+        assert!(reopened.mutate_catalog(&mounted, |_| Ok(())).is_ok());
     }
     assert!(state
         .catalog()
@@ -1663,10 +1775,11 @@ fn release_context_does_not_run_write_owner_recovery() {
         .unwrap()
         .iter()
         .all(|s| s.session_id != session));
-    assert_eq!(
-        state.catalog().list_active_tape_io_fences().unwrap().len(),
-        1
-    );
+    assert!(state
+        .catalog()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
 }
 
 /// The release-only type is still a mutation boundary: ephemeral devices cannot
@@ -1711,20 +1824,6 @@ fn copy_closed_state(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), dest).unwrap();
         }
     }
-}
-macro_rules! append_for_rollback {
-    (&mut $state:ident, $world:expr, $root:expr, $name:expr) => {{
-        let world = $world;
-        let root = $root;
-        let mut mount = backend(&mut $state, world, &root.join("locks"), fault()).unwrap();
-        let mounted = mount.mount(target()).unwrap();
-        let (mut actor, reopen_state) = own_mount!(mount, mounted, $state);
-        let result = actor.write_checkpointed(request(root, $name));
-        let _ = actor.finish();
-        $state = reopen_state();
-        let _ = &$state; // The caller regains state ownership even on refusal.
-        result
-    }};
 }
 /// Restore an actual crash cut: the previous closed boundary plus a new unended owner.
 fn open_crash_fixture(state: &StateHandle) {
@@ -1890,6 +1989,8 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
             copy_closed_state(&backup, &dir);
             let mut state = configured_state(&dir, false);
             open_crash_fixture(&state);
+            let paths = state.paths().clone();
+            let library_uuid = state.library_runtime().manifest().library_uuid();
             let before = dispatched_writes(&world);
             assert!(append_for_rollback!(&mut state, &world, root.path(), "C")
                 .unwrap_err()
@@ -1912,6 +2013,34 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
                 })
                 .unwrap();
             assert_eq!(discarded, std::slice::from_ref(&b_id));
+            use remanence_state::authority::TapeAuthorityView as _;
+            let authority = remanence_state::TapeAuthority::open(
+                paths.journal_dir.join("tapes"),
+                UUID,
+                &paths.sqlite_path,
+            )
+            .unwrap();
+            let snapshot = authority.freeze().unwrap();
+            let ending = snapshot.tape_summary().last_session_end.clone().unwrap();
+            assert_eq!(ending.session_id, [0xc7; 16]);
+            assert_eq!(
+                ending.reason,
+                remanence_state::tape_log::SessionEndReason::CrashRecovered
+            );
+            let crash_ack = ending
+                .crash_ack_audit_sequence
+                .expect("crash ending must cite the SupersedeTail acknowledgement");
+            let mut tail = Vec::new();
+            snapshot
+                .visit_session_tail(&mut |file| {
+                    tail.push(file.clone());
+                    Ok(())
+                })
+                .unwrap();
+            assert!(tail.iter().any(|file| file.identity
+                == remanence_state::tape_log::TailIdentity::Object(b_id.clone())));
+            drop(snapshot);
+            drop(authority);
             if finalize_after {
                 actor
                     .finalize_standalone(StandaloneFinalizeRequest {
@@ -1928,12 +2057,42 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
             if !finalize_after {
                 append_for_rollback!(&mut state, &world, root.path(), "C").unwrap();
             }
-            let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-            assert!(audit.iter().any(|r| r.event == AuditEvent::RecoveryEvent
-                && r.detail.get("discarded_object_ids")
-                    == Some(&ciborium::Value::Array(vec![ciborium::Value::Text(
-                        b_id.clone()
-                    )]))));
+            drop(state);
+            // Use the same validated replay as read_library_records; its Record callback
+            // cannot borrow SupersedeTail, so inspect the public fold by source sequence.
+            use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+            let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path)
+                .unwrap();
+            let mut sequences = Vec::new();
+            let replay =
+                store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+                    if applied.record().tag() == Tag::SupersedeTail {
+                        sequences.push(applied.sequence());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                replay.refusal.is_none(),
+                "typed library replay refused: {:?}",
+                replay.refusal
+            );
+            assert!(replay.fold.pending.is_empty());
+            let acknowledgments: Vec<_> = sequences
+                .into_iter()
+                .filter_map(|sequence| {
+                    replay
+                        .fold
+                        .supersede(sequence)
+                        .filter(|value| value.at.tape.uuid == UUID)
+                        .map(|value| (sequence, value.clone()))
+                })
+                .collect();
+            let (sequence, _) = acknowledgments
+                .iter()
+                .find(|(_, value)| value.session_id == Some([0xc7; 16]))
+                .expect("library log must acknowledge this tape's crashed-session discard");
+            assert_eq!(crash_ack, *sequence);
         }
     }
 }
@@ -2628,9 +2787,9 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
 
 /// Code 5, through `OperatorMount::initialize`, the standalone write path. A failed WRITE whose
 /// uncertainty the library log cannot record latches the motion fence and refuses with its text,
-/// and the raise is counted once in the library log, naming the tape. (`recover_sessions_after_restart`
-/// reaches the same function for a standalone write session lost by a restart, but the library log
-/// has no write-kind session, so that caller cannot be driven.)
+/// and the raise is counted once in the library log, naming the tape. (C8-G2 / DEC-2:
+/// `recover_sessions_after_restart` at a standalone mount does not reach `raise_standalone_fence`;
+/// it recovers only library-log sessions, which have no write kind.)
 #[test]
 fn an_unrecordable_standalone_write_fence_is_counted_once_with_its_tape() {
     use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
