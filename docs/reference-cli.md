@@ -1292,6 +1292,7 @@ Supply a non-nil `--idempotency-key` for a retry. If omitted, the command genera
 one and prints it to stderr **before connecting or sending the RPC**; retain it
 and repeat the same tape and expected-pool arguments with that key after a lost
 response. JSON mode prints a preliminary stderr JSON object with `idempotency_key`.
+A close-out that ended without success is final under its key; repeating the key fails with `FAILED_PRECONDITION` starting `ClosedOperationRetry:`, so run the command again with a new key (or none).
 
 Success prints the terminal operation (JSON on stdout with `--json`) and exits 0.
 Failures print to stderr and exit 1. JSON terminal failures include

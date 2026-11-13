@@ -17,7 +17,8 @@ const CLOSEOUT_TAPE_IDEMPOTENCY_CONFLICT: &str =
     "CloseoutTape idempotency key is already bound to a different request";
 
 /// Operator acceptance carries the original fingerprint into a writer-minted
-/// operation. Closed failures remain the explicit same-operation retry gap.
+/// operation. A closed close-out is final under its key, as terminal finalize
+/// (ruling 25); a retry needs a new key.
 pub(crate) fn start(
     state: &ApiState,
     actor: AuditActor,
@@ -92,7 +93,7 @@ pub(crate) fn start(
                 state.operations.register(id,KIND).publish_state(pb::OperationState::Succeeded,&[("phase","complete")]);return Ok(response)
             }
             lib::OperationEvent::Accepted(_)|lib::OperationEvent::Started(_)=>{},
-            _=>return Err(Status::failed_precondition("this closeout operation has ended; a new operation is required for further physical work"))
+            _=>return Err(Status::failed_precondition("ClosedOperationRetry: this closeout operation has ended; a new operation is required for further physical work"))
         }
     }
     if state

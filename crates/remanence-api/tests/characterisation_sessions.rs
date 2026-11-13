@@ -626,18 +626,38 @@ async fn an_overdue_timer_checkpoint_is_counted_in_the_library_log() {
     assert!(recorded.contains(&barrier), "{recorded:?}");
 }
 
-/// Bind the durable close audit to the exact session, independently of RPC lookup.
-fn assert_session_closed(fixture: &Harness, session_id: &[u8]) {
-    let id = uuid::Uuid::from_slice(session_id).unwrap();
+/// Replay typed close-out chains after daemon teardown, following `recorded_refusals`.
+fn recorded_closeouts(fixture: &Harness) -> Vec<remanence_state::library_log::OperationRecorded> {
+    use remanence_state::library_log::{native_view::NativeTapeView, store};
+    let paths = state_paths(&fixture.config);
+    let uuid = StateHandle::open_with_config(paths.clone(), fixture.config.clone())
+        .unwrap()
+        .library_runtime()
+        .manifest()
+        .library_uuid();
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+    let mut records = Vec::new();
+    store::replay_observed(&paths.audit_dir, uuid, &view, &mut |applied| {
+        if let Some(operation) = applied.record().operation_recorded() {
+            if operation.kind == remanence_state::library_log::OperationKind::TapeCloseout {
+                records.push(operation.clone());
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    records
+}
+
+/// Bind a write session's shutdown to its exact native ending, without a second owner.
+fn assert_write_session_shutdown(fixture: &Harness, session_id: &[u8]) {
+    let id = *uuid::Uuid::from_slice(session_id).unwrap().as_bytes();
     assert!(
-        remanence_state::FileAuditLog::replay(&fixture.config.audit.dir)
-            .unwrap()
-            .iter()
-            .any(
-                |event| event.event == remanence_state::AuditEvent::SessionClosed
-                    && event.session_id == Some(id)
-            ),
-        "session {id} has a clean-close audit"
+        ruling24_native_records(&fixture.config).iter().any(|record| matches!(record,
+            remanence_state::tape_log::Record::SessionEnded(end)
+                if end.session_id == id
+                    && end.reason == remanence_state::tape_log::SessionEndReason::GracefulShutdown)),
+        "session {} has a native GracefulShutdown ending", uuid::Uuid::from_bytes(id)
     );
 }
 
@@ -691,7 +711,7 @@ async fn check_graceful_shutdown_restart(other_drive: bool) {
         pb::write_session::State::WriteSessionStateClosed as i32,
         "shutdown retains the completed session and its receipts"
     );
-    assert_session_closed(&fixture, &session.session_id);
+    assert_write_session_shutdown(&fixture, &session.session_id);
     let authority = remanence_state::TapeAuthority::open(
         fixture.config.journal.dir.join("tapes"),
         UUID,
@@ -862,15 +882,31 @@ async fn graceful_shutdown_closes_read_session_without_motion() {
         tonic::Code::NotFound,
         "shutdown releases the read session"
     );
-    assert_session_closed(&fixture, &read.session_id);
-    let world = fixture.world.lock().unwrap();
-    assert!(world.drive_bays[&BAY].is_some());
+    {
+        let world = fixture.world.lock().unwrap();
+        assert!(world.drive_bays[&BAY].is_some());
+        assert_eq!(
+            world.command_log[before..]
+                .iter()
+                .filter(|c| matches!(c.opcode, 0x01 | 0x1b | 0xa5))
+                .count(),
+            0
+        );
+    }
+    drop(reader);
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    let state = StateHandle::open_with_config(state_paths(&fixture.config), fixture.config.clone())
+        .unwrap();
+    state.library_runtime().catch_up().unwrap();
     assert_eq!(
-        world.command_log[before..]
-            .iter()
-            .filter(|c| matches!(c.opcode, 0x01 | 0x1b | 0xa5))
-            .count(),
-        0
+        state
+            .catalog()
+            .session_state(uuid::Uuid::from_slice(&read.session_id).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("closed"),
+        "shutdown projects the read session's typed Closed observation"
     );
 }
 
@@ -1990,17 +2026,22 @@ async fn closeout_due_noop_idempotency_and_wrong_pool() {
     let snapshot = authority.freeze().unwrap();
     assert!(!snapshot.tape_summary().closeout_due());
     assert!(snapshot.tape_summary().open_session.is_none());
-    let ended = remanence_state::FileAuditLog::replay(&fixture.config.audit.dir).unwrap();
-    assert!(ended
-        .iter()
-        .any(|record| record.session_id.map(|id| id.as_bytes().to_vec())
-            == Some(session.session_id.clone())
-            && record.detail.get("end_reason")
-                == Some(&ciborium::Value::Text("drive_error".into()))));
+    let session_id = *uuid::Uuid::from_slice(&session.session_id)
+        .unwrap()
+        .as_bytes();
+    assert!(
+        ruling24_native_records(&fixture.config)
+            .iter()
+            .any(|record| matches!(record,
+            remanence_state::tape_log::Record::SessionEnded(end)
+                if end.session_id == session_id
+                    && end.reason == remanence_state::tape_log::SessionEndReason::DriveError)),
+        "failed write session has a native DriveError ending"
+    );
     // A worker may win the closeout hold after the failed write. The operator
     // then waits and succeeds as already protected, without publishing a second
     // media proof under its own operation ID. Require the actual native proof
-    // and its terminal worker audit in that case, not merely a zero-debt view.
+    // and its terminal worker library record in that case, not merely a zero-debt view.
     let proof = snapshot
         .tape_summary()
         .last_closeout_record
@@ -2011,13 +2052,6 @@ async fn closeout_due_noop_idempotency_and_wrong_pool() {
     if proof.operation_id != operator_id {
         assert_eq!(status.progress["already_protected"], "true");
         assert_eq!(status.progress["reserved_bytes"], "0");
-        assert!(
-            ended.iter().any(|record| {
-                record.operation_id.map(|id| *id.as_bytes()) == Some(proof.operation_id)
-                    && record.event == remanence_state::AuditEvent::OperationFinished
-            }),
-            "worker's native closeout proof must have a finished audit operation"
-        );
     }
     assert!(
         remanence_state::projector::open(&fixture.config.index.sqlite_path)
@@ -2038,6 +2072,23 @@ async fn closeout_due_noop_idempotency_and_wrong_pool() {
     assert_eq!(fixture.world.lock().unwrap().command_log.len(), before);
     client.assert_object(&committed, b"committed bytes").await;
     client.state.shutdown_drive_pool().await.unwrap();
+    drop(catalog);
+    drop(daemon);
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    if proof.operation_id != operator_id {
+        assert!(
+            recorded_closeouts(&fixture).iter().any(|record| {
+                record.operation == proof.operation_id
+                    && record.kind == remanence_state::library_log::OperationKind::TapeCloseout
+                    && matches!(
+                        record.event,
+                        remanence_state::library_log::OperationEvent::Finished(_)
+                    )
+            }),
+            "worker's native closeout proof must have a Finished library operation"
+        );
+    }
 }
 
 /// The close receipt is early, but ownership remains exclusive until native
@@ -2305,16 +2356,12 @@ async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_res
         assert!(text.contains("run rem tape closeout"), "{text}");
         assert!(text.contains("before retirement"), "{text}");
     }
-    let key = uuid::Uuid::new_v4();
-    let request = pb::CloseoutTapeRequest {
-        tape_uuid: UUID.to_vec(),
-        expected_pool_id: Some("archive".into()),
-        idempotency_key: Some(pb::IdempotencyKey {
-            value: key.as_bytes().to_vec(),
-        }),
-    };
+    // Ruling 25 and DEC-4: a close-out ended by failure or restart loss is
+    // final under its key. Further physical work requires a new key.
+    let keys = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
     let mut operation = None;
-    for (attempt, limited) in [true, false, false].into_iter().enumerate() {
+    let mut failed_chain = Vec::new();
+    for (attempt, limited) in [true, true, false, false].into_iter().enumerate() {
         fixture.config.daemon.io_memory_ceiling = if limited {
             1024 * 1024
         } else {
@@ -2324,45 +2371,77 @@ async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_res
         fixture.config.tape_io.read_reservoir_bytes = 1024 * 1024;
         let client = fixture.start().await;
         let before = fixture.world.lock().unwrap().command_log.len();
-        let op = pb::catalog_client::CatalogClient::new(client.channel.clone())
-            .closeout_tape(request.clone())
-            .await
-            .unwrap()
-            .into_inner();
-        let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
-            .watch_operation(pb::GetOperationRequest {
-                operation_id: op.operation_id.clone(),
+        let answer = pb::catalog_client::CatalogClient::new(client.channel.clone())
+            .closeout_tape(pb::CloseoutTapeRequest {
+                tape_uuid: UUID.to_vec(),
+                expected_pool_id: Some("archive".into()),
+                idempotency_key: Some(pb::IdempotencyKey {
+                    value: keys[attempt / 2].as_bytes().to_vec(),
+                }),
             })
-            .await
-            .unwrap()
-            .into_inner();
-        let mut last = None;
-        while let Some(status) = watch.message().await.unwrap() {
-            last = Some(status);
-        }
-        let last = last.unwrap();
-        if limited {
-            assert_eq!(last.state, pb::OperationState::Failed as i32);
-            assert!(last.error_summary.contains("CloseoutMemory:"), "{last:?}");
-            assert_eq!(fixture.world.lock().unwrap().command_log.len(), before);
-        } else {
-            assert_eq!(last.state, pb::OperationState::Succeeded as i32, "{last:?}");
-        }
-        if attempt == 2 {
+            .await;
+
+        if attempt == 1 {
+            let error = answer.expect_err("an ended close-out refuses the same key");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+            assert_eq!(error.message(), "ClosedOperationRetry: this closeout operation has ended; a new operation is required for further physical work");
             assert_eq!(
                 fixture.world.lock().unwrap().command_log.len(),
                 before,
-                "durable retry does no media work after restart"
+                "refused retry does no drive work"
             );
+        } else {
+            let op = answer.unwrap().into_inner();
+            let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
+                .watch_operation(pb::GetOperationRequest {
+                    operation_id: op.operation_id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let mut last = None;
+            while let Some(status) = watch.message().await.unwrap() {
+                last = Some(status);
+            }
+            let last = last.unwrap();
+
+            if attempt == 0 {
+                assert_eq!(last.state, pb::OperationState::Failed as i32);
+                assert!(last.error_summary.contains("CloseoutMemory:"), "{last:?}");
+                assert_eq!(fixture.world.lock().unwrap().command_log.len(), before);
+            } else if attempt >= 2 {
+                assert_eq!(last.state, pb::OperationState::Succeeded as i32, "{last:?}");
+            }
+            if attempt == 3 {
+                assert_eq!(
+                    fixture.world.lock().unwrap().command_log.len(),
+                    before,
+                    "durable retry does no media work after restart"
+                );
+                assert_eq!(Some(&op.operation_id), operation.as_ref());
+            }
+            operation = Some(op.operation_id);
+            drop(watch);
         }
-        if let Some(previous) = &operation {
-            assert_eq!(&op.operation_id, previous);
-        }
-        operation = Some(op.operation_id);
         client.state.shutdown_drive_pool().await.unwrap();
-        drop(watch);
         client.shutdown().await;
         fixture.wait_for_teardown().await;
+        if attempt == 0 {
+            failed_chain = recorded_closeouts(&fixture);
+        } else if attempt == 1 {
+            let closeouts = recorded_closeouts(&fixture);
+            let failed_id = *uuid::Uuid::from_slice(operation.as_ref().unwrap())
+                .unwrap()
+                .as_bytes();
+            assert!(
+                closeouts.iter().all(|record| record.operation == failed_id),
+                "refused retry creates no other TapeCloseout operation: {closeouts:?}"
+            );
+            assert_eq!(
+                closeouts, failed_chain,
+                "refused retry leaves the failed operation's chain unchanged"
+            );
+        }
     }
 }
 
