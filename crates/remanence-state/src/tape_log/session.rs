@@ -1,4 +1,4 @@
-//! Native v2 session metadata and bounded references to streamed abandoned files.
+//! Native v3 session metadata and bounded references to streamed abandoned files.
 //! Production writers publish these under the exclusive tape lease; the fold
 //! binds every Object commit and named ending to its session.
 use super::{CheckValue, CommitCursor, GroupRef};
@@ -13,6 +13,20 @@ pub struct SessionCursor {
     /// Next tape file.
     pub next_file: u64,
 }
+/// Physical drive identity captured when a native write session opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionDrive {
+    /// Nonempty, trimmed drive serial number.
+    pub serial: String,
+    /// Trimmed inquiry vendor, when reported.
+    pub vendor: Option<String>,
+    /// Trimmed inquiry product, when reported.
+    pub product: Option<String>,
+    /// Physical endpoint at the time of the write.
+    pub endpoint: crate::library_log::DriveKey,
+    /// Active observed catalogue identity at the time of the write, if any.
+    pub drive_uuid: Option<[u8; 16]>,
+}
 /// Durable start of an exclusive session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionOpened {
@@ -26,6 +40,8 @@ pub struct SessionOpened {
     pub cursor: SessionCursor,
     /// RFC3339 UTC time.
     pub opened_at_utc: String,
+    /// Drive that opened this session.
+    pub drive: SessionDrive,
 }
 /// Why the session ended; wire discriminants follow this declaration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

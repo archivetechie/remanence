@@ -1245,7 +1245,21 @@ fn b4b2b_tape_owned_decisions_survive_empty_catalog_rebuild() {
             .unwrap();
             let mut lease = authority.acquire_exclusive().unwrap();
             lease
-                .open_session([0xda; 16], "2026-11-05T00:00:00Z".into())
+                .open_session(
+                    [0xda; 16],
+                    "2026-11-05T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: remanence_state::library_log::DriveKey::Standalone(
+                            remanence_state::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
+                )
                 .unwrap();
             f.index()
                 .project_tape_log(&lease.freeze().unwrap())

@@ -420,7 +420,8 @@ struct Session {
 fn rebind_finalization_marker(root: &Path, seed_journal_root: &Path) -> Result<(), String> {
     let marker_bytes = |journal_root: &Path| {
         format!(
-            "remanence-tape-log-v2\n{}\n",
+            "{}\n{}\n",
+            remanence_state::authority_layout::FORMAT,
             serde_json::to_string(journal_root).unwrap()
         )
         .into_bytes()

@@ -58,7 +58,21 @@ async fn b7_fix_top_once_json_reads_held_checkpoint_and_partial_lists_exit_nonze
         )
         .unwrap();
     lease
-        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [9; 16],
+            "2026-11-02T00:00:00Z".into(),
+            remanence_state::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: remanence_state::library_log::DriveKey::Standalone(
+                    remanence_state::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     let mut staged = lease.latest_commit().unwrap().unwrap();
     staged.ordinal += 1;

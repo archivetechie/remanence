@@ -1,4 +1,4 @@
-//! V2 per-tape host authority format; this module performs no tape I/O.
+//! V3 per-tape host authority format; this module performs no tape I/O.
 //!
 //! The fixed little-endian prefix is CRC protected before lengths are trusted;
 //! structural and catalog sections have independent CRC-64/XZ trailers. The
@@ -24,7 +24,7 @@
 //! therefore stage output until close; they must not publish provisional rows.
 //! Frames and group digests do not bind a tape UUID: storage validates the
 //! file header and its tape identity before folding these bytes.
-//! Session records are accepted by v2; step-6 tags remain reserved.
+//! Session records are accepted by v3; step-6 tags remain reserved.
 
 pub mod authority;
 pub mod codec;
@@ -47,7 +47,7 @@ pub use remanence_parity::{
 use remanence_parity::{SidecarEpochDirectoryEntry, TerminalTailLayout};
 
 /// Host frame version; independent of every on-tape format version.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub use crate::log_frame::{Section, FRAME_OVERHEAD, MAX_FRAME_BODY, PREFIX_LEN};
 
 macro_rules! tags {

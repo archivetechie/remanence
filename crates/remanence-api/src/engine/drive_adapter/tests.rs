@@ -2706,3 +2706,69 @@ fn mounted_append_failure_with_an_undurable_ending_keeps_the_classifier_fence() 
     eprintln!("T3 fences after reopen: {reasons:?}");
     assert_eq!(reasons, ["transfer_error"]);
 }
+
+/// T-B: the mounted standalone actor records its physical serial, without
+/// inventing an observed UUID, a bay, an endpoint key, or a correlation row.
+#[test]
+fn wdrv_standalone_session_records_serial_without_observed_identity() {
+    use rusqlite::types::Value;
+    let (fixture, state) = Fixture::new(false);
+    let runtime = state.library_runtime();
+    let mut owner = fixture.owner(state);
+    let session = owner.open_session("default").unwrap();
+    let id = Uuid::from_slice(&session.session_id).unwrap();
+    let row = || {
+        runtime.catch_up().unwrap();
+        let conn = rusqlite::Connection::open(&fixture.config.index.sqlite_path).unwrap();
+        conn.query_row(
+            "select drive_serial,drive_uuid,library_serial,drive_bay,endpoint_key
+             from sessions where session_id=?1 and session_kind='write'",
+            [id.to_string()],
+            |r| {
+                (0..5)
+                    .map(|i| r.get::<_, Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            },
+        )
+        .unwrap()
+    };
+    let expected = vec![
+        Value::Text(SERIAL.into()),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ];
+    assert_eq!(row(), expected);
+    let records = native_records(&fixture.config);
+    let open = records
+        .iter()
+        .find_map(|record| match record {
+            remanence_state::tape_log::Record::SessionOpened(v) => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(open.drive.serial, SERIAL);
+    assert_eq!(open.drive.drive_uuid, None);
+    assert_eq!(
+        open.drive.endpoint,
+        remanence_state::library_log::DriveKey::Standalone(
+            remanence_state::library_log::Standalone {
+                drive_serial: SERIAL.into()
+            }
+        )
+    );
+    assert!(fixture
+        .index()
+        .tape_drive_correlation_rollups(&UUID)
+        .unwrap()
+        .is_empty());
+    assert!(fixture
+        .index()
+        .drive_tape_correlation_rollups(&[0xd1; 16])
+        .unwrap()
+        .is_empty());
+    owner.close_session().unwrap();
+    assert_eq!(row(), expected, "session end preserves standalone serial");
+    owner.finish().unwrap();
+}

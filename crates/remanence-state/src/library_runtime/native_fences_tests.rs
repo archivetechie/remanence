@@ -123,7 +123,23 @@ impl Fixture {
             .unwrap();
         let mut session = uuid;
         session[0] ^= 0x10;
-        owner.open_session(session, TIME.into()).unwrap();
+        owner
+            .open_session(
+                session,
+                TIME.into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
         if let Some(reason) = reason {
             owner
                 .end_session(session, TIME.into(), reason, None, std::iter::empty())
@@ -666,7 +682,23 @@ fn replacement_without_runtime(paths: &StatePaths, uuid: lib::Id) -> Snapshot {
         .unwrap();
     let mut session = uuid;
     session[0] ^= 0x10;
-    owner.open_session(session, TIME.into()).unwrap();
+    owner
+        .open_session(
+            session,
+            TIME.into(),
+            crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
+        .unwrap();
     owner
         .end_session(
             session,

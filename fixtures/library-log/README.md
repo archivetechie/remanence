@@ -666,7 +666,7 @@ Authoritative prefix end: 1268 bytes; tail Complete.
 
 Tail: `Some(Complete)`. Authoritative sequence 15; applied 10; pending 3; tapes 2; fences 1; duplicates 0.
 
-`00000000000000000001-2026-11-03.remlib`: 4325 bytes, SHA-256 `e62001dd32d98eac769e907ca520f966492b0bbd6df66f7de39284b251c04fae`.
+`00000000000000000001-2026-11-03.remlib`: 4325 bytes, SHA-256 `082d1c750de7419926d43f2fd0150a232e7dad314e436ca78b438e886eff1a1b`.
 
 Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
 
@@ -678,19 +678,19 @@ Authoritative prefix end: 4325 bytes; tail Complete.
 |---:|---|---|---:|---:|---|
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 324 | `9b1675e129a3f0686822c9bceb3a78ea11c19066e24e05d45725fa10a2246be8` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 324 | 564 | `8e4b15115d158e793d4cedc23201d2735933290a28559d4d3f14a76df14b5bbd` |
-| 3 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 564 | 868 | `df99912747b32f332589928af53fa8e344e554a4666fc7f063512c7241657645` |
-| 4 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 868 | 1172 | `563f9ace2ae34e757154d210b61cf2659dcf597336a4d3cd5d8005a6e750810a` |
-| 5 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1172 | 1476 | `513b075f5ab04e978d1ba8a8c9632bcd1a12d5cd5fbd918e6121f355ab461879` |
-| 6 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1476 | 1780 | `84231eeec437f8328526a8e4890c08f2a39ba9b1dea17638294a83ba911a2383` |
-| 7 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1780 | 2084 | `795beebb611c523ee3ec7dcf5f2e22236d67551217ab32362c544dc6194363d6` |
-| 8 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 2084 | 2388 | `11a731d1384cb5f3f8be25bc638c26f8d8281d37885a310bc0868d99f69975bf` |
-| 9 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 2388 | 2692 | `e221ee217c7257131259c267e95469357130d4b3e13f8dc0bdf62b4db37f8e89` |
-| 10 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 2692 | 2996 | `689aad0abf77a7e7b24ee02733b2ff6f34b25e433b85f4242935f75dc6c42f00` |
-| 11 | VerificationVerdict | 00000000000000000001-2026-11-03.remlib | 2996 | 3293 | `0d1eebf397f9302fd2afac6b2c8097e7c8bc09c53684cec980f9865b4be5b12d` |
-| 12 | AssignPool | 00000000000000000001-2026-11-03.remlib | 3293 | 3501 | `0d8c745077bbabdebba9d82b0116fbc5f3311222191dab95ed34fbc21ead4c35` |
-| 13 | FenceRaised | 00000000000000000001-2026-11-03.remlib | 3501 | 3783 | `c43f8ffb431829cd812269afe6797af1547071d218263f3c0e74d92f0f29bbe3` |
-| 14 | AssignPool | 00000000000000000001-2026-11-03.remlib | 3783 | 3991 | `5a71016b2c67bf7c37f7286e8b18d88709e438fdd76c16b19c889dea8b64c072` |
-| 15 | SupersedeTail | 00000000000000000001-2026-11-03.remlib | 3991 | 4325 | `ab65e52355e0bc268b9d5f91f8c33ededf478c968b6a501f040988f03c2eab5a` |
+| 3 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 564 | 868 | `3df55e3f97081d8f0561e1f600ef23bd9ac64b9b5f5e6729b41da4f6f7c4b0df` |
+| 4 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 868 | 1172 | `bf516efe51407ee4c3eb7864a6eb67e57d9ba2e7fd970b551c7daafa52b6ea13` |
+| 5 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1172 | 1476 | `cbe588ae395d7180e23bca55fdf0d867afbb9e09f7e2383a2e7fc79949c5e2e8` |
+| 6 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1476 | 1780 | `f9216b52c59ecf9ff4011c87dce8bca5042897aba3b5c51c672fd3292c48f60c` |
+| 7 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1780 | 2084 | `a9fe6fa9073ff0ceb81234816b6a46f7a7460b7cb7a28e2626ad2667aa3555c2` |
+| 8 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 2084 | 2388 | `364363b9495dfd5766a5c2eabc1c8fc36f7631b919912e3440374ae71f8a3169` |
+| 9 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 2388 | 2692 | `9526b33df3e13e67a52e19ee986c290392695d2becaef4c1236f56df01c48063` |
+| 10 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 2692 | 2996 | `3c83ebba55925068902e6614cff538e1eaeee71cb7b41d63eea5ecb3029333a6` |
+| 11 | VerificationVerdict | 00000000000000000001-2026-11-03.remlib | 2996 | 3293 | `0fd743d854729e784d408a579a04c57828bbe97c51942080d38c12d5c5ab6bd3` |
+| 12 | AssignPool | 00000000000000000001-2026-11-03.remlib | 3293 | 3501 | `1ebcb9b951b83ff4ebc188f529b8a7d920c7e0a5c98b30bbab8cd790ff972924` |
+| 13 | FenceRaised | 00000000000000000001-2026-11-03.remlib | 3501 | 3783 | `b423e87de8661fcd06173e4201c666cffe41d447b5cc925a45640055f7d1f650` |
+| 14 | AssignPool | 00000000000000000001-2026-11-03.remlib | 3783 | 3991 | `ad066cbbb2f0bfcb1538d4b2b3059c852aa07ca382da57fe4736a10e65350db5` |
+| 15 | SupersedeTail | 00000000000000000001-2026-11-03.remlib | 3991 | 4325 | `88be360d90e93c4ac2ed5c6459d380e2316b3512b0074992deff06dbff6d84a9` |
 ## queued-successor-fence
 
 Tail: `Some(Complete)`. Authoritative sequence 5; applied 1; pending 4; tapes 1; fences 1; duplicates 0.
@@ -7933,21 +7933,21 @@ Default: NotYet.
 
 Default: NotYet.
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 1: Present(Initialized, d26d8bfaa389abf12b2c8047b52f0e31cb090c8982bc1e90e99116c379fd74e8).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 1: Present(Initialized, 08fbd1333bd7f790d743d9c0ed8d50206469ad9d1cf225f2dc46cbc0fd215c20).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 2: Present(SessionOpened, f199113b0bdd3399a8c28bef3733383390b636c835087709e3070f9c29089ab6).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 2: Present(SessionOpened, 54dc1c22aeb0c947db7ae93feceac926195502f56540b8bc6bf6aa693847feae).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 3: Present(PayloadContinuation, f89a8b7a38baf9d0ec845f376533d40238a1ccccc132eacd305c01c23c8a8b16).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 3: Present(PayloadContinuation, 7313a35702d0912f3c04f1ebed13639f4ce766519037b50e676430f82e0ef189).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 4: Present(PayloadContinuation, 984a063aba1f16436f59f00ff48b7e2169c8aaf1f115f29039dfc08bcd5aa1bb).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 4: Present(PayloadContinuation, bcb6a8052a2764dbbbccfc8d53c2b838fa6bc4f8a846a78e7f593aa345504c4c).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 5: Present(Committed, e85229ea7b05a7aea7071af7f9e144fdde36ebe2b6a2fb896a01fc53771e015c).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 5: Present(Committed, d015ee315a1c562c1cd7bb06f1c54659de79a40819393fd0fec0abdd7570eafd).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 6: Present(PayloadContinuation, d2ff6d35b9702856cba9922bc188bc83fca57c81cccf1256a2db7e7c02852450).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 6: Present(PayloadContinuation, d58cbe923c2f215bd22b1d4c6ccfcb73a237fad6487be0404f96b05b679024a2).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 7: Present(PayloadContinuation, 645b0fef892178b98d645006ab6d4a143cff25a62e69e7c2af1f5ed37f9c94b1).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 7: Present(PayloadContinuation, e6d576782cc187016a830ffd640416dfd2289bf012c6ea03a0eeecace28e6770).
 
-Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 8: Present(SessionEnded, 9d01be0662f6b7190a0bc1a44c2cb9dff6b86220436aef08b168a40240731a71).
+Tape `a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1` at sequence 8: Present(SessionEnded, e0eb919a38760673570a4dbf460950537607f97166d1d167a5a7ca5b343235b5).
 
 ### queued-successor-fence
 

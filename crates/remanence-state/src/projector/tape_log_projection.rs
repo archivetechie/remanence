@@ -516,14 +516,24 @@ fn project_snapshot_rows(
         let mut row_number = 0;
         let group = raw.group_snapshot(sequence, begin, frame.end);
         // Write-session authority exists only in the native tape source. Apply
-        // it on live catch-up as well as rebuild; metadata is preserved by
-        // project_session_core when this native record supplies no endpoint.
+        // it on live catch-up as well as rebuild; the ending preserves the
+        // open's drive fields through project_session_core's coalescing upsert.
+        // Bay coordinates stay in the native record: leaving both SQL bay
+        // columns NULL prevents the legacy trigger from deriving an endpoint.
+        // Native recovery remains tape-owned.
         let session = match &frame.record {
-            Record::SessionOpened(v) => Some((v.session_id, "open", v.opened_at_utc.as_str())),
-            Record::SessionEnded(v) => Some((v.session_id, "closed", v.ended_at_utc.as_str())),
+            Record::SessionOpened(v) => Some((
+                v.session_id,
+                "open",
+                v.opened_at_utc.as_str(),
+                Some(&v.drive),
+            )),
+            Record::SessionEnded(v) => {
+                Some((v.session_id, "closed", v.ended_at_utc.as_str(), None))
+            }
             _ => None,
         };
-        if let Some((session, state, timestamp)) = session {
+        if let Some((session, state, timestamp, drive)) = session {
             project_session_core(
                 tx,
                 SessionProjection {
@@ -532,7 +542,8 @@ fn project_snapshot_rows(
                     tape_uuid: Some(uuid.to_vec()),
                     library_serial: None,
                     drive_bay: None,
-                    drive_uuid: None,
+                    drive_uuid: drive.and_then(|v| v.drive_uuid).map(|v| v.to_vec()),
+                    drive_serial: drive.map(|v| v.serial.clone()),
                     state,
                     timestamp,
                     endpoint: None,
@@ -996,7 +1007,21 @@ mod tests {
         let authority = TapeAuthority::open_fixture(root.path(), id).unwrap();
         let mut lease = authority.acquire_exclusive().unwrap();
         lease
-            .open_session([0xda; 16], "2026-11-05T00:00:00Z".into())
+            .open_session(
+                [0xda; 16],
+                "2026-11-05T00:00:00Z".into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
             .unwrap();
         let snapshot = lease.freeze().unwrap();
         let mut expected = std::collections::BTreeMap::new();

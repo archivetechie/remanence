@@ -10294,7 +10294,23 @@ fn l1a_api_native(root: &TypedRoot, id: [u8; 16], long: bool) -> Vec<u8> {
     } else {
         "2026-11-11T00:00:00Z".into()
     };
-    owner.open_session(id, time.clone()).unwrap();
+    owner
+        .open_session(
+            id,
+            time.clone(),
+            remanence_state::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: remanence_state::library_log::DriveKey::Standalone(
+                    remanence_state::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
+        .unwrap();
     owner
         .end_session(
             id,
@@ -10331,7 +10347,21 @@ async fn l1a_daemon_starts_for_short_rewritten_and_short_bytes() {
                     .unwrap();
             let mut owner = authority.acquire_exclusive().unwrap();
             owner
-                .open_session([0x91; 16], "2026-11-11T00:00:00Z".into())
+                .open_session(
+                    [0x91; 16],
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: remanence_state::library_log::DriveKey::Standalone(
+                            remanence_state::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
+                )
                 .unwrap();
             owner
                 .end_session(

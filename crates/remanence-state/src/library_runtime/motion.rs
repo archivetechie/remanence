@@ -5,6 +5,13 @@ use super::{LibraryRuntime, RuntimeError};
 use crate::{library_log as lib, StateError};
 use remanence_library::{motion::*, outcome};
 
+/// Share the physical endpoint conversion with native tape-session producers.
+impl From<&remanence_library::DriveKey> for lib::DriveKey {
+    fn from(key: &remanence_library::DriveKey) -> Self {
+        endpoint(key)
+    }
+}
+
 pub(super) fn endpoint(key: &remanence_library::DriveKey) -> lib::DriveKey {
     match key {
         remanence_library::DriveKey::Bay {

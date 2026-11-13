@@ -123,8 +123,21 @@ fn tail_log(refined: bool) -> Vec<u8> {
         .unwrap();
         if refined {
             w.record_session_tail_eod(11).unwrap();
-            w.open_session([10; 16], "2026-11-02T00:03:00Z".into())
-                .unwrap();
+            w.open_session(
+                [10; 16],
+                "2026-11-02T00:03:00Z".into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-FIXTURE".into(),
+                    vendor: Some("IBM".into()),
+                    product: Some("ULT3580".into()),
+                    endpoint: crate::library_log::DriveKey::Bay(crate::library_log::Bay {
+                        library_serial: "LIB-FIXTURE".into(),
+                        bay: 0x100,
+                    }),
+                    drive_uuid: Some([0xd1; 16]),
+                },
+            )
+            .unwrap();
         }
     })
 }
@@ -153,6 +166,16 @@ fn rejected_tail(base: &[u8], open: bool, change_reason: bool) -> Vec<u8> {
             base_media_sequence: end.base_media_sequence,
             cursor: end.cursor,
             opened_at_utc: "2026-11-02T00:03:00Z".into(),
+            drive: crate::tape_log::SessionDrive {
+                serial: "DRV-FIXTURE".into(),
+                vendor: Some("IBM".into()),
+                product: Some("ULT3580".into()),
+                endpoint: crate::library_log::DriveKey::Bay(crate::library_log::Bay {
+                    library_serial: "LIB-FIXTURE".into(),
+                    bay: 0x100,
+                }),
+                drive_uuid: Some([0xd1; 16]),
+            },
         };
         sequence += 1;
         super::codec::encode_frame(&mut bytes, sequence, &Record::SessionOpened(opened), &[])
@@ -489,7 +512,7 @@ fn describe(case: &Case, frames_tsv: &mut String, summary_tsv: &mut String) -> S
 
 const README_HEAD: &str = "# Per-tape log reference fixtures
 
-Host per-tape logs (`<tape-uuid>.remtape`, format version 2) for testing an
+Host per-tape logs (`<tape-uuid>.remtape`, format version 3) for testing an
 independent decoder. The Rust authority writer produced every healthy log from
 fixed inputs; the damaged tails are cut or edited from a healthy log afterwards.
 These are host authority files, not tape images, and carry no on-tape bytes.

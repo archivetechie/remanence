@@ -1977,6 +1977,12 @@ pub(super) fn handle_drive_open_write(
         drive_serial,
         reply,
     } = request;
+    if drive.drive().serial.trim().is_empty() {
+        let _ = reply.send(Err(Status::failed_precondition(
+            "The drive reports no serial number and cannot record archive writes.",
+        )));
+        return None;
+    }
     // Declare before leases so refusal publication follows their release.
     let mut reply = OpenWriteReply {
         sender: Some(reply),
@@ -2763,7 +2769,37 @@ pub(super) fn handle_drive_open_write(
             .flatten()
             .and_then(|t| t.voltag),
     );
-    if let Err(error) = checkpoint_lease.open_session(*session_id.as_bytes(), opened_at_utc.clone())
+    let installed = drive.drive();
+    let serial = installed.serial.trim().to_owned();
+    let recorded_drive_uuid = match cfg.authority.runtime() {
+        Some(runtime) => match runtime.active_drive_uuid_for_serial(&serial) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = reply.send(Err(Status::failed_precondition(error.to_string())));
+                return None;
+            }
+        },
+        None => None,
+    };
+    let session_drive = remanence_state::tape_log::SessionDrive {
+        serial,
+        vendor: installed
+            .vendor
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned),
+        product: installed
+            .product
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned),
+        endpoint: (&cfg.endpoint(bay)).into(),
+        drive_uuid: recorded_drive_uuid,
+    };
+    if let Err(error) =
+        checkpoint_lease.open_session(*session_id.as_bytes(), opened_at_utc.clone(), session_drive)
     {
         let status = status_from_state_error(error);
         super::checkpoint::fence_ambiguous_authority(

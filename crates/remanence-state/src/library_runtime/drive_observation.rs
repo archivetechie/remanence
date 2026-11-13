@@ -13,16 +13,9 @@ struct Seen {
     retired: bool,
 }
 impl LibraryRuntime {
-    /// Observe one complete owner-supplied batch. A missing drive is not retired.
-    /// UUIDs are minted only for unmatched observations and become source facts.
-    pub fn observe_drives(
-        &self,
-        inputs: Vec<crate::DriveObservationInput>,
-    ) -> Result<Vec<crate::DriveObservationOutcome>, RuntimeError> {
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+    /// Replay the same identity and stewardship facts for observation and
+    /// session attribution. The caller holds the runtime dispatch lock.
+    fn replay_drive_history_locked(&self) -> Result<(BTreeMap<lib::Id, Seen>, u64), RuntimeError> {
         let view = self
             .0
             .view
@@ -73,6 +66,46 @@ impl LibraryRuntime {
             )
             .into());
         }
+        Ok((known, generation))
+    }
+
+    /// Resolve a trimmed physical serial to its unique active observed identity.
+    /// This reads authenticated history under dispatch and appends nothing;
+    /// absent and ambiguous active holders both return None.
+    pub fn active_drive_uuid_for_serial(
+        &self,
+        serial: &str,
+    ) -> Result<Option<lib::Id>, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let (known, _) = self.replay_drive_history_locked()?;
+        let serial = serial.trim();
+        let mut active = known.values().filter(|seen| {
+            !seen.retired
+                && seen
+                    .value
+                    .serial
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == serial)
+        });
+        let first = active.next().map(|seen| seen.value.drive_uuid);
+        if active.next().is_some() {
+            Ok(None)
+        } else {
+            Ok(first)
+        }
+    }
+
+    /// Observe one complete owner-supplied batch. A missing drive is not retired.
+    /// UUIDs are minted only for unmatched observations and become source facts.
+    pub fn observe_drives(
+        &self,
+        inputs: Vec<crate::DriveObservationInput>,
+    ) -> Result<Vec<crate::DriveObservationOutcome>, RuntimeError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let (known, generation) = self.replay_drive_history_locked()?;
         let refusal = |message: &str| {
             self.0.motion_fenced.store(true, Ordering::Release);
             RuntimeError::State(StateError::JournalReplayFailed(format!("{message}; drive discovery cannot preserve the required identity alarm; motion is fenced")))

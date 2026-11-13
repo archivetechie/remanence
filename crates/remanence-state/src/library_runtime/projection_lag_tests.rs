@@ -129,7 +129,21 @@ tape_catalog_dir = "{0}/cache"
         .unwrap();
         let mut owner = authority.acquire_exclusive().unwrap();
         owner
-            .open_session(id, "2026-11-12T00:00:00Z".into())
+            .open_session(
+                id,
+                "2026-11-12T00:00:00Z".into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
             .unwrap();
         owner
             .end_session(

@@ -4627,7 +4627,21 @@ mod tests {
                     .unwrap();
                 let short = std::fs::read(&path).unwrap();
                 owner
-                    .open_session(id, "2026-11-11T00:00:00Z".into())
+                    .open_session(
+                        id,
+                        "2026-11-11T00:00:00Z".into(),
+                        remanence_state::tape_log::SessionDrive {
+                            serial: "DRV-TEST".into(),
+                            vendor: None,
+                            product: None,
+                            endpoint: remanence_state::library_log::DriveKey::Standalone(
+                                remanence_state::library_log::Standalone {
+                                    drive_serial: "DRV-TEST".into(),
+                                },
+                            ),
+                            drive_uuid: None,
+                        },
+                    )
                     .unwrap();
                 owner
                     .end_session(

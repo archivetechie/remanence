@@ -76,7 +76,21 @@ tape_catalog_dir="{0}/cache"
                 )
                 .unwrap();
             writer
-                .open_session([drive + 20; 16], "2026-11-06T00:00:00Z".into())
+                .open_session(
+                    [drive + 20; 16],
+                    "2026-11-06T00:00:00Z".into(),
+                    crate::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: crate::library_log::DriveKey::Standalone(
+                            crate::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
+                )
                 .unwrap();
             let mut index = crate::projector::open(&paths.sqlite_path)
                 .unwrap()

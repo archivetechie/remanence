@@ -314,11 +314,13 @@ see the [configuration reference](reference-configuration.md).
 - **Per-tape logs** (`journal_dir/tapes/<lowercase-simple-uuid>.remtape`) —
   one append-only authority for each tape, with or without parity. Each log
   carries tape-file rows, Object and member payloads, parity state, the proved
-  physical cursor, and finalization decisions, plans and progress. Its magic
-  is `REMTAPE\x01`, its format version is 2, and its tape incarnation is 1.
+  physical cursor, and finalization decisions, plans and progress. Each session-open
+  record carries the drive serial, vendor, product, endpoint, and the observed
+  catalogue drive identity when one was known at the open. Its magic
+  is `REMTAPE\x01`, its format version is 3, and its tape incarnation is 1.
   Reinitialization assigns a new tape UUID rather than incrementing the incarnation.
 - **Authority marker** (`state_dir/authority-format`) — exact bytes
-  `remanence-tape-log-v2\n`, followed by a JSON string containing the canonical
+  `remanence-tape-log-v3\n`, followed by a JSON string containing the canonical
   configured journal root, followed by `\n`. It binds the layout to that root.
 - **Log leases and fences** — the log basename with `.lock` holds the stable
   lease; `.ambiguous` fences uncertain authority; `.repair-required` fences a

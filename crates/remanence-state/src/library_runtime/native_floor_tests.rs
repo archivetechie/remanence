@@ -148,7 +148,23 @@ tape_catalog_dir = "{0}/cache"
         } else {
             TIME.into()
         };
-        owner.open_session(id, time.clone()).unwrap();
+        owner
+            .open_session(
+                id,
+                time.clone(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
         owner
             .end_session(
                 id,
@@ -167,7 +183,23 @@ tape_catalog_dir = "{0}/cache"
         let authority =
             crate::TapeAuthority::open_fixture(self.paths.journal_dir.join("tapes"), id).unwrap();
         let mut owner = authority.acquire_exclusive().unwrap();
-        owner.open_session(session, TIME.into()).unwrap();
+        owner
+            .open_session(
+                session,
+                TIME.into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
         owner
             .end_session(
                 session,

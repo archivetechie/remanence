@@ -26,6 +26,17 @@ fn open_fixture_session(lease: &mut Lease) {
                 next_file: s.next_file,
             },
             opened_at_utc: "2026-11-02T00:00:00Z".into(),
+            drive: crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
         });
         let group = lease.prepare().unwrap();
         lease.append(group.close(&record).unwrap()).unwrap();
@@ -1256,6 +1267,15 @@ fn session_tail_snapshot_streams_only_the_last_closed_end() {
             next_file: 1,
         },
         opened_at_utc: "2026-11-02T00:00:00Z".into(),
+        drive: crate::tape_log::SessionDrive {
+            serial: "DRV-TEST".into(),
+            vendor: None,
+            product: None,
+            endpoint: crate::library_log::DriveKey::Standalone(crate::library_log::Standalone {
+                drive_serial: "DRV-TEST".into(),
+            }),
+            drive_uuid: None,
+        },
     };
     let group = lease.prepare().unwrap();
     lease

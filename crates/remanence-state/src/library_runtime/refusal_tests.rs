@@ -490,3 +490,98 @@ fn a_retry_of_a_closed_manual_operation_is_refused_and_recorded_with_its_operati
         )]
     );
 }
+
+/// T-X: resolution is read-only, serial-based, and unique among active drives;
+/// a retired identity never competes with its replacement.
+#[test]
+fn wdrv_resolves_only_unique_active_serial() {
+    let f = open();
+    let before = f.runtime.test_source_records().len();
+    assert_eq!(
+        f.runtime.active_drive_uuid_for_serial("SER-WDRV").unwrap(),
+        None
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+    let retired = f
+        .runtime
+        .observe_drives(vec![drive_input("SER-WDRV", "HPE")])
+        .unwrap()
+        .remove(0)
+        .drive_uuid;
+    let before = f.runtime.test_source_records().len();
+    assert_eq!(
+        f.runtime
+            .active_drive_uuid_for_serial(" SER-WDRV ")
+            .unwrap(),
+        Some(retired.clone().try_into().unwrap())
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+    f.runtime
+        .append(|a, v| {
+            a.drive_decision(
+                lib::DriveDecision {
+                    drive_uuid: retired.clone().try_into().unwrap(),
+                    decision: lib::Stewardship::Retire(lib::Reason {
+                        reason: "operator".into(),
+                    }),
+                    change: lib::GenerationChange {
+                        expected: 1,
+                        next: 2,
+                    },
+                },
+                1,
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        f.runtime.active_drive_uuid_for_serial("SER-WDRV").unwrap(),
+        None
+    );
+    let mut replacement = drive_input("SER-WDRV", "HPE");
+    replacement.product = Some("Replacement product".into());
+    let active = f
+        .runtime
+        .observe_drives(vec![replacement])
+        .unwrap()
+        .remove(0)
+        .drive_uuid;
+    assert_ne!(active, retired);
+    let before = f.runtime.test_source_records().len();
+    assert_eq!(
+        f.runtime.active_drive_uuid_for_serial("SER-WDRV").unwrap(),
+        Some(active.try_into().unwrap()),
+        "retired-and-active serial resolves the active drive"
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+    // The existing historical-collision fixture shows how older source records
+    // can hold two active identities. Resolution must not choose either one.
+    f.runtime
+        .append(|a, v| {
+            a.drive_observed(
+                lib::DriveObserved {
+                    drive_uuid: [0xee; 16],
+                    serial: Some("SER-WDRV".into()),
+                    identity_source: lib::IdentitySource::DvcidAndInquiry,
+                    endpoint: None,
+                    managed: lib::Managed::Rem,
+                    inventory_generation: 5,
+                    vendor: Some("IBM".into()),
+                    product: Some("Another product".into()),
+                    firmware_rev: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    let before = f.runtime.test_source_records().len();
+    assert_eq!(
+        f.runtime.active_drive_uuid_for_serial("SER-WDRV").unwrap(),
+        None
+    );
+    assert_eq!(f.runtime.test_source_records().len(), before);
+}

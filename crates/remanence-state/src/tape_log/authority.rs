@@ -710,6 +710,7 @@ impl TapeAuthorityLease {
         &mut self,
         session_id: [u8; 16],
         opened_at_utc: String,
+        drive: SessionDrive,
     ) -> Result<(), StateError> {
         self.ensure_abandonment_allowed()?;
         self.with_store(|core| {
@@ -726,6 +727,7 @@ impl TapeAuthorityLease {
                     next_file: s.next_file,
                 },
                 opened_at_utc,
+                drive,
             });
             let group = core.prepare()?;
             core.append(group.close(&record)?)?;
@@ -1706,6 +1708,16 @@ fn prepare_report(
                     next_file: s.next_file,
                 },
                 opened_at_utc: report.committed_at_utc.clone(),
+                drive: crate::tape_log::SessionDrive {
+                    serial: "DRV-FIXTURE".into(),
+                    vendor: Some("IBM".into()),
+                    product: Some("ULT3580".into()),
+                    endpoint: crate::library_log::DriveKey::Bay(crate::library_log::Bay {
+                        library_serial: "LIB-FIXTURE".into(),
+                        bay: 0x100,
+                    }),
+                    drive_uuid: Some([0xd1; 16]),
+                },
             });
             let group = core.prepare()?;
             core.append(group.close(&opened)?)?;

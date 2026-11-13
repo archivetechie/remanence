@@ -182,6 +182,17 @@ impl MillionMemberStream {
                         next_file: 1,
                     },
                     opened_at_utc: "2026-11-02T00:00:00Z".into(),
+                    drive: remanence_state::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: remanence_state::library_log::DriveKey::Standalone(
+                            remanence_state::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
                 })
             }
             1 => {

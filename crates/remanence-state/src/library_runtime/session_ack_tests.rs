@@ -195,7 +195,21 @@ fn native_crash_ack_checks_type_tape_session_and_preview_before_projection() {
                 .unwrap();
             if fault == "valid-reused" {
                 owners[0]
-                    .open_session(session, "2026-11-06T00:02:00Z".into())
+                    .open_session(
+                        session,
+                        "2026-11-06T00:02:00Z".into(),
+                        crate::tape_log::SessionDrive {
+                            serial: "DRV-TEST".into(),
+                            vendor: None,
+                            product: None,
+                            endpoint: crate::library_log::DriveKey::Standalone(
+                                crate::library_log::Standalone {
+                                    drive_serial: "DRV-TEST".into(),
+                                },
+                            ),
+                            drive_uuid: None,
+                        },
+                    )
                     .unwrap();
                 owners[0]
                     .end_session(

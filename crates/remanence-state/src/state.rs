@@ -4492,7 +4492,21 @@ pool_id = "camera.copy-a"
             .unwrap();
         let time = "2026-11-11T00:00:00Z";
         owner
-            .open_session(*session_id.as_bytes(), time.into())
+            .open_session(
+                *session_id.as_bytes(),
+                time.into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
             .unwrap();
         if let Some(reason) = end {
             owner
@@ -5679,7 +5693,7 @@ mod cutover_tests {
                     );
                     assert!(fs::read_to_string(&marker)
                         .unwrap()
-                        .starts_with("remanence-tape-log-v2\n"));
+                        .starts_with("remanence-tape-log-v3\n"));
                 }
             }
         }
@@ -5758,7 +5772,7 @@ mod cutover_tests {
             let marker_path = paths.state_dir.join("authority-format");
             let mut marker = fs::read_to_string(&marker_path).unwrap();
             if layout == "v1" {
-                marker = marker.replace("remanence-tape-log-v2", "remanence-tape-log-v1");
+                marker = marker.replace("remanence-tape-log-v3", "remanence-tape-log-v1");
                 fs::write(&marker_path, &marker).unwrap();
             }
             if layout == "schema23" {
@@ -5800,7 +5814,7 @@ mod cutover_tests {
             }
             assert!(fs::read_to_string(marker_path)
                 .unwrap()
-                .starts_with("remanence-tape-log-v2\n"));
+                .starts_with("remanence-tape-log-v3\n"));
             assert!(!paths.journal_dir.join(relative).exists());
             StateHandle::open_from_config_file(&config).unwrap();
         }

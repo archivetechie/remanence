@@ -476,7 +476,21 @@ fn staged_and_ambiguous_leases_explicitly_refuse_abandonment_and_stale_latest() 
             .unwrap();
     }
     writer
-        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [9; 16],
+            "2026-11-02T00:00:00Z".into(),
+            crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     writer.stage_report(&report).unwrap();
     assert!(writer.ensure_abandonment_allowed().is_err());
@@ -531,7 +545,21 @@ fn after_durable_report_clears_cached_snapshot_and_has_distinct_error_type() {
             .unwrap();
     }
     writer
-        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [9; 16],
+            "2026-11-02T00:00:00Z".into(),
+            crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     writer.stage_report(&report).unwrap();
     writer
@@ -667,7 +695,21 @@ fn session_owner_fixture() -> (
         )
         .unwrap();
     writer
-        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [9; 16],
+            "2026-11-02T00:00:00Z".into(),
+            crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     writer.stage_report(&report).unwrap();
     writer.complete_report(&report).unwrap();
@@ -734,7 +776,21 @@ fn session_owner_closeout_advances_latest_cursor_and_survives_reopen() {
     assert_eq!(before.tape_summary().protected, 0);
     let mut writer = authority.acquire_exclusive().unwrap();
     writer
-        .open_session([10; 16], "2026-11-02T00:03:00Z".into())
+        .open_session(
+            [10; 16],
+            "2026-11-02T00:03:00Z".into(),
+            crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     assert_eq!(writer.bound_session_id(), Some([10; 16]));
     assert_eq!(
@@ -864,7 +920,21 @@ fn session_owner_every_new_record_lost_publication_response_poisoned() {
                     &sidecar,
                     "2026-11-02T00:03:00Z".into(),
                 ),
-                18 => writer.open_session([10; 16], "2026-11-02T00:03:00Z".into()),
+                18 => writer.open_session(
+                    [10; 16],
+                    "2026-11-02T00:03:00Z".into(),
+                    crate::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: crate::library_log::DriveKey::Standalone(
+                            crate::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
+                ),
                 19 => writer.end_session(
                     [9; 16],
                     "2026-11-02T00:03:00Z".into(),
@@ -1003,7 +1073,21 @@ fn b7_fix_observer_staging_poison_and_lease_lifetime() {
         )
         .unwrap();
     writer
-        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [9; 16],
+            "2026-11-02T00:00:00Z".into(),
+            crate::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: crate::library_log::DriveKey::Standalone(
+                    crate::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     let before = authority.observe_summary().unwrap();
     writer.stage_report(&report).unwrap();
@@ -1141,7 +1225,21 @@ fn b7_fix2_slow_replay_does_not_block_other_status_or_session_open() {
         other.observe_summary().unwrap();
         let mut lease = other.acquire_exclusive().unwrap();
         lease
-            .open_session([3; 16], "2026-11-02T00:00:00Z".into())
+            .open_session(
+                [3; 16],
+                "2026-11-02T00:00:00Z".into(),
+                crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
             .unwrap();
         done_tx.send(()).unwrap();
     });

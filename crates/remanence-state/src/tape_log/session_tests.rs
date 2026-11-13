@@ -13,6 +13,15 @@ fn opened(log: &Log) -> SessionOpened {
             next_file: s.next_file,
         },
         opened_at_utc: "2026-11-02T00:00:00Z".into(),
+        drive: crate::tape_log::SessionDrive {
+            serial: "DRV-TEST".into(),
+            vendor: None,
+            product: None,
+            endpoint: crate::library_log::DriveKey::Standalone(crate::library_log::Standalone {
+                drive_serial: "DRV-TEST".into(),
+            }),
+            drive_uuid: None,
+        },
     }
 }
 fn session(parity: bool) -> Log {
@@ -161,6 +170,22 @@ fn session_records_roundtrip_and_metadata_preserves_media() {
         assert!(log.summary().last_session_end.is_none());
     }
 }
+#[test]
+fn wdrv_fold_refuses_empty_and_untrimmed_drive_serial() {
+    for serial in ["", " DRV-TEST "] {
+        let mut log = Log::default();
+        log.push(init(false), &[]);
+        let mut open = opened(&log);
+        open.drive.serial = serial.into();
+        log.push(Record::SessionOpened(open), &[]);
+        assert_eq!(
+            fault(fold::replay(&log.bytes[..]).unwrap_err()),
+            Fault::Invalid("session drive serial"),
+            "reject invalid drive serial {serial:?}"
+        );
+    }
+}
+
 #[test]
 fn session_illegal_identity_sequence_cursor_and_double_open_refuse() {
     for mutation in 0..8 {

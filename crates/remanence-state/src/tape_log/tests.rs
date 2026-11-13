@@ -201,6 +201,17 @@ impl Log {
                     next_file: s.next_file,
                 },
                 opened_at_utc: "2026-11-02T00:00:00Z".into(),
+                drive: crate::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
             }),
             &[],
         );
@@ -1986,7 +1997,7 @@ fn short_prefix_refuses_visible_version_contradictions() {
     short_prefix_fault(bytes, 1, Fault::Version(1));
     let mut bytes = valid_next_prefix();
     bytes[1] = 1;
-    short_prefix_fault(bytes, 2, Fault::Version(258));
+    short_prefix_fault(bytes, 2, Fault::Version(0x0100 | VERSION));
 }
 #[test]
 fn short_prefix_refuses_visible_unknown_and_reserved_tags() {

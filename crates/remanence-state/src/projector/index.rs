@@ -7973,6 +7973,7 @@ fn project_session_record(tx: &Connection, record: &AuditRecord) -> Result<(), S
             library_serial: detail_text(record, "library_serial"),
             drive_bay: detail_i64(record, "drive_bay"),
             drive_uuid: detail_bytes(record, "drive_uuid"),
+            drive_serial: None,
             state,
             timestamp: &record.timestamp_utc,
             endpoint: audit_endpoint(record)?.map(|e| e.encode()),
@@ -7986,6 +7987,7 @@ struct SessionProjection<'a> {
     library_serial: Option<String>,
     drive_bay: Option<i64>,
     drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
     state: &'a str,
     timestamp: &'a str,
     endpoint: Option<String>,
@@ -7996,9 +7998,9 @@ fn project_session_core(tx: &Connection, input: SessionProjection<'_>) -> Result
         "insert into sessions(
            session_id, session_kind, tape_uuid, library_serial, drive_bay,
            drive_uuid,
-           state, opened_at_utc, updated_at_utc, endpoint_key
+           state, opened_at_utc, updated_at_utc, endpoint_key, drive_serial
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)
          on conflict(session_id) do update set
            session_kind = case
              when excluded.session_kind != 'unknown' then excluded.session_kind
@@ -8008,6 +8010,7 @@ fn project_session_core(tx: &Connection, input: SessionProjection<'_>) -> Result
            library_serial = coalesce(excluded.library_serial, sessions.library_serial),
            drive_bay = coalesce(excluded.drive_bay, sessions.drive_bay),
            drive_uuid = coalesce(excluded.drive_uuid, sessions.drive_uuid),
+           drive_serial = coalesce(excluded.drive_serial, sessions.drive_serial),
            endpoint_key = coalesce(excluded.endpoint_key, sessions.endpoint_key),
            state = excluded.state,
            updated_at_utc = excluded.updated_at_utc",
@@ -8021,6 +8024,7 @@ fn project_session_core(tx: &Connection, input: SessionProjection<'_>) -> Result
             input.state,
             input.timestamp,
             input.endpoint,
+            input.drive_serial,
         ],
     )
     .map_err(|err| sqlite_error("project audit session", err))?;
@@ -12376,6 +12380,12 @@ fn migrate_cleaning_binding_columns(conn: &Connection) -> Result<(), StateError>
     Ok(())
 }
 
+/// Add the recorded write-drive serial without inventing historical values.
+/// Every writable catalogue-opening path shares this idempotent shape repair.
+fn migrate_session_drive_column(conn: &Connection) -> Result<(), StateError> {
+    ensure_column(conn, "sessions", "drive_serial", "drive_serial text")
+}
+
 fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
@@ -12394,6 +12404,7 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
         // Refuse a spoofed version/noncanonical base before extending its shape.
         validate_unsigned_structural_schema(conn)?;
         migrate_cleaning_binding_columns(conn)?;
+        migrate_session_drive_column(conn)?;
         refresh_endpoint_triggers(conn)?;
         conn.execute_batch(tape_log_projection::SCHEMA)
             .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
@@ -12409,6 +12420,7 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
                 .map_err(|e| sqlite_error("migrate library projection bookkeeping", e))?;
         }
         migrate_cleaning_binding_columns(conn)?;
+        migrate_session_drive_column(conn)?;
         migrate_object_instances(conn)?;
         refresh_endpoint_triggers(conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -12644,6 +12656,7 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     )
     .map_err(|err| sqlite_error("create tapes_pool_idx", err))?;
     migrate_standalone_evidence(conn)?;
+    migrate_session_drive_column(conn)?;
     conn.execute_batch(super::apply::SCHEMA)
         .map_err(|e| sqlite_error("create library projection bookkeeping", e))?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -23036,6 +23049,63 @@ tape_catalog_dir = "{0}/cache"
         assert_eq!(
             migration_rows(&conn, "select * from library_cleaning_runs"),
             before
+        );
+        let fresh = root.path().join("fresh.sqlite");
+        drop(crate::projector::open(&fresh).unwrap());
+        assert_eq!(
+            migration_schema(&conn),
+            migration_schema(&Connection::open(fresh).unwrap())
+        );
+    }
+
+    /// A current catalogue repairs a missing nullable serial, preserving all
+    /// old values and later drive metadata across repeated opens.
+    #[test]
+    fn wdrv_current_schema_repairs_missing_drive_serial_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.sqlite");
+        drop(crate::projector::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "alter table sessions drop column drive_serial;
+             insert into sessions(session_id,session_kind,state,opened_at_utc,updated_at_utc)
+             values('wdrv-session','write','closed','before','after');",
+        )
+        .unwrap();
+        let columns: Vec<String> = conn
+            .prepare("pragma table_info(sessions)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let old_query = format!("select {} from sessions order by rowid", columns.join(","));
+        let before = migration_rows(&conn, &old_query);
+        assert_eq!(before.len(), 1);
+        drop(crate::projector::open(&path).unwrap());
+        assert!(
+            table_column_exists(&conn, "sessions", "drive_serial").unwrap(),
+            "current-schema open repairs drive_serial"
+        );
+        assert_eq!(migration_rows(&conn, &old_query), before);
+        assert_eq!(
+            conn.query_row("select drive_serial from sessions", [], |r| r
+                .get::<_, Option<String>>(0))
+                .unwrap(),
+            None
+        );
+        conn.execute("update sessions set drive_serial='DRV-KEPT'", [])
+            .unwrap();
+        let retained = migration_rows(&conn, "select * from sessions order by rowid");
+        drop(crate::projector::open(&path).unwrap());
+        assert_eq!(
+            migration_rows(&conn, "select * from sessions order by rowid"),
+            retained
+        );
+        assert_eq!(
+            conn.query_row("pragma user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            26
         );
         let fresh = root.path().join("fresh.sqlite");
         drop(crate::projector::open(&fresh).unwrap());

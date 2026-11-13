@@ -715,6 +715,7 @@ impl CatalogCore {
                             .and_then(|e| e.library_serial().map(str::to_owned)),
                         drive_bay: endpoint.as_ref().and_then(|e| e.bay().map(i64::from)),
                         drive_uuid,
+                        drive_serial: None,
                         state: match v.event {
                             lib::SessionEvent::Opened => "open",
                             lib::SessionEvent::Closed => "closed",

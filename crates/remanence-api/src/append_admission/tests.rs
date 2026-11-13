@@ -1344,7 +1344,21 @@ fn native_session_suffix_rows_and_unknown_command_frontiers() {
                     )
                     .unwrap();
                 lease
-                    .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+                    .open_session(
+                        [0x61; 16],
+                        "2026-11-02T00:00:00Z".into(),
+                        remanence_state::tape_log::SessionDrive {
+                            serial: "DRV-TEST".into(),
+                            vendor: None,
+                            product: None,
+                            endpoint: remanence_state::library_log::DriveKey::Standalone(
+                                remanence_state::library_log::Standalone {
+                                    drive_serial: "DRV-TEST".into(),
+                                },
+                            ),
+                            drive_uuid: None,
+                        },
+                    )
                     .unwrap();
                 if row != "crash" {
                     let files = if row == "live_named" {
@@ -1503,7 +1517,21 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
             )
             .unwrap();
         lease
-            .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+            .open_session(
+                [0x61; 16],
+                "2026-11-02T00:00:00Z".into(),
+                remanence_state::tape_log::SessionDrive {
+                    serial: "DRV-TEST".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: remanence_state::library_log::DriveKey::Standalone(
+                        remanence_state::library_log::Standalone {
+                            drive_serial: "DRV-TEST".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
             .unwrap();
         lease
             .end_session(
@@ -1706,7 +1734,21 @@ fn b3b_scoped_suffix_contradiction_classifies_once() {
         )
         .unwrap();
     lease
-        .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [0x61; 16],
+            "2026-11-02T00:00:00Z".into(),
+            remanence_state::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: remanence_state::library_log::DriveKey::Standalone(
+                    remanence_state::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     lease
         .end_session(
@@ -1926,7 +1968,21 @@ fn golden_suffix_contradiction() -> AdmissionError {
         )
         .unwrap();
     lease
-        .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+        .open_session(
+            [0x61; 16],
+            "2026-11-02T00:00:00Z".into(),
+            remanence_state::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: remanence_state::library_log::DriveKey::Standalone(
+                    remanence_state::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
         .unwrap();
     lease
         .end_session(

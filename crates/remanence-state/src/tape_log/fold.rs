@@ -698,6 +698,9 @@ impl Fold {
                     open.cursor,
                 )?;
                 validate_time(&open.opened_at_utc)?;
+                if open.drive.serial.is_empty() || open.drive.serial != open.drive.serial.trim() {
+                    return Err(Fault::Invalid("session drive serial"));
+                }
                 if open.session_id == [0; 16]
                     || self.summary.open_session.is_some()
                     || self.summary.finalization.is_some()

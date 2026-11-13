@@ -12,7 +12,7 @@ use std::{
 };
 
 /// Active host authority layout identifier.
-pub const FORMAT: &str = "remanence-tape-log-v2";
+pub const FORMAT: &str = "remanence-tape-log-v3";
 /// Exact operator guidance for the declared clean break.
 pub const RESET_REQUIRED: &str = "This state directory predates the current tape-log format. A declared state reset and reinitialization of its test tapes is required. Run rem reset-catalog --config <config> with the existing explicit reset confirmation. No importer is available.";
 
@@ -51,7 +51,7 @@ fn old_authority(path: &Path, archive: &Path) -> Result<bool, StateError> {
                 .map_err(|e| StateError::io_at("inspect tape-log format", entry.path(), e))?;
             if file.read_exact(&mut prefix).is_ok()
                 && &prefix[..8] == b"REMTAPE\x01"
-                && prefix[8..] != 2u16.to_le_bytes()
+                && prefix[8..] != crate::tape_log::VERSION.to_le_bytes()
             {
                 return Ok(true);
             }
@@ -129,7 +129,8 @@ fn validate_layout(paths: &StatePaths) -> Result<Layout, StateError> {
     if marker.exists() {
         let marker_bytes = fs::read(&marker)
             .map_err(|e| StateError::io_at("read authority format", &marker, e))?;
-        if !marker_bytes.starts_with(b"remanence-tape-log-v2\n") || marker_bytes != contents(paths)?
+        if !marker_bytes.starts_with(format!("{FORMAT}\n").as_bytes())
+            || marker_bytes != contents(paths)?
         {
             return Err(invalid(RESET_REQUIRED));
         }

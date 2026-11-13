@@ -22235,7 +22235,21 @@ mod tests {
                 .unwrap();
             let short = fs::read(&path).unwrap();
             owner
-                .open_session(id, "2026-11-11T00:00:00Z".into())
+                .open_session(
+                    id,
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: remanence_state::library_log::DriveKey::Standalone(
+                            remanence_state::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
+                )
                 .unwrap();
             owner
                 .end_session(
@@ -22374,7 +22388,21 @@ mod tests {
                 .unwrap();
             let short = fs::read(&path).unwrap();
             owner
-                .open_session(id, "2026-11-11T00:00:00Z".into())
+                .open_session(
+                    id,
+                    "2026-11-11T00:00:00Z".into(),
+                    remanence_state::tape_log::SessionDrive {
+                        serial: "DRV-TEST".into(),
+                        vendor: None,
+                        product: None,
+                        endpoint: remanence_state::library_log::DriveKey::Standalone(
+                            remanence_state::library_log::Standalone {
+                                drive_serial: "DRV-TEST".into(),
+                            },
+                        ),
+                        drive_uuid: None,
+                    },
+                )
                 .unwrap();
             owner
                 .end_session(
@@ -25831,7 +25859,7 @@ tape_catalog_dir = "{0}/cache/tapes"
                     let path = root.path().join("authority-format");
                     let marker = fs::read_to_string(&path)
                         .unwrap()
-                        .replace("remanence-tape-log-v2", "remanence-tape-log-v1");
+                        .replace("remanence-tape-log-v3", "remanence-tape-log-v1");
                     fs::write(path, marker).unwrap();
                     remanence_state::authority_layout::RESET_REQUIRED
                 }
