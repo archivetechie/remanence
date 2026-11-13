@@ -1381,7 +1381,7 @@ enum TapeLogCommand {
         #[arg(long)]
         tape_uuid: uuid::Uuid,
     },
-    /// Archive a damaged suffix and retain an exact validated closed sequence.
+    /// Refused in this release; changes nothing.
     RepairTail {
         /// Daemon configuration file locating the local tape log.
         #[arg(long)]
@@ -1392,10 +1392,10 @@ enum TapeLogCommand {
         /// Retain the validated closed sequence through this number.
         #[arg(long)]
         through_sequence: u64,
-        /// Acknowledge archiving and discarding the corrupt suffix.
+        /// Accepted but not read; the command is refused.
         #[arg(long)]
         confirm_discard_corrupt_tail: bool,
-        /// Rebuild this tape's projection atomically after repairing below its mark.
+        /// Accepted but not read; the command is refused.
         #[arg(long)]
         rebuild_projection: bool,
     },
@@ -2723,7 +2723,7 @@ enum TapeQuarantineCommand {
         json: bool,
     },
 
-    /// Release one media-readiness fence after operator/RCA acknowledgement.
+    /// Release a media-readiness or tape-I/O fence (tioq- or library: ID) after acknowledgement.
     Release {
         /// Quarantine id or media-readiness operation UUID.
         quarantine: String,

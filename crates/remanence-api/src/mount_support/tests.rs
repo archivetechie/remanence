@@ -885,7 +885,7 @@ fn parity_import_is_refused_whether_or_not_the_source_log_is_present() {
 
 /// DEC-1 and D-N-1-1: the coupled failure latches until recovery, but a durable live ending owes no fence.
 #[test]
-fn combined_transport_and_audit_failure_latches_until_recovery_persists_quarantine() {
+fn combined_transport_and_audit_failure_latches_until_recovery_then_owes_no_fence() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
     let recovery_paths = state.paths().clone();
@@ -3444,7 +3444,7 @@ fn r3a_initialized_state(root: &Path, world: &SharedVirtualWorld) -> StateHandle
 
 /// DEC-1 and D-N-1-1: the coupled failure latches, then recovery admits a WRITE after its durable ending.
 #[test]
-fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
+fn r3a_recovery_admits_mounted_write_after_durable_ending() {
     use remanence_state::library_log as lib;
     let root = tempfile::tempdir().unwrap();
     let world = world();

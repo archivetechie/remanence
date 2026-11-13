@@ -505,7 +505,7 @@ Its hook is `abort_after_tape_log_append`. Both surfaces report
 `tape_log_sequence` and `tape_incarnation`; old split-journal fsync aliases and
 v1 plans are rejected.
 
-<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs @ 4dc2a3c6 -->
+<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## What ends up on disk
 
 For the minimal config above, a running daemon owns:
@@ -521,12 +521,6 @@ For the minimal config above, a running daemon owns:
 /var/lib/rem/journal/tapes/*.lock  stable per-tape leases
 /var/lib/rem/journal/tapes/*.ambiguous
                                  uncertain-authority fences
-/var/lib/rem/journal/tapes/*.repair-required
-                                 physical-tail reconciliation fences
-/var/lib/rem/journal/tapes/.repair-evidence-<uuid>-<unique>
-                                 exact-byte repair archives
-/var/lib/rem/journal/tapes/.repair-reconciled-<uuid>-<unique>
-                                 completed reconciliation evidence
 /var/lib/rem/reset-archives/reset-<number>/authority-reset.json
                                  declared-reset path binding and request digest
 /var/lib/rem/audit/*.remaudit     daily append-only audit segments
@@ -580,9 +574,9 @@ Object admission is permanently disabled. A failure enters
 their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
-<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 The marker contains `remanence-tape-log-v3\n`, the canonical configured journal
-root encoded as a JSON string, and a final `\n`. SQLite uses schema 24. Ordinary opens refuse schemas 1 through 23. Such
+root encoded as a JSON string, and a final `\n`. SQLite uses schema 26. Ordinary opens refuse schemas 1 through 25. Such
 state requires
 `rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
 followed by reinitialization of the approved scratch tapes. The reset archives

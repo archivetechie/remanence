@@ -7801,7 +7801,7 @@ Authoritative prefix end: 507 bytes; tail Torn { offset: 507, kind: ZeroFilled }
 | 2 | Diagnostic | 00000000000000000001-2026-11-03.remlib | 324 | 507 | `03c755883a53642b6b8151908e665decf988ca04dd8140b57985837cbdfe329f` |
 ## Tape views
 
-Native tape views are replay inputs, not part of the library log. VIEWS.tsv has exactly one default row per MANIFEST case (`*`, `*`). `Present` with digest `echo` returns the reference's own digest and kind `FinalizationPrepared`; `NotYet` has empty kind and digest. Explicit rows override that default by tape UUID and sequence; their Present digest is literal hex. Contradiction and NotYet have empty kind and digest.
+Native tape views are replay inputs, not part of the library log. VIEWS.tsv has exactly one default row per MANIFEST case (`*`, `*`). `Present` with digest `echo` returns `EmptyPrefix` at sequence 0 and `Present` with kind `FinalizationPrepared` otherwise, using the reference's own digest; `NotYet` has empty kind and digest. Explicit rows override that default by tape UUID and sequence; their Present digest is literal hex. Contradiction and NotYet have empty kind and digest.
 
 ### alarm-held-by-drive-fence-operation
 

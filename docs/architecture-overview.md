@@ -211,7 +211,7 @@ How a tape is recognized and adopted when the catalog has no record of it, and
 why that step records identity only, is described in [Importing and recovering
 Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
-<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 7f39930d -->
+<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs crates/remanence-api/src/daemon_catalog_services.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Layer 5: daemon and API
 
 Clients talk to `rem-daemon` over gRPC (a remote-call protocol built on
@@ -223,7 +223,7 @@ promise. `rem-daemon` serves seven services:
 |---|---|
 | `Daemon` | health, version, operation lifecycle (get/list/cancel/watch) |
 | `LibraryService` | inventory, drive stewardship, alarms, live status (incl. an advisory `drive_assignments` projection of the per-bay reservation state, for an external arbitration client — read-only, cannot gate a mount), robotics (move/load/unload); `ImportElement`, `ExportElement` and `StreamLibraryEvents` are defined but return unimplemented |
-| `Catalog` | tapes, pools, tape files, object enumeration, catalog units, reconcile; `StartTapeVerification` starts a cancellable `tape_verification` operation, `GetTapeVerification` fetches its retained verdict, and `VerifyTapeIndex` starts and waits for the same operation; scoped and paginated enumeration is not implemented (only the unscoped, unpaginated case works) |
+| `Catalog` | tapes, pools, tape files, object enumeration, catalog units; `ReconcileTape` is refused with `ReconcileTapeDeferred: reconciling a tape from a physical scan is deferred; no tape was loaded or scanned`, changes nothing, and has no CLI client; `StartTapeVerification` starts a cancellable `tape_verification` operation, `GetTapeVerification` fetches its retained verdict, and `VerifyTapeIndex` starts and waits for the same operation; scoped and paginated enumeration is not implemented (only the unscoped, unpaginated case works) |
 | `WriteSessionService` | open (pool and pinned-tape targets — drive targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; checkpoint-batched durability applies to parity and no-parity tapes; write-session restart (`recover_session_id`) is not implemented, and the restart support described under [The read path](#the-read-path) covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target, so a client that lost its session in a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset); see [The read path](#the-read-path) |
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |

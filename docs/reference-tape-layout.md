@@ -305,7 +305,7 @@ rewrites a cartridge under an existing barcode, the catalog still binds that
 barcode to the old UUID (recycle skew; see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs @ dcf8d39a -->
+<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## On disk: durable records and rebuildable state
 
 The host-side records that accompany the tapes. Paths are set by the operator;
@@ -323,13 +323,11 @@ see the [configuration reference](reference-configuration.md).
   `remanence-tape-log-v3\n`, followed by a JSON string containing the canonical
   configured journal root, followed by `\n`. It binds the layout to that root.
 - **Log leases and fences** — the log basename with `.lock` holds the stable
-  lease; `.ambiguous` fences uncertain authority; `.repair-required` fences a
-  repaired log until physical-tail reconciliation. Exact-byte repair archives
-  are `.repair-evidence-<uuid>-<unique>`; reconciled evidence is
-  `.repair-reconciled-<uuid>-<unique>`, both under `journal_dir/tapes/`.
+  lease; `.ambiguous` fences uncertain authority. The `repair-tail` command is
+  refused and produces no repair or reconciliation files.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
-- **SQLite index** — schema version 24, tracked via `PRAGMA
+- **SQLite index** — schema version 26, tracked via `PRAGMA
   user_version`, with tables for tapes, pools, tape files, objects,
   copies, files, catalog units, sessions, operations, idempotency keys,
   media-readiness records, tape-I/O fences, wrap-map cache rows, and the
@@ -355,9 +353,9 @@ Initialization, adoption and reset-preserved ready identities create no log.
 Initialization is grouped with the first actual barrier. A known written
 prefix without matching log authority cannot be treated as a fresh tape.
 
-<!-- code-anchor: crates/remanence-state/src/projector/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 The old `.remjournal`, `.remcheckpoint` and `.finalizing` layout is refused.
-Ordinary catalog opens also refuse schemas 1 through 23. There is no importer;
+Ordinary catalog opens also refuse schemas 1 through 25. There is no importer;
 use the declared reset and reinitialize approved scratch tapes as described in
 [troubleshooting](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
 The per-tape log is not recorded on tape and changes no REM-PARITY media byte.

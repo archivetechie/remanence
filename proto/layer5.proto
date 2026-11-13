@@ -234,6 +234,9 @@ service LibraryService {
   rpc ListDrives        (ListDrivesRequest)           returns (ListDrivesResponse);
   rpc GetDrive          (GetDriveRequest)             returns (DriveCatalogEntry);
   rpc GetDriveHistory   (GetDriveHistoryRequest)      returns (GetDriveHistoryResponse);
+  // AnnotateDrive, RetireDrive and ReinstateDrive are refused after input checks:
+  // DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded
+  // by the library log yet; the drive was not changed.
   rpc AnnotateDrive     (AnnotateDriveRequest)        returns (DriveCatalogEntry);
   rpc RetireDrive       (RetireDriveRequest)          returns (RetireDriveResponse);
   rpc ReinstateDrive    (ReinstateDriveRequest)       returns (ReinstateDriveResponse);
@@ -536,8 +539,8 @@ message AnnotateDriveRequest {
 message RetireDriveRequest {
   bytes drive_uuid = 1;
   string reason = 2;
-  // 3 held an acknowledgement that fleet removal was permanent. It is not:
-  // ReinstateDrive returns a retired drive to service.
+  // Field 3 is reserved. RetireDrive and ReinstateDrive are refused with
+  // DriveStewardshipDeferred; the drive stays as recorded.
   reserved 3;
   reserved "i_understand_fleet_removal_is_permanent";
   bool allow_derived_identity = 4;
@@ -769,9 +772,8 @@ service Catalog {
   // for one logical object across every known tape on this daemon.
   rpc FindObjectCopies (FindObjectCopiesRequest) returns (FindObjectCopiesResponse);
 
-  // Reconciliation: ask the daemon to (re-)read a tape's catalog and emit
-  // a fresh enumeration that bypasses the SQLite cache. Slow; intended for
-  // periodic scrub or after suspected drift.
+  // Refused with ReconcileTapeDeferred: reconciling a tape from a physical scan
+  // is deferred; no tape was loaded or scanned. Changes nothing.
   rpc ReconcileTape    (ReconcileTapeRequest)    returns (OperationRef);
 
   // Permanently finalize an exact reconciled tape at its current Object
@@ -780,10 +782,18 @@ service Catalog {
   // mandatory. An accepted request can never reopen the tape for Objects.
   // The operation describes one attempt; TapeFinalization describes durable intent.
   // A stopped worker publishes FAILED with a retry summary while intent remains
-  // FINALIZING and detail carries that summary. The same idempotency key resumes
-  // under the same operation id; retry and startup recovery publish RUNNING.
+  // FINALIZING and detail carries that summary. An operation that ended without
+  // success is final under its key: matching retries fail with FAILED_PRECONDITION
+  // and ClosedOperationRetry: manual operation cannot resume from ... .
+  // A new key starts a new operation; matching live or successful retries return
+  // the existing operation.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
-  // Sealed tapes fail immediately with FAILED_PRECONDITION ("tape is sealed"), except matching retries of live or successful operations.
+  // Sealed tapes fail immediately with FAILED_PRECONDITION ("tape is sealed"),
+  // except matching retries of live or successful operations, which return the
+  // existing operation. An operation that ended without success is final under
+  // its key: repeating it fails with FAILED_PRECONDITION and ClosedOperationRetry:
+  // this closeout operation has ended; a new operation is required for further
+  // physical work. A new key starts a new operation.
   rpc CloseoutTape (CloseoutTapeRequest) returns (OperationRef);
   rpc SupersedeTail    (SupersedeTailRequest)     returns (SupersedeTailResponse);
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);

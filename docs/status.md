@@ -172,7 +172,7 @@ Authorization is a role matrix with no scope below the role. A client is
 readonly, operator, orchestrator, admin or system, and a role cannot be narrowed
 to particular pools, tapes or objects.
 
-<!-- code-anchor: crates/remanence-api/src/catalog_conversion.rs crates/remanence-api/src/read_session_service.rs crates/remanence-api/src/library.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/daemon_catalog_services.rs proto/layer5.proto @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/catalog_conversion.rs crates/remanence-api/src/read_session_service.rs crates/remanence-api/src/library.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/daemon_catalog_services.rs proto/layer5.proto crates/remanence-state/src/library_runtime/terminal.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ### Some daemon operations are not implemented
 
 Library import and export through the mailslot, library-event streaming, and
@@ -232,8 +232,11 @@ until a client resumes it explicitly.
 
 Detached verification and manual finalization wait up to 15 minutes from the
 first readiness refusal before they stop their attempt. A stopped finalization
-attempt reports `FAILED`, keeps the tape's finalizing intent, and resumes under
-the same operation ID when the caller retries with the same idempotency key.
+attempt reports `FAILED` and keeps the tape's finalizing intent. That operation
+is final under its idempotency key: repeating it is refused with
+`FAILED_PRECONDITION` and `ClosedOperationRetry: manual operation cannot resume from ...`.
+A new key starts a new operation. Matching live or successful retries return
+the existing operation.
 `rem tape finalize --wait` exits with the attempt's error summary.
 
 <!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->

@@ -320,9 +320,9 @@ enum Tape {
         #[arg(long)]
         confirm_supersede: Option<String>,
     },
-    /// Import checkpoint journals for append recovery.
+    /// Refused in this release; changes nothing.
     ImportJournals {
-        /// Import checkpoint journals from this directory.
+        /// Accepted but not read; the command is refused.
         #[arg(long)]
         from: PathBuf,
     },

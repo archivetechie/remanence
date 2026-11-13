@@ -6,11 +6,11 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
-<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs @ dcf8d39a -->
+<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Authority-layout refusals and declared reset
 
 Old host state is refused before configured device admission. Ordinary catalog
-opens refuse schemas 1 through 23. The layout refusal contains this exact guidance:
+opens refuse schemas 1 through 25. The layout refusal contains this exact guidance:
 
 ```text
 This state directory predates the current tape-log format. A declared state reset and reinitialization of its test tapes is required. Run rem reset-catalog --config <config> with the existing explicit reset confirmation. No importer is available.
@@ -32,7 +32,10 @@ of the old state.
 
 Reinitialize each approved scratch tape before returning it to write service.
 For a library tape whose existing BOT UUID is absent from the reset catalog,
-use the exact UUID and label reported by init's refusal:
+init prints `observed BOT predecessor has no typed identity; no Bootstrap write admitted`
+and writes nothing. It prints no `next:` line. Keep the data by adopting the tape
+with `rem-debug tape adopt-bootstrap`. To destroy the approved scratch tape,
+name its exact observed tape UUID and barcode in the confirmed clobber command:
 
 ```sh
 rem tape init <LABEL> --config <PATH> --clobber-data --clobber-unknown-tape <OLD-UUID> --confirm-clobber "CLOBBER <LABEL>"
@@ -58,6 +61,35 @@ In plain terms, a reset discards the old host authority. It does not make an
 already written cartridge safe to append; the approved test tapes must be
 initialized again.
 
+## Refused physical reconciliation
+
+The `ReconcileTape` RPC is refused with
+`ReconcileTapeDeferred: reconciling a tape from a physical scan is deferred; no tape was loaded or scanned`.
+It loads, scans and changes nothing. The refusal is counted in the library log;
+there is no CLI client for this RPC.
+
+## Interrupted initialization of a known tape
+
+Init writes a new start-of-tape before the catalog records the replacement. If
+it is interrupted between those steps, the old identity remains live in the
+catalog while the cartridge carries the new UUID. Mounting it under the old
+identity and writing refuse with `tape identity mismatch: expected ...`.
+Another init refuses with
+`observed BOT predecessor has no typed identity; no Bootstrap write admitted`.
+No Bootstrap write is admitted on that retry.
+
+Retire the old identity to release its barcode. This marks its recorded copies
+missing, so identify the old catalog UUID before running:
+
+```sh
+rem tape retire <OLD-UUID> --reason "interrupted initialization" --i-understand-copies-become-unreadable
+```
+
+Then adopt the new identity with `rem-debug tape adopt-bootstrap`, or destroy it
+with `rem tape init <LABEL> --clobber-data --clobber-unknown-tape <NEW-UUID>` and
+the exact `CLOBBER <LABEL>` confirmation. Retirement alone does not admit writes
+to the unknown new identity.
+
 ## Damaged log tails and projection rebuild
 
 Inspect the per-tape log before choosing a retained boundary:
@@ -67,38 +99,13 @@ rem-debug tape-log inspect --config <PATH> --tape-uuid <UUID>
 ```
 
 Inspection returns JSON with `through_sequence`, `valid_bytes`, `original_bytes`
-and `damage`. Sequence and byte counts are decimal strings. With the daemon
-stopped, archive a damaged suffix and retain the last validated closed sequence:
-
-```sh
-rem-debug tape-log repair-tail --config <PATH> --tape-uuid <UUID> --through-sequence <N> --confirm-discard-corrupt-tail
-```
-
-The confirmation flag is mandatory before state is opened. Without it the
-command prints `repair-tail requires --confirm-discard-corrupt-tail`. A sequence
-below the catalog projection mark requires `--rebuild-projection` on the same
-command; otherwise the refusal is
-`repair sequence {requested} is below projection mark {projected}`. With that
-flag the same offline owner repairs the log and transactionally rebuilds only
-that tape's projection. A crash between these steps leaves a durable repair
-fence and permits retry with the same sequence.
-
-Repair returns the archive path and SHA-256, retained byte count and
-`physical_tail_reconciliation_required: true`. It does not permit arbitrary
-discard of valid closed groups, a seal or accepted terminal finalization.
-Keep the evidence and complete physical-tail reconciliation through the existing
-confirmed recovery path. For a daemon-managed tape, after starting the daemon:
-
-```sh
-rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> --confirm-supersede "SUPERSEDE <LABEL>"
-```
-
-The acknowledgement UUID must match the tape UUID. The command previews the
-tail and checks the exact confirmation, identity and retained cursor before
-physical recovery. Only successful physical recovery and durable reconciliation
-remove `.repair-required`. Declining confirmation, ordinary startup and catalog
-rebuild leave it in place. This path cannot clear terminal intent or make a
-sealed tape writable.
+and `damage`. Sequence and byte counts are decimal strings.
+`rem-debug tape-log repair-tail` prints
+`TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed`.
+It refuses before reading its flags or opening state, and repairs or changes
+nothing. Stop the daemon and restore the exact tape log from a preserved copy.
+If the logs are intact and only the catalog projection is damaged, use the
+rebuild route below. Catalog rebuild does not repair a damaged tape log.
 
 For a lost or damaged SQLite projection with intact authority, stop the daemon
 and run:
@@ -114,9 +121,8 @@ evicted and volumes become uncalibrated; calibration generation allocation
 advances. A log below its projection mark requires recovery, not a reset of the
 mark to match an older backup.
 
-In plain terms, log repair retains an evidenced prefix and keeps writing
-blocked until the cartridge agrees. Catalog rebuild only regenerates the
-queryable view of intact host records.
+Catalog rebuild regenerates the queryable view of intact host records; it does
+not change the cartridge or repair a tape log.
 
 <!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 6ed03ef0 -->
 ## Discovery finds no libraries
@@ -160,7 +166,7 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the `sg`
 kernel module is not loaded; `sudo modprobe sg` loads it).
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## A standalone drive is missing or read-only
 
 Start with:
@@ -188,14 +194,14 @@ standalone refusals are:
 | `TailBeyondKnownState` | Tape holds complete data beyond local checkpoint authority, often after restoring old state. Restore newer state or rescue with `rem tape restore --scan --out rescued`. Do not delete journals. Only deliberately discard a rescued suffix with `rem tape supersede-tail --acknowledge-tape LABEL` and its exact confirmation. |
 | `holds … data at the beginning` | Nonblank media needs `rem tape init --label LABEL --generation <yours> --clobber-data`, then `CLOBBER LABEL`. For non-interactive use, pass `--confirm-clobber "CLOBBER LABEL"`. This also applies after retirement. Clobber also erases a Remanence tape whose files are still in your catalog; run `rem list --tape LABEL` first. It does not bypass write protection, partition, label/identity-swap or cross-pool checks. |
 | `has 2 partitions` | LTFS media needs repartitioning, which erases the cartridge. Install `mt-st` with `sudo apt install mt-st` (Debian/Ubuntu) or `sudo dnf install mt-st` (Fedora). Find `nstN` with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` using the drive's sg name. The listing includes the node name; use `/dev/<the listed nstN>` (for example `/dev/nst0`). Run `sudo mt -f /dev/nstN stsetoptions can-partitions`, then `mt -f /dev/nstN mkpartition 0`. Re-run `rem tape init --label LABEL --generation <yours>`; add `--clobber-data` only if it still reports data at BOT. See [step 2](guide-standalone-drive.md#2-initialize-a-cartridge). |
-| Active tape-I/O quarantine | Run `rem tape quarantine list`. Reads remain available; rescue with `rem tape restore --scan --out rescued`. After investigating, use `rem tape quarantine release ID --ack "what was checked"`. Release does not bypass the physical append check. |
+| Active tape-I/O quarantine | Run `rem tape quarantine list`. For `native_log_behind_projection`, only `rem tape restore --scan --out rescued` proceeds; `get`, `tape identify`, `tape verify` and ordinary `tape restore` refuse. Contradicted tape admission refuses every read, including `--scan`. Other fence causes leave standalone reads available. The standalone release form has no `--force`; see [Tape-I/O fences](#tape-io-fences). Release does not bypass the physical append check. |
 | Tape full / capacity refusal | Written receipts remain committed. Finalize, eject, initialize the next cartridge in the same pool and rerun put. Unchanged committed files skip. An uncertain I/O failure needs quarantine investigation first. |
 | Ran with sudo / home mode refuses root | Never run rem with sudo. Use your normal account with the `tape` group and a capability on the binary. Check which state directory the earlier command used; preserve it before correcting ownership or choosing a config. Root's home state is not your user's state. |
 
 The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Tape-I/O fences
 
 The daemon starts with tape-scoped and drive-scoped tape-I/O fences. Each fence
@@ -214,14 +220,41 @@ and drive before release:
 rem tape quarantine release <ID> --after-settled-inventory --ack "what was checked"
 ```
 
-Standalone endpoint fences need only `--ack`. The command uses the configured
-daemon socket when it is listening. An absent listener permits offline release,
+A `native_log_behind_projection` fence requires restoration of the exact tape
+log or a catalog rebuild with `rem rebuild-catalog-from-journals`, followed by
+`rem tape quarantine release <ID> --ack <TEXT> --force` in library mode.
+Without `--force`, release is refused with
+`native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
+Even a forced release refuses contradicted tape admission or a log still behind
+the catalog. The standalone release form has no `--force`.
+
+The library command uses the configured daemon socket when it is listening.
+An absent listener permits offline release,
 which still requires the exclusive state lock. RPC and authentication failures
 do not fall back offline. Release syncs the actor, scope, acknowledgment and
 release time to the audit log before clearing the row. A crash between these
 steps leaves the fence active; retry or startup completes the release from the
 same evidence. The tape or drive becomes admissible without restarting, subject
 to the normal identity, readiness and append checks.
+
+A drive fence refuses a write, mount or finalize that needs its bay with
+`DriveFenced: <endpoint> library:<fence> <cause>`. That refusal is counted in the
+library log. Cleaning is the only producer of a drive fence in this release.
+If the only usable bays are drive-fenced or busy and at least one is fenced,
+a library mount refuses with `DriveFenced` immediately; it does not wait for a
+busy bay. Inspect the named fence and cleaning evidence before retrying.
+
+A failed standalone initialization write raises no tape or drive fence. It
+records a `StandaloneFenceUnrecorded` refusal and stops motion for the rest of
+the process. Investigate the failed write before restarting the command or
+daemon; there is no standalone endpoint fence to acknowledge away.
+
+If a library-log write fails at the store, including while recording a refusal,
+motion stops for the rest of that process. This is a storage failure, rather
+than an admission refusal. Further loads, moves and writes refuse with
+`library authority failed; motion is fenced until startup reconciliation`.
+Correct the storage problem and restart the daemon so startup can reconcile
+state before motion resumes.
 
 ## Media-readiness fences and quarantine
 
@@ -718,7 +751,7 @@ writable: <reason>` (the same writability preconditions above), `tape ...
 is fenced by quarantine ...` (see fences above). A tape with a known written
 prefix but no matching per-tape log is also refused before append positioning.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs crates/remanence-api/src/daemon_catalog_services.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered
@@ -750,7 +783,7 @@ RPC refusals or debt diagnostics rather than standalone log events:
 | `shutdown close deadline interrupted session` | WARN: the shared shutdown deadline interrupted the session; the event identifies its tape, ending and remaining work. |
 | `shutdown close deadline expired; no new drive command` | Drive-command refusal at the shared cutoff. Issued commands still settle; see the shutdown bound above. |
 | `daemon shutdown; maintenance admission closed` | RPC refusal: the daemon is stopping. Submit fresh maintenance after restart. |
-| `drives are busy` | A library-wide request (inventory refresh, load, unload, move, reconcile) is refused while sessions or other owners hold the library's drives; let them finish and retry. |
+| `drives are busy` | A library-wide request (inventory refresh, load, unload, move) is refused while sessions or other owners hold the library's drives; let them finish and retry. |
 | `terminal inventory interrupted by shutdown` | The inventory stops because shutdown began. Retry after restart. |
 | `pool selection waiting for tape closeout` | INFO: the selected tape is held by session closeout or a worker. The open waits, then checks that tape again; this is not a free-bay queue. |
 | `pool selection skipped tape` | INFO for the selection pass that decides admission; DEBUG for speculative passes. `pool_id`, `tape_uuid` and `reason` identify the excluded candidate, such as a live writer, finalization or parked debt. |

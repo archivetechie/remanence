@@ -148,7 +148,7 @@ thing and BOT says another. Only the operator's intent separates them. For that 
 way out is an explicit action performed by an operator, or by a script an operator wrote,
 and the default stays refusal.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-api/src/tape_init.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state/initialization.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## 4. Retire: declaring a tape identity dead
 
 `rem tape retire` is the explicit action. In words, the operator declares that logical tape
@@ -212,8 +212,9 @@ After `retire`, what `rem tape init RMJ101L9` does depends on what the medium ca
   `--confirm-clobber "CLOBBER RMJ101L9"`. It then writes a bootstrap with a fresh tape UUID.
   Rescue any bytes you need before confirming.
 - Media carrying a tape UUID the catalog has never seen (Y in Scenario A): retiring X does
-  not make Y writable. Init returns a `needs-explicit-rebuild` decision, writes nothing, and
-  prints a `next:` line with both ways out. The default is to adopt Y with
+  not make Y writable. Init prints
+  `observed BOT predecessor has no typed identity; no Bootstrap write admitted`,
+  writes nothing and prints no `next:` line. The default is to adopt Y with
   `rem-debug tape adopt-bootstrap`, described in
   [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).
   To destroy Y instead, name it exactly: `--clobber-data --clobber-unknown-tape Y`, with the

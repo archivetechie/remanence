@@ -301,7 +301,7 @@ An auxiliary, read-only parser linked into a separate Remanence distribution. Co
 owns the normalized reader and registry contract but ships with an empty registry and no
 concrete adapters. See [foreign-format adapters](reference-foreign-format-adapters.md).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/mount_support.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Catalog and daemon
 
 ### tape log
@@ -311,8 +311,9 @@ rows, object and member payloads, parity state, physical cursor and finalization
 is the host's authority for that tape, kept for tapes with or without parity, at
 `tapes/<uuid>.remtape` under the configured `[journal]` directory (the UUID in lowercase,
 without hyphens). The catalog is a replayable projection of its validated closed groups of
-records. Some command names keep an older word for these files: `rebuild-catalog-from-journals`
-and `tape import-journals`. See [Concepts](concepts.md#5-the-tape-log-the-audit-log-and-the-catalog).
+records. The command `rebuild-catalog-from-journals` keeps an older word for these
+files. `tape import-journals` is refused with `JournalImportDeferred: importing checkpoint journals is deferred; nothing was imported or changed`;
+it imports or changes nothing. See [Concepts](concepts.md#5-the-tape-log-the-audit-log-and-the-catalog).
 
 ### tape incarnation
 
@@ -389,8 +390,8 @@ Per-pool fill fractions. At `watermark_low` (0.92) a tape becomes a candidate fo
 The lifecycle state the catalog records for a tape. `ready` accepts writes. `Finalizing`
 (reported while finalization runs) and `sealed` accept no more objects. `recovery_required`
 means completion or repair needs an explicit recovery before ordinary use: for example a
-finalization component that failed, an adopted tape whose tail after the bootstrap is not
-exactly a filemark and end of data, or a tape whose log tail was repaired. `retired` is the
+finalization component that failed, or an adopted tape whose tail after the bootstrap
+is not exactly a filemark and end of data. `retired` is the
 terminal state that [`rem tape retire`](tape-identity-lifecycle-explainer.md) sets. Any state
 other than `ready` is unwritable.
 
@@ -454,7 +455,7 @@ A standing, catalog-persisted condition raised against a drive, tape or library 
 example a repeated cleaning failure, or a fenced tape awaiting release) until an operator
 acknowledges or clears it. `rem alarms` lists and acknowledges alarms.
 
-<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Safety and operations
 
 ### allowlist
@@ -483,11 +484,20 @@ list, show and release fences by that id; quarantine and fence name the same rec
 
 ### tape-I/O fence
 
-A fence (quarantine id beginning `tioq-`) recording tape input or output that ended unproved:
-a failed checkpoint barrier, a partial batch, a transfer error, an uncertain finalization step,
-or a tape log that ends before the point the catalog has already projected. `rem catalog tapes
---json`, `rem top` and `rem daemon health` show it, and `rem tape quarantine release <ID> --ack
-<TEXT>` releases it. On a standalone drive reads stay available while it is active.
+A fence (quarantine id beginning `tioq-` or `library:`) recording a partial batch,
+a transfer error, an uncertain finalization step, or a tape log that ends before
+the catalog's projection. `rem catalog tapes --json`, `rem top` and
+`rem daemon health` show it. Release takes `rem tape quarantine release <ID> --ack <TEXT>`.
+A `native_log_behind_projection` fence also requires `--force` in library mode,
+after restoring the exact log or rebuilding the catalog. The standalone release
+form has no `--force`.
+
+On a standalone drive, that cause refuses `rem get`, `rem tape identify`,
+`rem tape verify` and `rem tape restore`. Only `rem tape restore --scan` proceeds,
+walking the tape from its start. Contradicted tape admission refuses every read,
+including `--scan`. Reads under other fence causes remain available.
+A failed standalone initialization write raises no tape or drive fence; the
+`StandaloneFenceUnrecorded` refusal stops motion until the command or daemon restarts.
 
 ### media-readiness fence
 

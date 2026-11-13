@@ -11,7 +11,7 @@ daemon show the output format from the code, with illustrative values: barcode `
 pool `archive`, library serial `LIB001`, drive bay `0x0100`, slot `0x0400`, device
 `/dev/sg5`, and tape UUID `5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs crates/remanence-daemon/src/entry.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs crates/remanence-daemon/src/entry.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## The binaries
 
 Remanence builds four programs that operators use. The first two come from the
@@ -23,7 +23,7 @@ Remanence builds four programs that operators use. The first two come from the
   cannot issue arbitrary SCSI commands.
 - `rem-debug` is the break-glass CLI. It shares discovery, the local tape-lifecycle
   commands and the local `archive` commands with `rem`, and adds direct SCSI robotics,
-  direct tape reads and writes, tape-log repair and destructive catalog maintenance. It has
+  direct tape reads and writes, tape-log inspection and destructive catalog maintenance. It has
   neither the standalone-drive commands nor the daemon client commands.
   [rem-debug extras](#rem-debug-extras) lists exactly which commands each binary has.
 - `rem-daemon` is the long-running library service (see [rem-daemon](#rem-daemon)).
@@ -94,7 +94,7 @@ Angle brackets mark a value you supply. The names below are used throughout this
 | `<REMP>`, `<REMR>` | A recipient private-key file and a recipient public-key file; see [Recipient key-file formats](#recipient-key-file-formats). |
 | `<JSON>` | The locator JSON that a tape write (`rem-debug archive write`) returns, passed as the value of `--locator`. |
 | `<MEMBER>` | A member's archive path inside the object, exactly as recorded in the catalog: the `objects[].archive_path` value that `rem put --json` prints (ingest strips a leading `/` or `./`, so `/data/file` is stored as `data/file`), or the member path in the object's manifest. |
-| `--idempotency-key <UUID>` | A UUID you generate, not nil, that identifies one finalization request. Keep it and reuse the same value when you retry, so that the daemon deduplicates the request. It is not a tape UUID or an operation UUID. |
+| `--idempotency-key <UUID>` | A UUID you generate, not nil, that identifies one finalization request. Reuse it after a lost response to recover the existing live or successful operation. An operation that ended without success requires a new key. It is not a tape UUID or an operation UUID. |
 | `<DURATION>`, `<BYTES>` | A duration or a size, in the units described under the conventions above. |
 | `<HEX>` | A SHA-256 digest written as 64 hexadecimal characters. |
 | `<SG>` | The Linux SCSI generic device path of a tape drive, for example `/dev/sg5`. |
@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
@@ -389,10 +389,12 @@ rem tape init [OPTIONS] --label <LABEL>
 The command writes the bootstrap at BOT immediately; there is no dry run. Nonblank media,
 including media whose identity was retired, requires the clobber confirmation, and the other
 safety refusals still apply. A Remanence tape whose tape UUID this catalog does not know is
-refused: adopt it with `rem tape adopt` (the default), or erase it with
-`--clobber-data --clobber-unknown-tape <UUID>` naming that exact UUID, plus the clobber
-confirmation. The refusal prints the UUID to copy. A different UUID, or the flag on any
-other tape, refuses without writing. A label that already belongs to another tape is refused
+refused with `observed BOT predecessor has no typed identity; no Bootstrap write admitted`.
+It writes nothing and prints no `next:` line. Keep its data by adopting it with
+`rem-debug tape adopt-bootstrap`, or erase it with
+`--clobber-data --clobber-unknown-tape <UUID>` naming the exact tape UUID at BOT, plus
+the clobber confirmation. A different UUID, or the flag on any other tape, refuses
+without writing. A label that already belongs to another tape is refused
 with `label <LABEL> belongs to tape <UUID>; choose a new label`.
 
 The parser accepts `--generation` values `L1` to `L9`, `LZ` and `M8`. The drive's measured
@@ -475,8 +477,15 @@ written              photos/notes.txt  6fa459ea-ee8a-4ca4-894e-db77e160355e  FIR
 Total: 2 written, 0 already_stored, 0 skipped, 0 refused
 ```
 
-Reads report active tape-I/O fences and remain available. Writes refuse fences
-on the loaded tape or endpoint. Append admission also checks the physical tail:
+Reads report active tape-I/O fences. With a `native_log_behind_projection` fence
+(the tape log ends before the catalog's projection), `rem get`, `rem tape identify`,
+`rem tape verify` and `rem tape restore` refuse. Only `rem tape restore --scan`
+proceeds under that cause, walking the tape from its start. A contradicted tape
+admission refuses every read, including `--scan`. Other tape-I/O fence causes
+leave standalone reads available. Writes refuse active fences on the loaded tape
+or endpoint. A failed standalone initialization write raises no tape or drive
+fence: it records `StandaloneFenceUnrecorded` and stops motion for the process
+until the command or daemon restarts. Append admission also checks the physical tail:
 `TailBeyondKnownState` means local state cannot authorize overwriting complete
 data. Restore newer state or rescue with `tape restore --scan` before considering
 supersede-tail.
@@ -531,7 +540,9 @@ rem tape restore [OPTIONS]
 - `--path <PATH>` restores only this member path; repeat it to select several.
 - `--private-key <PRIVATE_KEY>` decrypts with this REMP file. Listing the members of an
   encrypted object also needs the key.
-- `--scan` walks the tape from BOT instead of using the terminal index.
+- `--scan` walks the tape from BOT instead of using the terminal index. It is the only
+  read admitted under a `native_log_behind_projection` fence; contradicted tape
+  admission still refuses it.
 
 Each recovered object is restored into its own directory under `--out`, named `candidate-1`,
 `candidate-2` and so on, with a `manifest.json` that records its object id, tape file number
@@ -619,17 +630,17 @@ rem tape rebind --label FIRST --previous-uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e
 
 ### rem tape import-journals
 
-Import tape logs from another state directory for append recovery.
+This command is refused and imports or changes nothing.
 
 ```text
 rem tape import-journals [OPTIONS] --from <FROM>
 ```
 
-- `--from <FROM>` is the directory to import from.
+- `--from <FROM>` is accepted but not read.
 
-The name keeps an older word: the command validates the loaded tape's tape log in
-`<FROM>/tapes/` and imports it. The tape must be adopted first. It prints
-`{"imported_from": <FROM>}`.
+The command prints `JournalImportDeferred: importing checkpoint journals is deferred; nothing was imported or changed`
+before enumerating or opening a device. The refusal is counted in the library log.
+There is no replacement import command.
 
 ### rem tape supersede-tail (standalone)
 
@@ -924,7 +935,7 @@ To see the retirements recorded on 2 November 2026:
 rem audit query --since 2026-11-02T00:00:00Z --until 2026-11-03T00:00:00Z --filter event=TapeRetired
 ```
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Drive stewardship
 
 Drive-fleet management through the daemon. A drive is addressed by serial or UUID.
@@ -976,7 +987,7 @@ rem drive clean [OPTIONS] <DRIVE>
 
 ### rem drive annotate
 
-Record purchase, warranty, cost and notes for a drive.
+This command is refused; the drive record stays as recorded.
 
 ```text
 rem drive annotate [OPTIONS] <DRIVE>
@@ -984,26 +995,29 @@ rem drive annotate [OPTIONS] <DRIVE>
 
 - `--purchase-date <PURCHASE_DATE>` and `--warranty-until <WARRANTY_UNTIL>` take
   `YYYY-MM-DD` dates.
-- `--cost <COST>` is a display-only string.
-- `--note <NOTE>` appends a timestamped note; `--notes-set <NOTES_SET>` replaces the notes.
-- `--allow-derived-identity` permits changing a derived-identity row.
+- `--cost <COST>`, `--note <NOTE>`, `--notes-set <NOTES_SET>` and
+  `--allow-derived-identity` are accepted; no row is changed.
+
+Input checks, including date validation, run first. Valid requests are refused with
+`DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded by the library log yet; the drive was not changed`.
+The refusal is counted in the library log. There is no command that records these
+annotations.
 
 ### rem drive retire, rem drive reinstate
 
-Remove a drive from the managed fleet, or return it to service.
+These commands are refused; existing drive rows stay as recorded.
 
 ```text
 rem drive retire [OPTIONS] --reason <REASON> <DRIVE>
 rem drive reinstate [OPTIONS] --reason <REASON> <DRIVE>
 ```
 
-- `--reason <REASON>` is recorded; on `reinstate` it is recorded beside the retirement it
-  reverses.
-- `--allow-derived-identity` permits changing a derived-identity row.
+- `--reason <REASON>` must be nonempty; validation runs before the refusal.
+- `--allow-derived-identity` is accepted; no row is changed.
 
-A retired drive keeps its identity and still appears in `rem top`, marked retired, but no
-selection or mount path uses it. Reinstating does not clear `fenced` or restore
-`actionable`; those are separate judgements.
+Both commands print `DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded by the library log yet; the drive was not changed`.
+The refusal is counted in the library log. No replacement command changes the
+stewardship record. `rem drive list --retired` still shows drives retired earlier.
 
 ### rem drive load
 
@@ -1062,7 +1076,7 @@ With `--json`, a failed, cancelled, or completion-unknown operation prints a
 `details.operation_id`, and `details.state`, and exits 1. Connection failures
 remain `daemon_client_error`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Tape lifecycle
 
 Initialization, readiness and retirement run against local configuration and state, and
@@ -1105,18 +1119,27 @@ before any media write, dry run included. No override (`--force`, `--clobber-dat
 `--clobber-unknown-tape`) relaxes it, and the refusal names the fence and the
 `rem tape quarantine release` command to run first.
 
-A Remanence tape whose tape UUID has no catalog row decides `needs-explicit-rebuild` and
-writes nothing; neither `--force` nor `--clobber-data` alone overrides it. Adopting the tape
-with `rem-debug tape adopt-bootstrap` is the default, and the refusal's `next:` line names
-both that command and the override. To destroy the identity instead, pass
-`--clobber-unknown-tape <UUID>` with `--clobber-data` and the confirmation. The UUID, in
-32-hex or hyphenated form, must equal the tape UUID at BOT exactly, or init refuses and
-names both. The override never relaxes any other decision. It refuses when committed copies
-still reference that UUID, re-reads BOT just before writing and refuses unless it still
-carries that UUID, and is rejected for dry runs and batch initialization. The tape gets a
-fresh UUID; the output's `clobbered:` line and the `TapeProvisioned` audit record
-(`clobbered_identity = "unknown-to-catalog"`, `clobbered_uuid`) record the destroyed
+A cartridge whose start names a tape UUID absent from the catalog is refused with
+`observed BOT predecessor has no typed identity; no Bootstrap write admitted`.
+It writes nothing and prints no `next:` line. Neither `--force` nor `--clobber-data`
+alone overrides it. Adopt the tape with `rem-debug tape adopt-bootstrap` to keep
+its data. To destroy the identity instead, pass `--clobber-unknown-tape <UUID>`
+with `--clobber-data` and the exact confirmation. The UUID, in 32-hex or hyphenated
+form, must equal the tape UUID at BOT exactly. The override refuses other
+decisions and committed copies, re-reads BOT before writing, and is rejected for
+dry runs and batch initialization. The tape gets a fresh UUID. The `clobbered:`
+output line and the library log's `Reprovision.replaced_bot` record the destroyed
 identity.
+
+Initialization writes the new start-of-tape before recording the replacement in
+the catalog. An interruption between those steps leaves the old identity live
+in the catalog while the cartridge carries the new UUID. Mounting it under the
+old identity and writing are refused with `tape identity mismatch: expected ...`.
+Another init refuses the unknown predecessor before writing. Retire the old
+identity with `rem tape retire <OLD-UUID> --reason <REASON> --i-understand-copies-become-unreadable`
+to release its barcode, then adopt the observed new identity or explicitly
+clobber that exact UUID as above. Retirement marks the old identity's copies
+missing; it does not make the new identity writable by itself.
 
 To check what initializing `RMJ101L9` with default parity would do, without writing:
 
@@ -1205,6 +1228,8 @@ rem tape quarantine release [OPTIONS] --ack <TEXT> <QUARANTINE>
 - `--ack <TEXT>` (on `release`) is the acknowledgement, recorded in the audit log.
 - `--after-settled-inventory` (on `release`) confirms that the library inventory has
   settled after the unknown operation.
+- `--force` (on `release`) is required for `native_log_behind_projection` after
+  restoring the exact tape log or rebuilding the catalog.
 
 `list` and `show` cover media-readiness fences, whose quarantine ids begin with `mrq-`.
 `list` prints one line per fence with its operation, library and drive, barcode, state,
@@ -1213,12 +1238,21 @@ an empty list prints `(no active media-readiness quarantines)`. `show` adds the 
 its JSON carries `last_sense` (`KK/AA/QQ`) and `last_sense_name` beside the raw sense
 fields. The JSON schema of `list` is `rem.tape.quarantine.list.v1`.
 
-`release` also releases tape-I/O fences, whose ids begin with `tioq-`; `rem catalog tapes`,
+`release` also releases tape-I/O fences, with `tioq-` or `library:` ids; `rem catalog tapes`,
 `rem top` and `rem daemon health` list those. A tape-I/O fence is released through the
 configured daemon socket after the operator's acknowledgement. Only an absent listener
 permits the offline fallback, which needs the exclusive state lock. Repeating a release
 returns its original evidence. Media-readiness release keeps its existing offline
 behaviour.
+
+For `native_log_behind_projection`, restore the exact tape log or rebuild the
+catalog with `rem rebuild-catalog-from-journals`, then run
+`rem tape quarantine release <ID> --ack <TEXT> --force`. Without `--force`, release
+is refused with `native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
+A forced release can still be refused if tape admission is contradicted or the
+log remains behind the catalog. This form uses the daemon when one listens;
+only an absent listener permits release offline under the state lock. The
+standalone form `rem tape quarantine release <ID> --ack <TEXT>` has no `--force`.
 
 To release a fence after checking the drive and the slot inventory:
 
@@ -1301,7 +1335,7 @@ Failures print to stderr and exit 1. JSON terminal failures include
 terminal operation state. Argument parsing failures exit 2. Each JSON message is
 one line, including the generated-key message preceding any error.
 
-<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs crates/remanence-state/src/library_runtime/terminal.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ### rem tape finalize (library)
 
 Finalize one exact tape through the daemon.
@@ -1322,8 +1356,11 @@ Finalization is irreversible, and works below the automatic low watermark too. W
 `--wait` the command submits once and prints the current status. With it, the command polls
 the read-only status RPC across daemon reconnects until a terminal outcome and never
 resubmits. While the tape is `FINALIZING` it also checks the operation, and exits non-zero
-with its summary on `FAILED`, `CANCELLED` or `COMPLETION_UNKNOWN`. Reuse the same
-idempotency key to resume the durable request under the same operation id.
+with its summary on `FAILED`, `CANCELLED` or `COMPLETION_UNKNOWN`. An attempt that
+ended without success is final under its idempotency key. Repeating that key is
+refused with `FAILED_PRECONDITION` and `ClosedOperationRetry: manual operation cannot resume from ...`.
+Use a new key to start a new operation. Matching retries of live or successful
+operations return the existing operation.
 
 Manual finalization refuses a due closeout. When the range retains its
 original-write check and has no closeout contradiction fence, the message is:
@@ -1332,8 +1369,8 @@ original-write check and has no closeout contradiction fence, the message is:
 CloseoutRequired: tape <UUID> has <N> unprotected bytes since <TIME>; run rem tape closeout <UUID> before finalization.
 ```
 
-Run the named closeout command, then retry finalization with the same
-idempotency key. An unprovable range instead produces
+Run the named closeout command, then submit finalization with a new idempotency
+key if the previous operation ended without success. An unprovable range instead produces
 `CloseoutUnprotectedFinalizationUnavailable`; accepting unprotected
 finalization is not supported. See [Closeout debt](guide-troubleshooting.md#closeout-debt).
 
@@ -2304,7 +2341,7 @@ keep the on-tape labels; it never substitutes labels from the new retry request.
   reports `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk and stored-range geometry.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## rem-debug extras
 
 `rem-debug` has only part of the surface above. It shares discovery (`libraries`,
@@ -2346,24 +2383,18 @@ sequence and byte counts are decimal strings, and `damage` is a string or `null`
 
 ### rem-debug tape-log repair-tail
 
-Archive a damaged suffix of a tape log and keep an exact validated closed sequence.
+This command is refused and repairs or changes nothing.
 
 ```text
 rem-debug tape-log repair-tail [OPTIONS] --config <CONFIG> --tape-uuid <TAPE_UUID> --through-sequence <THROUGH_SEQUENCE>
 ```
 
-- `--through-sequence <THROUGH_SEQUENCE>` is the last validated closed sequence to keep.
-- `--confirm-discard-corrupt-tail` is required before the state is opened.
-- `--rebuild-projection` rebuilds this tape's catalog rows in the same offline operation; it
-  is required when the cut falls below the catalog's projection mark.
-
-The JSON reports `tape_uuid`, `tape_incarnation`, `through_sequence`, `archive`,
-`archive_sha256`, `reconciliation_record`, `original_bytes`, `retained_bytes`,
-`projection_rebuilt` and `physical_tail_reconciliation_required`. Sequence and byte counts
-are decimal strings, the digest is lowercase hexadecimal, and the last field is `true`. The
-durable repair fence remains until a confirmed `rem tape supersede-tail` reconciles the
-physical media. See the
-[repair procedure](guide-troubleshooting.md#damaged-log-tails-and-projection-rebuild).
+The flags, including `--confirm-discard-corrupt-tail` and `--rebuild-projection`,
+are accepted but not read. The command prints
+`TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed`
+before reading its flags or opening state. Restore the tape log from a copy, or
+rebuild the catalog projection from intact logs. See
+[damaged log tails and projection rebuild](guide-troubleshooting.md#damaged-log-tails-and-projection-rebuild).
 
 ### Robotics
 
@@ -2379,6 +2410,9 @@ These commands send SCSI directly to the changer, bypassing the daemon, and all 
 | `rem-debug import --slot <SLOT> <SERIAL>` | Move a cartridge from the first occupied IE port to a slot. |
 | `rem-debug rescan <SERIAL>` | INITIALIZE ELEMENT STATUS, then reconcile the snapshot. A shape mismatch is a hard error. |
 | `rem-debug lock <SERIAL>`, `rem-debug unlock <SERIAL>` | PREVENT or ALLOW MEDIUM REMOVAL on the changer. The changer holds the lock, so it survives process exit; while it is held, the front-panel eject and operator mailslot eject are refused. A device reset or power cycle also releases it. |
+
+`export`, `import`, `rescan`, `lock` and `unlock` read `/etc/rem/config.toml` and
+accept no `--config` option.
 
 To move the cartridge in slot `0x0400` of library `LIB001` into bay `0x0100` and load it:
 

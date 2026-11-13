@@ -202,7 +202,7 @@ Init asks you to type `CLOBBER HOME01`. For a run without a prompt, add
 protection, the partition check, the label and identity swap checks, or the
 pool checks.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## 3. Put files on tape
 
 Write a directory to the loaded tape:
@@ -366,22 +366,35 @@ rem get Documents/notes.txt --version <OBJECT_UUID> --out restored-old
 
 ## After a crash or a killed write
 
-A fence records a write whose completion is uncertain. Writes to that tape or
-drive refuse until the cause is understood. Reads still work and report active
-fences, so start with inspection and rescue:
+A crash-left write session does not block the next standalone write at that
+drive. The session is closed when its tape is next opened, subject to the normal
+tape admission and tail checks. The drive's live busy/session map comes from
+current drive-pool reservations; it does not show the crash-left session.
+
+Inspect active fences before reading or writing. With a
+`native_log_behind_projection` fence, `rem get`, `rem tape identify`,
+`rem tape verify` and `rem tape restore` refuse. Only `rem tape restore --scan`
+proceeds, walking the tape from its start. Contradicted tape admission refuses
+every read, including `--scan`. Other tape-I/O fence causes leave reads available.
+Start by listing the fences; use scan rescue when that admission permits it:
 
 ```sh
 rem tape quarantine list
-rem tape identify
 rem tape restore --scan --out rescued
 ```
 
-After checking the hardware and preserving the data, release the named fence
-with a description of what you checked:
+The standalone release form has no `--force`, which a
+`native_log_behind_projection` fence requires. For other releasable fences,
+after checking the hardware and preserving the data, record what you checked:
 
 ```sh
 rem tape quarantine release <ID> --ack "checked drive and rescued readable files"
 ```
+
+A failed standalone initialization write raises no tape or drive fence. It
+records `StandaloneFenceUnrecorded` and stops motion for the process until the
+command or daemon restarts. Investigate the write failure before restarting;
+there is no endpoint fence to release for this failure.
 
 Release records your acknowledgement; it does not prove that the append point
 is safe. Every append checks the physical tail. `TailBeyondKnownState` means

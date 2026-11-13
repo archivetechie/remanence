@@ -8,7 +8,7 @@ them, and each builds on the ones before it. The [glossary](reference-glossary.m
 short entry for every term, and the [architecture overview](architecture-overview.md) is the
 next step for a reader who wants the design in detail.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## 1. How a tape behaves
 
 Remanence's design only makes sense against the behaviour of the medium, so this page starts
@@ -124,9 +124,11 @@ parity is about recovering from damage to the tape years later.
 The host keeps one **tape log** for each tape: an append-only file, `<uuid>.remtape` in the
 `tapes` directory under the configured `[journal]` directory. It records, in order, the
 commit records and everything else the host has decided about that tape, such as finalization
-progress. The tape log is the host's authority for its tape. Some command names keep an older
-word for these files: `rem rebuild-catalog-from-journals` and `rem tape import-journals`
-both work on the tape logs.
+progress. The tape log is the host's authority for its tape. The command
+`rem rebuild-catalog-from-journals` keeps an older word for these files; it
+rebuilds the catalog from the tape logs. `rem tape import-journals` is refused with
+`JournalImportDeferred: importing checkpoint journals is deferred; nothing was imported or changed`;
+it imports or changes nothing.
 
 Beside the tape logs sits the **audit log**, a hash-chained, append-only record of operations
 and who asked for them, in one segment file per day. Operator decisions that are not about one
@@ -199,7 +201,7 @@ reference](reference-cli.md#standalone-drives) lists which commands go where.
 ## 9. Fences
 
 When an operation on a tape or drive ends in a state that Remanence cannot prove, for example
-a barrier that failed or a load whose outcome is unknown, Remanence does not guess. It records
+a load whose outcome is unknown, Remanence does not guess. It records
 a **fence**: a durable refusal against that tape or drive, written to the audit log and the
 catalog, that survives restarts. Fenced media is refused for writes and initialization, and
 the daemon also refuses read sessions on it, until the cause is resolved. Other tapes and drives stay
@@ -209,13 +211,21 @@ record. Releasing a fence takes an acknowledgement text, which is recorded in th
 
 There are two kinds of fence.
 
-- A **tape-I/O fence** (quarantine id beginning `tioq-`) records tape input or output that
-  ended unproved: a failed checkpoint barrier, a partial batch, a transfer error, an uncertain
-  step of finalization, or a tape log that ends before the point the catalog has already
-  projected. `rem catalog tapes --json`, `rem top` and `rem daemon health` show these fences.
+- A **tape-I/O fence** (quarantine id beginning `tioq-` or `library:`) records a
+  partial batch, a transfer error, an uncertain step of finalization, or a tape log
+  that ends before the point the catalog has already projected.
+  `rem catalog tapes --json`, `rem top` and `rem daemon health` show these fences.
   An operator investigates, verifies the tape and drive, and releases the fence with
-  `rem tape quarantine release <ID> --ack <TEXT>`. On a standalone drive, reads stay
-  available while a tape-I/O fence is active, so data can be rescued.
+  `rem tape quarantine release <ID> --ack <TEXT>`. A tape log behind the catalog's
+  projection (`native_log_behind_projection`) also requires `--force` in library
+  mode, after restoring the log or rebuilding the catalog. The standalone release
+  form has no `--force`. Under that cause, `rem get`, `rem tape identify`,
+  `rem tape verify` and `rem tape restore` refuse on a standalone drive; only
+  `rem tape restore --scan` proceeds, walking from the tape's start. Contradicted
+  tape admission refuses every read, including `--scan`. Other fence causes leave
+  standalone reads available. A failed standalone initialization write raises no
+  tape or drive fence: it records `StandaloneFenceUnrecorded` and stops motion
+  until the command or daemon restarts.
 - A **media-readiness fence** (quarantine id beginning `mrq-`) records a readiness wait, the
   wait for a drive to become ready after a load, that was interrupted or ended without a clear
   answer. A wait that was still progressing (loading, becoming ready, busy) is resumable: the
@@ -227,8 +237,8 @@ Two things that look similar are not fences. The **eject guard** is the medium-r
 prevention that Remanence sets on a drive while a command runs, so that the cartridge cannot
 be ejected mid-operation; an interrupted command can leave it set, and `rem tape release`
 clears it on a standalone drive. A tape log can also carry a mark on the
-host that blocks appends to that tape after the host could not prove a log write, or after an
-operator repaired the log's tail; [troubleshooting](guide-troubleshooting.md) covers both.
+host that blocks appends to that tape after the host could not prove a log write;
+[troubleshooting](guide-troubleshooting.md) covers this refusal.
 
 ## In plain terms
 
