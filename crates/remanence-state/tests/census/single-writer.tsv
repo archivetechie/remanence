@@ -17,6 +17,7 @@
 # The projector's own modules are listed by function, not by directory.
 #
 # Outside the projector: sites a later order removes, or that never write SQL authority (D4)
+# cache, permanent: the calibration harvest's wrap map is an SQL cache, never authority; an empty rebuild evicts it and the map is not servable until the next harvest (replan-step4.md:367, :573-574; D-C3b-S2-1; test current_empty_rebuild_cached_wrap_map_evicted_not_servable); L2 records the harvest through WrapMapCached.
 crates/remanence-api/src/calibration.rs	harvest_and_install_calibration	upsert_wrap_map	1	cache	permanent
 crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	append_and_project_audit	2	unreachable-at-runtime	L2
 crates/remanence-api/src/drive_collection.rs	poll_foreign_drive_counters_once_with_reader	observe_foreign_drive_tapealert_advisory	1	unreachable-at-runtime	L2
