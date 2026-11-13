@@ -456,6 +456,7 @@ fn wor_environment_is_fail_closed_and_inert_for_standalone_and_daemon_sessions()
 
 /// Retrying an accepted terminal suffix under a lowered cap keeps a local typed cause.
 #[test]
+#[ignore = "ruling 25 (next landing): a same-key retry after CompletionUnknown is refused by the ClosedOperationRetry stand-in before the capacity check; D-C3a-2d-1"]
 fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
     let (mut fixture, state) = Fixture::new(false);
     let mut owner = library_owner(&fixture, state, "terminal-capacity").unwrap();

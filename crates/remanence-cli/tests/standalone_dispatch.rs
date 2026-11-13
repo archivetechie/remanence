@@ -320,6 +320,42 @@ impl remanence_library::SgTransport for RemovalTransport {
     }
 }
 
+/// D-C3a-2d-1: discard only SQLite and reopen through the production typed replay.
+fn home_rebuild_state(config_path: &Path) -> remanence_state::StateHandle {
+    let config = remanence_state::load_config(config_path).unwrap();
+    let paths = remanence_state::StatePaths::from_config(config_path, &config);
+    std::fs::remove_file(&paths.sqlite_path).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", paths.sqlite_path.display()));
+        match std::fs::remove_file(sidecar) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => panic!("D-C3a-2d-1: remove SQLite sidecar: {error}"),
+        }
+    }
+    remanence_state::StateHandle::open_from_config_file(config_path).unwrap()
+}
+
+/// D-C3a-2d-1: inspect AssignPool's source using the canonical-byte precedent in
+/// ruling24_reprovision_predecessor; Record has no public assignment accessor.
+fn home_assignment_source(record: &remanence_state::library_log::Record) -> ciborium::Value {
+    let (bytes, _) = remanence_state::library_log::codec::encode(1, [0; 32], record).unwrap();
+    let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let start = remanence_state::log_frame::PREFIX_LEN;
+    let value: ciborium::Value = ciborium::from_reader(&bytes[start..start + size]).unwrap();
+    fn field(value: &ciborium::Value, key: u64) -> &ciborium::Value {
+        let ciborium::Value::Map(map) = value else {
+            panic!("D-C3a-2d-1: canonical map");
+        };
+        &map.iter()
+            .find(|(k, _)| *k == ciborium::Value::Integer(key.into()))
+            .unwrap()
+            .1
+    }
+    field(field(&value, 1), 3).clone()
+}
+
+/// D-C3a-2d-1: typed operator metadata survives production rebuilds and real IO.
 #[test]
 fn home_roundtrip_and_metadata_use_real_dispatch() {
     use remanence_chaos::model::{DeviceRole, ModelTransport, VirtualTape, VirtualWorld};
@@ -399,41 +435,57 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
     };
     run(&["tape", "init", "--label", "HOMEL9", "--generation", "L9"]);
     let config_path = root.path().join("state/rem/config.toml");
-    let config = remanence_state::load_config(&config_path).unwrap();
-    let paths = remanence_state::StatePaths::from_config(&config_path, &config);
-    let audit = remanence_state::FileAuditLog::replay(&paths.audit_dir).unwrap();
-    let events: Vec<_> = audit
+    let records = ruling24_library_records(&config_path);
+    let events: Vec<_> = records
         .iter()
-        .filter(|r| {
+        .filter(|record| {
             matches!(
-                r.event,
-                remanence_state::AuditEvent::TapeProvisioned
-                    | remanence_state::AuditEvent::TapePoolAssigned
+                record.tag(),
+                remanence_state::library_log::Tag::Reprovision
+                    | remanence_state::library_log::Tag::AssignPool
             )
         })
         .collect();
-    assert_eq!(events.len(), 2);
     assert_eq!(
-        events[0].event,
-        remanence_state::AuditEvent::TapeProvisioned
+        events.iter().map(|record| record.tag()).collect::<Vec<_>>(),
+        [
+            remanence_state::library_log::Tag::Reprovision,
+            remanence_state::library_log::Tag::AssignPool,
+        ],
+        "D-C3a-2d-1: one reprovision precedes one assignment"
+    );
+    let provision = events[0].reprovision().unwrap();
+    assert_eq!(
+        provision.label_provenance,
+        Some(remanence_state::library_log::LabelProvenance::Operator),
+        "D-C3a-2d-1: operator label provenance"
     );
     assert_eq!(
-        events[1].event,
-        remanence_state::AuditEvent::TapePoolAssigned
+        home_assignment_source(events[1]),
+        ciborium::Value::Integer(
+            (remanence_state::library_log::AssignmentSource::Operator as u16).into()
+        ),
+        "D-C3a-2d-1: operator assignment source"
     );
-    assert_eq!(
-        events[0].detail.get("voltag_source"),
-        Some(&ciborium::Value::Text("operator".into()))
-    );
-    assert_eq!(
-        events[1].detail.get("assignment_source"),
-        Some(&ciborium::Value::Text("operator".into()))
-    );
-    let mut rebuilt = remanence_state::projector::open(root.path().join("rebuilt.sqlite"))
-        .map(|catalog| catalog.write_handle())
+    let state = remanence_state::StateHandle::open_from_config_file(&config_path).unwrap();
+    let folded = state
+        .library_runtime()
+        .tape_state(provision.tape.uuid)
         .unwrap();
-    rebuilt.replay_audit_records(&audit).unwrap();
-    let recovered = rebuilt.get_tape_by_voltag("HOMEL9").unwrap().unwrap();
+    assert!(
+        matches!(
+            folded.pool_source,
+            Some(remanence_state::library_log::PoolSource::Operator(..))
+        ),
+        "D-C3a-2d-1: folded operator pool source"
+    );
+    drop(state);
+    let rebuilt = home_rebuild_state(&config_path);
+    let recovered = rebuilt
+        .catalog()
+        .get_tape_by_voltag("HOMEL9")
+        .unwrap()
+        .unwrap();
     assert_eq!(recovered.pool_id.as_deref(), Some("default"));
     assert_eq!(
         recovered.voltag_source,
@@ -451,8 +503,8 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
         .unwrap()
         .contains("verification failed"));
     run(&["tape", "set-generation", "--generation", "L9"]);
-    // Later operator intent must survive loss of the SQLite cache, even when
-    // old init records and pool rules are replayed again.
+    // D-C3a-2d-1: each production rebuild must reproduce later operator intent
+    // after the SQLite cache is lost.
     run(&["pool", "new", "second"]);
     let assert_recovered = |pool: Option<&str>, generation: &str| {
         let config = remanence_state::load_config(&config_path).unwrap();
@@ -462,28 +514,25 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
         let expected = live.get_tape_by_voltag("HOMEL9").unwrap().unwrap();
         assert_eq!(expected.pool_id.as_deref(), pool);
         assert_eq!(expected.cartridge_generation.as_deref(), Some(generation));
-        let audit = remanence_state::FileAuditLog::replay(&paths.audit_dir).unwrap();
-        let mut rebuilt = remanence_state::projector::open(":memory:")
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        for full_rebuild in [false, false, true] {
-            if full_rebuild {
-                rebuilt
-                    .rebuild_from_authoritative_sources(&audit, &[])
-                    .unwrap();
-            } else {
-                rebuilt.replay_audit_records(&audit).unwrap();
-            }
-            rebuilt
-                .reconcile_tape_pool_projection_from_rules(&[], &[])
+        drop(live);
+        for _ in 0..2 {
+            let rebuilt = home_rebuild_state(&config_path);
+            let actual = rebuilt
+                .catalog()
+                .get_tape(&expected.tape_uuid)
+                .unwrap()
                 .unwrap();
-            let actual = rebuilt.get_tape(&expected.tape_uuid).unwrap().unwrap();
-            assert_eq!(actual.pool_id, expected.pool_id);
-            assert_eq!(actual.assignment_generation, expected.assignment_generation);
+            assert_eq!(actual.pool_id, expected.pool_id, "D-C3a-2d-1: rebuilt pool");
+            assert_eq!(
+                actual.assignment_generation, expected.assignment_generation,
+                "D-C3a-2d-1: rebuilt assignment generation"
+            );
             assert_eq!(
                 remanence_state::tape_generation(&actual),
-                remanence_state::tape_generation(&expected)
+                remanence_state::tape_generation(&expected),
+                "D-C3a-2d-1: rebuilt tape generation"
             );
+            drop(rebuilt);
         }
         uuid::Uuid::from_slice(&expected.tape_uuid)
             .unwrap()
@@ -497,7 +546,25 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
     assert_recovered(None, "L8");
 
     run(&["tape", "assign-pool", "--pool", "default"]);
-    run(&["tape", "set-generation", "--generation", "L9"]);
+    // R434, D-C3a-2d-1: an unmeasured capacity increase is refused without changing L8.
+    let (code, refusal) = run_result(&["tape", "set-generation", "--generation", "L9"]);
+    assert_eq!(code, ExitCode::from(1), "D-C3a-2d-1: {refusal}");
+    assert_eq!(
+        refusal["error"], "tape provisioning conflict: CapacityIncreaseRequiresMeasurement",
+        "D-C3a-2d-1: R434 refusal"
+    );
+    let state = remanence_state::StateHandle::open_from_config_file(&config_path).unwrap();
+    let unchanged = state
+        .catalog()
+        .get_tape_by_voltag("HOMEL9")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.cartridge_generation.as_deref(),
+        Some("L8"),
+        "D-C3a-2d-1: refused increase leaves generation unchanged"
+    );
+    drop(state);
     let source = root.path().join("hello.txt");
     std::fs::write(&source, b"standalone member roundtrip").unwrap();
     let result = run(&["put", source.to_str().unwrap()]);
@@ -2715,18 +2782,29 @@ fn restore_dates_listing_and_member_selection() {
     );
     // Opening the drive reconciles abandoned sessions; reads remain available.
     f.ok(&["tape", "identify"]);
-    // Restart recovery must fence the abandoned session; use the normal audited release.
+    // C8-G2, DEC-2, D-C3a-2d-1: restart recovery no longer fences this
+    // interrupted operation's tape. Its finalizing state refuses writes until
+    // the same-key finalize completes it.
     let quarantine = f.ok(&["tape", "quarantine", "list"]);
     let fences = quarantine["active_fences"].as_array().unwrap();
-    assert_eq!(fences.len(), 1);
-    f.ok(&[
-        "tape",
-        "quarantine",
-        "release",
-        fences[0]["quarantine_id"].as_str().unwrap(),
-        "--ack",
-        "fixture interrupted before first media write",
-    ]);
+    assert!(
+        fences.is_empty(),
+        "D-C3a-2d-1: no restart fence: {quarantine}"
+    );
+    let refused_source = f.root.path().join("while-finalizing.txt");
+    std::fs::write(&refused_source, b"refused until finalize completes").unwrap();
+    let (code, output, errors) = f.run(&["put", refused_source.to_str().unwrap()], true);
+    assert_eq!(code, ExitCode::from(1), "D-C3a-2d-1: {output} {errors}");
+    let refusal = VersionFixture::envelope(&output);
+    let summary = &refusal["result"]["summary"];
+    assert!(
+        summary["failed"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("tape is not ready for writing: state=\"finalizing\""),
+        "D-C3a-2d-1: {refusal}"
+    );
+    assert_eq!(summary["written"], 0, "D-C3a-2d-1: {refusal}");
     let finalized = f.ok(&["tape", "finalize", "--acknowledge-tape", "FIRST"]);
     assert_eq!(
         finalized["operation_id"],

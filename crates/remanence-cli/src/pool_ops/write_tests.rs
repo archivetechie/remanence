@@ -124,6 +124,31 @@ fn archive_write_refuses_unlisted_library_and_releases_state_lock() {
     let _state = StateHandle::open_from_config_file(&fx.config_path).unwrap();
 }
 
+/// D-C3a-2d-1: read native records as characterisation_sessions' ruling24_native_records
+/// does, without acquiring another tape owner or changing the log.
+fn native_write_records(config_path: &Path) -> Vec<remanence_state::tape_log::Record> {
+    let config = remanence_state::load_config(config_path).unwrap();
+    let path = config
+        .journal
+        .dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(TAPE).simple()));
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("D-C3a-2d-1: read tape source: {error}"),
+    };
+    remanence_state::tape_log::store::Header::decode(&mut file, TAPE).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+    let mut records = Vec::new();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        records.push(frame.record.clone());
+    }
+    records
+}
+
+/// D-C3a-2d-1: selected writes keep locators and encryption; committed replay opens no session.
 #[test]
 fn selected_library_actor_preserves_encryption_locators_and_replay_before_load() {
     let Fixture {
@@ -259,26 +284,17 @@ fn selected_library_actor_preserves_encryption_locators_and_replay_before_load()
             assert!(replay["recipient_epochs"][0]["label"].is_null());
         }
     }
-    let records = remanence_state::FileAuditLog::replay(root.path().join("audit")).unwrap();
-    let opened: Vec<_> = records
+    // D-C3a-2d-1: the native session does not record the drive today; the owner's
+    // drive-identity order W-DRV will add it. Committed replay opens no session.
+    let records = native_write_records(&config_path);
+    let opened = records
         .iter()
-        .filter(|r| r.event == remanence_state::AuditEvent::SessionOpened)
-        .collect();
-    assert_eq!(opened.len(), 2);
-    for record in opened {
-        assert_eq!(
-            record.detail["endpoint_key"],
-            ciborium::Value::Text(remanence_library::DriveKey::new(LIBRARY, BAY).encode())
-        );
-        assert_eq!(
-            record.detail["library_serial"],
-            ciborium::Value::Text(LIBRARY.into())
-        );
-        assert_eq!(
-            record.detail["drive_bay"],
-            ciborium::Value::Integer(u64::from(BAY).into())
-        );
-    }
+        .filter(|record| matches!(record, remanence_state::tape_log::Record::SessionOpened(_)))
+        .count();
+    assert_eq!(
+        opened, 2,
+        "D-C3a-2d-1: one native session per archive write"
+    );
     assert!(
         !world
             .lock()
