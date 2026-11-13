@@ -156,6 +156,16 @@ impl OperationRegistry {
             .map(|entry| entry.operation_kind.clone())
     }
 
+    /// Read the retained cancellation flag without changing the operation's state.
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self, id: &Uuid) -> bool {
+        self.ops
+            .lock()
+            .expect("ops lock")
+            .get(id)
+            .is_some_and(|entry| entry.cancel.load(Ordering::SeqCst))
+    }
+
     pub(crate) fn latest(&self, id: &Uuid) -> Option<pb::OperationStatus> {
         self.ops
             .lock()

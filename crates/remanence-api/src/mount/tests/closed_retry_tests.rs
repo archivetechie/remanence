@@ -2101,6 +2101,16 @@ pub(super) fn operation_events_in_log(
     paths: &remanence_state::StatePaths,
     operation: Uuid,
 ) -> Vec<lib::OperationEvent> {
+    library_records_in_log(paths)
+        .iter()
+        .filter_map(|record| record.operation_recorded())
+        .filter(|record| record.operation == *operation.as_bytes())
+        .map(|record| record.event.clone())
+        .collect()
+}
+
+/// Validate a quiescent byte snapshot without replaying the deliberately refused source.
+fn library_records_in_log(paths: &remanence_state::StatePaths) -> Vec<lib::Record> {
     use lib::codec::{Decoder, Header, HEADER_LEN};
     let mut entries: Vec<_> = std::fs::read_dir(&paths.audit_dir)
         .unwrap()
@@ -2117,11 +2127,7 @@ pub(super) fn operation_events_in_log(
         let mut previous = header.previous_segment_hash;
         while let Some(frame) = decoder.next_frame().unwrap() {
             previous = lib::codec::verify(&frame, previous).unwrap();
-            if let Some(record) = frame.record.operation_recorded() {
-                if record.operation == *operation.as_bytes() {
-                    records.push(record.event.clone());
-                }
-            }
+            records.push(frame.record);
         }
     }
     records
@@ -2758,9 +2764,10 @@ async fn u7_no_free_bay_stops_open_and_same_key_completes() {
     assert_eq!(durable_bytes(typed.paths()), before);
     assert!(drive_rx.try_recv().is_err());
     assert!(changer_rx.try_recv().is_err());
-    for _ in 0..5 {
+    for delay_ms in [0, 1050, 5050, 30_050, 60_050] {
+        // Let the existing backoff elapse; a wake would reset the media-failure count.
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         crate::closeout_obligation::scan(&state).unwrap();
-        state.closeout_work.wake_tape(TAPE);
         assert_eq!(
             crate::closeout_obligation::service_unheld_for_test(&state).await,
             vec![(TAPE, 1)]
@@ -2984,9 +2991,9 @@ impl remanence_library::SgTransport for U7ShortWrite {
 }
 
 /// Drive the unchanged CompletionUnknown producers through the worker and the shared physical funnel.
-async fn u7_completion_unknown(unproved: bool) {
+async fn u7_completion_unknown(unproved: bool, restart_detail: bool) {
     use remanence_chaos::model::{ModelTransport, Record, VirtualTape, VirtualWorld};
-    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let mut typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
     let tapes = install_checkpoint(&typed);
     let mut state = ApiState::new(typed.catalog());
     state.checkpoint_journal_dir = Arc::new(tapes);
@@ -3141,15 +3148,48 @@ async fn u7_completion_unknown(unproved: bool) {
     assert_eq!(durable_bytes(typed.paths()), before);
     assert!(drive_rx.try_recv().is_err());
     assert!(changer_rx.try_recv().is_err());
+    if restart_detail {
+        drop((state, pool, drive_rx, changer_rx, cfg, drive, library));
+        typed.release();
+        let (state, _drive_rx, _changer_rx) = second_incarnation(&typed, true);
+        assert!(
+            state.operations.latest(&operation).is_none(),
+            "restart has no live entry"
+        );
+        let stored = state
+            .index()
+            .unwrap()
+            .get_operation(&operation.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "completion_unknown");
+        assert!(stored.error_summary.is_none());
+        let finalization = tape_finalization(&state).await;
+        assert_eq!(
+            finalization.outcome,
+            pb::TapeFinalizationOutcome::RecoveryRequired as i32
+        );
+        assert_eq!(
+            finalization.detail,
+            "finalization completion is unknown; the tape needs operator recovery",
+            "durable completion-unknown fallback detail"
+        );
+    }
 }
 
 #[tokio::test]
 async fn u7_unproved_tail_publishes_unknown_and_scan_parks_without_registering() {
-    u7_completion_unknown(true).await;
+    u7_completion_unknown(true, false).await;
 }
 #[tokio::test]
 async fn u7_tail_write_failure_publishes_unknown_and_scan_parks_without_registering() {
-    u7_completion_unknown(false).await;
+    u7_completion_unknown(false, false).await;
+}
+
+/// Restart loses the live summary; the durable unknown state still supplies actionable detail.
+#[tokio::test]
+async fn fx2_unproved_tail_restart_detail() {
+    u7_completion_unknown(true, true).await;
 }
 
 /// Invoke the real cancel RPC with an authenticated request actor.
@@ -3225,8 +3265,16 @@ async fn u7_cancel_during_readiness_wait_is_rejected_and_attempt_finishes() {
     .unwrap();
     let response = u7_cancel(&state, operation).await;
     u7_assert_cancel_rejected(&typed, operation, &response);
+    assert!(
+        !state.operations.is_cancelled(&operation),
+        "accepted cancel must not set the flag"
+    );
     let before = durable_bytes(typed.paths());
     u7_assert_cancel_rejected(&typed, operation, &u7_cancel(&state, operation).await);
+    assert!(
+        !state.operations.is_cancelled(&operation),
+        "repeated accepted cancel must not set the flag"
+    );
     assert_eq!(
         durable_bytes(typed.paths()),
         before,
@@ -3248,6 +3296,10 @@ async fn u7_cancel_during_readiness_wait_is_rejected_and_attempt_finishes() {
     worker.await.unwrap().unwrap();
     let before = durable_bytes(typed.paths());
     let terminal = u7_cancel(&state, operation).await;
+    assert!(
+        !state.operations.is_cancelled(&operation),
+        "terminal cancel must not set the flag"
+    );
     assert_eq!(
         terminal.resulting_state,
         pb::OperationState::Succeeded as i32
@@ -3649,4 +3701,586 @@ async fn u7_readiness_never_returns_scan_cycles_append_nothing() {
             .unwrap();
         u7_assert_stopped(&typed, &state, operation, reason).await;
     }
+}
+
+/// Follow write_owner's unresolved-drive-history precedent: append against a
+/// claimed Prepared counterpart whose authenticated native kind is Initialized.
+fn fx2_refuse_replay(typed: &TypedRoot, state: &ApiState) {
+    use remanence_state::authority::TapeAuthorityView;
+    struct Present;
+    impl lib::TapeView for Present {
+        fn lookup(&self, at: &lib::TapeAt) -> Result<lib::TapeLookup, lib::FoldError> {
+            Ok(lib::TapeLookup::Present {
+                kind: remanence_state::tape_log::Tag::FinalizationPrepared,
+                digest: at.record_digest,
+            })
+        }
+    }
+    let other = [0xd5; 16];
+    let directory = typed.paths().journal_dir.join("tapes");
+    let authority = remanence_state::TapeAuthority::open_fixture(&directory, other).unwrap();
+    let mut owner = authority.acquire_exclusive().unwrap();
+    owner
+        .publish_initialized(
+            BLOCK_SIZE,
+            None,
+            remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    let runtime = state.catalog.library_runtime().unwrap();
+    runtime.refresh_native(&owner.freeze().unwrap()).unwrap();
+    drop(owner);
+    let counterpart = remanence_state::tape_log::store::Store::open(
+        &directory,
+        other,
+        &typed.paths().sqlite_path,
+    )
+    .unwrap()
+    .snapshot()
+    .unwrap()
+    .record_evidence(1)
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        counterpart.kind,
+        remanence_state::tape_log::Tag::Initialized
+    );
+    let assignment_generation = runtime.tape_state(other).unwrap().assignment_generation;
+    runtime
+        .append(|authority, _| {
+            authority.manual_finalization_accepted(
+                lib::ManualFinalizationAccepted {
+                    at: lib::TapeAt {
+                        tape: lib::TapeRef {
+                            uuid: other,
+                            incarnation: 1,
+                        },
+                        sequence: 1,
+                        record_digest: counterpart.digest,
+                    },
+                    operation: [0x98; 16],
+                    actor_fingerprint: "fx2-test".into(),
+                    idempotency_key: [0x98; 16],
+                    request_fingerprint: [0x99; 32],
+                    assignment_generation,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                &Present,
+            )
+        })
+        .unwrap();
+}
+
+/// Observe readiness before changing unrelated source; this never changes the attempt's inputs.
+async fn fx2_wait_readiness(state: &ApiState, operation: Uuid) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state
+            .operations
+            .latest(&operation)
+            .is_none_or(|s| s.progress.get("phase").map(String::as_str) != Some("readiness"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// RPC's attempt publisher/worker must end its live entry even when source becomes unreadable.
+#[tokio::test]
+async fn fx2_head_read_refusal_after_readiness_deadline_ends_live() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL), ([0xd5; 16], "FX2002L9")]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (_drive_rx, _changer_rx) = load_drive(&mut state);
+    let request = admit_first_request(&state, admission(0xF201));
+    let operation = request.candidate_operation_id;
+    u7_readiness_fence(&state);
+    let pool = state.drive_pool().unwrap().clone();
+    let reserved = pool.reserve_tape(TAPE).unwrap();
+    let worker = tokio::spawn(run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool,
+        reserved.into(),
+        request,
+        Duration::from_secs(3),
+    ));
+    fx2_wait_readiness(&state, operation).await;
+    let chain = operation_events_in_log(typed.paths(), operation);
+    fx2_refuse_replay(&typed, &state);
+    let before = durable_bytes(typed.paths());
+    let error = worker.await.unwrap().unwrap_err();
+    let live = state.operations.latest(&operation).unwrap();
+    assert_eq!(
+        live.state,
+        pb::OperationState::Failed as i32,
+        "head-read refusal must end live entry"
+    );
+    assert!(
+        error.message().contains("readiness wait deadline expired"),
+        "{error}"
+    );
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.metadata().get("remanence-retry").is_none());
+    assert!(error.details().is_empty());
+    assert_eq!(live.error_summary, error.message());
+    assert!(live.error_summary.starts_with("this attempt stopped: "));
+    assert_eq!(
+        live.progress.get("attempt").map(String::as_str),
+        Some("stopped")
+    );
+    assert_eq!(
+        operation_state(&state, operation).await,
+        pb::OperationState::Failed as i32
+    );
+    assert_eq!(operation_events_in_log(typed.paths(), operation), chain);
+    assert_eq!(durable_bytes(typed.paths()), before);
+}
+
+/// A scan's motion error retains its retry class, code, details and metadata across a failed read.
+#[tokio::test]
+async fn fx2_head_read_refusal_preserves_scan_media_error() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL), ([0xd5; 16], "FX2002L9")]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (_drive_rx, mut changer_rx) = load_drive(&mut state);
+    state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+        crate::live_status::LibrarySnapshot {
+            report: remanence_library::DiscoveryReport {
+                unattached_drives: vec![],
+                complete: true,
+                incomplete_evidence: vec![],
+                libraries: vec![test_library(
+                    vec![drive_bay(0x0101, false, None)],
+                    vec![empty_slot(0x0400), slot(0x0401, LABEL)],
+                )],
+                warnings: vec![],
+            },
+            captured_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+    ))));
+    let request = admit_first_request(&state, admission(0xF202));
+    let operation = request.candidate_operation_id;
+    let worker = tokio::spawn({
+        let state = state.clone();
+        async move { service_closeout_obligation(&state, TAPE, 1).await }
+    });
+    let crate::write_owner::ChangerCommand::Move { reply, .. } =
+        tokio::time::timeout(Duration::from_secs(3), changer_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("scan moves target");
+    };
+    fx2_refuse_replay(&typed, &state);
+    let before = durable_bytes(typed.paths());
+    let mut failure = Status::with_details(
+        tonic::Code::Unavailable,
+        "fx2 changer motion failed",
+        vec![7, 2].into(),
+    );
+    failure
+        .metadata_mut()
+        .insert("fx2-marker", "preserved".parse().unwrap());
+    reply.send(Err(failure)).unwrap();
+    let error = worker.await.unwrap().unwrap_err();
+    let live = state.operations.latest(&operation).unwrap();
+    assert_eq!(
+        live.state,
+        pb::OperationState::Failed as i32,
+        "scan head-read refusal must end live entry"
+    );
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.metadata().get("remanence-retry").unwrap(), "media");
+    assert_eq!(error.metadata().get("fx2-marker").unwrap(), "preserved");
+    assert_eq!(error.details(), &[7, 2]);
+    assert_eq!(error.message(), "this attempt stopped: fx2 changer motion failed. The finalization stays accepted; the daemon retries when a drive is ready. Rerun with the same idempotency key to follow it.");
+    assert_eq!(live.error_summary, error.message());
+    assert_eq!(
+        live.progress.get("attempt").map(String::as_str),
+        Some("stopped")
+    );
+    assert_eq!(
+        operation_state(&state, operation).await,
+        pb::OperationState::Failed as i32
+    );
+    assert_eq!(durable_bytes(typed.paths()), before);
+}
+
+/// A successful physical/host attempt with an unreadable head publishes the prescribed unread result.
+#[tokio::test]
+async fn fx2_head_read_refusal_after_success_ends_live() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL), ([0xd5; 16], "FX2002L9")]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (mut drive_rx, _changer_rx) = load_drive(&mut state);
+    let request = admit_first_request(&state, admission(0xF203));
+    let operation = request.candidate_operation_id;
+    let pool = state.drive_pool().unwrap().clone();
+    let reserved = pool.reserve_tape(TAPE).unwrap();
+    let worker = tokio::spawn(run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool,
+        reserved.into(),
+        request,
+        Duration::ZERO,
+    ));
+    let (mut request, reply) = take_finalize_command(&mut drive_rx, operation).await;
+    assert_eq!(advance_tail(&state, operation, 5), 5);
+    let completed = seal_tail(&state, &mut request);
+    fx2_refuse_replay(&typed, &state);
+    let before = durable_bytes(typed.paths());
+    reply.send(Ok(completed)).unwrap();
+    let error = worker.await.unwrap().unwrap_err();
+    let live = state.operations.latest(&operation).unwrap();
+    assert_eq!(
+        live.state,
+        pb::OperationState::Failed as i32,
+        "successful attempt with unread head must end live entry"
+    );
+    assert_eq!(live.error_summary, format!("the attempt ended, but the finalization's state could not be read: {}. Rerun with the same idempotency key to follow it.", error.message()));
+    assert_eq!(
+        live.progress.get("attempt").map(String::as_str),
+        Some("unread")
+    );
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        operation_state(&state, operation).await,
+        pb::OperationState::Succeeded as i32,
+        "polling preserves SQL's durable Finished; TG1(c) ends the live entry"
+    );
+    assert_eq!(durable_bytes(typed.paths()), before);
+}
+
+/// SQLite rejects only the projection following durable Finished, as in FX1's post-seal fault.
+#[tokio::test]
+async fn fx2_finished_after_projection_error_publishes_success() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (_drive_rx, _changer_rx) = load_drive(&mut state);
+    let request = admit_first_request(&state, admission(0xF204));
+    let operation = request.candidate_operation_id;
+    assert_eq!(advance_tail(&state, operation, 5), 5);
+    let fault = rusqlite::Connection::open(&typed.paths().sqlite_path).unwrap();
+    fault.execute_batch("CREATE TRIGGER fx2_refuse_finished BEFORE INSERT ON operations WHEN NEW.state = 'finished' BEGIN SELECT RAISE(ABORT, 'fx2 post-Finished projection refusal'); END;").unwrap();
+    let pool = state.drive_pool().unwrap().clone();
+    let reserved = pool.reserve_tape(TAPE).unwrap();
+    let result = run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool,
+        reserved.into(),
+        request,
+        Duration::ZERO,
+    )
+    .await;
+    let live = state.operations.latest(&operation).unwrap();
+    assert_eq!(
+        live.state,
+        pb::OperationState::Succeeded as i32,
+        "durable Finished must publish live SUCCEEDED: {result:?}"
+    );
+    result.unwrap();
+    assert_eq!(
+        state.operations.terminal_publications_for_test(&operation),
+        1,
+        "no FAILED publication in the ring"
+    );
+    let chain = operation_events_in_log(typed.paths(), operation);
+    assert!(
+        matches!(
+            chain.as_slice(),
+            [
+                lib::OperationEvent::Accepted(_),
+                lib::OperationEvent::Started(_),
+                lib::OperationEvent::Finished(_)
+            ]
+        ),
+        "{chain:?}"
+    );
+    assert_eq!(native_finalization(typed.paths()).sealed, 1);
+    assert_eq!(
+        state
+            .index()
+            .unwrap()
+            .get_operation(&operation.to_string())
+            .unwrap()
+            .unwrap()
+            .state,
+        "running",
+        "SQL fault follows durable Finished"
+    );
+    fault
+        .execute_batch("DROP TRIGGER fx2_refuse_finished;")
+        .unwrap();
+}
+
+/// A cancel after durable acceptance but before the first attempt must not poison Started.
+#[tokio::test]
+async fn fx2_cancel_before_first_started_same_key_completes() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (mut drive_rx, _changer_rx) = load_drive(&mut state);
+    let first = admission(0xF20301);
+    let mut index = state.catalog.write_handle();
+    let (tape, mut request) = prepare_manual_finalize_request(&index, first.clone(), |pool_id| {
+        state.pool_config(pool_id)
+    })
+    .unwrap();
+    assert!(crate::write_owner::preflight_manual_finalize_cancellable(
+        &mut index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            authority: crate::write_owner::TerminalAuthority::from_api(&state).unwrap(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path()
+        },
+        tape.voltag.as_deref(),
+        &mut request,
+        None,
+        || false
+    )
+    .unwrap()
+    .is_none());
+    drop(index);
+    let operation = request.candidate_operation_id;
+    u7_assert_cancel_rejected(&typed, operation, &u7_cancel(&state, operation).await);
+    assert!(matches!(
+        operation_events_in_log(typed.paths(), operation).as_slice(),
+        [
+            lib::OperationEvent::Accepted(_),
+            lib::OperationEvent::CancellationRejected(_)
+        ]
+    ));
+    manual_finalize_tape(&state, first)
+        .await
+        .expect("same-key FinalizeTape after acceptance cancel must be accepted");
+    let (request, reply) = take_finalize_command(&mut drive_rx, operation).await;
+    finish_finalize_command(&state, operation, request, reply);
+    wait_for_state(&state, operation, pb::OperationState::Succeeded).await;
+    let chain = operation_events_in_log(typed.paths(), operation);
+    assert!(
+        matches!(
+            chain.as_slice(),
+            [
+                lib::OperationEvent::Accepted(_),
+                lib::OperationEvent::CancellationRejected(_),
+                lib::OperationEvent::Finished(_)
+            ]
+        ),
+        "no Started over CancellationRejected: {chain:?}"
+    );
+}
+
+/// Degradation preserves other kinds' established cancel routes, while finalizations stay guarded.
+#[tokio::test]
+async fn fx2_degraded_cancel_keeps_other_kinds_answers() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL), ([0xd5; 16], "FX2002L9")]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (_drive_rx, _changer_rx) = load_drive(&mut state);
+    let request = admit_first_request(&state, admission(0xF20401));
+    let operation = request.candidate_operation_id;
+    let readiness = u7_readiness_fence(&state);
+    // Same registered wait + typed readiness record as the named cancel-durability precedent.
+    let readiness_handle = state.operations.register(readiness, "media_readiness_wait");
+    readiness_handle.publish_state(pb::OperationState::Running, &[("state", "becoming_ready")]);
+    let verification = Uuid::from_bytes(
+        state
+            .catalog
+            .library_runtime()
+            .unwrap()
+            .start_owned_operation(
+                lib::OperationKind::TapeVerification,
+                lib::AuditActor::System,
+            )
+            .unwrap(),
+    );
+    let verification_handle = state.operations.register(verification, "tape_verification");
+    verification_handle.publish_state(pb::OperationState::Running, &[]);
+    let pool = state.drive_pool().unwrap().clone();
+    let reserved = pool.reserve_tape(TAPE).unwrap();
+    let worker = tokio::spawn(run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool,
+        reserved.into(),
+        request,
+        Duration::from_secs(30),
+    ));
+    fx2_wait_readiness(&state, operation).await;
+    fx2_refuse_replay(&typed, &state);
+    let before = durable_bytes(typed.paths());
+    let error = fx2_cancel_result(&state, operation).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(!state.operations.is_cancelled(&operation));
+    assert_eq!(durable_bytes(typed.paths()), before);
+    let response = fx2_cancel_result(&state, readiness)
+        .await
+        .expect("degraded media_readiness_wait cancel must keep its answer");
+    assert_eq!(
+        response.detail, "cancellation requested",
+        "media_readiness_wait answer"
+    );
+    assert_eq!(response.resulting_state, pb::OperationState::Running as i32);
+    assert!(readiness_handle.is_cancelled());
+    let row = state
+        .index()
+        .unwrap()
+        .media_readiness_operation(readiness)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.phase, "cancelled");
+    assert_eq!(row.cancel_source.as_deref(), Some("operator"));
+    assert_eq!(
+        library_records_in_log(typed.paths())
+            .iter()
+            .filter_map(|record| record.readiness_observation())
+            .filter(|record| record.operation == *readiness.as_bytes()
+                && record.phase == lib::ReadinessPhase::Cancelled)
+            .count(),
+        1,
+        "cancel is durable on the readiness chain"
+    );
+    let before = durable_bytes(typed.paths());
+    let error = fx2_cancel_result(&state, verification).await.unwrap_err();
+    assert!(
+        verification_handle.is_cancelled(),
+        "verification flag is set before its own record refuses"
+    );
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("operation transition requires resolved source"),
+        "{error}"
+    );
+    assert_eq!(durable_bytes(typed.paths()), before);
+    assert_eq!(
+        fx2_cancel_result(&state, Uuid::from_u128(0xFA404))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let stopped = tokio::time::timeout(Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(stopped.message().starts_with("this attempt stopped:"));
+    assert_eq!(
+        state.operations.latest(&operation).unwrap().state,
+        pb::OperationState::Failed as i32
+    );
+    assert!(!state.operations.is_live(&operation));
+    assert_eq!(
+        state.operations.kind_of(&operation).as_deref(),
+        Some("finalize_tape")
+    );
+    assert_eq!(
+        fx2_cancel_result(&state, operation)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(!state.operations.is_cancelled(&operation));
+    assert_eq!(durable_bytes(typed.paths()), before);
+}
+
+/// Invoke the authenticated cancel RPC while retaining its error for degraded-source checks.
+async fn fx2_cancel_result(
+    state: &ApiState,
+    operation: Uuid,
+) -> Result<pb::CancelOperationResponse, Status> {
+    let mut request = tonic::Request::new(pb::CancelOperationRequest {
+        operation_id: operation.as_bytes().to_vec(),
+        idempotency_key: None,
+        force: false,
+    });
+    request
+        .metadata_mut()
+        .insert("x-remanence-actor", "fx2-operator".parse().unwrap());
+    <crate::DaemonService as pb::daemon_server::Daemon>::cancel_operation(
+        &state.daemon_service(),
+        request,
+    )
+    .await
+    .map(tonic::Response::into_inner)
+}
+
+/// A closed source head changes retry policy and the live summary, preserving the attempt error.
+#[tokio::test]
+async fn fx2_closed_failed_head_preserves_attempt_error() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (mut drive_rx, _changer_rx) = load_drive(&mut state);
+    let request = admit_first_request(&state, admission(0xF205));
+    let operation = request.candidate_operation_id;
+    let pool = state.drive_pool().unwrap().clone();
+    let reserved = pool.reserve_tape(TAPE).unwrap();
+    let worker = tokio::spawn(run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool,
+        reserved.into(),
+        request,
+        Duration::ZERO,
+    ));
+    let (_, reply) = take_finalize_command(&mut drive_rx, operation).await;
+    state
+        .catalog
+        .library_runtime()
+        .unwrap()
+        .record_operation_event(
+            *operation.as_bytes(),
+            lib::OperationKind::FinalizeTape,
+            lib::OperationEvent::Failed(lib::Failed {
+                retry: None,
+                refusal_code: None,
+                summary: "fx2 durable closure".into(),
+            }),
+            lib::AuditActor::System,
+        )
+        .unwrap();
+    let before = durable_bytes(typed.paths());
+    let mut failure = Status::with_details(
+        tonic::Code::Unavailable,
+        "fx2 actor attempt failed",
+        vec![4, 2].into(),
+    );
+    failure
+        .metadata_mut()
+        .insert("fx2-marker", "preserved".parse().unwrap());
+    reply.send(Err(failure)).unwrap();
+    let error = worker.await.unwrap().unwrap_err();
+    assert_eq!(
+        error.message(),
+        "fx2 actor attempt failed",
+        "closed head must preserve the attempt error message"
+    );
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.details(), &[4, 2]);
+    assert_eq!(error.metadata().get("fx2-marker").unwrap(), "preserved");
+    assert_eq!(error.metadata().get("remanence-retry").unwrap(), "operator");
+    let live = state.operations.latest(&operation).unwrap();
+    assert_eq!(live.state, pb::OperationState::Failed as i32);
+    assert!(
+        live.error_summary.contains("already closed") && live.error_summary.contains("Failed"),
+        "{}",
+        live.error_summary
+    );
+    assert_eq!(durable_bytes(typed.paths()), before);
 }

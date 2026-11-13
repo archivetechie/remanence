@@ -1295,7 +1295,8 @@ message ProtectedContentFinding {
 // FINALIZING can coexist with a failed attempt. Inspect GetOperation for the
 // attempt outcome and detail for its error summary; the same key resumes intent.
 // The daemon retries accepted finalization when a drive is ready. RECOVERY_REQUIRED
-// carries the completion-unknown summary and needs operator recovery instead.
+// carries a completion-unknown detail (the daemon's own summary while it runs; a
+// fixed sentence after a restart) and needs operator recovery.
 message TapeFinalization {
   bytes tape_uuid = 1;
   // Operator finalization operation. Absent for BUSY, and for a finalization

@@ -330,7 +330,8 @@ repeated readiness notifications do not restart the 5 s busy retry window.
 Detached verification and manual finalize workers wait up to 15 minutes for
 readiness. They keep waiting across failed readiness waits while the durable
 record stays resumable, but stop on daemon shutdown, dispatch failure,
-release-only states, or their deadline. Cancelling the underlying readiness wait
+release-only states, or their deadline. Detached verification workers also stop on
+operator cancellation of their own operation. Cancelling the underlying readiness wait
 can also stop an attempt. Cancellation of an accepted manual finalization itself
 is refused and recorded durably, without setting its cancel flag. A stopped
 finalize attempt reports live FAILED with a summary while the finalization stays
@@ -649,6 +650,8 @@ Diagnostic text changes do not reset the budget; ordinary contention does not
 consume it. For manual finalization, untagged motion failures after reserving a
 bay also count toward this budget when the existing close-out policy classifies
 them as transient. This includes eviction, changer moves and drive-actor failures.
+A tail write failure is the exception: it leaves completion unknown and parks the
+tape at once.
 Write protection and fences requiring operator action still park immediately;
 pre-reservation refusals keep their existing retry policy. The wake conditions
 above reset the budget. Other unrecognized failures remain transient.

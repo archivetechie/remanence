@@ -198,10 +198,22 @@ impl pb::daemon_server::Daemon for DaemonService {
         let operation_uuid = decode_uuid_bytes(request.operation_id.as_slice(), "operation_id")?;
         let operation_id = Uuid::from_bytes(operation_uuid);
         if let Some(runtime) = self.state.catalog.library_runtime() {
-            if let Some(head) = runtime
-                .reject_accepted_manual_cancel(operation_uuid, actor.clone())
-                .map_err(|error| Status::failed_precondition(error.to_string()))?
-            {
+            let head = match runtime.reject_accepted_manual_cancel(operation_uuid, actor.clone()) {
+                Ok(head) => head,
+                Err(error) => {
+                    if self
+                        .state
+                        .operations
+                        .kind_of(&operation_id)
+                        .is_some_and(|kind| kind != "finalize_tape")
+                    {
+                        None
+                    } else {
+                        return Err(Status::failed_precondition(error.to_string()));
+                    }
+                }
+            };
+            if let Some(head) = head {
                 use remanence_state::library_log::OperationEvent;
                 let resulting_state = match head {
                     OperationEvent::Finished(_) | OperationEvent::CompletedAfterCancel(_) => {
@@ -735,6 +747,13 @@ impl pb::catalog_server::Catalog for CatalogService {
                 {
                     if let Some(summary) = operation.error_summary {
                         response.detail = summary;
+                    } else if response.outcome
+                        == pb::TapeFinalizationOutcome::RecoveryRequired as i32
+                        && operation.state == "completion_unknown"
+                    {
+                        response.detail =
+                            "finalization completion is unknown; the tape needs operator recovery"
+                                .into();
                     }
                 }
             }

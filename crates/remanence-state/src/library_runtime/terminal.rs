@@ -35,6 +35,36 @@ impl LibraryRuntime {
             .map(|(value, _)| value.event))
     }
 
+    /// Decide and append the first manual attempt under one dispatch lease.
+    /// Later open and terminal heads are returned unchanged for the caller's admission check.
+    pub fn start_accepted_finalize_attempt(
+        &self,
+        operation: lib::Id,
+    ) -> Result<Option<lib::OperationEvent>, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((head, reference)) = self.operation_head_locked(operation)? else {
+            return Ok(None);
+        };
+        if !matches!(head.event, lib::OperationEvent::Accepted(_)) {
+            return Ok(Some(head.event));
+        }
+        let event = lib::OperationEvent::Started(lib::Unit);
+        self.append_locked(|a, v| {
+            a.operation_recorded(
+                lib::OperationRecorded {
+                    operation,
+                    kind: lib::OperationKind::FinalizeTape,
+                    previous: Some(reference),
+                    event: event.clone(),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer5,
+                v,
+            )
+        })?;
+        Ok(Some(event))
+    }
+
     /// Retain the source reference when the caller will append under this dispatch lease.
     fn operation_head_locked(
         &self,
@@ -582,6 +612,74 @@ mod tests {
             assignment_generation: 1,
         };
         (owner, value)
+    }
+
+    /// One dispatch lease decides Started; a later open or closed head is returned without append.
+    #[test]
+    fn fx2_started_only_on_accepted_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (_paths, _lease, runtime, _owner, _value) = fixture(root.path());
+        let accepted = |key| lib::Accepted {
+            actor_fingerprint: "fx2".into(),
+            idempotency_key: Some([key; 16]),
+            request_fingerprint: [key; 32],
+            subject: None,
+        };
+        let operation = runtime
+            .begin_manual_finalization(accepted(1), lib::AuditActor::System)
+            .unwrap();
+        let before = runtime.test_source_records().len();
+        assert_eq!(
+            runtime.start_accepted_finalize_attempt(operation).unwrap(),
+            Some(lib::OperationEvent::Started(lib::Unit))
+        );
+        assert_eq!(runtime.test_source_records().len(), before + 1);
+        assert_eq!(
+            runtime.operation_head(operation).unwrap(),
+            Some(lib::OperationEvent::Started(lib::Unit))
+        );
+        let rejected = runtime
+            .begin_manual_finalization(accepted(2), lib::AuditActor::System)
+            .unwrap();
+        runtime
+            .record_operation_event(
+                rejected,
+                lib::OperationKind::FinalizeTape,
+                lib::OperationEvent::CancellationRejected(lib::Unit),
+                lib::AuditActor::System,
+            )
+            .unwrap();
+        let before = runtime.test_source_records().len();
+        assert_eq!(
+            runtime.start_accepted_finalize_attempt(rejected).unwrap(),
+            Some(lib::OperationEvent::CancellationRejected(lib::Unit)),
+            "CancellationRejected head must not receive Started"
+        );
+        assert_eq!(
+            runtime.test_source_records().len(),
+            before,
+            "nothing appended over CancellationRejected"
+        );
+        runtime
+            .record_operation_event(
+                rejected,
+                lib::OperationKind::FinalizeTape,
+                lib::OperationEvent::Finished(lib::Response {
+                    response_fingerprint: None,
+                }),
+                lib::AuditActor::System,
+            )
+            .unwrap();
+        let before = runtime.test_source_records().len();
+        assert!(matches!(
+            runtime.start_accepted_finalize_attempt(rejected).unwrap(),
+            Some(lib::OperationEvent::Finished(_))
+        ));
+        assert_eq!(
+            runtime.test_source_records().len(),
+            before,
+            "nothing appended over terminal head"
+        );
     }
 
     #[test]

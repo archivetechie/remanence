@@ -1333,6 +1333,16 @@ fn start_accepted_finalize_attempt(
     request: &crate::write_owner::ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
     use remanence_state::library_log as lib;
+    if let Some(runtime) = state.catalog.library_runtime() {
+        let head = runtime
+            .start_accepted_finalize_attempt(*request.candidate_operation_id.as_bytes())
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition("manual finalization operation has no source head")
+            })?;
+        require_continuable_finalize_head(Some(head))?;
+        return Ok(());
+    }
     let head = continuable_finalize_head(state, request.candidate_operation_id)?;
     if matches!(head, Some(lib::OperationEvent::Accepted(_)) | None) {
         record_finalize_attempt(
@@ -1369,8 +1379,14 @@ fn continuable_finalize_head(
     state: &ApiState,
     id: Uuid,
 ) -> Result<Option<remanence_state::library_log::OperationEvent>, Status> {
+    require_continuable_finalize_head(finalize_operation_head(state, id)?)
+}
+
+/// Apply the same terminal refusal to a head read or an atomic Started decision.
+fn require_continuable_finalize_head(
+    head: Option<remanence_state::library_log::OperationEvent>,
+) -> Result<Option<remanence_state::library_log::OperationEvent>, Status> {
     use remanence_state::library_log::OperationEvent;
-    let head = finalize_operation_head(state, id)?;
     if matches!(
         head,
         None | Some(
@@ -1422,7 +1438,46 @@ async fn run_started_manual_finalize_worker(
     }
     .await;
     finalizing.clear_finalizing();
-    let head = finalize_operation_head(&state, id)?;
+    let head = match finalize_operation_head(&state, id) {
+        Ok(head) => head,
+        Err(error) => {
+            tracing::warn!(operation_id = %id, %error, "manual finalization head read failed after attempt");
+            if result.is_ok() {
+                let summary = format!(
+                    "the attempt ended, but the finalization's state could not be read: {}. Rerun with the same idempotency key to follow it.",
+                    error.message()
+                );
+                handle.publish_failed(&summary, &[("attempt", "unread")]);
+                return Err(error);
+            }
+            // Preserve the stopped attempt's code, details and retry metadata below.
+            None
+        }
+    };
+    match &head {
+        Some(
+            remanence_state::library_log::OperationEvent::Finished(_)
+            | remanence_state::library_log::OperationEvent::CompletedAfterCancel(_),
+        ) => {
+            if let Err(error) = result {
+                tracing::warn!(operation_id = %id, %error, "manual finalization attempt errored after durable completion");
+            }
+            handle.publish_state(pb::OperationState::Succeeded, &[]);
+            return Ok(());
+        }
+        Some(
+            remanence_state::library_log::OperationEvent::Failed(_)
+            | remanence_state::library_log::OperationEvent::CancelledBeforeDispatch(_),
+        ) => {
+            let summary = format!("manual finalization operation is already closed: {head:?}");
+            let error = result
+                .err()
+                .unwrap_or_else(|| Status::failed_precondition(summary.clone()));
+            handle.publish_failed(&summary, &[]);
+            return Err(crate::closeout_obligation::RetryCause::Operator.attach(error));
+        }
+        _ => {}
+    }
     if matches!(
         head,
         Some(remanence_state::library_log::OperationEvent::CompletionUnknown(_))
