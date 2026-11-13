@@ -2460,6 +2460,7 @@ fn tape_log_lease_contention_is_unavailable_and_other_lock_faults_are_not() {
 /// A historical tape identity never acquires today's endpoint; both explicit
 /// identity dimensions independently block mutations, while reads remain usable.
 #[test]
+#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1"]
 fn standalone_fences_match_only_recorded_tape_or_endpoint() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
@@ -2531,6 +2532,7 @@ fn standalone_fences_match_only_recorded_tape_or_endpoint() {
 
 /// Both raise and release preserve the endpoint across authoritative rebuilds.
 #[test]
+#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1"]
 fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
@@ -2706,12 +2708,18 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
     crate::tests::assert_fences_survive_empty_rebuild(&paths, config, library_uuid, &fences);
 }
 
-/// Standalone initialization fences a failed WRITE from its stored outcome; cleanup adds only its CDB.
+/// A failed standalone WRITE fails closed through the stand-in: motion is latched and counted
+/// once, with no fence recordable for an unprovisioned identity (ruling 29; D-L2-29-1).
+/// Cleanup adds only its CDB, and the spent invocation sends no more commands or refusals.
 #[test]
 fn b3b_standalone_init_failure_one_fence_by_cause() {
+    use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
     use remanence_library::outcome::census;
     let root = tempfile::tempdir().unwrap();
     let mut state = state_with_audit(root.path(), false);
+    let paths = state.paths().clone();
+    let runtime = state.library_runtime();
+    let library_uuid = runtime.manifest().library_uuid();
     let world = world();
     let injected = fault();
     let mut mount = backend(
@@ -2742,38 +2750,9 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
     );
     assert_eq!(census::normalizations(), finished.get().1);
     assert!(mount.unusable);
+    assert!(runtime.motion_fenced(), "{result:?}");
     let fences = mount.state.catalog().list_active_tape_io_fences().unwrap();
-    assert_eq!(fences.len(), 1);
-    assert_eq!(fences[0].reason, "transfer_error");
-    let records = remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir).unwrap();
-    let endings: Vec<_> = records
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.event,
-                AuditEvent::SessionOpened
-                    | AuditEvent::TapeIoFenceRaised
-                    | AuditEvent::SessionOrphaned
-                    | AuditEvent::SessionClosed
-            )
-        })
-        .map(|r| r.event.clone())
-        .collect();
-    assert_eq!(
-        endings,
-        vec![
-            AuditEvent::SessionOpened,
-            AuditEvent::TapeIoFenceRaised,
-            AuditEvent::SessionOrphaned
-        ]
-    );
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| r.event == AuditEvent::TapeIoFenceRaised)
-            .count(),
-        1
-    );
+    assert!(fences.is_empty(), "{fences:?}");
     let commands = world.lock().unwrap().command_log.len();
     let again: Result<(), _> = mount.initialize(
         false,
@@ -2782,6 +2761,20 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
     );
     assert!(again.is_err());
     assert_eq!(world.lock().unwrap().command_log.len(), commands);
+    drop((mount, runtime));
+    drop(state);
+
+    let log = read_log(&paths, library_uuid);
+    assert_eq!(
+        refusals(&log),
+        [RecordedRefusal::expect(
+            5,
+            "StandaloneFenceUnrecorded",
+            "tape",
+            Some(UUID),
+            remanence_state::AuditActor::local_user(),
+        )]
+    );
 }
 
 /// Code 5, through `OperatorMount::initialize`, the standalone write path. A failed WRITE whose
@@ -2984,10 +2977,15 @@ fn b3b_pipeline_position_consumer(consumer: &str) {
     mount.release(mounted);
 }
 
-/// Standalone initialization must replace a post-write local adapter result with the host fact.
+/// A post-write adapter failure fails closed through the stand-in: motion is latched and counted
+/// once, with no fence recordable for an unprovisioned identity (ruling 29; D-L2-29-1).
 fn fix2_init_adapter(scenario: &str) {
+    use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
     let root = tempfile::tempdir().unwrap();
     let mut state = state_with_audit(root.path(), false);
+    let paths = state.paths().clone();
+    let runtime = state.library_runtime();
+    let library_uuid = runtime.manifest().library_uuid();
     let world = world();
     let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
     let result: Result<(), _> = mount.initialize(
@@ -3006,35 +3004,43 @@ fn fix2_init_adapter(scenario: &str) {
         },
     );
     assert!(result.is_err());
+    assert!(mount.unusable, "{scenario}");
+    assert!(runtime.motion_fenced(), "{scenario}: {result:?}");
     let fences = mount.state.catalog().list_active_tape_io_fences().unwrap();
-    assert_eq!(fences.len(), 1, "{scenario}: {result:?}");
-    assert_eq!(fences[0].reason, "transfer_error");
-    let events = remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir).unwrap();
+    assert!(fences.is_empty(), "{scenario}: {fences:?}");
+    drop((mount, runtime));
+    drop(state);
+
+    let log = read_log(&paths, library_uuid);
     assert_eq!(
-        events
-            .iter()
-            .filter(|e| e.event == AuditEvent::TapeIoFenceRaised)
-            .count(),
-        1
+        refusals(&log),
+        [RecordedRefusal::expect(
+            5,
+            "StandaloneFenceUnrecorded",
+            "tape",
+            Some(UUID),
+            remanence_state::AuditActor::local_user(),
+        )],
+        "{scenario}"
     );
-    assert!(events
-        .iter()
-        .any(|e| e.event == AuditEvent::SessionOrphaned));
 }
 
-/// Initialization keeps its base fence after the production overlap completion check fails.
+/// An overlap completion failure latches motion and is counted once through the stand-in;
+/// no fence is recordable for the unprovisioned identity (ruling 29; D-L2-29-1).
 #[test]
 fn b3b_fix2_init_overlap_post_write() {
     fix2_init_adapter("overlap");
 }
 
-/// Initialization keeps its base fence after a parity block-size refusal following a WRITE.
+/// A post-write parity block-size refusal latches motion and is counted once through the stand-in;
+/// no fence is recordable for the unprovisioned identity (ruling 29; D-L2-29-1).
 #[test]
 fn b3b_fix2_init_parity_size_post_write() {
     fix2_init_adapter("parity-size");
 }
 
-/// Initialization keeps its base fence after a poisoned parity sink refuses further work.
+/// A post-write poisoned parity sink refusal latches motion and is counted once through the stand-in;
+/// no fence is recordable for the unprovisioned identity (ruling 29; D-L2-29-1).
 #[test]
 fn b3b_fix2_init_parity_poisoned_post_write() {
     fix2_init_adapter("parity-poisoned");
