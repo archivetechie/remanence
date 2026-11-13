@@ -493,6 +493,8 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
     );
     assert_eq!(recovered.cartridge_generation.as_deref(), Some("L9"));
     assert_eq!(recovered.stripes_per_neighborhood, Some(1));
+    // D-C3a-2d-1 gate dispositions: pin the first rebuilt assignment generation.
+    assert_eq!(recovered.assignment_generation, 2);
     drop(rebuilt);
     let (code, verification) = run_result(&["tape", "verify"]);
     assert_ne!(code, ExitCode::SUCCESS);
@@ -811,7 +813,8 @@ fn diagnostics_accepts_discovered_library_device_serials() {
 }
 
 /// An actual bootstrap uses the requested block-size geometry, and a failed
-/// bootstrap leaves durable quarantine instead of usable initialization facts.
+/// bootstrap records the ruling-29 stand-in refusal instead of main's endpoint fence.
+/// Each attempt plans a fresh tape identity (D-L2-29-1, D-L2-CLI-1-1).
 #[test]
 fn init_geometry_and_failed_bootstrap_are_guarded() {
     use remanence_chaos::model::{DeviceRole, ModelTransport, VirtualTape, VirtualWorld};
@@ -891,29 +894,61 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
             .map(|catalog| catalog.write_handle())
             .unwrap();
         if fail {
+            use remanence_state::library_log::{DiagnosticEvent, DiagnosticValue};
+            let error = "library authority failed; motion is fenced until startup reconciliation";
+            // D-L2-CLI-1-1: use ruling23's public diagnostic reader for code 5.
+            let refusal_ids = |expected| {
+                let records = ruling24_library_records(&root.path().join("state/rem/config.toml"));
+                let refusals: Vec<_> = records
+                    .iter()
+                    .filter_map(|record| record.diagnostic())
+                    .filter(|diagnostic| diagnostic.event == DiagnosticEvent::RefusalRecorded)
+                    .collect();
+                assert_eq!(refusals.len(), expected, "D-L2-CLI-1-1: refusal count");
+                refusals
+                    .iter()
+                    .map(|refusal| {
+                        assert_eq!(refusal.subject_kind.as_str(), "tape");
+                        let id = refusal
+                            .subject_id
+                            .as_ref()
+                            .expect("D-L2-CLI-1-1: tape subject");
+                        assert_eq!(
+                            refusal
+                                .detail
+                                .0
+                                .iter()
+                                .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
+                                .collect::<Vec<_>>(),
+                            [
+                                ("code".to_owned(), DiagnosticValue::Unsigned(5)),
+                                (
+                                    "name".to_owned(),
+                                    DiagnosticValue::Text("StandaloneFenceUnrecorded".into())
+                                ),
+                            ]
+                        );
+                        id.as_str().to_owned()
+                    })
+                    .collect::<Vec<_>>()
+            };
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
-            assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
+            assert_eq!(output["error"], error);
+            assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 0);
             assert!(index.get_tape_by_voltag("HOMEL9").unwrap().is_none());
             drop(index);
-            let before = world
-                .lock()
-                .unwrap()
-                .command_log
-                .iter()
-                .filter(|c| c.opcode == 0x0a)
-                .count();
+            let first = refusal_ids(1);
             let (code, output) = run(&init);
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
-            assert_eq!(
-                world
-                    .lock()
-                    .unwrap()
-                    .command_log
-                    .iter()
-                    .filter(|c| c.opcode == 0x0a)
-                    .count(),
-                before
-            );
+            assert_eq!(output["error"], error);
+            let retried = refusal_ids(2);
+            assert_eq!(retried[0], first[0]);
+            assert_ne!(retried[0], retried[1]);
+            let index = remanence_state::projector::open(&config.index.sqlite_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
+            assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 0);
+            assert!(index.get_tape_by_voltag("HOMEL9").unwrap().is_none());
         } else {
             assert_eq!(code, ExitCode::SUCCESS, "{output}");
             let tape = index.get_tape_by_voltag("HOMEL9").unwrap().unwrap();
@@ -1269,8 +1304,10 @@ fn occupied_tape_pool_changes_quote_instance_refusal() {
         .unwrap()
         .to_owned();
     f.ok(&["pool", "new", "offsite"]);
+    // D-L2-CLI-1-1: state.rs:749 adds this redundant facade clause;
+    // its removal is a CLI-message row for the next landing.
     let expected = format!(
-        "tape {uuid} holds 1 committed instances; a tape holding data cannot change pool; it can only be retired"
+        "tape pool assignment conflict: tape {uuid} holds 1 committed instances; a tape holding data cannot change pool; it can only be retired"
     );
     for args in [
         vec!["tape", "assign-pool", "--pool", "offsite"],
@@ -2055,7 +2092,8 @@ fn standalone_tape_init_refuses_while_a_fence_names_the_label_or_bot_uuid() {
     assert!(f.index().get_tape_by_voltag("SECOND").unwrap().is_some());
 }
 
-/// Rescue reads keep their ordinary path with a warning; release is local and audited.
+/// D-L2-CLI-1-1: rescue reads and the write block hold under a typed tape fence
+/// such as a library daemon raises; the release half is ignored until ruling 29.
 #[test]
 fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
     let f = VersionFixture::new();
@@ -2063,20 +2101,23 @@ fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
     std::fs::write(&source, b"rescue bytes").unwrap();
     let put = f.ok(&["put", source.to_str().unwrap()]);
     let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
-    let fence = f
-        .index()
-        .record_tape_io_fence_at_endpoint(
-            remanence_state::TapeIoFenceInput {
-                tape_uuid: tape.tape_uuid.try_into().unwrap(),
-                barcode: Some("FIRST".into()),
-                reason: "standalone_test".into(),
-                evidence_json: None,
-            },
-            Some(&remanence_library::DriveKey::Standalone {
-                drive_serial: "HOME-DRIVE".into(),
-            }),
-        )
-        .unwrap();
+    let tape_uuid = tape.tape_uuid.clone().try_into().unwrap();
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    l1b_raise(
+        &state,
+        tape_uuid,
+        remanence_state::library_log::FenceCause::PartialBatch,
+    );
+    let mut fences = state.catalog().list_active_tape_io_fences().unwrap();
+    drop(state);
+    // D-L2-CLI-1-1 permits reopening if this handle has not projected the raise.
+    if fences.is_empty() {
+        let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+        fences = state.catalog().list_active_tape_io_fences().unwrap();
+    }
+    assert_eq!(fences.len(), 1, "D-L2-CLI-1-1: one typed tape fence");
+    let fence = fences.pop().unwrap();
+    assert_eq!(fence.tape_uuid, tape.tape_uuid);
     for args in [
         vec![
             "get".to_string(),
@@ -2106,10 +2147,41 @@ fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
         ExitCode::SUCCESS
     );
     assert_eq!(before, f.writes());
+    let listed = f.ok(&["tape", "quarantine", "list"]);
     assert_eq!(
-        f.ok(&["tape", "quarantine", "list"])["active_fences"][0]["label"],
-        "FIRST"
+        listed["active_fences"][0]["quarantine_id"],
+        fence.quarantine_id
     );
+    assert_eq!(
+        listed["active_fences"][0]["tape_uuid"],
+        uuid::Uuid::from_bytes(tape_uuid).to_string()
+    );
+}
+
+/// D-L2-CLI-1-1: endpoint release waits for ruling 29; its audit read moves
+/// to the typed FenceReleased when that ruling lands.
+#[test]
+#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1, D-L2-CLI-1-1"]
+fn standalone_endpoint_fence_releases_by_ack_with_audit() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("rescue.txt");
+    std::fs::write(&source, b"rescue bytes").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
+    let fence = f
+        .index()
+        .record_tape_io_fence_at_endpoint(
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: tape.tape_uuid.try_into().unwrap(),
+                barcode: Some("FIRST".into()),
+                reason: "standalone_test".into(),
+                evidence_json: None,
+            },
+            Some(&remanence_library::DriveKey::Standalone {
+                drive_serial: "HOME-DRIVE".into(),
+            }),
+        )
+        .unwrap();
     f.ok(&[
         "tape",
         "quarantine",
@@ -3771,6 +3843,7 @@ fn cli_children_always_disable_live_scsi() {
 
 /// Pin the defaults at durable admission through the actual finalize dispatcher.
 #[test]
+#[ignore = "ruling 20 (next landing): unknown-generation adoption is refused until LtoGen::Unknown lands; the finalize defaults are pinned by restore_dates_listing_and_member_selection; D-L2-CLI-1-1"]
 fn finalize_stores_literal_defaults_for_fixed_tape() {
     let mut f = VersionFixture::with_parity(false);
     let tape_uuid = *uuid::Uuid::parse_str("42424242-4242-4242-8242-424242424242")

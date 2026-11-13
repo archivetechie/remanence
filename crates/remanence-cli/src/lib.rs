@@ -25182,6 +25182,8 @@ pool_id = "init-test"
     /// D-C3a-2c-1: item 37 removed preservation; pin its refusal, the exact
     /// erased identities and states in the receipt, and their absent catalog rows.
     /// The stdout's empty preserved-tapes clause is a next-landing row.
+    /// D-C3a-2c-1 gate dispositions: pin the execute-side preserve refusal
+    /// until the flag is deleted by the next landing's item-37 row.
     #[test]
     fn catalog_reset_reports_exact_preserved_tapes_and_states() {
         let temp = tempfile::Builder::new()
@@ -25234,6 +25236,17 @@ tape_catalog_dir = "{0}/cache/tapes"
                     .expect("provision tape");
             }
         }
+        {
+            let catalog =
+                remanence_state::CatalogReader::open(temp.path().join("index/rem-state.sqlite"))
+                    .expect("D-C3a-2c-1 gate dispositions: open seeded catalog");
+            for voltag in ["RMN009L9", "RMN010L9"] {
+                assert!(catalog
+                    .get_tape_by_voltag(voltag)
+                    .expect("D-C3a-2c-1 gate dispositions: get seeded tape")
+                    .is_some());
+            }
+        }
         let cli = DebugCli::parse_from([
             "rem-debug",
             "catalog",
@@ -25242,6 +25255,10 @@ tape_catalog_dir = "{0}/cache/tapes"
             config_path.to_str().expect("utf8 config path"),
             "--preserve-tape-voltag",
             "RMN009L9",
+            "--allow-erase-tape-voltag",
+            "RMN009L9",
+            "--allow-erase-tape-voltag",
+            "RMN010L9",
         ]);
         let mut out = Vec::<u8>::new();
         let mut err = Vec::<u8>::new();
@@ -25266,6 +25283,39 @@ tape_catalog_dir = "{0}/cache/tapes"
             &["RMN009L9".to_string(), "RMN010L9".to_string()],
         )
         .expect("preflight reset");
+        let cli = DebugCli::parse_from([
+            "rem-debug",
+            "catalog",
+            "reset",
+            "--config",
+            config_path.to_str().expect("utf8 config path"),
+            "--i-understand-this-erases-the-catalog",
+            "--allow-erase-tape-voltag",
+            "RMN009L9",
+            "--allow-erase-tape-voltag",
+            "RMN010L9",
+            "--preserve-tape-voltag",
+            "RMN011L9",
+            "--expected-preflight-token",
+            admitted.preflight_token.as_str(),
+        ]);
+        let mut out = Vec::<u8>::new();
+        let mut err = Vec::<u8>::new();
+        let code = run_debug(
+            cli,
+            move || -> Result<DiscoveryReport, DiscoveryError> {
+                panic!("D-C3a-2c-1 gate dispositions: reset must not discover")
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        let stderr = String::from_utf8(err).expect("stderr utf8");
+        assert!(
+            stderr.contains("declared reset cannot restore SQL tape identities"),
+            "{stderr}"
+        );
+
         let cli = DebugCli::parse_from([
             "rem-debug",
             "catalog",
