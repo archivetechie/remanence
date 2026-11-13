@@ -2273,6 +2273,17 @@ impl DriveHandle {
         self.motion_context = previous;
         result
     }
+    /// A LOAD sent inside this scope counts against `operation`'s budget and
+    /// keeps this handle's confirmation owner.
+    pub fn with_parent_operation<T>(
+        &mut self,
+        operation: [u8; 16],
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let mut context = self.motion_context.clone();
+        context.parent_operation = Some(operation);
+        self.with_motion_context(context, run)
+    }
     /// Use the same owner identity throughout this readiness wait. Other known
     /// tape and generation facts remain attached to this physical handle.
     pub fn with_readiness_operation<T>(

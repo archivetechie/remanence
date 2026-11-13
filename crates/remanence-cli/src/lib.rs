@@ -9873,6 +9873,15 @@ fn run_tape_wait_ready_hardware(
             });
         }
     };
+    if let Some(authority) = TapeInitStateOps::motion_authority(catalog) {
+        handle.set_motion_authority(Arc::new(authority));
+        handle
+            .reconcile_startup_motion()
+            .map_err(|error| TapeWaitReadyFailure {
+                message: format!("motion reconciliation: {error}"),
+                exit_code: 1,
+            })?;
+    }
     record_media_readiness_signal_if_requested(catalog, operation_id, "after_open_library", || {
         signal_guard.requested_signal_name()
     })
@@ -9944,7 +9953,7 @@ fn run_tape_wait_ready_hardware(
     };
     let initial = drive.probe_media_readiness(family);
     let poll = drive
-        .with_readiness_operation(*operation_id.as_bytes(), |drive| {
+        .with_parent_operation(*operation_id.as_bytes(), |drive| {
             drive.wait_for_media_readiness_with_initializing_load(
                 family,
                 Some(initial),
@@ -10491,7 +10500,9 @@ fn poll_media_readiness_after_initial_probe<S: TapeInitStateOps>(
                 ))?;
             }
             media_readiness_sleep(CONDITIONAL_LOAD_SETTLE);
-            if let Err(error) = drive.load_immediate() {
+            if let Err(error) = drive
+                .with_parent_operation(*operation_id.as_bytes(), |drive| drive.load_immediate())
+            {
                 if let Some(signal_name) = record_media_readiness_signal_or_mechanical_failure(
                     state,
                     operation_id,
@@ -21520,6 +21531,7 @@ mod tests {
                 (None, "planned".into(), None),
                 (None, "unit_attention".into(), Some(0)),
                 (None, "pre_ready_loading".into(), Some(0)),
+                (None, "pre_ready_loading".into(), Some(27)),
                 (None, "ready".into(), Some(0)),
             ]
         );
@@ -21547,6 +21559,7 @@ mod tests {
                 (None, "planned".into(), None),
                 (None, "becoming_ready".into(), Some(0)),
                 (None, "media_initializing".into(), Some(0)),
+                (None, "pre_ready_loading".into(), Some(27)),
                 (None, "ready".into(), Some(0)),
             ]
         );
@@ -21583,6 +21596,7 @@ mod tests {
                 (None, "planned".into(), None),
                 (None, "becoming_ready".into(), Some(0)),
                 (None, "media_initializing".into(), Some(0)),
+                (None, "pre_ready_loading".into(), Some(27)),
                 (None, "timeout_unknown".into(), Some(0)),
             ]
         );
@@ -21615,6 +21629,7 @@ mod tests {
             vec![
                 (None, "planned".into(), None),
                 (None, "pre_ready_loading".into(), Some(0)),
+                (None, "pre_ready_loading".into(), Some(27)),
                 (None, "ready".into(), Some(0)),
             ]
         );
@@ -21640,6 +21655,7 @@ mod tests {
             vec![
                 (None, "planned".into(), None),
                 (None, "pre_ready_loading".into(), Some(0)),
+                (None, "pre_ready_loading".into(), Some(27)),
                 (None, "terminal_error".into(), Some(0)),
             ]
         );
@@ -30138,6 +30154,364 @@ blob Project/Render Files/
         assert!(err.contains("no library with serial \"MISSING\""));
         assert!(err.contains("warnings (1):"));
         assert!(err.contains("FREE"));
+    }
+    /// Route fixtures retain the real model changer so LOAD confirmation reads inventory.
+    #[cfg(target_os = "linux")]
+    struct WbrLoadTransport {
+        inner: remanence_chaos::model::ModelTransport,
+        world: Arc<std::sync::Mutex<remanence_chaos::model::VirtualWorld>>,
+        keep_initializing: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl remanence_library::SgTransport for WbrLoadTransport {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            self.inner.execute_in(cdb, buf)
+        }
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            buf: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            self.inner.execute_out(cdb, buf)
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+            let result = self.inner.execute_none(cdb);
+            if self.keep_initializing
+                && result.is_ok()
+                && cdb.first() == Some(&0x1b)
+                && cdb.get(4).is_some_and(|v| v & 1 != 0)
+            {
+                self.world
+                    .lock()
+                    .unwrap()
+                    .leave_cartridge_unthreaded(0x0100);
+            }
+            result
+        }
+    }
+
+    /// Close all runtime owners before replaying the durable motion records.
+    #[cfg(target_os = "linux")]
+    struct WbrClosedFixture {
+        temp: tempfile::TempDir,
+        _world: Arc<std::sync::Mutex<remanence_chaos::model::VirtualWorld>>,
+        operation_id: Uuid,
+        intents: Vec<remanence_state::library_log::MotionIntent>,
+        outcomes: Vec<remanence_state::library_log::MotionOutcome>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wbr_close_fixture(init: VirtualTapeInit) -> WbrClosedFixture {
+        use remanence_state::library_log as lib;
+        let VirtualTapeInit {
+            temp,
+            state,
+            world,
+            _handle,
+            drive,
+            operation_id,
+        } = init;
+        let paths = state.paths().clone();
+        let library_uuid = state.library_runtime().manifest().library_uuid();
+        drop(drive);
+        drop(_handle);
+        drop(state);
+        let view = lib::native_view::NativeTapeView::probe(
+            &paths.journal_dir.join("tapes"),
+            &paths.sqlite_path,
+        )
+        .unwrap();
+        let mut intents = Vec::new();
+        let mut outcomes = Vec::new();
+        lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+            if let Some(value) = applied.record().motion_intent() {
+                intents.push(value.clone());
+            }
+            if let Some(value) = applied.record().motion_outcome() {
+                outcomes.push(value.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+        WbrClosedFixture {
+            temp,
+            _world: world,
+            operation_id,
+            intents,
+            outcomes,
+        }
+    }
+
+    /// Exercise offline wait-ready with the same runtime and drive observation as tape init.
+    #[cfg(target_os = "linux")]
+    fn wbr_wait_route(
+        keep_initializing: bool,
+        crash_left: bool,
+    ) -> (
+        VirtualTapeInit,
+        Result<TapeWaitReadyResult, TapeWaitReadyFailure>,
+    ) {
+        use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
+        let init = virtual_tape_init(0);
+        let library = {
+            let mut world = init.world.lock().unwrap();
+            world.leave_cartridge_unthreaded(0x0100);
+            world.library_snapshot()
+        };
+        if crash_left {
+            let command = MotionCommand::Move {
+                library_serial: "LIB-A".into(),
+                source: 0x0400,
+                destination: 0x0100,
+            };
+            init.state
+                .library_runtime()
+                .intent(&command, &MotionContext::default())
+                .unwrap();
+            assert!(init
+                .state
+                .library_runtime()
+                .requires_reconciliation(&command));
+        }
+        let factory_world = Arc::clone(&init.world);
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world
+                    .lock()
+                    .unwrap()
+                    .role_for_path(path)
+                    .expect("model path");
+                Ok(Box::new(WbrLoadTransport {
+                    inner: remanence_chaos::model::ModelTransport::new(
+                        Arc::clone(&factory_world),
+                        role,
+                    ),
+                    world: Arc::clone(&factory_world),
+                    keep_initializing,
+                }))
+            }));
+        });
+        let args = TapeWaitReadyArgs {
+            endpoint: None,
+            resume: Some(init.operation_id),
+            barcode: None,
+            drive_element: None,
+            already_loaded: false,
+            wait: true,
+            timeout: StdDuration::ZERO,
+            poll: StdDuration::ZERO,
+            config: init.temp.path().join("config.toml"),
+            library: Some("LIB-A".into()),
+            json: false,
+        };
+        let result = run_tape_wait_ready_hardware(
+            &library,
+            &StaticAllowlist::new(["LIB-A"]),
+            &args,
+            &tape_init_config_with_pool(4096),
+            &mut init.state.write_handle(),
+        );
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow().is_none()));
+        (init, result)
+    }
+
+    /// Offline wait-ready counts its one LOAD and confirms it from inventory before Ready.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbr_wait_ready_load_has_parent_and_inline_confirmation() {
+        use remanence_library::motion::{MotionAuthority, MotionCommand};
+        let (init, result) = wbr_wait_route(false, false);
+        assert!(result
+            .unwrap_or_else(|e| panic!("{}", e.message))
+            .readiness
+            .is_ready());
+        assert_eq!(
+            init.tur_and_load_opcodes()
+                .iter()
+                .filter(|&&op| op == 0x1b)
+                .count(),
+            1
+        );
+        assert!(!init
+            .state
+            .library_runtime()
+            .requires_reconciliation(&MotionCommand::Move {
+                library_serial: "LIB-A".into(),
+                source: 0x0400,
+                destination: 0x0100
+            }));
+        let closed = wbr_close_fixture(init);
+        let (intents, outcomes) = (&closed.intents, &closed.outcomes);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].parent_operation,
+            Some(*closed.operation_id.as_bytes())
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].result,
+            remanence_state::library_log::MotionResult::Done
+        );
+        assert!(matches!(
+            outcomes[0].confirmation,
+            Some(remanence_state::library_log::Confirmation::Inventory(_))
+        ));
+    }
+
+    /// A timed-out offline wait retains its spent budget after reopen without stranding motion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbr_wait_timeout_retains_budget_without_stranded_intent() {
+        use remanence_library::motion::{MotionAuthority, MotionCommand};
+        let (init, result) = wbr_wait_route(true, false);
+        assert!(result.unwrap_or_else(|e| panic!("{}", e.message)).timed_out);
+        assert_eq!(init.row().state, "timeout_unknown");
+        assert_eq!(
+            init.tur_and_load_opcodes()
+                .iter()
+                .filter(|&&op| op == 0x1b)
+                .count(),
+            1
+        );
+        let closed = wbr_close_fixture(init);
+        let (_, state) = runtime_backed_state(closed.temp.path());
+        assert_eq!(
+            state
+                .write_handle()
+                .media_readiness_load_attempts_since_ready(closed.operation_id)
+                .unwrap(),
+            1,
+            "offline wait LOAD budget survives reopen"
+        );
+        assert!(
+            !state
+                .library_runtime()
+                .requires_reconciliation(&MotionCommand::Move {
+                    library_serial: "LIB-A".into(),
+                    source: 0x0400,
+                    destination: 0x0100
+                }),
+            "offline wait leaves no stranded intent"
+        );
+        let outcomes = &closed.outcomes;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            outcomes[0].confirmation,
+            Some(remanence_state::library_log::Confirmation::Inventory(_))
+        ));
+    }
+
+    /// The offline route resolves a crash-left library intent before admitting its own LOAD.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbr_wait_reconciles_crash_left_motion_before_load() {
+        use remanence_library::motion::{MotionAuthority, MotionCommand};
+        let (init, result) = wbr_wait_route(false, true);
+        let result = result
+            .unwrap_or_else(|e| panic!("reconciled route must admit its LOAD: {}", e.message));
+        assert!(result.readiness.is_ready());
+        assert_eq!(
+            init.tur_and_load_opcodes()
+                .iter()
+                .filter(|&&op| op == 0x1b)
+                .count(),
+            1,
+            "reconciled route admits one LOAD"
+        );
+        assert!(
+            !init
+                .state
+                .library_runtime()
+                .requires_reconciliation(&MotionCommand::Move {
+                    library_serial: "LIB-A".into(),
+                    source: 0x0400,
+                    destination: 0x0100
+                }),
+            "crash-left and new intents resolved"
+        );
+        let closed = wbr_close_fixture(init);
+        let (intents, outcomes) = (&closed.intents, &closed.outcomes);
+        assert_eq!(intents.len(), 2);
+        assert_eq!(
+            intents[1].parent_operation,
+            Some(*closed.operation_id.as_bytes())
+        );
+        assert!(outcomes.iter().any(|outcome| matches!(
+            outcome.confirmation,
+            Some(remanence_state::library_log::Confirmation::Inventory(_))
+        )));
+    }
+    /// Tape init's conditional LOAD belongs to its operation and completes inline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbr_init_load_has_parent_and_inline_confirmation() {
+        let mut init = virtual_tape_init(0);
+        assert!(init
+            .poll_at_the_deadline(|| None)
+            .unwrap()
+            .readiness
+            .is_ready());
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        let closed = wbr_close_fixture(init);
+        let (intents, outcomes) = (&closed.intents, &closed.outcomes);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].parent_operation,
+            Some(*closed.operation_id.as_bytes())
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].result,
+            remanence_state::library_log::MotionResult::Done
+        );
+        assert!(matches!(
+            outcomes[0].confirmation,
+            Some(remanence_state::library_log::Confirmation::Inventory(_))
+        ));
+    }
+
+    /// A conditional LOAD followed by timeout remains counted when tape init's state reopens.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbr_init_timeout_retains_load_budget_after_reopen() {
+        let mut init = virtual_tape_init(0);
+        let world = Arc::clone(&init.world);
+        let poll = init
+            .poll_at_the_deadline(move || {
+                let mut world = world.lock().unwrap();
+                if world.command_log.iter().any(|c| c.opcode == 0x1b) {
+                    world.leave_cartridge_unthreaded(0x0100);
+                }
+                None
+            })
+            .unwrap();
+        assert!(poll.timed_out);
+        assert_eq!(init.row().state, "timeout_unknown");
+        assert_eq!(init.tur_and_load_opcodes(), vec![0x00, 0x1b, 0x00]);
+        let closed = wbr_close_fixture(init);
+        let (_, state) = runtime_backed_state(closed.temp.path());
+        assert_eq!(
+            state
+                .write_handle()
+                .media_readiness_load_attempts_since_ready(closed.operation_id)
+                .unwrap(),
+            1,
+            "tape init LOAD budget survives reopen"
+        );
+        let outcomes = &closed.outcomes;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            outcomes[0].confirmation,
+            Some(remanence_state::library_log::Confirmation::Inventory(_))
+        ));
     }
 }
 

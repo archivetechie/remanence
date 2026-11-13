@@ -592,26 +592,28 @@ pub(crate) fn session_open_immediate_load_then_probe(
     std::thread::sleep(SESSION_OPEN_CONDITIONAL_LOAD_SETTLE);
     let mut admission = None;
     let mut refusal = None;
-    let result = drive.load_immediate_with_admission(&mut || {
-        if !ctx.load_continues_move {
-            admission = ctx
-                .lifecycle
-                .map(|lifecycle| {
-                    lifecycle.begin_motion(&crate::drive_pool::DriveKey::new(
-                        ctx.library_serial,
-                        ctx.bay,
-                    ))
-                })
-                .transpose()
-                .map_err(|status| {
-                    let detail = status.message().to_string();
-                    if crate::drive_pool::DaemonShuttingDown::is_status(&status) {
-                        refusal = Some(status);
-                    }
-                    detail
-                })?;
-        }
-        Ok(())
+    let result = drive.with_parent_operation(*operation_id.as_bytes(), |drive| {
+        drive.load_immediate_with_admission(&mut || {
+            if !ctx.load_continues_move {
+                admission = ctx
+                    .lifecycle
+                    .map(|lifecycle| {
+                        lifecycle.begin_motion(&crate::drive_pool::DriveKey::new(
+                            ctx.library_serial,
+                            ctx.bay,
+                        ))
+                    })
+                    .transpose()
+                    .map_err(|status| {
+                        let detail = status.message().to_string();
+                        if crate::drive_pool::DaemonShuttingDown::is_status(&status) {
+                            refusal = Some(status);
+                        }
+                        detail
+                    })?;
+            }
+            Ok(())
+        })
     });
     if let Some(status) = refusal {
         #[cfg(test)]

@@ -19134,3 +19134,268 @@ tape_catalog_dir="{0}/cache"
         drop(tx);
     }
 }
+
+/// Preserve model inventory confirmation while optionally keeping post-LOAD TURs initializing.
+struct WbrSessionTransport {
+    inner: ModelTransport,
+    world: Arc<Mutex<VirtualWorld>>,
+    keep_initializing: bool,
+}
+impl SgTransport for WbrSessionTransport {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        buf: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_in(cdb, buf)
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        buf: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        let result = self.inner.execute_none(cdb);
+        if self.keep_initializing
+            && result.is_ok()
+            && cdb.first() == Some(&0x1b)
+            && cdb.get(4).is_some_and(|v| v & 1 != 0)
+        {
+            self.world
+                .lock()
+                .unwrap()
+                .leave_cartridge_unthreaded(0x0100);
+        }
+        result
+    }
+}
+
+/// Replay the session owner's LOAD and its confirmation independently of the projected history.
+fn wbr_session_records(
+    root: &Path,
+) -> (
+    Uuid,
+    Vec<remanence_state::library_log::MotionIntent>,
+    Vec<remanence_state::library_log::MotionOutcome>,
+) {
+    use remanence_state::library_log as lib;
+    let (runtime, catalog) = runtime_backed_catalog(root);
+    let library_uuid = runtime.manifest().library_uuid();
+    drop(catalog);
+    drop(runtime);
+    let paths = runtime_state_paths(root);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut owner = None;
+    let mut intents = Vec::new();
+    let mut outcomes = Vec::new();
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+        if let Some(value) = applied.record().readiness_observation() {
+            owner = Some(Uuid::from_bytes(value.operation));
+        }
+        if let Some(value) = applied.record().motion_intent() {
+            intents.push(value.clone());
+        }
+        if let Some(value) = applied.record().motion_outcome() {
+            outcomes.push(value.clone());
+        }
+        Ok(())
+    })
+    .unwrap();
+    (
+        owner.expect("session minted a readiness owner"),
+        intents,
+        outcomes,
+    )
+}
+
+/// Open the production session readiness route with the daemon's observed drive and authority.
+fn wbr_session_route(root: &Path, keep_initializing: bool) -> (Arc<Mutex<VirtualWorld>>, Uuid) {
+    let (runtime, catalog) = runtime_backed_catalog(root);
+    let mut index = catalog.write_handle();
+    let (world, initial_library) = unthreaded_cartridge_world("LIB-WBR-SESSION");
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [initial_library.library()],
+        &std::collections::HashSet::from(["LIB-WBR-SESSION".to_string()]),
+    )
+    .unwrap();
+    let model = world.lock().unwrap().library_snapshot();
+    let policy = remanence_library::StaticAllowlist::new(["LIB-WBR-SESSION"]);
+    let mut library = model
+        .open_with(&policy, {
+            let world = world.clone();
+            move |path| {
+                let role = world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(WbrSessionTransport {
+                    inner: ModelTransport::new(world.clone(), role),
+                    world: world.clone(),
+                    keep_initializing,
+                }))
+            }
+        })
+        .unwrap();
+    library.set_motion_authority(Arc::new(runtime.clone()));
+    let mut drive = library.open_drive(0x0100, &policy).unwrap();
+    let result = session_open_short_probe_or_load(
+        &mut index,
+        &mut drive,
+        SessionOpenReadinessContext {
+            action: "open write session",
+            bay: 0x0100,
+            library_serial: "LIB-WBR-SESSION",
+            barcode: Some("UNT001L9"),
+            source_slot: Some(0x0400),
+            drive_serial: Some("DRV-UNTHREADED"),
+            needs_drive_load: true,
+            load_continues_move: true,
+            lifecycle: None,
+        },
+    );
+    if keep_initializing {
+        assert!(result.is_err());
+    } else {
+        result.unwrap();
+    }
+    assert_eq!(drive_load_commands(&world), 1);
+    let operation_id = Uuid::parse_str(
+        &rusqlite::Connection::open(runtime_state_paths(root).sqlite_path)
+            .unwrap()
+            .query_row("select operation_id from media_readiness_ops", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.state,
+        if keep_initializing {
+            "media_initializing"
+        } else {
+            "ready"
+        }
+    );
+    if keep_initializing {
+        assert!(
+            !index
+                .tape_io_is_fenced(None, Some("UNT001L9"), Some(&row.endpoint))
+                .unwrap(),
+            "initializing owner is resumable, not a fence"
+        );
+    }
+    (world, operation_id)
+}
+
+/// A successful session-open LOAD is parented to the minted owner and inventory-confirmed.
+#[test]
+fn wbr_session_ready_load_has_parent_and_inline_confirmation() {
+    use remanence_library::motion::{MotionAuthority, MotionCommand};
+    let root = tempfile::tempdir().unwrap();
+    let (_world, operation_id) = wbr_session_route(root.path(), false);
+    let (owner, intents, outcomes) = wbr_session_records(root.path());
+    let (runtime, _catalog) = runtime_backed_catalog(root.path());
+    assert_eq!(owner, operation_id);
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].parent_operation, Some(*owner.as_bytes()));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].result,
+        remanence_state::library_log::MotionResult::Done
+    );
+    assert!(matches!(
+        outcomes[0].confirmation,
+        Some(remanence_state::library_log::Confirmation::Inventory(_))
+    ));
+    assert!(!runtime.requires_reconciliation(&MotionCommand::Move {
+        library_serial: "LIB-WBR-SESSION".into(),
+        source: 0x0400,
+        destination: 0x0100
+    }));
+}
+
+/// An initializing session owner reopens with its LOAD spent; startup probes without another LOAD.
+#[test]
+fn wbr_session_initializing_budget_survives_restart_without_second_load() {
+    use crate::startup_media_readiness::{
+        reconcile_library_media_readiness_on_startup, startup_media_readiness_probe_plan,
+        StartupReadinessPlan,
+    };
+    use remanence_library::motion::{MotionAuthority, MotionCommand};
+    let root = tempfile::tempdir().unwrap();
+    let (world, operation_id) = wbr_session_route(root.path(), true);
+    let (_, intents, outcomes) = wbr_session_records(root.path());
+    let (runtime, catalog) = runtime_backed_catalog(root.path());
+    let mut index = catalog.write_handle();
+    assert_eq!(
+        index
+            .media_readiness_load_attempts_since_ready(operation_id)
+            .unwrap(),
+        1,
+        "session-open LOAD budget survives reopen"
+    );
+    let row = index
+        .media_readiness_operation(operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "media_initializing");
+    assert!(!index
+        .tape_io_is_fenced(None, Some("UNT001L9"), Some(&row.endpoint))
+        .unwrap());
+    assert!(
+        !runtime.requires_reconciliation(&MotionCommand::Move {
+            library_serial: "LIB-WBR-SESSION".into(),
+            source: 0x0400,
+            destination: 0x0100
+        }),
+        "session LOAD completed inline"
+    );
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].parent_operation, Some(*operation_id.as_bytes()));
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(
+        outcomes[0].confirmation,
+        Some(remanence_state::library_log::Confirmation::Inventory(_))
+    ));
+    let mut library = open_model_library(Arc::clone(&world));
+    library.set_motion_authority(Arc::new(runtime));
+    library.reconcile_startup_motion().unwrap();
+    assert!(
+        matches!(startup_media_readiness_probe_plan(&row, library.library(), operation_id), StartupReadinessPlan::Probe { operation_id: owner, drive_element: 0x0100, .. } if owner == operation_id),
+        "startup must take the probe plan"
+    );
+    let policy = remanence_library::StaticAllowlist::new(["LIB-WBR-SESSION"]);
+    let drive = library.open_drive(0x0100, &policy).unwrap();
+    let before = world.lock().unwrap().command_log.len();
+    reconcile_library_media_readiness_on_startup(
+        &mut index,
+        library.library(),
+        &mut [(0x0100, drive)],
+    )
+    .unwrap();
+    let world = world.lock().unwrap();
+    assert!(
+        world.command_log[before..].iter().any(|c| c.opcode == 0),
+        "startup sent TUR"
+    );
+    assert!(
+        !world.command_log[before..].iter().any(|c| c.opcode == 0x1b),
+        "startup sends no second LOAD"
+    );
+    assert_eq!(
+        world
+            .command_log
+            .iter()
+            .filter(|c| c.opcode == 0x1b)
+            .count(),
+        1
+    );
+}
