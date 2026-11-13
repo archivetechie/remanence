@@ -24,6 +24,94 @@ pub enum ManualAcceptanceStatus {
     Archived,
 }
 impl LibraryRuntime {
+    /// Read the authenticated operation head without relying on its SQL projection.
+    pub fn operation_head(
+        &self,
+        operation: lib::Id,
+    ) -> Result<Option<lib::OperationEvent>, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(self
+            .operation_head_locked(operation)?
+            .map(|(value, _)| value.event))
+    }
+
+    /// Retain the source reference when the caller will append under this dispatch lease.
+    fn operation_head_locked(
+        &self,
+        operation: lib::Id,
+    ) -> Result<Option<(lib::OperationRecorded, lib::DecisionRef)>, RuntimeError> {
+        let view = self
+            .0
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut head = None;
+        let replay = self
+            .0
+            .authority
+            .snapshot()?
+            .replay(&view, &mut |applied| {
+                if let lib::BodyView::OperationRecorded(value) = applied.record().body_view() {
+                    if value.operation == operation {
+                        head = Some((
+                            value.clone(),
+                            applied.record().reference(applied.sequence()),
+                        ));
+                    }
+                }
+                Ok(())
+            })
+            .map_err(AuthorityError::Store)?;
+        if replay.refusal.is_some() || !replay.fold.pending.is_empty() {
+            return Err(StateError::JournalReplayFailed(
+                "operation head requires resolved source".into(),
+            )
+            .into());
+        }
+        Ok(head)
+    }
+
+    /// Refuse cancellation of an applied manual acceptance atomically with its operation head.
+    /// None leaves other operations' existing cancel path untouched, even with unrelated pending source.
+    pub fn reject_accepted_manual_cancel(
+        &self,
+        operation: lib::Id,
+        actor: lib::AuditActor,
+    ) -> Result<Option<lib::OperationEvent>, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let acceptance =
+            self.inspect_manual_acceptance_locked(|value| value.operation == operation, false)?;
+        if !acceptance.is_some_and(|value| value.status == ManualAcceptanceStatus::Applied) {
+            return Ok(None);
+        }
+        let (head, reference) = self.operation_head_locked(operation)?.ok_or_else(|| {
+            StateError::JournalReplayFailed("manual acceptance has no operation head".into())
+        })?;
+        if !operation_open(&head.event) {
+            return Ok(Some(head.event));
+        }
+        let event = lib::OperationEvent::CancellationRejected(lib::Unit);
+        if head.event == event {
+            self.catch_up_locked()?;
+        } else {
+            self.append_locked(|a, v| {
+                a.operation_recorded(
+                    lib::OperationRecorded {
+                        operation,
+                        kind: lib::OperationKind::FinalizeTape,
+                        previous: Some(reference),
+                        event: event.clone(),
+                    },
+                    actor,
+                    lib::SourceLayer::Layer5,
+                    v,
+                )
+            })?;
+        }
+        Ok(Some(event))
+    }
+
     /// Accept the real request once, including retries cut before native Prepared.
     /// Source scope lookup and writer minting share the dispatch lease.
     pub fn begin_manual_finalization(
@@ -236,6 +324,15 @@ impl LibraryRuntime {
         &self,
         matches: impl Fn(&lib::ManualFinalizationAccepted) -> bool,
     ) -> Result<Option<ManualAcceptance>, RuntimeError> {
+        self.inspect_manual_acceptance_locked(matches, true)
+    }
+
+    /// Admission needs proved absence; the cancel gate only needs an applied acceptance.
+    fn inspect_manual_acceptance_locked(
+        &self,
+        matches: impl Fn(&lib::ManualFinalizationAccepted) -> bool,
+        require_resolved_absence: bool,
+    ) -> Result<Option<ManualAcceptance>, RuntimeError> {
         let view = self
             .0
             .view
@@ -309,7 +406,7 @@ impl LibraryRuntime {
             {
                 found.status = ManualAcceptanceStatus::Applied;
             }
-        } else if !replay.fold.pending.is_empty() {
+        } else if require_resolved_absence && !replay.fold.pending.is_empty() {
             return Err(StateError::JournalReplayFailed(
                 "pending library source cannot prove acceptance absent".into(),
             )

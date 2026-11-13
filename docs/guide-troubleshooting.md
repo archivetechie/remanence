@@ -329,11 +329,17 @@ repeated readiness notifications do not restart the 5 s busy retry window.
 
 Detached verification and manual finalize workers wait up to 15 minutes for
 readiness. They keep waiting across failed readiness waits while the durable
-record stays resumable, but stop on daemon shutdown, operator cancellation,
-dispatch failure, release-only states, or their deadline. A stopped finalize attempt
-reports FAILED with a summary while the intent stays FINALIZING. Neither its key
-(`ClosedOperationRetry`) nor a new key (`ALREADY_EXISTS`) resumes it;
-`rem tape finalize --wait` reports the stopped attempt and exits non-zero.
+record stays resumable, but stop on daemon shutdown, dispatch failure,
+release-only states, or their deadline. Cancelling the underlying readiness wait
+can also stop an attempt. Cancellation of an accepted manual finalization itself
+is refused and recorded durably, without setting its cancel flag. A stopped
+finalize attempt reports live FAILED with a summary while the finalization stays
+accepted and FINALIZING. The daemon retries when a drive is ready; rerun with the
+same idempotency key to follow or resume it. A new key is refused (`ALREADY_EXISTS`)
+while that intent is pending. `rem tape finalize --wait` reports the stopped
+attempt and exits non-zero. A tail write failure or an unproved tail leaves
+COMPLETION_UNKNOWN and RECOVERY_REQUIRED with an explanatory detail; it needs
+operator recovery, and a same-key retry is refused (`ClosedOperationRetry`).
 
 `rem tape verify-index --tape-uuid <UUID>` resumes a media-readiness fence
 and waits up to `15m` before retrying verification. It prints each readiness
@@ -640,14 +646,20 @@ Persistent typed medium or hardware failures in closeout maintenance receive
 three attempts with the existing backoff, then park the tape. Debt views and
 `rem top` show `parked: media fault (3/3 attempts)` with the diagnostic cause.
 Diagnostic text changes do not reset the budget; ordinary contention does not
-consume it. The wake conditions above reset the budget. Unrecognized failures remain transient.
+consume it. For manual finalization, untagged motion failures after reserving a
+bay also count toward this budget when the existing close-out policy classifies
+them as transient. This includes eviction, changer moves and drive-actor failures.
+Write protection and fences requiring operator action still park immediately;
+pre-reservation refusals keep their existing retry policy. The wake conditions
+above reset the budget. Other unrecognized failures remain transient.
 
 After resolving the refusal, run `rem tape closeout <UUID>` to request and watch
 closeout for that exact tape. It succeeds without media work if nothing is due.
 An accepted finalization plan owns its uncovered range instead of ordinary
-closeout. If its operation is still open, retry with the original idempotency key;
-an attempt that closed without success is refused under both its own key and a new
-key. See the
+closeout. A stopped attempt leaves that finalization accepted for the daemon to
+retry; use the original idempotency key to follow or resume it. A new key is
+refused while its intent is pending, and cancellation after acceptance is refused.
+Completion unknown requires operator recovery instead of another attempt. See the
 [CLI reference](reference-cli.md#rem-tape-closeout) for retry arguments and
 [manual finalization](reference-cli.md#rem-tape-finalize-library) for the
 `CloseoutRequired` refusal.

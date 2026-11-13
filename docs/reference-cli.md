@@ -94,7 +94,7 @@ Angle brackets mark a value you supply. The names below are used throughout this
 | `<REMP>`, `<REMR>` | A recipient private-key file and a recipient public-key file; see [Recipient key-file formats](#recipient-key-file-formats). |
 | `<JSON>` | The locator JSON that a tape write (`rem-debug archive write`) returns, passed as the value of `--locator`. |
 | `<MEMBER>` | A member's archive path inside the object, exactly as recorded in the catalog: the `objects[].archive_path` value that `rem put --json` prints (ingest strips a leading `/` or `./`, so `/data/file` is stored as `data/file`), or the member path in the object's manifest. |
-| `--idempotency-key <UUID>` | A UUID you generate, not nil, that identifies one finalization request. Reuse it after a lost response to recover the existing live or successful operation. While a finalization intent is pending, a different key is refused with `ALREADY_EXISTS`; a daemon finalization that closed without success is also refused under its own key. It is not a tape UUID or an operation UUID. |
+| `--idempotency-key <UUID>` | A UUID you generate, not nil, that identifies one finalization request. Reuse it after a lost response or a stopped attempt to follow or resume the accepted finalization. The daemon also retries when a drive is ready. While its intent is pending, a different key is refused with `ALREADY_EXISTS`. Completion unknown requires operator recovery. It is not a tape UUID or an operation UUID. |
 | `<DURATION>`, `<BYTES>` | A duration or a size, in the units described under the conventions above. |
 | `<HEX>` | A SHA-256 digest written as 64 hexadecimal characters. |
 | `<SG>` | The Linux SCSI generic device path of a tape drive, for example `/dev/sg5`. |
@@ -1369,13 +1369,20 @@ Finalization is irreversible, and works below the automatic low watermark too. W
 `--wait` the command submits once and prints the current status. With it, the command polls
 the read-only status RPC across daemon reconnects until a terminal outcome and never
 resubmits. While the tape is `FINALIZING` it also checks the operation, and exits non-zero
-with its summary on `FAILED`, `CANCELLED` or `COMPLETION_UNKNOWN`. An attempt that
-ended without success is final under its idempotency key. Repeating that key is
-refused with `FAILED_PRECONDITION` and `ClosedOperationRetry: manual operation cannot resume from ...`.
-A new key is refused too, with `ALREADY_EXISTS` and
-`pending terminal finalization belongs to a different exact request`, while the
-tape keeps its finalizing intent.
-Matching live or successful retries return the existing operation.
+with its summary on `FAILED`, `CANCELLED` or `COMPLETION_UNKNOWN`. A live `FAILED`
+means this attempt stopped: the finalization stays accepted and the daemon retries
+when a drive is ready. Rerun with the same idempotency key to follow or resume it.
+A new key is refused with `ALREADY_EXISTS` and
+`pending terminal finalization belongs to a different exact request` while that
+intent is pending. Matching live or successful retries return the existing operation.
+Cancellation after acceptance is refused and recorded durably; it does not stop
+the waiting attempt. A tail write failure or an unproved tail leaves completion
+unknown and requires operator recovery; that closed operation refuses a same-key
+retry with `FAILED_PRECONDITION` and `ClosedOperationRetry`.
+Motion faults after a drive bay is reserved count toward the close-out scan's
+three-attempt media budget, then park until a wake. Drive contention does not
+consume that budget; write protection and fences that require operator action
+still park immediately.
 
 Manual finalization refuses a due closeout. When the range retains its
 original-write check and has no closeout contradiction fence, the message is:

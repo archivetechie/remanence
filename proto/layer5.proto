@@ -108,6 +108,8 @@ service Daemon {
   // Operation lifecycle, applicable across all services that return OperationRef.
   rpc GetOperation    (GetOperationRequest)    returns (OperationStatus);
   rpc ListOperations  (ListOperationsRequest)  returns (ListOperationsResponse);
+  // An accepted manual finalization refuses cancellation durably and answers
+  // RUNNING while its durable operation is open, even after a stopped attempt.
   rpc CancelOperation (CancelOperationRequest) returns (CancelOperationResponse);
 
   // Server-streaming progress for an operation (alternative to polling
@@ -212,6 +214,7 @@ message CancelOperationRequest {
   IdempotencyKey idempotency_key = 2;
   // True: best-effort interrupt (CDB completion may still arrive).
   // False: only cancel if not yet dispatched.
+  // Accepted manual finalization refuses cancellation for either value.
   bool force              = 3;
 }
 
@@ -780,13 +783,17 @@ service Catalog {
   // boundary. This is valid below the pool low watermark and bypasses only
   // that automatic trigger; all fit, fence, ownership, and format checks stay
   // mandatory. An accepted request can never reopen the tape for Objects.
-  // The operation describes one attempt; TapeFinalization describes durable intent.
-  // A stopped worker publishes FAILED with a retry summary while intent remains
-  // FINALIZING and detail carries that summary. An operation that ended without
-  // success is final under its key: matching retries fail with FAILED_PRECONDITION
-  // and ClosedOperationRetry: manual operation cannot resume from ... .
-  // A new key fails with ALREADY_EXISTS while the finalizing intent stays pending;
-  // matching live or successful retries return the existing operation.
+  // The durable operation stays open across stopped attempts. A stopped worker
+  // publishes live FAILED with a summary while intent remains FINALIZING; detail
+  // carries that summary. The daemon retries when a drive is ready; the same key
+  // follows or resumes the accepted finalization. A new key fails with
+  // ALREADY_EXISTS while its intent is pending. Matching live or successful
+  // retries return the existing operation. Cancellation after acceptance is
+  // refused durably. A tail write failure or an unproved tail leaves completion
+  // unknown and needs operator recovery; that terminal head refuses same-key
+  // retries with FAILED_PRECONDITION and ClosedOperationRetry.
+  // Transient motion faults after a bay reservation count toward the existing
+  // close-out three-attempt media budget; contention does not consume it.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
   // Sealed tapes fail immediately with FAILED_PRECONDITION ("tape is sealed"),
   // except matching retries of live or successful operations, which return the
@@ -1287,6 +1294,8 @@ message ProtectedContentFinding {
 
 // FINALIZING can coexist with a failed attempt. Inspect GetOperation for the
 // attempt outcome and detail for its error summary; the same key resumes intent.
+// The daemon retries accepted finalization when a drive is ready. RECOVERY_REQUIRED
+// carries the completion-unknown summary and needs operator recovery instead.
 message TapeFinalization {
   bytes tape_uuid = 1;
   // Operator finalization operation. Absent for BUSY, and for a finalization

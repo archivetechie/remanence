@@ -197,6 +197,34 @@ impl pb::daemon_server::Daemon for DaemonService {
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "CancelOperation")?;
         let operation_uuid = decode_uuid_bytes(request.operation_id.as_slice(), "operation_id")?;
         let operation_id = Uuid::from_bytes(operation_uuid);
+        if let Some(runtime) = self.state.catalog.library_runtime() {
+            if let Some(head) = runtime
+                .reject_accepted_manual_cancel(operation_uuid, actor.clone())
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+            {
+                use remanence_state::library_log::OperationEvent;
+                let resulting_state = match head {
+                    OperationEvent::Finished(_) | OperationEvent::CompletedAfterCancel(_) => {
+                        pb::OperationState::Succeeded
+                    }
+                    OperationEvent::Failed(_) => pb::OperationState::Failed,
+                    OperationEvent::CancelledBeforeDispatch(_) => pb::OperationState::Cancelled,
+                    OperationEvent::CompletionUnknown(_) => pb::OperationState::CompletionUnknown,
+                    OperationEvent::Accepted(_)
+                    | OperationEvent::Started(_)
+                    | OperationEvent::CancelRequested(_)
+                    | OperationEvent::CancellationRejected(_) => pb::OperationState::Running,
+                };
+                return Ok(Response::new(pb::CancelOperationResponse {
+                    resulting_state: resulting_state as i32,
+                    detail: if resulting_state == pb::OperationState::Running {
+                        "an accepted finalization cannot be cancelled; it completes when a drive is ready"
+                    } else {
+                        "operation is already terminal"
+                    }.into(),
+                }));
+            }
+        }
         let resulting_state = self.state.operations.request_cancel(&operation_id)?;
         if matches!(
             resulting_state,
@@ -692,9 +720,16 @@ impl pb::catalog_server::Catalog for CatalogService {
             .ok_or_else(|| Status::not_found("tape has no terminal-finalization authority"))?;
         let operation_id = projection.operation_id;
         let mut response = tape_finalization_to_proto(tape_uuid, operation_id, projection);
-        if response.outcome == pb::TapeFinalizationOutcome::Finalizing as i32 {
+        if response.outcome == pb::TapeFinalizationOutcome::Finalizing as i32
+            || response.outcome == pb::TapeFinalizationOutcome::RecoveryRequired as i32
+        {
             if let Some(id) = operation_id {
-                if let Some(operation) = index
+                if let Some(live) = self.state.operations.latest(&id).filter(|live| {
+                    live.state == pb::OperationState::Failed as i32
+                        || live.state == pb::OperationState::CompletionUnknown as i32
+                }) {
+                    response.detail = live.error_summary;
+                } else if let Some(operation) = index
                     .get_operation(&id.to_string())
                     .map_err(status_from_state_error)?
                 {

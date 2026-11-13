@@ -233,14 +233,18 @@ until a client resumes it explicitly.
 
 Detached verification and manual finalization wait up to 15 minutes from the
 first readiness refusal before they stop their attempt. A stopped finalization
-attempt reports `FAILED` and keeps the tape's finalizing intent. That operation
-is final under its idempotency key: repeating it is refused with
-`FAILED_PRECONDITION` and `ClosedOperationRetry: manual operation cannot resume from ...`.
-A new key is refused too, with `ALREADY_EXISTS` and
-`pending terminal finalization belongs to a different exact request`, while the
-tape keeps its finalizing intent.
-Matching live or successful retries return the existing operation.
-`rem tape finalize --wait` exits with the attempt's error summary.
+attempt reports live `FAILED`, with an error summary, while the finalization stays
+accepted and its durable operation stays open. The daemon retries when a drive is
+ready; rerun with the same idempotency key to follow or resume it. A new key is
+refused with `ALREADY_EXISTS` while that intent is pending. Matching live or
+successful retries return the existing operation. Cancellation after acceptance
+is refused and recorded durably, without stopping the waiting attempt.
+`rem tape finalize --wait` exits non-zero with the stopped attempt's summary.
+A tail write failure or an unproved tail reports `COMPLETION_UNKNOWN`, with a
+recovery-required detail, and needs operator recovery; a same-key retry of that
+closed operation is refused with `ClosedOperationRetry`. Motion faults after a
+bay reservation count toward the close-out scan's three-attempt media budget;
+drive contention does not, and write protection still parks immediately.
 
 <!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ### A cartridge left unthreaded by a hard kill

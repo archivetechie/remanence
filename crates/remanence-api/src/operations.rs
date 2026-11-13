@@ -356,6 +356,24 @@ impl OperationHandle {
             error_summary,
         ));
     }
+
+    /// Preserve the media incident's explanation when the live status overlays SQL.
+    pub(crate) fn publish_completion_unknown(
+        &self,
+        error_summary: &str,
+        progress: &[(&str, &str)],
+    ) {
+        self.publish(status_with_error(
+            self.op_id,
+            self.operation_kind.as_str(),
+            pb::OperationState::CompletionUnknown,
+            progress
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            error_summary,
+        ));
+    }
 }
 
 pub(crate) fn status(
