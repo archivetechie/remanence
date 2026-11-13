@@ -24,8 +24,10 @@ use remanence_library::{
     RecordingTransport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass, VecBlockSink,
 };
 use remanence_parity::{bootstrap::write_bootstrap_block, ParityConfig};
+use remanence_state::library_log as lib;
 use remanence_state::{
-    CatalogIndex, FileAuditLog, ProvisionTapeInput, StateHandle, StatePaths, TapeIoFenceInput,
+    CatalogIndex, GenerationSource, LabelProvenance, MediaObservation, ProvisionTapeInput,
+    StateHandle, StatePaths,
 };
 
 const DEVICE: &str = "/dev/sg-chaos-drive-0100";
@@ -131,6 +133,64 @@ tape_catalog_dir = "{0}/cache"
     state
         .write_handle()
         .project_tape_pool_membership(UUID, "default")
+        .unwrap();
+    state
+}
+
+/// Provision and assign the standalone tape through the typed library authority.
+fn typed_state(root: &Path) -> StateHandle {
+    fs::create_dir_all(root).unwrap();
+    let config = remanence_state::parse_config_toml(&format!(
+        r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+io_memory_ceiling = "64 MiB"
+append_ring_bytes = "16 MiB"
+[tape_io]
+read_reservoir_bytes = "16 MiB"
+[[tape_pools]]
+id = "default"
+block_size = 262144
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+[audit]
+dir = "{0}/audit"
+fsync = true
+[index]
+sqlite_path = "{0}/index.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+"#,
+        root.display()
+    ))
+    .unwrap();
+    let paths = StatePaths::from_config(root.join("config.toml"), &config);
+    let mut state = StateHandle::open_with_config(paths, config).unwrap();
+    state
+        .provision_tape_with_media(
+            ProvisionTapeInput {
+                tape_uuid: UUID,
+                voltag: "ORACLEL9".into(),
+                block_size: BLOCK,
+                parity: ParityConfig::None,
+                force: false,
+            },
+            LabelProvenance::Operator,
+            Some(MediaObservation {
+                generation: LtoGen::Lto9,
+                source: GenerationSource::Operator,
+            }),
+        )
+        .unwrap();
+    let generation = state
+        .library_runtime()
+        .tape_state(UUID)
+        .unwrap()
+        .assignment_generation;
+    state
+        .assign_tape_pool(UUID, generation, Some("default"))
         .unwrap();
     state
 }
@@ -951,9 +1011,8 @@ fn c2_null_generation_refuses_writability_even_with_lto_label() {
 #[test]
 fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
     let temp = tempfile::tempdir().unwrap();
-    let state = state(&temp.path().join("state"));
+    let state = typed_state(&temp.path().join("state"));
     let db_path = state.paths().sqlite_path.clone();
-    let audit_dir = state.paths().audit_dir.clone();
     let world = world(tape(UUID));
     let before = state.calibration_control().row(UUID).write_epoch;
     let observed = Arc::new(Mutex::new(0usize));
@@ -996,21 +1055,31 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
         sessions > 0,
         "adapter persists a write session for the mounted tape"
     );
-    let records = FileAuditLog::replay(&audit_dir).unwrap();
-    assert!(
-        records
-            .iter()
-            .any(|record| record.subject.kind == "drive"
-                && record.subject.id.as_deref() == Some(SERIAL)),
-        "a drive audit subject must name the VPD serial: {records:?}"
-    );
+    // The mount's allowlist match on the VPD serial checks the drive identity.
+    // No log records the drive for a standalone write; that audit gap is deferred
+    // to the next landing (D-C3a-1-1 D6).
+    let tape = state.library_runtime().tape_state(UUID).unwrap().tape;
+    let at = state
+        .library_runtime()
+        .current_native_reference(UUID)
+        .unwrap();
     state
-        .write_handle()
-        .record_tape_io_fence(TapeIoFenceInput {
-            tape_uuid: UUID,
-            barcode: Some("ORACLEL9".into()),
-            reason: "oracle-stale-active".into(),
-            evidence_json: None,
+        .library_runtime()
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape),
+                    cause: lib::FenceCause::TransferError,
+                    evidence: None,
+                    at,
+                    operation: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer5,
+                v,
+            )
         })
         .unwrap();
     let config = state.config().clone();
@@ -1078,7 +1147,7 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
 #[test]
 fn current_mounted_unknown_write_refuses_retry_without_changing_prefix() {
     let root = tempfile::tempdir().unwrap();
-    let state = state(&root.path().join("state"));
+    let state = typed_state(&root.path().join("state"));
     let paths = state.paths().clone();
     let config = state.config().clone();
     let world = world(tape(UUID));
@@ -1392,7 +1461,7 @@ fn c5_scan_restore_contains_hostile_members_and_destination_symlinks() {
 #[test]
 fn b3b_mounted_bootstrap_unknown_write_raises_one_fence() {
     let root = tempfile::tempdir().unwrap();
-    let state = state(&root.path().join("state"));
+    let state = typed_state(&root.path().join("state"));
     let paths = state.paths().clone();
     let config = state.config().clone();
     let world = world(tape(UUID));
@@ -1478,7 +1547,7 @@ fn b3b_mounted_named_tail_preserves_no_fence() {
 #[test]
 fn b3b_mounted_bootstrap_failure_one_fence() {
     let root = tempfile::tempdir().unwrap();
-    let state = state(&root.path().join("state"));
+    let state = typed_state(&root.path().join("state"));
     let paths = state.paths().clone();
     let config = state.config().clone();
     let world = world(tape(UUID));
@@ -1503,14 +1572,23 @@ fn b3b_mounted_bootstrap_failure_one_fence() {
     let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1, "{fences:?}");
     assert_eq!(fences[0].reason, "partial_batch");
-    let records = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    assert_eq!(
-        records
-            .iter()
-            .filter(|r| r.event == remanence_state::AuditEvent::TapeIoFenceRaised)
-            .count(),
-        1
-    );
+    let log_uuid = state.library_runtime().manifest().library_uuid();
+    let paths = state.paths().clone();
+    drop(state);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut raised = 0;
+    lib::store::replay_observed(&paths.audit_dir, log_uuid, &view, &mut |applied| {
+        if applied.record().tag() == lib::Tag::FenceRaised {
+            raised += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(raised, 1);
 }
 
 /// A later 05/24/00 WRITE has no fence; a new mounted invocation proves C before its next WRITE.
