@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
@@ -391,11 +391,17 @@ including media whose identity was retired, requires the clobber confirmation, a
 safety refusals still apply. A Remanence tape whose tape UUID this catalog does not know is
 refused with `observed BOT predecessor has no typed identity; no Bootstrap write admitted`.
 It writes nothing and prints no `next:` line. Keep its data by adopting it with
-`rem-debug tape adopt-bootstrap`, or erase it with
+[`rem tape adopt`](#rem-tape-adopt), or erase it with
 `--clobber-data --clobber-unknown-tape <UUID>` naming the exact tape UUID at BOT, plus
 the clobber confirmation. A different UUID, or the flag on any other tape, refuses
 without writing. A label that already belongs to another tape is refused
 with `label <LABEL> belongs to tape <UUID>; choose a new label`.
+
+Initialization writes the new start-of-tape before recording it; if it is interrupted
+in between, the next init refuses with
+`observed BOT predecessor has no typed identity; no Bootstrap write admitted`.
+Retire the old identity, then adopt the cartridge with `rem tape adopt` or clobber its
+exact UUID.
 
 The parser accepts `--generation` values `L1` to `L9`, `LZ` and `M8`. The drive's measured
 density wins and is recorded. Without `--generation`, a label that ends in a generation code
@@ -483,9 +489,11 @@ Reads report active tape-I/O fences. With a `native_log_behind_projection` fence
 proceeds under that cause, walking the tape from its start. A contradicted tape
 admission refuses every read, including `--scan`. Other tape-I/O fence causes
 leave standalone reads available. Writes refuse active fences on the loaded tape
-or endpoint. A failed standalone initialization write raises no tape or drive
-fence: it records `StandaloneFenceUnrecorded` and stops motion for the process
-until the command or daemon restarts. Append admission also checks the physical tail:
+or endpoint. A standalone initialization write that fails with an uncertain outcome
+raises no tape or drive fence. It is refused with
+`cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
+counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
+restarts. Append admission also checks the physical tail:
 `TailBeyondKnownState` means local state cannot authorize overwriting complete
 data. Restore newer state or rescue with `tape restore --scan` before considering
 supersede-tail.
@@ -935,7 +943,7 @@ To see the retirements recorded on 2 November 2026:
 rem audit query --since 2026-11-02T00:00:00Z --until 2026-11-03T00:00:00Z --filter event=TapeRetired
 ```
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/mount.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Drive stewardship
 
 Drive-fleet management through the daemon. A drive is addressed by serial or UUID.
@@ -1018,6 +1026,10 @@ rem drive reinstate [OPTIONS] --reason <REASON> <DRIVE>
 Both commands print `DriveStewardshipDeferred: drive annotate, retire and reinstate are not recorded by the library log yet; the drive was not changed`.
 The refusal is counted in the library log. No replacement command changes the
 stewardship record. `rem drive list --retired` still shows drives retired earlier.
+A drive retired earlier keeps its identity and appears in `rem top` marked retired;
+mount resolution refuses it with
+`resolved drive is retired and excluded from mount resolution`, and it stays out of
+service because `reinstate` is refused.
 
 ### rem drive load
 
@@ -1076,7 +1088,7 @@ With `--json`, a failed, cancelled, or completion-unknown operation prints a
 `details.operation_id`, and `details.state`, and exits 1. Connection failures
 remain `daemon_client_error`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Tape lifecycle
 
 Initialization, readiness and retirement run against local configuration and state, and
@@ -1253,6 +1265,7 @@ A forced release can still be refused if tape admission is contradicted or the
 log remains behind the catalog. This form uses the daemon when one listens;
 only an absent listener permits release offline under the state lock. The
 standalone form `rem tape quarantine release <ID> --ack <TEXT>` has no `--force`.
+On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses the home configuration when `/etc/rem/config.toml` is absent.
 
 To release a fence after checking the drive and the slot inventory:
 

@@ -541,7 +541,7 @@ Home mode uses a different generated layout under
 config.toml                     generated config, default pool, saved home serial
 state.lock                      invocation ownership lock
 authority-format                layout marker
-journals/tapes/                 per-tape logs, leases, fences and repair evidence
+journals/tapes/                 per-tape logs, leases and fences
 index/rem-state.sqlite          rebuildable catalog
 cache/tapes/                    tape catalog cache
 audit/                          audit segments

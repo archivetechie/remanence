@@ -455,7 +455,7 @@ A standing, catalog-persisted condition raised against a drive, tape or library 
 example a repeated cleaning failure, or a fenced tape awaiting release) until an operator
 acknowledges or clears it. `rem alarms` lists and acknowledges alarms.
 
-<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/standalone_init.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Safety and operations
 
 ### allowlist
@@ -491,13 +491,17 @@ the catalog's projection. `rem catalog tapes --json`, `rem top` and
 A `native_log_behind_projection` fence also requires `--force` in library mode,
 after restoring the exact log or rebuilding the catalog. The standalone release
 form has no `--force`.
+On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses the home configuration when `/etc/rem/config.toml` is absent.
 
 On a standalone drive, that cause refuses `rem get`, `rem tape identify`,
 `rem tape verify` and `rem tape restore`. Only `rem tape restore --scan` proceeds,
 walking the tape from its start. Contradicted tape admission refuses every read,
 including `--scan`. Reads under other fence causes remain available.
-A failed standalone initialization write raises no tape or drive fence; the
-`StandaloneFenceUnrecorded` refusal stops motion until the command or daemon restarts.
+A standalone initialization write that fails with an uncertain outcome raises no
+tape or drive fence. It is refused with
+`cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
+counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
+restarts.
 
 ### media-readiness fence
 

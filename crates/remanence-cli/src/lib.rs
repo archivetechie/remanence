@@ -1386,10 +1386,10 @@ enum TapeLogCommand {
         /// Daemon configuration file locating the local tape log.
         #[arg(long)]
         config: PathBuf,
-        /// UUID of the tape log to repair.
+        /// Accepted but not read; the command is refused.
         #[arg(long)]
         tape_uuid: uuid::Uuid,
-        /// Retain the validated closed sequence through this number.
+        /// Accepted but not read; the command is refused.
         #[arg(long)]
         through_sequence: u64,
         /// Accepted but not read; the command is refused.
@@ -1621,13 +1621,13 @@ enum DriveClientCommand {
         drive: String,
     },
 
-    /// Annotate one drive.
+    /// Refused in this release; changes nothing.
     Annotate(DriveAnnotateArgs),
 
-    /// Remove one drive from the managed fleet. Reversible with `reinstate`.
+    /// Refused in this release; changes nothing.
     Retire(DriveRetireArgs),
 
-    /// Return a retired drive to service.
+    /// Refused in this release; changes nothing.
     Reinstate(DriveReinstateArgs),
 
     /// Poll one drive now.

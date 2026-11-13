@@ -8,7 +8,7 @@ them, and each builds on the ones before it. The [glossary](reference-glossary.m
 short entry for every term, and the [architecture overview](architecture-overview.md) is the
 next step for a reader who wants the design in detail.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## 1. How a tape behaves
 
 Remanence's design only makes sense against the behaviour of the medium, so this page starts
@@ -219,13 +219,17 @@ There are two kinds of fence.
   `rem tape quarantine release <ID> --ack <TEXT>`. A tape log behind the catalog's
   projection (`native_log_behind_projection`) also requires `--force` in library
   mode, after restoring the log or rebuilding the catalog. The standalone release
-  form has no `--force`. Under that cause, `rem get`, `rem tape identify`,
+  form has no `--force`.
+  On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses the home configuration when `/etc/rem/config.toml` is absent.
+  Under that cause, `rem get`, `rem tape identify`,
   `rem tape verify` and `rem tape restore` refuse on a standalone drive; only
   `rem tape restore --scan` proceeds, walking from the tape's start. Contradicted
   tape admission refuses every read, including `--scan`. Other fence causes leave
-  standalone reads available. A failed standalone initialization write raises no
-  tape or drive fence: it records `StandaloneFenceUnrecorded` and stops motion
-  until the command or daemon restarts.
+  standalone reads available. A standalone initialization write that fails with
+  an uncertain outcome raises no tape or drive fence. It is refused with
+  `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
+  counted as `StandaloneFenceUnrecorded`, and motion stops until the command or
+  daemon restarts.
 - A **media-readiness fence** (quarantine id beginning `mrq-`) records a readiness wait, the
   wait for a drive to become ready after a load, that was interrupted or ended without a clear
   answer. A wait that was still progressing (loading, becoming ready, busy) is resumable: the

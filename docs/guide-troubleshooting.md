@@ -6,7 +6,7 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
-<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs crates/remanence-cli/src/standalone.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Authority-layout refusals and declared reset
 
 Old host state is refused before configured device admission. Ordinary catalog
@@ -38,7 +38,7 @@ with `rem-debug tape adopt-bootstrap`. To destroy the approved scratch tape,
 name its exact observed tape UUID and barcode in the confirmed clobber command:
 
 ```sh
-rem tape init <LABEL> --config <PATH> --clobber-data --clobber-unknown-tape <OLD-UUID> --confirm-clobber "CLOBBER <LABEL>"
+rem tape init <LABEL> --config <PATH> --clobber-data --clobber-unknown-tape <BOT-UUID> --confirm-clobber "CLOBBER <LABEL>"
 ```
 
 Select the approved geometry with `--block-size <BYTES>` and
@@ -78,21 +78,25 @@ Another init refuses with
 `observed BOT predecessor has no typed identity; no Bootstrap write admitted`.
 No Bootstrap write is admitted on that retry.
 
-Retire the old identity to release its barcode. This marks its recorded copies
-missing, so identify the old catalog UUID before running:
+With the daemon stopped, retire the old identity to release its barcode. This marks
+its recorded copies missing, so identify the old catalog UUID before running.
+Use the configuration for the affected catalog as `<PATH>`:
 
 ```sh
-rem tape retire <OLD-UUID> --reason "interrupted initialization" --i-understand-copies-become-unreadable
+rem tape retire <OLD-UUID> --config <PATH> --reason "interrupted initialization" --i-understand-copies-become-unreadable
 ```
 
-Then adopt the new identity with `rem-debug tape adopt-bootstrap`, or destroy it
-with `rem tape init <LABEL> --clobber-data --clobber-unknown-tape <NEW-UUID>` and
-the exact `CLOBBER <LABEL>` confirmation. Retirement alone does not admit writes
-to the unknown new identity.
+For a library cartridge, adopt the new identity with `rem-debug tape adopt-bootstrap`,
+or destroy it with `rem tape init <LABEL> --clobber-data --clobber-unknown-tape <NEW-UUID>`
+and the exact `CLOBBER <LABEL>` confirmation. For a standalone cartridge, adopt it
+with `rem tape adopt`, or destroy it with
+`rem tape init --label <LABEL> --clobber-data --clobber-unknown-tape <NEW-UUID>`
+and the same confirmation. Retirement alone does not admit writes to the unknown
+new identity.
 
 ## Damaged log tails and projection rebuild
 
-Inspect the per-tape log before choosing a retained boundary:
+To see the last valid closed boundary and any damage in a tape log:
 
 ```sh
 rem-debug tape-log inspect --config <PATH> --tape-uuid <UUID>
@@ -201,7 +205,7 @@ standalone refusals are:
 The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Tape-I/O fences
 
 The daemon starts with tape-scoped and drive-scoped tape-I/O fences. Each fence
@@ -227,6 +231,7 @@ Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
 Even a forced release refuses contradicted tape admission or a log still behind
 the catalog. The standalone release form has no `--force`.
+On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses your home configuration when `/etc/rem/config.toml` is absent.
 
 The library command uses the configured daemon socket when it is listening.
 An absent listener permits offline release,
@@ -234,20 +239,24 @@ which still requires the exclusive state lock. RPC and authentication failures
 do not fall back offline. Release syncs the actor, scope, acknowledgment and
 release time to the audit log before clearing the row. A crash between these
 steps leaves the fence active; retry or startup completes the release from the
-same evidence. The tape or drive becomes admissible without restarting, subject
+same evidence. The tape becomes admissible without restarting, subject
 to the normal identity, readiness and append checks.
 
 A drive fence refuses a write, mount or finalize that needs its bay with
 `DriveFenced: <endpoint> library:<fence> <cause>`. That refusal is counted in the
-library log. Cleaning is the only producer of a drive fence in this release.
+library log. Cleaning is the only operation that raises a drive fence.
 If the only usable bays are drive-fenced or busy and at least one is fenced,
 a library mount refuses with `DriveFenced` immediately; it does not wait for a
-busy bay. Inspect the named fence and cleaning evidence before retrying.
+busy bay. Only the cleaning run that raised a drive fence releases it.
+`rem tape quarantine release` refuses a drive fence with `fence is not tape-scoped`,
+and a new cleaning run on that drive refuses with `drive is already fenced`.
 
-A failed standalone initialization write raises no tape or drive fence. It
-records a `StandaloneFenceUnrecorded` refusal and stops motion for the rest of
-the process. Investigate the failed write before restarting the command or
-daemon; there is no standalone endpoint fence to acknowledge away.
+A standalone initialization write that fails with an uncertain outcome raises no
+tape or drive fence. It is refused with
+`cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
+counted as `StandaloneFenceUnrecorded`, and motion stops until the command or daemon
+restarts. Investigate the failed write before restarting; there is no standalone
+endpoint fence to acknowledge away.
 
 If a library-log write fails at the store, including while recording a refusal,
 motion stops for the rest of that process. This is a storage failure, rather
@@ -835,7 +844,7 @@ A failed move also refreshes inventory. Sense `05/3B/0D` reports a full destinat
 and `05/3B/0E` an empty source. An unload followed by a failed move does not prove that the
 cartridge remains in the drive; use the fresh element status for recovery.
 
-<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
 ## Waiting for the library (open magazine or door)
 
 A library shared with another system has its magazines and doors opened
@@ -894,7 +903,7 @@ follows.
   time, and that move is sent as it would be without the wait. A cartridge whose move home fails this way
   stays unthreaded in its drive, as before, and the next start reconciles
   it as described in [A drive stays not ready after a daemon crash](#a-drive-stays-not-ready-after-a-daemon-crash);
-- a robotics or reconcile operation is cancelled while it waits;
+- a robotics operation is cancelled while it waits;
 - the client of a write session open goes away while the load move for its
   tape waits. A client that goes away after that move has completed still
   gets its session opened, and the session is closed by the idle timeout as
