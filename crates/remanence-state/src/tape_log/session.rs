@@ -18,9 +18,9 @@ pub struct SessionCursor {
 pub struct SessionDrive {
     /// Nonempty, trimmed drive serial number.
     pub serial: String,
-    /// Trimmed inquiry vendor, when reported.
+    /// Vendor, when reported, trimmed by the producer.
     pub vendor: Option<String>,
-    /// Trimmed inquiry product, when reported.
+    /// Product, when reported, trimmed by the producer.
     pub product: Option<String>,
     /// Physical endpoint at the time of the write.
     pub endpoint: crate::library_log::DriveKey,

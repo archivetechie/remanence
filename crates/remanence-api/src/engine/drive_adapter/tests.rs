@@ -2714,6 +2714,21 @@ fn wdrv_standalone_session_records_serial_without_observed_identity() {
     use rusqlite::types::Value;
     let (fixture, state) = Fixture::new(false);
     let runtime = state.library_runtime();
+    let other_drive = runtime
+        .observe_drives(vec![remanence_state::DriveObservationInput {
+            serial: "WDRV-OTHER".into(),
+            identity_source: "DvcidAndInquiry".into(),
+            vendor: None,
+            product: None,
+            firmware_rev: None,
+            managed: "rem".into(),
+            library_serial: None,
+            element_address: None,
+            observed_at_utc: None,
+        }])
+        .unwrap()
+        .remove(0)
+        .drive_uuid;
     let mut owner = fixture.owner(state);
     let session = owner.open_session("default").unwrap();
     let id = Uuid::from_slice(&session.session_id).unwrap();
@@ -2763,9 +2778,18 @@ fn wdrv_standalone_session_records_serial_without_observed_identity() {
         .tape_drive_correlation_rollups(&UUID)
         .unwrap()
         .is_empty());
+    let conn = rusqlite::Connection::open(&fixture.config.index.sqlite_path).unwrap();
+    let attributed: i64 = conn
+        .query_row(
+            "select count(*) from sessions where tape_uuid=?1 and drive_uuid is not NULL",
+            [UUID.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(attributed, 0, "no session for this tape has a drive UUID");
     assert!(fixture
         .index()
-        .drive_tape_correlation_rollups(&[0xd1; 16])
+        .drive_tape_correlation_rollups(&other_drive)
         .unwrap()
         .is_empty());
     owner.close_session().unwrap();

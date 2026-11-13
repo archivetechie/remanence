@@ -18743,6 +18743,260 @@ tape_catalog_dir="{0}/cache"
         drop(tx);
     }
 
+    /// Send an explicit request identity through the same daemon actor as T-A.
+    async fn open_with_request_identity(
+        f: &Fixture,
+        tx: &mpsc::Sender<DriveCommand>,
+        drive_uuid: Option<Vec<u8>>,
+    ) -> Uuid {
+        let (reply, done) = oneshot::channel();
+        tx.send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
+            pool_cfg: f.state.config().tape_pools[0].clone(),
+            selected: SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "wdrv".into(),
+                tape_uuid: TAPE,
+                block_size: BLOCK,
+                parity_config: ParityConfig::None,
+            },
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: false,
+            library_serial: LIBRARY.into(),
+            barcode: Some(BARCODE.into()),
+            source_slot: None,
+            drive_uuid,
+            drive_serial: Some(SERIAL.into()),
+            reply,
+        })
+        .await
+        .unwrap();
+        let session = done.await.unwrap().expect("daemon write open must succeed");
+        Uuid::from_slice(&session.session_id).unwrap()
+    }
+
+    /// Close the actor session before dropping the fixture's authority.
+    async fn close_session(tx: &mpsc::Sender<DriveCommand>, session: Uuid) {
+        let (reply, done) = oneshot::channel();
+        tx.send(DriveCommand::Close {
+            session_id: session,
+            reply,
+        })
+        .await
+        .unwrap();
+        done.await.unwrap().unwrap();
+        settle_write_actor(tx, session).await;
+    }
+
+    /// T-R: a refused cross-log counterpart makes attribution fail, while
+    /// the daemon still records the physical serial and opens the write.
+    #[tokio::test]
+    async fn unresolved_drive_history_records_serial_and_allows_write() {
+        use remanence_state::library_log as lib;
+
+        // Follow authority_pending_retry_names_rejected_durable_record:
+        // ManualFinalizationAccepted sees FinalizationPrepared at append, but
+        // the runtime replays a different native kind with the same digest.
+        struct Present;
+        impl lib::TapeView for Present {
+            fn lookup(&self, at: &lib::TapeAt) -> Result<lib::TapeLookup, lib::FoldError> {
+                Ok(lib::TapeLookup::Present {
+                    kind: remanence_state::tape_log::Tag::FinalizationPrepared,
+                    digest: at.record_digest,
+                })
+            }
+        }
+
+        let mut f = fixture();
+        let other_tape = [0xd5; 16];
+        f.state
+            .provision_tape_with_media(
+                ProvisionTapeInput {
+                    tape_uuid: other_tape,
+                    voltag: "WDRV02L9".into(),
+                    block_size: BLOCK,
+                    parity: ParityConfig::None,
+                    force: false,
+                },
+                remanence_state::LabelProvenance::Changer,
+                remanence_state::MediaObservation::label_hint("WDRV02L9"),
+            )
+            .unwrap();
+        let runtime = f.state.library_runtime();
+        let directory = f.state.paths().journal_dir.join("tapes");
+        let authority = remanence_state::TapeAuthority::open(
+            &directory,
+            other_tape,
+            &f.state.paths().sqlite_path,
+        )
+        .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                BLOCK,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        runtime.refresh_native(&owner.freeze().unwrap()).unwrap();
+        drop(owner);
+        let counterpart = remanence_state::tape_log::store::Store::open(
+            &directory,
+            other_tape,
+            &f.state.paths().sqlite_path,
+        )
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .record_evidence(1)
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            counterpart.kind,
+            remanence_state::tape_log::Tag::Initialized
+        );
+        runtime
+            .append(|authority, _| {
+                authority.manual_finalization_accepted(
+                    lib::ManualFinalizationAccepted {
+                        at: lib::TapeAt {
+                            tape: lib::TapeRef {
+                                uuid: other_tape,
+                                incarnation: 1,
+                            },
+                            sequence: 1,
+                            record_digest: counterpart.digest,
+                        },
+                        operation: [0x98; 16],
+                        actor_fingerprint: "wdrv-test".into(),
+                        idempotency_key: [0x98; 16],
+                        request_fingerprint: [0x99; 32],
+                        assignment_generation: runtime
+                            .tape_state(other_tape)
+                            .unwrap()
+                            .assignment_generation,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    &Present,
+                )
+            })
+            .unwrap();
+        let error = runtime.active_drive_uuid_for_serial(SERIAL).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("drive observation needs resolved authority"),
+            "{error}"
+        );
+        let cfg = test_state_write_owner_config(
+            &f.state,
+            &f.library,
+            library_snapshot_cell(f.library.library().clone()),
+        );
+        let drive = f
+            .library
+            .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
+            .unwrap();
+        let tx = spawn_drive_actor(BAY, drive, cfg);
+        let session = open_with_request_identity(&f, &tx, None).await;
+        let records = native_records(&f.state);
+        let open = records
+            .iter()
+            .find_map(|record| match record {
+                NativeRecord::SessionOpened(v) => Some(v),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(open.drive.serial, SERIAL);
+        assert_eq!(
+            open.drive.drive_uuid, None,
+            "record has no guessed identity"
+        );
+        use rusqlite::OptionalExtension;
+        let conn = rusqlite::Connection::open(&f.state.paths().sqlite_path).unwrap();
+        let row: Option<(String, Option<Vec<u8>>)> = conn
+            .query_row(
+                "select drive_serial,drive_uuid from sessions
+                 where session_id=?1 and session_kind='write'",
+                [session.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        // Projection may wait on the unresolved library log; T-A covers the row.
+        if let Some((serial, identity)) = &row {
+            assert_eq!(serial, SERIAL, "projected physical serial");
+            assert_eq!(*identity, None, "projected identity stays NULL");
+        }
+        println!("T-R session row present: {}", row.is_some());
+        assert!(runtime.active_drive_uuid_for_serial(SERIAL).is_err());
+        close_session(&tx, session).await;
+    }
+
+    /// T-A2: absent and mismatching request identities cannot replace the
+    /// physical drive's observed identity in either durable or projected facts.
+    #[tokio::test]
+    async fn daemon_session_uses_observed_identity_over_request() {
+        for requested in [None, Some(vec![0xee; 16])] {
+            let mut f = fixture();
+            let observed = f
+                .state
+                .library_runtime()
+                .observe_drives(vec![DriveObservationInput {
+                    serial: SERIAL.into(),
+                    identity_source: "DvcidAndInquiry".into(),
+                    vendor: None,
+                    product: None,
+                    firmware_rev: None,
+                    managed: "rem".into(),
+                    library_serial: Some(LIBRARY.into()),
+                    element_address: Some(BAY.into()),
+                    observed_at_utc: None,
+                }])
+                .unwrap()
+                .remove(0)
+                .drive_uuid;
+            assert_ne!(requested.as_ref(), Some(&observed));
+            let cfg = test_state_write_owner_config(
+                &f.state,
+                &f.library,
+                library_snapshot_cell(f.library.library().clone()),
+            );
+            let drive = f
+                .library
+                .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
+                .unwrap();
+            let tx = spawn_drive_actor(BAY, drive, cfg);
+            let session = open_with_request_identity(&f, &tx, requested.clone()).await;
+            let row = drive_row(&f.state, session);
+            assert_eq!(row[0], Value::Text(SERIAL.into()), "physical serial");
+            assert_eq!(
+                row[1],
+                Value::Blob(observed.clone()),
+                "row uses observed identity; request={requested:?}"
+            );
+            let records = native_records(&f.state);
+            let open = records
+                .iter()
+                .find_map(|record| match record {
+                    NativeRecord::SessionOpened(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(open.drive.serial, SERIAL);
+            assert_eq!(
+                open.drive.drive_uuid,
+                Some(observed.try_into().unwrap()),
+                "record uses observed identity; request={requested:?}"
+            );
+            close_session(&tx, session).await;
+        }
+    }
+
     /// T-P: an existing unserialized mock is refused at actor open, before
     /// its requested LOAD, before SessionOpened, and without fencing its tape.
     #[tokio::test]
@@ -18753,6 +19007,17 @@ tape_catalog_dir="{0}/cache"
             &f.library,
             library_snapshot_cell(f.library.library().clone()),
         );
+        // busy_error renders this lifecycle's holder only for reserved bays.
+        let pool = crate::drive_pool::DrivePool::new_with_lifecycle(
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(HashMap::from([(
+                crate::drive_pool::DriveKey::new(LIBRARY, BAY),
+                AtomicBool::new(true),
+            )])),
+            cfg.lifecycle.clone().unwrap(),
+        );
+        let checkpoint_dir = cfg.checkpoint_journal_dir.clone();
         let path = Path::new("/fixture/wdrv-no-serial");
         let log = RecordingLog::new();
         let drive = DriveHandle::open_standalone_with_transport(
@@ -18812,6 +19077,23 @@ tape_catalog_dir="{0}/cache"
                 .any(|r| matches!(r, NativeRecord::SessionOpened(_))),
             "no SessionOpened"
         );
+        assert_eq!(
+            pool.busy_error().message(),
+            "all drives are busy",
+            "serial refusal must not set a lifecycle holder"
+        );
+        let authority = remanence_state::TapeAuthority::open(
+            &checkpoint_dir,
+            TAPE,
+            &f.state.paths().sqlite_path,
+        )
+        .unwrap();
+        drop(
+            authority
+                .acquire_exclusive()
+                .expect("serial refusal takes no tape lease"),
+        );
+        f.state.library_runtime().catch_up().unwrap();
         assert!(
             !index
                 .tape_io_is_fenced(Some(&TAPE), Some(BARCODE), Some(&endpoint))
@@ -18822,8 +19104,8 @@ tape_catalog_dir="{0}/cache"
         assert!(
             !commands[before..]
                 .iter()
-                .any(|c| matches!(c.first(), Some(0x1b | 0xa5))),
-            "no LOAD or MOVE dispatched"
+                .any(|c| matches!(c.first(), Some(0x1b))),
+            "no LOAD dispatched"
         );
         assert_eq!(commands.len(), before, "refusal precedes drive commands");
         drop(commands);

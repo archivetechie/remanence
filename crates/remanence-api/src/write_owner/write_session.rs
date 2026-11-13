@@ -2775,8 +2775,12 @@ pub(super) fn handle_drive_open_write(
         Some(runtime) => match runtime.active_drive_uuid_for_serial(&serial) {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = reply.send(Err(Status::failed_precondition(error.to_string())));
-                return None;
+                tracing::warn!(
+                    drive_serial = %serial,
+                    %error,
+                    "drive attribution unavailable; recording serial without catalogue identity"
+                );
+                None
             }
         },
         None => None,
