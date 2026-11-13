@@ -25151,6 +25151,9 @@ pool_id = "init-test"
         );
     }
 
+    /// D-C3a-2c-1: item 37 removed preservation; pin its refusal, the exact
+    /// erased identities and states in the receipt, and their absent catalog rows.
+    /// The stdout's empty preserved-tapes clause is a next-landing row.
     #[test]
     fn catalog_reset_reports_exact_preserved_tapes_and_states() {
         let temp = tempfile::Builder::new()
@@ -25189,11 +25192,10 @@ tape_catalog_dir = "{0}/cache/tapes"
         )
         .expect("write config");
         {
-            let state = remanence_state::StateHandle::open_from_config_file(&config_path)
+            let mut state = remanence_state::StateHandle::open_from_config_file(&config_path)
                 .expect("open state");
             for (tape_uuid, voltag) in [([0xA1; 16], "RMN009L9"), ([0xA2; 16], "RMN010L9")] {
                 state
-                    .write_handle()
                     .provision_tape(remanence_state::ProvisionTapeInput {
                         tape_uuid,
                         voltag: voltag.to_string(),
@@ -25203,15 +25205,37 @@ tape_catalog_dir = "{0}/cache/tapes"
                     })
                     .expect("provision tape");
             }
-            state
-                .write_handle()
-                .seal_tape([0xA2; 16])
-                .expect("seal second tape");
         }
+        let cli = DebugCli::parse_from([
+            "rem-debug",
+            "catalog",
+            "reset-preflight",
+            "--config",
+            config_path.to_str().expect("utf8 config path"),
+            "--preserve-tape-voltag",
+            "RMN009L9",
+        ]);
+        let mut out = Vec::<u8>::new();
+        let mut err = Vec::<u8>::new();
+        let code = run_debug(
+            cli,
+            move || -> Result<DiscoveryReport, DiscoveryError> {
+                panic!("discover_fn must not be called for catalog preflight")
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        let stderr = String::from_utf8(err).expect("stderr utf8");
+        assert!(
+            stderr.contains("declared reset does not import preserved catalog identities"),
+            "{stderr}"
+        );
+
         let admitted = remanence_state::StateHandle::preflight_catalog_reset_from_config_file(
             &config_path,
-            &["RMN009L9".to_string(), "RMN010L9".to_string()],
             &[],
+            &["RMN009L9".to_string(), "RMN010L9".to_string()],
         )
         .expect("preflight reset");
         let cli = DebugCli::parse_from([
@@ -25221,9 +25245,9 @@ tape_catalog_dir = "{0}/cache/tapes"
             "--config",
             config_path.to_str().expect("utf8 config path"),
             "--i-understand-this-erases-the-catalog",
-            "--preserve-tape-voltag",
+            "--allow-erase-tape-voltag",
             "RMN009L9",
-            "--preserve-tape-voltag",
+            "--allow-erase-tape-voltag",
             "RMN010L9",
             "--expected-preflight-token",
             admitted.preflight_token.as_str(),
@@ -25244,10 +25268,33 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
         assert_eq!(
             String::from_utf8(out).expect("stdout utf8"),
-            "catalog reset ok; preserved tapes: RMN009L9 (ready), RMN010L9 (recovery_required)\n"
+            "catalog reset ok; preserved tapes: \n"
         );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("authority-reset-receipt.json"))
+                .expect("read reset receipt"),
+        )
+        .expect("reset receipt JSON");
+        let tapes = receipt["tapes"].as_array().expect("receipt tapes array");
+        assert_eq!(tapes.len(), 2);
+        for tape_uuid in [[0xA1; 16], [0xA2; 16]] {
+            assert!(tapes.iter().any(|tape| {
+                tape["tape_uuid"] == json!(tape_uuid) && tape["state"] == "typed_identity"
+            }));
+        }
+        let catalog =
+            remanence_state::CatalogReader::open(temp.path().join("index/rem-state.sqlite"))
+                .expect("reopen catalog");
+        for voltag in ["RMN009L9", "RMN010L9"] {
+            assert!(catalog
+                .get_tape_by_voltag(voltag)
+                .expect("get tape")
+                .is_none());
+        }
     }
 
+    /// D-C3a-2c-1: item 37's declared reset reports typed data and cleaning
+    /// inventory with stable JSON fields when both labels are allow-listed.
     #[test]
     fn catalog_reset_preflight_emits_stable_all_kinds_json() {
         let temp = tempfile::Builder::new()
@@ -25286,10 +25333,9 @@ tape_catalog_dir = "{0}/cache/tapes"
         )
         .expect("write config");
         {
-            let state = remanence_state::StateHandle::open_from_config_file(&config_path)
+            let mut state = remanence_state::StateHandle::open_from_config_file(&config_path)
                 .expect("open state");
             state
-                .write_handle()
                 .provision_tape(remanence_state::ProvisionTapeInput {
                     tape_uuid: [0xB1; 16],
                     voltag: "RMN009L9".to_string(),
@@ -25299,19 +25345,9 @@ tape_catalog_dir = "{0}/cache/tapes"
                 })
                 .expect("provision data");
             state
-                .write_handle()
-                .provision_tape(remanence_state::ProvisionTapeInput {
-                    tape_uuid: [0xB2; 16],
-                    voltag: "CLN001L9".to_string(),
-                    block_size: 1024 * 1024,
-                    parity: remanence_parity::ParityConfig::None,
-                    force: false,
-                })
-                .expect("provision cleaning");
-            state
-                .write_handle()
-                .set_tape_kind(&[0xB2; 16], "cleaning")
-                .expect("set cleaning kind");
+                .library_runtime()
+                .register_cleaning_cartridge("CLN001L9", 1)
+                .expect("register cleaning cartridge");
         }
         let cli = DebugCli::parse_from([
             "rem-debug",
@@ -25319,7 +25355,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             "reset-preflight",
             "--config",
             config_path.to_str().expect("utf8 config path"),
-            "--preserve-tape-voltag",
+            "--allow-erase-tape-voltag",
             "RMN009L9",
             "--allow-erase-tape-voltag",
             "CLN001L9",
@@ -25341,10 +25377,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             serde_json::from_slice(&out).expect("preflight JSON document");
         assert_eq!(document["schema"], "rem.catalog.reset-preflight.v1");
         assert_eq!(document["ok"], true);
-        assert_eq!(
-            document["source_schema_version"],
-            remanence_state::SCHEMA_VERSION
-        );
+        assert_eq!(document["source_schema_version"], 0);
         assert_eq!(document["resume_exact"], false);
         assert_eq!(
             document["preflight_token"]
@@ -25374,7 +25407,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             tape["voltag"] == "RMN009L9"
                 && tape["kind"] == "data"
                 && tape["block_size"] == 1024 * 1024
-                && tape["assignment_generation"] == 0
+                && tape["assignment_generation"] == 1
         }));
         assert!(tapes.iter().any(|tape| {
             tape["voltag"] == "CLN001L9"
@@ -26091,11 +26124,11 @@ tape_catalog_dir = "{0}/cache/tapes"
         path
     }
 
+    /// D-C3a-2c-1: seed typed tape identity through the shared retire-test funnel.
     fn provision_retire_test_tape(config_path: &Path, tape_uuid: [u8; 16], voltag: &str) {
-        let handle =
+        let mut handle =
             remanence_state::StateHandle::open_from_config_file(config_path).expect("open state");
         handle
-            .write_handle()
             .provision_tape(remanence_state::ProvisionTapeInput {
                 tape_uuid,
                 voltag: voltag.to_string(),
