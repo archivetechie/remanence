@@ -3766,12 +3766,13 @@ fn explicit_endpoint_connection_error_has_no_setup_hint() {
     }
 }
 
-/// The public local rebuild command reconstructs tape-level verification from audit authority.
+/// The public local rebuild command reconstructs tape-level verification from the typed verdict
+/// record (D-C3a-2-1).
 #[test]
 fn rebuild_command_restores_tape_verification_record() {
-    use ciborium::value::Value;
     use remanence_state::{
-        AuditActor, AuditEvent, AuditEventRecord, AuditSubject, FileAuditLog, SourceLayer,
+        library_log::{AuditActor, VerificationOutcome},
+        library_runtime::VerdictFacts,
     };
     let f = VersionFixture::with_parity(false);
     let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
@@ -3780,30 +3781,44 @@ fn rebuild_command_restores_tape_verification_record() {
         .replace("[journal]\n", "[journal]\nrequire_trusted_volume = false\n");
     std::fs::write(f.config(), text).unwrap();
     let config = remanence_state::load_config(f.config()).unwrap();
-    let record = FileAuditLog::open(&config.audit.dir, false)
-        .unwrap()
-        .append_and_return_record(AuditEventRecord {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: Some(uuid::Uuid::new_v4()),
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::OperationFinished,
-            subject: AuditSubject {
-                kind: "tape".into(),
-                id: Some(uuid::Uuid::from_slice(&tape.tape_uuid).unwrap().to_string()),
+    let before_verdict = f.root.path().join("projection-before-verdict.sqlite");
+    std::fs::copy(&config.index.sqlite_path, &before_verdict).unwrap();
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let operation = *uuid::Uuid::new_v4().as_bytes();
+    state
+        .library_runtime()
+        .record_verification_verdict(
+            operation,
+            tape.tape_uuid.as_slice().try_into().unwrap(),
+            VerdictFacts {
+                native_reference: None,
+                outcome: VerificationOutcome::VerifiedComplete,
+                unprotected: None,
+                modes: 0x7f,
+                edition_digest: Some([0x67; 32]),
             },
-            detail: std::collections::BTreeMap::from([
-                (
-                    "operation_kind".into(),
-                    Value::Text("tape_verification".into()),
-                ),
-                ("tape_uuid".into(), Value::Bytes(tape.tape_uuid.to_vec())),
-                ("verification_state".into(), Value::Integer(2.into())),
-                ("edition_digest".into(), Value::Bytes(vec![0x67; 32])),
-            ]),
+            AuditActor::System,
+        )
+        .unwrap();
+    drop(state);
+    let records = library_records_read_only(&f.config(), library_uuid);
+    let record = records
+        .iter()
+        .find(|record| {
+            record
+                .verification_verdict()
+                .is_some_and(|verdict| verdict.operation == operation)
         })
         .unwrap();
+    let expected_time = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+        record.envelope.timestamp_unix_ns,
+    ))
+    .unwrap()
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap();
+    // Keep the typed authority but remove the projection made by the append.
+    std::fs::copy(&before_verdict, &config.index.sqlite_path).unwrap();
     assert!(f
         .index()
         .get_tape(&tape.tape_uuid)
@@ -3832,7 +3847,7 @@ fn rebuild_command_restores_tape_verification_record() {
         let rebuilt = f.index().get_tape(&tape.tape_uuid).unwrap().unwrap();
         assert_eq!(
             rebuilt.last_verified_at_utc.as_deref(),
-            Some(record.1.timestamp_utc.as_str())
+            Some(expected_time.as_str())
         );
         assert_eq!(rebuilt.last_verification_state, Some(2));
         assert_eq!(rebuilt.last_verified_edition_digest, Some(vec![0x67; 32]));
@@ -3871,6 +3886,8 @@ fn authority_hashes(
     visit(&config.audit.dir, &mut hashes);
     hashes
 }
+/// Rebuild preserves typed library and tape authority byte for byte, including a torn final
+/// library-log prefix and ambiguity markers (D-C3a-2-1).
 #[test]
 fn cli_projection_rebuild_hashes_logs_audit_and_ambiguity_markers_without_reset() {
     let f = VersionFixture::with_parity(false);
@@ -3891,17 +3908,17 @@ fn cli_projection_rebuild_hashes_logs_audit_and_ambiguity_markers_without_reset(
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(out.contains("tape logs: 1"), "{out}");
     assert_eq!(authority_hashes(&config), before);
-    // A normal audit-writer open truncates this valid partial trailing prefix.
-    // Protected rebuild must preserve it byte-for-byte as an immutable input.
-    let audit_path = before
+    // Replay tolerates a torn trailing prefix in the final library-log segment; only explicit
+    // tail repair rewrites it, so protected rebuild must leave it byte for byte.
+    let library_path = before
         .keys()
-        .find(|p| p.extension().is_some_and(|e| e == "remaudit"))
+        .find(|p| p.extension().is_some_and(|e| e == "remlib"))
         .unwrap();
     {
         use std::io::Write;
         std::fs::OpenOptions::new()
             .append(true)
-            .open(audit_path)
+            .open(library_path)
             .unwrap()
             .write_all(&[0, 0])
             .unwrap();
@@ -3938,6 +3955,8 @@ fn cli_projection_rebuild_does_not_create_an_audit_segment() {
     assert_eq!(std::fs::read_dir(&config.audit.dir).unwrap().count(), 0);
 }
 
+/// Declared reset of the schema-22 predecessor admits fresh I/O and leaves exactly one reset
+/// boundary diagnostic as the first typed library-log record (D-C3a-2-1).
 #[test]
 fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
     let f = VersionFixture::with_parity(false);
@@ -3992,9 +4011,20 @@ fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
         std::fs::read(output.join("after-reset.txt")).unwrap(),
         b"after declared reset"
     );
-    let audit = remanence_state::FileAuditLog::replay(&config.audit.dir).unwrap();
-    assert!(audit.iter().any(|r| r.detail.get("action")
-        == Some(&ciborium::value::Value::Text("declared_state_reset".into()))));
+    let records = ruling24_library_records(&f.config());
+    let reset_positions: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            record.diagnostic().and_then(|diagnostic| {
+                (diagnostic.event == remanence_state::library_log::DiagnosticEvent::RecoveryEvent
+                    && diagnostic.subject_kind.as_str() == "authority-reset")
+                    .then_some(position)
+            })
+        })
+        .collect();
+    assert_eq!(reset_positions.len(), 1);
+    assert_eq!(reset_positions[0], 0);
 }
 
 /// Declared reset archives authority and admits fresh initialization and I/O.
