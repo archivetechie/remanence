@@ -3,7 +3,12 @@
 //! Reopening and startup_replay exercise today's actual restart/rebuild path.
 
 use ciborium::value::Value;
+use remanence_library::{
+    motion::{LoadConfirmation, MotionAuthority, MotionCommand, MotionContext},
+    outcome::CompletionEvidence,
+};
 use remanence_parity::ParityConfig;
+use remanence_state::library_log as lib;
 use remanence_state::*;
 use std::collections::BTreeMap;
 use std::fs;
@@ -135,7 +140,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         self.index()
             .observe_drive(DriveObservationInput {
                 serial: "B1-DRIVE".into(),
-                identity_source: "vpd".into(),
+                identity_source: "DvcidAndInquiry".into(),
                 vendor: None,
                 product: None,
                 firmware_rev: None,
@@ -173,14 +178,12 @@ fn current_empty_rebuild_label_after_rebind_kept() {
     assert_eq!(read(&mut s), before);
 }
 
-/// B4b flips this to kept.
+/// The first landing keeps geometry, pool and label from Reprovision without a native tape log.
+/// D-C3b-S-1: the library record alone rebuilds the provisioned tape.
 #[test]
-fn current_empty_rebuild_logless_provision_geometry_pool_lost() {
+fn current_empty_rebuild_logless_provision_geometry_pool_kept() {
     let mut s = State::new();
     s.provision(1, "B1001L9");
-    s.index()
-        .project_tape_pool_membership([1; 16], "archive")
-        .unwrap();
     let tape = s.index().get_tape(&[1; 16]).unwrap().unwrap();
     assert_eq!(tape.block_size, Some(262144));
     assert_eq!(tape.pool_id.as_deref(), Some("archive"));
@@ -190,8 +193,14 @@ fn current_empty_rebuild_logless_provision_geometry_pool_lost() {
             .count(),
         0
     );
+    let before = (tape.block_size, tape.pool_id, tape.voltag);
+    assert_eq!(
+        before,
+        (Some(262144), Some("archive".into()), Some("B1001L9".into()))
+    );
     s.empty_rebuild();
-    assert!(s.index().get_tape(&[1; 16]).unwrap().is_none());
+    let tape = s.index().get_tape(&[1; 16]).unwrap().unwrap();
+    assert_eq!((tape.block_size, tape.pool_id, tape.voltag), before);
 }
 
 #[test]
@@ -211,15 +220,18 @@ fn current_empty_rebuild_audited_logless_provision_geometry_pool_kept() {
     assert_eq!(read(&mut s), before);
 }
 
-/// B4b flips this to kept.
+/// The first landing keeps the readiness owner and LOAD budget from typed observations and intents.
+/// D-C3b-S-1: failed LOAD completions close motion without closing the readiness owner.
 #[test]
-fn current_empty_rebuild_readiness_operation_and_load_budget_lost() {
+fn current_empty_rebuild_readiness_operation_and_load_budget_kept() {
     let mut s = State::new();
-    let operation_id = Uuid::new_v4();
+    s.drive();
     let endpoint = DriveKey::new("B1-LIBRARY", 1);
-    s.index()
-        .record_media_readiness_operation(MediaReadinessOperationInput {
-            operation_id,
+    let operation_id = s
+        .index()
+        .begin_typed_media_readiness_operation(MediaReadinessOperationInput {
+            // The unowned producer replaces this placeholder with its minted identity.
+            operation_id: Uuid::nil(),
             run_id: None,
             endpoint: endpoint.clone(),
             changer_sg: None,
@@ -227,40 +239,36 @@ fn current_empty_rebuild_readiness_operation_and_load_budget_lost() {
             drive_serial: Some("B1-DRIVE".into()),
             barcode: Some("B1001L9".into()),
             source_slot: None,
-            media_generation: Some(9),
+            media_generation: None,
             media_family: None,
-            phase: "load".into(),
+            phase: "readiness_poll".into(),
             state: "planned".into(),
             dirty_scope: Some("drive+tape".into()),
             deadline_at_utc: None,
             evidence_path: None,
         })
-        .unwrap();
+        .unwrap()
+        .operation_id;
+    let operation_id = Uuid::parse_str(&operation_id).unwrap();
+    let runtime = s.state().library_runtime();
+    let context = MotionContext {
+        parent_operation: Some(*operation_id.as_bytes()),
+        load_confirmation: LoadConfirmation::Readiness,
+        ..Default::default()
+    };
+    let failure = CompletionEvidence {
+        failed: true,
+        scsi_status: Some(2),
+        opcode: Some(0x1b),
+        ..CompletionEvidence::success()
+    };
     for _ in 0..2 {
-        s.index()
-            .record_media_readiness_transition(MediaReadinessTransitionInput {
-                completion_evidence: None,
-                operation_id,
-                phase: Some("load".into()),
-                state: "pre_ready_loading".into(),
-                dirty_scope: Some("drive+tape".into()),
-                last_cdb_opcode: Some(0x1b),
-                last_sense_raw: None,
-                last_sense_key: None,
-                last_asc: None,
-                last_ascq: None,
-                last_host_status: None,
-                last_driver_status: None,
-                target_status: None,
-                transport_class: None,
-                cancel_source: None,
-                signal: None,
-                evidence_path: None,
-                last_error_json: None,
-                quarantine_id: None,
-            })
+        let ticket = runtime
+            .intent(&MotionCommand::Load(endpoint.clone()), &context)
             .unwrap();
+        runtime.failed(ticket, &failure).unwrap();
     }
+    drop(runtime);
     assert_eq!(
         s.index()
             .media_readiness_load_attempts_since_ready(operation_id)
@@ -285,14 +293,17 @@ fn current_empty_rebuild_readiness_operation_and_load_budget_lost() {
         s.index()
             .media_readiness_load_attempts_since_ready(operation_id)
             .unwrap(),
-        0
+        2
     );
-    assert!(s
-        .index()
-        .media_readiness_operation(operation_id)
-        .unwrap()
-        .is_none());
-    assert!(s
+    assert_eq!(
+        s.index()
+            .media_readiness_operation(operation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "pre_ready_loading"
+    );
+    assert!(!s
         .index()
         .media_readiness_admission_conflicts(&endpoint, None, None, false)
         .unwrap()
@@ -339,11 +350,12 @@ fn current_empty_rebuild_repair_is_refused_and_leaves_the_projection_floor() {
     assert_eq!(s.index().projected_through_sequence(id).unwrap(), floor);
 }
 
-/// Retirement wins over an older native seal, even with an empty projection.
-/// This pins no resurrection without asserting a duplicate TapeSealed audit.
+/// The first landing keeps retirement over an older native seal, even with an empty projection.
+/// D-C3b-S-1: Reprovision supplies identity authority before the native seal and typed retirement.
 #[test]
 fn current_empty_rebuild_retired_sealed_identity_kept() {
     let mut s = State::new();
+    s.provision(0xa3, "B1003L9");
     let id = [0xa3; 16];
     let path = s
         .state()
@@ -414,57 +426,107 @@ fn current_empty_rebuild_cached_wrap_map_lost() {
         .is_map_servable([1; 16], epoch));
 }
 
-/// B4b flips this to kept. Each production non-terminal phase holds the drive.
+/// The first landing keeps each nonterminal cleaning phase holding its drive via CleaningRecorded.
+/// D-C3b-S-1: Begin and the selected phase rebuild the active run after SQLite loss.
 #[test]
-fn current_empty_rebuild_clean_run_nonterminal_states_lost() {
-    for phase in [
-        "fencing",
-        "selecting",
-        "moving-in",
-        "cleaning",
-        "moving-back",
-        "verifying",
+fn current_empty_rebuild_clean_run_nonterminal_states_kept() {
+    for (phase, expected) in [
+        (lib::CleanPhase::Fencing, "fencing"),
+        (lib::CleanPhase::Selecting, "selecting"),
+        (lib::CleanPhase::MovingIn, "moving-in"),
+        (lib::CleanPhase::Cleaning, "cleaning"),
+        (lib::CleanPhase::MovingBack, "moving-back"),
+        (lib::CleanPhase::Verifying, "verifying"),
     ] {
         let mut s = State::new();
         let drive = s.drive();
-        let run = s
-            .index()
-            .begin_clean_run(&drive, "B1-LIBRARY", "manual", None)
+        let runtime = s.state().library_runtime();
+        let home_slot = 0x0400;
+        let cartridge = runtime
+            .register_cleaning_cartridge("CLN001L9", home_slot)
             .unwrap();
-        s.index()
-            .advance_clean_run(&run.run_id, phase, None)
+        let run = Uuid::new_v4().to_string();
+        runtime
+            .record_cleaning_action(
+                &run,
+                Some(drive.clone().try_into().unwrap()),
+                None,
+                lib::CleaningAction::Begin(lib::Begin {
+                    trigger: lib::CleanTrigger::Manual,
+                }),
+                lib::AuditActor::System,
+            )
             .unwrap();
+        let selecting = phase == lib::CleanPhase::MovingIn;
+        runtime
+            .record_cleaning_action(
+                &run,
+                None,
+                selecting.then_some(cartridge),
+                lib::CleaningAction::Advance(lib::Advance {
+                    phase,
+                    home_slot: selecting.then_some(home_slot),
+                }),
+                lib::AuditActor::System,
+            )
+            .unwrap();
+        drop(runtime);
         assert_eq!(
             s.index()
                 .get_active_clean_run_by_drive(&drive)
                 .unwrap()
                 .unwrap()
                 .phase,
-            phase
+            expected
         );
         s.empty_rebuild();
-        assert!(
+        assert_eq!(
             s.index()
                 .get_active_clean_run_by_drive(&drive)
                 .unwrap()
-                .is_none(),
-            "{phase}"
+                .unwrap()
+                .phase,
+            expected
         );
     }
 }
 
-/// B4b flips this to kept.
+/// The first landing keeps a cleaning drive fence from FenceRaised and the typed drive identity.
+/// D-C3b-S-1: rebuilding and reobserving the same drive both retain its fence and UUID.
 #[test]
-fn current_empty_rebuild_drive_fence_lost() {
+fn current_empty_rebuild_drive_fence_kept() {
     let mut s = State::new();
     let drive = s.drive();
-    s.index().set_drive_fenced(&drive, true).unwrap();
+    s.state()
+        .library_runtime()
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    detail: lib::Bounded(vec![]),
+                    kind: lib::FenceKind::DriveFault,
+                    scope: lib::FenceScope::Drive(lib::DriveKey::Bay(lib::Bay {
+                        library_serial: "B1-LIBRARY".into(),
+                        bay: 1,
+                    })),
+                    cause: lib::FenceCause::Cleaning,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
     assert!(s.index().get_drive_by_uuid(&drive).unwrap().unwrap().fenced);
     s.empty_rebuild();
-    assert!(s.index().get_drive_by_uuid(&drive).unwrap().is_none());
+    let rebuilt = s.index().get_drive_by_uuid(&drive).unwrap().unwrap();
+    assert_eq!((rebuilt.drive_uuid, rebuilt.fenced), (drive.clone(), true));
     let observed = s.drive();
+    assert_eq!(observed, drive);
     assert!(
-        !s.index()
+        s.index()
             .get_drive_by_uuid(&observed)
             .unwrap()
             .unwrap()
@@ -518,38 +580,41 @@ fn current_empty_rebuild_idempotency_registration_lost() {
         .is_none());
 }
 
+/// The first landing keeps a finished request and its idempotency scope from OperationRecorded.
+/// D-C3b-S-1: the runtime mints the accepted identity and records its terminal event.
 #[test]
-fn current_empty_rebuild_audited_idempotency_and_operation_kept() {
+fn current_empty_rebuild_idempotency_and_operation_kept() {
     let mut s = State::new();
     let key = Uuid::new_v4();
-    let operation = Uuid::new_v4();
-    for event in [AuditEvent::RequestReceived, AuditEvent::OperationFinished] {
-        FileAuditLog::open(&s.state().paths().audit_dir, true)
-            .unwrap()
-            .append(AuditEventRecord {
-                actor: AuditActor::System,
-                source_layer: SourceLayer::Layer5,
-                operation_id: Some(operation),
-                session_id: None,
-                idempotency_key: Some(key),
-                event,
-                subject: AuditSubject {
-                    kind: "tape".into(),
-                    id: Some(Uuid::from_bytes([1; 16]).to_string()),
-                },
-                detail: BTreeMap::from([
-                    ("operation_kind".into(), Value::Text("verify_tape".into())),
-                    ("actor_fingerprint".into(), Value::Text("operator".into())),
-                    ("request_fingerprint".into(), Value::Bytes(vec![7; 32])),
-                ]),
-            })
-            .unwrap();
-    }
-    s.state().replay_audit_projection().unwrap();
+    let runtime = s.state().library_runtime();
+    let (operation, _) = runtime
+        .accept_operation(
+            lib::OperationKind::TapeVerification,
+            lib::Accepted {
+                actor_fingerprint: "operator".into(),
+                idempotency_key: Some(*key.as_bytes()),
+                request_fingerprint: [7; 32],
+                subject: Some(Uuid::from_bytes([1; 16]).to_string().as_str().into()),
+            },
+            lib::AuditActor::System,
+        )
+        .unwrap();
+    runtime
+        .record_operation_event(
+            operation,
+            lib::OperationKind::TapeVerification,
+            lib::OperationEvent::Finished(lib::Response {
+                response_fingerprint: None,
+            }),
+            lib::AuditActor::System,
+        )
+        .unwrap();
+    drop(runtime);
+    let operation = Uuid::from_bytes(operation);
     let read = |s: &mut State| {
         let scope = s
             .index()
-            .idempotency_scope_record("operator", "verify_tape", key)
+            .idempotency_scope_record("operator", "tape_verification", key)
             .unwrap()
             .unwrap();
         (
@@ -571,8 +636,12 @@ fn current_empty_rebuild_audited_idempotency_and_operation_kept() {
     assert_eq!(read(&mut s), before);
 }
 
-/// B4b flips this to kept. Operator annotations are another SQL-only fact.
+/// Drive stewardship is deferred to L2 (DriveStewardshipDeferred): rem drive annotate is refused
+/// before any drive record, proved by remanence-api stewardship_typed_annotate_is_deferred_before_any_write;
+/// this body characterises main's lost SQL-only note and drive row, while the typed row now survives,
+/// and is rewritten to kept with L2's stewardship order (D-C3b-S-1).
 #[test]
+#[ignore = "drive stewardship deferred to L2 (DriveStewardshipDeferred): rem drive annotate is refused before any drive record, proved by remanence-api stewardship_typed_annotate_is_deferred_before_any_write; this body characterises main (the SQL-only note and the drive row lost; the typed drive row now survives a rebuild) and is rewritten to kept with L2's stewardship order; D-C3b-S-1"]
 fn current_empty_rebuild_drive_annotation_lost() {
     let mut s = State::new();
     let drive = s.drive();
