@@ -16872,6 +16872,8 @@ tape_catalog_dir = "{0}/cache"
         );
     }
 
+    /// Pins the legacy rebuild’s authoritative tables and read-session drive identity
+    /// through the audit adapter, per D-C3a-S-1.
     #[test]
     fn rebuild_preserves_ds_m1_authoritative_tables_and_drive_session_projection() {
         let temp = tempfile::Builder::new()
@@ -16945,9 +16947,9 @@ tape_catalog_dir = "{0}/cache"
             None,
             Some(session_id),
             None,
-            "write",
+            "read",
             detail(&[
-                ("session_kind", CborValue::Text("write".to_string())),
+                ("session_kind", CborValue::Text("read".to_string())),
                 ("tape_uuid", CborValue::Bytes(tape_uuid.to_vec())),
                 ("library_serial", CborValue::Text("mainlib".to_string())),
                 ("drive_bay", CborValue::Integer(0x0100.into())),
@@ -17411,70 +17413,104 @@ tape_catalog_dir = "{0}/cache"
         assert_eq!(foreign_row.cleaning_due, "none");
     }
 
+    /// Pins the production drive and tape readers’ rollups over a typed read session, per D-C3a-S-1.
+    /// Native write sessions have no drive on their row (ledgered for the whole-branch review).
     #[test]
     fn correlation_rollups_use_sessions_snapshots_and_voltags() {
+        use crate::library_log as lib;
+        use crate::library_runtime::LibraryRuntime;
+        use std::sync::Arc;
+
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .expect("open");
+        let paths = crate::StatePaths {
+            config_path: temp.path().join("config"),
+            state_dir: temp.path().join("state"),
+            audit_dir: temp.path().join("library"),
+            journal_dir: temp.path().join("native"),
+            sqlite_path: temp.path().join("rem-state.sqlite"),
+            tape_cache_dir: temp.path().join("cache"),
+            calibration_dir: temp.path().join("calibration"),
+        };
+        let runtime = LibraryRuntime::open(
+            &paths,
+            true,
+            Arc::new(crate::StateLockGuard::acquire(&paths.state_dir).unwrap()),
+        )
+        .expect("open library runtime");
         let tape_uuid = [0x44; 16];
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: "RMJ042L9".to_string(),
-                block_size: 4096,
-                parity: ParityConfig::None,
-                force: false,
+        runtime
+            .append(|authority, view| {
+                authority.reprovision(
+                    lib::Reprovision {
+                        pool_source: Some(lib::PoolSource::Operator(lib::Unit)),
+                        operation: None,
+                        replaced_bot: None,
+                        tape: lib::TapeRef {
+                            uuid: tape_uuid,
+                            incarnation: 1,
+                        },
+                        predecessor: None,
+                        mode: lib::ProvisionMode::Initialize,
+                        label: Some("RMJ042L9".into()),
+                        label_provenance: Some(lib::LabelProvenance::Operator),
+                        parity_scheme: None,
+                        medium: lib::MediumSpec {
+                            family: lib::MediumFamily::Lto(lib::LtoGen::Lto9),
+                            usable_logical_bytes: 18_000_000_000_000,
+                            record_size: 262144,
+                            rerecord: true,
+                            lifecycle_ops: true,
+                            source: lib::GenerationSource::Operator,
+                        },
+                        pool: Some("rollups".into()),
+                        endpoint: None,
+                        adoption: None,
+                    },
+                    lib::AuditActor::User("reader".into()),
+                    lib::SourceLayer::Layer4,
+                    view,
+                )
             })
             .expect("provision tape");
-        let drive_uuid = index
-            .observe_drive(DriveObservationInput {
+        let observed = runtime
+            .observe_drives(vec![DriveObservationInput {
                 serial: "DRV-ROLL".to_string(),
-                identity_source: "DvcidAndInquiry".to_string(),
-                vendor: None,
-                product: None,
+                identity_source: "DvcidInline".to_string(),
+                vendor: Some("MODEL".to_string()),
+                product: Some("DRIVE".to_string()),
                 firmware_rev: None,
                 managed: "rem".to_string(),
                 library_serial: Some("mainlib".to_string()),
                 element_address: Some(0x0100),
-                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
-            })
-            .expect("observe drive")
-            .drive_uuid;
-        let session_id = Uuid::from_u128(0x4242);
-        let opened = audit_record(
-            1,
-            AuditEvent::SessionOpened,
-            None,
-            Some(session_id),
-            None,
-            "write",
-            detail(&[
-                ("session_kind", CborValue::Text("write".to_string())),
-                ("tape_uuid", CborValue::Bytes(tape_uuid.to_vec())),
-                ("library_serial", CborValue::Text("mainlib".to_string())),
-                ("drive_bay", CborValue::Integer(0x0100.into())),
-                ("drive_uuid", CborValue::Bytes(drive_uuid.clone())),
-            ]),
-        );
-        let closed = audit_record(
-            2,
-            AuditEvent::SessionClosed,
-            None,
-            Some(session_id),
-            None,
-            "write",
-            detail(&[("session_kind", CborValue::Text("write".to_string()))]),
-        );
-        index
-            .project_audit_record(&opened)
-            .expect("project opened session");
-        index
-            .project_audit_record(&closed)
-            .expect("project closed session");
+                observed_at_utc: None,
+            }])
+            .expect("observe drive");
+        let drive_uuid = observed[0].drive_uuid.clone();
+        let drive_id = <lib::Id>::try_from(drive_uuid.as_slice()).expect("drive UUID");
+        let endpoint = crate::DriveKey::new("mainlib", 0x0100);
+        let session = Uuid::from_u128(0x4242).into_bytes();
+        for event in [lib::SessionEvent::Opened, lib::SessionEvent::Closed] {
+            runtime
+                .observe_session(
+                    session,
+                    lib::SessionKind::Read,
+                    Some(&endpoint),
+                    Some(tape_uuid),
+                    event,
+                    None,
+                    lib::AuditActor::User("reader".into()),
+                    (Some(drive_id), Some("DRV-ROLL".into())),
+                )
+                .expect("observe read session");
+        }
+        let session_id = Uuid::from_bytes(session).to_string();
+        let mut index = crate::projector::open(&paths.sqlite_path)
+            .expect("open")
+            .with_library_runtime(runtime.clone())
+            .write_handle();
         index
             .record_drive_health_snapshot(DriveHealthSnapshotInput {
                 drive_uuid: drive_uuid.clone(),
@@ -22023,6 +22059,8 @@ tape_catalog_dir = "{0}/cache"
         }
     }
 
+    /// Pins legacy audit replay of operations, read sessions and idempotency
+    /// without changing their projected values, per D-C3a-S-1.
     #[test]
     fn audit_replay_projects_operations_sessions_and_idempotency() {
         let temp = tempfile::Builder::new()
@@ -22045,9 +22083,9 @@ tape_catalog_dir = "{0}/cache"
                 None,
                 Some(session_id),
                 None,
-                "write",
+                "read",
                 detail(&[
-                    ("session_kind", CborValue::Text("write".to_string())),
+                    ("session_kind", CborValue::Text("read".to_string())),
                     ("tape_uuid", CborValue::Bytes(tape_uuid.clone())),
                     ("library_serial", CborValue::Text("LIB001".to_string())),
                     ("drive_bay", CborValue::Integer(3.into())),
@@ -22101,7 +22139,7 @@ tape_catalog_dir = "{0}/cache"
                 None,
                 Some(session_id),
                 None,
-                "write",
+                "read",
                 BTreeMap::new(),
             ),
         ];
@@ -22171,7 +22209,7 @@ tape_catalog_dir = "{0}/cache"
                 )
                 .expect("session row"),
             (
-                "write".to_string(),
+                "read".to_string(),
                 tape_uuid,
                 "LIB001".to_string(),
                 3,
