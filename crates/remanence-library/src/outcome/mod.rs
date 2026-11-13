@@ -997,8 +997,13 @@ pub fn classify(input: OutcomeInput) -> ClassifiedOutcome {
         }
     }
     if e.fact == CompletionFact::PartialWrite && authority && writing {
-        out.effect = Effect::WriteFence(FenceCause::PartialBatch);
-        out.reason = OutcomeReason::UncommittablePartialWrite;
+        if d.named_live_tail {
+            out.effect = Effect::NoFence;
+            out.reason = OutcomeReason::NamedLiveTail;
+        } else {
+            out.effect = Effect::WriteFence(FenceCause::PartialBatch);
+            out.reason = OutcomeReason::UncommittablePartialWrite;
+        }
         return out;
     }
     if e.completion == Completion::Unknown {
@@ -1033,8 +1038,13 @@ pub fn classify(input: OutcomeInput) -> ClassifiedOutcome {
         && authority
         && current.is_some_and(|s| s.key == 6 && s.asc == 0x29 && matches!(s.ascq, 0..=4 | 7))
     {
-        out.effect = Effect::WriteFence(FenceCause::ResetUnitAttention);
-        out.reason = OutcomeReason::ResetUnitAttention;
+        if d.named_live_tail {
+            out.effect = Effect::NoFence;
+            out.reason = OutcomeReason::NamedLiveTail;
+        } else {
+            out.effect = Effect::WriteFence(FenceCause::ResetUnitAttention);
+            out.reason = OutcomeReason::ResetUnitAttention;
+        }
         return out;
     }
     if class == CommandClass::SenseStatus
@@ -1074,15 +1084,20 @@ pub fn classify(input: OutcomeInput) -> ClassifiedOutcome {
             _ => {}
         }
     }
+    out.reason = OutcomeReason::DeviceFailure;
     out.effect = if writing
         && authority
         && (primary.fact == CompletionFact::PostTransferFailure || !e.definitely_rejected())
     {
-        Effect::WriteFence(FenceCause::TransferError)
+        if d.named_live_tail {
+            out.reason = OutcomeReason::NamedLiveTail;
+            Effect::NoFence
+        } else {
+            Effect::WriteFence(FenceCause::TransferError)
+        }
     } else {
         Effect::Transient
     };
-    out.reason = OutcomeReason::DeviceFailure;
     out
 }
 

@@ -144,11 +144,23 @@ type AppendReceiptWaiters = std::collections::HashMap<
     Vec<std::sync::Weak<std::sync::Mutex<Option<pb::ObjectRecord>>>>,
 >;
 
+/// A failed mounted append retains its evidence and caller until the ending decides its fence.
+struct PendingMountedAppendFailure {
+    classified: remanence_library::outcome::ClassifiedOutcome,
+    original_error: String,
+    caller_object_id: String,
+    batch: Option<PendingCheckpointBatch>,
+    typed_status: Status,
+    status: Status,
+    reply: Option<oneshot::Sender<Result<AppendFinishOutcome, Status>>>,
+}
+
 pub(super) struct WriteSessionState<'a> {
     closing_error: Option<Status>,
     closing_work: Option<crate::drive_pool::ClosingGuard>,
     end_reason: remanence_state::tape_log::SessionEndReason,
     ended_durably: bool,
+    pending_mounted_append_failure: Option<PendingMountedAppendFailure>,
     abort_reason: Option<String>,
     tail: super::session_tail::SessionTail,
     timers: super::timers::SessionTimers,
@@ -442,7 +454,39 @@ impl WriteSessionState<'_> {
             self.end_reason = remanence_state::tape_log::SessionEndReason::GracefulShutdown;
         }
         self.begin_closing_work();
-        if let Err(error) = self.finish_session() {
+        let ending_result = self.finish_session();
+        if let Some(failed) = self.pending_mounted_append_failure.take() {
+            let ending =
+                super::checkpoint::live_ending_outcome(&failed.classified, self.ended_durably);
+            let (fenced_status, persisted) = fence_failed_parity_raw_write(
+                self.index,
+                self.cfg,
+                &self.selected,
+                "object_append",
+                Some(&failed.caller_object_id),
+                failed.batch.as_ref(),
+                &ending,
+                &failed.original_error,
+                failed.status.clone(),
+            );
+            if persisted {
+                self.drive.mark_media_failure_outcome_applied();
+            }
+            // A failed batch keeps its all-objects retry message, as at the failure site.
+            let status = if failed.batch.is_some() {
+                failed.status
+            } else {
+                fenced_status
+            };
+            let reply = failed
+                .reply
+                .expect("mounted append wrapper retained its reply");
+            let _ = reply.send(Err(super::ActorFailure::preserve(
+                &failed.typed_status,
+                status,
+            )));
+        }
+        if let Err(error) = ending_result {
             if !self.ended_durably {
                 let outcome = super::checkpoint::ambiguous_authority_outcome();
                 let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect else {
@@ -776,7 +820,11 @@ impl WriteSessionState<'_> {
         if self.append_gate.poisoned || self.append_gate.sealed {
             self.begin_closing_work();
         }
-        let _ = reply.send(outcome);
+        if let Some(failed) = self.pending_mounted_append_failure.as_mut() {
+            failed.reply = Some(reply);
+        } else {
+            let _ = reply.send(outcome);
+        }
     }
 
     fn handle_append_finish_inner(&mut self, command: DriveCommand) {
@@ -1302,24 +1350,11 @@ impl WriteSessionState<'_> {
                 let mut status = status_from_selected_write_error(&selected, err);
                 let typed_status = status.clone();
                 if tape_started {
+                    let mut mounted_failure = None;
                     if let Some(before) = mounted_dispatches {
                         let classified =
                             super::checkpoint::write_failure_outcome(self.drive, before, None);
-                        let (fenced_status, persisted) = fence_failed_parity_raw_write(
-                            self.index,
-                            cfg,
-                            &selected,
-                            "object_append",
-                            Some(&current_caller_object_id),
-                            self.pending_batch.as_ref(),
-                            &classified,
-                            &original_error,
-                            status,
-                        );
-                        status = fenced_status;
-                        if persisted {
-                            self.drive.mark_media_failure_outcome_applied();
-                        }
+                        mounted_failure = Some(classified);
                     }
                     let failed_batch = self.pending_batch.take();
                     if let Some(batch) = failed_batch.as_ref() {
@@ -1329,6 +1364,17 @@ impl WriteSessionState<'_> {
                             current_caller_object_id,
                             batch.objects.len(),
                         ));
+                    }
+                    if let Some(classified) = mounted_failure {
+                        self.pending_mounted_append_failure = Some(PendingMountedAppendFailure {
+                            classified,
+                            original_error: original_error.clone(),
+                            caller_object_id: current_caller_object_id.clone(),
+                            batch: failed_batch,
+                            typed_status: typed_status.clone(),
+                            status: status.clone(),
+                            reply: None,
+                        });
                     }
                     self.end_reason = if self.tail.drive_failed() {
                         remanence_state::tape_log::SessionEndReason::DriveError
@@ -2752,6 +2798,7 @@ pub(super) fn handle_drive_open_write(
         closing_work: None,
         end_reason: remanence_state::tape_log::SessionEndReason::ClientDisconnected,
         ended_durably: false,
+        pending_mounted_append_failure: None,
         abort_reason: None,
         tail,
         timers: super::timers::SessionTimers::default(),

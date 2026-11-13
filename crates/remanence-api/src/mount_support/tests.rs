@@ -883,6 +883,7 @@ fn parity_import_is_refused_whether_or_not_the_source_log_is_present() {
     mount.release(mounted);
 }
 
+/// DEC-1 and D-N-1-1: the coupled failure latches until recovery, but a durable live ending owes no fence.
 #[test]
 fn combined_transport_and_audit_failure_latches_until_recovery_persists_quarantine() {
     let root = tempfile::tempdir().unwrap();
@@ -1038,8 +1039,7 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
         log.clear_ambiguity(&view).unwrap();
     }
     let mut state = reopen_state();
-    // A durable failed native ending still owes quarantine after the library
-    // publication failed. No write-session audit mirror supplies this evidence.
+    // DEC-1 and D-N-1-1: recovery preserves the durable ending without a quarantine.
     let recovered = self::backend(
         &mut state,
         &world,
@@ -1050,8 +1050,8 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
     drop(recovered);
     let expected = state.catalog().list_active_tape_io_fences().unwrap();
     assert!(
-        !expected.is_empty(),
-        "native failure debt must persist quarantine"
+        expected.is_empty(),
+        "a durable live ending owes no quarantine (DEC-1, D-N-1-1)"
     );
     let paths = state.paths().clone();
     let config = state.config().clone();
@@ -1065,8 +1065,7 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
     for _ in 0..2 {
         let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
         let actual = state.catalog().list_active_tape_io_fences().unwrap();
-        assert_eq!(actual.len(), expected.len());
-        assert_eq!(actual[0].quarantine_id, expected[0].quarantine_id);
+        assert!(actual.is_empty(), "rebuild preserves the no-fence ending");
         drop(state);
     }
 }
@@ -3421,7 +3420,7 @@ fn r3a_initialized_state(root: &Path, world: &SharedVirtualWorld) -> StateHandle
     state
 }
 
-/// A2: the production coupled failure reconstructs D4 and blocks the next mounted WRITE.
+/// DEC-1 and D-N-1-1: the coupled failure latches, then recovery admits a WRITE after its durable ending.
 #[test]
 fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
     use remanence_state::library_log as lib;
@@ -3465,12 +3464,14 @@ fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
         .unwrap()
         .is_empty());
     let marker = paths.audit_dir.join("library-log.fence-reconcile");
+    let names_tape = || match std::fs::read(&marker) {
+        Ok(bytes) => bytes.chunks_exact(16).any(|entry| entry == UUID),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("read reconcile marker: {error}"),
+    };
     assert!(
-        std::fs::read(&marker)
-            .unwrap()
-            .chunks_exact(16)
-            .any(|entry| entry == UUID),
-        "ruling-11 lost append must name its tape"
+        !names_tape(),
+        "a durable live ending owes no reconciled fence (DEC-1, D-N-1-1)"
     );
     std::fs::remove_dir(&audit_path).unwrap();
     std::fs::rename(audit_path.with_extension("saved"), &audit_path).unwrap();
@@ -3480,7 +3481,7 @@ fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
         .is_err());
     assert_eq!(dispatched_writes(&world), count);
     let _ = actor.finish();
-    let ending_at = {
+    {
         use lib::{
             native_view::NativeTapeView,
             store::{Clock, Origin, UuidSource},
@@ -3511,28 +3512,6 @@ fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
             end.reason,
             remanence_state::tape_log::SessionEndReason::DriveError
         );
-        let mut ending = None;
-        native
-            .visit_frames(|frame| {
-                if let remanence_state::tape_log::Record::SessionEnded(value) = &frame.record {
-                    if value.session_id == end.session_id {
-                        ending = Some(frame.sequence);
-                    }
-                }
-                Ok(())
-            })
-            .unwrap();
-        let sequence = ending.unwrap();
-        let evidence = native.record_evidence(sequence).unwrap().unwrap();
-        assert_eq!(evidence.kind, remanence_state::tape_log::Tag::SessionEnded);
-        let at = lib::TapeAt {
-            tape: lib::TapeRef {
-                uuid: UUID,
-                incarnation: 1,
-            },
-            sequence,
-            record_digest: evidence.digest,
-        };
         let view =
             NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
         let mut log = LibraryLog::open(
@@ -3550,28 +3529,15 @@ fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
         )
         .unwrap();
         log.clear_ambiguity(&view).unwrap();
-        assert!(marker.exists());
-        at
-    };
+        assert!(!names_tape());
+    }
     let mut state = reopen_state();
     let fences = state.catalog().list_active_tape_io_fences().unwrap();
-    assert_eq!(fences.len(), 1);
-    let id = fences[0].quarantine_id.clone();
-    assert_eq!(fences[0].reason, "authority_ambiguous");
-    let sequence = id.strip_prefix("library:").unwrap().parse().unwrap();
-    assert_eq!(
-        state.library_runtime().active_fence(sequence).unwrap(),
-        lib::FenceRaised {
-            kind: lib::FenceKind::Write,
-            scope: lib::FenceScope::Tape(ending_at.tape),
-            cause: lib::FenceCause::AuthorityAmbiguous,
-            evidence: None,
-            at: Some(ending_at),
-            operation: None,
-            detail: lib::Bounded(vec![]),
-        }
+    assert!(
+        fences.is_empty(),
+        "a durable live ending owes no quarantine (DEC-1, D-N-1-1)"
     );
-    assert!(!marker.exists());
+    assert!(!names_tape());
     let mut mount = backend(
         &mut state,
         &world,
@@ -3582,14 +3548,10 @@ fn r3a_recovered_fence_refuses_mounted_write_without_dispatch() {
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, _reopen_state) = own_mount!(mount, mounted, state);
     let before = dispatched_writes(&world);
-    let error = actor
+    actor
         .write_checkpointed(request(root.path(), "r3a-refused"))
-        .unwrap_err();
-    assert!(
-        error.to_string().contains(&id),
-        "refusal must name {id}: {error}"
-    );
-    assert_eq!(dispatched_writes(&world), before);
+        .unwrap();
+    assert!(dispatched_writes(&world) > before);
     actor.finish().unwrap();
 }
 

@@ -1104,3 +1104,96 @@ fn b3b_fix2_mounted_parity_poisoned_post_write() {
 fn b3b_fix2_mounted_r6_definite_rejection() {
     b3b_mounted_definite_rejection_no_fence();
 }
+
+/// Reclassifying at the ending preserves the command outcome until a durable tail exempts it.
+#[test]
+fn live_ending_outcome_matches_the_command_outcome_without_a_named_tail() {
+    use crate::write_owner::checkpoint::live_ending_outcome;
+    use remanence_library::outcome::*;
+    let context = OperationContext {
+        phase: Phase::Append,
+        region: Region::Unknown,
+        mounted: true,
+        ..Default::default()
+    };
+    let check = |key, asc| {
+        let mut sense = vec![0; 18];
+        sense[0] = 0x70;
+        sense[2] = key;
+        sense[7] = 10;
+        sense[12] = asc;
+        CompletionEvidence::from_scsi(&ScsiError::CheckCondition {
+            sense,
+            bytes_transferred: 0,
+        })
+    };
+    let mut partial = CompletionEvidence::success();
+    partial.failed = true;
+    partial.fact = CompletionFact::PartialWrite;
+    partial.requested_records = Some(4);
+    partial.records_transferred = Some(2);
+    let mut drift = CompletionEvidence::success();
+    drift.failed = true;
+    drift.fact = CompletionFact::PositionDrift;
+    let mut filemark = CompletionEvidence::unknown();
+    filemark.opcode = Some(0x10);
+    let mut cases = vec![(
+        "abandoned",
+        finish_abandoned_write_with_retry(context.clone(), RetryCause::Media),
+    )];
+    for (name, evidence) in [
+        ("unknown", CompletionEvidence::unknown()),
+        ("partial", partial),
+        ("reset", check(6, 0x29)),
+        ("device", check(3, 0x0c)),
+        ("drift", drift),
+        ("filemark", filemark),
+    ] {
+        cases.push((
+            name,
+            classify(OutcomeInput {
+                class: if evidence.opcode == Some(0x10) {
+                    CommandClass::WriteFilemarks {
+                        count: 0,
+                        immediate: false,
+                    }
+                } else {
+                    CommandClass::Write
+                },
+                context: context.clone(),
+                evidence,
+            }),
+        ));
+    }
+    // Check every false half before collecting the expected K0 true-half failures.
+    for (name, failed) in &cases {
+        let ending = live_ending_outcome(failed, false);
+        assert_eq!(ending.effect, failed.effect, "false effect {name}");
+        assert_eq!(ending.retry, failed.retry, "false retry {name}");
+        assert_eq!(ending.reason, failed.reason, "false reason {name}");
+        assert_eq!(
+            ending.completion, failed.completion,
+            "false completion {name}"
+        );
+        assert_eq!(
+            ending.requires_reproof, failed.requires_reproof,
+            "false reproof {name}"
+        );
+    }
+    let mut failures = Vec::new();
+    for (name, failed) in cases {
+        let ending = live_ending_outcome(&failed, true);
+        let expected = if name == "drift" {
+            Effect::WriteFence(FenceCause::PositionDrift)
+        } else {
+            Effect::NoFence
+        };
+        if ending.effect != expected {
+            failures.push(format!(
+                "true {name}: got {:?}, expected {expected:?}",
+                ending.effect
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

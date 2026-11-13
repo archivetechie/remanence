@@ -1844,6 +1844,35 @@ pub(super) fn write_closeout(
     result
 }
 
+/// Finish the failed mounted append with the durability of its native session ending.
+pub(super) fn live_ending_outcome(
+    failed: &remanence_library::outcome::ClassifiedOutcome,
+    ending_durable: bool,
+) -> remanence_library::outcome::ClassifiedOutcome {
+    use remanence_library::outcome::*;
+    classify(OutcomeInput {
+        class: if failed.evidence.opcode == Some(0x10) {
+            CommandClass::WriteFilemarks {
+                count: 0,
+                immediate: false,
+            }
+        } else {
+            CommandClass::Write
+        },
+        context: OperationContext {
+            phase: Phase::Append,
+            region: Region::Unknown,
+            mounted: true,
+            durability: DurabilityEvidence {
+                named_live_tail: ending_durable,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        evidence: failed.evidence.clone(),
+    })
+}
+
 /// Classify the new host publication fact without re-reading device evidence.
 pub(super) fn ambiguous_authority_outcome() -> remanence_library::outcome::ClassifiedOutcome {
     use remanence_library::outcome::*;

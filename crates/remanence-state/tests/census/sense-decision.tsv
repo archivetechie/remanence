@@ -5,6 +5,8 @@
 crates/remanence-api/src/append_admission.rs::finish_admission_refusal::classify	1
 # ambiguous_authority_outcome: Finishes the distinct unknown-authority-append fact.
 crates/remanence-api/src/write_owner/checkpoint.rs::ambiguous_authority_outcome::classify	1
+# live_ending_outcome: Finishes the distinct live-ending fact of a failed mounted append: the failed command's evidence with the ending's durability.
+crates/remanence-api/src/write_owner/checkpoint.rs::live_ending_outcome::classify	1
 # checked_epoch_rebuild: Finishes a new second-check mismatch or proved committed contradiction.
 crates/remanence-api/src/write_owner/checkpoint.rs::checked_epoch_rebuild::classify	2
 # fence_admission_contradiction: Finishes the new scoped append-authority contradiction; an already scoped suffix error retains its outcome.

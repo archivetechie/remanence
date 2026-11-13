@@ -1112,3 +1112,83 @@ fn b3b_w2_trace_cases() {
         );
     }
 }
+
+/// DEC-1 exempts known failed writes only after a durable live ending; composite fences remain.
+#[test]
+fn b3b_named_tail_exempts_known_write_failures() {
+    let mut partial = CompletionEvidence::success();
+    partial.failed = true;
+    partial.fact = CompletionFact::PartialWrite;
+    partial.requested_records = Some(4);
+    partial.records_transferred = Some(2);
+    let mut drift = CompletionEvidence::success();
+    drift.failed = true;
+    drift.fact = CompletionFact::PositionDrift;
+    let cases = [
+        (
+            "partial",
+            partial,
+            FenceCause::PartialBatch,
+            OutcomeReason::UncommittablePartialWrite,
+        ),
+        (
+            "reset",
+            check(6, 0x29, 0),
+            FenceCause::ResetUnitAttention,
+            OutcomeReason::ResetUnitAttention,
+        ),
+        (
+            "device",
+            check(3, 0x0c, 0),
+            FenceCause::TransferError,
+            OutcomeReason::DeviceFailure,
+        ),
+        (
+            "drift",
+            drift,
+            FenceCause::PositionDrift,
+            OutcomeReason::CommittedContradiction,
+        ),
+        (
+            "authority",
+            CompletionEvidence::success(),
+            FenceCause::AuthorityAmbiguous,
+            OutcomeReason::AuthorityAmbiguous,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, evidence, cause, reason) in cases {
+        let mut i = input(
+            CommandClass::Write,
+            Phase::Append,
+            Region::Unknown,
+            evidence,
+        );
+        i.context.mounted = true;
+        if name == "authority" {
+            i.context.durability.authority_append = AuthorityAppend::Ambiguous;
+        }
+        let original = classify(i.clone());
+        assert_eq!(original.effect, Effect::WriteFence(cause), "unnamed {name}");
+        assert_eq!(original.reason, reason, "unnamed {name}");
+        i.context.durability.named_live_tail = true;
+        let named = classify(i);
+        assert_eq!(named.retry, original.retry, "retry {name}");
+        assert_eq!(
+            named.requires_reproof, original.requires_reproof,
+            "reproof {name}"
+        );
+        let expected = if matches!(name, "drift" | "authority") {
+            (Effect::WriteFence(cause), reason)
+        } else {
+            (Effect::NoFence, OutcomeReason::NamedLiveTail)
+        };
+        if (named.effect.clone(), named.reason) != expected {
+            failures.push(format!(
+                "{name}: got {:?}/{:?}, expected {expected:?}",
+                named.effect, named.reason
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

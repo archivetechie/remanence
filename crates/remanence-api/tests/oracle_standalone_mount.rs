@@ -1502,7 +1502,7 @@ fn b3b_mounted_bootstrap_unknown_write_raises_one_fence() {
 #[test]
 fn b3b_mounted_named_tail_preserves_no_fence() {
     let root = tempfile::tempdir().unwrap();
-    let state = state(&root.path().join("state"));
+    let state = typed_state(&root.path().join("state"));
     let paths = state.paths().clone();
     let config = state.config().clone();
     let world = world(tape(UUID));
@@ -1598,7 +1598,7 @@ fn b3b_mounted_named_tail_rejection_reproves_on_reopen() {
     // WRITE. Capture this on kernel 5.14 in the next field window; a nonzero
     // report must fail closed, never grant refusal-based position authority.
     let root = tempfile::tempdir().unwrap();
-    let state = state(&root.path().join("state"));
+    let state = typed_state(&root.path().join("state"));
     let paths = state.paths().clone();
     let config = state.config().clone();
     let world = world(tape(UUID));
@@ -1677,7 +1677,7 @@ fn b3b_mounted_named_tail_rejection_reproves_on_reopen() {
 #[test]
 fn b3b_fix1_mounted_later_reset_has_no_fence() {
     let root = tempfile::tempdir().unwrap();
-    let state = state(&root.path().join("state"));
+    let state = typed_state(&root.path().join("state"));
     let paths = state.paths().clone();
     let config = state.config().clone();
     let world = world(tape(UUID));

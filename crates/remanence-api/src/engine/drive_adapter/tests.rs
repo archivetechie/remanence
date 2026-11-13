@@ -2633,3 +2633,76 @@ fn suffix_fence_release_requires_explicit_physical_recovery_and_replays() {
         }
     }
 }
+
+/// DEC-1 and D-N-1-2: an undurable ending retains exactly the append classifier fence.
+#[test]
+fn mounted_append_failure_with_an_undurable_ending_keeps_the_classifier_fence() {
+    let (fixture, mut state) = Fixture::new(false);
+    let mut mount = OperatorMount::with_transport(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(fixture.world.clone(), DeviceRole::Drive { bay: BAY }),
+            commands: fixture.commands.clone(),
+            fault: fixture.fault.clone(),
+            evidence: Some(fixture.config.audit.dir.clone()),
+            last_opcode: None,
+            bootstrap_step: 0,
+            empty_prefix_recovery: None,
+        }),
+        &mut state,
+        fixture.root.path(),
+    )
+    .unwrap();
+    let mounted = mount
+        .mount(MountTarget::Device {
+            path: DEVICE.into(),
+            expected_uuid: Some(UUID),
+        })
+        .unwrap();
+    let audit = mount.context.audit_error.clone();
+    mount.finish().unwrap();
+    let cfg = mounted_config(&state, &mounted, StaticAllowlist::new([SERIAL]), audit).unwrap();
+    cfg.io_memory
+        .epoch_test_action
+        .store(13, std::sync::atomic::Ordering::Relaxed);
+    let endpoint = cfg.mounted().unwrap().endpoint.clone();
+    let (tx, thread) = write_owner::spawn_mounted_actor(mounted, cfg).unwrap();
+    let mut owner = MountedDrive {
+        owner: Some(Owner {
+            tx: tx.clone(),
+            thread,
+            state,
+            _library_guard: None,
+        }),
+        client: MountedCommands::new(tx, UUID, endpoint),
+    };
+    owner.open_session("default").unwrap();
+    *fixture.fault.lock().unwrap() = Some(0x0a);
+    assert!(owner.append(fixture.request("undurable-ending")).is_err());
+    assert!(
+        fixture.fault.lock().unwrap().is_none(),
+        "first Object WRITE failed"
+    );
+    let fences = fixture.index().list_active_tape_io_fences().unwrap();
+    assert_eq!(
+        fences
+            .iter()
+            .filter(|f| f.tape_uuid == UUID && f.reason == "transfer_error")
+            .count(),
+        1,
+        "append reply follows the classifier fence: {fences:?}"
+    );
+    let _ = owner.finish();
+    drop(owner);
+    let state = fixture.reopen().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
+    let mut reasons: Vec<_> = fences
+        .iter()
+        .filter(|f| f.tape_uuid == UUID)
+        .map(|f| f.reason.as_str())
+        .collect();
+    reasons.sort();
+    eprintln!("T3 fences after reopen: {reasons:?}");
+    assert_eq!(reasons, ["transfer_error"]);
+}
