@@ -24,7 +24,8 @@ pub struct SessionDrive {
     pub product: Option<String>,
     /// Physical endpoint at the time of the write.
     pub endpoint: crate::library_log::DriveKey,
-    /// Active observed catalogue identity at the time of the write, if any.
+    /// Observed catalogue identity at the open, or None when no single active
+    /// drive has this serial or the library log could not be resolved at the open.
     pub drive_uuid: Option<[u8; 16]>,
 }
 /// Durable start of an exclusive session.

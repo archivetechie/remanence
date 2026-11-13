@@ -18823,6 +18823,28 @@ tape_catalog_dir="{0}/cache"
             )
             .unwrap();
         let runtime = f.state.library_runtime();
+        // Follow T-A2: an active identity exists before attribution is refused.
+        let observed = runtime
+            .observe_drives(vec![DriveObservationInput {
+                serial: SERIAL.into(),
+                identity_source: "DvcidAndInquiry".into(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "rem".into(),
+                library_serial: Some(LIBRARY.into()),
+                element_address: Some(BAY.into()),
+                observed_at_utc: None,
+            }])
+            .unwrap()
+            .remove(0)
+            .drive_uuid;
+        assert_eq!(
+            runtime.active_drive_uuid_for_serial(SERIAL).unwrap(),
+            Some(observed.clone().try_into().unwrap())
+        );
+        let requested = vec![0xee; 16];
+        assert_ne!(requested, observed);
         let directory = f.state.paths().journal_dir.join("tapes");
         let authority = remanence_state::TapeAuthority::open(
             &directory,
@@ -18902,7 +18924,7 @@ tape_catalog_dir="{0}/cache"
             .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
             .unwrap();
         let tx = spawn_drive_actor(BAY, drive, cfg);
-        let session = open_with_request_identity(&f, &tx, None).await;
+        let session = open_with_request_identity(&f, &tx, Some(requested)).await;
         let records = native_records(&f.state);
         let open = records
             .iter()
@@ -18932,7 +18954,6 @@ tape_catalog_dir="{0}/cache"
             assert_eq!(serial, SERIAL, "projected physical serial");
             assert_eq!(*identity, None, "projected identity stays NULL");
         }
-        println!("T-R session row present: {}", row.is_some());
         assert!(runtime.active_drive_uuid_for_serial(SERIAL).is_err());
         close_session(&tx, session).await;
     }
@@ -19037,6 +19058,17 @@ tape_catalog_dir="{0}/cache"
         assert!(!index
             .tape_io_is_fenced(Some(&TAPE), Some(BARCODE), Some(&endpoint))
             .unwrap());
+        let authority = remanence_state::TapeAuthority::open(
+            &checkpoint_dir,
+            TAPE,
+            &f.state.paths().sqlite_path,
+        )
+        .unwrap();
+        let held_lease = authority.acquire_exclusive().unwrap();
+        assert!(
+            authority.acquire_exclusive().is_err(),
+            "held tape lease refuses another writer without waiting"
+        );
         let before = log.borrow().len();
         let tx = spawn_drive_actor(BAY, drive, cfg);
         let (reply, done) = oneshot::channel();
@@ -19071,6 +19103,7 @@ tape_catalog_dir="{0}/cache"
             "serial refusal message"
         );
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        drop(held_lease);
         assert!(
             !native_records(&f.state)
                 .iter()
@@ -19081,17 +19114,6 @@ tape_catalog_dir="{0}/cache"
             pool.busy_error().message(),
             "all drives are busy",
             "serial refusal must not set a lifecycle holder"
-        );
-        let authority = remanence_state::TapeAuthority::open(
-            &checkpoint_dir,
-            TAPE,
-            &f.state.paths().sqlite_path,
-        )
-        .unwrap();
-        drop(
-            authority
-                .acquire_exclusive()
-                .expect("serial refusal takes no tape lease"),
         );
         f.state.library_runtime().catch_up().unwrap();
         assert!(

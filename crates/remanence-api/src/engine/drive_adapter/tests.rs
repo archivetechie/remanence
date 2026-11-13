@@ -2779,6 +2779,14 @@ fn wdrv_standalone_session_records_serial_without_observed_identity() {
         .unwrap()
         .is_empty());
     let conn = rusqlite::Connection::open(&fixture.config.index.sqlite_path).unwrap();
+    let sessions: i64 = conn
+        .query_row(
+            "select count(*) from sessions where tape_uuid=?1",
+            [UUID.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sessions >= 1, "at least one session exists for this tape");
     let attributed: i64 = conn
         .query_row(
             "select count(*) from sessions where tape_uuid=?1 and drive_uuid is not NULL",
