@@ -16872,7 +16872,7 @@ tape_catalog_dir = "{0}/cache"
         );
     }
 
-    /// Pins the legacy rebuild’s authoritative tables and read-session drive identity
+    /// Pins the legacy rebuild's authoritative tables and read-session drive identity
     /// through the audit adapter, per D-C3a-S-1.
     #[test]
     fn rebuild_preserves_ds_m1_authoritative_tables_and_drive_session_projection() {
@@ -17413,8 +17413,8 @@ tape_catalog_dir = "{0}/cache"
         assert_eq!(foreign_row.cleaning_due, "none");
     }
 
-    /// Pins the production drive and tape readers’ rollups over a typed read session, per D-C3a-S-1.
-    /// Native write sessions have no drive on their row (ledgered for the whole-branch review).
+    /// Pins the production drive and tape readers' rollups over a typed read session, per D-C3a-S-1.
+    /// Native write sessions have no drive on their row until order W-DRV (owner, 2026-11-13).
     #[test]
     fn correlation_rollups_use_sessions_snapshots_and_voltags() {
         use crate::library_log as lib;
@@ -22059,8 +22059,8 @@ tape_catalog_dir = "{0}/cache"
         }
     }
 
-    /// Pins legacy audit replay of operations, read sessions and idempotency
-    /// without changing their projected values, per D-C3a-S-1.
+    /// Pins legacy audit replay of operations, a read session and idempotency,
+    /// per D-C3a-S-1.
     #[test]
     fn audit_replay_projects_operations_sessions_and_idempotency() {
         let temp = tempfile::Builder::new()
