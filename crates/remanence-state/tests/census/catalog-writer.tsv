@@ -59,9 +59,9 @@ crates/remanence-state/src/state.rs::rebuild_projection_from_config_file::write_
 crates/remanence-state/src/state.rs::write_handle::write_handle	1
 # B4b-1 disconnected worker takes the registered writer capability.
 crates/remanence-state/src/projector/thread.rs::open::write_handle	1
-# Persist a waiting media-readiness operation's operator-cancel pause through the API owner client. rulings R1c, runtime part (88e4b07f)
+# Persist a waiting media-readiness operation's operator-cancel pause through the API owner client. R1c, runtime part (88e4b07f)
 crates/remanence-api/src/api_state.rs::record_readiness_wait_cancel::write_handle	1
-# Persist the closeout worker's progress through the API owner client. step 4 (3733589c)
+# Persist the closeout worker's progress through the API owner client. B4b-3, the paused cutover tree salvaged for L1 (3733589c)
 crates/remanence-api/src/tape_closeout.rs::spawn_closeout::write_handle	1
 # Persist configured library-drive observations through the CLI owner client. L1 trial rung R1a (02ecd961)
 crates/remanence-cli/src/lib.rs::observe_library_drives::write_handle	1

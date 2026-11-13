@@ -28,11 +28,11 @@ crates/remanence-state/src/state.rs::record_rule_tape_pool_assignment::library_l
 # W-DRV-1 (5daf3614)
 crates/remanence-state/src/tape_log/authority.rs::prepare_report::library_log	2
 crates/remanence-state/src/tape_log/session.rs::<module>::library_log	1
-# order C0b-1b with its fix round, decisions D-C0b-1b-0, -1, -2 (313cf638)
+# C0b-1b (313cf638)
 crates/remanence-api/src/append_admission.rs::tape_fence_detail::library_log	3
-# rung L1-R3c-L1a, ruling 31-L1; decisions D-L1a-1, D-L1a-2; implemented, gates pending; one clippy type-complexity lint in native_floor.rs left for the fix round (1b94c39c)
+# L1-R3c-L1a (1b94c39c)
 crates/remanence-state/src/library_runtime/native_floor.rs::<module>::library_log	1
-# rung L1-R3c-L1b G1-G4, brief r6, decisions D-L1b-1 and D-L1b-2 (33b08f16)
+# L1-R3c-L1b (33b08f16)
 crates/remanence-api/src/mount_support.rs::standalone_data_admission::library_log	1
 crates/remanence-api/src/pool_write/capacity.rs::ensure_selected_tape_accepts_write_inner::library_log	3
 crates/remanence-api/src/pool_write/selection.rs::admit_pinned_tape_for_write_session::library_log	3
@@ -41,15 +41,15 @@ crates/remanence-api/src/tape_admission.rs::<module>::library_log	1
 crates/remanence-api/src/write_owner/placement.rs::mounted_admission_inner::library_log	2
 crates/remanence-api/src/write_owner/read_session.rs::handle_drive_open_read::library_log	4
 crates/remanence-api/src/write_owner/read_session.rs::session_open_reject_tape_io_fences::library_log	2
-# rung L1-R3e, brief r3, decision D-R3e-1; group 4, mount resolution, remains (6bc181b9)
+# L1-R3e (6bc181b9)
 crates/remanence-api/src/write_owner/readiness.rs::session_open_reject_admission_conflicts_inner::library_log	1
-# rung L1-R3e-G4, brief r1 (0e80baba)
+# L1-R3e-G4 (0e80baba)
 crates/remanence-api/src/mount.rs::load_tape_by_uuid_with_admission::library_log	1
 crates/remanence-api/src/mount.rs::resolve_actor_mount_inner::library_log	1
 crates/remanence-api/src/mount.rs::resolve_pinned_actor_mount::library_log	1
-# rung TIX10-F2F3, decision TIX10-F2F3 (a7ac0764)
+# TIX10-F2F3 (a7ac0764)
 crates/remanence-api/src/write_owner/terminal_finalize.rs::<module>::library_log	1
-# step 4 (3733589c)
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
 crates/remanence-api/src/api_state.rs::accept_owner_request::library_log	1
 crates/remanence-api/src/api_state.rs::record_operation_failed::library_log	1
 crates/remanence-api/src/append_admission.rs::daemon_admission_error::library_log	1
