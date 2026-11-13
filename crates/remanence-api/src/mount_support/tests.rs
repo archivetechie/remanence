@@ -2709,7 +2709,8 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
 }
 
 /// A failed standalone WRITE fails closed through the stand-in: motion is latched and counted
-/// once, with no fence recordable for an unprovisioned identity (ruling 29; D-L2-29-1).
+/// once, and it records no fence (ruling 29; D-L2-29-1 D1). Production plans an identity not yet
+/// provisioned (D-L2-29-1 §3); this fixture provisions it, so the pin is the stand-in, not the fold.
 /// Cleanup adds only its CDB, and the spent invocation sends no more commands or refusals.
 #[test]
 fn b3b_standalone_init_failure_one_fence_by_cause() {
@@ -2978,7 +2979,8 @@ fn b3b_pipeline_position_consumer(consumer: &str) {
 }
 
 /// A post-write adapter failure fails closed through the stand-in: motion is latched and counted
-/// once, with no fence recordable for an unprovisioned identity (ruling 29; D-L2-29-1).
+/// once, and it records no fence (ruling 29; D-L2-29-1 D1). Production plans an identity not yet
+/// provisioned (D-L2-29-1 §3); this fixture provisions it, so the pin is the stand-in, not the fold.
 fn fix2_init_adapter(scenario: &str) {
     use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
     let root = tempfile::tempdir().unwrap();
@@ -3026,21 +3028,21 @@ fn fix2_init_adapter(scenario: &str) {
 }
 
 /// An overlap completion failure latches motion and is counted once through the stand-in;
-/// no fence is recordable for the unprovisioned identity (ruling 29; D-L2-29-1).
+/// the stand-in records no fence (ruling 29; D-L2-29-1 D1).
 #[test]
 fn b3b_fix2_init_overlap_post_write() {
     fix2_init_adapter("overlap");
 }
 
 /// A post-write parity block-size refusal latches motion and is counted once through the stand-in;
-/// no fence is recordable for the unprovisioned identity (ruling 29; D-L2-29-1).
+/// the stand-in records no fence (ruling 29; D-L2-29-1 D1).
 #[test]
 fn b3b_fix2_init_parity_size_post_write() {
     fix2_init_adapter("parity-size");
 }
 
 /// A post-write poisoned parity sink refusal latches motion and is counted once through the stand-in;
-/// no fence is recordable for the unprovisioned identity (ruling 29; D-L2-29-1).
+/// the stand-in records no fence (ruling 29; D-L2-29-1 D1).
 #[test]
 fn b3b_fix2_init_parity_poisoned_post_write() {
     fix2_init_adapter("parity-poisoned");
