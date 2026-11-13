@@ -19,8 +19,10 @@ crates/remanence-state/src/projector/apply.rs::<module>::mutating-sql	1
 crates/remanence-state/src/projector/apply.rs::apply_authority::execute	4
 crates/remanence-state/src/projector/apply.rs::apply_authority::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::apply_authority::mutating-sql	4
-crates/remanence-state/src/projector/apply.rs::apply_library_body::execute	16
-crates/remanence-state/src/projector/apply.rs::apply_library_body::mutating-sql	16
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
+crates/remanence-state/src/projector/apply.rs::apply_library_body::execute	20
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
+crates/remanence-state/src/projector/apply.rs::apply_library_body::mutating-sql	20
 crates/remanence-state/src/projector/apply.rs::commit::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::drop::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::finish_library_replay::execute	2
@@ -36,8 +38,6 @@ crates/remanence-state/src/projector/apply.rs::record_fold_progress::mutating-sq
 crates/remanence-state/src/projector/index.rs::<module>::mutating-sql	2
 crates/remanence-state/src/projector/index.rs::ack_alarm::execute	1
 crates/remanence-state/src/projector/index.rs::ack_alarm::mutating-sql	1
-crates/remanence-state/src/projector/index.rs::adopt_bootstrap_identity_tx::execute	1
-crates/remanence-state/src/projector/index.rs::adopt_bootstrap_identity_tx::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::advance_clean_run::execute	1
 crates/remanence-state/src/projector/index.rs::advance_clean_run::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::annotate_drive::execute	1
@@ -93,8 +93,6 @@ crates/remanence-state/src/projector/index.rs::observe_managed_drive_cleaning_du
 crates/remanence-state/src/projector/index.rs::open::Connection::open	1
 crates/remanence-state/src/projector/index.rs::open_inventory::Connection::open	1
 crates/remanence-state/src/projector/index.rs::open_read_only::Connection::open	1
-crates/remanence-state/src/projector/index.rs::open_reset_source::Connection::open	1
-crates/remanence-state/src/projector/index.rs::prepare_admitted_catalog_reset_source_atomic_swap::Connection::open	1
 crates/remanence-state/src/projector/index.rs::project_adopted_state_core::execute	1
 crates/remanence-state/src/projector/index.rs::project_adopted_state_core::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::project_alarm_state_core::execute	1
@@ -144,7 +142,6 @@ crates/remanence-state/src/projector/index.rs::project_verification_core::mutati
 crates/remanence-state/src/projector/index.rs::projection_transaction::transaction_with_behavior	1
 crates/remanence-state/src/projector/index.rs::raise_alarm_tx::execute	1
 crates/remanence-state/src/projector/index.rs::raise_alarm_tx::mutating-sql	1
-crates/remanence-state/src/projector/index.rs::read_legacy_catalog_reset_erase_source::Connection::open	1
 crates/remanence-state/src/projector/index.rs::rebuild_from_authoritative_sources::execute	1
 crates/remanence-state/src/projector/index.rs::rebuild_from_authoritative_sources::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::reconcile_cleaning_prefixes::execute	1
@@ -175,8 +172,6 @@ crates/remanence-state/src/projector/index.rs::replay_audit_records::execute	3
 crates/remanence-state/src/projector/index.rs::replay_audit_records::mutating-sql	3
 crates/remanence-state/src/projector/index.rs::reprovision_tape_tx::execute	5
 crates/remanence-state/src/projector/index.rs::reprovision_tape_tx::mutating-sql	5
-crates/remanence-state/src/projector/index.rs::restore_catalog_reset_tapes::execute	2
-crates/remanence-state/src/projector/index.rs::restore_catalog_reset_tapes::mutating-sql	2
 crates/remanence-state/src/projector/index.rs::restore_preserved_tape_rows_tx::execute	1
 crates/remanence-state/src/projector/index.rs::restore_preserved_tape_rows_tx::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::retire_drive::execute	1
@@ -187,8 +182,6 @@ crates/remanence-state/src/projector/index.rs::seal_tape::execute	1
 crates/remanence-state/src/projector/index.rs::seal_tape::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::select_clean_run_cart::execute	1
 crates/remanence-state/src/projector/index.rs::select_clean_run_cart::mutating-sql	1
-crates/remanence-state/src/projector/index.rs::set_append_recovery_required::execute	1
-crates/remanence-state/src/projector/index.rs::set_append_recovery_required::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::set_tape_generation_at::execute	1
 crates/remanence-state/src/projector/index.rs::set_tape_generation_at::mutating-sql	1
 crates/remanence-state/src/projector/index.rs::update_provisioned_tape_voltag_tx::execute	1
@@ -217,7 +210,14 @@ crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_tape_log_pr
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::execute	2
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::execute_batch	2
 crates/remanence-state/src/projector/tape_log_projection.rs::validate_projected_history::mutating-sql	4
-
 # Endpoint trigger refresh is shared by fresh creation and current/predecessor schema repair.
 crates/remanence-state/src/projector/index.rs::refresh_endpoint_triggers::execute_batch	1
 crates/remanence-state/src/projector/index.rs::refresh_endpoint_triggers::mutating-sql	1
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
+crates/remanence-state/src/projector/tape_log_projection.rs::clear_typed_projection::execute	1
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
+crates/remanence-state/src/projector/tape_log_projection.rs::clear_typed_projection::execute_batch	1
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
+crates/remanence-state/src/projector/tape_log_projection.rs::clear_typed_projection::mutating-sql	1
+# B4b-3, the paused cutover tree salvaged for L1 (3733589c)
+crates/remanence-state/src/projector/tape_log_projection.rs::rebuild_typed_sources::execute_batch	4

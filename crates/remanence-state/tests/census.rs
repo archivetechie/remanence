@@ -1482,8 +1482,8 @@ fn scanner_cfg_fields_and_generic_items() {
     );
 }
 
-/// The checked-in producer dispositions must cover every census key and count,
-/// including readers/candidates and the public sink with all its accessors.
+/// Producer dispositions must cover every census key and count; the public audit sink is gone.
+/// An accessor needs a sink row that names it, and a sink row must name every accessor.
 #[test]
 fn audit_producer_table_matches_ratchet_and_sink_callers() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/census");
@@ -1520,7 +1520,7 @@ fn audit_producer_table_matches_ratchet_and_sink_callers() {
         }
     }
     assert_eq!(actual, expected);
-    assert_eq!(public_sink.unwrap(), callers.join("; "));
+    assert_eq!(public_sink.unwrap_or_default(), callers.join("; "));
 }
 /// Pins literal comparison discovery for closure contains.
 #[test]
