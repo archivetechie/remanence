@@ -284,8 +284,9 @@ fn selected_library_actor_preserves_encryption_locators_and_replay_before_load()
             assert!(replay["recipient_epochs"][0]["label"].is_null());
         }
     }
-    // D-C3a-2d-1: the native session does not record the drive today; the owner's
-    // drive-identity order W-DRV will add it. Committed replay opens no session.
+    // D-L2-WDRV-1, owner's decision of 2026-11-13: each native session records
+    // the drive that wrote, serial-keyed at its bay. The fixture reports no inquiry
+    // strings and has no catalogue identity (P17). Committed replay opens no session.
     let records = native_write_records(&config_path);
     let opened = records
         .iter()
@@ -295,6 +296,24 @@ fn selected_library_actor_preserves_encryption_locators_and_replay_before_load()
         opened, 2,
         "D-C3a-2d-1: one native session per archive write"
     );
+    let expected_drive = remanence_state::tape_log::SessionDrive {
+        serial: "POOL-DRIVE".into(),
+        vendor: None,
+        product: None,
+        endpoint: remanence_state::library_log::DriveKey::Bay(remanence_state::library_log::Bay {
+            library_serial: LIBRARY.into(),
+            bay: BAY,
+        }),
+        drive_uuid: None,
+    };
+    for record in &records {
+        if let remanence_state::tape_log::Record::SessionOpened(session) = record {
+            assert_eq!(
+                session.drive, expected_drive,
+                "D-L2-WDRV-1: each native session records the drive that wrote"
+            );
+        }
+    }
     assert!(
         !world
             .lock()
