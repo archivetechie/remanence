@@ -4510,7 +4510,8 @@ pool_id = "camera.copy-a"
     }
 
     /// D-C3a-S-1: startup replay rebuilds typed provisioning and retirement while
-    /// preserving an independently closed native write session, with no audit replay.
+    /// preserving an independently closed native write session; the rebuild reports no audit
+    /// records replayed.
     #[test]
     fn audit_replay_projects_retire_and_provision_events_without_disturbing_sessions() {
         let temp = tempfile::Builder::new()
@@ -5408,7 +5409,8 @@ pool_id = "camera.copy-a"
         );
     }
 
-    /// D-C3a-S-1: a crash-left native write session advances its tape's epoch and
+    /// D-C3a-S-1 (the design's §6.5 startup/orphan-recovery row): a crash-left native write
+    /// session advances its tape's epoch and
     /// invalidates its map until a fresh harvest; a lost typed read session does not advance its epoch.
     /// The native recovery branch has no daemon caller, and rebuild eviction alone uncalibrates
     /// both tapes, so the write epoch distinguishes possible-write recovery from eviction.
