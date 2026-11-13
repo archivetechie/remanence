@@ -3257,8 +3257,8 @@ pool_id = "camera.copy-a"
             .is_empty());
     }
 
-    /// D-C3a-S-1: typed records pin identity-only, idempotent adoption, and typed
-    /// drive/readiness evidence makes an active physical operation refuse a no-op.
+    /// D-C3a-S-1: typed records pin identity-only, idempotent adoption; with the bay's drive
+    /// observed, an active readiness operation makes a no-op adoption refuse.
     #[test]
     fn bootstrap_adoption_is_audited_identity_only_and_idempotent() {
         let temp = tempfile::Builder::new()
