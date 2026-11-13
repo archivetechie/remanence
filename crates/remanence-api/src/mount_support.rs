@@ -703,31 +703,10 @@ impl<'a> OperatorMount<'a> {
             state.replay_audit_projection().map_err(refusal)?;
             if matches!(endpoint, DriveKey::Standalone { .. }) {
                 standalone_fence_policy(state.catalog(), None, Some(endpoint), false)?;
+                // C8-G2 / DEC-2: only library-log sessions at this endpoint
+                // are recovered here; native writes await their tape's next open.
                 state
-                    .recover_sessions_after_restart(Some(endpoint), |state, session| {
-                        if session.session_kind == "write" {
-                            let tape_uuid = session
-                                .tape_uuid
-                                .as_deref()
-                                .and_then(|b| b.try_into().ok())
-                                .ok_or_else(|| {
-                                    remanence_state::StateError::IndexCorrupt(
-                                        "unfinished write has no tape identity".into(),
-                                    )
-                                })?;
-                            raise_standalone_fence(
-                                state,
-                                tape_uuid,
-                                session.drive_key.as_ref(),
-                                "standalone_write_lost_by_restart",
-                                "unfinished durable write session requires recovery",
-                            )
-                            .map_err(|e| {
-                                remanence_state::StateError::IndexCorrupt(e.to_string())
-                            })?;
-                        }
-                        Ok(())
-                    })
+                    .recover_sessions_after_restart(Some(endpoint), |_, _| Ok(()))
                     .map_err(refusal)?;
                 standalone_fence_policy(state.catalog(), None, Some(endpoint), false)?;
             } else if let Some(session) = state

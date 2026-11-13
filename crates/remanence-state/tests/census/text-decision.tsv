@@ -64,7 +64,6 @@ crates/remanence-api/src/mount.rs::should_compensate_open_mount::text-contains	1
 crates/remanence-api/src/mount.rs::shutdown_mounted_session::text-equality	1
 crates/remanence-api/src/mount.rs::tape_inventory_critical::text-equality	1
 crates/remanence-api/src/mount.rs::verify_tape_index_critical::text-equality	1
-crates/remanence-api/src/mount_support.rs::from_context::text-equality	1
 crates/remanence-api/src/mount_support.rs::lock_device::text-equality	2
 crates/remanence-api/src/mount_support.rs::release_with_transport::text-strip_prefix	1
 crates/remanence-api/src/mount_support.rs::with_transport::text-strip_prefix	1

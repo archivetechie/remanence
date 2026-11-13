@@ -496,6 +496,29 @@ tape_catalog_dir = "{0}/cache"
             .unwrap()
     }
 }
+/// Read native tape evidence without taking a second lease from the mounted owner.
+/// A never-admitted session may have no native file yet.
+fn native_records(config: &remanence_state::RemConfig) -> Vec<remanence_state::tape_log::Record> {
+    let path = config
+        .journal
+        .dir
+        .join("tapes")
+        .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("read native session evidence: {error}"),
+    };
+    remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+    let mut records = Vec::new();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        records.push(frame.record);
+    }
+    records
+}
+
 #[test]
 fn pinned_endpoint_receipts_source_and_explicit_finish_release_both_locks() {
     let (fixture, state) = Fixture::new(false);
@@ -852,7 +875,7 @@ fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() 
         drop(owner);
         std::fs::copy(&backup, &fixture.config.index.sqlite_path).unwrap();
         std::fs::remove_dir_all(&fixture.config.journal.dir).unwrap();
-        std::fs::create_dir_all(&fixture.config.journal.dir).unwrap();
+        std::fs::create_dir_all(fixture.config.journal.dir.join("tapes")).unwrap();
         let mut owner = fixture.owner(fixture.reopen().unwrap());
         fixture.commands.lock().unwrap().clear();
         let before = fixture.world.lock().unwrap().tapes["HAND"].records.clone();
@@ -871,8 +894,13 @@ fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() 
         assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
         assert_eq!(
             fixture.index().get_tape(&UUID).unwrap().unwrap().state,
-            "recovery_required"
+            "ready"
         );
+        // Ruling 13: the suffix contradiction is a durable fence, not a tape state.
+        let fences = fixture.index().list_active_tape_io_fences().unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].tape_uuid, UUID);
+        assert_eq!(fences[0].reason, "session_suffix_contradiction");
         let preview = owner
             .supersede_tail(pb::SupersedeTailRequest {
                 observed_tape_log_sequence: None,
@@ -933,9 +961,19 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
     let config: remanence_state::RemConfig =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     assert!(!config.audit.fsync);
-    let records = FileAuditLog::replay(&config.audit.dir).unwrap();
-    assert!(records.iter().any(|r| r.event == AuditEvent::SessionOpened));
-    assert!(!records.iter().any(|r| r.event == AuditEvent::SessionClosed));
+    use remanence_state::tape_log::Record as Native;
+    let records = native_records(&config);
+    let crashed_session = records
+        .iter()
+        .find_map(|record| match record {
+            Native::SessionOpened(open) => Some(open.session_id),
+            _ => None,
+        })
+        .expect("crashed child recorded its native session");
+    assert!(!records.iter().any(|record| matches!(
+        record,
+        Native::SessionEnded(end) if end.session_id == crashed_session
+    )));
     let mut state = StateHandle::open_with_config(
         remanence_state::StatePaths::from_config(
             config.daemon.state_dir.join("config.toml"),
@@ -970,16 +1008,21 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
     )
     .unwrap();
     mount.finish().unwrap();
+    // C8-G2 and DEC-2: typed restart leaves native write sessions open;
+    // the next open of their tape reconciles them, without a restart fence.
     let fences = state.catalog().list_active_tape_io_fences().unwrap();
-    assert_eq!(fences.len(), 1);
+    assert!(!fences.iter().any(|fence| fence.tape_uuid == UUID));
+    let sessions = state.catalog().non_terminal_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, Uuid::from_bytes(crashed_session));
     assert_eq!(
-        fences[0].endpoint,
-        Some(remanence_library::DriveKey::Standalone {
-            drive_serial: SERIAL.into()
-        })
+        state
+            .catalog()
+            .session_state(sessions[0].session_id)
+            .unwrap()
+            .as_deref(),
+        Some("open")
     );
-    assert_eq!(fences[0].reason, "standalone_write_lost_by_restart");
-    assert!(state.catalog().non_terminal_sessions().unwrap().is_empty());
     drop(state);
     std::fs::remove_dir_all(&config.daemon.state_dir).unwrap();
 }
@@ -1319,19 +1362,22 @@ fn check_automatic_terminal_media_completion(
     trigger: remanence_state::TerminalFinalizationTrigger,
 ) {
     use remanence_state::authority::{TapeAuthorityView, TapeAuthorityWriter};
+    use remanence_state::tape_log::{Record as Native, SessionEndReason};
 
     let (mut fixture, state) = Fixture::new(false);
     drop(state);
     fixture.config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
     fixture.config.tape_pools[0].watermark_low = 0.1;
     fixture.config.tape_pools[0].watermark_high = 0.25;
-    let mut owner = fixture.owner(fixture.reopen().unwrap());
+    let state = fixture.reopen().unwrap();
+    let runtime = state.library_runtime();
+    let mut owner = fixture.owner(state);
     owner.open_session("default").unwrap();
     let receipt = owner.append(fixture.request("seal-due")).unwrap();
     owner.close_session().unwrap();
     // Persist the typed seal obligation at the recovery cut before projecting
     // its display cache. Recovery takes the reason from native authority.
-    let mut index = fixture.index();
+    let index = fixture.index();
     let journal = remanence_state::TapeAuthority::open(
         fixture.config.journal.dir.join("tapes"),
         UUID,
@@ -1345,7 +1391,8 @@ fn check_automatic_terminal_media_completion(
     checkpoint.session_id = None;
     checkpoint.seal_due = Some(trigger);
     writer.publish_report(&checkpoint).unwrap();
-    index.project_tape_log(&writer.freeze().unwrap()).unwrap();
+    runtime.refresh_native(&writer.freeze().unwrap()).unwrap();
+    runtime.catch_up().unwrap();
     drop(writer);
     drop(index);
     assert!(fixture
@@ -1388,24 +1435,67 @@ fn check_automatic_terminal_media_completion(
     assert!(!index
         .tape_io_is_fenced(Some(&UUID), None, Some(&endpoint))
         .unwrap());
-    let records = FileAuditLog::replay(&fixture.config.audit.dir).unwrap();
-    assert!(!records
-        .iter()
-        .any(|r| r.event == AuditEvent::SessionOrphaned));
+    let records = native_records(&fixture.config);
     let opened: Vec<_> = records
         .iter()
-        .filter(|r| r.event == AuditEvent::SessionOpened)
+        .filter_map(|record| match record {
+            Native::SessionOpened(open) => Some(open),
+            _ => None,
+        })
         .collect();
-    assert_eq!(opened.len(), 2);
-    for open in opened {
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| r.event == AuditEvent::SessionClosed && r.session_id == open.session_id)
-                .count(),
-            1
-        );
-    }
+    let open = opened.first().expect("native write session opened");
+    let endings: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| match record {
+            Native::SessionEnded(end) if end.session_id == open.session_id => Some((position, end)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(endings.len(), 1, "one native ending for the write session");
+    let (end_position, end) = endings[0];
+    assert_eq!(end.reason, SessionEndReason::CleanClose);
+    // D-C3a-1b-1: recovery finalizes before native session admission. Its
+    // durable evidence is the finalization itself, outside any write session.
+    let after_end = &records[end_position + 1..];
+    assert!(
+        !after_end
+            .iter()
+            .any(|record| matches!(record, Native::SessionOpened(_))),
+        "automatic finalization must not open another native session"
+    );
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, Native::SessionEnded(_)))
+            .count(),
+        1
+    );
+    assert!(!records.iter().any(|record| matches!(
+        record,
+        Native::SessionEnded(end) if end.reason == SessionEndReason::CrashRecovered
+    )));
+    let decisions: Vec<_> = after_end
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            matches!(record, Native::FinalizationDecided(_)).then_some(position)
+        })
+        .collect();
+    let seals: Vec<_> = after_end
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            matches!(record, Native::Sealed { .. }).then_some(position)
+        })
+        .collect();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(seals.len(), 1);
+    assert!(
+        decisions[0] < seals[0],
+        "finalization decision precedes its seal"
+    );
     assert_eq!(owner.receipts(), &[receipt]);
 }
 
@@ -1420,21 +1510,18 @@ fn finish_without_an_open_epoch_adds_no_session_evidence() {
                 owner.open_session("default").unwrap();
                 owner.close_session().unwrap();
             }
-            let before = FileAuditLog::replay(&fixture.config.audit.dir).unwrap();
+            let before = native_records(&fixture.config);
             owner.finish().unwrap();
-            let after = FileAuditLog::replay(&fixture.config.audit.dir).unwrap();
-            let session_events = |records: &[remanence_state::AuditRecord]| {
+            let after = native_records(&fixture.config);
+            let session_events = |records: &[remanence_state::tape_log::Record]| {
+                use remanence_state::tape_log::Record as Native;
                 records
                     .iter()
-                    .filter(|r| {
-                        matches!(
-                            r.event,
-                            AuditEvent::SessionOpened
-                                | AuditEvent::SessionClosed
-                                | AuditEvent::SessionOrphaned
-                        )
+                    .filter_map(|record| match record {
+                        Native::SessionOpened(open) => Some((open.session_id, record.tag())),
+                        Native::SessionEnded(end) => Some((end.session_id, record.tag())),
+                        _ => None,
                     })
-                    .map(|r| (r.session_id, r.event.clone()))
                     .collect::<Vec<_>>()
             };
             assert_eq!(session_events(&before), session_events(&after));
@@ -1501,10 +1588,9 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
     assert_eq!(receipts.len(), 1);
     let session_id = owner.client.session.as_ref().unwrap().0;
     loop {
-        if FileAuditLog::replay(&fixture.config.audit.dir)
-            .unwrap()
+        if native_records(&fixture.config)
             .iter()
-            .any(|r| r.session_id == Some(session_id) && r.event == AuditEvent::SessionClosed)
+            .any(|record| matches!(record, remanence_state::tape_log::Record::SessionEnded(end) if end.session_id == *session_id.as_bytes()))
         {
             break;
         }
@@ -1619,10 +1705,9 @@ fn frontend_batches_one_invocation_and_all_skips_open_no_session() {
             .is_ok());
     }
     let opened = || {
-        FileAuditLog::replay(&fixture.config.audit.dir)
-            .unwrap()
+        native_records(&fixture.config)
             .iter()
-            .filter(|r| r.event == AuditEvent::SessionOpened)
+            .filter(|record| matches!(record, remanence_state::tape_log::Record::SessionOpened(_)))
             .count()
     };
     assert_eq!(opened(), 1, "one session spans both object checkpoints");
