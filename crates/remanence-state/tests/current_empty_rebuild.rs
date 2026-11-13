@@ -269,7 +269,8 @@ fn current_empty_rebuild_readiness_operation_and_load_budget_kept() {
         runtime.failed(ticket, &failure).unwrap();
     }
     drop(runtime);
-    // media_readiness_load_attempts_since_ready reads the runtime's readiness count from the library log fold's admitted LOAD intents; a rebuild does not compute it.
+    // The load count is read through the runtime from the library log's fold (its admitted LOAD
+    // intents), so it is restored by reopening the log, not by the SQL rebuild.
     assert_eq!(
         s.index()
             .media_readiness_load_attempts_since_ready(operation_id)
@@ -385,8 +386,8 @@ fn current_empty_rebuild_retired_sealed_identity_kept() {
 
 /// D-C3b-S2-1: the first landing keeps the calibration harvest's wrap map as an SQL cache, never authority.
 /// This seeds the harvest's record_harvest_success then upsert_wrap_map writes; an empty rebuild
-/// evicts the map, the control row keeps its write epoch, and the map is not servable until the
-/// next harvest. L2 records the harvest through WrapMapCached.
+/// evicts the map, the calibration control store (outside SQLite) survives with its write epoch,
+/// and the map is not servable until the next harvest. L2 records the harvest through WrapMapCached.
 #[test]
 fn current_empty_rebuild_cached_wrap_map_evicted_not_servable() {
     let mut s = State::new();
@@ -598,8 +599,9 @@ fn current_empty_rebuild_alarm_acknowledgement_kept() {
 }
 
 /// D-C3b-S2-1: this characterises SQL-only CatalogIndex::register_idempotency_request,
-/// which no production code calls. A reservation without OperationRecorded leaves no scope
-/// and no operation after a rebuild; the typed path is current_empty_rebuild_idempotency_and_operation_kept.
+/// which no production code calls. The reservation writes only an idempotency scope (no
+/// operation row and no OperationRecorded), so a rebuild restores no scope; the typed path is
+/// current_empty_rebuild_idempotency_and_operation_kept.
 #[test]
 fn current_empty_rebuild_sql_only_idempotency_reservation_not_restored() {
     let mut s = State::new();
@@ -631,8 +633,9 @@ fn current_empty_rebuild_sql_only_idempotency_reservation_not_restored() {
 
 /// The first landing keeps a finished request and its idempotency scope from OperationRecorded.
 /// D-C3b-S-1: the runtime mints the accepted identity and records its terminal event.
-/// A keyed verification is a synthetic pairing (production keys only the tape close-out), and
-/// the projection logic does not branch on the kind.
+/// A keyed verification is a synthetic pairing: production accepts a verification unkeyed, while
+/// other kinds (the tape close-out, manual finalization) are keyed; the projection logic does not
+/// branch on the kind.
 #[test]
 fn current_empty_rebuild_idempotency_and_operation_kept() {
     let mut s = State::new();
