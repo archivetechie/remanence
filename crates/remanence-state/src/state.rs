@@ -4579,6 +4579,8 @@ pool_id = "camera.copy-a"
     }
 
     /// Inspect the crash image without starting the projector or library runtime.
+    /// A read-only open of a WAL catalogue may leave an empty `-wal` and a `-shm`
+    /// beside the restored image; these sidecars hold no frames.
     fn library_restart_image_session(sqlite_path: &Path, session_id: Uuid) -> Option<String> {
         use rusqlite::OptionalExtension;
         let connection = rusqlite::Connection::open_with_flags(
@@ -4670,6 +4672,7 @@ pool_id = "camera.copy-a"
         let calibration_before = fs::read(&calibration_path).unwrap();
         let restarted = StateHandle::open_with_config(paths, config.clone()).unwrap();
         let state_after_start = restarted.catalog().session_state(session_id).unwrap();
+        assert_eq!(state_after_start.as_deref(), Some("closed"));
 
         let lost =
             recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap();
@@ -4682,7 +4685,6 @@ pool_id = "camera.copy-a"
                 .as_deref(),
             Some("closed")
         );
-        assert_eq!(state_after_start.as_deref(), Some("closed"));
         assert_eq!(lost, 0);
         assert_eq!(fs::read(calibration_path).unwrap(), calibration_before);
         assert!(!restarted
@@ -4864,10 +4866,15 @@ pool_id = "camera.copy-a"
             }
         }
         let restarted = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+        let calibration_path = paths
+            .calibration_dir
+            .join(crate::CALIBRATION_CONTROL_FILENAME);
+        let calibration_before = fs::read(&calibration_path).unwrap();
         assert_eq!(
             recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap(),
             3
         );
+        let calibration = CalibrationControlStore::open(&paths.calibration_dir).unwrap();
         for (n, (_, _, expected)) in sessions.iter().enumerate() {
             assert_eq!(
                 restarted
@@ -4877,7 +4884,7 @@ pool_id = "camera.copy-a"
                     .as_deref(),
                 Some(*expected)
             );
-            let row = restarted.calibration_control().row([n as u8 + 1; 16]);
+            let row = calibration.row([n as u8 + 1; 16]);
             assert_eq!(row.write_epoch, 0);
             assert_ne!(row.state, crate::VolumeCalibrationState::Uncalibrated);
             assert!(!restarted
@@ -4885,10 +4892,8 @@ pool_id = "camera.copy-a"
                 .tape_io_is_fenced(Some(&[n as u8 + 1; 16]), None, None)
                 .unwrap());
         }
+        assert_eq!(fs::read(&calibration_path).unwrap(), calibration_before);
         let before = restarted.library_runtime().test_source_records().len();
-        let calibration_path = paths
-            .calibration_dir
-            .join(crate::CALIBRATION_CONTROL_FILENAME);
         let calibration_bytes = fs::read(&calibration_path).unwrap();
         assert_eq!(
             recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap(),
