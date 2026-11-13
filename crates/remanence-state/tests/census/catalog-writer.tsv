@@ -3,25 +3,12 @@
 crates/remanence-api/src/api_state.rs::new_with_config::write_handle	1
 # Existing reconcile drive catalog from report catalog reconciliation uses the retained client.
 crates/remanence-api/src/api_state.rs::reconcile_drive_catalog_from_report::write_handle	1
-# Persist alarm acked at the existing audit/projection point.
-# Persist cancel requested at the existing audit/projection point.
-crates/remanence-api/src/api_state.rs::record_cancel_requested::write_handle	1
-# Persist library request received at the existing audit/projection point.
-crates/remanence-api/src/api_state.rs::record_library_request_received::write_handle	1
-# Persist operation failed at the existing audit/projection point.
-crates/remanence-api/src/api_state.rs::record_operation_failed::write_handle	1
-# Persist request received at the existing audit/projection point.
-crates/remanence-api/src/api_state.rs::record_request_received::write_handle	1
 # Startup recovery uses the same owner later handed to all actors.
 crates/remanence-api/src/api_state.rs::with_drive_pool_opener::write_handle	1
-# Existing alarm writes retain their scope and observer policy using the API owner client.
 # Existing retry projection writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/closeout_obligation.rs::retry_projection::write_handle	1
 # Foreign health observations use the client retained by the worker.
 crates/remanence-api/src/drive_collection.rs::poll_foreign_drive_counters_once_with_reader::write_handle	1
-# Existing ack alarm writes retain their scope and observer policy using the API owner client.
-# Existing release tape io fence writes retain their scope and observer policy using the API owner client.
-crates/remanence-api/src/library.rs::release_tape_io_fence::write_handle	1
 # Existing closeout tape reserved writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/mount.rs::closeout_tape_reserved::write_handle	1
 # Existing closeout worker attempt writes retain their scope and observer policy using the API owner client.
@@ -32,21 +19,12 @@ crates/remanence-api/src/mount.rs::manual_finalize_attempt::write_handle	1
 crates/remanence-api/src/mount.rs::manual_finalize_tape_critical::write_handle	1
 # Existing open write session reserved for caller writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/mount.rs::open_write_session_reserved_for_caller::write_handle	1
-# Persist finalize attempt at the existing audit/projection point.
-crates/remanence-api/src/mount.rs::record_finalize_attempt::write_handle	1
 # Existing recover automatic terminal tape writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/mount.rs::recover_automatic_terminal_tape::write_handle	1
 # Existing service closeout obligation writes retain their scope and observer policy using the API owner client.
 crates/remanence-api/src/mount.rs::service_closeout_obligation::write_handle	1
-# Standalone recovery and tape-log projection require writer capabilities.
-# Persist the existing standalone fence through the state owner.
-crates/remanence-api/src/mount_support.rs::raise_standalone_fence::write_handle	1
 # Replay existing checkpoint authority through the state owner.
 crates/remanence-api/src/startup_checkpoint.rs::reconcile_checkpoint_journal_projections::write_handle	1
-# Existing start writes retain their scope and observer policy using the API owner client.
-crates/remanence-api/src/tape_closeout.rs::start::write_handle	2
-# Existing record writes retain their scope and observer policy using the API owner client.
-crates/remanence-api/src/tape_verification.rs::record::write_handle	1
 # Changer actor keeps its own observer-bearing handle to the shared connection.
 crates/remanence-api/src/write_owner/actor_runtime.rs::changer_loop::write_handle	1
 # Drive actor keeps its own observer-bearing handle to the shared connection.
@@ -55,8 +33,6 @@ crates/remanence-api/src/write_owner/actor_runtime.rs::drive_loop::write_handle	
 crates/remanence-api/src/write_owner/actor_runtime.rs::refresh_actor_changer::write_handle	1
 # Absent-catalog dry run builds an in-memory reader and writes no file.
 crates/remanence-cli/src/lib.rs::open_tape_init_dry_run_catalog::CatalogReader::empty	1
-# Standalone provision initialized tape with media uses a writer issued by its StateHandle.
-crates/remanence-cli/src/lib.rs::provision_initialized_tape_with_media::write_handle	1
 # Record a readiness fence through the shared runtime.
 crates/remanence-cli/src/lib.rs::record_media_readiness_fence::write_handle	1
 # Persist media readiness operation at the existing audit/projection point.
@@ -69,12 +45,8 @@ crates/remanence-cli/src/lib.rs::run_tape_init::write_handle	1
 crates/remanence-cli/src/lib.rs::run_tape_quarantine::write_handle	1
 # Standalone run tape wait ready uses a writer issued by its StateHandle.
 crates/remanence-cli/src/lib.rs::run_tape_wait_ready::write_handle	1
-# Confirmed media replacement uses a writer issued by the state owner.
-crates/remanence-cli/src/standalone.rs::prepare_init::write_handle	1
 # Daemon opens the catalog once after acquiring its lifetime state lock.
 crates/remanence-daemon/src/entry.rs::main_entry_with_registry::projector::open	1
-# Reset replacement uses its distinct temporary-file registry key.
-crates/remanence-state/src/projector/mod.rs::open_reset_replacement::write_handle	1
 # The state lock owner opens and retains the catalog client and its writer.
 crates/remanence-state/src/state.rs::open_with_config::projector::open	1
 # The state lock owner opens and retains the catalog client and its writer.
@@ -87,3 +59,9 @@ crates/remanence-state/src/state.rs::rebuild_projection_from_config_file::write_
 crates/remanence-state/src/state.rs::write_handle::write_handle	1
 # B4b-1 disconnected worker takes the registered writer capability.
 crates/remanence-state/src/projector/thread.rs::open::write_handle	1
+# Persist a waiting media-readiness operation's operator-cancel pause through the API owner client. rulings R1c, runtime part (88e4b07f)
+crates/remanence-api/src/api_state.rs::record_readiness_wait_cancel::write_handle	1
+# Persist the closeout worker's progress through the API owner client. step 4 (3733589c)
+crates/remanence-api/src/tape_closeout.rs::spawn_closeout::write_handle	1
+# Persist configured library-drive observations through the CLI owner client. L1 trial rung R1a (02ecd961)
+crates/remanence-cli/src/lib.rs::observe_library_drives::write_handle	1

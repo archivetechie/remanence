@@ -1900,7 +1900,7 @@ fn scanner_literal_operand_and_arm_shapes() {
     assert_eq!(found.values().sum::<usize>(), 11);
 }
 
-/// No production component may use the disconnected library authority.
+/// Lists every production use of the library authority so new consumers are added deliberately.
 #[test]
 fn library_reserved_census() {
     census("library-reserved");

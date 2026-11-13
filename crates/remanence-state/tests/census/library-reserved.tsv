@@ -1,3 +1,4 @@
+# Every production use of the library authority outside its module and the two reserved bodies' fixture constructors.
 crates/remanence-state/src/lib.rs::<module>::library_log	1
 crates/remanence-state/src/library_log/mod.rs::fixture_progress::constructor::VerificationProgress	1
 crates/remanence-state/src/library_log/mod.rs::fixture_unprotected::constructor::AcceptUnprotectedFinalization	1
@@ -8,3 +9,95 @@ crates/remanence-state/src/projector/thread.rs::project_library::library_log	2
 crates/remanence-state/src/projector/thread.rs::project_library_replay::library_log	5
 crates/remanence-state/src/projector/thread.rs::project_library_snapshot::library_log	2
 crates/remanence-state/src/projector/thread.rs::rebuild_library::library_log	3
+# L1 trial rung 1 (78524e71)
+crates/remanence-api/src/api_state.rs::record_cancel_requested::library_log	1
+crates/remanence-api/src/tape_verification.rs::<module>::library_log	1
+# L1 trial rung 2b (7373d571)
+crates/remanence-api/src/write_owner/terminal_inventory.rs::<module>::library_log	2
+crates/remanence-api/src/write_owner/terminal_inventory.rs::terminal_verification_evidence::library_log	1
+# L1 trial rung CODES (3cb76aa8)
+crates/remanence-api/src/daemon_catalog_services.rs::reconcile_tape::library_log	1
+crates/remanence-api/src/drive_collection.rs::foreign_drive_poll_loop::library_log	1
+crates/remanence-api/src/library.rs::drive_stewardship_refused::library_log	1
+crates/remanence-api/src/mount_support.rs::import_journals::library_log	1
+crates/remanence-api/src/mount_support.rs::raise_standalone_fence::library_log	1
+crates/remanence-api/src/write_owner/write_session.rs::record_barrier_alarm_unrecorded::library_log	1
+crates/remanence-cli/src/standalone.rs::dispatch::library_log	1
+# L1 trial rung R2b (af4b6546)
+crates/remanence-state/src/state.rs::record_rule_tape_pool_assignment::library_log	1
+# W-DRV-1 (5daf3614)
+crates/remanence-state/src/tape_log/authority.rs::prepare_report::library_log	2
+crates/remanence-state/src/tape_log/session.rs::<module>::library_log	1
+# order C0b-1b with its fix round, decisions D-C0b-1b-0, -1, -2 (313cf638)
+crates/remanence-api/src/append_admission.rs::tape_fence_detail::library_log	3
+# rung L1-R3c-L1a, ruling 31-L1; decisions D-L1a-1, D-L1a-2; implemented, gates pending; one clippy type-complexity lint in native_floor.rs left for the fix round (1b94c39c)
+crates/remanence-state/src/library_runtime/native_floor.rs::<module>::library_log	1
+# rung L1-R3c-L1b G1-G4, brief r6, decisions D-L1b-1 and D-L1b-2 (33b08f16)
+crates/remanence-api/src/mount_support.rs::standalone_data_admission::library_log	1
+crates/remanence-api/src/pool_write/capacity.rs::ensure_selected_tape_accepts_write_inner::library_log	3
+crates/remanence-api/src/pool_write/selection.rs::admit_pinned_tape_for_write_session::library_log	3
+crates/remanence-api/src/pool_write/selection.rs::select_tape_in_pool_with_policy_and_eligibility::library_log	1
+crates/remanence-api/src/tape_admission.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/placement.rs::mounted_admission_inner::library_log	2
+crates/remanence-api/src/write_owner/read_session.rs::handle_drive_open_read::library_log	4
+crates/remanence-api/src/write_owner/read_session.rs::session_open_reject_tape_io_fences::library_log	2
+# rung L1-R3e, brief r3, decision D-R3e-1; group 4, mount resolution, remains (6bc181b9)
+crates/remanence-api/src/write_owner/readiness.rs::session_open_reject_admission_conflicts_inner::library_log	1
+# rung L1-R3e-G4, brief r1 (0e80baba)
+crates/remanence-api/src/mount.rs::load_tape_by_uuid_with_admission::library_log	1
+crates/remanence-api/src/mount.rs::resolve_actor_mount_inner::library_log	1
+crates/remanence-api/src/mount.rs::resolve_pinned_actor_mount::library_log	1
+# rung TIX10-F2F3, decision TIX10-F2F3 (a7ac0764)
+crates/remanence-api/src/write_owner/terminal_finalize.rs::<module>::library_log	1
+# step 4 (3733589c)
+crates/remanence-api/src/api_state.rs::accept_owner_request::library_log	1
+crates/remanence-api/src/api_state.rs::record_operation_failed::library_log	1
+crates/remanence-api/src/append_admission.rs::daemon_admission_error::library_log	1
+crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_authority::library_log	1
+crates/remanence-api/src/closeout_progress.rs::for_owner::library_log	1
+crates/remanence-api/src/closeout_progress.rs::record::library_log	1
+crates/remanence-api/src/engine/drive_adapter.rs::standalone_tail_recovery_admission::library_log	1
+crates/remanence-api/src/mount.rs::publish_finalize_attempt::library_log	2
+crates/remanence-api/src/mount.rs::record_finalize_attempt::library_log	2
+crates/remanence-api/src/mount.rs::recover_manual_terminal_tape::library_log	2
+crates/remanence-api/src/mount.rs::run_started_manual_finalize_worker::library_log	2
+crates/remanence-api/src/operation_source.rs::<module>::library_log	1
+crates/remanence-api/src/tape_closeout.rs::start::library_log	1
+crates/remanence-api/src/write_owner/actor_runtime.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/actor_runtime.rs::collect_drive_health_snapshot::library_log	1
+crates/remanence-api/src/write_owner/actor_runtime.rs::raise_alarm_with_evidence::library_log	1
+crates/remanence-api/src/write_owner/actor_runtime.rs::record_read_session::library_log	1
+crates/remanence-api/src/write_owner/cleaning.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/cleaning_source.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/reconcile.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/robotics.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/session_tail.rs::write_file::library_log	1
+crates/remanence-api/src/write_owner/tail_recovery.rs::supersede_mounted_tail::library_log	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::accept_manual_finalize_library::library_log	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::finish_terminal_tail::library_log	2
+crates/remanence-api/src/write_owner/terminal_finalize.rs::preflight_manual_finalize_cancellable::library_log	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::record_manual_finalize_event_with::library_log	2
+crates/remanence-api/src/write_owner/terminal_finalize.rs::record_terminal_finalize_event::library_log	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::record_terminal_finalize_event_with::library_log	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::terminal_tail_write_failure::library_log	2
+crates/remanence-api/src/write_owner/write_session.rs::raise_tape_io_fence::library_log	1
+crates/remanence-state/src/index.rs::<module>::library_log	1
+crates/remanence-state/src/library_runtime.rs::<module>::library_log	1
+crates/remanence-state/src/library_runtime/motion.rs::<module>::library_log	1
+crates/remanence-state/src/library_runtime/readiness.rs::<module>::library_log	1
+crates/remanence-state/src/projector/handle.rs::rebuild_typed_sources::library_log	4
+crates/remanence-state/src/state.rs::adopt_bootstrap_identity::library_log	1
+crates/remanence-state/src/state.rs::adoption_assignment_source::library_log	2
+crates/remanence-state/src/state.rs::assign_tape_pool::library_log	1
+crates/remanence-state/src/state.rs::provision_replacing_media::library_log	1
+crates/remanence-state/src/state.rs::rebind_tape_label::library_log	1
+crates/remanence-state/src/state.rs::rebuild_projection_inputs::library_log	1
+crates/remanence-state/src/state.rs::recover_library_sessions_after_restart::library_log	1
+crates/remanence-state/src/state.rs::recover_sessions_after_restart::library_log	1
+crates/remanence-state/src/state.rs::repair_tape_log_tail::library_log	1
+crates/remanence-state/src/state.rs::retire_tape::library_log	1
+crates/remanence-state/src/state.rs::set_tape_generation::library_log	1
+crates/remanence-state/src/state/authority_reset.rs::<module>::library_log	1
+crates/remanence-state/src/state/initialization.rs::<module>::library_log	1
+crates/remanence-state/src/state/initialization.rs::record_initialization_replacement::library_log	1
+crates/remanence-state/src/tape_log/projection.rs::rebuild_typed_sources::library_log	4

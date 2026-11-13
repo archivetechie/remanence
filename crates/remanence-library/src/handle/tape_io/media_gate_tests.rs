@@ -611,12 +611,39 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-api/src/write_owner/tests.rs",
             DispatchPolicy::Exact {
-                execute_out: 4,
-                execute_none: 4,
-                why: "cfg(test) TurScriptTransport, RecoveryReadFaultTransport, \
-                      VerificationCancelTransport and LoadRefreshGate forwarders only; \
-                      LoadRefreshGate pauses in-memory changer refresh; production write_owner \
-                      code dispatches through DriveHandle",
+                execute_out: 5,
+                execute_none: 5,
+                why: "cfg(test) TurScriptTransport forwards to FixtureTransport; \
+                      RecoveryReadFaultTransport, VerificationCancelTransport, LoadRefreshGate \
+                      and ReadinessFailedLoad forward to in-memory ModelTransport only; \
+                      LoadRefreshGate pauses changer refresh; production write_owner code \
+                      dispatches through DriveHandle",
+            },
+        ),
+        (
+            "remanence-api/src/write_owner/r1c2_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 2,
+                execute_none: 2,
+                why: "cfg(test) FailSecondElementStatus and LifecycleDrive forwarders \
+                      to in-memory ModelTransport only",
+            },
+        ),
+        (
+            "remanence-api/src/write_owner/drive_fence_api_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) HeldTur forwarder to in-memory ModelTransport only",
+            },
+        ),
+        (
+            "remanence-cli/src/pool_ops/write_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) FailSecondElementStatus forwarder to the fixture \
+                      mounted_tests::library_transport wrapping in-memory ModelTransport only",
             },
         ),
         (
@@ -854,9 +881,10 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-library/src/handle/changer_evidence_tests.rs",
             DispatchPolicy::Exact {
-                execute_out: 1,
-                execute_none: 1,
-                why: "changer-evidence tests forward only to FixtureTransport and fixture inventory; no device I/O",
+                execute_out: 2,
+                execute_none: 2,
+                why: "cfg(test) FailOpcode and FailConfirmation forwarders to FixtureTransport \
+                      and the test handle's own fixture transport and inventory only; no device I/O",
             },
         ),
         // Frozen P1 model-only fault-injection forwarders.
