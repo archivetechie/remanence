@@ -185,6 +185,7 @@ mod tests {
 
     /// Startup projects a synced raise after a crash, with no duplicate on retry.
     #[test]
+    #[ignore = "ruling 29 (next landing): the typed tape fence carries no endpoint (two-target fences); the crash-before-projection property is covered on typed sources by runtime_shares_real_identity_and_rebuilds_fence_after_sql_loss and native_fences s1, s3, s7; D-C3a-S-1"]
     fn raise_crash_before_projection_recovers_at_startup_once() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");

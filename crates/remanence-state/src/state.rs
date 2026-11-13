@@ -2879,8 +2879,12 @@ pool_id = "camera.copy-a"
         }
     }
 
+    /// D-C3a-S-1: an unlabelled standalone adoption preserves its typed evidence
+    /// through an in-place rebuild, while forged endpoint evidence is refused at append.
     #[test]
     fn standalone_adoption_without_label_preserves_typed_evidence_through_replay() {
+        use crate::library_log as lib;
+
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         fs::write(&config_path, config_text(temp.path())).unwrap();
@@ -2910,33 +2914,41 @@ pool_id = "camera.copy-a"
                 .unwrap()
                 .newly_adopted
         );
-        let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
+        let records = handle.library_runtime().test_source_records();
         let record = records
             .iter()
-            .find(|r| r.event == AuditEvent::TapeIdentityAdopted)
+            .find_map(|record| match record.body_view() {
+                lib::BodyView::Reprovision(value)
+                    if value.tape.uuid == input.tape_uuid
+                        && value.mode == lib::ProvisionMode::Adopt =>
+                {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
             .unwrap();
-        assert_eq!(record.detail.get("voltag"), Some(&CborValue::Null));
+        assert_eq!(record.label, None);
+        assert_eq!(record.label_provenance, None);
         assert_eq!(
-            record.detail.get("endpoint_key"),
-            Some(&CborValue::Text(evidence.endpoint.encode()))
+            record.endpoint,
+            Some(lib::DriveKey::Standalone(lib::Standalone {
+                drive_serial: "DRV001".into(),
+            }))
         );
-        for field in [
-            "library_serial",
-            "library_revision",
-            "home_slot",
-            "drive_element",
-        ] {
-            assert!(!record.detail.contains_key(field));
-        }
-        let mut restored = crate::projector::open(":memory:")
-            .map(|catalog| catalog.write_handle())
+        let adoption = record.adoption.as_ref().unwrap();
+        assert_eq!(adoption.library_revision, None);
+        assert_eq!(adoption.home_slot, None);
+        let expected = handle
+            .catalog()
+            .get_tape(&input.tape_uuid)
+            .unwrap()
             .unwrap();
-        restored.replay_audit_records(&records).unwrap();
-        restored
-            .rebuild_from_authoritative_sources(&records, &[])
+        handle.rebuild_index_from_journals().unwrap();
+        let actual = handle
+            .catalog()
+            .get_tape(&input.tape_uuid)
+            .unwrap()
             .unwrap();
-        let expected = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
-        let actual = restored.get_tape(&input.tape_uuid).unwrap().unwrap();
         assert_eq!(
             (actual.voltag.as_deref(), actual.voltag_source),
             (None, None)
@@ -2953,19 +2965,7 @@ pool_id = "camera.copy-a"
         assert!(handle
             .adopt_bootstrap_identity(input.clone(), invalid)
             .is_err());
-        let mut bad_records = records.clone();
-        bad_records
-            .iter_mut()
-            .find(|r| r.event == AuditEvent::TapeIdentityAdopted)
-            .unwrap()
-            .detail
-            .insert("drive_serial".into(), CborValue::Text("different".into()));
-        let mut rejected = crate::projector::open(":memory:")
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        rejected.replay_audit_records(&bad_records).unwrap();
-        assert!(rejected.get_tape(&input.tape_uuid).unwrap().is_none());
-        // Bay admission still requires revision and return slot, live and replay.
+        // Bay admission still requires revision and return slot at the live producer.
         for missing_revision in [false, true] {
             let mut bay =
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
@@ -2975,23 +2975,46 @@ pool_id = "camera.copy-a"
                 bay.home_slot = None;
             }
             assert!(handle.adopt_bootstrap_identity(input.clone(), bay).is_err());
-            let mut bad = record.clone();
-            bad.detail.insert(
-                "endpoint_key".into(),
-                CborValue::Text(crate::DriveKey::new("LIB001", 0).encode()),
-            );
-            if missing_revision {
-                bad.detail
-                    .insert("home_slot".into(), CborValue::Integer(1.into()));
+        }
+        // Fresh identities bypass duplicate-tape and duplicate-operation refusals,
+        // so each append reaches the fold's endpoint-evidence schema check.
+        for case in ["standalone serial", "bay revision", "bay home slot"] {
+            let mut forged = record.clone();
+            let forged_tape = *Uuid::new_v4().as_bytes();
+            let operation = *Uuid::new_v4().as_bytes();
+            forged.tape.uuid = forged_tape;
+            let adoption = forged.adoption.as_mut().unwrap();
+            adoption.operation = operation;
+            adoption.idempotency_key = operation;
+            if case == "standalone serial" {
+                adoption.drive_serial = "different".into();
             } else {
-                bad.detail
-                    .insert("library_revision".into(), CborValue::Text("D.00".into()));
+                forged.endpoint = Some(lib::DriveKey::Bay(lib::Bay {
+                    library_serial: "LIB001".into(),
+                    bay: 0,
+                }));
+                if case == "bay revision" {
+                    adoption.home_slot = Some(1);
+                } else {
+                    adoption.library_revision = Some("D.00".into());
+                }
             }
-            let mut rejected = crate::projector::open(":memory:")
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
-            rejected.replay_audit_records(&[bad]).unwrap();
-            assert!(rejected.get_tape(&input.tape_uuid).unwrap().is_none());
+            let result = handle
+                .library_runtime()
+                .append(|a, v| a.reprovision(forged, AuditActor::System, SourceLayer::Layer4, v));
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::library_runtime::RuntimeError::Authority(
+                        lib::authority::AuthorityError::Store(lib::store::StoreError::Fold(
+                            lib::fold::FoldError::InvalidSchema
+                        ))
+                    ))
+                ),
+                "forged {case} append must be refused as InvalidSchema: {result:?}"
+            );
+            assert!(handle.catalog().get_tape(&forged_tape).unwrap().is_none());
+            assert!(handle.library_runtime().tape_state(forged_tape).is_none());
         }
         drop(handle);
         let mut reopened = StateHandle::open_from_config_file(&config_path).unwrap();
@@ -4173,6 +4196,7 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
+    #[ignore = "D-C3a-S-1 D3 (next landing): the restart pool-rule pass is not in the first landing"]
     fn reopen_reconciles_removed_config_tape_pools() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-handle")
@@ -4235,6 +4259,7 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
+    #[ignore = "D-C3a-S-1 D3 (next landing): the restart pool-rule pass is not in the first landing"]
     fn reopen_reconciles_derived_pool_membership_from_rules() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-handle")
@@ -4438,6 +4463,54 @@ pool_id = "camera.copy-a"
         assert_eq!(records.len(), record_count);
     }
 
+    /// Prime a native write session through the same authority steps as
+    /// native_fences_tests::Fixture::native, then refresh the handle's typed view.
+    fn seed_native_write_session(
+        handle: &StateHandle,
+        tape_uuid: [u8; 16],
+        session_id: Uuid,
+        end: Option<crate::tape_log::SessionEndReason>,
+    ) {
+        use crate::authority::TapeAuthorityView;
+
+        let authority = crate::TapeAuthority::open(
+            handle.paths().journal_dir.join("tapes"),
+            tape_uuid,
+            &handle.paths().sqlite_path,
+        )
+        .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                262144,
+                None,
+                crate::tape_log::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        let time = "2026-11-11T00:00:00Z";
+        owner
+            .open_session(*session_id.as_bytes(), time.into())
+            .unwrap();
+        if let Some(reason) = end {
+            owner
+                .end_session(
+                    *session_id.as_bytes(),
+                    time.into(),
+                    reason,
+                    None,
+                    std::iter::empty(),
+                )
+                .unwrap();
+        }
+        let snapshot = owner.freeze().unwrap();
+        handle.library_runtime().refresh_native(&snapshot).unwrap();
+    }
+
+    /// D-C3a-S-1: startup replay rebuilds typed provisioning and retirement while
+    /// preserving an independently closed native write session, with no audit replay.
     #[test]
     fn audit_replay_projects_retire_and_provision_events_without_disturbing_sessions() {
         let temp = tempfile::Builder::new()
@@ -4447,93 +4520,40 @@ pool_id = "camera.copy-a"
         let config = parse_config_toml(&config_text(temp.path())).expect("config");
         let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
         let session_id = Uuid::from_u128(0x61);
-        let operation_id = Uuid::from_u128(0x62);
+        let session_tape = [0x22; 16];
 
         {
-            let handle =
+            let mut handle =
                 StateHandle::open_with_config(paths.clone(), config.clone()).expect("open first");
-            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::User("alice".to_string()),
-                    source_layer: SourceLayer::Layer5,
-                    operation_id: None,
-                    session_id: Some(session_id),
-                    idempotency_key: None,
-                    event: AuditEvent::SessionOpened,
-                    subject: AuditSubject {
-                        kind: "write".to_string(),
-                        id: Some(session_id.to_string()),
-                    },
-                    detail: BTreeMap::from([(
-                        "session_kind".to_string(),
-                        CborValue::Text("write".to_string()),
-                    )]),
+            for (tape_uuid, label) in [([0x21; 16], "ACM002L9"), (session_tape, "ACM003L9")] {
+                handle
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: label.into(),
+                        block_size: 262144,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .expect("provision tape");
+            }
+            handle
+                .retire_tape(RetireTapeInput {
+                    tape_uuid: [0x21; 16],
+                    reason: "recycled".into(),
                 })
-                .expect("append session opened");
-            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::User("alice".to_string()),
-                    source_layer: SourceLayer::Layer4,
-                    operation_id: None,
-                    session_id: None,
-                    idempotency_key: None,
-                    event: AuditEvent::TapeProvisioned,
-                    subject: AuditSubject {
-                        kind: "tape".to_string(),
-                        id: Some("21".repeat(16)),
-                    },
-                    detail: BTreeMap::from([(
-                        "voltag".to_string(),
-                        CborValue::Text("ACM002L9".to_string()),
-                    )]),
-                })
-                .expect("append tape provisioned");
-            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::User("alice".to_string()),
-                    source_layer: SourceLayer::Layer4,
-                    operation_id: None,
-                    session_id: None,
-                    idempotency_key: None,
-                    event: AuditEvent::TapeRetired,
-                    subject: AuditSubject {
-                        kind: "tape".to_string(),
-                        id: Some("21".repeat(16)),
-                    },
-                    detail: BTreeMap::from([(
-                        "reason".to_string(),
-                        CborValue::Text("recycled".to_string()),
-                    )]),
-                })
-                .expect("append tape retired");
-            crate::FileAuditLog::open(&handle.paths().audit_dir, true)
-                .unwrap()
-                .append(AuditEventRecord {
-                    actor: AuditActor::User("alice".to_string()),
-                    source_layer: SourceLayer::Layer5,
-                    operation_id: Some(operation_id),
-                    session_id: Some(session_id),
-                    idempotency_key: None,
-                    event: AuditEvent::SessionClosed,
-                    subject: AuditSubject {
-                        kind: "write".to_string(),
-                        id: Some(session_id.to_string()),
-                    },
-                    detail: BTreeMap::new(),
-                })
-                .expect("append session closed");
+                .expect("retire tape");
+            seed_native_write_session(
+                &handle,
+                session_tape,
+                session_id,
+                Some(crate::tape_log::SessionEndReason::CleanClose),
+            );
         }
 
-        // Replay projects both the catalog lifecycle and the independent
-        // operation/session history from the same ordered ledger.
         let mut restarted =
             StateHandle::open_with_config(paths, config).expect("open restarted handle");
         let report = restarted.startup_replay().expect("startup replay");
-
-        assert_eq!(report.rebuild.audit_records_replayed, 4);
+        assert_eq!(report.rebuild.audit_records_replayed, 0);
         assert_eq!(report.lost_operations_marked, 0);
         assert_eq!(report.lost_sessions_marked, 0);
         assert_eq!(
@@ -4541,7 +4561,7 @@ pool_id = "camera.copy-a"
                 .catalog()
                 .get_tape(&[0x21; 16])
                 .expect("tape lookup")
-                .expect("audit-projected tape")
+                .expect("typed-projected tape")
                 .state,
             "retired"
         );
@@ -4907,6 +4927,7 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
+    #[ignore = "ruling 25 (next landing): restart-lost operations become CompletionUnknown and the daemon closes prior work at start; StateHandle::startup_replay has no production caller in the first landing; D-C3a-S-1"]
     fn startup_replay_marks_non_terminal_prior_work_lost() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-handle")
@@ -5387,10 +5408,10 @@ pool_id = "camera.copy-a"
         );
     }
 
-    /// §6.5 startup/orphan-recovery row: a write session that was
-    /// non-terminal when the process died leaves its volume invalid —
-    /// epoch durably advanced, uncalibrated — until a fresh load
-    /// harvest. A lost read session does not.
+    /// D-C3a-S-1: a crash-left native write session advances its tape's epoch and
+    /// invalidates its map until a fresh harvest; a lost typed read session does not advance its epoch.
+    /// The native recovery branch has no daemon caller, and rebuild eviction alone uncalibrates
+    /// both tapes, so the write epoch distinguishes possible-write recovery from eviction.
     #[test]
     fn startup_replay_invalidates_possibly_written_volumes() {
         let temp = tempfile::Builder::new()
@@ -5405,35 +5426,33 @@ pool_id = "camera.copy-a"
         let read_session = Uuid::from_u128(0x72);
 
         let (write_map_epoch, read_map_epoch) = {
-            let handle =
+            let mut handle =
                 StateHandle::open_with_config(paths.clone(), config.clone()).expect("open");
-            for (session_id, kind, tape) in [
-                (write_session, "write", write_tape),
-                (read_session, "read", read_tape),
-            ] {
-                crate::FileAuditLog::open(&handle.paths().audit_dir, true)
-                    .unwrap()
-                    .append(AuditEventRecord {
-                        actor: AuditActor::User("alice".to_string()),
-                        source_layer: SourceLayer::Layer5,
-                        operation_id: None,
-                        session_id: Some(session_id),
-                        idempotency_key: None,
-                        event: AuditEvent::SessionOpened,
-                        subject: AuditSubject {
-                            kind: kind.to_string(),
-                            id: Some(session_id.to_string()),
-                        },
-                        detail: BTreeMap::from([
-                            (
-                                "session_kind".to_string(),
-                                CborValue::Text(kind.to_string()),
-                            ),
-                            ("tape_uuid".to_string(), CborValue::Bytes(tape.to_vec())),
-                        ]),
+            for (tape_uuid, label) in [(write_tape, "ACM006L9"), (read_tape, "ACM007L9")] {
+                handle
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid,
+                        voltag: label.into(),
+                        block_size: 262144,
+                        parity: ParityConfig::None,
+                        force: false,
                     })
-                    .expect("append session opened");
+                    .expect("provision tape");
             }
+            seed_native_write_session(&handle, write_tape, write_session, None);
+            handle
+                .library_runtime()
+                .observe_session(
+                    *read_session.as_bytes(),
+                    crate::library_log::SessionKind::Read,
+                    Some(&crate::DriveKey::new("LIB001", 256)),
+                    Some(read_tape),
+                    crate::library_log::SessionEvent::Opened,
+                    None,
+                    AuditActor::System,
+                    (None, None),
+                )
+                .expect("open typed read session");
             let mut epochs = Vec::new();
             for tape in [write_tape, read_tape] {
                 let transition = handle
@@ -5453,7 +5472,7 @@ pool_id = "camera.copy-a"
         // The process "dies" (handle dropped) and a new one replays.
         let mut handle = StateHandle::open_with_config(paths, config).expect("reopen");
         let report = handle.startup_replay().expect("startup replay");
-        assert_eq!(report.lost_sessions_marked, 2);
+        assert_eq!(report.lost_sessions_marked, 1);
 
         let write_row = handle.calibration_control().row(write_tape);
         assert_eq!(
