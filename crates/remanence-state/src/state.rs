@@ -4555,127 +4555,234 @@ pool_id = "camera.copy-a"
         );
     }
 
-    /// Build ordinary bay-session audit evidence for startup projection gaps.
-    fn library_restart_event(
-        session_id: Uuid,
-        tape_uuid: [u8; 16],
-        event: AuditEvent,
-    ) -> AuditEventRecord {
-        AuditEventRecord {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: None,
-            session_id: Some(session_id),
-            idempotency_key: None,
-            event,
-            subject: AuditSubject {
-                kind: "write".into(),
-                id: Some(session_id.to_string()),
-            },
-            detail: BTreeMap::from([
-                ("session_kind".into(), CborValue::Text("write".into())),
-                ("tape_uuid".into(), CborValue::Bytes(tape_uuid.to_vec())),
-                ("library_serial".into(), CborValue::Text("LIB001".into())),
-                ("drive_bay".into(), CborValue::Integer(256.into())),
-            ]),
+    /// Copy a closed catalogue and its exact sidecar set to or from a crash image.
+    /// All state handles must be dropped before either snapshot or restore.
+    fn copy_library_restart_catalogue(source: &Path, destination: &Path) {
+        assert!(
+            source.is_file(),
+            "catalogue image requires the main SQLite file"
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let with_suffix = |path: &Path| {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                PathBuf::from(name)
+            };
+            let source = with_suffix(source);
+            let destination = with_suffix(destination);
+            if source.exists() {
+                fs::copy(source, destination).unwrap();
+            } else if destination.exists() {
+                fs::remove_file(destination).unwrap();
+            }
         }
     }
 
-    /// A durable close wins over stale open projection without invalidating its tape.
+    /// Inspect the crash image without starting the projector or library runtime.
+    fn library_restart_image_session(sqlite_path: &Path, session_id: Uuid) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        let connection = rusqlite::Connection::open_with_flags(
+            sqlite_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        connection
+            .query_row(
+                "select state from sessions where session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Give each recovery session a live typed Reprovision identity.
+    fn provision_library_restart_tape(state: &mut StateHandle, tape_uuid: [u8; 16]) {
+        state
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: format!("ACM{:03}L9", tape_uuid[0]),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+    }
+
+    /// A durable typed close wins over a crash image's stale open without changing
+    /// its tape calibration on daemon restart (D-C3a-S-1, row 9).
     #[test]
     fn library_startup_replays_unprojected_session_close() {
+        use crate::library_log as lib;
         let temp = tempfile::tempdir().unwrap();
         let config = parse_config_toml(&config_text(temp.path())).unwrap();
         let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let image = temp.path().join("crash-image.sqlite");
         let session_id = Uuid::new_v4();
         let tape_uuid = [0x71; 16];
+        let endpoint = crate::DriveKey::new("LIB001", 256);
         {
             let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
-            let (_, opened) = crate::FileAuditLog::open(&state.paths().audit_dir, true)
-                .unwrap()
-                .append_and_return_record(library_restart_event(
-                    session_id,
-                    tape_uuid,
-                    AuditEvent::SessionOpened,
-                ))
-                .unwrap();
-            state.index.project_audit_record(&opened).unwrap();
+            provision_library_restart_tape(&mut state, tape_uuid);
             state
                 .calibration_control()
                 .record_harvest_success(tape_uuid, 0)
                 .unwrap();
-            crate::FileAuditLog::open(&state.paths().audit_dir, true)
-                .unwrap()
-                .append(library_restart_event(
-                    session_id,
-                    tape_uuid,
-                    AuditEvent::SessionClosed,
-                ))
+            state
+                .library_runtime()
+                .observe_session(
+                    *session_id.as_bytes(),
+                    lib::SessionKind::Operation,
+                    Some(&endpoint),
+                    Some(tape_uuid),
+                    lib::SessionEvent::Opened,
+                    None,
+                    AuditActor::System,
+                    (None, None),
+                )
                 .unwrap();
         }
-        let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
-        let mut index = crate::projector::open(&paths.sqlite_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
+        copy_library_restart_catalogue(&paths.sqlite_path, &image);
+        {
+            let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            state
+                .library_runtime()
+                .observe_session(
+                    *session_id.as_bytes(),
+                    lib::SessionKind::Operation,
+                    Some(&endpoint),
+                    Some(tape_uuid),
+                    lib::SessionEvent::Closed,
+                    None,
+                    AuditActor::System,
+                    (None, None),
+                )
+                .unwrap();
+        }
+        copy_library_restart_catalogue(&image, &paths.sqlite_path);
         assert_eq!(
-            index.session_state(session_id).unwrap().as_deref(),
+            library_restart_image_session(&paths.sqlite_path, session_id).as_deref(),
             Some("open")
         );
         let calibration_path = paths
             .calibration_dir
             .join(crate::CALIBRATION_CONTROL_FILENAME);
         let calibration_before = fs::read(&calibration_path).unwrap();
+        let restarted = StateHandle::open_with_config(paths, config.clone()).unwrap();
+        let state_after_start = restarted.catalog().session_state(session_id).unwrap();
 
-        let lost = recover_library_sessions_after_restart(&mut index, &config).unwrap();
+        let lost =
+            recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap();
 
         assert_eq!(
-            index.session_state(session_id).unwrap().as_deref(),
+            restarted
+                .catalog()
+                .session_state(session_id)
+                .unwrap()
+                .as_deref(),
             Some("closed")
         );
+        assert_eq!(state_after_start.as_deref(), Some("closed"));
         assert_eq!(lost, 0);
         assert_eq!(fs::read(calibration_path).unwrap(), calibration_before);
-        assert!(!FileAuditLog::replay(&paths.audit_dir)
-            .unwrap()
+        assert!(!restarted
+            .library_runtime()
+            .test_source_records()
             .iter()
-            .any(|record| record.event == AuditEvent::SessionLostByRestart));
+            .any(
+                |record| matches!(record.body_view(), lib::BodyView::SessionObserved(value)
+                if value.session_id == *session_id.as_bytes()
+                    && value.event == lib::SessionEvent::LostByRestart)
+            ));
     }
 
-    /// A durable open missing from SQLite still belongs to startup recovery.
+    /// A durable typed open missing from a crash image is projected on daemon
+    /// restart and marked lost exactly once (D-C3a-S-1, row 10).
     #[test]
     fn library_startup_replays_unprojected_session_open() {
+        use crate::library_log as lib;
         let temp = tempfile::tempdir().unwrap();
         let config = parse_config_toml(&config_text(temp.path())).unwrap();
         let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let image = temp.path().join("crash-image.sqlite");
         let session_id = Uuid::new_v4();
+        let tape_uuid = [0x72; 16];
+        {
+            let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            provision_library_restart_tape(&mut state, tape_uuid);
+        }
+        copy_library_restart_catalogue(&paths.sqlite_path, &image);
         {
             let state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
-            crate::FileAuditLog::open(&state.paths().audit_dir, true)
-                .unwrap()
-                .append(library_restart_event(
-                    session_id,
-                    [0x72; 16],
-                    AuditEvent::SessionOpened,
-                ))
+            state
+                .library_runtime()
+                .observe_session(
+                    *session_id.as_bytes(),
+                    lib::SessionKind::Operation,
+                    Some(&crate::DriveKey::new("LIB001", 256)),
+                    Some(tape_uuid),
+                    lib::SessionEvent::Opened,
+                    None,
+                    AuditActor::System,
+                    (None, None),
+                )
                 .unwrap();
         }
-        let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
-        let mut index = crate::projector::open(&paths.sqlite_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        assert_eq!(index.session_state(session_id).unwrap(), None);
+        copy_library_restart_catalogue(&image, &paths.sqlite_path);
+        assert_eq!(
+            library_restart_image_session(&paths.sqlite_path, session_id),
+            None
+        );
+        let restarted = StateHandle::open_with_config(paths, config.clone()).unwrap();
+        assert_eq!(
+            restarted
+                .catalog()
+                .session_state(session_id)
+                .unwrap()
+                .as_deref(),
+            Some("open")
+        );
 
-        let lost = recover_library_sessions_after_restart(&mut index, &config).unwrap();
+        let lost =
+            recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap();
 
         assert_eq!(
-            index.session_state(session_id).unwrap().as_deref(),
-            Some("lost_by_restart")
+            restarted
+                .catalog()
+                .session_state(session_id)
+                .unwrap()
+                .as_deref(),
+            Some("lost_restart")
         );
         assert_eq!(lost, 1);
+        let records = restarted.library_runtime().test_source_records();
+        let lost_records: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record.body_view() {
+                lib::BodyView::SessionObserved(value)
+                    if value.session_id == *session_id.as_bytes()
+                        && value.event == lib::SessionEvent::LostByRestart =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lost_records.len(), 1);
+        assert_eq!(
+            lost_records[0]
+                .reason
+                .as_ref()
+                .map(|reason| reason.as_str()),
+            Some("daemon_restart")
+        );
     }
 
-    /// Daemon recovery scopes loss and existing volume invalidation to its library bays.
+    /// Typed daemon recovery is scoped to configured bays and idempotent; it
+    /// invalidates no calibration (D-C3a-S-1, row 11, facts 2-3 and whole-branch review row).
     #[test]
     fn library_startup_recovery_is_scoped_and_idempotent() {
+        use crate::library_log::{SessionEvent, SessionKind};
         let temp = tempfile::tempdir().unwrap();
         let mut config = parse_config_toml(&config_text(temp.path())).unwrap();
         let mut second_library = config.libraries[0].clone();
@@ -4685,28 +4792,36 @@ pool_id = "camera.copy-a"
         let sessions = [
             (
                 Some(crate::DriveKey::new("LIB001", 256)),
-                "write",
-                "lost_by_restart",
+                SessionKind::Operation,
+                "lost_restart",
             ),
             (
                 Some(crate::DriveKey::new("LIB001", 0)),
-                "read",
-                "lost_by_restart",
+                SessionKind::Read,
+                "lost_restart",
             ),
-            (Some(crate::DriveKey::new("OTHER", 256)), "write", "open"),
+            (
+                Some(crate::DriveKey::new("OTHER", 256)),
+                SessionKind::Operation,
+                "open",
+            ),
             (
                 Some(crate::DriveKey::Standalone {
                     drive_serial: "DIRECT".into(),
                 }),
-                "write",
+                SessionKind::Operation,
                 "open",
             ),
-            (Some(crate::DriveKey::new("LIB001", 257)), "write", "closed"),
-            (None, "write", "open"),
+            (
+                Some(crate::DriveKey::new("LIB001", 257)),
+                SessionKind::Operation,
+                "closed",
+            ),
+            (None, SessionKind::Operation, "open"),
             (
                 Some(crate::DriveKey::new("LIB002", 256)),
-                "write",
-                "lost_by_restart",
+                SessionKind::Operation,
+                "lost_restart",
             ),
         ];
         {
@@ -4714,108 +4829,76 @@ pool_id = "camera.copy-a"
             for (n, (endpoint, kind, expected)) in sessions.iter().enumerate() {
                 let id = Uuid::from_u128(n as u128 + 1);
                 let tape = [n as u8 + 1; 16];
-                let mut detail = BTreeMap::from([
-                    ("session_kind".into(), CborValue::Text((*kind).into())),
-                    ("tape_uuid".into(), CborValue::Bytes(tape.to_vec())),
-                ]);
-                if let Some(endpoint) = endpoint {
-                    // The read fixture exercises legacy bay-coordinate evidence.
-                    if *kind != "read" {
-                        detail.insert("endpoint_key".into(), CborValue::Text(endpoint.encode()));
-                    }
-                    // Explicit standalone identity wins over stale bay coordinates.
-                    detail.insert(
-                        "library_serial".into(),
-                        CborValue::Text(endpoint.library_serial().unwrap_or("LIB001").into()),
-                    );
-                    detail.insert(
-                        "drive_bay".into(),
-                        CborValue::Integer(endpoint.bay().unwrap_or(256).into()),
-                    );
-                }
-                let mut event = AuditEventRecord {
-                    actor: AuditActor::System,
-                    source_layer: SourceLayer::Layer5,
-                    operation_id: None,
-                    session_id: Some(id),
-                    idempotency_key: None,
-                    event: AuditEvent::SessionOpened,
-                    subject: AuditSubject {
-                        kind: (*kind).into(),
-                        id: Some(id.to_string()),
-                    },
-                    detail,
-                };
-                crate::FileAuditLog::open(&state.paths().audit_dir, true)
-                    .unwrap()
-                    .append(event.clone())
-                    .unwrap();
-                if *expected == "closed" {
-                    event.event = AuditEvent::SessionClosed;
-                    crate::FileAuditLog::open(&state.paths().audit_dir, true)
-                        .unwrap()
-                        .append(event)
-                        .unwrap();
-                }
+                provision_library_restart_tape(&mut state, tape);
                 state
                     .calibration_control()
                     .record_harvest_success(tape, 0)
                     .unwrap();
+                let runtime = state.library_runtime();
+                runtime
+                    .observe_session(
+                        *id.as_bytes(),
+                        *kind,
+                        endpoint.as_ref(),
+                        Some(tape),
+                        SessionEvent::Opened,
+                        None,
+                        AuditActor::System,
+                        (None, None),
+                    )
+                    .unwrap();
+                if *expected == "closed" {
+                    runtime
+                        .observe_session(
+                            *id.as_bytes(),
+                            *kind,
+                            endpoint.as_ref(),
+                            Some(tape),
+                            SessionEvent::Closed,
+                            None,
+                            AuditActor::System,
+                            (None, None),
+                        )
+                        .unwrap();
+                }
             }
-            state.replay_audit_projection().unwrap();
         }
-        let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
-        let mut index = crate::projector::open(&paths.sqlite_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
+        let restarted = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
         assert_eq!(
-            recover_library_sessions_after_restart(&mut index, &config).unwrap(),
+            recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap(),
             3
         );
-        let calibration = CalibrationControlStore::open(&paths.calibration_dir).unwrap();
-        for (n, (_, kind, expected)) in sessions.iter().enumerate() {
+        for (n, (_, _, expected)) in sessions.iter().enumerate() {
             assert_eq!(
-                index
+                restarted
+                    .catalog()
                     .session_state(Uuid::from_u128(n as u128 + 1))
                     .unwrap()
                     .as_deref(),
                 Some(*expected)
             );
-            let row = calibration.row([n as u8 + 1; 16]);
-            let invalidated = *kind == "write" && *expected == "lost_by_restart";
-            assert_eq!(row.write_epoch, u64::from(invalidated));
-            assert_eq!(
-                row.state == crate::VolumeCalibrationState::Uncalibrated,
-                invalidated
-            );
-            assert!(!index
+            let row = restarted.calibration_control().row([n as u8 + 1; 16]);
+            assert_eq!(row.write_epoch, 0);
+            assert_ne!(row.state, crate::VolumeCalibrationState::Uncalibrated);
+            assert!(!restarted
+                .catalog()
                 .tape_io_is_fenced(Some(&[n as u8 + 1; 16]), None, None)
                 .unwrap());
         }
-        let before = FileAuditLog::replay(&paths.audit_dir).unwrap().len();
-        let calibration_bytes = fs::read(
-            paths
-                .calibration_dir
-                .join(crate::CALIBRATION_CONTROL_FILENAME),
-        )
-        .unwrap();
+        let before = restarted.library_runtime().test_source_records().len();
+        let calibration_path = paths
+            .calibration_dir
+            .join(crate::CALIBRATION_CONTROL_FILENAME);
+        let calibration_bytes = fs::read(&calibration_path).unwrap();
         assert_eq!(
-            recover_library_sessions_after_restart(&mut index, &config).unwrap(),
+            recover_library_sessions_after_restart(&mut restarted.write_handle(), &config).unwrap(),
             0
         );
         assert_eq!(
-            FileAuditLog::replay(&paths.audit_dir).unwrap().len(),
+            restarted.library_runtime().test_source_records().len(),
             before
         );
-        assert_eq!(
-            fs::read(
-                paths
-                    .calibration_dir
-                    .join(crate::CALIBRATION_CONTROL_FILENAME)
-            )
-            .unwrap(),
-            calibration_bytes
-        );
+        assert_eq!(fs::read(calibration_path).unwrap(), calibration_bytes);
     }
 
     #[test]
