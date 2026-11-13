@@ -135,14 +135,22 @@ fn restart(
     typed: &TypedRoot,
     closing_step: bool,
 ) -> (Option<remanence_state::StateHandle>, ApiState) {
-    let config = typed.config();
+    restart_with_config(typed, closing_step, &typed.config())
+}
+
+/// Reopen as the daemon does with the caller's pool configuration.
+fn restart_with_config(
+    typed: &TypedRoot,
+    closing_step: bool,
+    config: &remanence_state::RemConfig,
+) -> (Option<remanence_state::StateHandle>, ApiState) {
     if closing_step {
         let mut handle =
             remanence_state::StateHandle::open_with_config(typed.paths().clone(), config.clone())
                 .expect("reopen the state root");
         let report = handle.startup_replay().expect("startup replay");
         assert_eq!(report.lost_operations_marked, 1, "the started finalize");
-        let state = ApiState::new_with_config(handle.projection_client(), &config)
+        let state = ApiState::new_with_config(handle.projection_client(), config)
             .expect("service state after the restart");
         return (Some(handle), state);
     }
@@ -157,7 +165,7 @@ fn restart(
         .expect("reopen the catalog")
         .with_library_runtime(runtime);
     let state =
-        ApiState::new_with_config(catalog, &config).expect("service state after the restart");
+        ApiState::new_with_config(catalog, config).expect("service state after the restart");
     (None, state)
 }
 
@@ -267,7 +275,7 @@ fn files_under(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 /// Every byte a request could have appended to: the library log and the native tape logs.
-fn durable_bytes(paths: &remanence_state::StatePaths) -> BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn durable_bytes(paths: &remanence_state::StatePaths) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = files_under(&paths.audit_dir);
     files.extend(files_under(&paths.journal_dir.join("tapes")));
     files
@@ -275,7 +283,7 @@ fn durable_bytes(paths: &remanence_state::StatePaths) -> BTreeMap<PathBuf, Vec<u
 
 /// What the tape's native log holds about finalization, counted from its decoded frames.
 #[derive(Debug, PartialEq, Eq)]
-struct NativeFinalization {
+pub(super) struct NativeFinalization {
     prepared: usize,
     decided: usize,
     retired: usize,
@@ -283,15 +291,23 @@ struct NativeFinalization {
 }
 
 fn native_finalization(paths: &remanence_state::StatePaths) -> NativeFinalization {
+    native_finalization_for(paths, TAPE)
+}
+
+/// Count finalization frames for the caller's tape, without opening a competing authority.
+pub(super) fn native_finalization_for(
+    paths: &remanence_state::StatePaths,
+    tape: TapeUuid,
+) -> NativeFinalization {
     use remanence_state::tape_log::{codec::Decoder, store::Header, Record};
     let directory = paths.journal_dir.join("tapes");
     let path = remanence_state::TapeAuthority::list_entries(&directory)
         .unwrap()
         .into_iter()
-        .find(|path| remanence_state::TapeAuthority::entry_tape_uuid(path).unwrap() == TAPE)
+        .find(|path| remanence_state::TapeAuthority::entry_tape_uuid(path).unwrap() == tape)
         .expect("native tape log");
     let mut file = std::fs::File::open(path).unwrap();
-    Header::decode(&mut file, TAPE).unwrap();
+    Header::decode(&mut file, tape).unwrap();
     let offset = std::io::Seek::stream_position(&mut file).unwrap();
     let mut decoder = Decoder::at(file, 1, offset);
     let mut counts = NativeFinalization {
@@ -1845,4 +1861,420 @@ fn the_finalize_rpc_with_a_changed_reason_under_a_bound_key_is_refused_with_the_
     });
     drop(incarnation);
     drop(held);
+}
+
+/// Shutdown leaves an admitted operation open; its readiness deadline closes the attempt
+/// with the retained-intent explanation.
+#[tokio::test]
+async fn manual_finalize_attempt_ends_at_shutdown_or_its_readiness_deadline_with_the_intent_summary(
+) {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+    let first = admission(0x4A01);
+    let request = admit_first_request(&state, first.clone());
+    let operation = request.candidate_operation_id;
+    let admitted = operation_events_in_log(typed.paths(), operation);
+    assert!(matches!(
+        admitted.as_slice(),
+        [
+            lib::OperationEvent::Accepted(_),
+            lib::OperationEvent::Started(_)
+        ]
+    ));
+    let pool = state.drive_pool().unwrap().clone();
+    let readiness_id = Uuid::from_bytes(
+        state
+            .catalog
+            .library_runtime()
+            .unwrap()
+            .start_owned_operation(
+                remanence_state::library_log::OperationKind::MediaReadinessWait,
+                remanence_state::AuditActor::System,
+            )
+            .expect("start the typed readiness owner"),
+    );
+    let mut index = state.catalog.write_handle();
+    index.set_readiness_observer(pool.readiness_wake.clone());
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: readiness_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB001", 0x0101),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: Some(LABEL.into()),
+            source_slot: None,
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "session_open_short_probe".into(),
+            state: "becoming_ready".into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    index
+        .record_media_readiness_transition(
+            crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                readiness_id,
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 1,
+                        media_initializing: false,
+                    },
+                ),
+            ),
+        )
+        .unwrap();
+    drop(index);
+    state
+        .readiness_shutdown
+        .store(true, std::sync::atomic::Ordering::Release);
+    let guard = pool.reserve_tape(TAPE).unwrap();
+    let before_shutdown = durable_bytes(typed.paths());
+    let shutdown_error = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_manual_finalize_worker_with_budget(
+            state.clone(),
+            pool.clone(),
+            guard.into(),
+            request.clone(),
+            Duration::from_secs(900),
+        ),
+    )
+    .await
+    .expect("shutdown ends the finalize attempt")
+    .unwrap_err();
+    assert!(crate::drive_pool::DaemonShuttingDown::is_status(
+        &shutdown_error
+    ));
+    assert_eq!(operation_events_in_log(typed.paths(), operation), admitted);
+    assert_eq!(durable_bytes(typed.paths()), before_shutdown);
+    assert_eq!(
+        state.operations.latest(&operation).unwrap().state,
+        pb::OperationState::Running as i32
+    );
+    state
+        .readiness_shutdown
+        .store(false, std::sync::atomic::Ordering::Release);
+    let guard = pool.reserve_tape(TAPE).unwrap();
+    let deadline_error = run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool.clone(),
+        guard.into(),
+        request,
+        Duration::from_millis(20),
+    )
+    .await
+    .unwrap_err();
+    assert!(deadline_error.message().contains("deadline expired"));
+    assert!(deadline_error.message().contains("remains incomplete"));
+    assert!(deadline_error
+        .message()
+        .contains("keeps this request's finalization intent"));
+    assert_eq!(
+        state
+            .index()
+            .unwrap()
+            .get_operation(&operation.to_string())
+            .unwrap()
+            .unwrap()
+            .state,
+        "failed"
+    );
+    assert_eq!(
+        state
+            .index()
+            .unwrap()
+            .terminal_finalization(&TAPE)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        remanence_state::TerminalFinalizationOutcome::InProgress
+    );
+    assert!(drive_rx.try_recv().is_err());
+    assert!(changer_rx.try_recv().is_err());
+}
+
+/// The worker's retained-intent explanation preserves an actor's typed retry cause.
+#[tokio::test]
+async fn manual_finalize_attempt_keeps_the_actors_retry_cause_beside_the_intent_summary() {
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+    let first = admission(0x4A02);
+    let request = admit_first_request(&state, first.clone());
+    let operation = request.candidate_operation_id;
+    let admitted = operation_events_in_log(typed.paths(), operation);
+    assert!(matches!(
+        admitted.as_slice(),
+        [
+            lib::OperationEvent::Accepted(_),
+            lib::OperationEvent::Started(_)
+        ]
+    ));
+    let pool = state.drive_pool().unwrap().clone();
+    let guard = pool.reserve_tape(TAPE).unwrap();
+    let typed_attempt = tokio::spawn(run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool.clone(),
+        guard.into(),
+        request,
+        Duration::from_secs(1),
+    ));
+    let command = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::write_owner::DriveCommand::FinalizeTape { reply, .. } = command else {
+        panic!("expected finalization dispatch");
+    };
+    reply
+        .send(Err(crate::closeout_obligation::RetryCause::Operator
+            .attach(Status::failed_precondition("opaque media refusal"))))
+        .unwrap();
+    let typed_error = tokio::time::timeout(Duration::from_secs(2), typed_attempt)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        typed_error.metadata().get("remanence-retry").unwrap(),
+        "operator"
+    );
+    assert!(typed_error.message().contains("remains incomplete"));
+    assert!(typed_error
+        .message()
+        .contains("keeps this request's finalization intent"));
+    assert!(drive_rx.try_recv().is_err());
+    assert!(changer_rx.try_recv().is_err());
+}
+
+/// Decode the operation's durable chain at a quiescent boundary while its runtime still
+/// owns the writer lock. Each byte snapshot is validated by the library frame decoder.
+pub(super) fn operation_events_in_log(
+    paths: &remanence_state::StatePaths,
+    operation: Uuid,
+) -> Vec<lib::OperationEvent> {
+    use lib::codec::{Decoder, Header, HEADER_LEN};
+    let mut entries: Vec<_> = std::fs::read_dir(&paths.audit_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "remlib"))
+        .collect();
+    entries.sort();
+    let mut records = Vec::new();
+    for path in entries {
+        let bytes = std::fs::read(path).unwrap();
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let header = Header::decode(&mut cursor, bytes[10..26].try_into().unwrap()).unwrap();
+        let mut decoder = Decoder::at(cursor, header.first_sequence, HEADER_LEN);
+        let mut previous = header.previous_segment_hash;
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            previous = lib::codec::verify(&frame, previous).unwrap();
+            if let Some(record) = frame.record.operation_recorded() {
+                if record.operation == *operation.as_bytes() {
+                    records.push(record.event.clone());
+                }
+            }
+        }
+    }
+    records
+}
+
+/// A crash leaves the accepted operation open: its fence holds startup, release resumes
+/// once, and a further crash after replica C leaves only the host suffix for the retry.
+#[test]
+fn manual_finalize_left_open_by_a_crash_waits_out_its_fence_then_resumes_once_and_completes_after_c(
+) {
+    let pool = TapePoolConfig {
+        scheme: None,
+        id: "async-finalize".into(),
+        display_name: None,
+        copy_class: None,
+        content_class: None,
+        selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+        watermark_low: 0.92,
+        watermark_high: 0.97,
+        capacity_cap_bytes: None,
+        block_size_bytes: u64::from(BLOCK_SIZE),
+        min_object_size_bytes: 0,
+    };
+    let (mut typed, handle, config) = pooled_manual_finalize_root(TAPE, LABEL, pool);
+    drop(handle);
+    let mut first = admission(0x4A03);
+    first.expected_pool_id = Some("async-finalize".into());
+
+    let incarnation = runtime();
+    let (state, held, quarantine_id, operation) = incarnation.block_on(async {
+        let (_, mut state) = restart_with_config(&typed, false, &config);
+        let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+        let accepted = manual_finalize_tape(&state, first.clone())
+            .await
+            .expect("durable acceptance");
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(accepted) = accepted else {
+            panic!("durable admission must not return BUSY");
+        };
+        let operation = accepted.operation_id;
+        assert_eq!(
+            accepted.projection.outcome,
+            remanence_state::TerminalFinalizationOutcome::InProgress
+        );
+        let command = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+            .await
+            .expect("first worker dispatches")
+            .expect("first drive command");
+        let crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } = command else {
+            panic!("expected first finalization dispatch");
+        };
+        assert_eq!(request.candidate_operation_id, operation);
+        let fence_config = crate::write_owner::TerminalWriteConfig {
+            authority: crate::write_owner::TerminalAuthority::Typed(
+                state.catalog.library_runtime().unwrap(),
+            ),
+            io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
+            mounted_endpoint: None,
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_ref().clone(),
+        };
+        let fence = crate::write_owner::raise_tape_io_fence(
+            &mut state.catalog.write_handle(),
+            &fence_config,
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: TAPE,
+                barcode: None,
+                reason: "transfer_error".into(),
+                evidence_json: None,
+            },
+            None,
+            None,
+        )
+        .expect("raise typed transfer fence");
+        assert!(state
+            .catalog
+            .write_handle()
+            .tape_io_is_fenced(Some(&TAPE), None, None)
+            .unwrap());
+        assert!(drive_rx.try_recv().is_err());
+        assert!(changer_rx.try_recv().is_err());
+        (
+            state,
+            (reply, drive_rx, changer_rx),
+            fence.quarantine_id,
+            operation,
+        )
+    });
+    // Kill with the actor's reply unanswered, so no failure handler closes the operation.
+    drop(incarnation);
+    drop((state, held));
+    let open = runtime().block_on(events_of(&mut typed, operation));
+    assert!(matches!(
+        open.as_slice(),
+        [
+            lib::OperationEvent::Accepted(_),
+            lib::OperationEvent::Started(_)
+        ]
+    ));
+
+    let incarnation = runtime();
+    let (state, held) = incarnation.block_on(async {
+        let (_, mut state) = restart_with_config(&typed, false, &config);
+        let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+        let before = files_under(state.checkpoint_journal_dir.as_ref());
+        spawn_startup_terminal_recoveries(state.clone());
+        state.closeout_work.wait_for_fence_refusal(TAPE).await;
+        assert!(drive_rx.try_recv().is_err(), "fenced manual intent never relaunches");
+        assert!(changer_rx.try_recv().is_err(), "fenced manual intent never moves media");
+        assert_eq!(files_under(state.checkpoint_journal_dir.as_ref()), before,
+            "fenced startup changed the native tape log");
+        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+            &state.library_service(), tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+                force: false, quarantine_id, acknowledgment: "checked terminal intent".into(),
+            }),
+        ).await.expect("release the typed transfer fence");
+        // Release wakes the already-running dispatcher; it resumes this operation once.
+        let resumed = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+            .await.expect("startup resumes manual intent").expect("resumed drive command");
+        let crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } = resumed else {
+            panic!("expected resumed finalization dispatch");
+        };
+        assert_eq!(request.candidate_operation_id, operation);
+        assert_eq!(request.idempotency_key, first.idempotency_key);
+        assert_eq!(request.actor_fingerprint, first.actor_fingerprint);
+        assert_eq!(request.request_fingerprint, first.request_fingerprint);
+        assert_eq!(request.expected_pool_id, first.expected_pool_id);
+        assert_eq!(request.reason, first.reason);
+        assert_eq!(state.index().unwrap().get_operation(&operation.to_string()).unwrap().unwrap().state, "running");
+        assert!(tokio::time::timeout(Duration::from_millis(300), drive_rx.recv()).await.is_err(),
+            "startup duplicated tail dispatch");
+        assert!(changer_rx.try_recv().is_err(), "loaded-tape recovery moved media");
+        assert_eq!(state.index().unwrap().terminal_finalization(&TAPE).unwrap().unwrap().progress,
+            remanence_state::TerminalFinalizationProgress::BeforeReplicaA);
+        assert_eq!(advance_tail(&state, operation, 5), 5);
+        let after_c = state.index().unwrap().terminal_finalization(&TAPE).unwrap().unwrap();
+        assert_eq!(after_c.progress, remanence_state::TerminalFinalizationProgress::AfterReplicaC);
+        assert_eq!(after_c.outcome, remanence_state::TerminalFinalizationOutcome::InProgress);
+        (state, (reply, drive_rx, changer_rx))
+    });
+    drop(incarnation);
+    drop((state, held));
+    assert_eq!(runtime().block_on(events_of(&mut typed, operation)), open);
+
+    let incarnation = runtime();
+    let state = incarnation.block_on(async {
+        let (_, mut state) = restart_with_config(&typed, false, &config);
+        let (mut drive_rx, mut changer_rx) = load_drive(&mut state);
+        // No startup dispatcher: the operator's retry alone completes the post-C suffix.
+        let completed = manual_finalize_tape(&state, first.clone()).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), drive_rx.recv())
+                .await
+                .is_err(),
+            "manual post-C API route reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "manual post-C API route reached changer actor"
+        );
+        let completed = completed.expect("manual API entry completes the post-C host suffix");
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(completed) = completed else {
+            panic!("manual host-only completion must retain durable acceptance");
+        };
+        assert_eq!(completed.operation_id, operation);
+        assert_eq!(
+            completed.projection.outcome,
+            remanence_state::TerminalFinalizationOutcome::Finalized
+        );
+        assert_eq!(
+            operation_state(&state, operation).await,
+            pb::OperationState::Succeeded as i32
+        );
+        state
+    });
+    drop(incarnation);
+    drop(state);
+    assert_eq!(
+        native_finalization(typed.paths()),
+        NativeFinalization {
+            prepared: 1,
+            decided: 1,
+            retired: 0,
+            sealed: 1
+        }
+    );
+    assert!(matches!(
+        runtime()
+            .block_on(events_of(&mut typed, operation))
+            .as_slice(),
+        [
+            lib::OperationEvent::Accepted(_),
+            lib::OperationEvent::Started(_),
+            lib::OperationEvent::Finished(_),
+        ]
+    ));
 }

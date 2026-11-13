@@ -7965,18 +7965,50 @@ mod tests {
         );
     }
 
+    /// A pooled typed root with the manual-finalization checkpoint in its native tape log.
+    /// Assignment uses library authority before the checkpoint makes the tape nonempty.
+    fn pooled_manual_finalize_root(
+        tape: TapeUuid,
+        label: &str,
+        pool: TapePoolConfig,
+    ) -> (
+        crate::tests::TypedRoot,
+        remanence_state::StateHandle,
+        remanence_state::RemConfig,
+    ) {
+        let mut typed = crate::tests::TypedRoot::open_with_tapes(&[(tape, label)]);
+        let mut config = typed.config();
+        config.tape_pools.push(pool.clone());
+        typed.release();
+        let mut handle =
+            remanence_state::StateHandle::open_with_config(typed.paths().clone(), config.clone())
+                .expect("open pooled typed root");
+        let generation = handle
+            .library_runtime()
+            .tape_state(tape)
+            .unwrap()
+            .assignment_generation;
+        handle
+            .assign_tape_pool(tape, generation, Some(&pool.id))
+            .expect("assign typed pool");
+        let checkpoint_dir = handle.paths().journal_dir.join("tapes");
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape)
+            .build()
+            .expect("open checkpoint journal")
+            .append(&manual_finalize_checkpoint(
+                tape,
+                pool.block_size_bytes as u32,
+            ))
+            .expect("append checkpoint");
+        (typed, handle, config)
+    }
+
     #[tokio::test]
     async fn manual_finalize_accepts_rejoins_redispatches_and_restarts_without_duplicates() {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
         const BLOCK_SIZE: u32 = 256 * 1024;
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-manual-finalize-async")
-            .tempdir()
-            .expect("tempdir");
-        let index_path = temp.path().join("state.sqlite");
-        let checkpoint_dir = temp.path().join("tapes");
         let tape_uuid = [0xA5; 16];
         let pool_id = "async-finalize";
         let pool_config = TapePoolConfig {
@@ -7992,49 +8024,12 @@ mod tests {
             block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
-        let mut index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("open catalog");
-        index
-            .upsert_tape_pool_projection(TapePoolProjectionInput {
-                pool_id: pool_id.to_string(),
-                display_name: None,
-                copy_class: None,
-                content_class: None,
-                created_at_utc: None,
-            })
-            .expect("project pool");
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: "ASY001L9".to_string(),
-                block_size: BLOCK_SIZE,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .expect("provision tape");
-        index
-            .project_tape_pool_membership(tape_uuid, pool_id)
-            .expect("assign pool");
-        let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
-        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
-            .build()
-            .expect("open checkpoint journal")
-            .append(&checkpoint)
-            .expect("append checkpoint");
-        index
-            .project_checkpoint_record(&checkpoint)
-            .expect("project checkpoint");
-
-        let mut state = ApiState::new_with_pool_configs(
-            {
-                let index = index;
-                let catalog = remanence_state::projector::open(index.path()).unwrap();
-                drop(index);
-                catalog
-            },
-            [pool_config],
-        );
+        let (typed, root_handle, _config) =
+            pooled_manual_finalize_root(tape_uuid, "ASY001L9", pool_config.clone());
+        let checkpoint_dir = root_handle.paths().journal_dir.join("tapes");
+        let mut state =
+            ApiState::new_with_pool_configs(root_handle.projection_client(), [pool_config]);
+        state.checkpoint_journal_dir = Arc::new(checkpoint_dir);
         state.default_library_serial = Some(Arc::new("LIB001".to_string()));
         let mut loaded = drive_bay(0x0101, true, Some("ASY001L9"));
         loaded.source_slot = None;
@@ -8078,7 +8073,55 @@ mod tests {
         let crate::write_owner::ManualFinalizeTapeResult::Accepted(accepted) = accepted else {
             panic!("durable admission must not return BUSY");
         };
-        assert_eq!(accepted.operation_id, Uuid::from_u128(0xA503));
+        let operation = accepted.operation_id;
+        let acceptance = root_handle
+            .library_runtime()
+            .manual_acceptance_by_request(
+                &admission.actor_fingerprint,
+                *admission.idempotency_key.as_bytes(),
+            )
+            .unwrap()
+            .expect("typed acceptance for the caller's key");
+        assert_eq!(
+            acceptance.status,
+            remanence_state::library_runtime::terminal::ManualAcceptanceStatus::Applied
+        );
+        assert_eq!(Uuid::from_bytes(acceptance.value.operation), operation);
+        assert_eq!(
+            state
+                .catalog
+                .write_handle()
+                .idempotency_scope_record(
+                    &admission.actor_fingerprint,
+                    "finalize_tape",
+                    admission.idempotency_key,
+                )
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            operation
+        );
+        let journal = remanence_state::TapeAuthority::open(
+            state.checkpoint_journal_dir.as_ref(),
+            tape_uuid,
+            state.index_path.as_ref(),
+        )
+        .unwrap();
+        let lease = journal.acquire_exclusive_for_terminal_recovery().unwrap();
+        let intent = lease.pending_finalization().unwrap().unwrap();
+        assert_eq!(
+            Uuid::from_bytes(intent.manual.as_ref().unwrap().operation_id),
+            operation
+        );
+        let incarnation = acceptance.value.at.tape.incarnation;
+        drop((lease, journal));
+        assert!(matches!(
+            closed_retry_tests::operation_events_in_log(typed.paths(), operation).as_slice(),
+            [
+                remanence_state::library_log::OperationEvent::Accepted(_),
+                remanence_state::library_log::OperationEvent::Started(_),
+            ]
+        ));
         assert_eq!(
             accepted.projection.outcome,
             remanence_state::TerminalFinalizationOutcome::InProgress
@@ -8095,7 +8138,17 @@ mod tests {
             }
             _ => panic!("unexpected worker command"),
         };
-        let readiness_id = Uuid::new_v4();
+        let readiness_id = Uuid::from_bytes(
+            state
+                .catalog
+                .library_runtime()
+                .unwrap()
+                .start_owned_operation(
+                    remanence_state::library_log::OperationKind::MediaReadinessWait,
+                    remanence_state::AuditActor::System,
+                )
+                .expect("start the typed readiness owner"),
+        );
         {
             let mut index = state.catalog.write_handle();
             if let Some(pool) = &state.drive_pool {
@@ -8113,7 +8166,7 @@ mod tests {
             barcode: Some("ASY001L9".into()),
             source_slot: None,
             media_generation: Some(9),
-            media_family: None,
+            media_family: Some(remanence_state::LtoGen::Lto9),
             phase: "session_open_short_probe".into(),
             state: "becoming_ready".into(),
             dirty_scope: Some("drive+tape".into()),
@@ -8153,14 +8206,19 @@ mod tests {
             }
             index
         }
-        .record_media_readiness_transition(
-            crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                readiness_id,
-                &remanence_library::MediaReadiness::new(
-                    remanence_library::MediaReadinessKind::Ready,
-                ),
-            ),
-        )
+        .record_media_readiness_transition({
+            let mut transition =
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    readiness_id,
+                    &remanence_library::MediaReadiness::new(
+                        remanence_library::MediaReadinessKind::Ready,
+                    ),
+                );
+            // The model actor's successful TUR is the source of Ready.
+            transition.completion_evidence =
+                Some((&remanence_library::outcome::CompletionEvidence::success()).into());
+            transition
+        })
         .unwrap();
         handle.publish_state(pb::OperationState::Succeeded, &[("state", "ready")]);
         drop(reservation);
@@ -8255,11 +8313,7 @@ mod tests {
             "idempotency conflict moved media"
         );
 
-        // Dropping the actor reply simulates a worker dispatch failure after
-        // acceptance. Once its reservation is gone, an explicit same-key retry
-        // must start exactly one replacement worker while retaining the
-        // recovery-required projection until physical reconciliation advances
-        // durable progress.
+        // Dropping the actor reply fails the accepted worker and closes its operation.
         drop(first_reply);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -8298,7 +8352,7 @@ mod tests {
         );
         assert_eq!(polled.detail, summary);
         // A fresh registry uses the durable audit projection for GetOperation.
-        let reopened = ApiState::new(remanence_state::projector::open(&index_path).unwrap());
+        let reopened = ApiState::new(root_handle.projection_client());
         let stored = <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
             &reopened.daemon_service(),
             tonic::Request::new(pb::GetOperationRequest {
@@ -8310,443 +8364,85 @@ mod tests {
         .into_inner();
         assert_eq!(stored.state, pb::OperationState::Failed as i32);
         assert_eq!(stored.error_summary, summary);
-        {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        }
-        .record_media_readiness_transition(
-            crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                readiness_id,
-                &remanence_library::MediaReadiness::new(
-                    remanence_library::MediaReadinessKind::BecomingReady {
-                        ascq: 1,
-                        media_initializing: false,
-                    },
-                ),
-            ),
-        )
-        .unwrap();
-        let (_, retry_request) =
-            prepare_manual_finalize_request(&state.index().unwrap(), admission.clone(), |id| {
-                state.pool_config(id)
-            })
-            .unwrap();
-        let guard = pool.reserve_tape(tape_uuid).unwrap();
-        let shutdown_error = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_manual_finalize_worker_with_budget(
-                state.clone(),
-                pool.clone(),
-                guard.into(),
-                retry_request.clone(),
-                Duration::from_secs(900),
-            ),
-        )
-        .await
-        .expect("shutdown ends the finalize attempt")
-        .unwrap_err();
-        assert!(crate::drive_pool::DaemonShuttingDown::is_status(
-            &shutdown_error
-        ));
-        assert_eq!(
-            state
-                .operations
-                .latest(&accepted.operation_id)
-                .unwrap()
-                .state,
-            pb::OperationState::Failed as i32
-        );
         state
             .readiness_shutdown
             .store(false, std::sync::atomic::Ordering::Release);
-        let guard = pool.reserve_tape(tape_uuid).unwrap();
-        let deadline_error = run_manual_finalize_worker_with_budget(
-            state.clone(),
-            pool.clone(),
-            guard.into(),
-            retry_request.clone(),
-            Duration::from_millis(20),
-        )
-        .await
-        .unwrap_err();
-        assert!(deadline_error.message().contains("deadline expired"));
-        assert!(deadline_error.message().contains("remains incomplete"));
-        assert!(deadline_error
-            .message()
-            .contains("keeps this request's finalization intent"));
-        assert_eq!(
-            state
-                .index()
-                .unwrap()
-                .get_operation(&accepted.operation_id.to_string())
-                .unwrap()
-                .unwrap()
-                .state,
-            "failed"
-        );
-        assert_eq!(
-            state
-                .index()
-                .unwrap()
-                .terminal_finalization(&tape_uuid)
-                .unwrap()
-                .unwrap()
-                .outcome,
-            remanence_state::TerminalFinalizationOutcome::InProgress
-        );
-        {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        }
-        .record_media_readiness_transition(
-            crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                readiness_id,
-                &remanence_library::MediaReadiness::new(
-                    remanence_library::MediaReadinessKind::Ready,
-                ),
-            ),
-        )
-        .unwrap();
-        // A resumed finalization's diagnostic suffix must preserve the actor's
-        // typed retry cause even when its text cannot classify the refusal.
-        let guard = pool.reserve_tape(tape_uuid).unwrap();
-        let typed_attempt = tokio::spawn(run_manual_finalize_worker_with_budget(
-            state.clone(),
-            pool.clone(),
-            guard.into(),
-            retry_request,
-            Duration::from_secs(1),
+
+        // Ruling 25: the failed operation retains its intent but admits no same-key retry.
+        let before_retry = closed_retry_tests::durable_bytes(typed.paths());
+        let counted = crate::tests::refusal_tests::mark(&typed.paths().sqlite_path);
+        let refusal = manual_finalize_tape(&state, admission.clone())
+            .await
+            .expect_err("a failed operation admits no same-key retry");
+        assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(refusal.message(), format!(
+            "tape provisioning conflict: ClosedOperationRetry: manual operation cannot resume from \
+             Some(Failed(Failed {{ retry: None, refusal_code: None, summary: TextValue({summary:?}) }})); \
+             no permitted same-operation completion transition"
         ));
-        let command = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let crate::write_owner::DriveCommand::FinalizeTape { reply, .. } = command else {
-            panic!("expected finalization dispatch");
-        };
-        reply
-            .send(Err(crate::closeout_obligation::RetryCause::Operator
-                .attach(Status::failed_precondition("opaque media refusal"))))
-            .unwrap();
-        let typed_error = tokio::time::timeout(Duration::from_secs(2), typed_attempt)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
+        crate::tests::refusal_tests::assert_grew_by(&typed.paths().sqlite_path, &counted, 1);
+        let after_retry = closed_retry_tests::durable_bytes(typed.paths());
         assert_eq!(
-            typed_error.metadata().get("remanence-retry").unwrap(),
-            "operator"
+            before_retry.keys().collect::<Vec<_>>(),
+            after_retry.keys().collect::<Vec<_>>()
         );
-        assert!(typed_error.message().contains("remains incomplete"));
-        assert!(typed_error
-            .message()
-            .contains("keeps this request's finalization intent"));
-
-        let mut recovery_index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("open recovery projection");
-        recovery_index
-            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
-                tape_uuid,
-                trigger: accepted.projection.trigger,
-                operation_id: Some(accepted.operation_id),
-                progress: accepted.projection.progress,
-                edition_digest: accepted.projection.edition_digest,
-                layout_digest: accepted.projection.layout_digest,
-                outcome: remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
-                updated_at_utc: None,
-            })
-            .expect("project completion-unknown outcome");
-        drop(recovery_index);
-        let retried = manual_finalize_tape(&state, admission.clone())
-            .await
-            .expect("same-key retry restarts failed worker");
-        let crate::write_owner::ManualFinalizeTapeResult::Accepted(retried) = retried else {
-            panic!("same-key retry must retain durable acceptance");
-        };
-        assert_eq!(retried.operation_id, accepted.operation_id);
-        assert_eq!(
-            retried.projection.outcome,
-            remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
-            "an explicit repair retry must retain the safety classification before redispatch"
-        );
-        // A --wait poll immediately after acceptance sees the new attempt, before the worker runs.
-        assert_eq!(
-            state
-                .operations
-                .latest(&accepted.operation_id)
-                .unwrap()
-                .state,
-            pb::OperationState::Running as i32
-        );
-        assert_eq!(
-            state
-                .index()
-                .unwrap()
-                .get_operation(&accepted.operation_id.to_string())
-                .unwrap()
-                .unwrap()
-                .state,
-            "running"
-        );
-        let polled = <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
-            &state.daemon_service(),
-            tonic::Request::new(pb::GetOperationRequest {
-                operation_id: accepted.operation_id.as_bytes().to_vec(),
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(polled.state, pb::OperationState::Running as i32);
-        let retried_command = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
-            .await
-            .expect("same-key retry redispatches")
-            .expect("retry drive command");
-        assert_eq!(
-            state
-                .index()
-                .unwrap()
-                .get_operation(&accepted.operation_id.to_string())
-                .unwrap()
-                .unwrap()
-                .state,
-            "running"
-        );
-        let retried_reply = match retried_command {
-            crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } => {
-                assert_eq!(request.candidate_operation_id, accepted.operation_id);
-                reply
+        for (path, was) in &before_retry {
+            if path.starts_with(&typed.paths().audit_dir) {
+                assert!(
+                    after_retry[path].starts_with(was),
+                    "library log is append-only"
+                );
+            } else {
+                assert_eq!(
+                    &after_retry[path], was,
+                    "refused retry changed a native tape log"
+                );
             }
-            _ => panic!("unexpected retry command"),
-        };
-        assert!(
-            drive_rx.try_recv().is_err(),
-            "retry duplicated tail dispatch"
-        );
-
-        // A second lost worker models daemon shutdown. Startup must reacquire
-        // exact-tape ownership and resume without another FinalizeTape RPC.
-        drop(retried_reply);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Ok(probe) = pool.reserve_tape(tape_uuid) {
-                    drop(probe);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("retry worker releases exact-tape ownership");
-        let fence = {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        }
-        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
-            tape_uuid,
-            barcode: None,
-            reason: "checkpoint_barrier_failed".into(),
-            evidence_json: None,
-        })
-        .unwrap();
-        let before = std::fs::read(
-            remanence_state::TapeAuthority::list_entries(&checkpoint_dir)
-                .unwrap()
-                .pop()
-                .unwrap(),
-        )
-        .unwrap();
-        spawn_startup_terminal_recoveries(state.clone());
-        state.closeout_work.wait_for_fence_refusal(tape_uuid).await;
-        assert!(
-            drive_rx.try_recv().is_err(),
-            "fenced manual intent never relaunches"
-        );
-        assert_eq!(
-            std::fs::read(
-                remanence_state::TapeAuthority::list_entries(&checkpoint_dir)
-                    .unwrap()
-                    .pop()
-                    .unwrap()
-            )
-            .unwrap(),
-            before
-        );
-        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
-            &state.library_service(),
-            tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
-                force: false,
-                quarantine_id: fence.quarantine_id,
-                acknowledgment: "checked terminal intent".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        spawn_startup_terminal_recoveries(state.clone());
-        let resumed = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
-            .await
-            .expect("startup resumes manual intent")
-            .expect("resumed drive command");
-        assert_eq!(
-            state
-                .index()
-                .unwrap()
-                .get_operation(&accepted.operation_id.to_string())
-                .unwrap()
-                .unwrap()
-                .state,
-            "running"
-        );
-        match resumed {
-            crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } => {
-                assert_eq!(request.candidate_operation_id, accepted.operation_id);
-                assert_eq!(request.idempotency_key, Uuid::from_u128(0xA504));
-                assert_eq!(request.actor_fingerprint, "sha256:async-finalize");
-                assert_eq!(request.request_fingerprint, [0xA5; 32]);
-                assert_eq!(request.expected_pool_id.as_deref(), Some(pool_id));
-                assert_eq!(request.reason, "ship accepted tape");
-                let _ = reply.send(Err(Status::unavailable("end restart test")));
-            }
-            _ => panic!("unexpected startup command"),
         }
         assert!(
             drive_rx.try_recv().is_err(),
-            "startup duplicated tail dispatch"
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Ok(probe) = pool.reserve_tape(tape_uuid) {
-                    drop(probe);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("startup worker releases exact-tape ownership");
-        let journal =
-            remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
-                .build()
-                .expect("reopen manual terminal checkpoint");
-        let mut lease = journal
-            .acquire_exclusive_for_terminal_recovery()
-            .expect("acquire manual terminal recovery");
-        let mut recovery_index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("open manual progress projection");
-        let current = lease
-            .pending_finalization()
-            .map(|intent| {
-                intent
-                    .as_ref()
-                    .map(remanence_state::TerminalFinalizationIntent::from)
-            })
-            .expect("read manual finalization intent")
-            .expect("manual finalization intent");
-        assert_eq!(
-            current.progress,
-            remanence_state::TerminalFinalizationProgress::BeforeReplicaA
-        );
-        for (expected, next) in [
-            (
-                remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
-                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
-            ),
-            (
-                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
-                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
-            ),
-            (
-                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
-                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
-            ),
-            (
-                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
-                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
-            ),
-            (
-                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
-                remanence_state::TerminalFinalizationProgress::AfterReplicaC,
-            ),
-        ] {
-            let current = lease
-                .advance_terminal_finalization(expected, next)
-                .expect("advance manual finalization to replica C");
-            recovery_index
-                .project_terminal_finalization(
-                    remanence_state::TerminalFinalizationProjectionInput {
-                        tape_uuid,
-                        trigger: current.trigger,
-                        operation_id: Some(accepted.operation_id),
-                        progress: current.progress,
-                        edition_digest: current.edition_digest,
-                        layout_digest: current.layout.layout_digest,
-                        outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
-                        updated_at_utc: None,
-                    },
-                )
-                .expect("project manual component progress");
-        }
-        let current = lease
-            .mark_terminal_recovery_required()
-            .expect("retain manual recovery classification after C");
-        recovery_index
-            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
-                tape_uuid,
-                trigger: current.trigger,
-                operation_id: Some(accepted.operation_id),
-                progress: current.progress,
-                edition_digest: current.edition_digest,
-                layout_digest: current.layout.layout_digest,
-                outcome: remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
-                updated_at_utc: None,
-            })
-            .expect("project manual post-C recovery state");
-        drop(recovery_index);
-        drop(lease);
-
-        let completed = manual_finalize_tape(&state, admission)
-            .await
-            .expect("manual API entry completes the post-C host suffix");
-        let crate::write_owner::ManualFinalizeTapeResult::Accepted(completed) = completed else {
-            panic!("manual host-only completion must retain durable acceptance");
-        };
-        assert_eq!(
-            completed.projection.outcome,
-            remanence_state::TerminalFinalizationOutcome::Finalized
-        );
-        let completed_operation =
-            <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
-                &state.daemon_service(),
-                tonic::Request::new(pb::GetOperationRequest {
-                    operation_id: accepted.operation_id.as_bytes().to_vec(),
-                }),
-            )
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            completed_operation.state,
-            pb::OperationState::Succeeded as i32
-        );
-        assert!(
-            drive_rx.try_recv().is_err(),
-            "manual post-C API route reached drive actor"
+            "closed retry reached drive actor"
         );
         assert!(
             changer_rx.try_recv().is_err(),
-            "manual post-C API route reached changer actor"
+            "closed retry reached changer actor"
+        );
+        let chain = closed_retry_tests::operation_events_in_log(typed.paths(), operation);
+        assert!(matches!(chain.as_slice(), [
+            remanence_state::library_log::OperationEvent::Accepted(_),
+            remanence_state::library_log::OperationEvent::Started(_),
+            remanence_state::library_log::OperationEvent::Failed(failed),
+        ] if failed.summary.as_str() == summary));
+
+        // Startup's closed-operation path must return without physical work or a durable write.
+        // Its error wording and retry classification are deliberately not part of this contract.
+        let native = closed_retry_tests::native_finalization_for(typed.paths(), tape_uuid);
+        let recovery = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::mount::service_closeout_obligation(&state, tape_uuid, incarnation),
+        )
+        .await;
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "closed recovery reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "closed recovery reached changer actor"
+        );
+        let _ = recovery.expect("closed recovery returns without resuming");
+        assert_eq!(
+            closed_retry_tests::durable_bytes(typed.paths()),
+            after_retry,
+            "closed recovery changed durable bytes"
+        );
+        assert_eq!(
+            closed_retry_tests::native_finalization_for(typed.paths(), tape_uuid),
+            native
+        );
+        assert_eq!(
+            closed_retry_tests::operation_events_in_log(typed.paths(), operation),
+            chain
         );
     }
 
