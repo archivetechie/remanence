@@ -213,7 +213,7 @@ fn space_plan(
     let mut amounts = vec![
         (
             &inventory.library_root,
-            if inventory.library_marked {
+            if inventory.library_marked || !inventory.tapes.is_empty() || inventory.trigger {
                 inventory.segments.last().map_or(0, |(_, size)| *size)
             } else {
                 0
@@ -267,7 +267,10 @@ fn replay(paths: &StatePaths, manifest: &AuthorityManifest) -> Result<Replay, St
         .map_err(|e| failure("library replay", e))
 }
 fn refusal_text(refusal: &store::Refusal) -> String {
-    format!("{LIBRARY_LOG_REPAIR_DEFERRED}: segment {} offset {} sequence {:?}: {}; no repair in this release; reset-catalog refuses too; keep the state directory",refusal.segment,refusal.offset,refusal.sequence,refusal.fault)
+    let sequence = refusal
+        .sequence
+        .map_or_else(|| "unknown".to_owned(), |sequence| sequence.to_string());
+    format!("{LIBRARY_LOG_REPAIR_DEFERRED}: segment {} offset {} sequence {sequence}: {}; no repair in this release; reset-catalog refuses too; keep the state directory",refusal.segment,refusal.offset,refusal.fault)
 }
 fn checked_replay(paths: &StatePaths, manifest: &AuthorityManifest) -> Result<Replay, StateError> {
     let replay = replay(paths, manifest)?;

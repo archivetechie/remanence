@@ -276,8 +276,10 @@ Inspection reports both marker families, owed fence UUIDs, segment sizes, requir
 and available space, and the library replay or why it was skipped. Recovery takes
 the state lock, clears tape ambiguity before library ambiguity, republishes the
 retained prefixes, reconciles owed tape fences, and records a synced recovery
-event. An owed fence whose record could not be written is not yet shown in the
-catalog or audit queries; recovery can raise it from the reconciliation trigger.
+event. An owed fence recorded in the reconciliation trigger is raised by recovery
+and reported. If the disk was too full even to record the owed fence, the daemon
+logged `could not record lost library fence` and no command can show or raise that
+fence, so check the daemon's log for that line before returning the tape to service.
 Restart the daemon after successful recovery.
 
 `LibraryLogRepairDeferred` names the damaged segment, offset and sequence.

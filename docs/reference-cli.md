@@ -2402,13 +2402,16 @@ read-only to report whether the daemon is running.
 rem-debug library-log inspect --config <PATH>
 ```
 
-The JSON report lists `markers`, `owed_tape_uuids`, `fence_reconcile_exists`,
-`segments` with their sizes, and `filesystems` with `needed_bytes` and
-`available_bytes`. Space for logs on the same filesystem is counted together.
+The JSON report lists `daemon_running`, `markers`, `owed_tape_uuids`,
+`fence_reconcile_exists`, `segments` with their sizes, and `filesystems` with
+`needed_bytes` and `available_bytes`. Space for logs on the same filesystem is
+counted together.
 `library_replay` gives the retained sequence, terminal hash, final segment,
 `through` byte offset and tail class, or a refusal with segment, offset and
 sequence. `library_replay_skipped` explains a running daemon, a marked native
-log that blocks probing, or a missing admitted manifest. A replay refusal exits 1.
+log that blocks probing, or a missing admitted manifest. The report also includes
+`preflight_error`, `space_error` and `library_replay_error`. `inspect` exits 1 when
+any of these three `*_error` fields is set or the replay refuses.
 
 ### rem-debug library-log recover
 

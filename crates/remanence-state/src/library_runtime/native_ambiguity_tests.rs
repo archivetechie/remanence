@@ -340,6 +340,54 @@ fn fx1_t6_space_refuses_before_authority_writes() {
     assert_eq!(digest(f._root.path()), before);
 }
 
+/// A tape-only clear still needs room for the runtime's copy of an unmarked torn tail.
+#[test]
+fn fx1_fr1_tape_only_torn_tail_space_refuses_before_writes() {
+    let (f, _) = Fixture::failed();
+    let f = Offline::from_fixture(f);
+    let segment = f.segment();
+    let original = fs::read(&segment).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .unwrap()
+        .write_all(&original[84..87])
+        .unwrap();
+    let tape_prefix = crate::tape_log::store::Store::open(
+        f.paths.journal_dir.join("tapes"),
+        T,
+        &f.paths.sqlite_path,
+    )
+    .unwrap()
+    .inspect_tail()
+    .unwrap()
+    .valid_bytes;
+    fs::write(f.tape_marker(), b"").unwrap();
+    assert!(!f.marker().exists());
+    let before = digest(f._root.path());
+    let result = recovery::recover_with_space_probe(&f.paths, true, |_| Ok(tape_prefix));
+    assert!(
+        matches!(&result, Err(error) if error.to_string().contains("free space")),
+        "expected a free-space refusal before writes: {result:?}"
+    );
+    assert_eq!(digest(f._root.path()), before);
+}
+
+/// An existing segment needs no copy space when no marker or trigger calls for writes.
+#[test]
+fn fx1_fr1_noop_with_segment_needs_no_space() {
+    let (f, _) = Fixture::failed();
+    let f = Offline::from_fixture(f);
+    assert!(fs::metadata(f.segment()).unwrap().len() > 0);
+    assert!(!f.marker().exists());
+    assert!(!f.tape_marker().exists());
+    assert!(!lib::store::fence_reconcile_path(&f.paths.audit_dir).exists());
+    let before = digest(f._root.path());
+    let result = recovery::recover_with_space_probe(&f.paths, true, |_| Ok(0));
+    assert!(result.is_ok(), "no-op recovery needs no space: {result:?}");
+    assert_eq!(digest(f._root.path()), before);
+}
+
 #[test]
 fn fx1_t7_inspect_preserves_unmarked_tail_and_temporary() {
     let (f, _) = Fixture::failed();
@@ -401,6 +449,18 @@ fn fx1_t9_damage_with_and_without_marker_leaves_tree() {
     for marked in [false, true] {
         for damage in [0, 1, 2] {
             let (f, _) = Fixture::failed();
+            if damage == 0 {
+                f.rt()
+                    .append(|a, v| {
+                        a.diagnostic(
+                            diagnostic(),
+                            lib::AuditActor::System,
+                            lib::SourceLayer::Layer4,
+                            v,
+                        )
+                    })
+                    .unwrap();
+            }
             let f = Offline::from_fixture(f);
             let segment = f.segment();
             if damage == 2 {
@@ -449,6 +509,9 @@ fn fx1_t9_damage_with_and_without_marker_leaves_tree() {
             }
             let inspection = f.inspect_unchanged();
             assert!(!inspection["library_replay"]["refusal"].is_null());
+            if damage == 0 {
+                assert!(inspection["library_replay"]["through"].as_u64().unwrap() > 84);
+            }
             let before = digest(f._root.path());
             let error = f.recover().unwrap_err();
             assert!(matches!(error, StateError::JournalReplayFailed(_)));
@@ -462,6 +525,9 @@ fn fx1_t9_damage_with_and_without_marker_leaves_tree() {
                     .contains(segment.file_name().unwrap().to_str().unwrap()),
                 "{error}"
             );
+            if damage == 0 {
+                assert!(error.to_string().contains("sequence 2"), "{error}");
+            }
             assert_eq!(digest(f._root.path()), before);
         }
     }
@@ -476,6 +542,32 @@ fn fx1_t10_startup_hint_with_state_lease() {
     assert!(hint.contains("restart does not clear"));
     assert!(hint.contains("rem-debug library-log recover --config"));
     assert!(hint.contains("--confirm-clear-ambiguity"));
+
+    let (f, _) = Fixture::failed();
+    let f = Offline::from_fixture(f);
+    let segment = f.segment();
+    let mut bytes = fs::read(&segment).unwrap();
+    let end = bytes.len() - 1;
+    bytes[end] ^= 1;
+    fs::write(&segment, bytes).unwrap();
+    let refusal = f.replay().refusal.unwrap();
+    let _lease = StateLockGuard::acquire(&f.paths.state_dir).unwrap();
+    let hint = recovery::startup_hint(&f.paths).unwrap();
+    assert!(hint.contains(LIBRARY_LOG_REPAIR_DEFERRED), "{hint}");
+    assert!(hint.contains(&refusal.segment), "{hint}");
+    assert!(
+        hint.contains(&format!("offset {}", refusal.offset)),
+        "{hint}"
+    );
+    assert!(
+        hint.contains(&format!("sequence {}", refusal.sequence.unwrap())),
+        "{hint}"
+    );
+    let damage_line = hint
+        .lines()
+        .find(|line| line.contains(LIBRARY_LOG_REPAIR_DEFERRED))
+        .unwrap();
+    assert!(!damage_line.contains("Some("), "{damage_line}");
 }
 
 /// Exercise R1 directly so the base failure is the inode assertion itself.

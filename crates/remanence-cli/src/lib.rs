@@ -31236,7 +31236,7 @@ mod library_log_cli_tests {
             let root = tempfile::tempdir().unwrap();
             let config = crate::tests::write_retire_test_config(root.path());
             drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
-            if damaged {
+            let damage_location = if damaged {
                 let segment = fs::read_dir(root.path().join("audit"))
                     .unwrap()
                     .map(|e| e.unwrap().path())
@@ -31245,15 +31245,31 @@ mod library_log_cli_tests {
                 let mut bytes = fs::read(&segment).unwrap();
                 let end = bytes.len() - 1;
                 bytes[end] ^= 1;
-                fs::write(segment, bytes).unwrap();
+                fs::write(&segment, bytes).unwrap();
+                let inspection = remanence_state::ambiguity_recovery::inspect(&config).unwrap();
+                let refusal = &inspection["library_replay"]["refusal"];
+                Some((
+                    segment.file_name().unwrap().to_str().unwrap().to_string(),
+                    refusal["offset"].as_u64().unwrap(),
+                    refusal["sequence"].as_u64().unwrap(),
+                ))
             } else {
                 fs::write(root.path().join("audit/library-log.ambiguous"), b"").unwrap();
-            }
+                None
+            };
             let error = remanence_state::StateHandle::open_from_config_file(&config)
                 .unwrap_err()
                 .to_string();
-            if damaged {
+            if let Some((segment, offset, sequence)) = damage_location {
                 assert!(error.contains("no repair in this release; reset-catalog refuses too; keep the state directory"),"{error}");
+                assert!(
+                    error
+                        .contains(remanence_state::ambiguity_recovery::LIBRARY_LOG_REPAIR_DEFERRED),
+                    "{error}"
+                );
+                assert!(error.contains(&segment), "{error}");
+                assert!(error.contains(&format!("offset {offset}")), "{error}");
+                assert!(error.contains(&format!("sequence {sequence}")), "{error}");
             } else {
                 assert!(
                     error.contains("rem-debug library-log recover --config"),

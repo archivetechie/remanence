@@ -960,7 +960,7 @@ mod ambiguity_recovery_tests {
             let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
             let paths = state.paths().clone();
             drop(state);
-            if damaged {
+            let damage_location = if damaged {
                 let segment = std::fs::read_dir(&paths.audit_dir)
                     .unwrap()
                     .map(|e| e.unwrap().path())
@@ -969,10 +969,18 @@ mod ambiguity_recovery_tests {
                 let mut bytes = std::fs::read(&segment).unwrap();
                 let end = bytes.len() - 1;
                 bytes[end] ^= 1;
-                std::fs::write(segment, bytes).unwrap();
+                std::fs::write(&segment, bytes).unwrap();
+                let inspection = remanence_state::ambiguity_recovery::inspect(&config).unwrap();
+                let refusal = &inspection["library_replay"]["refusal"];
+                Some((
+                    segment.file_name().unwrap().to_str().unwrap().to_string(),
+                    refusal["offset"].as_u64().unwrap(),
+                    refusal["sequence"].as_u64().unwrap(),
+                ))
             } else {
                 std::fs::write(paths.audit_dir.join("library-log.ambiguous"), b"").unwrap();
-            }
+                None
+            };
             let lease = std::sync::Arc::new(
                 remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap(),
             );
@@ -980,8 +988,19 @@ mod ambiguity_recovery_tests {
                 remanence_state::library_runtime::LibraryRuntime::open(&paths, true, lease.clone())
                     .unwrap_err();
             let message = library_open_refusal(&paths, &error);
-            if damaged {
+            if let Some((segment, offset, sequence)) = damage_location {
                 assert!(message.contains("no repair in this release; reset-catalog refuses too; keep the state directory"),"{message}");
+                assert!(
+                    message
+                        .contains(remanence_state::ambiguity_recovery::LIBRARY_LOG_REPAIR_DEFERRED),
+                    "{message}"
+                );
+                assert!(message.contains(&segment), "{message}");
+                assert!(message.contains(&format!("offset {offset}")), "{message}");
+                assert!(
+                    message.contains(&format!("sequence {sequence}")),
+                    "{message}"
+                );
             } else {
                 assert!(
                     message.contains("rem-debug library-log recover --config"),
