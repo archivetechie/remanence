@@ -195,6 +195,9 @@ fn store_failure(error: &AuthorityError) -> bool {
         _ => false,
     }
 }
+/// Per owed tape, the reconciliation disposition and its existing skip reason.
+pub(crate) type ReconciliationSummary = Vec<(lib::Id, &'static str)>;
+
 impl LibraryRuntime {
     /// Admit the bound namespaces under an existing state lease, probe every
     /// native log before library replay, then start the projector. No SQL or
@@ -204,8 +207,17 @@ impl LibraryRuntime {
         fsync_diagnostics: bool,
         lease: Arc<StateLockGuard>,
     ) -> Result<Self, RuntimeError> {
+        Self::open_reporting(paths, fsync_diagnostics, lease).map(|(runtime, _)| runtime)
+    }
+
+    /// Open once and retain the lost-fence dispositions for an operator recovery record.
+    pub(crate) fn open_reporting(
+        paths: &StatePaths,
+        fsync_diagnostics: bool,
+        lease: Arc<StateLockGuard>,
+    ) -> Result<(Self, ReconciliationSummary), RuntimeError> {
         let manifest = AuthorityManifest::admit(paths, &lease)?;
-        Self::open_bound_manifest(paths, fsync_diagnostics, lease, manifest)
+        Self::open_bound_reporting(paths, fsync_diagnostics, lease, manifest)
     }
 
     /// The reset owner supplies its receipt-pinned manifest while the startup
@@ -216,6 +228,16 @@ impl LibraryRuntime {
         lease: Arc<StateLockGuard>,
         manifest: AuthorityManifest,
     ) -> Result<Self, RuntimeError> {
+        Self::open_bound_reporting(paths, fsync_diagnostics, lease, manifest)
+            .map(|(runtime, _)| runtime)
+    }
+
+    fn open_bound_reporting(
+        paths: &StatePaths,
+        fsync_diagnostics: bool,
+        lease: Arc<StateLockGuard>,
+        manifest: AuthorityManifest,
+    ) -> Result<(Self, ReconciliationSummary), RuntimeError> {
         let view = NativeTapeView::probe(manifest.tape_root(), &paths.sqlite_path)
             .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
         let host = std::fs::read_to_string("/etc/machine-id")
@@ -239,12 +261,14 @@ impl LibraryRuntime {
         )?;
         let snapshot = authority.snapshot()?;
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
-        if lib::store::fence_reconcile_path(manifest.library_root())
+        let reconciliation = if lib::store::fence_reconcile_path(manifest.library_root())
             .try_exists()
             .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
         {
-            native_fences::reconcile(&authority, &view)?;
-        }
+            native_fences::reconcile(&authority, &view)?
+        } else {
+            Vec::new()
+        };
         let snapshot = authority.snapshot()?;
         let projector = ProjectionClient::open(&paths.sqlite_path)?;
         let marks = projector.reader()?.tape_projection_marks()?;
@@ -318,25 +342,28 @@ impl LibraryRuntime {
                 )
             })
             .collect();
-        Ok(Self(Arc::new(Inner {
-            #[cfg(test)]
-            native_projection_waiters: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            native_projection_high_water: std::sync::atomic::AtomicUsize::new(0),
-            ack_progress: Mutex::new(ack_progress),
-            #[cfg(test)]
-            ack_frames_checked: std::sync::atomic::AtomicUsize::new(0),
-            authority,
-            view: Mutex::new(view),
-            dispatch: Mutex::new(()),
-            projector,
-            manifest,
-            motion_fenced: AtomicBool::new(false),
-            projection_dirty: AtomicBool::new(false),
-            projection_lag: Mutex::new(projection_lag),
-            #[cfg(any(test, feature = "fixtures"))]
-            source_projection_lag: Mutex::new(Vec::new()),
-        })))
+        Ok((
+            Self(Arc::new(Inner {
+                #[cfg(test)]
+                native_projection_waiters: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                native_projection_high_water: std::sync::atomic::AtomicUsize::new(0),
+                ack_progress: Mutex::new(ack_progress),
+                #[cfg(test)]
+                ack_frames_checked: std::sync::atomic::AtomicUsize::new(0),
+                authority,
+                view: Mutex::new(view),
+                dispatch: Mutex::new(()),
+                projector,
+                manifest,
+                motion_fenced: AtomicBool::new(false),
+                projection_dirty: AtomicBool::new(false),
+                projection_lag: Mutex::new(projection_lag),
+                #[cfg(any(test, feature = "fixtures"))]
+                source_projection_lag: Mutex::new(Vec::new()),
+            })),
+            reconciliation,
+        ))
     }
 
     /// Execute one typed writer call and forward its applications even when its

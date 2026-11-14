@@ -516,6 +516,8 @@ For the minimal config above, a running daemon owns:
 /var/lib/rem/rem.sock             gRPC Unix socket (mode 0660)
 /var/lib/rem/spool/               pre-commit append spool (mode 0700, spool-<uuid>.bin files)
 /var/lib/rem/authority-format     layout marker bound to the canonical journal root
+/var/lib/rem/authority-manifest.json
+                                 canonical tape/library root bindings and library UUID
 /var/lib/rem/journal/tapes/*.remtape
                                  per-tape authority logs
 /var/lib/rem/journal/tapes/*.lock  stable per-tape leases
@@ -523,7 +525,13 @@ For the minimal config above, a running daemon owns:
                                  uncertain-authority fences
 /var/lib/rem/reset-archives/reset-<number>/authority-reset.json
                                  declared-reset path binding and request digest
-/var/lib/rem/audit/*.remaudit     daily append-only audit segments
+/var/lib/rem/audit/*.remlib        typed library authority segments, ordered by first sequence
+/var/lib/rem/audit/library-log.lock
+                                 stable library authority lease
+/var/lib/rem/audit/library-log.ambiguous
+                                 uncertain library authority; blocks startup
+/var/lib/rem/audit/library-log.fence-reconcile
+                                 tape UUIDs whose owed fences need reconciliation
 /var/lib/rem/rem-state.sqlite     rebuildable SQLite catalog projection
 /var/lib/rem/tape-catalog/        per-tape catalog cache files
 /var/lib/rem/calibration/control.remcalibration
@@ -534,6 +542,13 @@ For the minimal config above, a running daemon owns:
                                  rebuilt or reset
 ```
 
+An ambiguity marker in either log family prevents startup and survives a restart.
+After stopping the daemon and fixing the storage problem, use
+`rem-debug library-log inspect --config <PATH>`, followed by
+`rem-debug library-log recover --config <PATH> --confirm-clear-ambiguity`.
+Recovery clears tape markers before the library marker and writes a synced
+recovery diagnostic even when ordinary diagnostic fsync is disabled.
+
 Home mode uses a different generated layout under
 `${XDG_STATE_HOME:-$HOME/.local/state}/rem/`:
 
@@ -541,10 +556,12 @@ Home mode uses a different generated layout under
 config.toml                     generated config, default pool, saved home serial
 state.lock                      invocation ownership lock
 authority-format                layout marker
+authority-manifest.json         canonical tape/library root bindings and library UUID
 journals/tapes/                 per-tape logs, leases and fences
 index/rem-state.sqlite          rebuildable catalog
 cache/tapes/                    tape catalog cache
-audit/                          audit segments
+audit/                          *.remlib segments, library-log.lock,
+                                library-log.ambiguous and library-log.fence-reconcile
 calibration/control.remcalibration
                                 durable calibration state
 ```

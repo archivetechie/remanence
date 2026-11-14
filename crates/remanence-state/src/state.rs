@@ -419,7 +419,14 @@ impl StateHandle {
         validate_trusted_volume_paths(&config)?;
         let library =
             crate::library_runtime::LibraryRuntime::open(&paths, config.audit.fsync, lock.clone())
-                .map_err(|e| StateError::ConfigInvalid(e.to_string()))?;
+                .map_err(|e| {
+                    let mut message = e.to_string();
+                    if let Some(hint) = crate::ambiguity_recovery::startup_hint(&paths) {
+                        message.push('\n');
+                        message.push_str(&hint);
+                    }
+                    StateError::ConfigInvalid(message)
+                })?;
         let mut accepted = authority_reset::configuration_record(&config)?;
         let prior_configuration = library.configuration();
         if let Some(prior) = &prior_configuration {

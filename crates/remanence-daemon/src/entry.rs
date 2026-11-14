@@ -144,7 +144,7 @@ pub async fn main_entry_with_registry(
     ) {
         Ok(library) => library,
         Err(error) => {
-            stderr_message!("error: open library authority: {error}");
+            stderr_message!("{}", library_open_refusal(&state_paths, &error));
             return ExitCode::from(1);
         }
     };
@@ -301,6 +301,19 @@ pub async fn main_entry_with_registry(
             ExitCode::from(1)
         }
     }
+}
+
+/// Format the library admission refusal for the operator at the process boundary.
+fn library_open_refusal(
+    paths: &remanence_state::StatePaths,
+    error: &impl std::fmt::Display,
+) -> String {
+    let mut message = format!("error: open library authority: {error}");
+    if let Some(hint) = remanence_state::ambiguity_recovery::startup_hint(paths) {
+        message.push('\n');
+        message.push_str(&hint);
+    }
+    message
 }
 
 fn init_tracing() {
@@ -932,5 +945,50 @@ mod tests {
     fn parses_mem_available_from_proc_meminfo() {
         let text = "MemTotal: 1000 kB\nMemAvailable: 12345 kB\n";
         assert_eq!(parse_mem_available_bytes(text), Some(12_641_280));
+    }
+}
+
+#[cfg(test)]
+mod ambiguity_recovery_tests {
+    use super::*;
+    #[test]
+    fn fx1_t10_daemon_refusal_carries_recovery_guidance() {
+        for damaged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let config = root.path().join("config.toml");
+            std::fs::write(&config,format!("[daemon]\ndefault_idle_timeout_seconds = 1800\nread_only = false\nstate_dir = \"{0}/state\"\n[journal]\ndir = \"{0}/journals\"\nrequire_trusted_volume = false\n[audit]\ndir = \"{0}/audit\"\n[index]\nsqlite_path = \"{0}/index.sqlite\"\n[cache]\ntape_catalog_dir = \"{0}/cache\"\n",root.path().display())).unwrap();
+            let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+            let paths = state.paths().clone();
+            drop(state);
+            if damaged {
+                let segment = std::fs::read_dir(&paths.audit_dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p.extension().is_some_and(|e| e == "remlib"))
+                    .unwrap();
+                let mut bytes = std::fs::read(&segment).unwrap();
+                let end = bytes.len() - 1;
+                bytes[end] ^= 1;
+                std::fs::write(segment, bytes).unwrap();
+            } else {
+                std::fs::write(paths.audit_dir.join("library-log.ambiguous"), b"").unwrap();
+            }
+            let lease = std::sync::Arc::new(
+                remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap(),
+            );
+            let error =
+                remanence_state::library_runtime::LibraryRuntime::open(&paths, true, lease.clone())
+                    .unwrap_err();
+            let message = library_open_refusal(&paths, &error);
+            if damaged {
+                assert!(message.contains("no repair in this release; reset-catalog refuses too; keep the state directory"),"{message}");
+            } else {
+                assert!(
+                    message.contains("rem-debug library-log recover --config"),
+                    "{message}"
+                );
+                assert!(message.contains("library-log.ambiguous"), "{message}");
+            }
+        }
     }
 }

@@ -322,18 +322,24 @@ see the [configuration reference](reference-configuration.md).
 - **Authority marker** (`state_dir/authority-format`) — exact bytes
   `remanence-tape-log-v3\n`, followed by a JSON string containing the canonical
   configured journal root, followed by `\n`. It binds the layout to that root.
-- **Log leases and fences** — the log basename with `.lock` holds the stable
-  lease; `.ambiguous` fences uncertain authority. The `repair-tail` command is
-  refused and produces no repair or reconciliation files.
-- **Audit segments** (daily `.remaudit` files) — append-only record of
-  every state-changing operation, fsynced by default.
+- **Log leases and fences** — `<uuid>.lock` holds a tape log's stable lease;
+  `<uuid>.ambiguous` fences uncertain native authority. The library family uses
+  `audit_dir/library-log.lock` and `audit_dir/library-log.ambiguous`.
+  Neither ambiguity marker is cleared by a restart. Use the offline
+  `rem-debug library-log inspect` and confirmed `recover` commands; recovery
+  clears tape ambiguity first. The `repair-tail` command remains refused.
+- **Library authority segments** (`audit_dir/<first-sequence>-<date>.remlib`) —
+  typed, chained records of library decisions and diagnostics, ordered by their
+  first sequence. `audit_dir/library-log.fence-reconcile` names tapes whose owed
+  fences must be reconciled. `state_dir/authority-manifest.json` binds the
+  canonical tape and library roots and the library identity.
 - **SQLite index** — schema version 26, tracked via `PRAGMA
   user_version`, with tables for tapes, pools, tape files, objects,
   copies, files, catalog units, sessions, operations, idempotency keys,
   media-readiness records, tape-I/O fences, wrap-map cache rows, and the
   drive-stewardship set (drives, events, health snapshots, cleaning runs,
   alarms). It is a projection: `rem rebuild-catalog-from-journals`
-  regenerates it from the tape logs and audit log without changing their bytes.
+  regenerates it from the tape logs and library log without changing their bytes.
 - **Per-tape catalog caches** — regenerable per-tape files under the
   configured cache directory.
 - **Calibration-control store** (`calibration/control.remcalibration`) — a

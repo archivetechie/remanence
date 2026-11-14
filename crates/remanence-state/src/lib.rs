@@ -5,6 +5,7 @@
 //! implements the state-directory and config boundary; audit and index modules
 //! are added in later implementation steps.
 
+pub mod ambiguity_recovery;
 pub mod authority;
 pub mod authority_layout;
 pub mod authority_manifest;

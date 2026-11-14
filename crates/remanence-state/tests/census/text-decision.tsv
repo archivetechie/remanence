@@ -437,3 +437,5 @@ crates/remanence-state/src/projector/apply.rs::library_readiness_transition::tex
 crates/remanence-state/src/projector/handle.rs::record_media_readiness_fence::text-matches	1
 crates/remanence-state/src/state.rs::adoption_assignment_source::text-equality	1
 crates/remanence-state/src/state/initialization.rs::prepare_tape_initialization::text-equality	1
+crates/remanence-state/src/ambiguity_recovery.rs::inventory::text-equality	1
+crates/remanence-state/src/ambiguity_recovery.rs::marker_inventory::text-equality	3

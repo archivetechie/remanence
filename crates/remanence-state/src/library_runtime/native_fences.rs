@@ -22,7 +22,8 @@ fn invalid(message: &str) -> RuntimeError {
 pub(super) fn reconcile(
     authority: &LibraryAuthority,
     view: &NativeTapeView,
-) -> Result<(), RuntimeError> {
+) -> Result<ReconciliationSummary, RuntimeError> {
+    let mut outcomes = Vec::new();
     let mut tapes = authority.fence_reconciliation_tapes()?;
     tapes.sort_unstable();
     tapes.dedup();
@@ -47,11 +48,13 @@ pub(super) fn reconcile(
     for tape in tapes {
         let Some(native) = view.snapshots().find(|s| s.header().tape_uuid == tape) else {
             tracing::warn!(tape = %uuid::Uuid::from_bytes(tape), "lost fence skipped: no native snapshot");
+            outcomes.push((tape, "skipped: no native snapshot"));
             continue;
         };
         let summary = native.summary();
         if summary.open_session.is_some() {
             tracing::warn!(tape = %uuid::Uuid::from_bytes(tape), "lost fence skipped: native session still open");
+            outcomes.push((tape, "skipped: native session still open"));
             continue;
         }
         let Some(end) = summary
@@ -60,6 +63,7 @@ pub(super) fn reconcile(
             .filter(|end| failed_ending(end))
         else {
             tracing::warn!(tape = %uuid::Uuid::from_bytes(tape), "lost fence skipped: no eligible ending");
+            outcomes.push((tape, "skipped: no eligible ending"));
             continue;
         };
         let Some(state) = authority
@@ -67,6 +71,10 @@ pub(super) fn reconcile(
             .filter(|s| !s.retired && s.tape.incarnation == end.incarnation)
         else {
             tracing::warn!(tape = %uuid::Uuid::from_bytes(tape), "lost fence skipped: absent, retired or different library incarnation");
+            outcomes.push((
+                tape,
+                "skipped: absent, retired or different library incarnation",
+            ));
             continue;
         };
         let mut opened = None;
@@ -111,6 +119,7 @@ pub(super) fn reconcile(
             }
         }
         if covered {
+            outcomes.push((tape, "covered"));
             continue;
         }
         #[cfg(test)]
@@ -133,11 +142,12 @@ pub(super) fn reconcile(
             lib::SourceLayer::Layer4,
             view,
         )?;
+        outcomes.push((tape, "raised"));
         #[cfg(test)]
         cut(2)?;
     }
     authority.finish_fence_reconciliation()?;
-    Ok(())
+    Ok(outcomes)
 }
 
 #[cfg(test)]

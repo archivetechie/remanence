@@ -297,3 +297,4 @@ crates/remanence-state/src/state.rs::recover_sessions_after_restart::audit-appen
 crates/remanence-state/src/state.rs::set_tape_generation::audit-append	1
 crates/remanence-state/src/state/authority_reset.rs::boundary::audit-append	1
 crates/remanence-state/src/state/authority_reset.rs::install_configuration::audit-append	1
+crates/remanence-state/src/ambiguity_recovery.rs::recover_with_space_probe::audit-append	1

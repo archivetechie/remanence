@@ -788,3 +788,6 @@ fn s13_ending_found_by_frame_scan_not_last_closed_sequence() {
     assert_eq!(f.live(T).len(), 1);
     assert!(!f.marker().exists());
 }
+
+#[path = "native_ambiguity_tests.rs"]
+mod ambiguity_recovery_tests;

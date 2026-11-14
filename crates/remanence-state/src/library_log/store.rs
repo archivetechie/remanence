@@ -583,16 +583,39 @@ impl LibraryLog {
         Ok(())
     }
     /// Explicit recovery retains every complete valid frame, including a landed failed append.
+    /// Republish even a complete final segment, then verify its retained end before clearing the fence.
     pub fn clear_ambiguity(&mut self, view: &dyn TapeView) -> Result<(), StoreError> {
         let state = scan(&self.dir, self.log_uuid, view)?;
         if let Some(e) = state.refusal {
             return Err(StoreError::RecoveryRequired(e));
         }
-        self.state = state;
-        self.remove_absent_suffix()?;
-        let result = (|| {
-            for s in &self.state.segments {
-                File::open(self.dir.join(&s.name))?.sync_all()?;
+        let result = (|| -> io::Result<()> {
+            if let Some(last) = state.segments.last() {
+                publication::replace_prefix(
+                    &self.dir,
+                    &self.dir.join(&last.name),
+                    "library-log",
+                    last.through,
+                )
+                .map_err(io::Error::other)?;
+            }
+            let rescanned = scan(&self.dir, self.log_uuid, view).map_err(io::Error::other)?;
+            let same_end = rescanned.last_sequence == state.last_sequence
+                && rescanned.terminal_hash == state.terminal_hash
+                && rescanned.segments.last().map(|s| (&s.name, s.through))
+                    == state.segments.last().map(|s| (&s.name, s.through));
+            let valid_empty = !state.segments.is_empty()
+                || (rescanned.segments.is_empty()
+                    && rescanned.last_sequence == 0
+                    && rescanned.terminal_hash == [0; 32]);
+            if rescanned.refusal.is_some() || !same_end || !valid_empty {
+                return Err(io::Error::other(
+                    "library end changed during ambiguity recovery",
+                ));
+            }
+            self.state = rescanned;
+            if self.state.segments.is_empty() {
+                File::open(&self.dir)?.sync_all()?;
             }
             let p = self.identity.with_extension("ambiguous");
             match fs::remove_file(p) {

@@ -2392,6 +2392,52 @@ In the other direction, `rem` refuses the robotics and the direct tape-path `arc
 `rem-debug`. It has no `tape bot-probe`, `tape read-rate`, `tape adopt-bootstrap`,
 `tape recovery-report`, `catalog reset` or `catalog reset-preflight`.
 
+### rem-debug library-log inspect
+
+Inspect both library-log and tape-log ambiguity markers without changing authority
+bytes or acquiring the state lock. The command probes an existing state lock
+read-only to report whether the daemon is running.
+
+```text
+rem-debug library-log inspect --config <PATH>
+```
+
+The JSON report lists `markers`, `owed_tape_uuids`, `fence_reconcile_exists`,
+`segments` with their sizes, and `filesystems` with `needed_bytes` and
+`available_bytes`. Space for logs on the same filesystem is counted together.
+`library_replay` gives the retained sequence, terminal hash, final segment,
+`through` byte offset and tail class, or a refusal with segment, offset and
+sequence. `library_replay_skipped` explains a running daemon, a marked native
+log that blocks probing, or a missing admitted manifest. A replay refusal exits 1.
+
+### rem-debug library-log recover
+
+Stop the daemon and correct the storage problem before clearing ambiguity.
+A restart alone does not clear either family's marker.
+
+```text
+rem-debug library-log recover --config <PATH> --confirm-clear-ambiguity
+```
+
+Without the confirmation flag, the command refuses before reading configuration
+or state. Recovery holds one exclusive state lock throughout, refuses a pending
+catalog reset or insufficient free space, and checks for library damage before
+any library-log write. It clears marked tape logs down to their validated closed
+prefixes without going below their catalog projection marks. It then clears the
+library marker, republishing the final segment to a new inode while retaining
+every valid complete record, including a write that landed before its sync failed.
+
+Recovery reopens the runtime once to reconcile owed fences and appends a synced
+`Diagnostic(RecoveryEvent)` with subject `ambiguity-recovery`. Its JSON output
+contains `cleared_markers`, `retained_library_end`, and `reconciliation` (each owed
+tape is raised, covered, or skipped with a reason). A rerun with no marker or
+reconciliation trigger leaves the logs unchanged.
+
+A damaged library replay refuses with `LibraryLogRepairDeferred`, naming the
+segment, offset and sequence. There is no repair in this release;
+`reset-catalog` refuses too. Keep the state directory. See
+[storage failures and recovery](guide-troubleshooting.md).
+
 ### rem-debug tape-log inspect
 
 Report the last valid closed boundary of a tape log, and any damage, without changing it.

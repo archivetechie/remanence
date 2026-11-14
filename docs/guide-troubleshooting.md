@@ -262,8 +262,28 @@ If a library-log write fails at the store, including while recording a refusal,
 motion stops for the rest of that process. This is a storage failure, rather
 than an admission refusal. Further loads, moves and writes refuse with
 `library authority failed; motion is fenced until startup reconciliation`.
-Correct the storage problem and restart the daemon so startup can reconcile
-state before motion resumes.
+A restart can reconcile a failure before publication when no ambiguity marker
+remains. A tape-log `<uuid>.ambiguous` or library-log `library-log.ambiguous`
+marker blocks startup and is not cleared by restarting. Stop the daemon, correct
+the storage problem and free enough space for the retained prefixes, then run:
+
+```text
+rem-debug library-log inspect --config /etc/rem/config.toml
+rem-debug library-log recover --config /etc/rem/config.toml --confirm-clear-ambiguity
+```
+
+Inspection reports both marker families, owed fence UUIDs, segment sizes, required
+and available space, and the library replay or why it was skipped. Recovery takes
+the state lock, clears tape ambiguity before library ambiguity, republishes the
+retained prefixes, reconciles owed tape fences, and records a synced recovery
+event. An owed fence whose record could not be written is not yet shown in the
+catalog or audit queries; recovery can raise it from the reconciliation trigger.
+Restart the daemon after successful recovery.
+
+`LibraryLogRepairDeferred` names the damaged segment, offset and sequence.
+There is no library-log repair in this release; `reset-catalog` refuses too.
+Keep the state directory and its evidence. The recovery command does not repair
+a damaged log.
 
 ## Media-readiness fences and quarantine
 

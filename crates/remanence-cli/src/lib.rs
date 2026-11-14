@@ -326,6 +326,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::TapeLog { .. }
+        | Command::LibraryLog { .. }
         | Command::Catalog { .. }
         | Command::Archive { .. }
         | Command::DaemonClient { .. }
@@ -377,6 +378,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::TapeLog { .. }
+        | Command::LibraryLog { .. }
         | Command::Catalog { .. }
         | Command::Archive { .. }
         | Command::Tape { .. } => None,
@@ -879,6 +881,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::TapeLog { .. }
+        | Command::LibraryLog { .. }
         | Command::Catalog { .. }
         | Command::DaemonClient { .. }
         | Command::OperationClient { .. }
@@ -1036,6 +1039,12 @@ pub fn parse_binary_byte_count(s: &str, label: &str) -> Result<u64, String> {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Inspect or recover ambiguity in the local library and tape logs.
+    LibraryLog {
+        #[command(subcommand)]
+        command: LibraryLogCommand,
+    },
+
     /// Inspect or explicitly repair the per-tape host authority log.
     TapeLog {
         #[command(subcommand)]
@@ -1396,6 +1405,74 @@ enum Command {
         locator: String,
         expected_sha256: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryLogCommand {
+    /// Inspect ambiguity markers, free space and the validated library end without changing logs.
+    Inspect {
+        /// Configuration locating the local authority roots.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Clear tape ambiguity first, then library ambiguity, and reconcile owed fences offline.
+    Recover {
+        /// Configuration locating the local authority roots.
+        #[arg(long)]
+        config: PathBuf,
+        /// Confirm explicit ambiguity clearing with the daemon stopped.
+        #[arg(long)]
+        confirm_clear_ambiguity: bool,
+    },
+}
+
+/// Dispatch offline inspection and confirmed recovery before discovery or state loading.
+fn run_library_log(
+    command: &LibraryLogCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if matches!(
+        command,
+        LibraryLogCommand::Recover {
+            confirm_clear_ambiguity: false,
+            ..
+        }
+    ) {
+        let _ = writeln!(
+            err,
+            "library-log recover requires --confirm-clear-ambiguity; no state was read"
+        );
+        return ExitCode::FAILURE;
+    }
+    let (name, result) = match command {
+        LibraryLogCommand::Inspect { config } => (
+            "inspect",
+            remanence_state::ambiguity_recovery::inspect(config),
+        ),
+        LibraryLogCommand::Recover { config, .. } => (
+            "recover",
+            remanence_state::ambiguity_recovery::recover(config),
+        ),
+    };
+    match result {
+        Ok(report) => {
+            let refused = matches!(command, LibraryLogCommand::Inspect { .. })
+                && (!report["library_replay"]["refusal"].is_null()
+                    || !report["library_replay_error"].is_null()
+                    || !report["preflight_error"].is_null()
+                    || !report["space_error"].is_null());
+            if writeln!(out, "{report}").is_err() || refused {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(err, "library-log {name}: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -4471,7 +4548,10 @@ pub fn run_offline_catalog_for_test(
 ) -> ExitCode {
     let (command, mode) = if args.first() == Some(&"rem-debug") {
         let cli = DebugCli::parse_from(args);
-        assert!(matches!(cli.command, Command::TapeLog { .. }));
+        assert!(matches!(
+            cli.command,
+            Command::TapeLog { .. } | Command::LibraryLog { .. }
+        ));
         (cli.into(), CliMode::Debug)
     } else {
         let cli = Cli::parse_from(args);
@@ -4644,6 +4724,7 @@ where
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
         | Command::TapeLog { .. }
+        | Command::LibraryLog { .. }
         | Command::Catalog { .. }
         | Command::Tape { .. }
         | Command::Archive { .. } => {}
@@ -4717,6 +4798,9 @@ where
     // notification-driven and never issues SCSI.
     if let Command::Watch { coalesce_window } = &cli.command {
         return run_watch(coalesce_window, out, err);
+    }
+    if let Command::LibraryLog { command } = &cli.command {
+        return run_library_log(command, out, err);
     }
     if let Command::TapeLog { command } = &cli.command {
         return run_tape_log(command, out, err);
@@ -5061,6 +5145,7 @@ where
         // bug in the early-return logic above.
         Command::Watch { .. } => unreachable!("rem watch dispatched pre-discovery"),
         Command::TapeLog { .. } => unreachable!("tape-log command dispatched pre-discovery"),
+        Command::LibraryLog { .. } => unreachable!("library-log command dispatched pre-discovery"),
         Command::RebuildCatalogFromJournals { .. } => {
             unreachable!("catalog rebuild dispatched pre-discovery")
         }
@@ -31072,3 +31157,130 @@ mod tape_log_cli_tests {
 
 #[cfg(test)]
 mod b7_surface_tests;
+
+#[cfg(test)]
+mod library_log_cli_tests {
+    use super::*;
+    use std::{collections::BTreeMap, fs};
+
+    fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let p = entry.unwrap().path();
+                if p.file_name().is_some_and(|n| n == "state.lock")
+                    || p.extension().is_some_and(|e| e == "lock")
+                {
+                    continue;
+                }
+                if p.is_dir() {
+                    visit(root, &p, out);
+                } else {
+                    out.insert(p.strip_prefix(root).unwrap().into(), fs::read(p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        visit(root, root, &mut out);
+        out
+    }
+
+    fn command(config: &Path, args: &[&str]) -> (ExitCode, String, String) {
+        let mut argv = vec!["rem-debug", "library-log"];
+        argv.extend_from_slice(args);
+        argv.extend(["--config", config.to_str().unwrap()]);
+        let cli = DebugCli::try_parse_from(argv)
+            .expect("library-log must be a supported offline command");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_debug(
+            cli,
+            || panic!("offline recovery must not discover devices"),
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn fx1_t1b_confirmed_recovery_and_confirmation_before_config() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("absent.toml");
+        let (code, _, error) = command(&absent, &["recover"]);
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(error.contains("--confirm-clear-ambiguity"), "{error}");
+        assert!(tree(root.path()).is_empty());
+        let config = crate::tests::write_retire_test_config(root.path());
+        drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
+        let marker = root.path().join("audit/library-log.ambiguous");
+        fs::write(&marker, b"").unwrap();
+        let before = tree(root.path());
+        let (code, _, error) = command(&config, &["recover"]);
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(error.contains("--confirm-clear-ambiguity"), "{error}");
+        assert_eq!(tree(root.path()), before);
+        let (code, output, error) = command(&config, &["recover", "--confirm-clear-ambiguity"]);
+        assert_eq!(code, ExitCode::SUCCESS, "{error}");
+        assert!(!marker.exists());
+        assert!(output.contains("cleared_markers"));
+        assert!(output.contains("retained_library_end"));
+        assert!(output.contains("reconciliation"));
+        drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
+    }
+
+    #[test]
+    fn fx1_t10_offline_refusal_carries_marker_and_damage_hint() {
+        for damaged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let config = crate::tests::write_retire_test_config(root.path());
+            drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
+            if damaged {
+                let segment = fs::read_dir(root.path().join("audit"))
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p.extension().is_some_and(|e| e == "remlib"))
+                    .unwrap();
+                let mut bytes = fs::read(&segment).unwrap();
+                let end = bytes.len() - 1;
+                bytes[end] ^= 1;
+                fs::write(segment, bytes).unwrap();
+            } else {
+                fs::write(root.path().join("audit/library-log.ambiguous"), b"").unwrap();
+            }
+            let error = remanence_state::StateHandle::open_from_config_file(&config)
+                .unwrap_err()
+                .to_string();
+            if damaged {
+                assert!(error.contains("no repair in this release; reset-catalog refuses too; keep the state directory"),"{error}");
+            } else {
+                assert!(
+                    error.contains("rem-debug library-log recover --config"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fx1_inspect_exits_one_on_replay_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::tests::write_retire_test_config(root.path());
+        drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
+        let segment = fs::read_dir(root.path().join("audit"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "remlib"))
+            .unwrap();
+        let mut bytes = fs::read(&segment).unwrap();
+        let end = bytes.len() - 1;
+        bytes[end] ^= 1;
+        fs::write(segment, bytes).unwrap();
+        let before = tree(root.path());
+        let (code, output, error) = command(&config, &["inspect"]);
+        assert_eq!(code, ExitCode::FAILURE, "{error}");
+        assert!(output.contains("refusal"));
+        assert_eq!(tree(root.path()), before);
+    }
+}

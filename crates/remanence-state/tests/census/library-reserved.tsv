@@ -106,3 +106,11 @@ crates/remanence-api/src/mount.rs::start_accepted_finalize_attempt::library_log	
 crates/remanence-api/src/mount.rs::continuable_finalize_head::library_log	1
 crates/remanence-api/src/mount.rs::require_continuable_finalize_head::library_log	3
 crates/remanence-api/src/mount.rs::run_started_manual_finalize_worker::library_log	5
+crates/remanence-state/src/ambiguity_recovery.rs::<module>::library_log	1
+crates/remanence-state/src/ambiguity_recovery.rs::recover_with_space_probe::LibraryLog	1
+crates/remanence-cli/src/lib.rs::<module>::LibraryLog	1
+crates/remanence-cli/src/lib.rs::rem_debug_only_reason::LibraryLog	1
+crates/remanence-cli/src/lib.rs::rem_only_reason::LibraryLog	1
+crates/remanence-cli/src/lib.rs::run_offline_catalog_for_test::LibraryLog	1
+crates/remanence-cli/src/lib.rs::run_with_mode::LibraryLog	3
+crates/remanence-cli/src/lib.rs::state_changing_target::LibraryLog	1
