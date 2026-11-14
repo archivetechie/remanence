@@ -6,7 +6,7 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
-<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
+<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ## Authority-layout refusals and declared reset
 
 A state directory written by an earlier release, with library or tape authority
@@ -64,7 +64,7 @@ its filemark, takes a synchronous barrier, then closes an `Initialized` record
 before writing an Object. Both parity modes use this order. An idempotent init of an already
 registered tape does not assign a new identity. `--preserve-tape-voltag` is
 accepted but refused: preflight prints `declared reset does not import preserved catalog identities; reinitialize or adopt physical media afterward`,
-and reset prints `declared reset cannot restore SQL tape identities; reinitialize or adopt afterward`.
+and reset, given a well-formed `--expected-preflight-token` (64 lowercase hexadecimal characters), prints `declared reset cannot restore SQL tape identities; reinitialize or adopt afterward`.
 A scoped erase reset requires the matching token from
 `rem-debug catalog reset-preflight`; without it the CLI refuses with
 `scoped catalog reset requires --expected-preflight-token from reset-preflight`.
@@ -303,7 +303,8 @@ then release with
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`.
 Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force:`.
-A contradicted log, a floor conflict or an absent tape log still refuses forced
+A contradicted log, a floor conflict, an absent tape log, or a tape log shorter
+than or different from what the catalog already recorded still refuses forced
 release; restore the exact log or retire the tape. Rebuilding the catalog does
 not cure those conditions. On a standalone host without `/etc/rem/config.toml`,
 this release form uses the home configuration. The bare `--ack` form is not a

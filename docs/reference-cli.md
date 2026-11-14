@@ -574,7 +574,10 @@ rem tape finalize [OPTIONS] --acknowledge-tape <ACKNOWLEDGE_TAPE>
   comes from the catalog at each attempt. Matching retries resume an open
   operation or deduplicate a sealed success. After a completion-unknown ending,
   the pending intent needs operator recovery; the same key is refused with
-  `ClosedOperationRetry`, and a new key with `ALREADY_EXISTS`.
+  `tape provisioning conflict: ClosedOperationRetry: ...`, and a new key with
+  `pending terminal finalization belongs to a different exact request`. If that
+  ending also raised a tape-I/O fence on the tape, the fence refuses both until it
+  is released.
 - `--expected-pool <EXPECTED_POOL>` requires this pool instead of the catalogued one.
 
 Finalization is permanent: the tape accepts no more objects afterwards.
@@ -706,7 +709,8 @@ lock. RPC and authentication failures do not fall back offline.
 
 The bare form without `--after-settled-inventory` is not a release route for
 these tape fences. On a home host, or with `--device`, it selects standalone
-release and refuses a `library:` fence with `fence raised by a library daemon:`.
+release and refuses every tape-I/O fence a standalone host can hold with
+`bare standalone release cannot release this fence:`.
 On a system-configured host the library parser refuses with
 `tape quarantine release requires --after-settled-inventory`.
 
@@ -1129,7 +1133,7 @@ With `--json`, a failed, cancelled, or completion-unknown operation prints a
 `details.operation_id`, and `details.state`, and exits 1. Connection failures
 remain `daemon_client_error`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/projector/apply.rs crates/remanence-cli/src/top.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ## Tape lifecycle
 
 Initialization, readiness and retirement run against local configuration and state, and
@@ -1294,8 +1298,8 @@ an empty list prints `(no active media-readiness quarantines)`. `show` adds the 
 its JSON carries `last_sense` (`KK/AA/QQ`) and `last_sense_name` beside the raw sense
 fields. The JSON schema of `list` is `rem.tape.quarantine.list.v1`.
 
-`release` also releases tape-I/O fences, with `tioq-` or `library:` ids; `rem catalog tapes`,
-`rem top` and `rem daemon health` list those. A tape-I/O fence is released through the
+`release` also releases tape-I/O fences, with `library:` ids; `rem catalog tapes --json`,
+`rem top` and `rem daemon health --json` list those. A tape-I/O fence is released through the
 configured daemon socket after the operator's acknowledgement. Only an absent listener
 permits the offline fallback, which needs the exclusive state lock. Repeating a release
 returns its original evidence. Media-readiness (`mrq-`) release runs offline;
@@ -1311,7 +1315,8 @@ rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
 
 Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force:`. A contradicted log,
-a floor conflict or an absent tape log still refuses forced release; restore
+a floor conflict, an absent tape log, or a tape log shorter than or different
+from what the catalog already recorded still refuses forced release; restore
 the exact log or retire the tape. Rebuilding the catalog does not cure those
 conditions. This release form uses the home configuration on a standalone host
 without `/etc/rem/config.toml`. The bare `--ack` form is not a release route for
@@ -2576,7 +2581,7 @@ logs, and take `--config <PATH>` (default `/etc/rem/config.toml`).
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a loaded tape instead of a dump file. `--tape` takes the serial of the library that holds the tape and `--bay` the drive bay; that library must be on `--allow`. `restore` and `recover` also take `--dest <DIR>`. |
 | `rem-debug tape alerts --bay <BAY> [--library <SERIAL>]` | Read the loaded drive's TapeAlert LOG SENSE page directly. `--library` selects a configured library when there is more than one. `rem tape alerts` has no `--bay`; it is the daemon alias that takes a drive serial or UUID. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/authority_layout.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ## Destructive state reset
 
 ### rem-debug catalog reset-preflight
@@ -2609,7 +2614,8 @@ rem-debug catalog reset [OPTIONS]
   history, drive health snapshots, cleaning runs and alarms.
 - `--expected-preflight-token <SHA256>` is the token from `reset-preflight`, required for a
   scoped reset.
-- `--preserve-tape-voltag` is accepted but refused with
+- `--preserve-tape-voltag` is accepted but refused, once a well-formed
+  `--expected-preflight-token` (64 lowercase hexadecimal characters) is given, with
   `declared reset cannot restore SQL tape identities; reinitialize or adopt afterward`.
 - `--allow-erase-tape-voltag` has the exact typed-label scope described for
   `reset-preflight`; it preserves no identity.

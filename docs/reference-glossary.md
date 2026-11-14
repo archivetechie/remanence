@@ -301,7 +301,7 @@ An auxiliary, read-only parser linked into a separate Remanence distribution. Co
 owns the normalized reader and registry contract but ships with an empty registry and no
 concrete adapters. See [foreign-format adapters](reference-foreign-format-adapters.md).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/read_session.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-api/src/auth.rs crates/remanence-api/src/library.rs crates/remanence-state/src/library_runtime/peer_observations.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/lib.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/audit_query_service.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/read_session.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-api/src/auth.rs crates/remanence-api/src/library.rs crates/remanence-state/src/library_runtime/peer_observations.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/lib.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/audit_query_service.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ## Catalog and daemon
 
 ### tape log
@@ -438,8 +438,8 @@ all (`recover_session_id` returns unimplemented).
 
 ### authority marker
 
-The file `authority-format` in the state directory, which names the layout of the host's
-durable state (the tape logs and the library log). Only an empty state directory, or the
+The file `authority-format` in the state directory, which names the tape-log format and
+the root directory of the tape logs. Only an empty state directory, or the
 declared reset, may install it, and only under the exclusive state lock. A state directory in
 an older layout is refused, and `rem rebuild-catalog-from-journals` requires the marker and
 never installs it.
@@ -504,14 +504,15 @@ list, show and release fences by that id; quarantine and fence name the same rec
 
 ### tape-I/O fence
 
-A fence (quarantine id beginning `tioq-` or `library:`) recording a partial batch,
+A fence (quarantine id beginning `library:`) recording a partial batch,
 a transfer error, an uncertain finalization step, or a tape log that ends before
 the catalog's projection. `rem catalog tapes --json`, `rem top` and
-`rem daemon health` show it. The release form is
+`rem daemon health --json` show it. The release form is
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
 For a present, noncontradicted `native_log_behind_projection` log, restore the
 exact tape log or rebuild the catalog, then add `--force` to release. A
-contradicted log, floor conflict or absent log still refuses forced release;
+contradicted log, floor conflict, absent log, or a log shorter than or different
+from what the catalog already recorded still refuses forced release;
 restore the exact log or retire the tape. On a standalone host without
 `/etc/rem/config.toml`, this release form uses the home configuration. The bare
 `--ack` form is not a release route for these fences. See the

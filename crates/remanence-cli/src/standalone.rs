@@ -1176,7 +1176,7 @@ where
                 if fences.iter().any(|f| {
                     f.quarantine_id == *id && !remanence_api::standalone_fence_releasable(f)
                 }) {
-                    return Err("fence raised by a library daemon: release it on the host that owns it with rem --config <the library config> tape quarantine release ID --after-settled-inventory --ack TEXT".into());
+                    return Err("bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction fence is released by rem tape supersede-tail instead".into());
                 }
                 let released = state
                     .release_tape_io_fence(id, ack.trim(), false)

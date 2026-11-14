@@ -213,16 +213,17 @@ record. A tape-I/O fence release records the acknowledgement in the library log.
 
 There are two kinds of fence.
 
-- A **tape-I/O fence** (quarantine id beginning `tioq-` or `library:`) records a
+- A **tape-I/O fence** (quarantine id beginning `library:`) records a
   partial batch, a transfer error, an uncertain step of finalization, or a tape log
   that ends before the point the catalog has already projected.
-  `rem catalog tapes --json`, `rem top` and `rem daemon health` show these fences.
+  `rem catalog tapes --json`, `rem top` and `rem daemon health --json` show these fences.
   An operator investigates, verifies the tape and drive, and uses
   `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
   A present, noncontradicted tape log behind the catalog's projection
   (`native_log_behind_projection`) can be restored from an exact copy, or the
   catalog can be rebuilt, before release with `--force`. A contradicted log,
-  a floor conflict or an absent log still refuses forced release; restore the
+  a floor conflict, an absent log, or a log shorter than or different from what
+  the catalog already recorded still refuses forced release; restore the
   exact log or retire the tape.
   On a standalone host without `/etc/rem/config.toml`, the release form uses
   the home configuration. The form without `--after-settled-inventory` is not

@@ -480,7 +480,7 @@ minimal config above puts them there.
 startup refuses with `authority path contains a symlink` or
 `state lock path contains a symlink`. Mount or bind-mount the volume instead.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs crates/remanence-state/src/state.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs crates/remanence-state/src/state.rs crates/remanence-state/src/lock.rs crates/remanence-state/src/library_runtime.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ## Environment variables
 
 Remanence reads very little from the environment; configuration belongs in
@@ -494,7 +494,7 @@ the config file.
 | `REM_CHAOS_ALLOW_REAL` | `rem-debug` | Second gate, required in addition to `REM_CHAOS_ENABLED` before real hardware transports are wrapped with fault injection. Both unset is the safe production state. |
 | `REM_CHAOS_STATE` | chaos engine | Path to the chaos scenario state file; required when chaos is enabled. |
 | `USER` / `LOGNAME` | library-log actor | Recorded as the acting user for local CLI mutations; falls back to a system actor. |
-| `HOSTNAME` | library-log writer, lock file | Last-resort host identity after `/etc/machine-id` and `/proc/sys/kernel/hostname`. |
+| `HOSTNAME` | audit records, lock file | Last-resort host identity after `/etc/machine-id` and `/proc/sys/kernel/hostname`. |
 
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.

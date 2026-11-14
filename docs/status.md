@@ -246,7 +246,7 @@ closed operation is refused with `ClosedOperationRetry`. Motion faults after a
 bay reservation count toward the close-out scan's three-attempt media budget;
 drive contention does not, and write protection still parks immediately.
 
-<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_runtime/drive_observation.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_runtime/drive_observation.rs crates/remanence-cli/src/lib.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ### A cartridge left unthreaded by a hard kill
 
 A hard kill during an unload can leave the cartridge in the drive unthreaded.
@@ -277,7 +277,7 @@ restore.
 `rem rebuild-catalog-from-journals` starts from an empty catalog and applies
 the library log before the tape logs, carrying over no old catalog rows. The
 command keeps an older word for the tape logs in its name. Its summary prints
-`audit records: 0` and a `tape logs:` line with the snapshot count. It requires
+`audit records: 0` and a `tape logs:` line that repeats the catalog's tape count. It requires
 `authority-format` and `authority-manifest.json`, leaves both logs unchanged
 and does not clear repair fences.
 

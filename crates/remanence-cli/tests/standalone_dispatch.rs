@@ -895,7 +895,6 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
             .unwrap();
         if fail {
             use remanence_state::library_log::{DiagnosticEvent, DiagnosticValue};
-            let error = "library authority failed; motion is fenced until startup reconciliation";
             // D-L2-CLI-1-1: use ruling23's public diagnostic reader for code 5.
             let refusal_ids = |expected| {
                 let records = ruling24_library_records(&root.path().join("state/rem/config.toml"));
@@ -933,14 +932,30 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
                     .collect::<Vec<_>>()
             };
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
-            assert_eq!(output["error"], error);
+            let text = output["error"].as_str().expect("the error is a string");
+            assert!(
+                text.starts_with("cannot durably record standalone write uncertainty for "),
+                "{text}"
+            );
+            assert!(
+                text.ends_with("; motion is fenced and recovery is required"),
+                "{text}"
+            );
             assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 0);
             assert!(index.get_tape_by_voltag("HOMEL9").unwrap().is_none());
             drop(index);
             let first = refusal_ids(1);
             let (code, output) = run(&init);
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
-            assert_eq!(output["error"], error);
+            let text = output["error"].as_str().expect("the error is a string");
+            assert!(
+                text.starts_with("cannot durably record standalone write uncertainty for "),
+                "{text}"
+            );
+            assert!(
+                text.ends_with("; motion is fenced and recovery is required"),
+                "{text}"
+            );
             let retried = refusal_ids(2);
             assert_eq!(retried[0], first[0]);
             assert_ne!(retried[0], retried[1]);
@@ -2547,9 +2562,12 @@ fn standalone_cannot_release_a_library_fence() {
             true,
         );
         assert_ne!(code, ExitCode::SUCCESS);
-        assert!(out.contains("--after-settled-inventory"), "{out}");
-        assert!(out.contains("--config <the library config>"), "{out}");
-        assert!(out.contains("host that owns it"), "{out}");
+        assert!(
+            out.contains(
+                "bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction fence is released by rem tape supersede-tail instead"
+            ),
+            "{out}"
+        );
         assert_eq!(f.index().list_active_tape_io_fences().unwrap().len(), 1);
     }
 }

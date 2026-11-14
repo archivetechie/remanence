@@ -276,8 +276,11 @@ generated per-tape request key. Explicitly repeat the first request's `--reason`
 and `--expected-pool`; the default pool comes from the catalog at each attempt.
 Matching retries resume an open operation or deduplicate a sealed success.
 After a completion-unknown ending, the intent stays pending and needs operator
-recovery: the same key is refused with `ClosedOperationRetry`, and a new key
-with `ALREADY_EXISTS`.
+recovery: the same key is refused with
+`tape provisioning conflict: ClosedOperationRetry: ...`, and a new key with
+`pending terminal finalization belongs to a different exact request`. If that
+ending also raised a tape-I/O fence on the tape, the fence refuses both until it
+is released.
 
 Each command prints a JSON summary. A successful finalize reports
 `"finalized": true`. `rem tape verify` reports `"status": "verified"` with the
@@ -395,7 +398,8 @@ exact tape log or rebuild the catalog, then release the fence with:
 rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
 ```
 
-A contradicted log, a floor conflict or an absent tape log still refuses forced
+A contradicted log, a floor conflict, an absent tape log, or a tape log shorter
+than or different from what the catalog already recorded still refuses forced
 release; restore the exact log or retire the tape. Rebuilding the catalog does
 not cure those conditions. `--after-settled-inventory` selects the library form,
 which uses your home configuration when `/etc/rem/config.toml` is absent. With
@@ -409,8 +413,8 @@ rem tape quarantine release <ID> --after-settled-inventory --ack "checked drive 
 ```
 
 The bare form without `--after-settled-inventory` is not a release route for
-these tape fences. On a home host, or with `--device`, it refuses a `library:`
-fence with `fence raised by a library daemon:`. On a host with a system
+these tape fences. On a home host, or with `--device`, it refuses every
+tape-I/O fence a standalone host can hold with `bare standalone release cannot release this fence:`. On a host with a system
 configuration, it prints `tape quarantine release requires --after-settled-inventory`.
 When both configurations exist, list the home state's fence ids with
 `rem tape quarantine list --device <SG> --allow-device <SERIAL> --config <PATH>`:

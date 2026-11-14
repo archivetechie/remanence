@@ -97,8 +97,9 @@ impl OperatorMount<'_> {
         } else {
             Ok(())
         };
-        self.flush_audit()?;
+        let flushed = self.flush_audit();
         let value = result?;
+        flushed?;
         allow?;
         release?;
         Ok(value)

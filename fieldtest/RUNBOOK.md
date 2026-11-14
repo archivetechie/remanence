@@ -426,7 +426,7 @@ block mode set. In that case, use the selected library serial and occupied bay
 to unload before restarting the daemon:
 
 ```bash
-rem-debug --allow <SERIAL> unload --bay <BAY> --config "$REMFIELD_HOME/config.toml" <SERIAL>
+rem-debug --allow <SERIAL> unload --bay <BAY> --config "${REMFIELD_HOME:-$HOME/remfield}/config.toml" <SERIAL>
 ./scripts/03-bringup.sh
 ```
 
