@@ -1484,7 +1484,8 @@ mod tests {
 }
 
 impl CatalogCore {
-    /// B4b-only bounded projection. All native row SQL stays in project_snapshot_rows.
+    /// Commit bounded chunks only when this projection owns the outer transaction.
+    /// Nested projections leave atomicity to their caller.
     pub(super) fn project_tape_log_bounded(
         &mut self,
         snapshot: &AuthoritySnapshot,
@@ -1519,11 +1520,12 @@ impl CatalogCore {
         let resume:Option<(SqliteU64,SqliteU64)>=self.conn.query_row("select through_sequence,rows_committed from tape_projection_chunks where tape_uuid=?1",[uuid.as_slice()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|sqlite_error("read tape chunk resume",e))?;
         let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin bounded tape projection", e))?;
+        let owns_transaction = matches!(tx, ProjectionTransaction::Transaction(_));
         tx.execute("insert into tape_projection_sources values(?1,?2,?3,?4) on conflict(tape_uuid) do update set received_sequence=excluded.received_sequence,byte_end=excluded.byte_end,source_digest=excluded.source_digest",params![uuid.as_slice(),SqliteU64::new(snapshot.log_reference().0),SqliteU64::new(end),digest.as_slice()]).map_err(|e|sqlite_error("bind tape projection source",e))?;
         let mut count = 0;
         let mut last = None;
         project_snapshot_rows(&tx, snapshot, true, &mut |conn, sequence, row| {
-            if count == super::apply::TAPE_CHUNK_ROWS {
+            if owns_transaction && count == super::apply::TAPE_CHUNK_ROWS {
                 let (sequence, row) = last.expect("nonempty chunk");
                 conn.execute("insert into tape_projection_chunks values(?1,?2,?3) on conflict(tape_uuid) do update set through_sequence=excluded.through_sequence,rows_committed=excluded.rows_committed",params![uuid.as_slice(),SqliteU64::new(sequence),SqliteU64::new(row)]).map_err(|e|sqlite_error("checkpoint tape chunk",e))?;
                 conn.execute_batch("commit; begin immediate")
