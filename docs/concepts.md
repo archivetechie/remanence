@@ -222,9 +222,10 @@ There are two kinds of fence.
   A present, noncontradicted tape log behind the catalog's projection
   (`native_log_behind_projection`) can be restored from an exact copy, or the
   catalog can be rebuilt, before release with `--force`. A contradicted log,
-  a floor conflict, an absent log, or a log shorter than or different from what
-  the catalog already recorded still refuses forced release; restore the
-  exact log or retire the tape.
+  a floor conflict or an absent log still refuses forced release; restore the
+  exact log or retire the tape. A log still shorter than, or different from,
+  what the catalog recorded also refuses forced release, until the exact log is
+  restored or the catalog is rebuilt.
   On a standalone host without `/etc/rem/config.toml`, the release form uses
   the home configuration. The form without `--after-settled-inventory` is not
   a release route for these tape fences; see the [CLI reference](reference-cli.md#rem-tape-quarantine-standalone).

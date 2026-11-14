@@ -202,7 +202,7 @@ Init asks you to type `CLOBBER HOME01`. For a run without a prompt, add
 protection, the partition check, the label and identity swap checks, or the
 pool checks.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/tail_recovery.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/tail_recovery.rs crates/remanence-state/src/error.rs crates/remanence-state/src/projector/apply.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## 3. Put files on tape
 
 Write a directory to the loaded tape:
@@ -398,10 +398,11 @@ exact tape log or rebuild the catalog, then release the fence with:
 rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
 ```
 
-A contradicted log, a floor conflict, an absent tape log, or a tape log shorter
-than or different from what the catalog already recorded still refuses forced
+A contradicted log, a floor conflict or an absent tape log still refuses forced
 release; restore the exact log or retire the tape. Rebuilding the catalog does
-not cure those conditions. `--after-settled-inventory` selects the library form,
+not cure those conditions. A tape log still shorter than, or different from,
+what the catalog recorded also refuses forced release, until the exact log is
+restored or the catalog is rebuilt. `--after-settled-inventory` selects the library form,
 which uses your home configuration when `/etc/rem/config.toml` is absent. With
 no daemon socket answering, it runs offline under the state lock.
 

@@ -303,10 +303,11 @@ then release with
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`.
 Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force:`.
-A contradicted log, a floor conflict, an absent tape log, or a tape log shorter
-than or different from what the catalog already recorded still refuses forced
+A contradicted log, a floor conflict or an absent tape log still refuses forced
 release; restore the exact log or retire the tape. Rebuilding the catalog does
-not cure those conditions. On a standalone host without `/etc/rem/config.toml`,
+not cure those conditions. A tape log still shorter than, or different from,
+what the catalog recorded also refuses forced release, until the exact log is
+restored or the catalog is rebuilt. On a standalone host without `/etc/rem/config.toml`,
 this release form uses the home configuration. The bare `--ack` form is not a
 release route for these tape fences; see [release routing](reference-cli.md#rem-tape-quarantine-standalone).
 

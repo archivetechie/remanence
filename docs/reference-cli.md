@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/tail_recovery.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/tail_recovery.rs crates/remanence-state/src/error.rs crates/remanence-state/src/projector/apply.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
@@ -1315,10 +1315,11 @@ rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
 
 Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force:`. A contradicted log,
-a floor conflict, an absent tape log, or a tape log shorter than or different
-from what the catalog already recorded still refuses forced release; restore
+a floor conflict or an absent tape log still refuses forced release; restore
 the exact log or retire the tape. Rebuilding the catalog does not cure those
-conditions. This release form uses the home configuration on a standalone host
+conditions. A tape log still shorter than, or different from, what the catalog
+recorded also refuses forced release, until the exact log is restored or the
+catalog is rebuilt. This release form uses the home configuration on a standalone host
 without `/etc/rem/config.toml`. The bare `--ack` form is not a release route for
 these tape fences; see [standalone routing](#rem-tape-quarantine-standalone).
 

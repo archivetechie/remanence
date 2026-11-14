@@ -511,9 +511,10 @@ the catalog's projection. `rem catalog tapes --json`, `rem top` and
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
 For a present, noncontradicted `native_log_behind_projection` log, restore the
 exact tape log or rebuild the catalog, then add `--force` to release. A
-contradicted log, floor conflict, absent log, or a log shorter than or different
-from what the catalog already recorded still refuses forced release;
-restore the exact log or retire the tape. On a standalone host without
+contradicted log, floor conflict or absent log still refuses forced release;
+restore the exact log or retire the tape. A log still shorter than, or different
+from, what the catalog recorded also refuses forced release, until the exact log
+is restored or the catalog is rebuilt. On a standalone host without
 `/etc/rem/config.toml`, this release form uses the home configuration. The bare
 `--ack` form is not a release route for these fences. See the
 [CLI reference](reference-cli.md#rem-tape-quarantine-standalone) for routing and listing.

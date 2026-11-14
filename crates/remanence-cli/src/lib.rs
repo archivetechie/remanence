@@ -2833,7 +2833,7 @@ enum TapeQuarantineCommand {
         json: bool,
     },
 
-    /// Release a media-readiness or tape-I/O fence (library: ID) after acknowledgement.
+    /// Release a tape-I/O fence (library: ID) or a media-readiness fence after acknowledgement.
     Release {
         /// Quarantine id or media-readiness operation UUID.
         quarantine: String,

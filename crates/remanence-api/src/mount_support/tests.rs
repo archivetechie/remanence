@@ -2825,7 +2825,7 @@ fn an_unrecordable_standalone_write_fence_is_counted_once_with_its_tape() {
         },
     );
     // The closure's refusal ("cannot durably record standalone write uncertainty ...") is what
-    // `initialize` returns: it flushes the audit first, then answers the write's own error.
+    // `initialize` returns: it flushes the audit first, then returns the closure's refusal.
     let error = result
         .expect_err("the fence cannot be recorded")
         .to_string();
