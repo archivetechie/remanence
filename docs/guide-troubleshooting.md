@@ -353,7 +353,10 @@ This can follow a failure to open the drive, read its alerts, move the cartridge
 back, or read a fresh inventory. A new manual clean on that drive refuses with
 `drive is already fenced`. `rem tape quarantine release` refuses a drive fence
 with `fence is not tape-scoped`. There is no command to release a retained drive
-fence; the erasing reset is the only route.
+fence; the declared reset,
+`rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`
+([declared reset](#authority-layout-refusals-and-declared-reset)), is the only
+route, and it erases the catalog.
 
 The refusal `drive discovery cannot preserve the required identity alarm; motion is fenced`
 occurs when discovery finds one serial twice in an inventory, two active
@@ -637,6 +640,7 @@ layers — seeing one does not imply the others tripped too.
 | `untrusted state volume ...` | State, journal, audit, index, cache, or socket path sits on tmpfs/NFS/SMB/overlayfs and `journal.require_trusted_volume` is `true` (the default). Move the state or consciously disable the check. |
 | `error: configure spool dir ...` | The spool resolved to tmpfs and `spool_tmpfs_ram_budget` is not set. Spooling to RAM needs an explicit budget acknowledgement. |
 | `TLS private key ... has insecure permissions` | The key file is group- or world-accessible. `chmod 600` it. |
+| `drive discovery cannot preserve the required identity alarm; motion is fenced` | Discovery found one serial twice, two active identities for one serial, a changed vendor or product, or a retired drive reappearing; see [Tape-I/O fences](#tape-io-fences). A drive whose host connection is down is not a cause. |
 | `startup blocked by active tape-I/O fence <id> ...` | The fence has missing or unparseable scope. Inspect its evidence. There is no operator route to repair a fence without a typed library source identity; release refuses with `fence has no typed library source identity`. Scoped fences produce WARNs and allow startup. |
 | `error: discover libraries: ...` | Same permission gates as the CLI (tape group + `CAP_SYS_RAWIO`, via systemd `AmbientCapabilities` for a service). |
 | `error: acquire daemon state ownership ...` | Another daemon or offline state-mutating command holds `<state_dir>/state.lock`. Stop the other owner; do not delete the lock file or point a second daemon at the same state directory. The kernel releases the lock when its owner exits. |

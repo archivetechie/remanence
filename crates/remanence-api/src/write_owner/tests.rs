@@ -18044,7 +18044,7 @@ fn k67_fast_eject_case(expired: bool, before_move: bool) {
 
 /// T2: fast-eject before LOAD admission releases durably.
 #[test]
-fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
+fn typed_cleaning_owner_fast_eject_releases_fence_after_reopen() {
     k67_fast_eject_case(true, false);
 }
 
