@@ -3329,6 +3329,29 @@ impl super::DriveHandle {
             }
         };
 
+        // 3. Drives that report medium type 0x00 in the mode
+        // parameter header (HP LTO among them) expose WORM state only
+        // through the Medium Configuration page. Consult it solely
+        // when the header was inconclusive; any failure keeps the
+        // state Unknown, so ordinary writes still refuse.
+        let worm = if mode.worm == WormMediaState::Unknown {
+            let cdb_mc = remanence_scsi::mode::build_mode_sense6_cdb(
+                remanence_scsi::mode::PageControl::Current,
+                remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION,
+                64,
+            );
+            let mut mc_buf = [0u8; 64];
+            match self.transport.execute_in(&cdb_mc, &mut mc_buf) {
+                Ok(outcome) => {
+                    let bytes = (outcome.bytes_transferred as usize).min(mc_buf.len());
+                    worm_state_from_medium_configuration_page(&mc_buf[..bytes])
+                }
+                Err(_) => WormMediaState::Unknown,
+            }
+        } else {
+            mode.worm
+        };
+
         self.finish_tape_success(op, started.elapsed());
 
         self.max_write_block_size_bytes = Some(max_block_size_bytes);
@@ -3345,7 +3368,7 @@ impl super::DriveHandle {
             compression: mode.compression,
             max_block_size_bytes,
             write_protected: mode.write_protected,
-            worm: mode.worm,
+            worm,
         })
     }
 
@@ -4153,6 +4176,37 @@ fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {
         0x01 | 0x3C | 0x4C | 0x5C | 0x6C | 0x7C | 0x8C | 0x9C => WormMediaState::Worm,
         0x38 | 0x48 | 0x58 | 0x68 | 0x78 | 0x88 | 0x98 => WormMediaState::NotWorm,
         _ => WormMediaState::Unknown,
+    }
+}
+
+/// Classify WORM state from a MODE SENSE(6) response for the Medium
+/// Configuration page (0x1D): 4-byte header, block descriptor of
+/// BDL bytes, then the page. WORMM is byte 2 bit 0 of the page.
+///
+/// Fails closed: any malformed, truncated or unexpected response
+/// yields [`WormMediaState::Unknown`] rather than an assumption.
+fn worm_state_from_medium_configuration_page(buf: &[u8]) -> WormMediaState {
+    if buf.len() < 4 {
+        return WormMediaState::Unknown;
+    }
+    let mode_data_length = buf[0] as usize;
+    let bdl = buf[3] as usize;
+    let page_start = 4 + bdl;
+    // MODE DATA LENGTH excludes itself; the page header and the
+    // WORMM byte must all lie inside the bytes the drive reported.
+    let reported_end = (mode_data_length + 1).min(buf.len());
+    if reported_end < page_start + 3 {
+        return WormMediaState::Unknown;
+    }
+    let page_code = buf[page_start] & 0x3F;
+    let page_length = buf[page_start + 1] as usize;
+    if page_code != remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION || page_length < 1 {
+        return WormMediaState::Unknown;
+    }
+    if buf[page_start + 2] & 0x01 != 0 {
+        WormMediaState::Worm
+    } else {
+        WormMediaState::NotWorm
     }
 }
 

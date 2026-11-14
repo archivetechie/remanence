@@ -35,6 +35,13 @@ pub const PAGE_DATA_COMPRESSION: u8 = 0x0F;
 /// LTO tape drives.
 pub const PAGE_DEVICE_CONFIGURATION: u8 = 0x10;
 
+/// Mode page code for Medium Configuration (SSC-3 onward). Byte 2
+/// bit 0 of the page is WORMM: set when the loaded medium is
+/// operated as WORM. Some drives (e.g. HP LTO) report medium type
+/// 0x00 in the mode parameter header and only expose WORM state
+/// here.
+pub const PAGE_MEDIUM_CONFIGURATION: u8 = 0x1D;
+
 /// Special page code: return all supported pages.
 pub const PAGE_ALL: u8 = 0x3F;
 

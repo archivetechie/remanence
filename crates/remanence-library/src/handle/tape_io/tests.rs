@@ -789,6 +789,72 @@ fn parse_mode_sense_detects_worm_medium_type() {
     assert_eq!(parsed.worm, WormMediaState::Worm);
 }
 
+/// MODE SENSE(6) page 0x1D response captured from an HP Ultrium
+/// 6-SCSI (firmware O36Z) with a rewritable LTO-6 cartridge loaded:
+/// header medium type 0x00, density 0x5A, WORMM clear.
+const HP_LTO6_MEDIUM_CONFIGURATION: [u8; 44] = [
+    0x2b, 0x00, 0x10, 0x08, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x1d, 0x1e, 0x00, 0x00,
+    0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn medium_configuration_page_proves_rewritable_hp_lto6() {
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&HP_LTO6_MEDIUM_CONFIGURATION),
+        WormMediaState::NotWorm
+    );
+}
+
+#[test]
+fn medium_configuration_page_detects_wormm_bit() {
+    let mut buf = HP_LTO6_MEDIUM_CONFIGURATION;
+    buf[14] |= 0x01;
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&buf),
+        WormMediaState::Worm
+    );
+}
+
+#[test]
+fn medium_configuration_page_fails_closed_on_unexpected_responses() {
+    // Wrong page code (e.g. a drive that ignores the page request).
+    let mut wrong_page = HP_LTO6_MEDIUM_CONFIGURATION;
+    wrong_page[12] = 0x0f;
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&wrong_page),
+        WormMediaState::Unknown
+    );
+
+    // Zero page length.
+    let mut empty_page = HP_LTO6_MEDIUM_CONFIGURATION;
+    empty_page[13] = 0x00;
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&empty_page),
+        WormMediaState::Unknown
+    );
+
+    // Transfer truncated before the WORMM byte.
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&HP_LTO6_MEDIUM_CONFIGURATION[..14]),
+        WormMediaState::Unknown
+    );
+
+    // MODE DATA LENGTH claims less than the page header plus WORMM byte.
+    let mut short_length = HP_LTO6_MEDIUM_CONFIGURATION;
+    short_length[0] = 13;
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&short_length),
+        WormMediaState::Unknown
+    );
+
+    // Header only.
+    assert_eq!(
+        worm_state_from_medium_configuration_page(&[0u8; 3]),
+        WormMediaState::Unknown
+    );
+}
+
 #[test]
 fn parse_mode_sense_rejects_short_header() {
     let buf = [0u8; 3];
