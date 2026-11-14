@@ -10,11 +10,21 @@ use crate::tape_log::{
 };
 use std::{collections::BTreeMap, fs, io, path::Path};
 
+/// A tape source the tolerant probe could not retain. Only offline rebuild refuses it.
+#[derive(Clone)]
+pub(crate) struct DroppedTapeLog {
+    pub tape: Id,
+    pub path: std::path::PathBuf,
+    /// None denotes a marker with no corresponding tape log.
+    pub error: Option<String>,
+}
+
 /// A frozen set of probed native logs. A genuinely missing or corrupt log is
 /// absent from the map and can never produce a pending (`NotYet`) reference.
 #[derive(Clone)]
 pub struct NativeTapeView {
     tapes: BTreeMap<Id, Snapshot>,
+    dropped: Vec<DroppedTapeLog>,
     replaced: BTreeMap<Id, std::collections::BTreeSet<(u64, u64)>>,
 }
 impl NativeTapeView {
@@ -54,12 +64,27 @@ impl NativeTapeView {
         open: impl Fn(Id) -> Result<Store, StoreError>,
     ) -> Result<Self, StoreError> {
         let mut tapes = BTreeMap::new();
+        let mut dropped = Vec::new();
+        let mut markers = BTreeMap::new();
+        let mut log_paths = std::collections::BTreeSet::new();
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "ambiguous") {
+                // Previously ignored marker names remain ignored unless they name a tape.
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(id) = uuid::Uuid::parse_str(stem) {
+                        if stem == id.simple().to_string() {
+                            markers.insert(*id.as_bytes(), path);
+                        }
+                    }
+                }
+                continue;
+            }
             if path.extension().is_none_or(|ext| ext != "remtape") {
                 continue;
             }
+            log_paths.insert(path.clone());
             let stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid native tape filename")
             })?;
@@ -82,14 +107,36 @@ impl NativeTapeView {
                     tapes.insert(id, snapshot);
                 }
                 // These are format/identity failures proved by bytes, not I/O.
-                Err(StoreError::Header | StoreError::Codec(CodecError::Recovery(_))) => {}
+                Err(error @ (StoreError::Header | StoreError::Codec(CodecError::Recovery(_)))) => {
+                    dropped.push(DroppedTapeLog {
+                        tape: id,
+                        path,
+                        error: Some(error.to_string()),
+                    });
+                }
                 Err(error) => return Err(error),
             }
         }
+        for (tape, path) in markers {
+            if !log_paths.contains(&path.with_extension("remtape")) {
+                dropped.push(DroppedTapeLog {
+                    tape,
+                    path,
+                    error: None,
+                });
+            }
+        }
+        dropped.sort_by_key(|entry| entry.tape);
         Ok(Self {
             tapes,
+            dropped,
             replaced: BTreeMap::new(),
         })
+    }
+
+    /// Probe omissions are evidence for the offline completeness gate, not a startup policy.
+    pub(crate) fn dropped_logs(&self) -> &[DroppedTapeLog] {
+        &self.dropped
     }
 
     /// Frozen native prefixes already probed at startup; no second path open.

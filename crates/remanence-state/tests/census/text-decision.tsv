@@ -373,7 +373,7 @@ crates/remanence-state/src/index.rs::validate_catalog_digest_pair::text-match	1
 crates/remanence-state/src/index.rs::validate_unsigned_structural_schema_for_table::text-eq_ignore_ascii_case	1
 crates/remanence-state/src/index.rs::validate_unsigned_structural_schema_for_table::text-equality	1
 # Native filenames only: .remtape extension and canonical UUID spelling, not diagnostic text.
-crates/remanence-state/src/library_log/native_view.rs::probe_with::text-equality	2
+crates/remanence-state/src/library_log/native_view.rs::probe_with::text-equality	4
 crates/remanence-state/src/media.rs::parse_label_generation::text-match	10
 crates/remanence-state/src/media.rs::tape_generation::text-match	3
 crates/remanence-state/src/state.rs::adopt_bootstrap_identity::text-equality	2

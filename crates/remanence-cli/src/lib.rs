@@ -8255,6 +8255,9 @@ fn run_rebuild_catalog_from_journals(
             let _ = writeln!(out, "  object copies: {}", report.object_instances_rebuilt);
             let _ = writeln!(out, "  audit records: {}", report.audit_records_replayed);
             let _ = writeln!(out, "  tape logs: {}", report.tapes_rebuilt);
+            if let Some(note) = &report.standing_note {
+                let _ = writeln!(out, "  note: {note}");
+            }
             for warning in &report.preserved_fallbacks {
                 let _ = writeln!(err, "WARN preserved-not-replayed: {warning}");
             }

@@ -466,6 +466,8 @@ pub struct RebuildTapeJournalInput {
 /// Report from rebuilding SQLite from authoritative audit and journal sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildReport {
+    /// Offline rebuild's standing note when no library witness existed in the catalog.
+    pub standing_note: Option<String>,
     /// Number of tape journals consumed.
     pub tapes_rebuilt: u64,
     /// Number of tape-file rows rebuilt.
@@ -3840,6 +3842,7 @@ impl CatalogCore {
         tx.commit()
             .map_err(|err| sqlite_error("commit full index rebuild transaction", err))?;
         Ok(RebuildReport {
+            standing_note: None,
             tapes_rebuilt: tape_journals.len() as u64,
             tape_files_rebuilt,
             object_instances_rebuilt,

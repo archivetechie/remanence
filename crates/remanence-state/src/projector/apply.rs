@@ -91,6 +91,70 @@ pub enum ApplyError {
     },
 }
 
+/// Bind both the validated hash-chain position and canonical decoded source bytes.
+/// Rebuild completeness and projection must agree on precisely this source identity.
+pub(crate) fn library_source_digest(
+    sequence: u64,
+    record_hash: lib::Hash,
+    record: &lib::Record,
+) -> Result<[u8; 32], StateError> {
+    let (encoded, _) = lib::codec::encode(sequence, [0; 32], record)
+        .map_err(|e| StateError::IndexCorrupt(e.to_string()))?;
+    let mut source_hash = Sha256::new();
+    source_hash.update(record_hash);
+    source_hash.update(&encoded);
+    Ok(source_hash.finalize().into())
+}
+
+/// Catalog witnesses retained until a rebuild has proved its sources complete.
+pub(crate) struct StoredLibraryRecord {
+    pub sequence: u64,
+    pub digest: [u8; 32],
+    pub tag: u16,
+    pub bytes: Vec<u8>,
+}
+/// All stored applications and the greatest received position, including unapplied records.
+pub(crate) struct LibraryCatalogEvidence {
+    pub rows: Vec<StoredLibraryRecord>,
+    pub received: u64,
+}
+impl CatalogCore {
+    /// Read only: no replay, projection progress update, or transaction is started here.
+    pub(in crate::projector) fn library_catalog_evidence(
+        &self,
+    ) -> Result<LibraryCatalogEvidence, StateError> {
+        let mut statement = self.conn.prepare(
+            "select sequence,source_digest,tag,source_bytes from library_projection_records order by sequence"
+        ).map_err(|e| sqlite_error("read library rebuild witnesses", e))?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(StoredLibraryRecord {
+                    sequence: r.get::<_, SqliteU64>(0)?.get(),
+                    digest: r.get(1)?,
+                    tag: r.get(2)?,
+                    bytes: r.get(3)?,
+                })
+            })
+            .map_err(|e| sqlite_error("read library rebuild witnesses", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sqlite_error("read library rebuild witness", e))?;
+        let mut received = 0;
+        for sql in [
+            "select received from projection_sources where source='library'",
+            "select received from library_projection_progress where singleton=1",
+            "select received from library_fold_progress where singleton=1",
+        ] {
+            let position = self
+                .conn
+                .query_row(sql, [], |r| r.get::<_, SqliteU64>(0))
+                .optional()
+                .map_err(|e| sqlite_error("read library rebuild received position", e))?;
+            received = received.max(position.map_or(0, SqliteU64::get));
+        }
+        Ok(LibraryCatalogEvidence { rows, received })
+    }
+}
+
 /// Roll back on both error and unwind; inner typed methods use nested savepoints.
 struct RecordTransaction<'a> {
     core: &'a mut CatalogCore,
@@ -179,13 +243,8 @@ impl CatalogCore {
                 }
                 let (encoded, _) = lib::codec::encode(value.sequence, [0; 32], &value.record)
                     .map_err(|e| StateError::IndexCorrupt(e.to_string()))?;
-                // Bind the actual validated hash-chain position as well as
-                // canonical decoded bytes; a rewritten predecessor is not an
-                // identical source even if this record's body is unchanged.
-                let mut source_hash = Sha256::new();
-                source_hash.update(value.record_hash);
-                source_hash.update(&encoded);
-                let digest: [u8; 32] = source_hash.finalize().into();
+                let digest =
+                    library_source_digest(value.sequence, value.record_hash, &value.record)?;
                 let previous: Option<Vec<u8>> = guard.core.conn.query_row(
                     "select source_digest from library_projection_records where sequence=?1 or record_uuid=?2",
                     params![SqliteU64::new(value.sequence), value.record.envelope.record_uuid.as_slice()], |r|r.get(0))

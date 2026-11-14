@@ -138,8 +138,10 @@ nothing. Stop the daemon and restore the exact tape log from a preserved copy.
 If the logs are intact and only the catalog projection is damaged, use the
 rebuild route below. Catalog rebuild does not repair a damaged tape log.
 
-For a lost SQLite catalog with intact authority, stop the daemon and run the
-command below. If the catalog is damaged, first move the file named by
+For a lost SQLite catalog, stop the daemon and run the offline rebuild below
+before starting the daemon. Daemon startup does not check for a tape log that
+the probe drops because of damage or a lone ambiguity marker. If the catalog
+is damaged, first move the file named by
 `index.sqlite_path` and its `-wal`/`-shm` sidecars aside without deleting them.
 Then rebuild:
 
@@ -155,6 +157,25 @@ It does not clear ambiguity or repair fences or media. Cached wrap maps are
 evicted and volumes become uncalibrated; calibration generation allocation
 advances. A short log can refuse with `RebuildWouldDropMarkEvidence:` when
 rebuild would discard the catalog's mark evidence.
+
+`RebuildWouldDropLibraryRecords:` means the catalog holds library records that
+the supplied log does not. The refusal lists the tape-standing changes and
+counts the other records. Put back the library log this catalog was built from
+and run again. If it no longer exists, keep the state directory and catalog as
+they are; they hold the only copy of those records. The declared reset erases
+them and is the only way to run sooner. Moving the catalog aside removes this
+witness; there is no override for the refusal.
+
+`RebuildWouldDropTapeLog:` means a damaged tape log or a tape with only an
+ambiguity marker would disappear from the rebuilt catalog. Restore the named
+tape log from a copy and run again, or keep the state directory as it is. For a
+marker-only tape, follow the refusal's `rem-debug library-log recover
+--confirm-clear-ambiguity` command with the named configuration, then rebuild.
+Neither refusal clears catalog rows or changes either log.
+
+With no catalog witness, a successful rebuild prints the library record and
+time its tape standing reflects. Nothing on this host establishes that the
+library log is the newest copy.
 
 Catalog rebuild regenerates the queryable view of intact host records; it does
 not change the cartridge or repair a tape log.

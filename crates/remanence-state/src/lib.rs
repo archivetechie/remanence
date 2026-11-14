@@ -10,6 +10,7 @@ pub mod authority;
 pub mod authority_layout;
 pub mod authority_manifest;
 pub mod library_runtime;
+mod rebuild_sources;
 pub use authority::{TapeAuthority, TapeAuthorityLease, TerminalIndexSource};
 pub mod adapters;
 pub mod audit;

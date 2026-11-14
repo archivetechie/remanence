@@ -1403,3 +1403,86 @@ fn l1b_release_floor_memory_content_extent_and_clear() {
     l1b_force(&mut f, seq).unwrap();
     assert!(l1b_release_record(&f).detail.0.is_empty());
 }
+
+/// In-process rebuild must retain catalog-only library evidence without appending a fence.
+#[test]
+fn k94_t13_in_process_older_library_refuses() {
+    fn files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut result = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n == "state.lock")
+                || path.extension().is_some_and(|e| e == "lock")
+            {
+                continue;
+            }
+            if path.is_dir() {
+                result.extend(files(&path));
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                result.insert(path, bytes);
+            }
+        }
+        result
+    }
+    fn rows(path: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut stmt=conn.prepare("select sequence,record_uuid,source_digest,tag,source_bytes from library_projection_records order by sequence").unwrap();
+        let rows = stmt
+            .query_map([], |r| (0..5).map(|i| r.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+    let mut f = Fixture::new();
+    f.provision(T);
+    f.native(T, false);
+    f.close();
+    let old = files(&f.paths.audit_dir);
+    f.reopen();
+    f.rt()
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(tape(T)),
+                    cause: lib::FenceCause::PartialBatch,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    f.close();
+    for p in files(&f.paths.audit_dir).keys() {
+        std::fs::remove_file(p).unwrap();
+    }
+    for (p, b) in &old {
+        std::fs::write(p, b).unwrap();
+    }
+    f.reopen();
+    let before = files(&f.paths.audit_dir);
+    let natives = files(&f.paths.journal_dir);
+    let catalog = rows(&f.paths.sqlite_path);
+    let error = f
+        .state
+        .as_mut()
+        .unwrap()
+        .rebuild_projection_from_tape_logs()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("RebuildWouldDropLibraryRecords"),
+        "{error}"
+    );
+    assert_eq!(files(&f.paths.audit_dir), before);
+    assert_eq!(files(&f.paths.journal_dir), natives);
+    assert_eq!(rows(&f.paths.sqlite_path), catalog);
+}

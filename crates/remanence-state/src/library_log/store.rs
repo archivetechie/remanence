@@ -191,19 +191,39 @@ pub fn replay_observed(
     view: &dyn TapeView,
     applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
 ) -> Result<Replay, StoreError> {
+    replay_observed_with_received(dir, log_uuid, view, applied, &mut |_, _| Ok(()))
+}
+/// Observe every validated received record, including excluded and pending records,
+/// under exactly the same directory and library-log leases as ordinary replay.
+pub fn replay_observed_with_received(
+    dir: &Path,
+    log_uuid: Id,
+    view: &dyn TapeView,
+    applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+    received: &mut dyn FnMut(&Record, &Receipt) -> Result<(), StoreError>,
+) -> Result<Replay, StoreError> {
     let _directory = directory_lock(dir, false)?;
     let _lock = if dir.join("library-log.lock").try_exists()? {
         Some(lock(dir, false)?)
     } else {
         None
     };
-    scan_observed(dir, log_uuid, view, applied)
+    scan_observed_with_received(dir, log_uuid, view, applied, received)
 }
 fn scan_observed(
     dir: &Path,
     log_uuid: Id,
     view: &dyn TapeView,
     applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+) -> Result<Replay, StoreError> {
+    scan_observed_with_received(dir, log_uuid, view, applied, &mut |_, _| Ok(()))
+}
+fn scan_observed_with_received(
+    dir: &Path,
+    log_uuid: Id,
+    view: &dyn TapeView,
+    applied: &mut dyn FnMut(super::authority::AppliedLibraryRecord) -> Result<(), StoreError>,
+    received: &mut dyn FnMut(&Record, &Receipt) -> Result<(), StoreError>,
 ) -> Result<Replay, StoreError> {
     let mut files: Vec<_> = fs::read_dir(dir)?
         .map(|e| e.map(|e| e.path()))
@@ -217,7 +237,7 @@ fn scan_observed(
         .into_iter()
         .map(|path| (path, None))
         .collect::<Vec<_>>();
-    scan_prefixes(dir, log_uuid, view, applied, &files)
+    scan_prefixes_observed(dir, log_uuid, view, applied, received, &files)
 }
 fn scan_prefixes(
     dir: &Path,

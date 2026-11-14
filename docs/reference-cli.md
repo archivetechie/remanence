@@ -2675,6 +2675,34 @@ catalog file and its `-wal`/`-shm` sidecars aside first, because rebuild opens a
 existing file before replay. A short tape log can also refuse with
 `RebuildWouldDropMarkEvidence:` if rebuilding would discard the catalog's mark
 evidence. See [recovery and release](#rem-tape-quarantine-list-show-and-release-library).
+
+Before clearing the catalog, rebuild checks whether its library records are
+still present in the library log. `RebuildWouldDropLibraryRecords:` means the
+log is older or contains different records. The refusal lists each affected
+record that changes tape standing, with its tape and time, and counts the other
+kinds. Put back the library log this catalog was built from and run again. If
+that log no longer exists, keep the state directory and catalog as they are:
+they hold the only copy of those records, and this release cannot write them
+back. The declared reset is the only way to run sooner, and it erases them.
+There is no override. Moving the catalog aside removes this comparison witness.
+
+`RebuildWouldDropTapeLog:` lists each damaged tape log with its path and error,
+or a tape that has only an ambiguity marker. Restore a damaged tape log from a
+copy and run again, or keep the state directory as it is. For a marker-only
+tape, follow the appended `rem-debug library-log recover --config <PATH>
+--confirm-clear-ambiguity` advice, then rebuild. Both refusals occur before any
+catalog rows are cleared and leave the library and tape logs unchanged.
+
+When the catalog has no stored library records and no received position,
+success includes this line after `tape logs:`:
+
+```text
+  note: tape standing (withdrawals, fences, pools) is as of library record <L> (<time>); there was no catalog to compare, so nothing on this host shows that this library log is the newest copy
+```
+
+The time is the last received record's UTC time; an empty log says
+`record 0 (no records)`. The note does not establish that the log is current.
+
 Rebuild evicts wrap maps and marks volumes uncalibrated while advancing
 calibration generation allocation. See
 [Tape identity and the retire operation](tape-identity-lifecycle-explainer.md#5-retire-and-catalog-rebuild).

@@ -574,10 +574,20 @@ impl LibraryRuntime {
             view.clone()
         };
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
+        let mut received = std::collections::BTreeMap::new();
         let replay = snapshot
-            .replay(&view, &mut |_| Ok(()))
+            .inspect(&view, &mut |_| Ok(()), &mut |record, receipt| {
+                crate::rebuild_sources::observe_received(&mut received, record, receipt)
+            })
             .map_err(AuthorityError::Store)?;
         let snapshot = if replay.refusal.is_none() {
+            crate::rebuild_sources::rebuild_sources_complete(
+                index,
+                &received,
+                replay.last_sequence,
+                &[],
+                None,
+            )?;
             let marks = index.tape_projection_marks()?;
             for raise in native_floor::detect(
                 &replay.fold,

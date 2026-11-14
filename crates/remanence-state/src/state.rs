@@ -1242,13 +1242,44 @@ impl StateHandle {
                 applied,
             )
         })?;
-        let replay = lib::store::replay_observed(
+        let mut received = std::collections::BTreeMap::new();
+        let mut last_received_time = None;
+        let replay = lib::store::replay_observed_with_received(
             manifest.library_root(),
             manifest.library_uuid(),
             &view,
             &mut |_| Ok(()),
+            &mut |record, receipt| {
+                last_received_time = Some(record.envelope.timestamp_unix_ns);
+                crate::rebuild_sources::observe_received(&mut received, record, receipt)
+            },
         )
         .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        if let Some(refusal) = &replay.refusal {
+            let mut message =
+                format!("projection contradiction: typed rebuild source refused: {refusal:?}");
+            if let Some(hint) = crate::ambiguity_recovery::startup_hint(paths) {
+                message.push(' ');
+                message.push_str(&hint);
+            }
+            return Err(StateError::JournalReplayFailed(message));
+        }
+        let no_witness = crate::rebuild_sources::rebuild_sources_complete(
+            index,
+            &received,
+            replay.last_sequence,
+            view.dropped_logs(),
+            Some(paths),
+        )?;
+        let standing_note = if no_witness {
+            let time = last_received_time
+                .map(crate::rebuild_sources::record_time)
+                .transpose()?
+                .unwrap_or_else(|| "no records".into());
+            Some(format!("tape standing (withdrawals, fences, pools) is as of library record {} ({time}); there was no catalog to compare, so nothing on this host shows that this library log is the newest copy", replay.last_sequence))
+        } else {
+            None
+        };
         let marks = index.tape_projection_marks()?;
         crate::library_runtime::native_floor::check_rebuild(
             &replay.fold,
@@ -1263,7 +1294,7 @@ impl StateHandle {
             .snapshots()
             .map(crate::tape_log::authority::AuthoritySnapshot::new)
             .collect::<Result<Vec<_>, _>>()?;
-        let report = index
+        let mut report = index
             .rebuild_typed_sources(
                 |applied| {
                     lib::store::replay_observed(
@@ -1276,6 +1307,7 @@ impl StateHandle {
                 &natives,
             )
             .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+        report.standing_note = standing_note;
         calibration.record_all_maps_evicted("projection_rebuild")?;
         Ok(report)
     }

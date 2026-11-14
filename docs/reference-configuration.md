@@ -588,8 +588,10 @@ with them, together with the configuration. The catalog is rebuilt from the two
 logs. The tape-log, library-log, catalog and state-directory paths are configured
 independently, so check that a backup of "the state directory" includes each.
 
-Restore both logs, both authority files and the configuration together, each
-from its newest copy, to the configured paths. An older copy knows nothing
+Restore the whole state together from a matching backup: both logs, the
+catalog, both authority files and the configuration, at their configured paths.
+Moving the catalog aside before a rebuild removes the only witness that the
+library log may be older than the catalog. An older copy knows nothing
 decided after it: a tape withdrawn or fenced since then is not withdrawn or
 fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,

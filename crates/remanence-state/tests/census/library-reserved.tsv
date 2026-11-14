@@ -114,3 +114,4 @@ crates/remanence-cli/src/lib.rs::rem_only_reason::LibraryLog	1
 crates/remanence-cli/src/lib.rs::run_offline_catalog_for_test::LibraryLog	1
 crates/remanence-cli/src/lib.rs::run_with_mode::LibraryLog	3
 crates/remanence-cli/src/lib.rs::state_changing_target::LibraryLog	1
+crates/remanence-state/src/rebuild_sources.rs::<module>::library_log	1

@@ -196,6 +196,7 @@ impl CatalogCore {
         native_records: u64,
     ) -> Result<RebuildReport, StateError> {
         Ok(RebuildReport {
+            standing_note: None,
             tapes_rebuilt: table_count(&self.conn, "tapes")?,
             tape_files_rebuilt: table_count(&self.conn, "tape_files")?,
             object_instances_rebuilt: table_count(&self.conn, "object_instances")?,
@@ -295,6 +296,7 @@ impl CatalogCore {
         }
         tx.execute("update object_instances set status = 'missing' where tape_uuid in (select tape_uuid from tapes where state = 'retired')", []).map_err(|e| sqlite_error("rebuild retired copies", e))?;
         let report = RebuildReport {
+            standing_note: None,
             tapes_rebuilt: snapshots.len() as u64,
             tape_files_rebuilt: table_count(&tx, "tape_files")?,
             object_instances_rebuilt: table_count(&tx, "object_instances")?,

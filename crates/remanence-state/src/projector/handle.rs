@@ -1227,6 +1227,12 @@ impl CatalogIndex {
     ) -> Result<RebuildReport, StateError> {
         self.with_core(|core| core.rebuild_tape_log_projection(audit, snapshots))
     }
+    /// Read the existing library witnesses before any rebuild clears the projection.
+    pub(crate) fn library_catalog_evidence(
+        &self,
+    ) -> Result<super::apply::LibraryCatalogEvidence, StateError> {
+        self.with_core(|core| core.library_catalog_evidence())
+    }
     /// Full typed replacement retains its single writer lease and rollback scope.
     pub(crate) fn rebuild_typed_sources(
         &mut self,

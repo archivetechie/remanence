@@ -382,6 +382,11 @@ records from backup. The tape logs live under `journal.dir`; the library log's
 `*.remlib` segments live in `audit.dir`. The rebuild keeps an older word for
 the tape logs in its command name.
 
+If the library log is older than the catalog, for example after restoring an
+older copy, rebuild refuses and lists what it would forget. Put back the
+library log the catalog was built from; if that log no longer exists, keep the
+state directory and catalog as they are.
+
 The library log (`audit.dir`) and the tape logs (`journal.dir`) are the records
 that cannot be rebuilt. Both grow only at the end. Copy them to another machine
 often, a minute or two apart on a working archive, and keep dated generations.

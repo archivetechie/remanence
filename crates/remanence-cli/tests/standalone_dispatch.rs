@@ -4101,8 +4101,12 @@ fn cli_projection_rebuild_does_not_create_an_audit_segment() {
         "--config",
         f.config().to_str().unwrap(),
     ]);
-    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(err.contains("RebuildWouldDropLibraryRecords"), "{err}");
+    assert_eq!(code, ExitCode::from(1), "{err}");
     assert_eq!(authority_hashes(&config), before);
+    assert_eq!(std::fs::read_dir(&config.audit.dir).unwrap().count(), 0);
+    k94_sql_loss(&f);
+    k94_success(&f);
     assert_eq!(std::fs::read_dir(&config.audit.dir).unwrap().count(), 0);
 }
 
@@ -5578,4 +5582,754 @@ fn l1b_standalone_scan_rescues_absent_log_but_not_contradiction() {
     let records = l1b_refusals(&f);
     assert_eq!(records.len(), blocked.len() + 1);
     l1b_assert_refusal(records.last().unwrap(), id, 2);
+}
+
+// Rebuild completeness regressions use the real standalone dispatcher and logs.
+type K94Files = std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>;
+fn k94_config(f: &VersionFixture) -> remanence_state::RemConfig {
+    remanence_state::load_config(f.config()).unwrap()
+}
+fn k94_segments(f: &VersionFixture) -> K94Files {
+    std::fs::read_dir(k94_config(f).audit.dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "remlib"))
+        .map(|p| {
+            let b = std::fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect()
+}
+fn k94_restore(f: &VersionFixture, files: &K94Files) {
+    for p in k94_segments(f).keys() {
+        std::fs::remove_file(p).unwrap();
+    }
+    for (p, b) in files {
+        std::fs::write(p, b).unwrap();
+    }
+}
+fn k94_rows(f: &VersionFixture) -> Vec<Vec<rusqlite::types::Value>> {
+    let config = k94_config(f);
+    if !config.index.sqlite_path.exists() {
+        return Vec::new();
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        config.index.sqlite_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut stmt=conn.prepare("select sequence,record_uuid,source_digest,tag,source_bytes from library_projection_records order by sequence").unwrap();
+    let rows = stmt
+        .query_map([], |r| (0..5).map(|i| r.get(i)).collect())
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+fn k94_hashes(f: &VersionFixture) -> K94Files {
+    authority_hashes(&k94_config(f))
+        .into_iter()
+        .filter(|(p, _)| {
+            p.file_name().is_none_or(|n| n != "state.lock")
+                && p.extension().is_none_or(|e| e != "lock")
+        })
+        .collect()
+}
+fn k94_sql_loss(f: &VersionFixture) {
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            k94_config(f).index.sqlite_path.display()
+        ));
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+fn k94_rebuild(f: &VersionFixture) -> (ExitCode, String, String) {
+    offline_catalog_cli(&[
+        "rem",
+        "rebuild-catalog-from-journals",
+        "--config",
+        f.config().to_str().unwrap(),
+    ])
+}
+fn k94_refused(f: &VersionFixture, code: &str) -> String {
+    let rows = k94_rows(f);
+    let logs = k94_hashes(f);
+    let (status, _, err) = k94_rebuild(f);
+    assert!(err.contains(code), "expected {code}: {status:?}: {err}");
+    assert_eq!(status, ExitCode::from(1), "{err}");
+    assert_eq!(k94_rows(f), rows, "refusal changed catalog library rows");
+    assert_eq!(k94_hashes(f), logs, "refusal changed authority bytes");
+    err
+}
+fn k94_success(f: &VersionFixture) -> String {
+    let logs = k94_hashes(f);
+    let (code, out, err) = k94_rebuild(f);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(k94_hashes(f), logs);
+    out
+}
+fn k94_id(f: &VersionFixture) -> [u8; 16] {
+    f.index()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap()
+        .tape_uuid
+        .try_into()
+        .unwrap()
+}
+/// As in cli_projection_rebuild_hashes_logs_audit_and_ambiguity_markers_without_reset,
+/// put a file before taking a native-log copy: standalone init can leave it logless.
+fn k94_with_file() -> VersionFixture {
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("before-copy.txt");
+    std::fs::write(&source, b"recorded before the log copy").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    f
+}
+fn k94_tape_path(f: &VersionFixture) -> std::path::PathBuf {
+    k94_config(f).journal.dir.join("tapes").join(format!(
+        "{}.remtape",
+        uuid::Uuid::from_bytes(k94_id(f)).simple()
+    ))
+}
+fn k94_diagnostic() -> remanence_state::library_log::Diagnostic {
+    use remanence_state::library_log as lib;
+    lib::Diagnostic {
+        event: lib::DiagnosticEvent::RecoveryEvent,
+        subject_kind: "rebuild-test".into(),
+        subject_id: None,
+        detail: lib::Bounded(vec![]),
+    }
+}
+fn k94_append_diagnostic(f: &VersionFixture) {
+    use remanence_state::library_log as lib;
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    state
+        .library_runtime()
+        .append(|a, v| {
+            a.diagnostic(
+                k94_diagnostic(),
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+}
+fn k94_fence(f: &VersionFixture) {
+    let id = k94_id(f);
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    l1b_raise(
+        &state,
+        id,
+        remanence_state::library_log::FenceCause::PartialBatch,
+    );
+}
+/// Probe H's standing changes, with the fence before retirement (a retired identity refuses a new fence).
+fn k94_lost_standing(f: &VersionFixture) -> ([u8; 16], K94Files) {
+    let old = k94_segments(f);
+    let id = k94_id(f);
+    {
+        let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+        l1b_raise(
+            &state,
+            id,
+            remanence_state::library_log::FenceCause::PartialBatch,
+        );
+        state
+            .retire_tape(remanence_state::RetireTapeInput {
+                tape_uuid: id,
+                reason: "withdrawn as damaged".into(),
+            })
+            .unwrap();
+    }
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    let current = k94_segments(f);
+    k94_restore(f, &old);
+    (id, current)
+}
+/// Decode stored source envelopes independently to pin each refusal's sequence and UTC time.
+fn k94_standing_line(
+    f: &VersionFixture,
+    kind: remanence_state::library_log::Tag,
+    id: [u8; 16],
+    reason: &str,
+) -> String {
+    use rusqlite::types::Value;
+    for row in k94_rows(f) {
+        if row[3] != Value::Integer(kind as i64) {
+            continue;
+        }
+        let (Value::Blob(sequence), Value::Blob(bytes)) = (&row[0], &row[4]) else {
+            panic!("source row");
+        };
+        let sequence = u64::from_be_bytes(sequence.as_slice().try_into().unwrap());
+        let mut decoder =
+            remanence_state::library_log::codec::Decoder::at(bytes.as_slice(), sequence, 0);
+        let frame = decoder.next_frame().unwrap().unwrap();
+        let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+            frame.record.envelope.timestamp_unix_ns,
+        ))
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+        return format!(
+            "  record {sequence} {kind:?} tape {} at {at}: {reason}",
+            uuid::Uuid::from_bytes(id)
+        );
+    }
+    panic!("missing {kind:?}")
+}
+#[test]
+fn k94_t1_t10_older_library_standing_and_restore_exit() {
+    use remanence_state::library_log::Tag;
+    let f = VersionFixture::with_parity(false);
+    let (id, current) = k94_lost_standing(&f);
+    let expected = [Tag::FenceRaised, Tag::Retire]
+        .map(|tag| k94_standing_line(&f, tag, id, "not in the library log"));
+    let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    for line in expected {
+        assert!(err.contains(&line), "{err}");
+    }
+    assert!(
+        err.contains("Put back the library log this catalog was built from and run again."),
+        "{err}"
+    );
+    assert!(
+        err.contains("The declared reset is the only way to run sooner, and it erases them."),
+        "{err}"
+    );
+    let source = f.root.path().join("new.txt");
+    std::fs::write(&source, b"new after refusal").unwrap();
+    let writes = f.writes();
+    let (status, _, _) = f.run(&["put", source.to_str().unwrap()], false);
+    assert_ne!(status, ExitCode::SUCCESS);
+    assert_eq!(f.writes(), writes);
+    k94_restore(&f, &current);
+    k94_success(&f);
+}
+#[test]
+fn k94_t2_same_length_different_record() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_fence(&f);
+    let rows = k94_rows(&f);
+    let sequence = rows.len();
+    k94_restore(&f, &old);
+    f.ok(&["pool", "new", "different", "--scheme", "none"]);
+    // Probe M: the next normal open appends the changed configuration before projection refuses it.
+    assert!(remanence_state::StateHandle::open_from_config_file(f.config()).is_err());
+    let inspected = remanence_state::ambiguity_recovery::inspect(f.config()).unwrap();
+    assert_eq!(
+        inspected["library_replay"]["last_sequence"].as_u64(),
+        Some(sequence as u64)
+    );
+    let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    assert!(
+        err.contains(&format!("differs from the library log's record {sequence}")),
+        "{err}"
+    );
+}
+#[test]
+fn k94_t3_ordinary_configuration_day() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    for name in ["day-one", "day-two"] {
+        f.ok(&["pool", "new", name, "--scheme", "none"]);
+        drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    }
+    k94_restore(&f, &old);
+    let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    assert!(
+        err.contains("  and 2 ConfigurationAccepted records"),
+        "{err}"
+    );
+    assert!(!err.lines().any(|l| l.starts_with("  record ")), "{err}");
+}
+#[test]
+fn k94_t4_diagnostic_exemption_and_next_append() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_append_diagnostic(&f);
+    k94_restore(&f, &old);
+    k94_success(&f);
+    let n = k94_rows(&f).len();
+    k94_append_diagnostic(&f);
+    assert_eq!(k94_rows(&f).len(), n + 1);
+}
+#[test]
+fn k94_t4b_diagnostic_then_fence() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_append_diagnostic(&f);
+    k94_fence(&f);
+    k94_restore(&f, &old);
+    let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    assert!(err.contains(" FenceRaised tape "), "{err}");
+    assert!(!err.contains("Diagnostic"), "{err}");
+}
+#[test]
+fn k94_t4c_fence_only() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_fence(&f);
+    k94_restore(&f, &old);
+    let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    assert!(err.contains(" FenceRaised tape "), "{err}");
+}
+#[test]
+fn k94_t5_empty_library_log() {
+    let f = VersionFixture::with_parity(false);
+    k94_restore(&f, &K94Files::new());
+    k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    assert!(k94_segments(&f).is_empty());
+}
+#[test]
+fn k94_t6a_intact_twice() {
+    let f = VersionFixture::with_parity(false);
+    let rows = k94_rows(&f);
+    for _ in 0..2 {
+        assert!(!k94_success(&f).contains("  note:"));
+        assert_eq!(k94_rows(&f), rows);
+    }
+}
+#[test]
+fn k94_t6b_catalog_behind() {
+    let f = VersionFixture::with_parity(false);
+    let path = k94_config(&f).index.sqlite_path;
+    let old = std::fs::read(&path).unwrap();
+    k94_fence(&f);
+    let expected = k94_rows(&f);
+    std::fs::write(&path, old).unwrap();
+    k94_success(&f);
+    assert_eq!(k94_rows(&f), expected);
+}
+#[test]
+fn k94_t6c_no_witness_note() {
+    for empty in [false, true] {
+        let f = VersionFixture::with_parity(false);
+        let records = if empty {
+            k94_restore(&f, &K94Files::new());
+            0
+        } else {
+            k94_rows(&f).len()
+        };
+        let expected_time = if empty {
+            "no records".to_owned()
+        } else {
+            let rows = k94_rows(&f);
+            let rusqlite::types::Value::Blob(bytes) = &rows.last().unwrap()[4] else {
+                panic!("source bytes");
+            };
+            let mut decoder = remanence_state::library_log::codec::Decoder::at(
+                bytes.as_slice(),
+                records as u64,
+                0,
+            );
+            let frame = decoder.next_frame().unwrap().unwrap();
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+                frame.record.envelope.timestamp_unix_ns,
+            ))
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+        };
+        k94_sql_loss(&f);
+        let out = k94_success(&f);
+        assert!(out.lines().any(|line| line == format!("  note: tape standing (withdrawals, fences, pools) is as of library record {records} ({expected_time}); there was no catalog to compare, so nothing on this host shows that this library log is the newest copy")), "{out}");
+        assert!(out.contains(&format!("  note: tape standing (withdrawals, fences, pools) is as of library record {records} (")),"{out}");
+        assert!(out.contains("there was no catalog to compare, so nothing on this host shows that this library log is the newest copy"),"{out}");
+        if empty {
+            assert!(out.contains("(no records)"), "{out}");
+        }
+        assert!(out.find("  tape logs:").unwrap() < out.find("  note:").unwrap());
+    }
+}
+fn k94_recover(f: &VersionFixture) {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem-debug"))
+        .env("REM_TEST_NO_LIVE_SCSI", "1")
+        .args([
+            "library-log",
+            "recover",
+            "--config",
+            f.config().to_str().unwrap(),
+            "--confirm-clear-ambiguity",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+#[test]
+fn k94_t6d_after_recovery() {
+    let f = VersionFixture::with_parity(false);
+    std::fs::write(k94_config(&f).audit.dir.join("library-log.ambiguous"), b"").unwrap();
+    k94_recover(&f);
+    let rows = k94_rows(&f);
+    k94_success(&f);
+    assert_eq!(k94_rows(&f), rows);
+}
+#[test]
+fn k94_t6e_received_excluded_verdict() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::library_log as lib;
+    let f = k94_with_file();
+    let id = k94_id(&f);
+    let path = k94_tape_path(&f);
+    let prefix = std::fs::read(&path).unwrap();
+    let source = f.root.path().join("verdict.txt");
+    std::fs::write(&source, b"longer tape log").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    {
+        let config = k94_config(&f);
+        let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+        let authority = remanence_state::TapeAuthority::open(
+            config.journal.dir.join("tapes"),
+            id,
+            &config.index.sqlite_path,
+        )
+        .unwrap();
+        let snapshot = authority.freeze().unwrap();
+        let at = state.library_runtime().native_reference(&snapshot).unwrap();
+        state
+            .library_runtime()
+            .record_verification_verdict(
+                *uuid::Uuid::new_v4().as_bytes(),
+                id,
+                remanence_state::library_runtime::VerdictFacts {
+                    native_reference: Some(at),
+                    outcome: lib::VerificationOutcome::VerifiedComplete,
+                    unprotected: None,
+                    modes: 0x7f,
+                    edition_digest: Some([0x61; 32]),
+                },
+                lib::AuditActor::System,
+            )
+            .unwrap();
+    }
+    std::fs::write(path, prefix).unwrap();
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    assert!(!f.index().list_active_tape_io_fences().unwrap().is_empty());
+    assert!(k94_rows(&f)
+        .iter()
+        .any(|r| r[3] == rusqlite::types::Value::Integer(lib::Tag::VerificationVerdict as i64)));
+    k94_success(&f);
+}
+#[test]
+fn k94_t6f_only_standalone_puts() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    let rows = k94_rows(&f);
+    let source = f.root.path().join("ordinary.txt");
+    std::fs::write(&source, b"ordinary write").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    assert_eq!(k94_rows(&f), rows);
+    k94_restore(&f, &old);
+    k94_success(&f);
+}
+#[test]
+fn k94_t7_received_without_row() {
+    for table in [
+        "projection_sources",
+        "library_projection_progress",
+        "library_fold_progress",
+    ] {
+        let f = VersionFixture::with_parity(false);
+        let end = k94_rows(&f).len() as u64;
+        // No producer deliberately loses a row. Plant the stored position; normal open's
+        // keep-newer branch is the production route that can preserve this evidence.
+        let conn = rusqlite::Connection::open(k94_config(&f).index.sqlite_path).unwrap();
+        let where_clause = if table == "projection_sources" {
+            " where source='library'"
+        } else {
+            ""
+        };
+        conn.execute(
+            &format!("update {table} set received=?1{where_clause}"),
+            [(end + 2).to_be_bytes().as_slice()],
+        )
+        .unwrap();
+        drop(conn);
+        let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+        assert!(
+            err.contains("  and 2 records received by the catalog with no catalog row"),
+            "{err}"
+        );
+    }
+}
+#[test]
+fn k94_t8_t10_header_restore_exit() {
+    let f = k94_with_file();
+    let path = k94_tape_path(&f);
+    let id = k94_id(&f);
+    let good = std::fs::read(&path).unwrap();
+    let mut bad = good.clone();
+    bad[0] ^= 1;
+    std::fs::write(&path, bad).unwrap();
+    k94_sql_loss(&f);
+    let err = k94_refused(&f, "RebuildWouldDropTapeLog");
+    assert!(
+        err.contains(&format!(
+            "tape {} log {}:",
+            uuid::Uuid::from_bytes(id),
+            path.display()
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "restore that tape log from a copy and run again, or keep the state directory as it is"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("retire"), "{err}");
+    std::fs::write(path, good).unwrap();
+    k94_success(&f);
+}
+#[test]
+fn k94_t8_middle_frame_crc() {
+    let f = k94_with_file();
+    let path = k94_tape_path(&f);
+    let prefix_len = std::fs::metadata(&path).unwrap().len() as usize;
+    let source = f.root.path().join("crc.txt");
+    std::fs::write(&source, b"closed frames after init").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.len() > prefix_len + 40);
+    // First frame added by the completed put is followed by more closed frames.
+    bytes[prefix_len + 20] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    k94_sql_loss(&f);
+    k94_refused(&f, "RebuildWouldDropTapeLog");
+}
+#[test]
+fn k94_t8_t10_marker_recovery_exit() {
+    let f = k94_with_file();
+    let path = k94_tape_path(&f);
+    let marker = path.with_extension("ambiguous");
+    let id = k94_id(&f);
+    std::fs::remove_file(path).unwrap();
+    std::fs::write(&marker, b"").unwrap();
+    k94_sql_loss(&f);
+    let err = k94_refused(&f, "RebuildWouldDropTapeLog");
+    assert!(
+        err.contains(&format!(
+            "tape {} has only an ambiguity marker {}",
+            uuid::Uuid::from_bytes(id),
+            marker.display()
+        )),
+        "{err}"
+    );
+    let config = k94_config(&f);
+    let paths = remanence_state::StatePaths::from_config(f.config(), &config);
+    let hint = remanence_state::ambiguity_recovery::startup_hint(&paths).unwrap();
+    assert!(err.trim_end().ends_with(&hint), "{err}");
+    k94_recover(&f);
+    k94_success(&f);
+}
+#[test]
+fn k94_t9_both_clauses() {
+    let f = k94_with_file();
+    let path = k94_tape_path(&f);
+    let old = k94_segments(&f);
+    k94_fence(&f);
+    k94_restore(&f, &old);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    let err = k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    assert!(err.contains("RebuildWouldDropTapeLog"), "{err}");
+}
+/// Rotate using the older-segment damage precedent in native_ambiguity_tests.
+#[test]
+fn k94_t12_damaged_library_precedes_comparison() {
+    use remanence_state::library_log::{
+        self as lib,
+        store::{Clock, Origin, UuidSource},
+    };
+    struct Later;
+    impl Clock for Later {
+        fn now(&self) -> u64 {
+            2_000_000_000_000_000_000
+        }
+    }
+    impl UuidSource for Later {
+        fn next(&self, _: u64) -> [u8; 16] {
+            *uuid::Uuid::new_v4().as_bytes()
+        }
+    }
+    let f = VersionFixture::with_parity(false);
+    let config = k94_config(&f);
+    let old = k94_segments(&f).keys().next().unwrap().clone();
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let id = state.library_runtime().manifest().library_uuid();
+    drop(state);
+    {
+        let view = lib::native_view::NativeTapeView::probe(
+            &config.journal.dir.join("tapes"),
+            &config.index.sqlite_path,
+        )
+        .unwrap();
+        let lease = std::sync::Arc::new(
+            remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap(),
+        );
+        let a = lib::authority::LibraryAuthority::open(
+            &config.audit.dir,
+            id,
+            Origin {
+                host: "test".into(),
+                pid: 1,
+                build: "test".into(),
+            },
+            Box::new(Later),
+            Box::new(Later),
+            true,
+            &view,
+            lease,
+        )
+        .unwrap();
+        a.diagnostic(
+            k94_diagnostic(),
+            lib::AuditActor::System,
+            lib::SourceLayer::Layer4,
+            &view,
+        )
+        .unwrap();
+    }
+    assert_eq!(k94_segments(&f).len(), 2);
+    let mut bytes = std::fs::read(&old).unwrap();
+    bytes[90] ^= 1;
+    std::fs::write(old, bytes).unwrap();
+    let rows = k94_rows(&f);
+    let logs = k94_hashes(&f);
+    let (code, _, err) = k94_rebuild(&f);
+    assert_eq!(code, ExitCode::from(1));
+    assert!(!err.contains("RebuildWouldDropLibraryRecords"), "{err}");
+    assert!(err.contains("LibraryLogRepairDeferred"), "{err}");
+    assert!(
+        err.contains("projection contradiction: typed rebuild source refused:"),
+        "{err}"
+    );
+    assert_eq!(k94_rows(&f), rows);
+    assert_eq!(k94_hashes(&f), logs);
+}
+
+impl VersionFixture {
+    fn k94_daemon_open(
+        &self,
+        mode: remanence_state::AppendStagingMode,
+    ) -> Result<(remanence_state::StateHandle, remanence_api::ApiState), String> {
+        let f = self;
+        let handle = remanence_state::StateHandle::open_from_config_file(f.config())
+            .map_err(|e| e.to_string())?;
+        let mut config = handle.config().clone();
+        // The daemon owns a real changer slot for mount and shutdown dismount.
+        {
+            let mut world = f.world.lock().unwrap();
+            let tape = world.tapes.remove("FIRST").unwrap();
+            *world = remanence_chaos::model::VirtualWorld::single_drive(
+                "UNEXPOSED",
+                0x100,
+                "HOME-DRIVE",
+                0x400,
+                1,
+            );
+            world.put_tape_in_drive(0x100, "FIRST", Some(0x400), tape);
+        }
+        let library = f.world.lock().unwrap().library_snapshot();
+        config.libraries = vec![remanence_state::LibraryConfig {
+            serial: library.serial.clone(),
+            allow_derived_drive_identity: false,
+        }];
+        config.standalone_drives.clear();
+        config.daemon.append_staging_mode = mode;
+        config.daemon.append_ring_bytes = 1024 * 1024;
+        config.daemon.drive_idle_unload_seconds = 0;
+        let spool = f.root.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let world = f.world.clone();
+        let state = remanence_api::ApiState::with_drive_pool_opener(
+            handle.projection_client(),
+            &config,
+            remanence_library::DiscoveryReport {
+                libraries: vec![library.clone()],
+                unattached_drives: vec![],
+                warnings: vec![],
+                complete: true,
+                incomplete_evidence: vec![],
+            },
+            remanence_library::StaticAllowlist::new([library.serial.as_str()]),
+            spool,
+            16 * 1024 * 1024,
+            move |library, policy| {
+                let world = world.clone();
+                library.open_with(policy, move |path| {
+                    let role = world
+                        .lock()
+                        .unwrap()
+                        .role_for_path(path)
+                        .expect("model device");
+                    Ok(Box::new(remanence_chaos::model::ModelTransport::new(
+                        world.clone(),
+                        role,
+                    )))
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((handle, state))
+    }
+}
+
+/// The daemon fixture replaces its virtual world, so media writes are counted from zero.
+fn k94_daemon_refuses(rebuild: bool) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let f = VersionFixture::with_parity(false);
+    k94_lost_standing(&f);
+    if rebuild {
+        k94_refused(&f, "RebuildWouldDropLibraryRecords");
+    }
+    let rows = k94_rows(&f);
+    let tape_hashes: K94Files = k94_hashes(&f)
+        .into_iter()
+        .filter(|(p, _)| p.starts_with(&k94_config(&f).journal.dir))
+        .collect();
+    let opened = f.k94_daemon_open(remanence_state::AppendStagingMode::Serial);
+    let error = match opened {
+        Err(e) => e,
+        Ok((_, state)) => {
+            state.begin_shutdown();
+            panic!("daemon open unexpectedly succeeded");
+        }
+    };
+    assert!(
+        error.contains("projection contradiction: library sequence"),
+        "{error}"
+    );
+    assert_eq!(f.writes(), 0);
+    assert_eq!(k94_rows(&f), rows);
+    let after: K94Files = k94_hashes(&f)
+        .into_iter()
+        .filter(|(p, _)| p.starts_with(&k94_config(&f).journal.dir))
+        .collect();
+    assert_eq!(after, tape_hashes); // The one attempted library append is explicitly exempt.
+}
+#[test]
+fn k94_t11_no_rebuild_daemon_refuses() {
+    k94_daemon_refuses(false);
+}
+#[test]
+fn k94_t11_after_refused_rebuild_daemon_refuses() {
+    k94_daemon_refuses(true);
 }
