@@ -1329,11 +1329,19 @@ different from, what the catalog recorded also refuses forced release, until the
 exact log is restored or the catalog is rebuilt. Retiring a tape whose log is
 absent or shorter than the catalog's record is refused until the catalog is
 rebuilt: rebuild first (`rem rebuild-catalog-from-journals`, with the daemon
-stopped), then retire. This release form uses the home configuration on a
-standalone host without `/etc/rem/config.toml`. Without a daemon listening on
-the selected configuration's socket, the bare `--ack` form is not a release
-route for these tape fences; with one listening, it hands the release to the
-daemon, which treats it as the release form without `--force`. See
+stopped), then retire. If the rebuild refuses with
+`RebuildWouldDropMarkEvidence:`, no fence records the catalog's mark yet: open
+the state once (start and stop the daemon; on a standalone host, run
+`rem tape quarantine list`), then rebuild. This release form uses the home
+configuration on a standalone host without `/etc/rem/config.toml`.
+`rem rebuild-catalog-from-journals` and `rem tape retire` do not use the home
+configuration: on a standalone host without `/etc/rem/config.toml`, pass them
+`--config` with its path. On a home host, or with `--device`, the bare `--ack`
+form is standalone release: with no daemon listening on the selected
+configuration's socket it is not a release route for these tape fences, and with
+one listening it hands the release to the daemon, which treats it as the release
+form without `--force`. Otherwise it is refused with
+`tape quarantine release requires --after-settled-inventory`. See
 [standalone routing](#rem-tape-quarantine-standalone).
 
 Stop the daemon before releasing a media-readiness fence. To release one after checking the drive and the slot inventory:

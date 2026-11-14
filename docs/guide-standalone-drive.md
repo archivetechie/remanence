@@ -409,7 +409,13 @@ different from, what the catalog recorded also refuses forced release, until the
 exact log is restored or the catalog is rebuilt. Retiring a tape whose log is
 absent or shorter than the catalog's record is refused until the catalog is
 rebuilt: rebuild first (`rem rebuild-catalog-from-journals`, with the daemon
-stopped), then retire.
+stopped), then retire. If the rebuild refuses with
+`RebuildWouldDropMarkEvidence:`, no fence records the catalog's mark yet: open
+the state once (start and stop the daemon; on a standalone host, run
+`rem tape quarantine list`), then rebuild. `rem rebuild-catalog-from-journals`
+and `rem tape retire` read `/etc/rem/config.toml` unless given `--config`; on a
+home host pass
+`--config "${XDG_STATE_HOME:-$HOME/.local/state}/rem/config.toml"`.
 `--after-settled-inventory` selects the library form,
 which uses your home configuration when `/etc/rem/config.toml` is absent. With
 no daemon socket answering, it runs offline under the state lock.
