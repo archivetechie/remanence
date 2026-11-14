@@ -2688,7 +2688,7 @@ log is older or contains different records. The refusal lists each affected
 record that changes tape standing, with its tape and time, and counts the other
 kinds. Put back the library log this catalog was built from and run again. If
 that log no longer exists, keep the state directory and catalog as they are:
-they hold the only copy of those records, and this release cannot write them
+they hold the only copy of those records, and the rebuild cannot write them
 back. The declared reset is the only way to run sooner, and it erases them.
 There is no override. Moving the catalog aside removes this comparison witness.
 
