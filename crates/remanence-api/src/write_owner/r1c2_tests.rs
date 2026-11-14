@@ -1605,3 +1605,356 @@ fn readiness_owner_shutdown_keeps_initializing_load_budget_spent() {
         "the startup probe is durable"
     );
 }
+
+// WBR-K16-FX1: refusal before the drive LOAD's admission must leave no readiness chain.
+
+/// Exercise a refused waited load through the typed owner and persist its Failed outcome.
+fn fx1_refused_waited_load(
+    root: &Root,
+    state: &remanence_state::StateHandle,
+    library: &mut remanence_library::LibraryHandle,
+    observe_drive: bool,
+) -> Uuid {
+    let mut index = state.write_handle();
+    if observe_drive {
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut index,
+            [library.library()],
+            &HashSet::from([SERIAL.to_string()]),
+        )
+        .unwrap();
+    }
+    let mut cfg = test_write_owner_config(
+        root.paths.sqlite_path.clone(),
+        root.paths.audit_dir.clone(),
+        library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.catalog = state.projection_client();
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
+    let api = crate::ApiState::new(state.projection_client());
+    let operation = api
+        .accept_owner_request(
+            AuditActor::User("loader".into()),
+            "load_drive",
+            "library",
+            SERIAL.into(),
+            [0x36; 32],
+        )
+        .unwrap();
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation, "load_drive");
+    cfg.configure_operation_library(library, &handle);
+    let result =
+        super::robotics::run_load_sequence(&mut index, &cfg, &handle, library, 0x400, BAY_A, true);
+    assert!(result.is_err(), "the fixture must refuse the waited load");
+    super::robotics::finish_library_operation(&mut index, &cfg, &handle, SERIAL, result, Ok(()));
+    assert_eq!(
+        registry.latest(&operation).unwrap().state,
+        pb::OperationState::Failed as i32
+    );
+    assert_eq!(
+        index
+            .get_operation(&operation.to_string())
+            .unwrap()
+            .unwrap()
+            .state,
+        "failed"
+    );
+    operation
+}
+
+/// T2: an empty-slot refusal leaves nothing for startup to quarantine.
+#[test]
+fn fx1_waited_empty_slot_leaves_no_readiness_row_across_restart() {
+    let root = root();
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        SERIAL, BAY_A, "DRV-R1C2", 0x400, 1,
+    )));
+    {
+        let state = root.open();
+        let mut library = open_model_library(world.clone());
+        fx1_refused_waited_load(&root, &state, &mut library, true);
+        no_active_readiness_rows(&state);
+    }
+    let (state, api, runtime) = start_daemon(&root, &world, plain)
+        .unwrap_or_else(|status| panic!("restart refused: {}", status.message()));
+    no_active_readiness_rows(&state);
+    runtime.block_on(api.shutdown_drive_pool()).unwrap();
+}
+
+/// T3: the single begin lies strictly between this operation's MOVE Done and LOAD intent.
+#[test]
+fn fx1_waited_load_begin_follows_move_done_and_precedes_load_intent() {
+    use remanence_state::library_log as lib;
+    let root = root();
+    let world = waited_world();
+    let uuid = {
+        let (state, _cfg, _library) = waited_load(&root, &world);
+        state.library_runtime().manifest().library_uuid()
+    };
+    wait_for_lifecycle_close(&root);
+    let records = crate::tests::read_library_records(&root.paths, uuid, &mut |r| Some(r.clone()))
+        .unwrap_or_else(|_| panic!("library log must be readable after owner closes"));
+    let (first, readiness) = records
+        .iter()
+        .enumerate()
+        .find_map(|(i, r)| r.readiness_observation().map(|v| (i, v)))
+        .expect("waited load has a readiness observation");
+    let operation = readiness.operation;
+    let begins: Vec<_> = records
+        .iter()
+        .filter_map(|r| r.readiness_observation())
+        .filter(|v| v.operation == operation && v.state == lib::ReadinessState::Planned)
+        .collect();
+    assert_eq!(begins.len(), 1, "exactly one readiness begin");
+    let move_id = records
+        .iter()
+        .find_map(|r| {
+            r.motion_intent()
+                .filter(|v| {
+                    v.parent_operation == Some(operation)
+                        && matches!(v.motion, lib::Motion::Move(_))
+                })
+                .map(|_| r.envelope.record_uuid)
+        })
+        .expect("owned MOVE intent");
+    let done = records
+        .iter()
+        .position(|r| {
+            r.motion_outcome().is_some_and(|v| {
+                v.intent.record_uuid == move_id && v.result == lib::MotionResult::Done
+            })
+        })
+        .expect("MOVE completed Done");
+    let load = records
+        .iter()
+        .position(|r| {
+            r.motion_intent().is_some_and(|v| {
+                v.parent_operation == Some(operation) && matches!(v.motion, lib::Motion::Load(_))
+            })
+        })
+        .expect("owned LOAD intent");
+    assert!(done < first && first < load,
+        "readiness begin must follow MOVE Done and precede LOAD intent: done={done}, begin={first}, load={load}");
+}
+
+/// Fail the actual MOVE dispatch with a definite SCSI source-empty completion.
+struct Fx1FailMove {
+    inner: ModelTransport,
+    attempts: Arc<AtomicUsize>,
+}
+impl SgTransport for Fx1FailMove {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_in(cdb, buf)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        if cdb.first() == Some(&0xa5) {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(ScsiError::CheckCondition {
+                sense: readiness_fixed_sense(5, 0x3b, 0x0e),
+                bytes_transferred: 0,
+            });
+        }
+        self.inner.execute_none(cdb)
+    }
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+/// T4: a definite failure of the MOVE CDB cannot strand a readiness begin.
+#[test]
+fn fx1_waited_move_check_condition_leaves_no_readiness_row() {
+    let root = root();
+    let world = waited_world();
+    let state = root.open();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let snapshot = world.lock().unwrap().library_snapshot();
+    let mut library = snapshot
+        .open_with(&remanence_library::StaticAllowlist::new([SERIAL]), {
+            let world = world.clone();
+            let attempts = attempts.clone();
+            move |path| {
+                let role = world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(Fx1FailMove {
+                    inner: ModelTransport::new(world.clone(), role),
+                    attempts: attempts.clone(),
+                }) as Box<dyn SgTransport>)
+            }
+        })
+        .unwrap();
+    fx1_refused_waited_load(&root, &state, &mut library, true);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "MOVE CDB attempted");
+    no_active_readiness_rows(&state);
+}
+
+/// T5: an installed drive without a device path refuses after MOVE, before the begin.
+#[test]
+fn fx1_waited_unopenable_drive_leaves_no_readiness_row_across_restart() {
+    let root = root();
+    let world = waited_world();
+    {
+        let state = root.open();
+        let mut snapshot = world.lock().unwrap().library_snapshot();
+        snapshot.drive_bays[0].installed.as_mut().unwrap().sg_path = None;
+        let mut library = snapshot
+            .open_with(&remanence_library::StaticAllowlist::new([SERIAL]), {
+                let world = world.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(ModelTransport::new(world.clone(), role)) as Box<dyn SgTransport>)
+                }
+            })
+            .unwrap();
+        fx1_refused_waited_load(&root, &state, &mut library, true);
+        assert_eq!(drive_load_commands_on(&world, BAY_A), 0, "no LOAD CDB");
+        assert_eq!(
+            world.lock().unwrap().loaded_barcode(BAY_A),
+            Some("R1C2L01L9")
+        );
+        no_active_readiness_rows(&state);
+    }
+    let (state, api, runtime) = start_daemon(&root, &world, plain)
+        .unwrap_or_else(|status| panic!("restart refused: {}", status.message()));
+    no_active_readiness_rows(&state);
+    let index = state.write_handle();
+    crate::startup_media_readiness::ensure_media_readiness_admitted(
+        &index,
+        Some(&state.library_runtime()),
+        "move_medium",
+        SERIAL,
+        None,
+        None,
+        true,
+    )
+    .unwrap();
+    runtime.block_on(api.shutdown_drive_pool()).unwrap();
+}
+
+/// T6: identity refusal at the LOAD admission leaves the moved cartridge and PartialFailure.
+#[test]
+fn fx1_waited_begin_refusal_leaves_moved_cartridge_without_readiness_row() {
+    let root = root();
+    let world = waited_world();
+    let state = root.open();
+    let mut library = open_model_library(world.clone());
+    fx1_refused_waited_load(&root, &state, &mut library, false);
+    assert!(
+        world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .any(|c| c.opcode == 0xa5),
+        "MOVE CDB completed before begin refusal"
+    );
+    assert_eq!(
+        world.lock().unwrap().loaded_barcode(BAY_A),
+        Some("R1C2L01L9")
+    );
+    assert_eq!(drive_load_commands_on(&world, BAY_A), 0, "no LOAD CDB");
+    assert_eq!(
+        library.dirty_cause(),
+        Some(remanence_library::DirtyCause::PartialFailure)
+    );
+    no_active_readiness_rows(&state);
+}
+
+/// T7 measures startup's W3 behavior with MOVE Done, an owned begin and no LOAD intent.
+#[test]
+fn fx1_measure_startup_after_move_done_and_begin_without_load_intent() {
+    let root = root();
+    let world = waited_world();
+    let operation;
+    {
+        let state = root.open();
+        let mut index = state.write_handle();
+        let mut library = open_model_library(world.clone());
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut index,
+            [library.library()],
+            &HashSet::from([SERIAL.to_string()]),
+        )
+        .unwrap();
+        let mut cfg = test_write_owner_config(
+            root.paths.sqlite_path.clone(),
+            root.paths.audit_dir.clone(),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        cfg.catalog = state.projection_client();
+        cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
+        let api = crate::ApiState::new(state.projection_client());
+        operation = api
+            .accept_owner_request(
+                AuditActor::User("loader".into()),
+                "load_drive",
+                "library",
+                SERIAL.into(),
+                [0x37; 32],
+            )
+            .unwrap();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(operation, "load_drive");
+        cfg.configure_operation_library(&mut library, &handle);
+        library
+            .with_motion_context(
+                MotionContext {
+                    parent_operation: Some(*operation.as_bytes()),
+                    ..Default::default()
+                },
+                |library| library.move_medium(0x400, BAY_A, &cfg.policy),
+            )
+            .unwrap();
+        world.lock().unwrap().leave_cartridge_unthreaded(BAY_A);
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: operation,
+                run_id: None,
+                endpoint: key(BAY_A),
+                changer_sg: Some(library.library().changer_sg.display().to_string()),
+                drive_sg: library.library().drive_bays[0]
+                    .installed
+                    .as_ref()
+                    .unwrap()
+                    .sg_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                drive_serial: Some("DRV-R1C2".into()),
+                barcode: Some("R1C2L01L9".into()),
+                source_slot: Some(0x400),
+                media_generation: None,
+                media_family: None,
+                phase: "load_drive_readiness".into(),
+                state: "planned".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        assert_eq!(drive_load_commands_on(&world, BAY_A), 0);
+    }
+    match start_daemon(&root, &world, plain) {
+        Ok((state, api, runtime)) => {
+            let row = state
+                .catalog()
+                .media_readiness_operation(operation)
+                .unwrap()
+                .unwrap();
+            println!(
+                "T7 W3 startup: LOAD CDBs={}, readiness={}",
+                drive_load_commands_on(&world, BAY_A),
+                row.state
+            );
+            runtime.block_on(api.shutdown_drive_pool()).unwrap();
+        }
+        Err(status) => println!(
+            "T7 W3 startup refused: {status}; LOAD CDBs={}",
+            drive_load_commands_on(&world, BAY_A)
+        ),
+    }
+}

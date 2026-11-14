@@ -413,37 +413,53 @@ fn run_load_sequence_owned(
     let family = session_open_media_family(observation);
 
     let operation_id = handle.op_id_uuid();
-    index
-        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-            operation_id,
-            run_id: None,
-            endpoint: remanence_state::DriveKey::new(library.library().serial.clone(), bay),
-            changer_sg: Some(library.library().changer_sg.display().to_string()),
-            drive_sg,
-            drive_serial,
-            barcode,
-            source_slot: Some(slot),
-            media_generation: observation.map(|o| o.generation.generation_number()),
-            media_family: observation.map(|o| o.generation),
-            phase: "load_drive_readiness".to_string(),
-            state: "planned".to_string(),
-            dirty_scope: Some("drive+tape".to_string()),
-            deadline_at_utc: OffsetDateTime::now_utc()
-                .checked_add(Duration::seconds(i64::from(
-                    crate::readiness_wait::DEFAULT_READY_TIMEOUT_SECONDS,
-                )))
-                .and_then(|deadline| deadline.format(&Rfc3339).ok()),
-            evidence_path: None,
-        })
-        .map_err(|error| format!("record load media-readiness operation: {error}"))?;
-    let retryable_load_completion =
-        match library.load_with_admission(slot, bay, &cfg.policy, &mut || motion.admit()) {
-            Ok(()) => None,
-            Err(error) => match retryable_readiness_from_load_error(&error, family) {
+    let endpoint = remanence_state::DriveKey::new(library.library().serial.clone(), bay);
+    let changer_sg = library.library().changer_sg.display().to_string();
+    let mut readiness_begun = false;
+    // Begin only at the drive LOAD's admission, after MOVE and drive-open can refuse.
+    let mut load_admit = || {
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                endpoint: endpoint.clone(),
+                changer_sg: Some(changer_sg.clone()),
+                drive_sg: drive_sg.clone(),
+                drive_serial: drive_serial.clone(),
+                barcode: barcode.clone(),
+                source_slot: Some(slot),
+                media_generation: observation.map(|o| o.generation.generation_number()),
+                media_family: observation.map(|o| o.generation),
+                phase: "load_drive_readiness".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: OffsetDateTime::now_utc()
+                    .checked_add(Duration::seconds(i64::from(
+                        crate::readiness_wait::DEFAULT_READY_TIMEOUT_SECONDS,
+                    )))
+                    .and_then(|deadline| deadline.format(&Rfc3339).ok()),
+                evidence_path: None,
+            })
+            .map_err(|error| format!("record load media-readiness operation: {error}"))?;
+        readiness_begun = true;
+        Ok(())
+    };
+    let retryable_load_completion = match library.load_with_admissions(
+        slot,
+        bay,
+        &cfg.policy,
+        &mut || motion.admit(),
+        &mut load_admit,
+    ) {
+        Ok(()) => None,
+        Err(error) if readiness_begun => {
+            match retryable_readiness_from_load_error(&error, family) {
                 Some(readiness) => Some(readiness),
                 None => return Err(error.to_string()),
-            },
-        };
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     if let Some(readiness) = retryable_load_completion.as_ref() {
         record_session_open_readiness_poll_transition(

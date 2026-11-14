@@ -1593,10 +1593,24 @@ impl LibraryHandle {
         policy: &dyn AccessPolicy,
         admit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), LoadError> {
+        self.load_with_admissions(slot, bay, policy, admit, &mut || Ok(()))
+    }
+
+    /// Complete MOVE then LOAD, admitting each at its own dispatch boundary.
+    /// The LOAD admission runs after the drive opens and before its motion intent,
+    /// so a caller can begin readiness without stranding it on an earlier refusal.
+    pub fn load_with_admissions(
+        &mut self,
+        slot: u16,
+        bay: u16,
+        policy: &dyn AccessPolicy,
+        move_admit: &mut dyn FnMut() -> Result<(), String>,
+        load_admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), LoadError> {
         let op = AuditOp::Load { slot, bay };
         // Phase 1: changer MOVE
         self.changer
-            .move_medium_as_with_admission(slot, bay, policy, op, admit)
+            .move_medium_as_with_admission(slot, bay, policy, op, move_admit)
             .map_err(LoadError::Move)?;
         // MOVE succeeded — snapshot patched (cartridge in bay). If
         // anything below fails, mark the snapshot dirty. Two
@@ -1612,7 +1626,7 @@ impl LibraryHandle {
         let mut compensated = false;
         let result = match self.open_drive(bay, policy) {
             Ok(mut drive) => {
-                let result = drive.load_as(op);
+                let result = drive.load_as(op, load_admit);
                 if result.is_ok() {
                     let pending = drive.take_pending_motion();
                     if !pending.is_empty() {
@@ -2675,13 +2689,12 @@ impl DriveHandle {
     /// Internal: same as [`Self::load`] but lets composed
     /// `LibraryHandle::load` tag the audit events with the outer op
     /// context (`AuditOp::Load { slot, bay }`).
-    pub(crate) fn load_as(&mut self, op: AuditOp) -> Result<(), DriveOpError> {
-        self.issue_load_unload(
-            /* load */ true,
-            /* immed */ false,
-            op,
-            &mut || Ok(()),
-        )
+    pub(crate) fn load_as(
+        &mut self,
+        op: AuditOp,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), DriveOpError> {
+        self.issue_load_unload(/* load */ true, /* immed */ false, op, admit)
     }
 
     fn issue_load_unload(
