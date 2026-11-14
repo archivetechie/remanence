@@ -8,7 +8,7 @@ them, and each builds on the ones before it. The [glossary](reference-glossary.m
 short entry for every term, and the [architecture overview](architecture-overview.md) is the
 next step for a reader who wants the design in detail.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/projector/apply.rs crates/remanence-cli/src/top.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## 1. How a tape behaves
 
 Remanence's design only makes sense against the behaviour of the medium, so this page starts

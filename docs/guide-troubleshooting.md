@@ -278,7 +278,7 @@ standalone refusals are:
 The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/library_runtime/terminal.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/library_runtime/terminal.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## Tape-I/O fences
 
 The daemon starts with tape-scoped and drive-scoped tape-I/O fences. Each fence

@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/tail_recovery.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
