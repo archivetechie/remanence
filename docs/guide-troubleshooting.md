@@ -326,8 +326,24 @@ library log. Cleaning is the only operation that raises a drive fence.
 If the only usable bays are drive-fenced or busy and at least one is fenced,
 a library mount refuses with `DriveFenced` immediately; it does not wait for a
 busy bay. Only the cleaning run that raised a drive fence releases it.
-`rem tape quarantine release` refuses a drive fence with `fence is not tape-scoped`,
-and a new cleaning run on that drive refuses with `drive is already fenced`.
+
+A failed cleaning run gives the drive back when no cartridge movement was
+admitted or a fresh inventory shows the drive bay empty. If the cleaning
+cartridge may still be inside and the run cannot prove otherwise, the drive
+stays out of data work and the `cleaning-needs-operator` alarm stays raised.
+This can follow a failure to open the drive, read its alerts, move the cartridge
+back, or read a fresh inventory. A new manual clean on that drive refuses with
+`drive is already fenced`. `rem tape quarantine release` refuses a drive fence
+with `fence is not tape-scoped`. There is no command to release a retained drive
+fence; the erasing reset is the only route.
+
+The refusal `drive discovery cannot preserve the required identity alarm; motion is fenced`
+occurs when discovery finds one serial twice in an inventory, two active
+identities for one serial, a known serial with a different vendor or product
+when both observations carry that field, or a retired drive reappearing.
+Motion and data work stop, and a daemon starting with this condition does not
+start. A drive whose host connection is down does not cause this identity
+refusal.
 
 A standalone initialization write that fails with an uncertain outcome raises no
 tape or drive fence. It is refused with

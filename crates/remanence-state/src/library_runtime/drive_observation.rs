@@ -171,7 +171,15 @@ impl LibraryRuntime {
             let norm = |v: Option<String>| v.map(|v| lib::Text::from(v.trim()));
             let vendor = norm(input.vendor);
             let product = norm(input.product);
-            let as_str = |v: &Option<lib::Text>| v.as_ref().map_or("", |v| v.as_str()).to_owned();
+            // A host field can corroborate identity only when both sides carry it.
+            let carries = |value: &Option<lib::Text>| {
+                value
+                    .as_ref()
+                    .is_some_and(|value| !value.as_str().trim().is_empty())
+            };
+            let compatible = |prior: &Option<lib::Text>, observed: &Option<lib::Text>| {
+                !carries(prior) || !carries(observed) || prior == observed
+            };
             let prior = known
                 .values()
                 .filter(|v| {
@@ -179,8 +187,8 @@ impl LibraryRuntime {
                         .serial
                         .as_ref()
                         .is_some_and(|v| v.as_str() == serial)
-                        && as_str(&v.value.vendor) == as_str(&vendor)
-                        && as_str(&v.value.product) == as_str(&product)
+                        && compatible(&v.value.vendor, &vendor)
+                        && compatible(&v.value.product, &product)
                 })
                 .min_by_key(|v| (v.retired, v.first, v.value.drive_uuid));
             if let Some(retired) = prior.filter(|v| v.retired) {
@@ -242,6 +250,18 @@ impl LibraryRuntime {
             if input.observed_at_utc.is_some() {
                 return Err(StateError::ConfigInvalid("typed discovery observation time is its writer envelope; caller timestamp is not supported".into()).into());
             }
+            // A changer-only observation keeps the prior host details together,
+            // including their source and firmware, without inventing a change.
+            let carried = prior.filter(|_| !carries(&vendor) && !carries(&product));
+            let (identity_source, vendor, product, firmware_rev) = match carried {
+                Some(prior) => (
+                    prior.value.identity_source,
+                    prior.value.vendor.clone(),
+                    prior.value.product.clone(),
+                    prior.value.firmware_rev.clone(),
+                ),
+                None => (identity_source, vendor, product, norm(input.firmware_rev)),
+            };
             prepared.push((
                 lib::DriveObserved {
                     drive_uuid: uuid,
@@ -252,7 +272,7 @@ impl LibraryRuntime {
                     inventory_generation: generation,
                     vendor,
                     product,
-                    firmware_rev: norm(input.firmware_rev),
+                    firmware_rev,
                 },
                 prior.is_none(),
             ));

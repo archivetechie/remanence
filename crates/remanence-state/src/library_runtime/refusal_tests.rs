@@ -585,3 +585,132 @@ fn wdrv_resolves_only_unique_active_serial() {
     );
     assert_eq!(f.runtime.test_source_records().len(), before);
 }
+
+/// K18 observations without host details preserve the same source identity.
+fn k18_observation_pair(
+    first: crate::DriveObservationInput,
+    second: crate::DriveObservationInput,
+    expected: crate::DriveObservationInput,
+) {
+    let f = open();
+    let before = f.runtime.observe_drives(vec![first]).unwrap().remove(0);
+    assert!(before.newly_seen);
+    let after = f.runtime.observe_drives(vec![second]).unwrap().remove(0);
+    assert_eq!(after.drive_uuid, before.drive_uuid);
+    assert!(!after.newly_seen);
+    assert!(!f.runtime.motion_fenced());
+    assert!(refusals(&f.runtime).is_empty());
+    let records: Vec<_> = f
+        .runtime
+        .test_source_records()
+        .into_iter()
+        .filter_map(|record| {
+            if let lib::BodyView::DriveObserved(value) = record.body_view() {
+                Some(value.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(records.len(), 2);
+    let observed = &records[1];
+    assert_eq!(observed.drive_uuid.as_slice(), before.drive_uuid);
+    assert_eq!(
+        observed.identity_source,
+        lib::IdentitySource::DvcidAndInquiry
+    );
+    assert_eq!(
+        observed.vendor.as_ref().map(|v| v.as_str()),
+        expected.vendor.as_deref()
+    );
+    assert_eq!(
+        observed.product.as_ref().map(|v| v.as_str()),
+        expected.product.as_deref()
+    );
+    assert_eq!(
+        observed.firmware_rev.as_ref().map(|v| v.as_str()),
+        expected.firmware_rev.as_deref()
+    );
+    assert_eq!(
+        observed.inventory_generation,
+        records[0].inventory_generation + 1
+    );
+    assert_eq!(observed.endpoint, records[0].endpoint);
+    assert_eq!(observed.managed, records[0].managed);
+}
+
+/// The changer still reports the serial when its host device is absent.
+fn k18_without_host() -> crate::DriveObservationInput {
+    let mut input = drive_input("SER-K18", "HPE");
+    input.vendor = None;
+    input.product = None;
+    input.firmware_rev = None;
+    input.identity_source = "DvcidInline".into();
+    input
+}
+
+/// T9: a missing host connection preserves identity and all four host fields.
+#[test]
+fn k18_missing_host_preserves_identity_and_source_record() {
+    k18_observation_pair(
+        drive_input("SER-K18", "HPE"),
+        k18_without_host(),
+        drive_input("SER-K18", "HPE"),
+    );
+}
+
+/// T10: the first host response enriches an identity first seen by the changer.
+#[test]
+fn k18_host_return_heals_initially_missing_details() {
+    k18_observation_pair(
+        k18_without_host(),
+        drive_input("SER-K18", "HPE"),
+        drive_input("SER-K18", "HPE"),
+    );
+}
+
+/// T11: whitespace-only vendor and empty product both mean absent.
+#[test]
+fn k18_blank_host_details_preserve_identity_and_source_record() {
+    let mut absent = k18_without_host();
+    absent.vendor = Some("  ".into());
+    absent.product = Some(String::new());
+    k18_observation_pair(
+        drive_input("SER-K18", "HPE"),
+        absent,
+        drive_input("SER-K18", "HPE"),
+    );
+}
+
+/// T12: replayed host details keep the row and firmware history stable.
+#[test]
+fn k18_missing_host_preserves_projected_details_and_firmware_history() {
+    let f = open();
+    let mut index = crate::projector::open(&f.paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(f.runtime.clone())
+        .write_handle();
+    let first = index
+        .observe_drive_inventory_snapshot(vec![drive_input("SER-K18", "HPE")])
+        .unwrap()
+        .remove(0);
+    let before = index.get_drive_by_uuid(&first.drive_uuid).unwrap().unwrap();
+    let second = index
+        .observe_drive_inventory_snapshot(vec![k18_without_host()])
+        .unwrap()
+        .remove(0);
+    assert_eq!(second.drive_uuid, first.drive_uuid);
+    assert!(!second.newly_seen);
+    let after = index.get_drive_by_uuid(&first.drive_uuid).unwrap().unwrap();
+    assert_eq!(after.vendor, before.vendor);
+    assert_eq!(after.product, before.product);
+    assert_eq!(after.firmware_rev, before.firmware_rev);
+    assert_eq!(after.identity_source, before.identity_source);
+    assert!(!index
+        .list_drive_events(&first.drive_uuid)
+        .unwrap()
+        .iter()
+        .any(|event| event.event_kind == "firmware-changed"));
+    assert!(!f.runtime.motion_fenced());
+    assert!(refusals(&f.runtime).is_empty());
+}

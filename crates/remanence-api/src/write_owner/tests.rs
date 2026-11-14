@@ -9682,12 +9682,12 @@ fn periodic_cleaning_defers_on_busy_drive_and_now_fences_after_session_end() {
     .expect_err("now cleaning should fence and then hit the busy-drive path");
     assert_ne!(err.code(), tonic::Code::Ok);
     assert!(
-        now_index
+        !now_index
             .get_drive_by_uuid(&now_drive_uuid)
             .expect("drive lookup")
             .expect("drive row")
             .fenced,
-        "now cleaning must fence the drive"
+        "now cleaning must release the drive when no MOVE was admitted"
     );
 }
 
@@ -17602,11 +17602,9 @@ fn typed_discovery_unsupported_batch_keeps_source_and_refuses_motion() {
     }
 }
 
-/// The actual owner selects inventory-only media, persists its run and fence,
-/// then records the physical fast-eject refusal through typed sources. An unknown
-/// LOAD is reconciled before further changer motion, preserving the drive fence.
-#[test]
-fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
+/// The typed fast-eject fixture preserves cartridge and motion evidence while
+/// checking durable release of the failed run's own drive fence.
+fn k67_fast_eject_case(expired: bool, before_move: bool) {
     use remanence_state::{
         library_log as lib, library_runtime::LibraryRuntime, StateLockGuard, StatePaths,
     };
@@ -17665,7 +17663,7 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
             panic!("no dispatch")
         }
     }
-    for (expired, before_move) in [(true, false), (false, false), (true, true)] {
+    {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
         let paths = StatePaths {
@@ -17789,9 +17787,27 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
                 "ok"
             })
         );
+        assert!(
+            !index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
+            "T2: failed fast-eject runs release the drive"
+        );
+        runtime
+            .admit_drive_data(
+                &remanence_state::DriveKey::new("LIB-CLEAN", 0x100),
+                remanence_state::library_runtime::RefusalSubject::Drive(
+                    drive.as_slice().try_into().unwrap(),
+                ),
+                lib::AuditActor::System,
+            )
+            .unwrap();
+        let run_id = index.list_clean_runs(true).unwrap()[0].run_id.clone();
         assert_eq!(
-            index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
-            expired
+            index
+                .get_alarm(&format!("cleaning-needs-operator:{run_id}"))
+                .unwrap()
+                .unwrap()
+                .state,
+            "cleared"
         );
         assert!(index
             .get_active_clean_run_by_drive(&drive)
@@ -17837,12 +17853,28 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
         let mut next_move_intent = None;
         let mut expire_at = None;
         let mut finish_at = None;
+        let mut finishes = 0;
+        let mut fences = Vec::new();
+        let mut releases = Vec::new();
         let view = lib::native_view::NativeTapeView::probe(
             &paths.journal_dir.join("tapes"),
             &paths.sqlite_path,
         )
         .unwrap();
         lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+            if record.record().tag() == lib::Tag::FenceRaised {
+                assert_eq!(
+                    k67_fence_field(record.record(), 5),
+                    CborValue::Bytes(operation.as_bytes().to_vec())
+                );
+                fences.push(record.sequence());
+            }
+            if record.record().tag() == lib::Tag::FenceReleased {
+                releases.push(
+                    u64::try_from(k67_fence_field(record.record(), 0).as_integer().unwrap())
+                        .unwrap(),
+                );
+            }
             if let Some(value) = record.record().motion_intent() {
                 if matches!(value.motion, lib::Motion::Load(_)) {
                     assert_eq!(value.parent_operation, Some(*operation.as_bytes()));
@@ -17869,13 +17901,23 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
             if let Some(value) = record.record().cleaning_recorded() {
                 match value.action {
                     lib::CleaningAction::Expire(_) => expire_at = Some(record.sequence()),
-                    lib::CleaningAction::Finish(_) => finish_at = Some(record.sequence()),
+                    lib::CleaningAction::Finish(_) => {
+                        assert_eq!(value.run_id.as_str(), run_id);
+                        finishes += 1;
+                        finish_at = Some(record.sequence());
+                    }
                     _ => (),
                 }
             }
             Ok(())
         })
         .unwrap();
+        assert_eq!(finishes, 1);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(
+            releases, fences,
+            "T2: exactly one release of this run's fence"
+        );
         if before_move {
             assert!(
                 load_intents.is_empty(),
@@ -17957,9 +17999,31 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
         }
         let runtime = LibraryRuntime::open(&paths, true, lease).unwrap();
         let index = runtime.reader().unwrap();
+        assert!(index
+            .get_active_clean_run_by_drive(&drive)
+            .unwrap()
+            .is_none());
+        assert!(
+            !index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
+            "T2: failed fast-eject runs release the drive"
+        );
+        runtime
+            .admit_drive_data(
+                &remanence_state::DriveKey::new("LIB-CLEAN", 0x100),
+                remanence_state::library_runtime::RefusalSubject::Drive(
+                    drive.as_slice().try_into().unwrap(),
+                ),
+                lib::AuditActor::System,
+            )
+            .unwrap();
+        let run_id = index.list_clean_runs(true).unwrap()[0].run_id.clone();
         assert_eq!(
-            index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
-            expired
+            index
+                .get_alarm(&format!("cleaning-needs-operator:{run_id}"))
+                .unwrap()
+                .unwrap()
+                .state,
+            "cleared"
         );
         assert_eq!(
             index
@@ -17976,6 +18040,24 @@ fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
             })
         );
     }
+}
+
+/// T2: fast-eject before LOAD admission releases durably.
+#[test]
+fn typed_cleaning_owner_fast_eject_preserves_fence_after_reopen() {
+    k67_fast_eject_case(true, false);
+}
+
+/// T2: admission followed by an intent refusal uses fresh empty-bay proof.
+#[test]
+fn k67_pre_move_evidence_refusal_releases_after_reopen() {
+    k67_fast_eject_case(true, true);
+}
+
+/// T2: successful cleaning retains its existing release and evidence contract.
+#[test]
+fn k67_success_release_survives_reopen() {
+    k67_fast_eject_case(false, false);
 }
 
 /// A real no-op closeout has no ClosedOut record for its operation. Its Finished
@@ -19398,4 +19480,436 @@ fn wbr_session_initializing_budget_survives_restart_without_second_load() {
             .count(),
         1
     );
+}
+
+/// Model-only transport for T5's known UNLOAD failure and T6's shutdown cutoff.
+struct K67CleaningTransport {
+    inner: ModelTransport,
+    lifecycle: crate::drive_pool::DrivePoolLifecycle,
+    fail_unload: bool,
+    stop_before_unload: bool,
+    unloads: Arc<AtomicU64>,
+}
+
+impl SgTransport for K67CleaningTransport {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        buf: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        let result = self.inner.execute_in(cdb, buf);
+        if cdb[0] == 0x4d && self.stop_before_unload {
+            self.lifecycle.shutting_down.store(true, Ordering::SeqCst);
+            self.lifecycle
+                .cut_changer_wait
+                .store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        if cdb[0] == 0x1b && cdb[4] & 1 == 0 {
+            self.unloads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_unload {
+                // B5's current HARDWARE ERROR: the failed command has a known outcome.
+                let mut sense = vec![0; 18];
+                sense[0] = 0x70;
+                sense[2] = 4;
+                sense[7] = 10;
+                sense[12] = 0x53;
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                });
+            }
+        }
+        self.inner.execute_none(cdb)
+    }
+
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        buf: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+
+    fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+/// T1, T3-T6 share the existing typed fast-eject test's complete owner setup.
+fn k67_failed_clean(occupied: bool, flag: Option<u8>, fail_unload: bool, stop_before_unload: bool) {
+    use remanence_state::{
+        library_log as lib, library_runtime::LibraryRuntime, StateLockGuard, StatePaths,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let paths = StatePaths {
+        config_path: root.join("config"),
+        state_dir: root.join("state"),
+        audit_dir: root.join("library"),
+        journal_dir: root.join("native"),
+        sqlite_path: root.join("catalog.sqlite"),
+        tape_cache_dir: root.join("cache"),
+        calibration_dir: root.join("calibration"),
+    };
+    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime.clone());
+    let mut index = catalog.write_handle();
+    let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 3);
+    model.put_tape_in_slot(
+        0x400,
+        "CLNU01L9",
+        VirtualTape {
+            cleaning_cart: true,
+            cleaning_cart_expired: false,
+            ..VirtualTape::default()
+        },
+    );
+    if occupied {
+        model.put_tape_in_drive(0x100, "DATA01L9", None, VirtualTape::default());
+    }
+    if let Some(flag) = flag {
+        assert!(model.set_tape_alert("CLNU01L9", flag));
+    }
+    let world = Arc::new(Mutex::new(model));
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+    let unloads = Arc::new(AtomicU64::new(0));
+    let snapshot = world.lock().unwrap().library_snapshot();
+    let opener_world = world.clone();
+    let opener_lifecycle = lifecycle.clone();
+    let opener_unloads = unloads.clone();
+    let mut library = snapshot
+        .open_with(
+            &remanence_library::StaticAllowlist::new(["LIB-CLEAN"]),
+            move |path| {
+                let role = opener_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(K67CleaningTransport {
+                    inner: ModelTransport::new(opener_world.clone(), role),
+                    lifecycle: opener_lifecycle.clone(),
+                    fail_unload,
+                    stop_before_unload,
+                    unloads: opener_unloads.clone(),
+                }))
+            },
+        )
+        .unwrap();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from(["LIB-CLEAN".into()]),
+    )
+    .unwrap();
+    let drive = index.list_drives(true, true).unwrap()[0].drive_uuid.clone();
+    let mut cfg = test_write_owner_config(
+        paths.sqlite_path.clone(),
+        paths.audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.catalog = catalog.clone();
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
+    cfg.cleaning.min_cycle_duration = "0s".into();
+    cfg.lifecycle = Some(lifecycle);
+    let api = crate::ApiState::new(catalog.clone());
+    let action = crate::write_owner::RoboticsAction::Clean {
+        drive_uuid: drive.clone(),
+        trigger: "manual".into(),
+    };
+    let fingerprint = crate::operation_source::robotics_fingerprint("LIB-CLEAN", &action);
+    let operation = api
+        .accept_owner_request(
+            AuditActor::User("real-cleaner".into()),
+            "clean_drive",
+            "library",
+            "LIB-CLEAN".into(),
+            fingerprint,
+        )
+        .unwrap();
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation, "clean_drive");
+    super::robotics::record_library_operation(
+        &mut index,
+        &cfg,
+        &handle,
+        "LIB-CLEAN",
+        lib::OperationEvent::Started(lib::Unit),
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    cfg.configure_operation_library(&mut library, &handle);
+    let error = run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive, "manual")
+        .unwrap_err();
+    if stop_before_unload {
+        assert!(
+            error.message().contains("shutdown before UNLOAD"),
+            "{error}"
+        );
+        assert!(
+            index
+                .get_active_clean_run_by_drive(&drive)
+                .unwrap()
+                .is_none(),
+            "T6: shutdown must finish the run"
+        );
+        assert_eq!(unloads.load(Ordering::SeqCst), 0);
+    } else if fail_unload {
+        assert!(
+            error.message().contains("unload cleaning cartridge:"),
+            "T5: moving-back error must win: {error}"
+        );
+        assert_eq!(unloads.load(Ordering::SeqCst), 2);
+    } else if let Some(flag) = flag {
+        assert_eq!(
+            error.message(),
+            if flag == 22 {
+                "cleaning cartridge expired during cleaning"
+            } else {
+                "cleaning cartridge behaved like data media"
+            }
+        );
+        assert_eq!(
+            world.lock().unwrap().loaded_barcode(0x100),
+            None,
+            "T3/T4: cartridge must be out of the bay"
+        );
+        assert_eq!(
+            world.lock().unwrap().slots[0].barcode.as_deref(),
+            Some("CLNU01L9")
+        );
+    }
+    let released = !fail_unload && !stop_before_unload;
+    assert_eq!(
+        index.get_drive_by_uuid(&drive).unwrap().unwrap().fenced,
+        !released,
+        "T1/T5/T6: drive fence obligation"
+    );
+    assert!(index
+        .get_active_clean_run_by_drive(&drive)
+        .unwrap()
+        .is_none());
+    let runs = index.list_clean_runs(true).unwrap();
+    assert_eq!(runs.len(), 1);
+    let run_id = runs[0].run_id.clone();
+    assert_eq!(runs[0].phase, "failed");
+    assert_eq!(
+        index
+            .get_alarm(&format!("cleaning-needs-operator:{run_id}"))
+            .unwrap()
+            .unwrap()
+            .state,
+        if released { "cleared" } else { "open" }
+    );
+    let admission = runtime.admit_drive_data(
+        &remanence_state::DriveKey::new("LIB-CLEAN", 0x100),
+        remanence_state::library_runtime::RefusalSubject::Drive(
+            drive.as_slice().try_into().unwrap(),
+        ),
+        lib::AuditActor::System,
+    );
+    if released {
+        admission.unwrap();
+    } else {
+        assert!(
+            matches!(
+                admission,
+                Err(remanence_state::library_runtime::DriveDataRefusal::Fenced(
+                    _
+                ))
+            ),
+            "{admission:?}"
+        );
+    }
+    if occupied {
+        assert_eq!(
+            world.lock().unwrap().loaded_barcode(0x100),
+            Some("DATA01L9")
+        );
+        assert!(
+            !world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .any(|c| c.opcode == 0xa5),
+            "T1: no MOVE dispatched"
+        );
+    }
+    if !released {
+        assert_eq!(
+            world.lock().unwrap().loaded_barcode(0x100),
+            Some("CLNU01L9")
+        );
+    }
+    if stop_before_unload {
+        cfg.lifecycle = Some(crate::drive_pool::DrivePoolLifecycle::default());
+        let later =
+            run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive, "manual")
+                .unwrap_err();
+        assert_eq!(
+            later.message(),
+            "drive is already fenced",
+            "T6: later trigger must not join an open run"
+        );
+    }
+    let alarm_id = flag.map(|flag| {
+        format!(
+            "{}:CLNU01L9",
+            if flag == 22 {
+                "cln-cart-expired"
+            } else {
+                "cart-not-cleaning-behavior"
+            }
+        )
+    });
+    if let Some(flag) = flag {
+        let cart = index.get_tape_by_voltag("CLNU01L9").unwrap().unwrap();
+        assert_eq!(
+            index
+                .get_tape_cleaning_state(&cart.tape_uuid)
+                .unwrap()
+                .flatten()
+                .as_deref(),
+            Some(if flag == 22 { "expired" } else { "rejected" })
+        );
+        assert_eq!(
+            index
+                .get_alarm(alarm_id.as_deref().unwrap())
+                .unwrap()
+                .unwrap()
+                .state,
+            "open"
+        );
+    }
+    super::robotics::record_library_operation(
+        &mut index,
+        &cfg,
+        &handle,
+        "LIB-CLEAN",
+        lib::OperationEvent::Failed(lib::Failed {
+            retry: None,
+            refusal_code: None,
+            summary: error.message().into(),
+        }),
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let library_uuid = runtime.manifest().library_uuid();
+    drop(api);
+    drop(library);
+    drop(cfg);
+    drop(index);
+    drop(catalog);
+    drop(runtime);
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut raises = Vec::new();
+    let mut releases = Vec::new();
+    let mut finishes = 0;
+    let mut tape_alarms = 0;
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |record| {
+        if record.record().tag() == lib::Tag::FenceRaised {
+            assert_eq!(
+                k67_fence_field(record.record(), 5),
+                CborValue::Bytes(operation.as_bytes().to_vec())
+            );
+            raises.push(record.sequence());
+        }
+        if record.record().tag() == lib::Tag::FenceReleased {
+            releases.push(
+                u64::try_from(k67_fence_field(record.record(), 0).as_integer().unwrap()).unwrap(),
+            );
+        }
+        if let Some(value) = record.record().cleaning_recorded() {
+            if value.run_id.as_str() == run_id
+                && matches!(value.action, lib::CleaningAction::Finish(_))
+            {
+                finishes += 1;
+            }
+        }
+        if let Some(value) = record.record().alarm_changed() {
+            if alarm_id.as_deref() == Some(value.condition_key.as_str())
+                && matches!(
+                    value.action,
+                    lib::AlarmAction::Raise(_) | lib::AlarmAction::Refresh(_)
+                )
+            {
+                tape_alarms += 1;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(raises.len(), 1);
+    assert_eq!(finishes, 1, "exactly one Finish for this run");
+    assert_eq!(
+        releases,
+        if released { raises } else { vec![] },
+        "release names only the run's own fence"
+    );
+    assert_eq!(
+        tape_alarms,
+        usize::from(flag.is_some()),
+        "TapeAlert alarm raised exactly once"
+    );
+}
+
+/// T1: a manual clean of a busy bay never moves its cleaning cartridge.
+#[test]
+fn k67_manual_busy_bay_releases_without_move() {
+    k67_failed_clean(true, None, false, false);
+}
+/// T3: flag 22 returns the expired cleaning cartridge home before releasing.
+#[test]
+fn k67_tapealert_22_returns_cartridge_and_releases() {
+    k67_failed_clean(false, Some(22), false, false);
+}
+/// T4: flag 20 returns a cartridge that behaved as data media.
+#[test]
+fn k67_tapealert_20_returns_cartridge_and_releases() {
+    k67_failed_clean(false, Some(20), false, false);
+}
+/// T4: flag 21 follows the same return-home rule independently of flag 20.
+#[test]
+fn k67_tapealert_21_returns_cartridge_and_releases() {
+    k67_failed_clean(false, Some(21), false, false);
+}
+/// T5: failed moving-back returns its own error and retains the drive fence.
+#[test]
+fn k67_tapealert_unload_failure_keeps_fence() {
+    k67_failed_clean(false, Some(22), true, false);
+}
+/// T6: shutdown after MOVE finishes once and later cleaning refuses the fence.
+#[test]
+fn k67_shutdown_after_move_finishes_and_keeps_fence() {
+    k67_failed_clean(false, None, false, true);
+}
+
+/// Inspect a fence field through the public codec because Record keeps fence
+/// bodies private. Re-encoding an authenticated replay record preserves its
+/// structural fields; framing sequence/hash are irrelevant to these assertions.
+fn k67_fence_field(record: &remanence_state::library_log::Record, key: u64) -> CborValue {
+    let (bytes, _) = remanence_state::library_log::codec::encode(1, [0; 32], record).unwrap();
+    let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let start = remanence_state::log_frame::PREFIX_LEN;
+    let value: CborValue = ciborium::de::from_reader(&bytes[start..start + length]).unwrap();
+    let field = |value: CborValue, key: u64| {
+        let CborValue::Map(entries) = value else {
+            panic!("expected canonical record map")
+        };
+        entries
+            .into_iter()
+            .find(|(k, _)| *k == CborValue::Integer(key.into()))
+            .unwrap()
+            .1
+    };
+    field(field(value, 1), key)
 }

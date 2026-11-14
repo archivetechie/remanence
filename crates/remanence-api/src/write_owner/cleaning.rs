@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use ciborium::value::Value as CborValue;
 #[cfg(test)]
 use remanence_state::AuditEvent;
-use remanence_state::CatalogIndex;
+use remanence_state::{index::CleanRunRecord, CatalogIndex};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tonic::Status;
@@ -154,6 +154,49 @@ fn run_cleaning_sequence_owned(
         library_serial.as_str(),
         drive_bay,
     )?;
+    let mut no_move_admitted = true;
+    let result = run_cleaning_body(
+        index,
+        cfg,
+        handle,
+        library,
+        &run,
+        drive_bay,
+        owned_fence,
+        &mut no_move_admitted,
+    );
+    if let Err(error) = &result {
+        finish_failed_cleaning(
+            index,
+            cfg,
+            handle,
+            library,
+            &run,
+            drive_bay,
+            owned_fence,
+            no_move_admitted,
+            error,
+        );
+    }
+    result
+}
+
+/// Run the fenced portion of cleaning. Every error returns to the owner's
+/// single failure funnel, with the MOVE admission fact captured before branching.
+#[allow(clippy::too_many_arguments)]
+fn run_cleaning_body(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library: &mut remanence_library::LibraryHandle,
+    run: &CleanRunRecord,
+    drive_bay: u16,
+    owned_fence: Option<u64>,
+    no_move_admitted: &mut bool,
+) -> Result<(), Status> {
+    let clean_cfg = &cfg.cleaning;
+    let library_serial = &run.library_serial;
+    let drive_uuid = run.drive_uuid.as_slice();
     #[cfg(test)]
     if cfg.authority.runtime().is_none() {
         if let Err(err) = record_library_event(
@@ -247,36 +290,6 @@ fn run_cleaning_sequence_owned(
             "{{\"reason\":\"{}\",\"recovery_step\":\"selecting\"}}",
             json_escape_text(&reason)
         );
-        let _ = clear_alarm_with_evidence(
-            index,
-            cfg,
-            format!("cleaning-needs-operator:{}", run.run_id).as_str(),
-        );
-        let _ = source::release(
-            index,
-            cfg,
-            drive_uuid,
-            owned_fence,
-            "cleaning run released its drive obligation",
-        );
-        #[cfg(test)]
-        let _ = record_library_event(
-            index,
-            cfg,
-            handle,
-            library_serial.as_str(),
-            AuditEvent::DriveUnfenced,
-            BTreeMap::from([
-                (
-                    "drive_uuid".to_string(),
-                    CborValue::Bytes(drive_uuid.to_vec()),
-                ),
-                (
-                    "component".to_string(),
-                    CborValue::Text("cleaning".to_string()),
-                ),
-            ]),
-        );
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
@@ -305,10 +318,6 @@ fn run_cleaning_sequence_owned(
     )?;
     let run_id = selected.run_id.clone();
     let complete_timeout = parse_duration_or(&clean_cfg.complete_timeout, Duration::minutes(10));
-    let drive_bay = drive
-        .last_element_address
-        .and_then(|value| u16::try_from(value).ok())
-        .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
     let mut motion =
         crate::drive_pool::MotionAdmission::new(cfg.lifecycle.clone(), cfg.endpoint(drive_bay));
     let maintenance = if cfg.authority.runtime().is_some() {
@@ -384,6 +393,7 @@ fn run_cleaning_sequence_owned(
                 })
         },
     );
+    *no_move_admitted = !motion.dispatched;
     if let Err(error) = loaded {
         // A cleaning cartridge may eject as soon as MOVE seats it, before LOAD
         // admission can confirm the bay. Preserve that actual read-only eject
@@ -446,31 +456,6 @@ fn run_cleaning_sequence_owned(
                 "cleaning-needs-operator",
                 "warning",
                 Some(&detail),
-            )?;
-        }
-        if crate::drive_pool::DaemonShuttingDown::is_status(&error) && !motion.dispatched {
-            // This run owns this unique alarm and raised the fence only after
-            // rejecting a pre-existing fence. No physical command was sent.
-            source::advance(
-                index,
-                cfg,
-                run_id.as_str(),
-                CleanPhase::Failed,
-                Some("{\"outcome\":\"cancelled\",\"reason\":\"daemon shutting down\"}"),
-            )?;
-            if !drive.fenced {
-                source::release(
-                    index,
-                    cfg,
-                    drive_uuid,
-                    owned_fence,
-                    "cleaning run released its drive obligation",
-                )?;
-            }
-            clear_alarm_with_evidence(
-                index,
-                cfg,
-                format!("cleaning-needs-operator:{run_id}").as_str(),
             )?;
         }
         return Err(error);
@@ -565,114 +550,98 @@ fn run_cleaning_sequence_owned(
     })?;
     let active_alerts = alerts.active();
     if alerts.is_set(22) {
-        source::cartridge_failed(
+        // Returning home must precede expiry/rejection: afterwards the library
+        // log permits only a non-crediting Finish for this run.
+        let returned = move_cleaning_cartridge_back(
             index,
             cfg,
-            run_id.as_str(),
-            tape_row.tape_uuid.as_slice(),
-            true,
-            "flag-22",
-        )?;
-        source::advance(
-            index,
-            cfg,
-            run_id.as_str(),
-            CleanPhase::Failed,
-            Some("{\"reason\":\"flag-22\"}"),
-        )?;
+            library,
+            &run_id,
+            drive_uuid,
+            drive_bay,
+            slot_address,
+        );
+        let marked =
+            source::cartridge_failed(index, cfg, &run_id, &tape_row.tape_uuid, true, "flag-22");
+        if returned.is_ok() {
+            marked?;
+        } else {
+            let _ = marked;
+        }
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
-            format!("cln-cart-expired:{}", voltag).as_str(),
+            &format!("cln-cart-expired:{voltag}"),
             "cln-cart-expired",
             "warning",
             Some("{\"reason\":\"flag-22\"}"),
         );
+        returned?;
+        source::advance(
+            index,
+            cfg,
+            &run_id,
+            CleanPhase::Failed,
+            Some("{\"reason\":\"flag-22\"}"),
+        )?;
         return Err(Status::failed_precondition(
             "cleaning cartridge expired during cleaning",
         ));
     }
     if alerts.is_set(20) || alerts.is_set(21) {
-        source::cartridge_failed(
+        // Returning home must precede expiry/rejection: afterwards the library
+        // log permits only a non-crediting Finish for this run.
+        let returned = move_cleaning_cartridge_back(
             index,
             cfg,
-            run_id.as_str(),
-            tape_row.tape_uuid.as_slice(),
+            library,
+            &run_id,
+            drive_uuid,
+            drive_bay,
+            slot_address,
+        );
+        let marked = source::cartridge_failed(
+            index,
+            cfg,
+            &run_id,
+            &tape_row.tape_uuid,
             false,
             "corroboration",
-        )?;
-        source::advance(
-            index,
-            cfg,
-            run_id.as_str(),
-            CleanPhase::Failed,
-            Some("{\"reason\":\"corroboration\"}"),
-        )?;
+        );
+        if returned.is_ok() {
+            marked?;
+        } else {
+            let _ = marked;
+        }
         let _ = raise_alarm_with_evidence(
             index,
             cfg,
-            format!("cart-not-cleaning-behavior:{}", voltag).as_str(),
+            &format!("cart-not-cleaning-behavior:{voltag}"),
             "cart-not-cleaning-behavior",
             "warning",
             Some("{\"reason\":\"corroboration\"}"),
         );
+        returned?;
+        source::advance(
+            index,
+            cfg,
+            &run_id,
+            CleanPhase::Failed,
+            Some("{\"reason\":\"corroboration\"}"),
+        )?;
         return Err(Status::failed_precondition(
             "cleaning cartridge behaved like data media",
         ));
     }
-    source::advance(
+    move_cleaning_cartridge_back(
         index,
         cfg,
-        run_id.as_str(),
-        CleanPhase::MovingBack,
-        Some("{\"phase\":\"moving-back\"}"),
-    )?;
-    // Admission happens at physical UNLOAD dispatch. Retain it across both
-    // retries and MOVE so shutdown cannot strand the unthreaded cartridge.
-    let mut dismount = None;
-    let shutdown_refusal = std::cell::RefCell::new(None);
-    let mut admit = || {
-        if dismount.is_none() {
-            dismount = cfg
-                .lifecycle
-                .as_ref()
-                .map(|l| l.begin_dismount(&cfg.endpoint(drive_bay)))
-                .transpose()
-                .map_err(|error| {
-                    let message = error.message().to_string();
-                    *shutdown_refusal.borrow_mut() = Some(error);
-                    message
-                })?;
-        }
-        Ok(())
-    };
-    library.set_changer_ready_wait(cfg.changer_ready_wait.clone().without_stop_signals());
-    retry_cleaning_move(
-        index,
-        cfg,
-        run_id.as_str(),
+        library,
+        &run_id,
         drive_uuid,
-        "moving-back",
-        false,
-        || {
-            crate::mount_support::unload_library_bay_with_admission(
-                library,
-                drive_bay,
-                Some(slot_address),
-                &cfg.policy,
-                None,
-                std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
-                &mut admit,
-            )
-            .map_err(|err| {
-                shutdown_refusal.borrow_mut().take().unwrap_or_else(|| {
-                    Status::internal(format!("unload cleaning cartridge: {err}"))
-                })
-            })?;
-            Ok(())
-        },
+        drive_bay,
+        slot_address,
     )?;
-    drop(dismount);
     let eject_observed = std::time::Instant::now();
     if eject_observed.duration_since(load_completed)
         < std::time::Duration::from_millis(min_cycle_millis)
@@ -796,6 +765,151 @@ fn run_cleaning_sequence_owned(
     Ok(())
 }
 
+/// Finish only this still-open run, then release its own obligation only when
+/// admission or a fresh empty-bay observation proves the cartridge is out.
+/// Cleanup failures never replace the error returned by the cleaning body.
+#[allow(clippy::too_many_arguments)]
+fn finish_failed_cleaning(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library: &mut remanence_library::LibraryHandle,
+    run: &CleanRunRecord,
+    drive_bay: u16,
+    owned_fence: Option<u64>,
+    no_move_admitted: bool,
+    error: &Status,
+) {
+    match index.get_active_clean_run_by_drive(&run.drive_uuid) {
+        Ok(Some(active)) if active.run_id == run.run_id => {
+            let detail = if crate::drive_pool::DaemonShuttingDown::is_status(error) {
+                "{\"outcome\":\"cancelled\",\"reason\":\"daemon shutting down\"}".to_owned()
+            } else {
+                format!("{{\"reason\":\"{}\"}}", json_escape_text(error.message()))
+            };
+            if let Err(error) =
+                source::advance(index, cfg, &run.run_id, CleanPhase::Failed, Some(&detail))
+            {
+                tracing::warn!(%error, run_id = %run.run_id, "finish failed cleaning run");
+            }
+        }
+        Ok(_) => (),
+        Err(error) => {
+            tracing::warn!(%error, run_id = %run.run_id, "read failed cleaning run before finish")
+        }
+    }
+    let reason = if no_move_admitted {
+        Some("cleaning run released its drive obligation: no MOVE was admitted")
+    } else {
+        match observed_empty_cleaning_bay(library, drive_bay) {
+            Ok(true) => {
+                Some("cleaning run released its drive obligation: the drive bay was seen empty")
+            }
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(%error, run_id = %run.run_id, "cannot prove cleaning cartridge out of drive");
+                None
+            }
+        }
+    };
+    let Some(reason) = reason else {
+        return;
+    };
+    if let Err(error) = source::release(index, cfg, &run.drive_uuid, owned_fence, reason) {
+        tracing::warn!(%error, run_id = %run.run_id, "release failed cleaning run's drive obligation");
+        return;
+    }
+    if let Err(error) = clear_alarm_with_evidence(
+        index,
+        cfg,
+        &format!("cleaning-needs-operator:{}", run.run_id),
+    ) {
+        tracing::warn!(%error, run_id = %run.run_id, "clear released cleaning run's alarm");
+    }
+    #[cfg(test)]
+    if cfg.authority.runtime().is_none() {
+        let _ = record_library_event(
+            index,
+            cfg,
+            handle,
+            &run.library_serial,
+            AuditEvent::DriveUnfenced,
+            BTreeMap::from([
+                (
+                    "drive_uuid".to_owned(),
+                    CborValue::Bytes(run.drive_uuid.clone()),
+                ),
+                (
+                    "component".to_owned(),
+                    CborValue::Text("cleaning".to_owned()),
+                ),
+            ]),
+        );
+    }
+    #[cfg(not(test))]
+    let _ = handle;
+}
+
+/// Share the existing dismount admission and retry across success and TapeAlert
+/// ends, retaining the guard through UNLOAD and the MOVE to the home slot.
+fn move_cleaning_cartridge_back(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    library: &mut remanence_library::LibraryHandle,
+    run_id: &str,
+    drive_uuid: &[u8],
+    drive_bay: u16,
+    slot_address: u16,
+) -> Result<(), Status> {
+    source::advance(
+        index,
+        cfg,
+        run_id,
+        CleanPhase::MovingBack,
+        Some("{\"phase\":\"moving-back\"}"),
+    )?;
+    // Admission happens at physical UNLOAD dispatch. Retain it across both
+    // retries and MOVE so shutdown cannot strand the unthreaded cartridge.
+    let mut dismount = None;
+    let shutdown_refusal = std::cell::RefCell::new(None);
+    let mut admit = || {
+        if dismount.is_none() {
+            dismount = cfg
+                .lifecycle
+                .as_ref()
+                .map(|l| l.begin_dismount(&cfg.endpoint(drive_bay)))
+                .transpose()
+                .map_err(|error| {
+                    let message = error.message().to_string();
+                    *shutdown_refusal.borrow_mut() = Some(error);
+                    message
+                })?;
+        }
+        Ok(())
+    };
+    library.set_changer_ready_wait(cfg.changer_ready_wait.clone().without_stop_signals());
+    retry_cleaning_move(index, cfg, run_id, drive_uuid, "moving-back", false, || {
+        crate::mount_support::unload_library_bay_with_admission(
+            library,
+            drive_bay,
+            Some(slot_address),
+            &cfg.policy,
+            None,
+            std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+            &mut admit,
+        )
+        .map_err(|err| {
+            shutdown_refusal
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| Status::internal(format!("unload cleaning cartridge: {err}")))
+        })?;
+        Ok(())
+    })?;
+    drop(dismount);
+    Ok(())
+}
+
 pub(crate) fn cleaning_too_soon(
     index: &CatalogIndex,
     drive_uuid: &[u8],
@@ -869,7 +983,7 @@ pub(crate) fn json_escape_text(value: &str) -> String {
     out
 }
 
-/// Missing bay evidence cannot prove an eject.
+/// Only a fresh, clean inventory with the bay present can prove an eject.
 fn observed_empty_cleaning_bay(
     library: &mut remanence_library::LibraryHandle,
     bay: u16,
@@ -877,12 +991,13 @@ fn observed_empty_cleaning_bay(
     library
         .refresh()
         .map_err(|e| Status::unavailable(format!("observe cleaning eject: {e}")))?;
-    Ok(library
-        .library()
-        .drive_bays
-        .iter()
-        .find(|v| v.element_address == bay)
-        .is_some_and(|v| !v.loaded))
+    Ok(!library.is_dirty()
+        && library
+            .library()
+            .drive_bays
+            .iter()
+            .find(|v| v.element_address == bay)
+            .is_some_and(|v| !v.loaded))
 }
 
 pub(crate) fn cleaning_drive_is_idle(
@@ -964,4 +1079,39 @@ pub(crate) fn retry_cleaning_move(
         Some(detail.as_str()),
     );
     Err(authority_refusal.unwrap_or_else(|| Status::internal(err)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observed_empty_cleaning_bay;
+
+    /// T7: a successful RES with a changed element count leaves a stale empty
+    /// snapshot; it cannot prove that the cleaning cartridge is out.
+    #[test]
+    fn k67_dirty_inventory_cannot_prove_empty_cleaning_bay() {
+        use remanence_library::{transport::FixtureTransport, StaticAllowlist};
+        let snapshot =
+            remanence_chaos::model::VirtualWorld::single_drive("LIB-T7", 0x100, "DRV-T7", 0x400, 1)
+                .library_snapshot();
+        let inquiry = include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec();
+        let mut serial = vec![8, 0x80, 0, 6];
+        serial.extend_from_slice(b"LIB-T7");
+        let responses = vec![inquiry, serial, vec![0; 8], vec![0; 8]];
+        let mut library = snapshot
+            .open_with(&StaticAllowlist::new(["LIB-T7"]), move |_| {
+                Ok(Box::new(
+                    FixtureTransport::new().with_responses(responses.clone()),
+                ))
+            })
+            .unwrap();
+        assert!(!library.library().drive_bays[0].loaded);
+        assert!(!library.is_dirty());
+        let empty = observed_empty_cleaning_bay(&mut library, 0x100).unwrap();
+        assert!(library.is_dirty(), "canned RES must cause a shape mismatch");
+        assert!(
+            !library.library().drive_bays[0].loaded,
+            "old snapshot retained"
+        );
+        assert!(!empty, "a dirty inventory is no empty-bay proof");
+    }
 }

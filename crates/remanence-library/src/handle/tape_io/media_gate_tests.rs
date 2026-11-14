@@ -611,11 +611,11 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-api/src/write_owner/tests.rs",
             DispatchPolicy::Exact {
-                execute_out: 6,
-                execute_none: 6,
+                execute_out: 7,
+                execute_none: 7,
                 why: "cfg(test) TurScriptTransport forwards to FixtureTransport; \
                       RecoveryReadFaultTransport, VerificationCancelTransport, LoadRefreshGate, \
-                      ReadinessFailedLoad and WbrSessionTransport forward to in-memory ModelTransport only; \
+                      ReadinessFailedLoad, WbrSessionTransport and K67CleaningTransport forward to in-memory ModelTransport only; \
                       LoadRefreshGate pauses changer refresh; production write_owner code \
                       dispatches through DriveHandle",
             },

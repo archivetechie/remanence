@@ -411,7 +411,7 @@ crates/remanence-api/src/write_owner/actor_runtime.rs::collect_drive_health_snap
 crates/remanence-api/src/write_owner/actor_runtime.rs::raise_alarm_with_evidence::text-match	12
 crates/remanence-api/src/write_owner/cleaning.rs::retry_cleaning_move::text-equality	1
 crates/remanence-api/src/write_owner/cleaning.rs::run_cleaning_sequence_owned::text-equality	6
-crates/remanence-api/src/write_owner/cleaning.rs::run_cleaning_sequence_owned::text-match	1
+crates/remanence-api/src/write_owner/cleaning.rs::run_cleaning_body::text-match	1
 crates/remanence-api/src/write_owner/cleaning_source.rs::begin::text-match	3
 crates/remanence-api/src/write_owner/readiness.rs::record_session_open_readiness_poll_transition::text-equality	1
 crates/remanence-api/src/write_owner/tail_recovery.rs::supersede_mounted_tail::text-strip_prefix	1

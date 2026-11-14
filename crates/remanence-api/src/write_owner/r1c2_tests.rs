@@ -370,6 +370,25 @@ fn start_daemon(
     ),
     Status,
 > {
+    let snapshot = world.lock().unwrap().library_snapshot();
+    start_daemon_with_snapshot(root, world, snapshot, wrap)
+}
+
+/// Start with the caller's discovery snapshot so host-link changes reach the
+/// real constructor while model transports remain available.
+fn start_daemon_with_snapshot(
+    root: &Root,
+    world: &Arc<Mutex<VirtualWorld>>,
+    snapshot: Library,
+    wrap: impl Fn(ModelTransport) -> Box<dyn SgTransport> + Clone + Send + 'static,
+) -> Result<
+    (
+        remanence_state::StateHandle,
+        crate::ApiState,
+        tokio::runtime::Runtime,
+    ),
+    Status,
+> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -380,7 +399,7 @@ fn start_daemon(
     let spool = root.paths.state_dir.join("spool");
     std::fs::create_dir_all(&spool).unwrap();
     let report = DiscoveryReport {
-        libraries: vec![world.lock().unwrap().library_snapshot()],
+        libraries: vec![snapshot],
         unattached_drives: vec![],
         complete: true,
         incomplete_evidence: vec![],
@@ -1956,5 +1975,52 @@ fn fx1_measure_startup_after_move_done_and_begin_without_load_intent() {
             "T7 W3 startup refused: {status}; LOAD CDBs={}",
             drive_load_commands_on(&world, BAY_A)
         ),
+    }
+}
+
+/// T13: three real daemon constructors retain identity across a missing host
+/// connection, using the established pool shutdown and state-lock teardown.
+#[test]
+fn k18_daemon_restarts_across_missing_host_details() {
+    let root = root();
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        SERIAL, BAY_A, "DRV-K18", 0x400, 1,
+    )));
+    let mut identity = None;
+    for (start, present) in [true, false, true].into_iter().enumerate() {
+        let mut snapshot = world.lock().unwrap().library_snapshot();
+        let installed = snapshot.drive_bays[0].installed.as_mut().unwrap();
+        installed.identity_source = if present {
+            IdentitySource::DvcidAndInquiry
+        } else {
+            IdentitySource::DvcidInline
+        };
+        installed.vendor = present.then(|| "HPE".to_owned());
+        installed.product = present.then(|| "Ultrium 9-SCSI".to_owned());
+        installed.revision = present.then(|| "R1.0".to_owned());
+        let result = start_daemon_with_snapshot(&root, &world, snapshot, plain);
+        let (state, api, runtime) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                wait_for_lifecycle_close(&root);
+                panic!(
+                    "T13: daemon start {} must preserve identity: {error}",
+                    start + 1
+                );
+            }
+        };
+        let rows = state.write_handle().list_drives(true, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        if let Some(identity) = &identity {
+            assert_eq!(&rows[0].drive_uuid, identity);
+        } else {
+            identity = Some(rows[0].drive_uuid.clone());
+        }
+        assert!(!state.library_runtime().motion_fenced());
+        runtime.block_on(api.shutdown_drive_pool()).unwrap();
+        drop(api);
+        drop(runtime);
+        drop(state);
+        wait_for_lifecycle_close(&root);
     }
 }
