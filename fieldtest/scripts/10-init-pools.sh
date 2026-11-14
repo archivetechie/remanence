@@ -250,7 +250,7 @@ unload_dry_run_bay_or_stop() {
   fi
   # rem's dry-run drains the bay itself since the append-session refresh;
   # an already-empty source element means the drain happened, not a failure.
-  if ! out="$("$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" 2>&1)"; then
+  if ! out="$("$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" --config "$(fieldtest_config_path)" 2>&1)"; then
     if grep -q "source element ${bay} is empty" <<<"$out"; then
       return 0
     fi
@@ -613,7 +613,7 @@ EOF
     rm -rf "$tmpdir"
     return 1
   fi
-  if [[ "$(grep -c -- 'rem-debug --allow LIBMAIN unload --bay 0x0001 LIBMAIN' "$rem_log")" -ne 2 ]]; then
+  if [[ "$(grep -Fc -- "rem-debug --allow LIBMAIN unload --bay 0x0001 LIBMAIN --config $tmpdir/home/config.toml" "$rem_log")" -ne 2 ]]; then
     echo "selftest: expected dry-run and final init unloads for bay 0x0001" >&2
     cat "$rem_log" >&2 || true
     rm -rf "$tmpdir"
@@ -811,7 +811,7 @@ main() {
     # 2-drive library runs out of free drives by the 3rd init.
     init_bay="$(init_output_bay "$init_out")"
     if [[ -n "$init_bay" ]]; then
-      "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$init_bay" "$serial" >/dev/null 2>&1 || \
+      "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$init_bay" "$serial" --config "$(fieldtest_config_path)" >/dev/null 2>&1 || \
         echo "warn: could not unload bay $init_bay after init (continuing)" >&2
     fi
     fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" PASS "initialized ${data_barcodes[$idx]} (level: $init_level) into pool candidate $((idx < halfway ? 1 : 2))" "$init_out"

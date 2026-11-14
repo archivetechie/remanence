@@ -105,7 +105,7 @@ PY
   "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true
   local move_json
   move_json="$(fieldtest_artifact_path "$SCRIPT_NAME" move "$stamp")"
-  if ! fieldtest_capture_json "$move_json" "$(fieldtest_rem_debug_bin)" --allow "$serial" move "$serial" --src "$source_slot" --dst "$dest_slot"; then
+  if ! fieldtest_capture_json "$move_json" "$(fieldtest_rem_debug_bin)" --allow "$serial" move "$serial" --src "$source_slot" --dst "$dest_slot" --config "$(fieldtest_config_path)"; then
     fieldtest_evidence_record "$SCRIPT_NAME" move FAIL "rem-debug move failed for $source_barcode" "$move_json"
     exit 1
   fi
@@ -124,10 +124,10 @@ PY
       export_json="$(fieldtest_artifact_path "$SCRIPT_NAME" ie-export "$stamp")"
       import_json="$(fieldtest_artifact_path "$SCRIPT_NAME" ie-import "$stamp")"
       "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true
-      fieldtest_capture_json "$export_json" "$(fieldtest_rem_debug_bin)" --allow "$serial" export "$serial" --slot "$dest_slot"
+      fieldtest_capture_json "$export_json" "$(fieldtest_rem_debug_bin)" --allow "$serial" export "$serial" --slot "$dest_slot" --config "$(fieldtest_config_path)"
       echo "remove the tape from the IE port, reinsert it, then press Enter to continue" >&2
       read -r _
-      fieldtest_capture_json "$import_json" "$(fieldtest_rem_debug_bin)" --allow "$serial" import "$serial" --slot "$source_slot"
+      fieldtest_capture_json "$import_json" "$(fieldtest_rem_debug_bin)" --allow "$serial" import "$serial" --slot "$source_slot" --config "$(fieldtest_config_path)"
       "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
       fieldtest_evidence_record "$SCRIPT_NAME" ie PASS "export/import cycle completed for allowlisted tape" "$import_json"
     fi

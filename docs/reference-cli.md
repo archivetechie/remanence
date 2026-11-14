@@ -2426,16 +2426,15 @@ These commands send SCSI directly to the changer, bypassing the daemon, and all 
 
 | Command | What it does |
 |---|---|
-| `rem-debug move --src <SRC> --dst <DST> <SERIAL>` | MOVE MEDIUM between two element addresses (slot, IE port or drive bay). |
-| `rem-debug load --slot <SLOT> --bay <BAY> <SERIAL>` | Changer MOVE MEDIUM, then drive SSC LOAD. |
+| `rem-debug move --src <SRC> --dst <DST> [--config <PATH>] <SERIAL>` | MOVE MEDIUM between two element addresses (slot, IE port or drive bay). |
+| `rem-debug load --slot <SLOT> --bay <BAY> [--config <PATH>] <SERIAL>` | Changer MOVE MEDIUM, then drive SSC LOAD. |
 | `rem-debug unload --bay <BAY> [--dest <DEST>] [--config <PATH>] <SERIAL>` | SSC UNLOAD, then MOVE MEDIUM back to the bay's recorded source slot or to `--dest`, with locked recovery for a stranded medium-removal prevent (below). |
-| `rem-debug export --slot <SLOT> <SERIAL>` | Move a cartridge from a slot to the first free IE (import/export) port. |
-| `rem-debug import --slot <SLOT> <SERIAL>` | Move a cartridge from the first occupied IE port to a slot. |
+| `rem-debug export --slot <SLOT> [--config <PATH>] <SERIAL>` | Move a cartridge from a slot to the first free IE (import/export) port. |
+| `rem-debug import --slot <SLOT> [--config <PATH>] <SERIAL>` | Move a cartridge from the first occupied IE port to a slot. |
 | `rem-debug rescan <SERIAL>` | INITIALIZE ELEMENT STATUS, then reconcile the snapshot. A shape mismatch is a hard error. |
 | `rem-debug lock <SERIAL>`, `rem-debug unlock <SERIAL>` | PREVENT or ALLOW MEDIUM REMOVAL on the changer. The changer holds the lock, so it survives process exit; while it is held, the front-panel eject and operator mailslot eject are refused. A device reset or power cycle also releases it. |
 
-`export`, `import`, `rescan`, `lock` and `unlock` read `/etc/rem/config.toml` and
-accept no `--config` option.
+`move`, `load`, `unload`, `export` and `import` read the configuration named by `--config` (default `/etc/rem/config.toml`) and install that library's motion authority before they run the operation; `rescan`, `lock` and `unlock` read `/etc/rem/config.toml` and accept no `--config` option.
 
 To move the cartridge in slot `0x0400` of library `LIB001` into bay `0x0100` and load it:
 

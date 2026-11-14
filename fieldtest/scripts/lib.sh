@@ -1808,7 +1808,7 @@ PY
       continue
     fi
     echo "draining drive bay $bay ($barcode) back to its home slot"
-    "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" || \
+    "$(fieldtest_rem_debug_bin)" --allow "$serial" unload --bay "$bay" "$serial" --config "$(fieldtest_config_path)" || \
       echo "warn: could not drain bay $bay (continuing)" >&2
   done <<<"$loaded_drives"
 }

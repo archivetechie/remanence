@@ -463,6 +463,9 @@ enum RemCommand {
         /// Source slot.
         #[arg(long, value_parser = parse_element_addr)]
         slot: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// Import a cartridge from the first occupied IE port to a slot.
@@ -473,6 +476,9 @@ enum RemCommand {
         /// Destination slot.
         #[arg(long, value_parser = parse_element_addr)]
         slot: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// INITIALIZE ELEMENT STATUS on the changer, then reconcile.
@@ -719,8 +725,24 @@ impl From<RemCommand> for Command {
                 dest,
                 config,
             },
-            RemCommand::Export { serial, slot } => Self::Export { serial, slot },
-            RemCommand::Import { serial, slot } => Self::Import { serial, slot },
+            RemCommand::Export {
+                serial,
+                slot,
+                config,
+            } => Self::Export {
+                serial,
+                slot,
+                config,
+            },
+            RemCommand::Import {
+                serial,
+                slot,
+                config,
+            } => Self::Import {
+                serial,
+                slot,
+                config,
+            },
             RemCommand::Rescan { serial } => Self::Rescan { serial },
             RemCommand::Lock { serial } => Self::Lock { serial },
             RemCommand::Unlock { serial } => Self::Unlock { serial },
@@ -1098,6 +1120,9 @@ enum Command {
         /// Source slot.
         #[arg(long, value_parser = parse_element_addr)]
         slot: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// Import a cartridge from the first occupied IE port to a slot.
@@ -1107,6 +1132,9 @@ enum Command {
         /// Destination slot.
         #[arg(long, value_parser = parse_element_addr)]
         slot: u16,
+        /// Shared authority configuration for this direct motion.
+        #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+        config: PathBuf,
     },
 
     /// INITIALIZE ELEMENT STATUS on the changer, then reconcile.
@@ -4915,10 +4943,15 @@ where
                 },
             );
         }
-        Command::Export { serial, slot } => {
-            return run_state_change(
+        Command::Export {
+            serial,
+            slot,
+            config,
+        } => {
+            return run_state_change_with_config(
                 &report,
                 &serial,
+                &config,
                 &allow,
                 &allow_derived,
                 out,
@@ -4938,10 +4971,15 @@ where
                 },
             );
         }
-        Command::Import { serial, slot } => {
-            return run_state_change(
+        Command::Import {
+            serial,
+            slot,
+            config,
+        } => {
+            return run_state_change_with_config(
                 &report,
                 &serial,
+                &config,
                 &allow,
                 &allow_derived,
                 out,
@@ -25621,6 +25659,116 @@ tape_catalog_dir = "{0}/cache/tapes"
             manifest_file_id: Some("manifest-map-direct".to_string()),
             timestamp: Some("2026-01-01T00:00:00Z".to_string()),
             chunk_size: 4096,
+        }
+    }
+
+    /// Both direct-motion CLI routes preserve explicit and default authority paths.
+    #[test]
+    fn direct_motion_config_parses() {
+        for command in ["export", "import"] {
+            for config in [None, Some("/explicit/config.toml")] {
+                let mut args = vec!["rem-debug", "--allow", "LIB", command, "LIB", "--slot", "1"];
+                if let Some(path) = config {
+                    args.extend(["--config", path]);
+                }
+                let debug = DebugCli::try_parse_from(args.clone()).unwrap();
+                args[0] = "rem";
+                let rem = Cli::try_parse_from(args).unwrap();
+                for (route, parsed) in [
+                    ("rem-debug", debug.command),
+                    ("rem", Command::from(rem.command)),
+                ] {
+                    let parsed_config = match (command, parsed) {
+                        ("export", Command::Export { config, .. })
+                        | ("import", Command::Import { config, .. }) => config,
+                        other => panic!("unexpected {route} command: {other:?}"),
+                    };
+                    assert_eq!(
+                        parsed_config.as_path(),
+                        Path::new(config.unwrap_or("/etc/rem/config.toml")),
+                        "{route} {command}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Export binds the supplied configuration before reaching its changer operation.
+    #[test]
+    fn direct_export_uses_supplied_motion_config() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::Mutex;
+
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "EXPORT-LIB",
+            256,
+            "EXPORT-DRIVE",
+            1024,
+            1,
+        )));
+        let library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(256, "TAPE", Some(1024), VirtualTape::default());
+            world.library_snapshot()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let missing_config = root.path().join("missing-motion-config.toml");
+        let valid_config = write_retire_test_config_with_library(root.path(), "EXPORT-LIB");
+        for (config, missing) in [(&missing_config, true), (&valid_config, false)] {
+            let cli = DebugCli::try_parse_from([
+                "rem-debug",
+                "--allow",
+                "EXPORT-LIB",
+                "export",
+                "EXPORT-LIB",
+                "--slot",
+                "1024",
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .expect("export --config must parse");
+            let factory_world = world.clone();
+            TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(move |path| {
+                    let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+                }));
+            });
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_debug(
+                cli,
+                || {
+                    Ok(DiscoveryReport {
+                        libraries: vec![library.clone()],
+                        unattached_drives: vec![],
+                        complete: true,
+                        incomplete_evidence: vec![],
+                        warnings: vec![],
+                    })
+                },
+                &mut out,
+                &mut err,
+            );
+            TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+            let text = String::from_utf8_lossy(&err);
+            if missing {
+                assert_eq!(code, ExitCode::FAILURE, "{text}");
+                assert!(text.contains("error: motion authority:"), "{text}");
+                assert!(
+                    text.contains(config.to_str().unwrap()),
+                    "motion authority must name supplied path {}: {text}",
+                    config.display()
+                );
+            } else {
+                assert!(!text.contains("error: opening library:"), "{text}");
+                assert!(!text.contains("error: motion authority"), "{text}");
+                eprintln!(
+                    "T2(b) export answered {code:?}: stdout={:?}; stderr={text:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
         }
     }
 
