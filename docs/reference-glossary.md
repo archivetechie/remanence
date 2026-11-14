@@ -475,7 +475,7 @@ acknowledge an active, unacknowledged alarm over the local socket: it is refused
 with `SystemAcknowledgement`. The CLI has no client-certificate option for the
 TCP endpoint. An authorized mTLS gRPC client can call `AckAlarm`.
 
-<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/projector/apply.rs crates/remanence-cli/src/top.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
+<!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/projector/apply.rs crates/remanence-cli/src/top.rs crates/remanence-state/src/library_log/native_view.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-state/src/rebuild_sources.rs crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## Safety and operations
 
 ### allowlist
@@ -510,14 +510,25 @@ the catalog's projection. `rem catalog tapes --json`, `rem top` and
 `rem daemon health --json` show it. The release form is
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
 For a present, noncontradicted `native_log_behind_projection` log, restore the
-exact tape log or rebuild the catalog, then add `--force` to release. A
-contradicted log, floor conflict or absent log still refuses forced release;
-restore the exact log or retire the tape. A log still shorter than, or different
-from, what the catalog recorded also refuses forced release, until the exact log
-is restored or the catalog is rebuilt. On a standalone host without
-`/etc/rem/config.toml`, this release form uses the home configuration. The bare
-`--ack` form is not a release route for these fences. See the
-[CLI reference](reference-cli.md#rem-tape-quarantine-standalone) for routing and listing.
+exact tape log or rebuild the catalog, then add `--force` to release. A running
+daemon keeps the tape log it read at startup: after restoring a log, restart the
+daemon, or forced release refuses with
+`the tape log on disk changed after this process read it`. A contradicted or
+absent log still refuses forced release; restore the exact log or retire the
+tape. A floor conflict means the library log's own records disagree about the
+tape's log; restoring the tape log cannot cure it, so retire the tape.
+Rebuilding the catalog cures none of these three. A log still shorter than, or
+different from, what the catalog recorded also refuses forced release, until the
+exact log is restored or the catalog is rebuilt. Retiring a tape whose log is
+absent or shorter than the catalog's record is refused until the catalog is
+rebuilt: rebuild first (`rem rebuild-catalog-from-journals`, with the daemon
+stopped), then retire. On a standalone host without `/etc/rem/config.toml`, this
+release form uses the home configuration. Without a daemon listening on the
+selected configuration's socket, the bare `--ack` form is not a release route
+for these fences; with one listening, it hands the release to the daemon, which
+treats it as the release form without `--force`. See the
+[CLI reference](reference-cli.md#rem-tape-quarantine-standalone) for routing and
+listing.
 
 On a standalone drive, that cause refuses `rem get`, `rem tape identify`,
 `rem tape verify` and `rem tape restore`. Only `rem tape restore --scan` proceeds,

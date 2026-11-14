@@ -202,7 +202,7 @@ Init asks you to type `CLOBBER HOME01`. For a run without a prompt, add
 protection, the partition check, the label and identity swap checks, or the
 pool checks.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/tail_recovery.rs crates/remanence-state/src/error.rs crates/remanence-state/src/projector/apply.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/api_state.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/standalone_init.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/write_owner/local_failure.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/tail_recovery.rs crates/remanence-state/src/error.rs crates/remanence-state/src/projector/apply.rs crates/remanence-state/src/library_log/native_view.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-state/src/rebuild_sources.rs crates/remanence-state/src/tape_log/store.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## 3. Put files on tape
 
 Write a directory to the loaded tape:
@@ -398,11 +398,19 @@ exact tape log or rebuild the catalog, then release the fence with:
 rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
 ```
 
-A contradicted log, a floor conflict or an absent tape log still refuses forced
-release; restore the exact log or retire the tape. Rebuilding the catalog does
-not cure those conditions. A tape log still shorter than, or different from,
-what the catalog recorded also refuses forced release, until the exact log is
-restored or the catalog is rebuilt. `--after-settled-inventory` selects the library form,
+A running daemon keeps the tape log it read at startup: after restoring a log,
+restart the daemon, or forced release refuses with
+`the tape log on disk changed after this process read it`. A contradicted or
+absent log still refuses forced release; restore the exact log or retire the
+tape. A floor conflict means the library log's own records disagree about the
+tape's log; restoring the tape log cannot cure it, so retire the tape.
+Rebuilding the catalog cures none of these three. A log still shorter than, or
+different from, what the catalog recorded also refuses forced release, until the
+exact log is restored or the catalog is rebuilt. Retiring a tape whose log is
+absent or shorter than the catalog's record is refused until the catalog is
+rebuilt: rebuild first (`rem rebuild-catalog-from-journals`, with the daemon
+stopped), then retire.
+`--after-settled-inventory` selects the library form,
 which uses your home configuration when `/etc/rem/config.toml` is absent. With
 no daemon socket answering, it runs offline under the state lock.
 
@@ -414,9 +422,14 @@ rem tape quarantine release <ID> --after-settled-inventory --ack "checked drive 
 ```
 
 The bare form without `--after-settled-inventory` is not a release route for
-these tape fences. On a home host, or with `--device`, it refuses every
-tape-I/O fence a standalone host can hold with `bare standalone release cannot release this fence:`. On a host with a system
-configuration, it prints `tape quarantine release requires --after-settled-inventory`.
+these tape fences unless a daemon is listening. On a home host, or with
+`--device`, it first tries the selected configuration's daemon socket: a
+listening daemon receives the release and treats it as the release form without
+`--force`. With no daemon listening, it refuses every tape-I/O fence a
+standalone host can hold with
+`bare standalone release cannot release this fence:`. On a host with a system
+configuration and no `--device`, it prints
+`tape quarantine release requires --after-settled-inventory`.
 When both configurations exist, list the home state's fence ids with
 `rem tape quarantine list --device <SG> --allow-device <SERIAL> --config <PATH>`:
 `<SG>` and `<SERIAL>` name your standalone drive, and `<PATH>` is its home

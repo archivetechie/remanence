@@ -278,7 +278,7 @@ standalone refusals are:
 The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/library_runtime/terminal.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/drive_fence.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-api/src/write_owner/cleaning_source.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/write_owner/cleaning.rs crates/remanence-api/src/standalone_init.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-state/src/library_log/native_view.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-state/src/rebuild_sources.rs crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/apply.rs crates/remanence-cli/src/top.rs @ 4f804c6c2c9d33d333e71c79eaed2344c8835bf3 -->
 ## Tape-I/O fences
 
 The daemon starts with tape-scoped and drive-scoped tape-I/O fences. Each fence
@@ -303,13 +303,23 @@ then release with
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`.
 Without `--force`, release is refused with
 `native_log_behind_projection fence requires --force:`.
-A contradicted log, a floor conflict or an absent tape log still refuses forced
-release; restore the exact log or retire the tape. Rebuilding the catalog does
-not cure those conditions. A tape log still shorter than, or different from,
-what the catalog recorded also refuses forced release, until the exact log is
-restored or the catalog is rebuilt. On a standalone host without `/etc/rem/config.toml`,
-this release form uses the home configuration. The bare `--ack` form is not a
-release route for these tape fences; see [release routing](reference-cli.md#rem-tape-quarantine-standalone).
+A running daemon keeps the tape log it read at startup: after restoring a log,
+restart the daemon, or forced release refuses with
+`the tape log on disk changed after this process read it`. A contradicted or
+absent log still refuses forced release; restore the exact log or retire the
+tape. A floor conflict means the library log's own records disagree about the
+tape's log; restoring the tape log cannot cure it, so retire the tape.
+Rebuilding the catalog cures none of these three. A log still shorter than, or
+different from, what the catalog recorded also refuses forced release, until the
+exact log is restored or the catalog is rebuilt. Retiring a tape whose log is
+absent or shorter than the catalog's record is refused until the catalog is
+rebuilt: rebuild first (`rem rebuild-catalog-from-journals`, with the daemon
+stopped), then retire. On a standalone host without `/etc/rem/config.toml`, this
+release form uses the home configuration. Without a daemon listening on the
+selected configuration's socket, the bare `--ack` form is not a release route
+for these tape fences; with one listening, it hands the release to the daemon,
+which treats it as the release form without `--force`. See
+[release routing](reference-cli.md#rem-tape-quarantine-standalone).
 
 The library command uses the configured daemon socket when it is listening.
 An absent listener permits offline release,
