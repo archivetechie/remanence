@@ -3163,14 +3163,17 @@ impl super::DriveHandle {
             let result = self.transport.execute_in(&cdb, buf);
             if result.is_err()
                 && self.verification_context().is_verifying()
-                && crate::verification_io::exact_recovered_evidence(
-                    &result,
-                    buf.len(),
-                    self.transport
-                        .outcomes
-                        .current_evidence()
-                        .expect("captured completion"),
-                )
+                && self
+                    .transport
+                    .outcomes
+                    .current_evidence()
+                    .is_some_and(|evidence| {
+                        crate::verification_io::exact_recovered_evidence(
+                            &result,
+                            buf.len(),
+                            evidence,
+                        )
+                    })
             {
                 if let Err(error) = self.advance_known_single_read_position(buf.len()) {
                     self.finish_tape_error(op, &error);
