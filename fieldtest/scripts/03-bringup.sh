@@ -61,15 +61,6 @@ start_daemon() {
   tmux send-keys -t "$session":rem "exec env $field_env$(printf '%q' "$(fieldtest_rem_daemon_bin)") --config $(printf '%q' "$config")" C-m
 }
 
-is_socket_live() {
-  local endpoint="$1"
-  set +e
-  "$(fieldtest_rem_bin)" daemon --endpoint "$endpoint" health >/dev/null 2>&1
-  local rc=$?
-  set -e
-  [[ $rc -eq 0 ]]
-}
-
 # Return only allowlisted media in the selected library while the daemon owns it.
 # Each CLI unload waits for the operation and uses its recorded source slot.
 unload_allowlisted_before_stop() {
@@ -309,16 +300,20 @@ PYCONFIG
     printf '%s\n' "refusing to start: /var/lib/replica/rem.sock is live. Stop the existing harness daemon first, then rerun 03-bringup.sh." >&2
     exit 1
   fi
-  if pgrep -f "rem-daemon --config $(fieldtest_config_path)" >/dev/null 2>&1; then
-    fieldtest_evidence_record "$SCRIPT_NAME" orphan-daemon FAIL "a rem-daemon with this config is already running; run 03-bringup.sh --stop first"
-    printf '%s\n' "refusing to start: an existing rem-daemon (possibly orphaned) holds this config; run 03-bringup.sh --stop" >&2
-    exit 1
-  fi
-  if [[ -S "$(fieldtest_socket_path)" ]] && is_socket_live "$endpoint"; then
-    fieldtest_evidence_record "$SCRIPT_NAME" socket-occupied FAIL "socket $(fieldtest_socket_path) is already live; stop the existing rem-daemon first"
-    printf '%s\n' "refusing to start because $(fieldtest_socket_path) is already owned by a running daemon" >&2
-    exit 1
-  fi
+  local daemon_check
+  daemon_check="$(fieldtest_daemon_running || true)"
+  case "$daemon_check" in
+    process)
+      fieldtest_evidence_record "$SCRIPT_NAME" orphan-daemon FAIL "a rem-daemon with this config is already running; run 03-bringup.sh --stop first"
+      printf '%s\n' "refusing to start: an existing rem-daemon (possibly orphaned) holds this config; run 03-bringup.sh --stop" >&2
+      exit 1
+      ;;
+    socket)
+      fieldtest_evidence_record "$SCRIPT_NAME" socket-occupied FAIL "socket $(fieldtest_socket_path) is already live; stop the existing rem-daemon first"
+      printf '%s\n' "refusing to start because $(fieldtest_socket_path) is already owned by a running daemon" >&2
+      exit 1
+      ;;
+  esac
 
   # One retry: daemon startup can lose a transient SQLite lock race (e.g. a
   # CLI catalog reader closing) and exit; a second start is reliably clean.

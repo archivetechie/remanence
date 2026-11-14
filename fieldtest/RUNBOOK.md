@@ -12,7 +12,7 @@ the day produces a management-ready test record, not just a feeling.
 
 ## 0. Before you start (10 min, read fully)
 
-**Without a remote session:** `fieldtest/package-owner-run.sh <out-dir>` builds a
+**Without a remote session:** `fieldtest/package-owner-run.sh --expect-commit <reviewed-sha> <out-dir>` builds a
 package that the host owner installs read-only and runs as one unattended plan
 (`run.sh plan/<name>.env`). See `OWNER.md` in the package. The plans are in
 `fieldtest/plan/`.
@@ -252,8 +252,9 @@ evidence and printed as warnings; waits longer than `FIELD_READY_FAIL_SECS`
 are hard stops. Terminal, timeout, or transport-unknown readiness results
 remain hard stops.
 **If blocked:** a single drive failing → continue on the other, note in
-evidence; catalog errors → capture `evidence/` + daemon log, then
-`91-cleanup.sh --state-only` and retry once from 1.1.
+evidence; catalog errors → capture `evidence/` + daemon log, then stop and
+investigate. For session-epoch-a, retry by rerunning its plan so the reset leg
+runs before startup.
 
 ---
 
@@ -518,8 +519,8 @@ on. A refused unsafe operation is a PASS.
 
 Run `run.sh plan/session-epoch-a.env` using OWNER.md's written Miria exclusion,
 capability custody and explicit field arming (`REM_FIELD_ALLOW_FAIL=1`). The plan verifies the exact
-four AOX barcodes, discovers LL01, starts the scoped daemon, checks readiness,
-stops it for retirement/re-init with default parity and pool assignment, and
+four AOX barcodes, resets kit state with `05-reset-state.sh`, checks readiness,
+starts the scoped daemon, discovers LL01, stops it for retirement/re-init with default parity and pool assignment, and
 restarts it before the three fault legs. It then measures the near-full range
 and live control, restores every committed prefix again, exports the actual
 variable-READ filemark/EOD sense vectors, and collects evidence.
@@ -563,8 +564,8 @@ No real-drive vectors are manufactured during kit development.
 Expected end reasons include `abort`, `failed_append`, `drive_error`,
 `client_disconnected`, `crash_recovered`, `clean_close`, `client_stall`,
 `graceful_shutdown` and `closeout_failed`. Inspect the actual native end rather
-than inferring it from the client error. Use the same closeout idempotency key
-when retrying an interrupted watch. All fault legs are fatal; preserve the first
+than inferring it from the client error. A close-out that ended needs a new key;
+the helper mints one and records every attempt's key in `closeout-key.json`. All fault legs are fatal; preserve the first
 failure and use the normal run.sh teardown rather than continuing manually.
 
 The kit refuses before device access if `REM_CHAOS_ENABLED`,

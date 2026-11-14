@@ -22,16 +22,4 @@ for bin in "$(fieldtest_rem_bin)" "$(fieldtest_rem_debug_bin)" "$(fieldtest_rem_
   [[ $(stat -c %U "$bin") == root && ! -w $bin ]] || { echo "capability binary must be root-owned and not writable: $bin" >&2; exit 2; }
   getcap "$bin" | tee -a "$out/capabilities.txt" | grep -q 'cap_sys_rawio=ep'
 done
-# No old unscoped catalog can reach the startup worker.
-"$py" - "$(fieldtest_config_path)" <<'PY'
-import pathlib, sqlite3, sys, tomllib
-path = pathlib.Path(sys.argv[1])
-if path.exists():
-    config = tomllib.loads(path.read_text())
-    assert [v["serial"] for v in config["libraries"]] == ["DEC418146K_LL01"]
-    index = pathlib.Path(config["index"]["sqlite_path"])
-    if index.exists():
-        db = sqlite3.connect(index.as_uri() + "?mode=ro", uri=True)
-        allowed = {"AOX032L9", "AOX036L9", "AOX038L9", "AOX058L9"}
-        assert all(row[0] in allowed for row in db.execute("SELECT voltag FROM tapes WHERE state != 'retired'")), "catalog has tapes outside field scope"
-PY
+# The plan's reset leg archives the old catalogue before any startup.

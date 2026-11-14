@@ -16,6 +16,17 @@ neutral = set('00-preflight 01-allowlist 42-session-evidence 90-collect-evidence
 def check(legs, library, minimum):
     if library == 'DEC418146K_LL01':
         assert minimum == '1', 'single-drive LL01 requires exported FIELD_MIN_DRIVES=1'
+    # The reset replaces preflight's old-catalog read before any state opener.
+    reset_pending = False
+    for leg in legs:
+        _, script, *args = shlex.split(leg)
+        if script == '00-preflight.sh' and '--session-epoch-a' in args:
+            reset_pending = True
+        elif script == '05-reset-state.sh':
+            reset_pending = False
+        elif script in {'09-media-ready.sh', '03-bringup.sh'}:
+            assert not reset_pending, 'session-epoch preflight needs 05-reset-state before media-ready or bringup'
+    assert not reset_pending, 'session-epoch preflight needs 05-reset-state before startup'
     up = False
     for leg in legs:
         _, script, *args = shlex.split(leg)
@@ -43,7 +54,7 @@ def check(legs, library, minimum):
             up = False
         elif name in daemon_legs:
             assert up, f'{leg} needs daemon bring-up first'
-        elif name in {'09-media-ready', '10-init-pools', '33-diag-capture'}:
+        elif name in {'05-reset-state', '09-media-ready', '10-init-pools', '33-diag-capture'}:
             assert not up, f'{leg} needs daemon stop before direct SCSI'
         else:
             assert name in neutral, f'unclassified leg {leg}; declare its ownership'
@@ -55,8 +66,8 @@ for plan in sorted((root / 'plan').glob('*.env')):
     library, minimum, *legs = output.splitlines()
     check(legs, library, minimum)
     print(f'PASS: {plan.name} daemon ownership and single-drive setting')
-# Mutation cases include direct TEST UNIT READY while the daemon is up.
-for legs, minimum in [(['fatal 03-bringup.sh', 'fatal 09-media-ready.sh --count 4 --no-wait'], '1'), (['fatal 02-discovery.sh'], '1'), (['fatal 03-bringup.sh', 'fatal 10-init-pools.sh'], '1'), (['fatal 03-bringup.sh', 'fatal 33-diag-capture.sh'], '1'), (['fatal 32-robotics.sh'], '1'), ([], '')]:
+# Refused cases include reset and direct TEST UNIT READY while the daemon is up.
+for legs, minimum in [(['fatal 03-bringup.sh', 'fatal 05-reset-state.sh'], '1'), (['fatal 00-preflight.sh --session-epoch-a', 'fatal 03-bringup.sh', 'fatal 05-reset-state.sh'], '1'), (['fatal 00-preflight.sh --session-epoch-a', 'fatal 09-media-ready.sh --count 4 --no-wait', 'fatal 05-reset-state.sh'], '1'), (['fatal 00-preflight.sh --session-epoch-a'], '1'), (['fatal 03-bringup.sh', 'fatal 09-media-ready.sh --count 4 --no-wait'], '1'), (['fatal 02-discovery.sh'], '1'), (['fatal 03-bringup.sh', 'fatal 10-init-pools.sh'], '1'), (['fatal 03-bringup.sh', 'fatal 33-diag-capture.sh'], '1'), (['fatal 32-robotics.sh'], '1'), ([], '')]:
     try:
         check(legs, 'DEC418146K_LL01', minimum)
     except AssertionError:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reinitialize the four approved scratch identities with parity; stopped daemon
-# ownership is required for retirement and direct init. Preserve the old catalog.
+# ownership is required for retirement and direct init. The plan's reset leg reset the catalogue.
 set -euo pipefail
 scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$scripts/lib.sh"

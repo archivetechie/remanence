@@ -156,6 +156,30 @@ fieldtest_socket_path() {
   printf '%s\n' "$(fieldtest_home)/rem.sock"
 }
 
+# Probe a daemon endpoint without opening state; shared by startup and kit guards.
+is_socket_live() {
+  local endpoint="$1"
+  set +e
+  "$(fieldtest_rem_bin)" daemon --endpoint "$endpoint" health >/dev/null 2>&1
+  local rc=$?
+  set -e
+  [[ $rc -eq 0 ]]
+}
+
+# Report which of this kit's live-daemon checks matched, process first.
+# Neither check needs config.toml to exist.
+fieldtest_daemon_running() {
+  if pgrep -f "rem-daemon --config $(fieldtest_config_path)" >/dev/null 2>&1; then
+    printf '%s\n' process
+    return 0
+  fi
+  if [[ -S "$(fieldtest_socket_path)" ]] && is_socket_live "$(fieldtest_rem_endpoint)"; then
+    printf '%s\n' socket
+    return 0
+  fi
+  return 1
+}
+
 fieldtest_allowlist_path() {
   printf '%s\n' "$(fieldtest_home)/allowlist.txt"
 }

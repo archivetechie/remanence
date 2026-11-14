@@ -410,6 +410,123 @@ fn validate_preview(
     }
     Ok(())
 }
+/// Replace the current key only after the complete attempt history is synced.
+/// A sibling temporary file keeps readers from observing a partially written key.
+fn write_closeout_key(evidence: &Path, value: &Value) -> AppResult<()> {
+    let temporary = evidence.join(format!(".closeout-key-{}.tmp", Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        writeln!(file, "{value}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, evidence.join("closeout-key.json"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Run the explicit closeout through injected RPC, streaming watch and readiness
+/// calls. Ended attempts need a new key; the same key is reused only inside the
+/// send's RPC-level readiness retry. One fence retry bounds all watched waits.
+async fn closeout_with<SendCall, SendFuture, Watch, WatchFuture, Updates, Wait, WaitFuture>(
+    tape: Uuid,
+    pool: &str,
+    evidence: &Path,
+    mut send: SendCall,
+    mut watch: Watch,
+    mut wait: Wait,
+) -> AppResult<()>
+where
+    SendCall: FnMut(pb::CloseoutTapeRequest) -> SendFuture,
+    SendFuture: std::future::Future<Output = AppResult<Result<pb::OperationRef, tonic::Status>>>,
+    Watch: FnMut(pb::OperationRef) -> WatchFuture,
+    WatchFuture: std::future::Future<Output = AppResult<Updates>>,
+    Updates: tokio_stream::Stream<Item = Result<pb::OperationStatus, tonic::Status>> + Unpin,
+    Wait: FnMut(Uuid) -> WaitFuture,
+    WaitFuture: std::future::Future<Output = AppResult<()>>,
+{
+    let mut updates = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(evidence.join("closeout.jsonl"))?;
+    let mut fence_retry = OpenRetry::from_env()?;
+    let mut attempts = Vec::new();
+    let mut previous_closed_refusal = false;
+    loop {
+        let key = Uuid::new_v4();
+        let closeout_attempt = attempts.len() + 1;
+        attempts
+            .push(json!({"closeout_attempt":closeout_attempt,"idempotency_key":key.to_string()}));
+        write_closeout_key(
+            evidence,
+            &json!({"tape_uuid":tape.to_string(),"idempotency_key":key.to_string(),"attempts":attempts}),
+        )?;
+        let request = pb::CloseoutTapeRequest {
+            tape_uuid: tape.as_bytes().to_vec(),
+            expected_pool_id: Some(pool.to_string()),
+            idempotency_key: Some(pb::IdempotencyKey {
+                value: key.as_bytes().to_vec(),
+            }),
+        };
+        let operation = match send(request).await? {
+            Ok(operation) => {
+                previous_closed_refusal = false;
+                operation
+            }
+            Err(status)
+                if status.message().starts_with("ClosedOperationRetry:")
+                    && !previous_closed_refusal =>
+            {
+                previous_closed_refusal = true;
+                continue;
+            }
+            Err(status) => return Err(status.into()),
+        };
+        let mut stream = watch(operation).await?;
+        let mut fenced = None;
+        let mut succeeded = false;
+        while let Some(status) = tokio_stream::StreamExt::next(&mut stream).await {
+            let status = status?;
+            writeln!(
+                updates,
+                "{}",
+                json!({"operation_id":uuid_bytes_to_text(&status.operation_id)?,"state":status.state,"progress":status.progress,"error":status.error_summary,"closeout_attempt":closeout_attempt,"idempotency_key":key.to_string()})
+            )?;
+            updates.sync_data()?;
+            if status.state == pb::OperationState::Succeeded as i32 {
+                succeeded = true;
+            }
+            if status.state == pb::OperationState::Failed as i32 {
+                if media_readiness_operation_id(&status.error_summary).is_some() {
+                    fenced = Some(tonic::Status::failed_precondition(status.error_summary));
+                    break;
+                }
+                return Err(AppError::new("closeout failed; see watch"));
+            }
+        }
+        if succeeded {
+            return Ok(());
+        }
+        match fenced {
+            Some(status) => {
+                wait_before_open_retry_with(
+                    &status,
+                    &mut fence_retry,
+                    &mut std::io::stderr(),
+                    &mut wait,
+                )
+                .await?;
+            }
+            None => return Err(AppError::new("closeout watch ended without success")),
+        }
+    }
+}
+
 async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> {
     let mut catalog = pb::catalog_client::CatalogClient::new(channel.clone());
     if args.mode == "kill-mid-write" {
@@ -471,79 +588,36 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
             }
         }
     }
-    let key = Uuid::new_v4();
-    save(
-        &args.evidence.join("closeout-key.json"),
-        &json!({"tape_uuid":args.tape.to_string(),"idempotency_key":key.to_string()}),
-    )?;
-    // The same idempotency key on every retry. The daemon accepts the closeout
-    // and raises a readiness fence inside the operation (a reloaded cartridge is
-    // becoming ready), so a fenced attempt ends Failed naming the fence. Wait on
-    // that fence and re-issue; the daemon re-runs a failed keyed closeout.
-    let closeout_request = pb::CloseoutTapeRequest {
-        tape_uuid: args.tape.as_bytes().to_vec(),
-        expected_pool_id: Some(args.pool.clone()),
-        idempotency_key: Some(pb::IdempotencyKey {
-            value: key.as_bytes().to_vec(),
-        }),
-    };
-    let mut updates = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(args.evidence.join("closeout.jsonl"))?;
-    let mut fence_retry = OpenRetry::from_env()?;
-    let mut succeeded = false;
-    while !succeeded {
-        let operation = call_with_readiness_retry(channel.clone(), || {
-            let mut client = catalog.clone();
-            let request = closeout_request.clone();
-            async move { client.closeout_tape(request).await }
-        })
-        .await??;
-        let mut watch = pb::daemon_client::DaemonClient::new(channel.clone())
-            .watch_operation(pb::GetOperationRequest {
-                operation_id: operation.operation_id,
-            })
-            .await?
-            .into_inner();
-        let mut fenced: Option<tonic::Status> = None;
-        let mut ended = false;
-        while let Some(status) = watch.message().await? {
-            writeln!(
-                updates,
-                "{}",
-                json!({"operation_id":uuid_bytes_to_text(&status.operation_id)?,"state":status.state,"progress":status.progress,"error":status.error_summary})
-            )?;
-            updates.sync_data()?;
-            if status.state == pb::OperationState::Succeeded as i32 {
-                succeeded = true;
-                ended = true;
+    closeout_with(
+        args.tape,
+        &args.pool,
+        &args.evidence,
+        |request| {
+            let channel = channel.clone();
+            let catalog = catalog.clone();
+            async move {
+                call_with_readiness_retry(channel, || {
+                    let mut client = catalog.clone();
+                    let request = request.clone();
+                    async move { client.closeout_tape(request).await }
+                })
+                .await
             }
-            if status.state == pb::OperationState::Failed as i32 {
-                if media_readiness_operation_id(&status.error_summary).is_some() {
-                    fenced = Some(tonic::Status::failed_precondition(
-                        status.error_summary.clone(),
-                    ));
-                    ended = true;
-                    break;
-                }
-                return Err(AppError::new("closeout failed; see watch"));
+        },
+        |operation| {
+            let mut daemon = pb::daemon_client::DaemonClient::new(channel.clone());
+            async move {
+                Ok(daemon
+                    .watch_operation(pb::GetOperationRequest {
+                        operation_id: operation.operation_id,
+                    })
+                    .await?
+                    .into_inner())
             }
-        }
-        if succeeded {
-            break;
-        }
-        match fenced {
-            Some(status) => {
-                wait_before_open_retry(channel.clone(), &status, &mut fence_retry).await?
-            }
-            None if ended => break,
-            None => return Err(AppError::new("closeout watch ended without success")),
-        }
-    }
-    if !succeeded {
-        return Err(AppError::new("closeout watch ended without success"));
-    }
+        },
+        |id| wait_for_media_readiness_operation(channel.clone(), id),
+    )
+    .await?;
     let after = native(&args.log, args.tape)?;
     if after["W"] != after["T"] || after["open_session"].is_string() {
         return Err(AppError::new("closeout did not discharge session debt"));
@@ -594,6 +668,293 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These fakes exercise the production loop, including real fence accounting
+    // and the durable key file as it exists immediately before every send.
+    fn closeout_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("closeout-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+    fn fake_operation(number: u8) -> pb::OperationRef {
+        pb::OperationRef {
+            operation_id: vec![number; 16],
+        }
+    }
+    fn fake_update(
+        operation: &pb::OperationRef,
+        state: pb::OperationState,
+        error: &str,
+    ) -> pb::OperationStatus {
+        pb::OperationStatus {
+            operation_id: operation.operation_id.clone(),
+            state: state as i32,
+            progress: [("attempt".into(), "999".into())].into_iter().collect(),
+            error_summary: error.into(),
+            ..Default::default()
+        }
+    }
+    fn assert_key_history(dir: &Path, tape: Uuid, keys: &[Uuid]) {
+        let current = read_json(&dir.join("closeout-key.json")).unwrap();
+        assert_eq!(current["tape_uuid"], tape.to_string());
+        assert_eq!(current["idempotency_key"], keys.last().unwrap().to_string());
+        let expected: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| json!({"closeout_attempt":i+1,"idempotency_key":key.to_string()}))
+            .collect();
+        assert_eq!(current["attempts"], json!(expected));
+        assert!(!std::fs::read_dir(dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+    }
+    fn closeout_rows(dir: &Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("closeout.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    #[tokio::test]
+    async fn closeout_readiness_failure_uses_new_key() {
+        let dir = closeout_test_dir("readiness");
+        let tape = Uuid::new_v4();
+        let fence = Uuid::new_v4();
+        // Replacing an existing file is required; save(create_new) cannot do it.
+        std::fs::write(dir.join("closeout-key.json"), b"stale key\n").unwrap();
+        let mut keys = Vec::new();
+        let mut waited = Vec::new();
+        closeout_with(
+            tape,
+            "fieldtest-a",
+            &dir,
+            |request| {
+                assert_eq!(request.tape_uuid, tape.as_bytes());
+                assert_eq!(request.expected_pool_id.as_deref(), Some("fieldtest-a"));
+                let key = Uuid::from_slice(&request.idempotency_key.unwrap().value).unwrap();
+                let duplicate = keys.contains(&key);
+                keys.push(key);
+                assert_key_history(&dir, tape, &keys);
+                std::future::ready(Ok(if duplicate {
+                    Err(tonic::Status::failed_precondition(
+                        "ClosedOperationRetry: ended key",
+                    ))
+                } else {
+                    Ok(fake_operation(keys.len() as u8))
+                }))
+            },
+            |operation| {
+                let (state, error) = if operation.operation_id == vec![1; 16] {
+                    (
+                        pb::OperationState::Failed,
+                        format!("media-readiness fence operation={fence}"),
+                    )
+                } else {
+                    (pb::OperationState::Succeeded, String::new())
+                };
+                std::future::ready(Ok(tokio_stream::iter(vec![
+                    Ok(fake_update(&operation, pb::OperationState::Running, "")),
+                    Ok(fake_update(&operation, state, &error)),
+                ])))
+            },
+            |id| {
+                waited.push(id);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(waited, vec![fence]);
+        assert_key_history(&dir, tape, &keys);
+        let rows = closeout_rows(&dir);
+        assert_eq!(rows.len(), 4);
+        for (i, row) in rows.iter().enumerate() {
+            let attempt = i / 2;
+            assert_eq!(row["closeout_attempt"], attempt + 1);
+            assert_eq!(row["idempotency_key"], keys[attempt].to_string());
+            assert_eq!(
+                row["operation_id"],
+                Uuid::from_bytes([attempt as u8 + 1; 16]).to_string()
+            );
+            assert_eq!(row["progress"]["attempt"], "999");
+        }
+        assert_eq!(rows[1]["state"], pb::OperationState::Failed as i32);
+        assert_eq!(rows[3]["state"], pb::OperationState::Succeeded as i32);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn closeout_closed_refusal_once_retries_without_wait() {
+        let dir = closeout_test_dir("closed-once");
+        let tape = Uuid::new_v4();
+        let mut keys = Vec::new();
+        let mut waits = 0;
+        closeout_with(
+            tape,
+            "fieldtest-a",
+            &dir,
+            |request| {
+                keys.push(Uuid::from_slice(&request.idempotency_key.unwrap().value).unwrap());
+                assert_key_history(&dir, tape, &keys);
+                std::future::ready(Ok(if keys.len() == 1 {
+                    Err(tonic::Status::failed_precondition(
+                        "ClosedOperationRetry: fresh but ended",
+                    ))
+                } else {
+                    Ok(fake_operation(2))
+                }))
+            },
+            |operation| {
+                std::future::ready(Ok(tokio_stream::iter(vec![Ok(fake_update(
+                    &operation,
+                    pb::OperationState::Succeeded,
+                    "",
+                ))])))
+            },
+            |_| {
+                waits += 1;
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(waits, 0);
+        assert_key_history(&dir, tape, &keys);
+        let rows = closeout_rows(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["closeout_attempt"], 2);
+        assert_eq!(rows[0]["idempotency_key"], keys[1].to_string());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn closeout_consecutive_closed_refusals_stop() {
+        let dir = closeout_test_dir("closed-bound");
+        let tape = Uuid::new_v4();
+        let mut keys = Vec::new();
+        let mut watches = 0;
+        let mut waits = 0;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            closeout_with(
+                tape,
+                "fieldtest-a",
+                &dir,
+                |request| {
+                    keys.push(Uuid::from_slice(&request.idempotency_key.unwrap().value).unwrap());
+                    async {
+                        // A fake that refuses forever must still let the test's
+                        // deadline run if the production consecutive bound is lost.
+                        tokio::task::yield_now().await;
+                        Ok(Err(tonic::Status::failed_precondition(
+                            "ClosedOperationRetry: always ended",
+                        )))
+                    }
+                },
+                |_| {
+                    watches += 1;
+                    std::future::ready(Ok(tokio_stream::iter(Vec::<
+                        Result<pb::OperationStatus, tonic::Status>,
+                    >::new())))
+                },
+                |_| {
+                    waits += 1;
+                    std::future::ready(Ok(()))
+                },
+            ),
+        )
+        .await
+        .expect("consecutive closeout refusal bound did not finish");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ClosedOperationRetry: always ended"));
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(watches, 0);
+        assert_eq!(waits, 0);
+        assert_key_history(&dir, tape, &keys);
+        assert!(closeout_rows(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn closeout_nonreadiness_failure_stops() {
+        let dir = closeout_test_dir("other-failure");
+        let mut sends = 0;
+        let mut waits = 0;
+        let result = closeout_with(
+            Uuid::new_v4(),
+            "fieldtest-a",
+            &dir,
+            |_| {
+                sends += 1;
+                std::future::ready(Ok(Ok(fake_operation(1))))
+            },
+            |operation| {
+                std::future::ready(Ok(tokio_stream::iter(vec![Ok(fake_update(
+                    &operation,
+                    pb::OperationState::Failed,
+                    "medium damage",
+                ))])))
+            },
+            |_| {
+                waits += 1;
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "closeout failed; see watch"
+        );
+        assert_eq!(sends, 1);
+        assert_eq!(waits, 0);
+        assert_eq!(closeout_rows(&dir)[0]["closeout_attempt"], 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn closeout_same_readiness_fence_is_not_waited_twice() {
+        let dir = closeout_test_dir("same-fence");
+        let fence = Uuid::new_v4();
+        let mut sends = 0;
+        let mut waited = Vec::new();
+        let result = closeout_with(
+            Uuid::new_v4(),
+            "fieldtest-a",
+            &dir,
+            |_| {
+                sends += 1;
+                std::future::ready(Ok(Ok(fake_operation(sends))))
+            },
+            |operation| {
+                std::future::ready(Ok(tokio_stream::iter(vec![Ok(fake_update(
+                    &operation,
+                    pb::OperationState::Failed,
+                    &format!("media-readiness fence operation={fence}"),
+                ))])))
+            },
+            |id| {
+                waited.push(id);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("media-readiness fence operation={fence}")));
+        assert_eq!(sends, 2);
+        assert_eq!(waited, vec![fence]);
+        let rows = closeout_rows(&dir);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["closeout_attempt"], 1);
+        assert_eq!(rows[1]["closeout_attempt"], 2);
+        assert_ne!(rows[0]["idempotency_key"], rows[1]["idempotency_key"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     /// Feed actual native v2 bytes into the same printer used in the field.
     /// Exported files are shell-test fixtures, not hand-authored CLI responses.
     #[test]

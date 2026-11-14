@@ -86,6 +86,20 @@ def verify(evidence, mode, control):
     assert marks and any(i > marks[0] and r["cdb"][0] == 0x10 and r["cdb"][2:5] == [0,0,0] for i,r in enumerate(subsequent)), "missing sidecar WRITE -> filemark -> barrier order"
     watches = [json.loads(line) for line in (evidence / "closeout.jsonl").read_text().splitlines()]
     assert watches and any(r["progress"].get("phase") == "complete" for r in watches)
+    # Count only this helper's explicit requests, before adding worker progress.
+    closeout_attempts = []
+    by_attempt = {}
+    for row in watches:
+        number = row["closeout_attempt"]
+        if number not in by_attempt:
+            attempt = {"closeout_attempt": number, "idempotency_key": row["idempotency_key"],
+                       "operation_ids": [], "state": row["state"]}
+            by_attempt[number] = attempt
+            closeout_attempts.append(attempt)
+        attempt = by_attempt[number]
+        if row["operation_id"] not in attempt["operation_ids"]:
+            attempt["operation_ids"].append(row["operation_id"])
+        attempt["state"] = row["state"]
     watches += [json.loads(line) for line in (evidence / "progress.jsonl").read_text().splitlines()]
     memory = [json.loads(line) for line in (evidence / "memory.jsonl").read_text().splitlines()]
     assert memory and all(r["VmRSS_kib"] > 0 and r["VmHWM_kib"] > 0 for r in memory)
@@ -111,6 +125,7 @@ def verify(evidence, mode, control):
                      for name, opcodes in {"read": [8], "write": [10], "position": [1, 0x11, 0x2b, 0x34, 0x92], "filemark_and_barrier": [0x10]}.items()}
     save(evidence / "metrics.json", {
         "sidecar_identity": sidecar,
+        "closeout_attempts": closeout_attempts,
         "transport_duration_ns": command_times,
         "host_stages": host,
         "attempts": [{"operation_id": r["operation_id"], "attempt": r["progress"].get("attempt")} for r in watches],

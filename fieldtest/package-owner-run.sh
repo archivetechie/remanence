@@ -1,13 +1,39 @@
 #!/usr/bin/env bash
 # Build a committed owner kit, or a clearly marked local dry package for review.
-# Usage: package-owner-run.sh [--dry-run] OUT
+# Usage: package-owner-run.sh [--dry-run] [--expect-commit <sha>] OUT
 set -euo pipefail
 dry=0
-if [[ ${1:-} == --dry-run ]]; then dry=1; shift; fi
-[[ $# == 1 ]] || { echo 'usage: package-owner-run.sh [--dry-run] OUT' >&2; exit 2; }
+expected=""
+has_expected=0
+usage() {
+  echo 'usage: package-owner-run.sh [--dry-run] [--expect-commit <sha>] OUT' >&2
+  exit 2
+}
+while (( $# )); do
+  case "$1" in
+    --dry-run) dry=1; shift ;;
+    --expect-commit)
+      (( $# >= 2 )) || usage
+      expected=$2
+      has_expected=1
+      shift 2
+      ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+[[ $# == 1 ]] || usage
+(( dry || has_expected )) || usage
 out=$1
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repo"
+if (( has_expected )); then
+  head=$(git rev-parse HEAD)
+  if ! reviewed=$(git rev-parse --verify --quiet "${expected}^{commit}") || [[ "$reviewed" != "$head" ]]; then
+    echo "refused: HEAD $head does not match --expect-commit $expected" >&2
+    exit 1
+  fi
+fi
 if (( ! dry )) && [[ -n $(git status --porcelain) ]]; then
   echo 'refused: owner package must match a clean commit; use --dry-run for uncommitted review' >&2
   exit 1

@@ -21,11 +21,14 @@ main() {
   fi
 
   fieldtest_init_layout
-  local evidence_dir summary pack_path
+  local evidence_dir summary pack_path py daemon_running=0
   evidence_dir="$(fieldtest_evidence_dir)"
+  py="$(fieldtest_python)" || return 2
+  # Make one decision for both the summary and the archive, before writing either.
+  if fieldtest_daemon_running >/dev/null; then daemon_running=1; fi
   summary="$evidence_dir/SUMMARY.md"
   pack_path="${FIELD_EVIDENCE_PACK:-$(fieldtest_home)/evidence-pack-$(date -u +%Y%m%d).tar.gz}"
-  python3 - "$evidence_dir" "$summary" <<'PY'
+  "$py" - "$evidence_dir" "$summary" "$daemon_running" <<'PY'
 import csv
 import json
 import sys
@@ -37,6 +40,8 @@ summary = Path(sys.argv[2])
 records = evidence / "records.jsonl"
 bench = evidence / "bench.csv"
 lines = ["# Evidence Summary", ""]
+if sys.argv[3] == "1":
+    lines += ["The daemon is running; library and tape logs are taken at teardown, with the authority manifest and reset receipt.", ""]
 if records.exists():
     by_script = defaultdict(list)
     for raw in records.read_text().splitlines():
@@ -61,7 +66,7 @@ if bench.exists():
             lines.append(f"| {row['metric']} | {row['drive']} | {row['block_size']} | {row['payload']} | {row['MB_s']} | {row['seconds']} | {row['bytes']} | {row.get('object_id', '')} | {row.get('daemon_drive_append_mib_s', '')} | {row.get('staging_mode', '')} | {row.get('daemon_diagnostics', '')} |")
 summary.write_text("\n".join(lines) + "\n")
 PY
-  python3 - "$evidence_dir" "$pack_path" <<'PY'
+  "$py" - "$evidence_dir" "$pack_path" "$(fieldtest_state_dir)" "$daemon_running" <<'PY'
 import os
 import tarfile
 import sys
@@ -69,6 +74,7 @@ from pathlib import Path
 
 evidence = Path(sys.argv[1])
 pack = Path(sys.argv[2])
+state = Path(sys.argv[3])
 with tarfile.open(pack, "w:gz") as tf:
     tf.add(evidence, arcname="evidence")
     config = evidence.parent / "config.toml"
@@ -77,6 +83,12 @@ with tarfile.open(pack, "w:gz") as tf:
     log = evidence.parent / "log" / "rem-daemon.log"
     if log.exists():
         tf.add(log, arcname="rem-daemon.log")
+    if sys.argv[4] == "0":
+        for pattern in ("audit/*.remlib", "journals/tapes/*.remtape",
+                        "authority-manifest.json", "authority-reset-receipt.json"):
+            for path in sorted(state.glob(pattern)):
+                if path.is_file():
+                    tf.add(path, arcname=str(Path("state") / path.relative_to(state)))
 PY
   fieldtest_evidence_record "$SCRIPT_NAME" collect PASS "wrote $(basename "$pack_path") and SUMMARY.md" "$summary"
   printf '%s\n' "$pack_path"
