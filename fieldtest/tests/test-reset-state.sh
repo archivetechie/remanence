@@ -3,6 +3,7 @@
 set -euo pipefail
 scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../scripts" && pwd)"
 python3 - "$scripts" "${1:-all}" <<'PY'
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,9 @@ if os.environ['RESET_MODE'] == 'fail':
     print('reset failed first line', flush=True)
     print('reset failed last line', file=sys.stderr)
     sys.exit(2)
+if os.environ['RESET_MODE'] == 'missing-manifest':
+    print('catalog reset ok')
+    sys.exit(0)
 (home / 'state/authority-manifest.json').write_text('{"manifest":"new"}\\n')
 if os.environ['RESET_MODE'] == 'receipt':
     (home / 'state/authority-reset-receipt.json').write_text('{"receipt":"new"}\\n')
@@ -49,14 +53,18 @@ sys.exit(1)
 ''')
     rem.chmod(0o755)
     pgrep.chmod(0o755)
-    for case in ['a', 'a-fallback', 'b', 'c']:
+    for case in ['a', 'a-fallback', 'b', 'c', 'outside', 'home', 'lock', 'missing-manifest']:
         if selected != 'all' and selected != case:
             continue
         home = root / case
         (home / 'state').mkdir(parents=True)
         if case == 'a-fallback':
-            scratch = root / 'scratch-spool'
+            scratch = home / 'ram'
             scratch.mkdir()
+            (home / 'spool').symlink_to(scratch, target_is_directory=True)
+        if case in {'outside', 'home'}:
+            scratch = root / 'outside-spool' if case == 'outside' else home
+            scratch.mkdir(exist_ok=True)
             (home / 'spool').symlink_to(scratch, target_is_directory=True)
         (home / 'spool/nested').mkdir(parents=True)
         (home / 'spool/nested/data').write_text('scratch')
@@ -67,13 +75,49 @@ sys.exit(1)
         before = {p: (home / p).read_bytes() for p in ['config.toml', 'state/selected-library']}
         env = dict(os.environ, REMFIELD_HOME=str(home), FIELD_BIN_DIR=str(bins), FIELDTEST_LOCK_HELD='1',
                    PATH=f"{bins}:{os.environ['PATH']}", LIVE_DAEMON='1' if case == 'b' else '0',
-                   RESET_MODE='fail' if case == 'c' else 'receipt' if case == 'a' else 'no-receipt')
+                   RESET_MODE='fail' if case == 'c' else 'receipt' if case == 'a' else 'missing-manifest' if case == 'missing-manifest' else 'no-receipt')
         env.pop('FIELDTEST_LIBRARY_SERIAL', None)
         if case != 'a-fallback':
             env['FIELDTEST_LIBRARY_SERIAL'] = 'DEC418146K_LL01'
-        result = subprocess.run(['bash', str(scripts / '05-reset-state.sh')], env=env, capture_output=True, text=True, timeout=15)
+        command = ['bash', str(scripts / '05-reset-state.sh')]
+        if case == 'lock':
+            # The kit's work lock uses the same flock protocol as test-read-rate.
+            env.pop('FIELDTEST_LOCK_HELD', None)
+            with (home / 'work.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    try:
+                        output = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        output = None
+                    assert output is None and process.poll() is None, 'T8 reset ran without waiting for work.lock'
+                    assert not (home / 'calls').exists(), 'T8 reset called rem while work.lock held'
+                except BaseException:
+                    if process.poll() is None:
+                        process.kill()  # Only this exact child PID, before it can take the lock.
+                    process.communicate(timeout=5)
+                    raise
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            try:
+                stdout, stderr = process.communicate(timeout=15)
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+                raise
+            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        else:
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+        if case in {'outside', 'home'}:
+            assert (home / 'spool/nested/data').is_file(), f'T7({case}) spool target contents removed'
+            assert (home / 'spool/nested/data').read_bytes() == b'scratch', f'T7({case}) spool contents changed'
+            assert (home / 'spool/.hidden').read_bytes() == b'hidden scratch', f'T7({case}) hidden spool contents changed'
+            assert (home / 'state/kit-sentinel').read_text() == 'keep', f'T7({case}) kit contents removed'
+
         calls = [json.loads(line) for line in (home / 'calls').read_text().splitlines()] if (home / 'calls').exists() else []
-        rows = [json.loads(line) for line in (home / 'evidence/records.jsonl').read_text().splitlines()]
+        rows = [json.loads(line) for line in (home / 'evidence/records.jsonl').read_text().splitlines()] if (home / 'evidence/records.jsonl').exists() else []
         if case == 'b':
             assert result.returncode == 1, ('T2(b) live daemon must refuse', result)
             assert not calls, 'T2(b) live daemon reached reset'
@@ -86,6 +130,12 @@ sys.exit(1)
             assert len(calls) == 1, calls
             assert (home / 'spool/nested/data').exists() and (home / 'spool/.hidden').exists()
             assert any(r['status'] == 'FAIL' and 'reset failed last line' in r['summary'] for r in rows), rows
+        elif case == 'missing-manifest':
+            assert result.returncode != 0, 'T9(b) missing manifest accepted'
+            assert len(calls) == 1, calls
+            assert any(r['status'] == 'FAIL' and 'authority-manifest.json' in r['summary'] for r in rows), ('T9(b) no manifest copy FAIL record', rows)
+            assert not any(r['status'] == 'PASS' and r['test_id'] == 'reset' for r in rows), rows
+            assert (home / 'spool/nested/data').read_text() == 'scratch' and (home / 'spool/.hidden').exists(), 'T9(b) spool touched after failed manifest copy'
         else:
             assert result.returncode == 0, result.stdout + result.stderr
             assert calls == [['reset-catalog', '--config', str(home / 'config.toml'), '--i-understand-this-erases-the-catalog']], calls
@@ -99,10 +149,24 @@ sys.exit(1)
                 assert (home / 'evidence/authority-reset-receipt.json').read_bytes() == (home / 'state/authority-reset-receipt.json').read_bytes()
             else:
                 assert not (home / 'evidence/authority-reset-receipt.json').exists()
-            assert (home / 'spool').is_dir() and not list((home / 'spool').iterdir()), 'T2(a) spool not emptied'
+            if case in {'outside', 'home'}:
+                resolved = str(scratch.resolve())
+                assert (home / 'spool').is_symlink() and scratch.is_dir(), f'T7({case}) spool link or target lost'
+                assert any(r['status'] == 'WARN' and resolved in r['summary'] for r in rows), ('T7 warning missing resolved spool', rows)
+                assert any(r['status'] == 'PASS' and r['test_id'] == 'reset' and 'spool left' in r['summary'] and 'emptied' not in r['summary'] for r in rows), ('T7 PASS must say spool left', rows)
+            else:
+                assert (home / 'spool').is_dir() and not list((home / 'spool').iterdir()), 'T2(a) spool not emptied'
+            if case == 'a-fallback':
+                assert (home / 'spool').is_symlink() and scratch.is_dir(), 'T7(a) spool link or target lost'
             assert (home / 'state/kit-sentinel').read_text() == 'keep'
             assert any(r['status'] == 'PASS' for r in rows), rows
             artifacts = [Path(r['detail_path']) for r in rows if r.get('detail_path')]
-            assert any('catalog reset ok' in p.read_text() for p in artifacts), artifacts
+            assert artifacts, 'T9(a) missing reset artifact'
+            for artifact in artifacts:
+                try:
+                    payload = json.loads(artifact.read_text())
+                except (ValueError, OSError) as error:
+                    raise AssertionError(f'T9(a) reset artifact is not JSON: {artifact}') from error
+                assert payload['exit_code'] == 0 and 'catalog reset ok' in payload['stdout'], ('T9(a)', payload)
         print(f'PASS: T2({case}) reset-state')
 PY

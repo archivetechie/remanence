@@ -252,9 +252,9 @@ evidence and printed as warnings; waits longer than `FIELD_READY_FAIL_SECS`
 are hard stops. Terminal, timeout, or transport-unknown readiness results
 remain hard stops.
 **If blocked:** a single drive failing → continue on the other, note in
-evidence; catalog errors → capture `evidence/` + daemon log, then stop and
-investigate. For session-epoch-a, retry by rerunning its plan so the reset leg
-runs before startup.
+evidence; catalog errors → capture `evidence/` + daemon log, then
+`91-cleanup.sh --state-only` and retry once from 1.1. For session-epoch-a,
+retry by rerunning its plan so the reset leg runs before startup.
 
 ---
 
@@ -519,7 +519,8 @@ on. A refused unsafe operation is a PASS.
 
 Run `run.sh plan/session-epoch-a.env` using OWNER.md's written Miria exclusion,
 capability custody and explicit field arming (`REM_FIELD_ALLOW_FAIL=1`). The plan verifies the exact
-four AOX barcodes, resets kit state with `05-reset-state.sh`, checks readiness,
+four AOX barcodes, resets kit state with `05-reset-state.sh` (emptying the spool
+only when it lies inside the kit home and otherwise recording a warning), checks readiness,
 starts the scoped daemon, discovers LL01, stops it for retirement/re-init with default parity and pool assignment, and
 restarts it before the three fault legs. It then measures the near-full range
 and live control, restores every committed prefix again, exports the actual

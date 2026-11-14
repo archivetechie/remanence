@@ -6,7 +6,7 @@ source "$scripts/lib.sh"
 [[ ${FIELD_SESSION_EPOCH_ARM:-} == session-epoch-a ]] || { echo 'field leg A is not owner armed' >&2; exit 2; }
 [[ ${REM_FIELD_ALLOW_FAIL:-} == 1 ]] || { echo 'failed-append requires REM_FIELD_ALLOW_FAIL=1' >&2; exit 2; }
 fieldtest_init_layout
-py="$(fieldtest_python)" || exit 2
+fieldtest_python >/dev/null || exit 2
 out="$(fieldtest_evidence_dir)/session-epoch-preflight"
 mkdir -p "$out"
 python3 - "${FIELD_MIRIA_ATTESTATION:?set written attestation path}" "$out" <<'PY'

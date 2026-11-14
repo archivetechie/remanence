@@ -133,8 +133,9 @@ Use a committed **field-kit** package for migration step 3. Dry packages refuse
 hardware use. This plan destroys and reinitializes AOX032L9, AOX036L9, AOX038L9
 and AOX058L9 with default parity, then checks kill, stream abort and failed
 append closeout. It also measures a near-full epoch and a live-close control.
-The plan's first legs reset the kit state; the old catalogue is archived on the
-host under `~/remfield/state/reset-archives/`. Keep other clients idle. The new
+The plan's first legs reset the kit state, emptying the spool only when it lies
+inside the kit home and otherwise recording a warning; the old catalogue is
+archived on the host under `~/remfield/state/reset-archives/`. Keep other clients idle. The new
 manifest, reset receipt and re-init results enter the evidence.
 
 Before running, write a dated, signed text file containing the exact statement

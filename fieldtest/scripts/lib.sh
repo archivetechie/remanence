@@ -158,11 +158,8 @@ fieldtest_socket_path() {
 
 # Probe a daemon endpoint without opening state; shared by startup and kit guards.
 is_socket_live() {
-  local endpoint="$1"
-  set +e
-  "$(fieldtest_rem_bin)" daemon --endpoint "$endpoint" health >/dev/null 2>&1
-  local rc=$?
-  set -e
+  local endpoint="$1" rc=0
+  "$(fieldtest_rem_bin)" daemon --endpoint "$endpoint" health >/dev/null 2>&1 || rc=$?
   [[ $rc -eq 0 ]]
 }
 

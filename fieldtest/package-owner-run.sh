@@ -29,7 +29,7 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repo"
 if (( has_expected )); then
   head=$(git rev-parse HEAD)
-  if ! reviewed=$(git rev-parse --verify --quiet "${expected}^{commit}") || [[ "$reviewed" != "$head" ]]; then
+  if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]] || ! reviewed=$(git rev-parse --verify --quiet "${expected}^{commit}") || [[ "$reviewed" != "$head" ]]; then
     echo "refused: HEAD $head does not match --expect-commit $expected" >&2
     exit 1
   fi
