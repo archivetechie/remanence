@@ -520,7 +520,8 @@ on. A refused unsafe operation is a PASS.
 Run `run.sh plan/session-epoch-a.env` using OWNER.md's written Miria exclusion,
 capability custody and explicit field arming (`REM_FIELD_ALLOW_FAIL=1`). The plan verifies the exact
 four AOX barcodes, resets kit state with `05-reset-state.sh` (emptying the spool
-only when it lies inside the kit home and otherwise recording a warning), checks readiness,
+only when it is its own directory inside the kit home, not one of the kit's state,
+evidence, log, binary or temporary directories, and otherwise recording a warning), checks readiness,
 starts the scoped daemon, discovers LL01, stops it for retirement/re-init with default parity and pool assignment, and
 restarts it before the three fault legs. It then measures the near-full range
 and live control, restores every committed prefix again, exports the actual

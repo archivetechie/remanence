@@ -53,7 +53,7 @@ sys.exit(1)
 ''')
     rem.chmod(0o755)
     pgrep.chmod(0o755)
-    for case in ['a', 'a-fallback', 'b', 'c', 'outside', 'home', 'lock', 'missing-manifest']:
+    for case in ['a', 'a-fallback', 'b', 'c', 'outside', 'home', 'kitdir', 'lock', 'missing-manifest', 'args', 'unreadable']:
         if selected != 'all' and selected != case:
             continue
         home = root / case
@@ -62,10 +62,16 @@ sys.exit(1)
             scratch = home / 'ram'
             scratch.mkdir()
             (home / 'spool').symlink_to(scratch, target_is_directory=True)
-        if case in {'outside', 'home'}:
-            scratch = root / 'outside-spool' if case == 'outside' else home
+        if case in {'outside', 'home', 'kitdir'}:
+            scratch = root / 'outside-spool' if case == 'outside' else home if case == 'home' else home / 'evidence'
             scratch.mkdir(exist_ok=True)
+            if case == 'kitdir':
+                (scratch / 'earlier-leg.json').write_text('{"keep": true}\n')
             (home / 'spool').symlink_to(scratch, target_is_directory=True)
+        if case == 'unreadable':
+            # The artifact cannot be written, so the FAIL path reads no output.
+            (home / 'evidence/05-reset-state').mkdir(parents=True)
+            (home / 'evidence/05-reset-state').chmod(0o555)
         (home / 'spool/nested').mkdir(parents=True)
         (home / 'spool/nested/data').write_text('scratch')
         (home / 'spool/.hidden').write_text('hidden scratch')
@@ -75,11 +81,22 @@ sys.exit(1)
         before = {p: (home / p).read_bytes() for p in ['config.toml', 'state/selected-library']}
         env = dict(os.environ, REMFIELD_HOME=str(home), FIELD_BIN_DIR=str(bins), FIELDTEST_LOCK_HELD='1',
                    PATH=f"{bins}:{os.environ['PATH']}", LIVE_DAEMON='1' if case == 'b' else '0',
-                   RESET_MODE='fail' if case == 'c' else 'receipt' if case == 'a' else 'missing-manifest' if case == 'missing-manifest' else 'no-receipt')
+                   RESET_MODE='fail' if case in {'c', 'unreadable'} else 'receipt' if case == 'a' else 'missing-manifest' if case == 'missing-manifest' else 'no-receipt')
         env.pop('FIELDTEST_LIBRARY_SERIAL', None)
         if case != 'a-fallback':
             env['FIELDTEST_LIBRARY_SERIAL'] = 'DEC418146K_LL01'
         command = ['bash', str(scripts / '05-reset-state.sh')]
+        if case == 'args':
+            # --selftest makes the lock wrapper skip the lock: the leg must refuse any argument before it writes.
+            env.pop('FIELDTEST_LOCK_HELD', None)
+            for argument, expected in [('--selftest', 2), ('extra', 2), ('--help', 0)]:
+                result = subprocess.run(command + [argument], env=env, capture_output=True, text=True, timeout=15)
+                assert result.returncode == expected, (f'T13 {argument} exit', result)
+                assert not (home / 'calls').exists(), f'T13 {argument} reached the reset'
+                assert all((home / p).read_bytes() == value for p, value in before.items()), f'T13 {argument} rewrote kit config or selection'
+                assert (home / 'spool/nested/data').read_text() == 'scratch' and (home / 'spool/.hidden').exists(), f'T13 {argument} touched the spool'
+            print(f'PASS: T2({case}) reset-state')
+            continue
         if case == 'lock':
             # The kit's work lock uses the same flock protocol as test-read-rate.
             env.pop('FIELDTEST_LOCK_HELD', None)
@@ -110,7 +127,9 @@ sys.exit(1)
             result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         else:
             result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
-        if case in {'outside', 'home'}:
+        if case == 'unreadable':
+            (home / 'evidence/05-reset-state').chmod(0o755)
+        if case in {'outside', 'home', 'kitdir'}:
             assert (home / 'spool/nested/data').is_file(), f'T7({case}) spool target contents removed'
             assert (home / 'spool/nested/data').read_bytes() == b'scratch', f'T7({case}) spool contents changed'
             assert (home / 'spool/.hidden').read_bytes() == b'hidden scratch', f'T7({case}) hidden spool contents changed'
@@ -125,6 +144,11 @@ sys.exit(1)
             assert all((home / p).read_bytes() == value for p, value in before.items()), 'T2(b) refusal rewrote kit config or selection'
             assert (home / 'spool/nested/data').read_text() == 'scratch' and (home / 'spool/.hidden').exists()
             assert any(r['status'] == 'FAIL' for r in rows), rows
+        elif case == 'unreadable':
+            assert result.returncode == 2, ('T14 unreadable reset output must keep the reset exit code', result)
+            assert len(calls) == 1, calls
+            assert any(r['status'] == 'FAIL' and r['test_id'] == 'reset' and 'exit 2' in r['summary'] and 'unreadable' in r['summary'] for r in rows), ('T14 no FAIL record for an unreadable reset output', rows)
+            assert (home / 'spool/nested/data').read_text() == 'scratch' and (home / 'spool/.hidden').exists()
         elif case == 'c':
             assert result.returncode != 0, 'T2(c) failed reset accepted'
             assert len(calls) == 1, calls
@@ -149,7 +173,9 @@ sys.exit(1)
                 assert (home / 'evidence/authority-reset-receipt.json').read_bytes() == (home / 'state/authority-reset-receipt.json').read_bytes()
             else:
                 assert not (home / 'evidence/authority-reset-receipt.json').exists()
-            if case in {'outside', 'home'}:
+            if case == 'kitdir':
+                assert (scratch / 'earlier-leg.json').read_text() == '{"keep": true}\n', 'T7(kitdir) earlier evidence removed'
+            if case in {'outside', 'home', 'kitdir'}:
                 resolved = str(scratch.resolve())
                 assert (home / 'spool').is_symlink() and scratch.is_dir(), f'T7({case}) spool link or target lost'
                 assert any(r['status'] == 'WARN' and resolved in r['summary'] for r in rows), ('T7 warning missing resolved spool', rows)

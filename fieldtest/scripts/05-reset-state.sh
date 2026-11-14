@@ -7,6 +7,16 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 main() {
   set -euo pipefail
+  # No arguments: the lock wrapper runs `--selftest` without the work lock, so an
+  # argument must never reach the reset.
+  if (( $# )); then
+    if (( $# == 1 )) && [[ "$1" == --help || "$1" == -h ]]; then
+      echo 'Usage: 05-reset-state.sh (no arguments): the whole-state reset of this kit for the plan'
+      return 0
+    fi
+    echo 'usage: 05-reset-state.sh (takes no arguments)' >&2
+    return 2
+  fi
   fieldtest_init_layout
   if fieldtest_daemon_running >/dev/null; then
     fieldtest_evidence_record "$SCRIPT_NAME" live-daemon FAIL "refusing reset while this kit's daemon is running; run 03-bringup.sh --stop first"
@@ -44,7 +54,7 @@ if not lines:
     lines = [line for line in payload['stdout'].splitlines() if line.strip()]
 print(lines[-1] if lines else '')
 PY
-)"
+)" || last_line='(reset output unreadable)'
     fieldtest_evidence_record "$SCRIPT_NAME" reset FAIL "reset failed (exit $rc): $last_line" "$output"
     return "$rc"
   fi
@@ -64,7 +74,18 @@ PY
     fieldtest_evidence_record "$SCRIPT_NAME" spool FAIL "spool resolution failed for $(fieldtest_spool_dir)" "$output"
     return 1
   fi
-  if [[ -d "$spool" && "$spool" == "$home/"* ]]; then
+  # The spool must not be, contain or lie inside one of the kit's own directories.
+  local own own_dir inside_own=0
+  for own in "$(fieldtest_bin_dir)" "$(fieldtest_state_dir)" "$(fieldtest_log_dir)" "$(fieldtest_evidence_dir)" "$home/bin" "$home/tmp"; do
+    if ! own_dir="$(readlink -f -- "$own")" || [[ -z "$own_dir" ]]; then
+      fieldtest_evidence_record "$SCRIPT_NAME" spool FAIL "spool resolution failed for $own" "$output"
+      return 1
+    fi
+    if [[ "$spool" == "$own_dir" || "$spool" == "$own_dir/"* || "$own_dir" == "$spool/"* ]]; then
+      inside_own=1
+    fi
+  done
+  if [[ -d "$spool" && "$spool" == "$home/"* ]] && (( ! inside_own )); then
     # The root is resolved; find and rm do not follow links within the spool.
     find "$spool" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || {
       fieldtest_evidence_record "$SCRIPT_NAME" spool FAIL "spool wipe failed for $(fieldtest_spool_dir) ($spool)" "$output"
@@ -72,7 +93,7 @@ PY
     }
     spool_action="emptied"
   else
-    fieldtest_evidence_record "$SCRIPT_NAME" spool WARN "spool $spool lies outside the kit home and was left as is"
+    fieldtest_evidence_record "$SCRIPT_NAME" spool WARN "spool $spool is not a separate directory strictly inside the kit home and was left as is"
   fi
   fieldtest_evidence_record "$SCRIPT_NAME" reset PASS "catalog reset for $serial; authority evidence copied and spool $spool_action" "$output"
 }

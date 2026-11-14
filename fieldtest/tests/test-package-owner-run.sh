@@ -55,7 +55,8 @@ with tempfile.TemporaryDirectory(prefix='package-source-') as tmp:
         print('PASS: T6 resolved mismatch, unresolvable source, both option orders and required expected commit')
     # The valid full SHA has a separate cargo record, independent of refusal cases.
     branch = git('symbolic-ref', '--short', 'HEAD')
-    arguments = {'head': 'HEAD', 'branch': branch, 'short': head[:12]}
+    # 'upper': HEAD's full sha in capitals resolves in git; only lowercase hex is accepted.
+    arguments = {'head': 'HEAD', 'branch': branch, 'short': head[:12], 'upper': head.upper()}
     names = {f'{kind}-{order}' for kind in arguments for order in range(3)}
     assert selected in {'all', 'baseline', 'full', *names}, selected
     for kind, argument in arguments.items():
