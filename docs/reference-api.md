@@ -26,18 +26,25 @@ These additions extend `proto/layer5.proto` without changing existing field tags
 | `LibraryService.ReleaseTapeIoFence` | `ReleaseTapeIoFenceRequest`: `quarantine_id`, non-empty `acknowledgment` | `TapeIoFence` | Operation control, the same permission as `CancelOperation` |
 | `Daemon.Health` | Empty | `HealthResponse`, including active fence count and records | Read |
 
-`ReleaseTapeIoFence` returns `NOT_FOUND` for an unknown id and `INVALID_ARGUMENT`
-for an empty or whitespace-only acknowledgment. A released id returns the
-original record unchanged. Tape and drive endpoint fences use the same RPC.
-The authenticated actor, quarantine id, scope, acknowledgment, and release time
-are durable in the audit log before the active row clears. Startup or a repeated
-release completes an interrupted projection without a second release event.
-Normal tape and drive admission observes the new catalog state without restart.
+`ReleaseTapeIoFence` refuses an empty or whitespace-only acknowledgment with
+`INVALID_ARGUMENT` and `acknowledgment must not be empty`. Release requires a
+`library:` tape-fence id. An id without a typed source identity is refused with
+`FAILED_PRECONDITION` and `fence has no typed library source identity`; a
+drive-scoped source is refused with `fence is not tape-scoped`. For a typed tape
+id with no record, the RPC returns `NOT_FOUND`. A released id returns its
+original record unchanged.
+
+A tape-fence release appends `FenceReleased` to the library log with the source
+fence reference and acknowledgment, under the authenticated actor. The record
+is durable before the catalog row clears. Startup or a repeated release
+completes an interrupted projection without a second release event. Tape
+admission observes the released catalog row, subject to the normal identity,
+readiness and append checks.
 
 `TapeIoFence` contains `fence_id`, `quarantine_id`, `tape_uuid`, optional `barcode`
 and `endpoint_key`, `reason`, `state`, `created_at_utc`, `updated_at_utc`, optional
 `release_ack`, and optional `evidence_json`. The released record's
-`updated_at_utc` is the original audit release timestamp.
+`updated_at_utc` is the original library-log release timestamp.
 
 `HealthResponse`, `ListTapesResponse`, and `GetLiveStatusResponse` include
 `active_tape_io_fence_count` and repeated `active_tape_io_fences`. The list
@@ -47,3 +54,12 @@ Scoped fences leave the daemon available; an unresolved scope refuses startup.
 
 On mTLS connections, authorization uses the certificate role and audit evidence
 identifies the certificate fingerprint. Read-only roles cannot release a fence.
+
+## Errors
+
+Tape and drive failures can reach clients as gRPC `INTERNAL`,
+`FAILED_PRECONDITION` or `UNAVAILABLE`. Such a status may carry the
+`remanence-retry` metadata label: `transient`, `operator` or `media` describes
+what kind of intervention helps. A status without the label gives no such
+advice; the label is not promised for every failure or RPC. `DATA_LOSS` means
+a digest or checksum failure.

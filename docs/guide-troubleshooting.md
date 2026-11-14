@@ -6,29 +6,44 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
-<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs crates/remanence-cli/src/standalone.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Authority-layout refusals and declared reset
 
-Old host state is refused before configured device admission. Ordinary catalog
-opens refuse schemas 1 through 25. The layout refusal contains this exact guidance:
+A state directory written by an earlier release, with library or tape authority
+and no `authority-manifest.json`, is refused by daemon startup, catalog rebuild
+and direct state opens. Their refusal begins:
+
+```text
+Legacy or unbound authority requires the declared state reset (`rem reset-catalog --config <config>`); no authority importer is available
+```
+
+Commands using the runtime configuration loader can refuse earlier at the layout
+marker or catalog schema. In a current authority directory, daemon startup,
+catalog rebuild and runtime commands refuse catalog schemas 1 through 25. The
+layout/schema refusal contains this guidance:
 
 ```text
 This state directory predates the current tape-log format. A declared state reset and reinitialization of its test tapes is required. Run rem reset-catalog --config <config> with the existing explicit reset confirmation. No importer is available.
 ```
 
-Stop the daemon and run the declared offline reset with the existing config:
+`rem list` checks the catalog without opening state. `setup`, `doctor`, `drives`
+and `diagnostics` can warn about a refused catalog while continuing discovery;
+`doctor` exits 1 when its catalog check fails.
+
+For state from an earlier release, stop the daemon. The following command
+destroys active host authority and starts an empty catalog:
 
 ```sh
 rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog
 ```
 
-This is a destructive state reset. It archives the prior audit and journal
-directories and authority marker, removes active authority, and installs the
-per-tape log layout. Configuration and calibration generation allocation
-survive. When the prior audit or journal directory existed, the archive includes
-`state_dir/reset-archives/reset-<number>/authority-reset.json`, which records
-the paths, replacement format and reset request digest. This is not an import
-of the old state.
+It archives the prior library-log (`audit`) and tape-log (`journals`)
+directories under `state_dir/reset-archives/reset-<number>/`, along with
+`catalog.sqlite` and its `-wal`/`-shm` files when present, `authority-format`,
+`authority-manifest.json`, `config.snapshot` and any prior receipt as
+`previous-reset-receipt.json`. The active receipt is
+`state_dir/authority-reset-receipt.json`. Configuration and calibration
+generation allocation survive; the reset imports no old state.
 
 Reinitialize each approved scratch tape before returning it to write service.
 For a library tape whose existing BOT UUID is absent from the reset catalog,
@@ -47,13 +62,25 @@ Initialization assigns a new tape UUID and incarnation 1. It creates no log
 until the first write-session open. That open writes the one-block BOT file and
 its filemark, takes a synchronous barrier, then closes an `Initialized` record
 before writing an Object. Both parity modes use this order. An idempotent init of an already
-registered tape does not assign a new identity. Scoped preservation and erase
-selectors still require the matching `catalog reset-preflight` token; see the
-[CLI reference](reference-cli.md#destructive-state-reset).
+registered tape does not assign a new identity. `--preserve-tape-voltag` is
+accepted but refused: preflight prints `declared reset does not import preserved catalog identities; reinitialize or adopt physical media afterward`,
+and reset prints `declared reset cannot restore SQL tape identities; reinitialize or adopt afterward`.
+A scoped erase reset requires the matching token from
+`rem-debug catalog reset-preflight`; without it the CLI refuses with
+`scoped catalog reset requires --expected-preflight-token from reset-preflight`.
+See the [CLI reference](reference-cli.md#destructive-state-reset).
 
-The same refusal covers the old two-journal layout, v1 tape logs and predecessor
-catalog schemas. A changed configured journal root also refuses admission;
-use the declared reset for an approved layout change. An interrupted reset
+An earlier layout requires the declared reset. A restored state at different
+paths needs its recorded paths instead. When the state directory, the tape-log
+root or `audit.dir` differs from `authority-manifest.json`, daemon startup,
+rebuild and direct state opens refuse with
+`authority manifest format or configured root binding differs; declared reset required`.
+A runtime-loader command with a different `journal.dir` can instead print
+`This state directory predates the current tape-log format.` because the
+marker binds that root. Reset also refuses this mismatch, beginning
+`scoped reset cannot establish current typed inventory:`, and erases nothing.
+Restore the recorded paths or point the configuration at them; keep those paths
+on a replacement server. An interrupted reset
 reports `durable fence {path} requires an exact reset rerun`; rerun the same
 reset request rather than removing its fence.
 
@@ -111,22 +138,47 @@ nothing. Stop the daemon and restore the exact tape log from a preserved copy.
 If the logs are intact and only the catalog projection is damaged, use the
 rebuild route below. Catalog rebuild does not repair a damaged tape log.
 
-For a lost or damaged SQLite projection with intact authority, stop the daemon
-and run:
+For a lost SQLite catalog with intact authority, stop the daemon and run the
+command below. If the catalog is damaged, first move the file named by
+`index.sqlite_path` and its `-wal`/`-shm` sidecars aside without deleting them.
+Then rebuild:
 
 ```sh
 rem rebuild-catalog-from-journals --config <PATH>
 ```
 
-This reads the audit log and per-tape logs and rebuilds SQLite. It preserves
-their bytes, does not clear ambiguity or repair fences, and does not repair
-media. It requires an existing `authority-format` marker. Cached wrap maps are
+This reads the library log (`*.remlib` segments in `audit.dir`) and the tape
+logs, starting from an empty catalog. Nothing is carried over from the old
+catalog, and the audit log is not a rebuild source. Rebuild requires
+`authority-format` and `authority-manifest.json` and preserves both logs.
+It does not clear ambiguity or repair fences or media. Cached wrap maps are
 evicted and volumes become uncalibrated; calibration generation allocation
-advances. A log below its projection mark requires recovery, not a reset of the
-mark to match an older backup.
+advances. A short log can refuse with `RebuildWouldDropMarkEvidence:` when
+rebuild would discard the catalog's mark evidence.
 
 Catalog rebuild regenerates the queryable view of intact host records; it does
 not change the cartridge or repair a tape log.
+
+The library log (`audit.dir`) and the tape logs (`journal.dir`) are the records
+that cannot be rebuilt. Both grow only at the end. Copy them to another machine
+often, a minute or two apart on a working archive, and keep dated generations.
+Keep the state directory's `authority-format` and `authority-manifest.json`
+with them, together with the configuration. The catalog is rebuilt from the two
+logs. The tape-log, library-log, catalog and state-directory paths are configured
+independently, so check that a backup of "the state directory" includes each.
+
+Restore both logs, both authority files and the configuration together, each
+from its newest copy, to the configured paths. An older copy knows nothing
+decided after it: a tape withdrawn or fenced since then is not withdrawn or
+fenced in the restored state, and a tape first provisioned since then is unknown
+to it. Before starting the service on restored state, list the tapes used,
+withdrawn or fenced since the copy's date.
+
+Populated state without `authority-manifest.json` refuses with
+`Legacy or unbound authority requires the declared state reset`. With a manifest
+but no `authority-format`, layout validation refuses with
+`This state directory predates the current tape-log format.`. Restore the
+missing authority files with the logs before starting the service.
 
 <!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 6ed03ef0 -->
 ## Discovery finds no libraries
@@ -224,20 +276,23 @@ and drive before release:
 rem tape quarantine release <ID> --after-settled-inventory --ack "what was checked"
 ```
 
-A `native_log_behind_projection` fence requires restoration of the exact tape
-log or a catalog rebuild with `rem rebuild-catalog-from-journals`, followed by
-`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` in library mode.
+For a present, noncontradicted `native_log_behind_projection` tape log, restore
+the exact log or rebuild the catalog with `rem rebuild-catalog-from-journals`,
+then release with
+`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`.
 Without `--force`, release is refused with
-`native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
-Even a forced release refuses contradicted tape admission or a log still behind
-the catalog. The standalone release form has no `--force`.
-On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses your home configuration when `/etc/rem/config.toml` is absent.
+`native_log_behind_projection fence requires --force:`.
+A contradicted log, a floor conflict or an absent tape log still refuses forced
+release; restore the exact log or retire the tape. Rebuilding the catalog does
+not cure those conditions. On a standalone host without `/etc/rem/config.toml`,
+this release form uses the home configuration. The bare `--ack` form is not a
+release route for these tape fences; see [release routing](reference-cli.md#rem-tape-quarantine-standalone).
 
 The library command uses the configured daemon socket when it is listening.
 An absent listener permits offline release,
 which still requires the exclusive state lock. RPC and authentication failures
-do not fall back offline. Release syncs the actor, scope, acknowledgment and
-release time to the audit log before clearing the row. A crash between these
+do not fall back offline. A tape-fence release appends a `FenceReleased` record
+to the library log before clearing the catalog row. A crash between these
 steps leaves the fence active; retry or startup completes the release from the
 same evidence. The tape becomes admissible without restarting, subject
 to the normal identity, readiness and append checks.
@@ -276,8 +331,10 @@ Inspection reports both marker families, owed fence UUIDs, segment sizes, requir
 and available space, and the library replay or why it was skipped. Recovery takes
 the state lock, clears tape ambiguity before library ambiguity, republishes the
 retained prefixes, reconciles owed tape fences, and records a synced recovery
-event. An owed fence recorded in the reconciliation trigger is raised by recovery
-and reported. If the disk was too full even to record the owed fence, the daemon
+event. An owed fence recorded in the reconciliation trigger is reconciled by
+recovery: raised, found already covered, or skipped with a reason. The result is
+reported in its `reconciliation` output. If the disk was too full even to record
+the owed fence, the daemon
 logged `could not record lost library fence` and no command can show or raise that
 fence, so check the daemon's log for that line before returning the tape to service.
 Restart the daemon after successful recovery.
@@ -376,16 +433,17 @@ command required)`; a drive that reports `02/04/02` is covered under [A drive
 stays not ready after a daemon crash](#a-drive-stays-not-ready-after-a-daemon-crash).
 
 If an operator cancels a resumable wait, explicitly resume it to continue.
-For a release-only fence, once you
-have verified the physical state (inventory settled, cartridge where the
-library says it is), release it explicitly:
+For a release-only media-readiness fence (`mrq-`), verify the physical state:
+inventory has settled and the cartridge is where the library says it is.
+Stop the daemon first; this release runs offline and needs the state lock.
+Then release it explicitly:
 
 ```sh
 rem tape quarantine release <id> --after-settled-inventory \
     --ack "verified slot inventory after power event; RCA in ticket 123"
 ```
 
-The `--ack` text is recorded. The fence exists so that nobody writes to a tape whose state was last seen
+The fence exists so that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
 <!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/append_admission.rs crates/remanence-library/src/transport.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
@@ -507,7 +565,7 @@ poison the write transfer or the whole write session. All three are
 independent "don't trust what you can't prove" mechanisms at different
 layers — seeing one does not imply the others tripped too.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs crates/remanence-state/src/library_runtime.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## The daemon refuses to start
 
 `rem-daemon` checks its world in order and exits 1 with a specific
@@ -522,7 +580,7 @@ layers — seeing one does not imply the others tripped too.
 | `untrusted state volume ...` | State, journal, audit, index, cache, or socket path sits on tmpfs/NFS/SMB/overlayfs and `journal.require_trusted_volume` is `true` (the default). Move the state or consciously disable the check. |
 | `error: configure spool dir ...` | The spool resolved to tmpfs and `spool_tmpfs_ram_budget` is not set. Spooling to RAM needs an explicit budget acknowledgement. |
 | `TLS private key ... has insecure permissions` | The key file is group- or world-accessible. `chmod 600` it. |
-| `startup blocked by active tape-I/O fence <id> ...` | The fence has missing or unparseable scope. Inspect its evidence and repair its attribution before restart, or release it after verification. Scoped fences produce WARNs and allow startup. |
+| `startup blocked by active tape-I/O fence <id> ...` | The fence has missing or unparseable scope. Inspect its evidence. There is no operator route to repair a fence without a typed library source identity; release refuses with `fence has no typed library source identity`. Scoped fences produce WARNs and allow startup. |
 | `error: discover libraries: ...` | Same permission gates as the CLI (tape group + `CAP_SYS_RAWIO`, via systemd `AmbientCapabilities` for a service). |
 | `error: acquire daemon state ownership ...` | Another daemon or offline state-mutating command holds `<state_dir>/state.lock`. Stop the other owner; do not delete the lock file or point a second daemon at the same state directory. The kernel releases the lock when its owner exits. |
 
@@ -799,7 +857,7 @@ writable: <reason>` (the same writability preconditions above), `tape ...
 is fenced by quarantine ...` (see fences above). A tape with a known written
 prefix but no matching per-tape log is also refused before append positioning.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs crates/remanence-api/src/daemon_catalog_services.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/operation_source.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered
@@ -826,7 +884,7 @@ RPC refusals or debt diagnostics rather than standalone log events:
 |---|---|
 | `closeout work-list scan failed; retrying` | WARN: the worker cannot reconstruct its work list. Inspect the attached error and native-log access; it retries the scan. |
 | `closeout needs operator; waiting for wake` | WARN: work is parked. Resolve the reported refusal, then request closeout or allow the relevant readiness or inventory change to wake it. |
-| `CloseoutOverdue` | WARN: debt has reached the alarm age. The audit event is `closeout_overdue`; inspect the tape's retry reason. |
+| `CloseoutOverdue` | WARN: debt has reached the alarm age. The operation kind is `closeout_overdue`; inspect the tape's retry reason. |
 | `parked: media fault (3/3 attempts)` | Debt diagnostic: repeated medium or hardware failures exhausted the attempt budget. Inspect the drive and media before waking the work. |
 | `shutdown close deadline interrupted session` | WARN: the shared shutdown deadline interrupted the session; the event identifies its tape, ending and remaining work. |
 | `shutdown close deadline expired; no new drive command` | Drive-command refusal at the shared cutoff. Issued commands still settle; see the shutdown bound above. |
@@ -883,7 +941,7 @@ A failed move also refreshes inventory. Sense `05/3B/0D` reports a full destinat
 and `05/3B/0E` an empty source. An unload followed by a failed move does not prove that the
 cartridge remains in the drive; use the fresh element status for recovery.
 
-<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs crates/remanence-api/src/mount.rs crates/remanence-library/src/handle/mod.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Waiting for the library (open magazine or door)
 
 A library shared with another system has its magazines and doors opened
@@ -913,9 +971,9 @@ compares the source and destination with what it saw before the move. It
 retries only if the source still holds the same cartridge, by occupancy and
 barcode, and the destination is still empty. If the operator moved a
 cartridge into or out of either element while the magazine was open, it
-refuses as in [Element inventory changes before unload or move](#element-inventory-changes-before-unload-or-move),
-records a `Refused` audit event, and does not retry. At most three waits
-are spent on one move, a wait before the first MOVE included, and one
+refuses as in [Element inventory changes before unload or move](#element-inventory-changes-before-unload-or-move)
+and does not retry. At most three waits are spent on one move, a wait before
+the first MOVE included, and one
 deadline, `[daemon] changer_not_ready_wait_seconds` (default 600, at most
 3600), covers all of them. A unit attention on the MOVE that follows a wait
 is waited out like any retry.
@@ -923,8 +981,8 @@ is waited out like any retry.
 The move ends without success in these cases. When a MOVE has already been
 sent, it fails as it did before, with the original sense and the refreshed
 inventory. When the wait began before any MOVE and ends by its deadline or
-a stop, no MOVE is sent; the daemon refreshes the inventory, records a
-`Refused` audit event, and reports `library not ready (...); MOVE MEDIUM
+a stop, no MOVE is sent; the daemon refreshes the inventory and reports
+`library not ready (...); MOVE MEDIUM
 0x.... -> 0x.... not issued`. When such a wait ends because a poll answered
 with something waiting does not clear, the daemon re-reads and compares
 both elements, as after a successful wait, before sending the one MOVE that
@@ -945,8 +1003,9 @@ follows.
 - a robotics operation is cancelled while it waits;
 - the client of a write session open goes away while the load move for its
   tape waits. A client that goes away after that move has completed still
-  gets its session opened, and the session is closed by the idle timeout as
-  before. The move home of an evicted cartridge always runs to the end of
+  has its newly opened session disconnected immediately, and the open returns
+  `cancelled` with `write session open caller disconnected`. The move home of an
+  evicted cartridge always runs to the end of
   its wait, because stopping it would leave that cartridge unthreaded in the
   drive.
 

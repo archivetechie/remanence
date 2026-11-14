@@ -17,7 +17,7 @@ how the tape was written. An **object** is the unit Remanence stores: one tape
 file that holds an archive of files. The **tape log** is the host's record of
 what was committed to one tape, kept in the state directory, and the
 **catalog** is the SQLite database that Remanence rebuilds from the tape logs
-and the audit log. [Concepts](concepts.md) introduces these terms in order, and
+and the library log. [Concepts](concepts.md) introduces these terms in order, and
 the [glossary](reference-glossary.md) has the rest.
 
 ## How import works
@@ -47,7 +47,7 @@ finalized or one whose replicas cannot be read.
 Two limits shape the rest of this guide. The first is that adoption records
 identity only. Remanence does not turn the rows of a tape-only inventory into
 ordinary catalog entries: `rem rebuild-catalog-from-journals` rebuilds the
-catalog from surviving tape logs and the audit log, and it reads neither a
+catalog from surviving tape logs and the library log, and it reads neither a
 terminal index nor a walk. A site that holds only the cartridge can identify it
 and inspect it, and it can restore files from it in a standalone drive, but it
 cannot import the tape's objects into its catalog. The second limit is that
@@ -89,7 +89,7 @@ and encrypted objects still need their private keys. A WORM (write-once)
 cartridge is safe for this read-only identity step, but Remanence does not write
 ordinary objects to WORM media.
 
-<!-- code-anchor: crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state.rs crates/remanence-state/src/config.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state.rs crates/remanence-state/src/config.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Which tapes can be adopted
 
 `rem-debug tape adopt-bootstrap` accepts a bootstrap only when all of these
@@ -121,7 +121,7 @@ Adoption records identity only. Other recovery options depend on what survives:
 - If this host's state directory survived, or you can restore it from a backup,
   and only the catalog was lost or damaged, you do not need adoption. Stop the
   daemon and rebuild the catalog ([Rebuild the catalog](#rebuild-the-catalog-from-the-tape-logs)).
-  The rebuild recreates the tape's row and its objects from the audit log and
+  The rebuild recreates the tape's row and its objects from the library log and
   the tape log, whatever the tape's geometry.
 - To see what the tape holds without a catalog, load it into a drive and run
   `rem-debug tape recovery-report` on the drive's device
@@ -136,7 +136,7 @@ Adoption records identity only. Other recovery options depend on what survives:
   library, with `device is not an unattached drive; library operations go
   through the daemon`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state.rs crates/remanence-state/src/library_runtime/adoption.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## How the commands treat the tape
 
 Both commands read the tape and neither writes to it, but they read it in
@@ -298,8 +298,8 @@ one you expected.
 
 ## What adoption records
 
-A first adoption writes a `TapeIdentityAdopted` record to the audit log and
-forces it to stable storage (fsync) before it writes the catalog row. The row
+A first adoption writes a `Reprovision` record in adoption mode to the library
+log and forces it to stable storage (fsync) before it writes the catalog row. The row
 holds the tape UUID, barcode, geometry, pool, lifecycle state and assignment
 generation. Adoption creates no tape-file rows, no object copies, no committed
 position, no session and no finalization record. For a tape that holds exactly
@@ -309,15 +309,15 @@ other tape, the catalog knows which tape it is and nothing about its contents.
 ## Running adoption again
 
 Each run of `adopt-bootstrap` generates a new operation UUID. A repeat run
-against a tape that is already adopted succeeds without a second audit record
+against a tape that is already adopted succeeds without a second library-log record
 when the catalog row is still the identity-only row that adoption made: the same
 UUID, barcode, geometry, pool, assignment generation and state, with no tape
 files, objects, open session, active fence or finalization. Its output then
 reports `"physical_disposition": "bootstrap_already_adopted"` and
 `"newly_adopted": false`.
 
-If the process stops after the audit record is written and before the catalog
-row, the next run replays the audit record and completes the row. Once writes or
+If the process stops after the library-log record is written and before the
+catalog row, the next run replays that record and completes the row. Once writes or
 lifecycle changes have changed the row, a new adoption is refused and does not
 roll the state back.
 
@@ -373,17 +373,40 @@ the catalog. Remanence does not create a tape log from an inventory either, so a
 `recovery_required` tape adopted from another site stays in that state, out of
 write service.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Rebuild the catalog from the tape logs
 
-When this host's own state directory holds the tape logs and the audit log, the
-catalog can be rebuilt from them, and no adoption is needed. The same applies
-after you restore the state directory from a backup. The tape logs live in the
-directory named by the `dir` key of the configuration's `[journal]` table; the
-command keeps its older name.
+When this host's library log and tape logs survive, the catalog can be rebuilt
+from them, and no adoption is needed. The same applies after restoring those
+records from backup. The tape logs live under `journal.dir`; the library log's
+`*.remlib` segments live in `audit.dir`. The rebuild keeps an older word for
+the tape logs in its command name.
 
-Stop the daemon, restore the state directory to its configured locations if it
-came from a backup, and run:
+The library log (`audit.dir`) and the tape logs (`journal.dir`) are the records
+that cannot be rebuilt. Both grow only at the end. Copy them to another machine
+often, a minute or two apart on a working archive, and keep dated generations.
+Keep the state directory's `authority-format` and `authority-manifest.json`
+with them, together with the configuration. The catalog is rebuilt from the two
+logs. The tape-log, library-log, catalog and state-directory paths are configured
+independently, so check that a backup of "the state directory" includes each.
+
+Restore both logs, both authority files and the configuration together, each
+from its newest copy, to the configured paths. An older copy knows nothing
+decided after it: a tape withdrawn or fenced since then is not withdrawn or
+fenced in the restored state, and a tape first provisioned since then is unknown
+to it. Before starting the service on restored state, list the tapes used,
+withdrawn or fenced since the copy's date.
+
+Stop the daemon before restoring or rebuilding. Keep the recorded paths on a
+replacement server. Roots that differ from `authority-manifest.json` refuse
+daemon startup, rebuild and direct state opens with
+`authority manifest format or configured root binding differs; declared reset required`.
+A runtime-loader command with a changed journal root can instead print
+`This state directory predates the current tape-log format.`. Reset also
+refuses the mismatch, beginning `scoped reset cannot establish current typed inventory:`,
+and erases nothing. Restore the recorded paths or point the configuration at
+them. If the catalog is damaged, move `index.sqlite_path` and its `-wal`/`-shm`
+sidecars aside first; a missing file can be rebuilt directly. Then run:
 
 ```sh
 rem rebuild-catalog-from-journals --config /etc/rem/config.toml
@@ -391,8 +414,9 @@ rem rebuild-catalog-from-journals --config /etc/rem/config.toml
 
 `/etc/rem/config.toml` is the daemon's configuration file and the default for
 `--config`. The rebuild takes the state lock, so it refuses to run beside a
-running daemon. It replaces every row it can derive and leaves the tape logs and
-the audit log unchanged. It prints a summary of the form below (illustrative
+running daemon. It starts from an empty catalog and carries over nothing from
+the old projection. It applies the library log before the tape logs, preserving
+both logs. It prints a summary of the form below (illustrative
 counts):
 
 ```text
@@ -400,19 +424,21 @@ rebuild-catalog-from-journals ok
   tapes: 3
   tape files: 214
   object copies: 211
-  audit records: 1840
+  audit records: 0
   tape logs: 3
 ```
 
-Warnings go to standard error. A line that begins
-`WARN audit-replay-divergence:` names an audit record that could not be
-replayed cleanly, or a value on which the audit log and the catalog's earlier
-contents disagreed, and ends `ledger value applied`: the audit log's value was
-used. A rebuild in a state directory without an
-`authority-format` marker refuses with `invalid config: projection rebuild
-requires an existing authority-format marker`.
+The audit count is always zero; audit segments are not a rebuild source.
+Rebuild requires both `authority-format` and `authority-manifest.json`. On an
+empty layout without the marker, it refuses with
+`projection rebuild requires an existing authority-format marker`. Populated
+logs without the manifest are refused earlier with
+`Legacy or unbound authority requires the declared state reset`. With a manifest
+but no marker, a populated layout instead gets
+`This state directory predates the current tape-log format.`. Restore the
+authority files together with the logs before rebuilding.
 
-<!-- code-anchor: crates/remanence-cli/src/recovery_report.rs crates/remanence-cli/src/lib.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/recovery_report.rs crates/remanence-cli/src/lib.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime/motion.rs crates/remanence-state/src/lock.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Inspect a tape without the catalog
 
 `rem-debug tape recovery-report` reads a tape without the catalog, the daemon
@@ -420,8 +446,10 @@ or any host state. It finds the bootstrap at a block size of 256 KiB, 512 KiB or
 1 MiB, selects a terminal index replica or walks the tape, and checks each
 object it finds. It works on a tape of any geometry, adopted or not. It does not
 load the cartridge itself, so load it first and unload it afterwards, with the
-daemon stopped. To read `RMJ101L9` from slot `0x0400` in the drive at bay
-`0x0001`:
+daemon stopped. `rem-debug load` and `unload` read `/etc/rem/config.toml`, which
+must list the library, or the file selected by their `--config <PATH>` option.
+Both take the state lock and record motion in the library log. To read
+`RMJ101L9` from slot `0x0400` in the drive at bay `0x0001`:
 
 ```sh
 rem-debug --allow LIB0001234 load LIB0001234 --slot 0x0400 --bay 0x0001
@@ -439,7 +467,7 @@ the report needs the tape UUID, block size and parity scheme from your records;
 [Damaged tapes](guide-damaged-tapes.md#the-bootstrap-is-unreadable) explains
 how to supply them.
 
-<!-- code-anchor: crates/remanence-parity/src/bot_recovery.rs crates/remanence-state/src/authority/bot_recovery.rs crates/remanence-cli/src/tape_inventory.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-parity/src/bot_recovery.rs crates/remanence-state/src/authority/bot_recovery.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/audit_projection.rs crates/remanence-state/src/tape_log/authority.rs crates/remanence-state/src/library_runtime/restart.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## How object names are recovered when the terminal index is damaged
 
 A healthy finalized tape carries its complete list of objects in each of its
@@ -579,9 +607,9 @@ file with a header, zero-filled interior records, and a footer) between each
 pair. If the tape log proves that replica C completed its synchronizing
 barrier, all three full indexes are already on tape. A restart then completes
 the remaining bookkeeping without loading, locating, reading, or writing the
-cartridge. That bookkeeping is the sealed log record, the SQLite projection and
-the audit entries. It applies to automatic finalization and to an
-operator-requested close-out.
+cartridge. That bookkeeping is the tape-log seal and its SQLite projection,
+and, for an operator-requested close-out, the library-log completion record.
+It applies to automatic and operator-requested finalization.
 
 During finalization the tape log records the decision, immutable plan and
 barrier-proved component progress. An ordinary write session cannot append an
@@ -595,10 +623,10 @@ SQLite. Changes to a pool's capacity cap or watermarks do not block host-only
 completion after replica C, because the complete reserved tail is already on
 the tape.
 
-The same restart repairs missing completion records in the append-only audit
-log. It records one tape-sealed event and, for a manual close-out, one
-operation-finished event. An event written before the crash is reused and not
-duplicated. Both records are always flushed to stable storage. Only one daemon
+The same restart completes the tape-log `Sealed` record and, for a manual
+close-out, repairs the operation's `Finished` event in the library log through
+the library runtime. A record written before the crash is reused rather than
+duplicated. Both records are flushed to stable storage. Only one daemon
 or offline state owner can use a state directory at a time, so another process
 cannot race that decision.
 

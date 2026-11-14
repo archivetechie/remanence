@@ -25,7 +25,7 @@
   <text class="rtg" x="20" y="124">LAYER 4</text>
   <rect class="gs" x="100" y="98" width="640" height="44"/>
   <text class="rt" x="420" y="117" text-anchor="middle">remanence-state</text>
-  <text class="rtd" x="420" y="132" text-anchor="middle">config · state lock · audit log · SQLite catalog — a rebuildable projection</text>
+  <text class="rtd" x="420" y="132" text-anchor="middle">config · state lock · library log · SQLite catalog — a rebuildable projection</text>
   <line class="rl" x1="420" y1="144" x2="420" y2="158" marker-end="url(#ah)"/>
   <text class="rtg" x="20" y="186">LAYER 3</text>
   <rect class="rs" x="100" y="160" width="150" height="44"/>

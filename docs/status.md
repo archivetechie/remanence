@@ -29,7 +29,7 @@ invalidated takes effect only at the freeze. Treat material written during the
 review window as re-writable, and keep the source it was made from until the
 formats are final.
 
-<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml .github/workflows/release.yml @ 625f7044 -->
+<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml .github/workflows/release.yml crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Releases and versions
 
 There is no binary release of Remanence yet. The only published release is
@@ -100,13 +100,13 @@ opens the object without a key server.
 
 The host keeps three kinds of record. The tape log is a file per tape that holds
 a durable commit record for each tape file written; it is the host's authority
-for that tape. The audit log is an append-only, hash-chained record of
-state-changing operations. The catalog is a SQLite projection rebuilt from the
-tape logs and the audit log, so it is never the only copy of anything. The host
-also keeps media-readiness records and fences. A fence is a durable refusal
-record written when tape input or output ended in a state the software cannot
-prove; the tape is refused for reads, writes and initialization until the fence
-clears or an operator releases it.
+for that tape. The library log is an append-only, hash-chained record of library
+decisions, kept as `*.remlib` segments in `audit.dir`. The state directory's
+`authority-manifest.json` binds the log roots. The catalog is a SQLite projection
+rebuilt from the library log and the tape logs; the audit log is not a rebuild
+source. The host also keeps media-readiness records and fences. A fence records
+a refusal after an operation ends in an unproved state. Admission depends on
+its cause and access path; see [fences](concepts.md#9-fences).
 
 ### The daemon
 
@@ -246,7 +246,7 @@ closed operation is refused with `ClosedOperationRetry`. Motion faults after a
 bay reservation count toward the close-out scan's three-attempt media budget;
 drive contention does not, and write protection still parks immediately.
 
-<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_runtime/drive_observation.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ### A cartridge left unthreaded by a hard kill
 
 A hard kill during an unload can leave the cartridge in the drive unthreaded.
@@ -267,18 +267,33 @@ and prints an operation UUID. `rem op watch <UUID>` follows it,
 `rem op cancel <UUID>` cancels it, and `rem tape verify-index --result <UUID>`
 fetches the verdict. Cancellation waits for the tape command in flight and then
 releases the drive. A cancelled verification starts over from the beginning.
-The catalog records completed verdicts, and audit replay rebuilds their
-timestamps, states and terminal edition digests. Drive allocation belongs to
+The library log records completed verification verdicts. Replay rebuilds their
+catalog timestamps, states and terminal edition digests. Drive allocation belongs to
 the caller: the daemon does not interrupt a verification to admit a write or a
 restore.
 
-### Catalog rebuild reads the tape logs
+### Catalog rebuild reads the library log and the tape logs
 
-`rem rebuild-catalog-from-journals` rebuilds the catalog from the audit log and
-the tape logs. (The command keeps its older name; the directory it reads holds
-the tape logs.) Its summary includes a `tape logs:` line with the snapshot
-count. It leaves the log and audit bytes unchanged and does not clear repair
-fences.
+`rem rebuild-catalog-from-journals` starts from an empty catalog and applies
+the library log before the tape logs, carrying over no old catalog rows. The
+command keeps an older word for the tape logs in its name. Its summary prints
+`audit records: 0` and a `tape logs:` line with the snapshot count. It requires
+`authority-format` and `authority-manifest.json`, leaves both logs unchanged
+and does not clear repair fences.
+
+### Not available in this version
+
+- Provisioning with an unknown medium family is refused with
+  `UnknownGenerationAdoption: Reprovision requires recorded medium family`.
+- Adoption with an unknown medium family is refused with
+  `UnknownGenerationAdoption: Reprovision adoption requires recorded medium family`.
+- `DriveIdentityConflictLatch` records a discovery identity conflict. The refusal
+  begins `duplicate serial in discovery snapshot`, `historical active serial collision`,
+  `retired drive reappeared` or `new identity would collide with an active serial`;
+  motion is fenced.
+- Rebuild refuses with `RebuildWouldDropMarkEvidence:` when it would discard
+  projection-mark evidence beyond a short log. Start the daemon, which fences
+  the tape, or retire it. Catalog queries can still show rows beyond that log.
 
 ### Write throughput is below the drive rate
 

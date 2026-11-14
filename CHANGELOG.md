@@ -4,7 +4,7 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Unreleased
 
 - The catalog now uses one writable connection per state directory in each
@@ -73,15 +73,19 @@ per-release summaries.
 - Host commit authority uses one per-tape log at
   `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
   parity. The layout marker is `state_dir/authority-format`; the catalog schema
-  is 24. Ordinary opens refuse schemas 1 through 23, and no importer is available.
+  is 26. Daemon startup, catalog rebuild and runtime commands refuse schemas 1
+  through 25 in a current authority directory. A state directory from an earlier
+  release with library or tape authority and no `authority-manifest.json` is
+  refused by daemon startup, rebuild and direct state opens; use the declared
+  reset. No authority importer is available.
   Old file names remain recognized for refusal and declared-reset archival;
   tape formats and media bytes are unchanged.
   See the [declared reset procedure](docs/guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
-  `rem-debug tape-log inspect` reports log-tail damage; `rem-debug tape-log
-  repair-tail` archives a damaged suffix with explicit confirmation and requires
-  physical reconciliation through `rem tape supersede-tail` before append.
-  `rem rebuild-catalog-from-journals` rebuilds the projection and preserves log
-  and audit bytes. Append output carries `tape_log_sequence` and
+  `rem-debug tape-log inspect` reports log-tail damage. `rem-debug tape-log
+  repair-tail` is refused with `TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed`
+  before reading its flags. Restore the exact tape log from a copy.
+  `rem rebuild-catalog-from-journals` rebuilds the projection from the library
+  log and tape logs, preserving both logs. Append output carries `tape_log_sequence` and
   `tape_incarnation`; `journal_record_ordinal` is present and null.
 
 - The field-test kit checks the changer not-ready wait on real hardware.
@@ -114,7 +118,7 @@ per-release summaries.
   daemon polls with TEST UNIT READY, re-reads the source and destination once
   the changer and both elements are ready, and retries up to three times only
   when both are unchanged and the source barcode was known; a changed
-  inventory refuses with a `Refused` audit event. The bound is the
+  inventory refuses. The bound is the
   `[daemon] changer_not_ready_wait_seconds` (default 600, at most 3600,
   `0` refuses immediately). Daemon shutdown, a cancelled robotics or
   reconcile operation, and a write-open client that goes away during the load
@@ -132,8 +136,8 @@ per-release summaries.
   UUIDs. Committed copies in the catalog that still reference the BOT UUID also
   refuse. BOT is re-read just before the write and must still carry the named
   UUID. The override is rejected for dry-run and batch init and relaxes no other
-  decision. The fresh identity's `TapeProvisioned` audit record carries
-  `clobbered_identity = "unknown-to-catalog"` and `clobbered_uuid`. Standalone
+  decision. The fresh identity's library-log `Reprovision` record carries the
+  replaced BOT UUID. Standalone
   `rem tape init` has the same flag.
 
 - Standalone and pool-selected writes share the drive actor.
@@ -234,7 +238,10 @@ per-release summaries.
   --endpoint <URI>` attaches to an existing readiness wait or robot load.
   Detached verification and manual finalization wait up to 15 minutes for a
   blocking drive to become ready, then retry. A stopped finalization attempt
-  reports failure with a same-key retry instruction and remains resumable.
+  whose intent stays `FINALIZING` and operation stays open resumes under the
+  same exact request key. A completion-unknown ending leaves its intent pending
+  and needs operator recovery: a same-key retry is refused with
+  `ClosedOperationRetry`, and a new key with `ALREADY_EXISTS`.
 - Readiness waits end on shutdown or when their drive actor stops. Robot load
   operations publish completion after refreshing inventory and releasing the
   library, and include the durable readiness state and sense. A shutdown that
@@ -277,7 +284,7 @@ per-release summaries.
 - Full tape verification runs as a watchable, cancellable daemon operation.
   `rem tape verify-index --detach` starts it and `--result <UUID>` fetches its
   retained verdict. Drive refusals name reservation holders; completed verdicts
-  record catalog freshness and replay from audit journals.
+  record catalog freshness and replay from the library log.
 
 - Full verification reads each parity sidecar forward once, retains up to
   64 MiB of metadata, and applies the recovery acquisition to those blocks.
@@ -295,7 +302,7 @@ per-release summaries.
   including for `rem tape wait-ready`.
 
 - `remanence-crc` uses slice-by-8 CRC-64/XZ for all callers, including tape
-  verification, sidecar and bootstrap writes, the audit log and checkpoints.
+  verification, sidecar and bootstrap writes, the library log and tape logs.
   `rem tape verify-index` uses reusable read buffers and physical-position
   lookups per run. `ReadRun` reuses its buffer across fills in the verification
   sweep, recovery, terminal-inventory and parity-map runs.
@@ -387,12 +394,15 @@ per-release summaries.
   and both parsers accept `--dest` for `--out`, `--tape-uuid` for `--tape` and
   `--ack-tape-uuid` for `--acknowledge-tape`. Standalone finalize needs only
   `--acknowledge-tape`: the reason defaults to a fixed text and the
-  idempotency key to a UUIDv5 of the tape, so a retry is the same request.
+  idempotency key to a UUIDv5 of the tape. A retry must explicitly repeat the
+  original `--reason` and `--expected-pool`; the default pool is read from the
+  catalog at each attempt. Matching retries resume an open operation or
+  deduplicate a sealed success.
 - The catalog records an operator label's provenance, the cartridge generation
   with its source (measured from the drive's density code, read from the label,
   or set by the operator) and each tape's pool-assignment history,
   independently of library identity, and it audits label rebinding. The
-  catalog is a rebuildable projection of native tape logs and the audit log.
+  catalog is a rebuildable projection of native tape logs and the library log.
 - Layer 5 contract: the `Catalog` service gains `SupersedeTail`.
   `HealthResponse` and `VersionResponse` carry `supported_endpoint_kinds`,
   `daemon_capabilities` and `observed_endpoints`. `FileRecord` and

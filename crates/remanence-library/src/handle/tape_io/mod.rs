@@ -3103,13 +3103,12 @@ impl super::DriveHandle {
     /// bytes; the return value is the number of bytes actually
     /// delivered.
     ///
-    /// Transferred bytes use the kernel residual when nonzero; otherwise a
-    /// valid current sense residue is subtracted in command units (bytes for
-    /// variable mode, blocks times block size for fixed mode), clamped to
-    /// zero through the request size. Missing, invalid or deferred sense
-    /// retains the kernel count. With no kernel residual, a negative
-    /// variable-mode ILI residue keeps the requested byte count and describes
-    /// an oversized record, not a negative transfer.
+    /// Transferred bytes prefer a usable current sense residual over the kernel
+    /// count. The residual is subtracted in command units (bytes for variable
+    /// mode, blocks times block size for fixed mode), saturating at zero.
+    /// Missing, invalid or deferred sense retains the kernel count. With current
+    /// valid sense, a negative variable-mode ILI residual keeps the requested
+    /// byte count and describes an oversized record, not a negative transfer.
     ///
     /// Buffer sizing per IBM LTO SCSI Reference §4.12.1 / Table 17:
     /// in variable-block mode the drive raises CHECK CONDITION with

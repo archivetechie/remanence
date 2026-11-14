@@ -49,13 +49,13 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 `TiB`/`T`/`TB`, `PiB`/`P`/`PB`. Every suffix is a power of 1024 — `KB` means
 1024 bytes here, not 1000.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/mount.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/mount.rs crates/remanence-library/src/handle/tape_io/media_gate.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/read_session.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/lock.rs crates/remanence-state/src/authority_manifest.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## `[daemon]` (required)
 
 | Key | Type | Default | Remarks |
 |---|---|---|---|
-| `state_dir` | absolute path | required | Root directory for mutable daemon state, including the default socket, default spool, and `state.lock`. Every daemon holds that lock for its lifetime; offline state-mutating commands acquire the same lock (see [What ends up on disk](#what-ends-up-on-disk)). |
-| `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
+| `state_dir` | absolute path | required | Root directory for mutable daemon state, including the default socket, default spool, and `state.lock`. Every daemon holds that lock for its lifetime; offline state-mutating commands acquire the same lock (see [What ends up on disk](#what-ends-up-on-disk)). The path and its ancestors must contain no symlinks; mount or bind-mount the volume instead. |
+| `default_idle_timeout_seconds` | integer > 0 | required | Write-session idle-close interval after an automatic checkpoint triggered by `checkpoint_max_age_seconds`. The session closes if no append follows before it expires. Session open and client-, size- or count-triggered checkpoints start no idle timer. Read sessions have no idle timeout; append-stream stalls use `append_ingress_idle_secs`. |
 | `append_ingress_idle_secs` | integer > 0 | `300` | Bounds client inactivity during append ingress, including before Start. Counts only time waiting with no bytes received from the client; empty chunks do not reset it, and daemon backpressure does not count. |
 | `shutdown_close_deadline_secs` | integer > 0 | `300` | Shared graceful shutdown deadline for every write session's final barrier, commit, and ending. At expiry no new drive command is issued; an issued command settles before the session records the tail it actually dispatched and leaves closeout due. |
 | `closeout_alarm_after_secs` | integer > 0 | `259200` | Warn and audit `CloseoutOverdue` once per debt age per daemon run. Age is measured from the original uncovered commit, including when the tape is unavailable; this notification does not fence the tape. |
@@ -323,7 +323,7 @@ prefix = "RMA"
 pool_id = "archive-a"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs crates/remanence-api/src/drive_collection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## `[verification]`
 
 | Field | Type | Default | Meaning |
@@ -358,10 +358,13 @@ Drive-stewardship settings. The whole section is optional.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `managed_libraries` | array of strings | `[]` | Library serials whose drives Remanence actively stewards (polling, cleaning, history). Empty means all configured daemon-operated libraries. |
-| `foreign_counter_poll` | duration string | `"60m"` | Error-counter poll cadence for foreign (unmanaged) drives. |
-| `foreign_tapealert` | bool | `false` | Opt in to reading TapeAlert flags from foreign drives. |
+| `foreign_counter_poll` | duration string | `"60m"` | Accepted, but foreign (unmanaged) drives are not polled in this version. |
+| `foreign_tapealert` | bool | `false` | Accepted, but foreign drives are not polled for TapeAlert in this version. |
 | `heartbeat` | duration string | `"1h"` | Liveness cadence for managed drives. |
 | `snapshot_miss_alarm` | integer | `3` | Consecutive missed health snapshots before an alarm is raised. |
+
+The daemon reports `ForeignDrivePollDisabled: foreign drive health polling is off`
+and polls no foreign drive, regardless of these two settings.
 
 ## `[cleaning]`
 
@@ -456,7 +459,7 @@ together.
 | Defaults: 16-block batch, 256 KiB blocks, 4 ring buffers | 16 × 256 KiB = 4 MiB | 4 MiB × 4 = 16 MiB | Two of the four minimum slabs stay unlocked, and the reservoir does not grow. |
 | A 1 MiB sg grant clamps the batch to 4; otherwise defaults | 4 × 256 KiB = 1 MiB | 1 MiB × 4 = 4 MiB | The minimum is locked, and growth stops at 8 slabs (8 MiB) of the 8 GiB target. |
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/lock.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
 
 These four sections place the durable state. They are deliberately
@@ -467,13 +470,17 @@ minimal config above puts them there.
 |---|---|---|---|
 | `journal.dir` | absolute path | required | Directory containing `tapes/<lowercase-simple-uuid>.remtape`, one authority log per tape with or without parity. The authority marker binds this configured root to the state directory. |
 | `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. |
-| `audit.dir` | absolute path | required | Directory of daily append-only `.remaudit` segments. |
-| `audit.fsync` | bool | `true` | fsync each audit append before returning. |
-| `audit.clock_forward_tolerance_seconds` | integer | `300` | Wall-clock forward jump tolerated before an audit warning. |
+| `audit.dir` | absolute path | required | Directory holding the library log's `*.remlib` segments, `library-log.lock`, `library-log.ambiguous` and `library-log.fence-reconcile`. The segments record withdrawals, fences, barcodes and pools. The state directory's `authority-manifest.json` binds the log's root and identity. |
+| `audit.fsync` | bool | `true` | Sync each library-log `Diagnostic` append before returning. Other record types sync regardless of this setting; segment rotation also syncs. |
+| `audit.clock_forward_tolerance_seconds` | integer | `300` | Accepted and range-validated, but has no effect in this version; production does not read it. |
 | `index.sqlite_path` | absolute path | required | The SQLite catalog projection file. The filename is yours to choose; `rem-state.sqlite` is the conventional name. This file is a rebuildable cache — see `rem rebuild-catalog-from-journals`. |
 | `cache.tape_catalog_dir` | absolute path | required | Directory of per-tape catalog cache files. |
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ 1dd451b2 -->
+`state_dir`, `journal.dir` and `audit.dir` may have no symlink at any ancestor;
+startup refuses with `authority path contains a symlink` or
+`state lock path contains a symlink`. Mount or bind-mount the volume instead.
+
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs crates/remanence-state/src/state.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Environment variables
 
 Remanence reads very little from the environment; configuration belongs in
@@ -486,8 +493,8 @@ the config file.
 | `REM_CHAOS_ENABLED` | chaos-aware binaries | First gate for fault injection. Truthy values: `1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON`. |
 | `REM_CHAOS_ALLOW_REAL` | `rem-debug` | Second gate, required in addition to `REM_CHAOS_ENABLED` before real hardware transports are wrapped with fault injection. Both unset is the safe production state. |
 | `REM_CHAOS_STATE` | chaos engine | Path to the chaos scenario state file; required when chaos is enabled. |
-| `USER` / `LOGNAME` | audit log | Recorded as the acting user for local CLI mutations; falls back to a system actor. |
-| `HOSTNAME` | audit log, lock file | Last-resort host identity after `/etc/machine-id` and `/proc/sys/kernel/hostname`. |
+| `USER` / `LOGNAME` | library-log actor | Recorded as the acting user for local CLI mutations; falls back to a system actor. |
+| `HOSTNAME` | library-log writer, lock file | Last-resort host identity after `/etc/machine-id` and `/proc/sys/kernel/hostname`. |
 
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.
@@ -505,7 +512,7 @@ Its hook is `abort_after_tape_log_append`. Both surfaces report
 `tape_log_sequence` and `tape_incarnation`; old split-journal fsync aliases and
 v1 plans are rejected.
 
-<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-cli/src/standalone.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## What ends up on disk
 
 For the minimal config above, a running daemon owns:
@@ -523,8 +530,13 @@ For the minimal config above, a running daemon owns:
 /var/lib/rem/journal/tapes/*.lock  stable per-tape leases
 /var/lib/rem/journal/tapes/*.ambiguous
                                  uncertain-authority fences
-/var/lib/rem/reset-archives/reset-<number>/authority-reset.json
-                                 declared-reset path binding and request digest
+/var/lib/rem/authority-reset-receipt.json
+                                 active declared-reset receipt
+/var/lib/rem/reset-archives/reset-<number>/
+                                 prior catalog.sqlite (and -wal/-shm when present),
+                                 authority-format, authority-manifest.json,
+                                 config.snapshot, audit/, journals/ and
+                                 previous-reset-receipt.json when present
 /var/lib/rem/audit/*.remlib        typed library authority segments, ordered by first sequence
 /var/lib/rem/audit/library-log.lock
                                  stable library authority lease
@@ -566,14 +578,42 @@ calibration/control.remcalibration
                                 durable calibration state
 ```
 
-No socket or running daemon is required. Back up the entire state directory
-and restore it to the same absolute path. An older backup cannot authorize
-append over newer tape data: `TailBeyondKnownState` refuses that operation.
-Restore newer state or use catalogless `tape restore --scan` to rescue files.
+No socket or running daemon is required for direct standalone operations.
 
-Direct standalone commands acquire the state lock for one
-invocation, append audit and journal evidence, update the catalog projection,
-and release the lock when they exit. A command that opens a drive also holds a
+The library log (`audit.dir`) and the tape logs (`journal.dir`) are the records
+that cannot be rebuilt. Both grow only at the end. Copy them to another machine
+often, a minute or two apart on a working archive, and keep dated generations.
+Keep the state directory's `authority-format` and `authority-manifest.json`
+with them, together with the configuration. The catalog is rebuilt from the two
+logs. The tape-log, library-log, catalog and state-directory paths are configured
+independently, so check that a backup of "the state directory" includes each.
+
+Restore both logs, both authority files and the configuration together, each
+from its newest copy, to the configured paths. An older copy knows nothing
+decided after it: a tape withdrawn or fenced since then is not withdrawn or
+fenced in the restored state, and a tape first provisioned since then is unknown
+to it. Before starting the service on restored state, list the tapes used,
+withdrawn or fenced since the copy's date.
+
+Keep the recorded paths on a replacement server. If the state-directory,
+`journal.dir` tape root or `audit.dir` root differs from `authority-manifest.json`,
+daemon startup, rebuild and direct state opens refuse with
+`authority manifest format or configured root binding differs; declared reset required`.
+Commands using the runtime configuration loader can instead report
+`This state directory predates the current tape-log format.` when the journal
+root differs from `authority-format`. Both messages mention reset, but reset
+also refuses this path mismatch and erases nothing. Restore the recorded paths
+or point the configuration at them. Without the authority files, populated logs
+are refused; see [authority-layout refusals](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
+An older backup cannot authorize append over newer tape data:
+`TailBeyondKnownState` refuses that operation. Restore newer state or use
+catalogless `tape restore --scan` to rescue files.
+
+Standalone commands that open state acquire the state lock for one invocation
+and release it when they exit. Tape decisions are recorded in the library log;
+committed tape content and finalization progress are recorded in the tape logs.
+Display-only commands such as `rem list`, `setup`, `doctor`, `drives` and
+`diagnostics` do not open a state owner. A command that opens a drive also holds a
 per-drive lock file, `/run/lock/rem/<drive serial>.lock`, for the invocation.
 That file lives outside the state directory, so `/run/lock/rem` must exist and
 be writable by the user who runs `rem`; the
@@ -591,17 +631,29 @@ Object admission is permanently disabled. A failure enters
 their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
-<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-cli/src/standalone.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 The marker contains `remanence-tape-log-v3\n`, the canonical configured journal
-root encoded as a JSON string, and a final `\n`. SQLite uses schema 26. Ordinary opens refuse schemas 1 through 25. Such
-state requires
-`rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
-followed by reinitialization of the approved scratch tapes. The reset archives
-the prior marker, audit and journals when those directories exist; it preserves
-configuration and calibration generation allocation. See the
+root encoded as a JSON string, and a final `\n`. SQLite uses schema 26. In a
+current authority directory, daemon startup, catalog rebuild and runtime
+commands refuse catalog schemas 1 through 25 with
+`This state directory predates the current tape-log format.` before migration.
+State written by an earlier release with library or tape authority but no
+`authority-manifest.json` is refused first by daemon startup, rebuild and direct
+state opens with `Legacy or unbound authority requires the declared state reset`.
+Commands using the runtime configuration loader can report the marker/schema
+refusal first. `rem list` validates the catalog without opening state;
+`setup`, `doctor`, `drives` and `diagnostics` can warn about a refused catalog
+while continuing discovery. `doctor` exits 1 when its catalog check fails.
+
+For an earlier release, stop the daemon and use
+`rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`.
+The reset archives the prior catalog, authority files, library-log directory,
+tape logs and configuration snapshot, then installs fresh authority. Preservation
+is refused; reinitialize or adopt the approved tapes afterwards. Configuration
+and calibration generation allocation survive. See the
 [reset procedure](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
-`rem rebuild-catalog-from-journals --config <PATH>` instead rebuilds only the
-catalog projection and preserves the tape logs and audit bytes.
+With current intact authority, `rem rebuild-catalog-from-journals --config <PATH>`
+replaces only the catalog projection and preserves both logs.
 
 `state.lock` is a kernel `flock`. Every `rem-daemon`, including a read-only
 one, acquires it before opening the API state and holds it for the process
@@ -615,7 +667,7 @@ startup, a non-read-only daemon also deletes any of its own leftover
 `spool-<uuid>.bin` files from a prior unclean exit before resolving the spool
 budget.
 
-The audit log and per-tape journals are append-only records; the SQLite
+The library log and tape logs are append-only records; the SQLite
 file is a projection that `rem rebuild-catalog-from-journals` can
 regenerate from them. The tape itself stays the ultimate authority — its BOT
 bootstrap, parity structures, and finalized A/B/C terminal replicas support a

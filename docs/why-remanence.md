@@ -1,6 +1,6 @@
 # Why Remanence?
 
-<!-- code-anchor: crates/remanence-library/src/transport.rs crates/remanence-library/src/error.rs crates/remanence-library/src/discovery.rs crates/remanence-library/src/watch/mod.rs crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write/model.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-library/src/transport.rs crates/remanence-library/src/error.rs crates/remanence-library/src/discovery.rs crates/remanence-library/src/watch/mod.rs crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/library_runtime/motion.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 
 This page is for someone choosing between Remanence and another way of putting
 data on LTO tape. It explains what Remanence is, compares it with the usual
@@ -193,14 +193,14 @@ subscribe to these events.
 whatever the operator saved from the terminal, and their internals cannot be
 reached by automated tests.
 
-Remanence records an audit event around each state-changing SCSI command:
-`Started`, with the command bytes, before it is sent; `Finished`, with the
-outcome, after it returns; `Refused`, when a safety check stops the operation;
-and `Warning`, for non-fatal observations such as a mismatch found during a
-refresh. The events go to a hash-chained audit log on disk. Each tape also has a
-tape log, a host file that holds a durable commit record for every tape file
-written. The SQLite catalog is a projection rebuilt from the tape logs and the
-audit log, so it is never the only copy of anything.
+Remanence records robot motion in the hash-chained library log: intent before
+a motion command, and its observed outcome after it returns. Tape decisions,
+including retirement, label rebinding and fence release, are library-log records
+too. The log's `*.remlib` segments live in `audit.dir`, with their root and
+identity bound by `authority-manifest.json` in the state directory. Each tape
+also has a tape log, a host file recording committed content and finalization
+progress. The SQLite catalog is rebuilt from the library log and the tape logs;
+the audit log is not a rebuild source.
 
 Automated tests run against captured SCSI responses from real hardware and
 against virtual media. The fixtures cover the identity reporting of real
@@ -293,7 +293,7 @@ the orchestrator's job. Its catalog answers mechanism-level questions (which
 tape holds an object, where its files begin, what was committed), but it is a
 rebuildable projection and not the archive's only record. Every tape describes
 itself through its object manifests and its bootstrap, and the tape logs and the
-hash-chained audit log record the host-side history. The daemon serves catalog,
+hash-chained library log record the host-side history. The daemon serves catalog,
 read, write, robotics and stewardship operations over gRPC, on a Unix socket or
 optionally on TCP with mutual TLS (mTLS).
 
@@ -392,7 +392,7 @@ You want Remanence if:
   can write that orchestrator yourself against the gRPC API defined in
   [proto/layer5.proto](../proto/layer5.proto).
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/library_runtime.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 One manually loaded tape drive also works. `rem setup`, `rem put` and `rem get`
 operate it directly, without a daemon, and finalization writes the index that a
 later restore without the catalog reads. Start with the
@@ -434,7 +434,7 @@ explains. If this page and a specification differ, follow the specification.
   Reed-Solomon tape layout, sidecars and recovery from the bootstrap without a
   catalog, in the published copy.
 - [Architecture overview](architecture-overview.md): the layer stack, the write
-  and read paths, the catalog, the audit log, the tape logs and the daemon.
+  and read paths, the catalog, the library log, the tape logs and the daemon.
 - [Partial-file restore](pfr-reference.md): how one byte range of a file is read
   from tape, with a comparison with LTFS extents.
 - [Installing Remanence](guide-install.md): building from source and preparing a

@@ -18,7 +18,7 @@ to archive and when, and calls Remanence's API to do it. Other terms are
 explained where they first appear and are collected in the
 [glossary](reference-glossary.md).
 
-<!-- code-anchor: Cargo.toml @ 7f39930d -->
+<!-- code-anchor: Cargo.toml crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## The layer model
 
 Remanence is organized as a stack of five layers. Each layer depends only on
@@ -29,7 +29,7 @@ formats, so other tools can build on them:
 Layer 5   remanence-api, remanence-daemon, remanence-cli
           gRPC services, drive actors, sessions, operator CLIs
 Layer 4   remanence-state
-          config, state lock, audit log, rebuildable SQLite catalog
+          config, state lock, library log, rebuildable SQLite catalog
 Layer 3   remanence-format (3b: rem-object-v1 body)   remanence-parity (3c: parity)
           + remanence-aead (REMO HPKE envelope), remanence-format-driver (traits),
             remanence-stream (composition)
@@ -116,7 +116,7 @@ guard asserts that the core workspace contains no concrete foreign-format
 adapter. An external project can therefore build its own tape layout and
 catalog on the platform crates without taking on Remanence's formats.
 
-<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ bc2f9f90 -->
+<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs crates/remanence-state/src/library_log/codec.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Layer 3: formats and parity
 
 Six crates share this layer.
@@ -162,7 +162,7 @@ Six crates share this layer.
   layers, projects catalog rows, and restores objects to a directory,
   including sparse recovery of damaged archives.
 - `remanence-crc` provides the CRC-64/XZ checksum used by the parity structures
-  and the audit log.
+  and the library log.
 
 `archive build` and pool-selected `archive write` produce the encrypted
 representation when given 2-8 ordered `--recipient` REMR files (public
@@ -172,14 +172,16 @@ streaming, and ranged opens use a REMP `--private-key` file; the key's epoch id
 selects the matching slot in the key frame. `rem-recover` performs the same
 encrypted open without the daemon, catalog, or config.
 
-<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
-operator configuration, an exclusive state lock, the append-only audit log, and
-the SQLite catalog. The catalog is a projection of other records, not the
-source of truth: the projection-only rebuild replays the audit log and the
-per-tape logs to regenerate it. A catalog opened read-only is never migrated.
+operator configuration, an exclusive state lock, the append-only library log,
+the per-tape logs and the SQLite catalog. The library log's `*.remlib` segments
+live in `audit.dir`; `authority-manifest.json` in the state directory binds the
+roots. The projection-only rebuild starts from an empty catalog, applies the
+library log before the tape logs, and carries over nothing from the old catalog.
+The audit log is not a rebuild source. A catalog opened read-only is never migrated.
 SQLite's `user_version` tracks the schema. The
 [configuration reference](reference-configuration.md#what-ends-up-on-disk) gives
 the supported schema and the versions ordinary opens refuse. The tables cover
@@ -192,26 +194,28 @@ the process runs. `StateHandle`-based `rem-debug` mutations take the same lock.
 These are offline operations such as tape init, adopting the identity of an
 existing bootstrap, pool operations, and catalog reset. A second daemon cannot
 avoid the lock by choosing a different socket, and an offline command cannot
-race SQLite, checkpoint recovery, or the hash-chained audit log while the
+race SQLite, checkpoint recovery, or the hash-chained library log while the
 daemon runs. The kernel releases the lock when the owning process dies.
 Maintenance procedures stop the daemon before taking it.
 
-Catalog reset goes through a single admission check. A current catalog is
-inspected normally. A schema-22 catalog is readable only for declared-reset
-admission. A predecessor catalog at schema 16 through 21 with the
-required tape identity and geometry columns may be inspected only for one
-purpose: erasing the whole catalog while preserving nothing. For that, the reader lists every bound tape and refuses any
-label outside the erase allowlist. It does not preserve or migrate the old
-rows. It records the observed schema and tape identities in a token that the
-mutation checks again under the same lock. The result is a safe path to an
-empty catalog without relaxing the ordinary refusal to open an incompatible
-catalog.
+Scoped catalog reset inventories typed library and tape authority, and returns
+a token bound to the source, configuration and request. Execution repeats that
+admission under the state lock and requires the token. It does not read older
+SQL schemas to import identities. `--preserve-tape-voltag` is accepted but
+refused; reinitialize or adopt the tapes afterwards. Reset archives the prior
+catalog, authority files, log directories and configuration snapshot before
+installing fresh authority and an empty catalog. For state from an earlier
+release, use the declared reset; see the
+[reset reference](reference-cli.md#destructive-state-reset). A changed root
+binding instead needs the recorded paths restored, as
+[troubleshooting](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset)
+describes.
 
 How a tape is recognized and adopted when the catalog has no record of it, and
 why that step records identity only, is described in [Importing and recovering
 Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
-<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs crates/remanence-api/src/daemon_catalog_services.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/audit_query_service.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Layer 5: daemon and API
 
 Clients talk to `rem-daemon` over gRPC (a remote-call protocol built on
@@ -227,9 +231,9 @@ promise. `rem-daemon` serves seven services:
 | `WriteSessionService` | open (pool and pinned-tape targets — drive targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; checkpoint-batched durability applies to parity and no-parity tapes; write-session restart (`recover_session_id`) is not implemented, and the restart support described under [The read path](#the-read-path) covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target, so a client that lost its session in a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset); see [The read path](#the-read-path) |
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |
-| `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
+| `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams earlier-version `.remaudit` segments back incrementally paged; it shows no history of this version's operations |
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/index.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 Write sessions own parity epochs from open to end. The native log's
 `SessionOpened`, `SessionEnded`, and `ClosedOut` records select the next
 access's complete suffix proof. A crash-torn final file is identified by its
@@ -285,9 +289,9 @@ an `OperatorMount` for one explicitly authorized SCSI device. Its durable
 endpoint is `DriveKey::Standalone { drive_serial }`; no library serial, bay, or
 home slot is invented. There is no gRPC hop, changer actor, or long-running
 drive actor because one process owns one loaded cartridge for one invocation.
-The mount backend still installs the calibration fence, records audit and
-session state, runs the checkpointed writer or common restore/finalization
-code, and raises a durable tape-I/O fence when write completion is uncertain.
+The mount backend installs the calibration fence and records library-log decisions
+and tape-session state. It runs the checkpointed writer and common restore and
+finalization code. Uncertain session writes raise durable tape-I/O fences.
 Moving a tape between a standalone drive and a library therefore does not
 change its on-tape format or identity.
 
@@ -304,7 +308,7 @@ The figure shows the multi-drive daemon topology. The standalone `rem` path
 described above runs beside it and deliberately has no changer or service
 process.
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/audit_projection.rs crates/remanence-state/src/tape_log/authority.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-state/src/library_log/store.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## The write path
 
 This section follows one object from an orchestrator's daemon request to a
@@ -518,13 +522,10 @@ reference](reference-tape-layout.md#finalization-and-catalog-less-recovery)
 describes the finalization lifecycle, the decisions and plans recorded in the
 log, and the recovery rules.
 
-When a finalization completes, Remanence ensures that the append-only audit log
-holds exactly one `TapeSealed` fact for the tape and, for an operator's
-close-out, exactly one `OperationFinished` fact bound to the operator's
-identity in the sealed checkpoint. Each is decided by reading before appending,
-under the audit append lock, so a repeat after an interruption neither loses
-nor duplicates it. Both facts are fsynced whatever the configured audit fsync
-setting is.
+When finalization completes, the tape log records `Sealed`. For an operator
+close-out, the library runtime also records the operation's `Finished` event in
+the library log, from the accepted request and sealed tape evidence. A retry
+reuses durable completion records rather than appending duplicates. These records are synced regardless of `audit.fsync`.
 
 In plain terms, a receipt means the data is on tape and recorded; parity may
 still be due. The session holds the drive through its ending work, including

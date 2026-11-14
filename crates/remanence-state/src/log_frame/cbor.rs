@@ -172,7 +172,6 @@ pub(crate) use {enumeration, fields};
 /// Definite-length array with a schema-specific limit checked before allocation.
 /// The tuple is crate-visible so schema code can inspect values without copying.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Library-log array primitive; no producer is connected in B2.
 pub struct Bounded<T, const MAX: usize>(
     /// Elements, checked against the bound by both encoder and decoder.
     pub Vec<T>,

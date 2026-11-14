@@ -321,7 +321,7 @@ pub enum Fault {
     Overflow,
 }
 
-/// Fence reason type only: publication wiring belongs to B3b.
+/// Currently unused reason type for tape-log fences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapeLogFenceReason {
     /// Append/fsync outcome could have changed durable authority.

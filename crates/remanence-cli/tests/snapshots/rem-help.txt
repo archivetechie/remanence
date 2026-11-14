@@ -10,14 +10,14 @@ Commands:
   doctor                         Check permissions and storage readiness
   drives                         Show discovered tape endpoints and ownership
   watch                          Subscribe to OS hot-plug events touching SCSI tape / changer subsystems
-  rebuild-catalog-from-journals  Rebuild the local SQLite catalog projection from the audit log and the tape logs
+  rebuild-catalog-from-journals  Rebuild the local SQLite catalog projection from the library log and the tape logs
   reset-catalog                  Declare the offline state reset required by an authority-layout change
   daemon                         Query daemon process health and version over Layer 5 gRPC
   op                             Query daemon operation status
   catalog                        Query the daemon catalog
-  audit                          Query the daemon's append-only audit log
+  audit                          Query earlier-version audit segments; this version records no operation history there
   drive                          Query and mutate daemon drive stewardship state
-  alarms                         List or acknowledge standing daemon alarms
+  alarms                         List standing alarms; CLI acknowledgement is refused for active unacknowledged alarms
   top                            Live top view over daemon state
   tape                           Manage and inspect tapes in a library or standalone drive
   put                            Archive local files onto a library or standalone tape

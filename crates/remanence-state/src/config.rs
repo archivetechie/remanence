@@ -76,7 +76,7 @@ pub struct RemConfig {
     pub verification: VerificationConfig,
     /// Layer 3c journal settings.
     pub journal: JournalConfig,
-    /// Layer 4 audit-log settings.
+    /// Library-log settings under the compatibility `[audit]` table.
     pub audit: AuditConfig,
     /// Rebuildable SQLite index settings.
     pub index: IndexConfig,
@@ -149,7 +149,10 @@ pub struct DaemonConfig {
     /// Maximum age of the oldest pending object before a barrier is requested.
     #[serde(default = "default_checkpoint_max_age_seconds")]
     pub checkpoint_max_age_seconds: u64,
-    /// Default idle timeout for sessions.
+    /// Write-session idle-close interval after an automatic age-triggered checkpoint.
+    /// The session closes if no append follows before it expires. Opening a session
+    /// or taking a client-, size- or count-triggered checkpoint starts no idle timer.
+    /// Read sessions have no idle timeout; append-stream stalls use append_ingress_idle_secs.
     pub default_idle_timeout_seconds: u64,
     /// Client inactivity limit; counts only waits for append messages, excluding backpressure.
     #[serde(default = "default_append_ingress_idle_secs")]
@@ -533,16 +536,17 @@ pub struct JournalConfig {
     pub require_trusted_volume: bool,
 }
 
-/// Audit-log configuration.
+/// Library-log configuration under the compatibility `[audit]` table.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditConfig {
-    /// Directory containing daily `.remaudit` segments.
+    /// Directory containing `*.remlib` segments and library-log lock/fence markers.
     pub dir: PathBuf,
-    /// Whether appends are fsynced before returning.
+    /// Whether library-log Diagnostic appends are synced before returning.
+    /// Other record types always sync; segment rotation also syncs.
     #[serde(default = "default_true")]
     pub fsync: bool,
-    /// Wall-clock forward jump tolerance before an audit warning is emitted.
+    /// Accepted and range-validated; production does not read this setting.
     #[serde(default = "default_clock_forward_tolerance_seconds")]
     pub clock_forward_tolerance_seconds: u64,
 }

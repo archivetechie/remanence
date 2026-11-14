@@ -1,4 +1,4 @@
-<!-- code-anchor: crates/remanence-aead/src/seal.rs crates/remanence-aead/src/header.rs crates/remanence-cli/src/pool_ops.rs specs/in-progress/rem-encrypt-1-specification.md specs/publication/rem-implementation-guide.md @ 311cc6c3 -->
+<!-- code-anchor: crates/remanence-aead/src/seal.rs crates/remanence-aead/src/header.rs crates/remanence-cli/src/pool_ops.rs specs/in-progress/rem-encrypt-1-specification.md specs/publication/rem-implementation-guide.md crates/remanence-api/src/catalog_conversion.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 # Encryption explained
 
 This page is for an operator or a reviewer who wants to know why Remanence encrypts objects in
@@ -25,8 +25,9 @@ Under encryption in the object the ciphertext begins at ingest, so every copy on
 is the same protected byte string.
 
 The practical consequence is that storing, replicating, repairing from parity (the recovery
-data written beside the objects on tape) and scrubbing (reading stored copies on a schedule to
-check them against their checksums) all work with no key present. Authenticated verification
+data written beside the objects on tape) and scrubbing (reading stored copies to
+check them against their checksums) all work with no key present. An orchestrator
+or operator starts that upkeep; this stack runs no periodic re-read. Authenticated verification
 of an object's contents, and any restore, need a key.
 
 In plain terms: drive encryption locks the cartridge, and everything outside the cartridge is
@@ -89,7 +90,7 @@ credentials for the token, and firmware that still supports the feature.
 | Key choice | Decided by the application or key manager | A fresh key for every seal, wrapped for each recipient |
 | Check a copy without the key | Only through the drive's raw decryption mode, where the drive supports it | Yes. REM-ENCRYPT defines a Keyless Verifier role. |
 | Repair from parity without the key | No | Yes |
-| Authority held by upkeep jobs | They must be able to decrypt everything in their scope | None for storage, replication, parity repair and scrubbing; authenticated verification and any restore need a key |
+| Authority held by upkeep jobs | They must be able to decrypt everything in their scope | None for storage, replication, parity repair and scrubbing started by an orchestrator or operator; authenticated verification and any restore need a key |
 | Migrate to new media | Decrypt, cross the host in the clear, encrypt again | Copy the bytes; no key is loaded |
 | What the medium carries | The key-associated data the application chose, such as a key identifier | The format version, cipher suite, wrapping scheme, salt, recipients and the wrapped key |
 | Needed to read a copy back | A compatible drive, the key, and a host that can send the SCSI security commands | The published specifications, a conforming implementation, and one matching recipient private key |
@@ -116,10 +117,10 @@ but all the copies made from one seal are identical.
 ### 3.2 The work an archive repeats
 
 An object is written once. The operations that follow recur for as long as the collection is
-held: reading copies back, scrubbing cartridges on a schedule, rebuilding damaged regions from
-parity, making more copies, and eventually moving everything to newer media. This work is
-automated because it is repetitive and very large, and automated work of this kind gets less
-oversight than interactive work.
+held: reading copies back, scrubbing cartridges, rebuilding damaged regions from
+parity, making more copies, and eventually moving everything to newer media. An
+orchestrator or operator must start this upkeep. Remanence runs no periodic
+re-read; `rem tape verify-index` starts only when requested.
 
 Under drive encryption all of it runs through the decryption path. The key store has to be
 reachable, and keys are released for operations whose only purpose is to confirm that stored

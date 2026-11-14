@@ -8,7 +8,7 @@ cartridge can be recycled or replaced without emptying the catalog. It also cove
 `rem tape rebind`, which moves an operator's label from one identity to another. The page
 is an explanation; nothing here is normative.
 
-<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/pool_write/model.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## 1. A tape has two names, and they mean different things
 
 A cartridge carries one name on the outside and one on the inside.
@@ -82,13 +82,13 @@ When the same workload runs again:
    intentional, and section 3 explains why.
 4. If every tape in the pool is in the same condition, the pool eventually reports
    `RESOURCE_EXHAUSTED: pool archive has no writable tapes (N rejection(s))`.
-5. Without `retire`, the only remaining way forward is a full catalog reset,
+5. A full catalog reset,
    `rem reset-catalog --i-understand-this-erases-the-catalog` (`rem-debug catalog reset` is
-   the same operation). It removes the stale pairing, but it also erases the whole catalog,
-   the active audit log (the hash-chained record of every operation) and the tape logs (the
-   per-tape records of what was committed to each tape). The reset moves the audit log and
-   the tape logs into a numbered directory under `reset-archives` in the state directory, but
-   the running system starts again from an empty catalog with no operation history. That is
+   the same operation), removes the stale pairing, but also erases the whole catalog,
+   the active library log (the hash-chained record of library decisions) and the tape logs
+   (the per-tape records of committed content). The reset archives both log directories,
+   the prior catalog, authority files and configuration snapshot under `reset-archives`, but
+   the running system starts again from an empty catalog with no prior operation history. That is
    far more than the one stale pairing.
 
 ### Scenario B: recycling tapes between test runs
@@ -100,7 +100,7 @@ returns a `refuse-clobber` decision: overwriting written media needs a separate 
 confirmation, and is refused outright where the catalog records committed copies. (Init on
 intact, unwritten media with a matching identity is an idempotent no-op.) A full catalog
 reset between runs works only when the catalog is disposable. On a production catalog the
-same sequence would empty the active catalog and audit log every time a tape was recycled.
+same sequence would empty the active catalog and library log every time a tape was recycled.
 
 ### Scenario C: losing a tape that holds copies
 
@@ -148,7 +148,7 @@ thing and BOT says another. Only the operator's intent separates them. For that 
 way out is an explicit action performed by an operator, or by a script an operator wrote,
 and the default stays refusal.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state/initialization.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state/initialization.rs crates/remanence-state/src/projector/apply.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## 4. Retire: declaring a tape identity dead
 
 `rem tape retire` is the explicit action. In words, the operator declares that logical tape
@@ -156,7 +156,7 @@ X is dead, that its contents are gone on purpose, that the system should stop ex
 them, and that its barcode is free for a new life.
 
 The first argument is the barcode of the tape or its tape UUID as 32 hexadecimal digits.
-`--reason` is free text recorded in the audit log, for example `recycled` or `vtl-rebuilt`.
+`--reason` is free text recorded in the library-log `Retire` record, for example `recycled` or `vtl-rebuilt`.
 The flag `--i-understand-copies-become-unreadable` is required on every run, including a
 dry run. `--dry-run` reports what would be retired without writing, and `--json` prints the
 `rem.tape.retire.v1` envelope.
@@ -179,8 +179,9 @@ dry-run: would retire RMJ101L9 (uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f): 2 co
 The same command without `--dry-run` retires the identity and prints
 `retired RMJ101L9 (uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f): 2 copies marked missing, 1 object now degraded`.
 
-A retire has five effects. Effects 1 to 3 and 5 are committed in one catalog transaction;
-the audit record (effect 4) is appended after that transaction commits.
+Retirement first appends a `Retire` record to the library log, with the tape
+identity, actor, time and reason. The record is synced before its catalog
+projection. It has these effects:
 
 1. The tape row changes to `state='retired'`, a terminal state. The pool selector never
    picks it again, since any state other than `ready` is already unwritable.
@@ -193,13 +194,9 @@ the audit record (effect 4) is appended after that transaction commits.
    under `--dry-run`, as a `warning:` line on standard error in text mode, and as the
    `degraded_objects` list in `--json` output (which carries no text warning). That list is
    the input re-replication needs.
-4. A `TapeRetired` record is appended to the hash-chained audit log. It records who, when,
-   which barcode, why, and how many copies were declared missing. A destructive declaration
-   belongs in the permanent record, and section 5 shows that this record is also what keeps
-   the retirement through a catalog rebuild. The catalog is committed first and the audit
-   append follows. If the append fails, the command reports an error although the
-   retirement has already taken effect and is not rolled back; check the tape's state and
-   the audit log before retrying.
+4. The library-log `Retire` record keeps the decision through catalog rebuild.
+   If the process stops after the record is durable but before projection,
+   replay completes the catalog changes.
 5. The retired row and its history stay in the catalog permanently. Retire is not delete.
    The purpose is to record what happened, not to rewrite it.
 
@@ -230,7 +227,7 @@ initialized under a new tape UUID Y needs adoption, or a clobber that names Y.
 For a recycled tape, the two paths compare as follows. Without retire:
 
 1. `rem tape init RMJ101L9` is refused.
-2. A full catalog reset clears the active catalog, the audit log and the tape logs (the
+2. A full catalog reset clears the active catalog, the library log and the tape logs (the
    inputs are archived under `reset-archives`).
 3. The workload runs again against an empty catalog.
 
@@ -240,71 +237,31 @@ With retire:
    retires X.
 2. `rem tape init RMJ101L9 --clobber-data`, confirmed with `CLOBBER RMJ101L9`, writes a new
    bootstrap.
-3. The workload runs again. The catalog, the audit log and the tape logs are intact, and the
-   audit log has gained one `TapeRetired` record.
+3. The workload runs again. The existing history is retained. The library log
+   records retirement and reprovisioning; new writes have their own tape log.
 
-<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/index.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_manifest.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## 5. Retire and catalog rebuild
 
-A retirement has to survive a catalog rebuild. This section explains why that takes more
-than a single `UPDATE` statement, and how the rebuild keeps it.
+A retirement survives catalog rebuild because it is recorded in the library log.
+The catalog is a SQLite projection of two durable sources: the library log and
+the per-tape logs. The library log's `*.remlib` segments live in `audit.dir`,
+with `authority-manifest.json` in the state directory binding their root and
+identity. A tape log records committed content and finalization progress for
+one tape. The audit log is not a rebuild source.
 
-Remanence treats the catalog as a projection: a set of SQLite tables derived from two
-durable sources, the per-tape logs and the audit log. The **tape log** is the host's
-append-only record for one tape of what was committed to it. The audit log is the
-hash-chained record of operator and system actions. The catalog can be rebuilt from them at
-any time with `rem rebuild-catalog-from-journals` (the command keeps an older name; it reads
-the tape logs and the audit log). The daemon does a smaller version of the same work when it
-starts: it projects any tape-log records the catalog has not seen yet, and it skips retired
-tapes.
-
-Following a retired tape through a rebuild shows the problem.
-
-1. Tape X was written once. Its tape log says that objects A and B were committed to X.
-   That log is history. It stays on disk, and it is correct, because those objects were
-   committed to X.
-2. The operator wipes the medium and retires X. The catalog row is `retired` and the copies
-   are `missing`.
-3. Months later a rebuild runs. It clears the catalog tables and replays the tape logs,
-   which recreate the copies of A and B on X as `committed`.
-
-If nothing else happened, step 3 would undo the retirement without a word. Restore planning
-would again believe that copies exist on a wiped medium, and the next initialization of that
-cartridge would produce Scenario A again. An identity fact held only in SQLite is lost when
-the catalog is rebuilt.
-
-The rebuild prevents this because the retirement is not held only in SQLite. The `TapeRetired`
-record in the audit log is the durable fact, and the rebuild applies the audit log after the
-tape logs. The rebuild runs as one SQLite transaction, in this order:
-
-1. It reads the operator-set columns of the existing tape rows: barcode, pool, cartridge
-   generation, finalization progress, and lifecycle states such as `sealed` and `retired`.
-2. It clears the rebuildable tables and puts those tape rows back.
-3. It replays every tape log. For X this recreates the tape-file rows and the copies of A
-   and B as `committed`.
-4. It writes the operator-set columns from step 1 back over the rows the logs produced, so
-   a row that was `retired` before the rebuild is `retired` again.
-5. It replays the catalog records in the audit log (tape provisioning, adoption, label
-   rebinds, seals and retirements), so that an audit fact wins over anything the tape logs
-   implied. The `TapeRetired` record for X sets the state to `retired` and clears the
-   barcode. This step needs nothing from the old catalog, so the retirement is restored even
-   when the catalog file itself was lost or deleted before the rebuild.
-6. It marks every `committed` copy on a retired tape `missing` again.
-
-Copy status is a consequence of tape state, never an independent fact. The rebuild therefore
-has one thing to keep, the tape's state, and recomputes the copies from it, so the two cannot
-drift apart.
-
-The tape log is not deleted at retire time, because it is the authoritative history that A
-and B were written to X. Retire records a change in the present and leaves the past as it
-was. Both statements stay true: the tape log says that A and B were written to X, and the
-catalog says that X is gone.
+`rem rebuild-catalog-from-journals` starts from an empty catalog. It applies
+the library log, including `Retire` and `Label` decisions, before the tape logs
+in one catalog transaction. It carries over nothing from the old catalog.
+A retired tape remains retired, its barcode remains released and its committed
+copies are projected as missing. The tape's old content records remain history;
+they do not undo the library-log decision.
 
 ## 6. What retire does not do
 
 - It does not touch the tape. There is no load, no robot move, and no SCSI command. The
-  medium may be in a drive, in a slot, or discarded. Retire is a catalog and audit
-  operation about expectations.
+  medium may be in a drive, in a slot, or discarded. Retire records the decision
+  in the library log and projects it into the catalog.
 - It does not erase anything: not the row, not the tape log, not the copies' rows.
   Everything becomes history with an accurate status.
 - It cannot be undone. There is no `un-retire`, and retired identities are permanent: an
@@ -315,7 +272,7 @@ catalog says that X is gone.
   before considering the cartridge for reuse. An undo flag would turn the retirement into a
   toggle, and every safety argument in section 3 assumes it is not one.
 - Retiring an identity that is already retired is a no-op that reports success
-  (`... is already retired; no change`) and appends no second audit record, but only when
+  (`... is already retired; no change`) and appends no second library-log retirement record, but only when
   the target is the original tape UUID. Retirement clears the barcode, so a retry by barcode
   either fails (the barcode is no longer assigned) or, once the cartridge has been
   initialized again, retires the new identity that now holds the barcode. A script should
@@ -327,7 +284,7 @@ catalog says that X is gone.
   `--dry-run` takes no state lock and opens the catalog read-only, so it can be used while
   the daemon runs.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/index.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/index.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## 7. Rebind: moving an operator label to another identity
 
 On a standalone drive the outside name is the operator's label, and the operator may need
@@ -368,28 +325,26 @@ The command prints the label it bound, as JSON:
 }
 ```
 
-A rebind does three things. It appends a `TapeLabelRebound` record to the audit log, naming
+A rebind does three things. It appends a `Label` record to the library log, naming
 the loaded tape, the label and the previous tape UUID. It then clears the label from X and
 gives it to the loaded tape, with `operator` as its provenance. Neither identity changes
 state, and no copy changes status. X keeps its objects and simply has no label until the
-operator gives it one. Like a retirement, the rebind is an audit record, so a catalog rebuild
-replays it (section 5, step 5) and the label stays where the operator put it.
+operator gives it one. Like retirement, label rebinding is a library-log decision.
+Catalog rebuild replays it before the tape logs (section 5), so the label stays
+where the operator put it.
 
-A rebind is refused, and changes nothing, in two cases:
-
-- `tape provisioning conflict: previous UUID does not match the current label binding`
-  means the label is not paired with the tape UUID given in `--previous-uuid`. The init
-  refusal shown above names the current holder; use that tape UUID.
-- `tape provisioning conflict: rebind target must be an existing live identity` means the
-  cartridge in the drive is not a catalogued, unretired tape. A blank cartridge, or one whose
-  identity was retired, cannot take a label this way; initialize it with a new label, or
-  retire the old identity first if its contents are really gone.
+A rebind refuses with
+`tape provisioning conflict: label prior holder differs from BOT-proven correction`
+when the named previous tape does not hold the label, or is the loaded tape
+itself. Check which identity holds the label before retrying. The loaded and
+previous identities must both have library-log provisioning records; an unknown
+cartridge cannot take a label through rebind.
 
 ## 8. Day-to-day use
 
 | Situation | Without retire | With retire |
 | --- | --- | --- |
-| Test setup rebuilt (virtual tape library) | `tape identity mismatch`. The only way forward is a full catalog reset, which clears the active catalog, audit log and tape logs (archiving them). | Retire each affected tape by tape UUID, then run `rem tape init` for blank cartridges and for those still carrying the old tape UUID, then run the workload again. The catalog and audit history stay intact. Cartridges initialized under an unknown tape UUID need adoption, or a clobber that names that UUID. |
+| Test setup rebuilt (virtual tape library) | `tape identity mismatch`. A full catalog reset clears the active catalog, library log and tape logs (archiving them). | Retire each affected tape by tape UUID, then run `rem tape init` for blank cartridges and for those still carrying the old tape UUID, then run the workload again. The catalog and library-log history stay intact. Cartridges initialized under an unknown tape UUID need adoption, or a clobber that names that UUID. |
 | Recycling tapes between runs | Init is refused: an anomaly if the medium was changed outside Remanence, `refuse-clobber` if it holds written data. | A script calls retire, by the original tape UUID, and then init. A repeated retire of the same tape UUID is a no-op that reports success. |
 | Which objects lost all their copies? | Nothing can answer this. | `rem tape retire --dry-run` lists the objects that would lose their last committed copy. |
 | Mislabeled or foreign cartridge | Refused. | Refused, unchanged. |

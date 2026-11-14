@@ -569,7 +569,12 @@ rem tape finalize [OPTIONS] --acknowledge-tape <ACKNOWLEDGE_TAPE>
 - `--tape <TAPE>` selects or verifies the tape identity. Default: the loaded tape's UUID.
 - `--reason <REASON>` records a reason. Default `finalized with rem`.
 - `--idempotency-key <IDEMPOTENCY_KEY>` overrides the request key. The default is a stable
-  UUIDv5 derived from the tape UUID and a fixed namespace, so a retry deduplicates.
+  UUIDv5 derived from the tape UUID and a fixed namespace. A retry must explicitly
+  repeat the first request's `--reason` and `--expected-pool`: the default pool
+  comes from the catalog at each attempt. Matching retries resume an open
+  operation or deduplicate a sealed success. After a completion-unknown ending,
+  the pending intent needs operator recovery; the same key is refused with
+  `ClosedOperationRetry`, and a new key with `ALREADY_EXISTS`.
 - `--expected-pool <EXPECTED_POOL>` requires this pool instead of the catalogued one.
 
 Finalization is permanent: the tape accepts no more objects afterwards.
@@ -621,13 +626,14 @@ rem tape rebind [OPTIONS] --label <LABEL> --previous-uuid <PREVIOUS_UUID>
 - `--previous-uuid <PREVIOUS_UUID>` is the tape UUID that holds the label now. The command
   proceeds only if the catalog pairs the label with exactly this UUID.
 
-The loaded tape must be a catalogued identity that is not retired. The rebind is an audit
-record (`TapeLabelRebound`) that catalog rebuild replays; neither identity changes state.
-It prints `{"label": <LABEL>}`. The refusals are
-`tape provisioning conflict: previous UUID does not match the current label binding` and
-`tape provisioning conflict: rebind target must be an existing live identity`. See
-[Tape identity and the retire operation](tape-identity-lifecycle-explainer.md) for when to
-rebind and when to retire.
+The loaded tape must be a catalogued identity that is not retired. Rebinding
+appends a `Label` record to the library log, which catalog rebuild replays.
+Neither identity changes state. It prints `{"label": <LABEL>}`.
+`tape provisioning conflict: label prior holder differs from BOT-proven correction`
+means the named previous identity does not hold that label, or is the loaded
+identity itself. Check the label's current holder before retrying. See
+[Tape identity and the retire operation](tape-identity-lifecycle-explainer.md)
+for when to rebind and when to retire.
 
 To give the label `FIRST`, now held by tape `5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f`, to the
 loaded tape:
@@ -656,7 +662,9 @@ There is no replacement import command.
 rem tape supersede-tail --acknowledge-tape <LABEL|UUID> [--confirm-supersede "SUPERSEDE <LABEL>"]
 ```
 
-List and explicitly discard the suffix beyond local authority, with typed confirmation and audit. Rescue files first.
+List and explicitly discard the suffix beyond local authority, with typed
+confirmation. The decision is recorded as `SupersedeTail` in the library log.
+Rescue files first.
 
 ### rem tape quarantine (standalone)
 
@@ -670,11 +678,37 @@ rem tape quarantine release [OPTIONS] --ack <ACK> <ID>
 - `<ID>` is the quarantine id of the fence to release.
 - `--ack <ACK>` records why the fence is being released. It must not be empty.
 
-`list` prints the active tape-I/O fences and media-readiness records. `release` goes
-through the configured daemon socket when it is listening; otherwise it takes the exclusive
-offline state lock. The acknowledgement is durable before the fence clears, and release does
-not bypass append admission. A fence raised by a library daemon must be released on the host
-that owns it.
+On a home host without `/etc/rem/config.toml`, `list` prints active tape-I/O
+fences, including `library:` ids, and media-readiness records. On a host with
+both system and home configurations, select the standalone parser explicitly:
+
+```sh
+rem tape quarantine list --device <SG> --allow-device <SERIAL> --config <PATH>
+```
+
+`<SG>` and `<SERIAL>` name the standalone drive; `<PATH>` is the home
+configuration. The library parser's `list` prints media-readiness records and
+does not list `library:` tape fences.
+
+Release these tape fences with the library form:
+
+```sh
+rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>
+```
+
+Add `--force` only for `native_log_behind_projection`, after the recovery
+[described below](#rem-tape-quarantine-list-show-and-release-library).
+The library form uses the home configuration when `/etc/rem/config.toml` is
+absent. To select a configuration explicitly, put `--config <PATH>` on the
+`release` subcommand, not before `tape`. It uses the configured daemon socket
+when one answers; an absent listener permits offline release under the state
+lock. RPC and authentication failures do not fall back offline.
+
+The bare form without `--after-settled-inventory` is not a release route for
+these tape fences. On a home host, or with `--device`, it selects standalone
+release and refuses a `library:` fence with `fence raised by a library daemon:`.
+On a system-configured host the library parser refuses with
+`tape quarantine release requires --after-settled-inventory`.
 
 ### rem tape release
 
@@ -865,7 +899,7 @@ rem catalog entries [OPTIONS] <UNIT_ID>
 - `--origin <ORIGIN>` (on `units`) filters by origin: `all` (default), `native` (objects
   Remanence wrote) or `foreign` (archives scanned through an adapter).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/top.rs crates/remanence-api/src/closeout_obligation.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/top.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/auth.rs crates/remanence-api/src/library.rs crates/remanence-state/src/library_runtime/peer_observations.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/audit_query_service.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ### rem top
 
 Show live daemon state.
@@ -911,7 +945,11 @@ their tape. Status reads during a checkpoint return the last committed summary.
 
 ### rem alarms, rem alarms ack
 
-List standing alarms, or acknowledge one.
+List standing alarms. The acknowledgement subcommand is accepted, but the CLI
+cannot acknowledge an active, unacknowledged alarm over the local socket. It
+prints `error: daemon returned failed_precondition: SystemAcknowledgement`.
+The CLI has no client-certificate option for the TCP endpoint; an authorized
+mTLS gRPC client can acknowledge an alarm with `AckAlarm`.
 
 ```text
 rem alarms [OPTIONS] [COMMAND]
@@ -922,7 +960,9 @@ rem alarms ack [OPTIONS] <CONDITION_KEY>
 
 ### rem audit query
 
-Stream audit-log entries for a time interval.
+Stream audit segments written by earlier versions for a time interval.
+This command shows no history of this version's operations and is not a query
+of the library log.
 
 ```text
 rem audit query [OPTIONS] --since <RFC3339> --until <RFC3339>
@@ -937,10 +977,10 @@ rem audit query [OPTIONS] --since <RFC3339> --until <RFC3339>
 
 `--json` prints one JSON object per entry.
 
-To see the retirements recorded on 2 November 2026:
+To query surviving earlier-version audit segments for one day:
 
 ```sh
-rem audit query --since 2026-11-02T00:00:00Z --until 2026-11-03T00:00:00Z --filter event=TapeRetired
+rem audit query --since 2026-11-02T00:00:00Z --until 2026-11-03T00:00:00Z
 ```
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/mount.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
@@ -1057,7 +1097,7 @@ To load `RMJ101L9` into bay `0x0100` of library `LIB001`:
 rem drive load --library LIB001 --bay 0x0100 --barcode RMJ101L9
 ```
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs crates/remanence-api/src/mount.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime/motion.rs crates/remanence-state/src/lock.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ### rem drive unload
 
 ```text
@@ -1081,14 +1121,15 @@ On success it prints the operation, then
 `unloaded <BARCODE> from bay <BAY> to slot <SLOT>`. With `--json`, the
 `rem.operation.status.v1` item carries a `location` object with `library_serial`,
 `bay`, `barcode` and `slot`. A retry sends a new request. `rem-debug unload` is
-the break-glass form that bypasses the daemon.
+the direct recovery form. Stop the daemon first: it reads the configuration
+and takes the state lock before admitting motion.
 
 With `--json`, a failed, cancelled, or completion-unknown operation prints a
 `rem.error.v1` error on stderr with `code: "operation_failed"`,
 `details.operation_id`, and `details.state`, and exits 1. Connection failures
 remain `daemon_client_error`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Tape lifecycle
 
 Initialization, readiness and retirement run against local configuration and state, and
@@ -1237,7 +1278,10 @@ rem tape quarantine release [OPTIONS] --ack <TEXT> <QUARANTINE>
 
 - `<QUARANTINE>` is a quarantine id or a media-readiness operation UUID.
 - `--library <SERIAL>` (on `list`) restricts the list to one library.
-- `--ack <TEXT>` (on `release`) is the acknowledgement, recorded in the audit log.
+- `--config <PATH>` selects the configuration on `list`, `show` or `release`.
+  Default `/etc/rem/config.toml`; this is a subcommand option, not a global flag.
+- `--ack <TEXT>` (on `release`) is the acknowledgement. A tape-I/O release stores
+  it in the library-log `FenceReleased` record.
 - `--after-settled-inventory` (on `release`) confirms that the library inventory has
   settled after the unknown operation.
 - `--force` (on `release`) is required for `native_log_behind_projection` after
@@ -1254,27 +1298,33 @@ fields. The JSON schema of `list` is `rem.tape.quarantine.list.v1`.
 `rem top` and `rem daemon health` list those. A tape-I/O fence is released through the
 configured daemon socket after the operator's acknowledgement. Only an absent listener
 permits the offline fallback, which needs the exclusive state lock. Repeating a release
-returns its original evidence. Media-readiness release keeps its existing offline
-behaviour.
+returns its original evidence. Media-readiness (`mrq-`) release runs offline;
+stop the daemon so it can take the state lock.
 
-For `native_log_behind_projection`, restore the exact tape log or rebuild the
-catalog with `rem rebuild-catalog-from-journals`, then run
-`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`. Without `--force`, release
-is refused with `native_log_behind_projection fence requires --force: restore the exact tape log, then release with --force; ...`.
-A forced release can still be refused if tape admission is contradicted or the
-log remains behind the catalog. This form uses the daemon when one listens;
-only an absent listener permits release offline under the state lock. The
-standalone form `rem tape quarantine release <ID> --ack <TEXT>` has no `--force`.
-On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses the home configuration when `/etc/rem/config.toml` is absent.
+For a present, noncontradicted `native_log_behind_projection` log, restore the
+exact tape log or rebuild the catalog with `rem rebuild-catalog-from-journals`,
+then release with:
 
-To release a fence after checking the drive and the slot inventory:
+```sh
+rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
+```
+
+Without `--force`, release is refused with
+`native_log_behind_projection fence requires --force:`. A contradicted log,
+a floor conflict or an absent tape log still refuses forced release; restore
+the exact log or retire the tape. Rebuilding the catalog does not cure those
+conditions. This release form uses the home configuration on a standalone host
+without `/etc/rem/config.toml`. The bare `--ack` form is not a release route for
+these tape fences; see [standalone routing](#rem-tape-quarantine-standalone).
+
+Stop the daemon before releasing a media-readiness fence. To release one after checking the drive and the slot inventory:
 
 ```sh
 rem tape quarantine release mrq-9b1d2c3e-4f50-4a61-8b72-93a4b5c6d7e8 \
     --after-settled-inventory --ack "inventory settled; cartridge is in its home slot"
 ```
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ### rem tape retire
 
 Retire one tape identity permanently in the local catalog.
@@ -1284,7 +1334,7 @@ rem tape retire [OPTIONS] --reason <TEXT> <TARGET>
 ```
 
 - `<TARGET>` is a barcode or a 32-hex tape UUID.
-- `--reason <TEXT>` is free text recorded in the audit log, such as `recycled`.
+- `--reason <TEXT>` is free text recorded in the library-log `Retire` record, such as `recycled`.
 - `--i-understand-copies-become-unreadable` is required on every run, dry run included.
 - `--dry-run` reports what would be retired without writing. It opens the catalog read-only
   and takes no state lock.
@@ -1348,7 +1398,7 @@ Failures print to stderr and exit 1. JSON terminal failures include
 terminal operation state. Argument parsing failures exit 2. Each JSON message is
 one line, including the generated-key message preceding any error.
 
-<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs crates/remanence-state/src/library_runtime/terminal.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
+<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime/motion.rs crates/remanence-state/src/lock.rs crates/remanence-state/src/state.rs crates/remanence-state/src/library_runtime/adoption.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ### rem tape finalize (library)
 
 Finalize one exact tape through the daemon.
@@ -1538,10 +1588,12 @@ rem-debug --allow <SERIAL> tape bot-probe [OPTIONS] --library <SERIAL> --expecte
 - `--json` is required; it is the only rendering.
 
 The probe is advisory and identity-only. Under one stable drive handle it verifies
-readiness, temporarily selects a fixed 1 MiB, compression-off read mode, issues exactly one
+readiness, temporarily selects a variable-block, compression-off read mode, issues exactly one
 LOCATE(0) and at most one READ, restores the prior drive mode, and parks the cartridge in
-the exact expected home slot. It never reads past BOT and never consults or changes the
-catalog. The JSON schema is `rem.tape.bot-probe.v1`; a valid native identity has
+the exact expected home slot. It never reads past BOT. It reads the configuration
+(`--config <PATH>`, default `/etc/rem/config.toml`), opens state and takes its lock,
+so stop the daemon first. Motion is recorded in the library log before the
+command moves a cartridge. The JSON schema is `rem.tape.bot-probe.v1`; a valid native identity has
 `physical_disposition="bootstrap_valid"`. See
 [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
@@ -1561,7 +1613,7 @@ rem-debug --allow <SERIAL> tape adopt-bootstrap [OPTIONS] --expected-existing-ta
 The command holds the exclusive state handle, runs fresh discovery, verifies the exact UUID,
 home slot and library, checks that the block size the bootstrap records is one every drive in
 the library supports and that the tape was written with drive compression off, restores the drive
-mode, parks the medium, then records a durable `TapeIdentityAdopted` event and an
+mode, parks the medium, then records a library-log `Reprovision` in adoption mode and an
 identity-only catalog row. A tape with exactly bootstrap, filemark and EOD becomes `ready`;
 every other tail after a valid bootstrap becomes `recovery_required`. The command generates
 its own operation UUID; a retry may be a no-op only while the replayed row is still the
@@ -2364,7 +2416,7 @@ keep the on-tape labels; it never substitutes labels from the new retry request.
   reports `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk and stored-range geometry.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/library_runtime.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime/motion.rs crates/remanence-state/src/lock.rs crates/remanence-library/src/handle/mod.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## rem-debug extras
 
 `rem-debug` has only part of the surface above. It shares discovery (`libraries`,
@@ -2471,7 +2523,8 @@ rebuild the catalog projection from intact logs. See
 ### Robotics
 
 These commands send SCSI directly to the changer, bypassing the daemon, and all require
-`--allow <SERIAL>`.
+`--allow <SERIAL>`. All nine robotics tools, including `tape bot-probe`, read
+configuration and take the state lock. Stop the daemon before running them.
 
 | Command | What it does |
 |---|---|
@@ -2483,7 +2536,11 @@ These commands send SCSI directly to the changer, bypassing the daemon, and all 
 | `rem-debug rescan <SERIAL>` | INITIALIZE ELEMENT STATUS, then reconcile the snapshot. A shape mismatch is a hard error. |
 | `rem-debug lock <SERIAL>`, `rem-debug unlock <SERIAL>` | PREVENT or ALLOW MEDIUM REMOVAL on the changer. The changer holds the lock, so it survives process exit; while it is held, the front-panel eject and operator mailslot eject are refused. A device reset or power cycle also releases it. |
 
-`move`, `load`, `unload`, `export` and `import` read the configuration named by `--config` (default `/etc/rem/config.toml`) and install that library's motion authority before they run the operation; `rescan`, `lock` and `unlock` read `/etc/rem/config.toml` and accept no `--config` option.
+`move`, `load`, `unload`, `export`, `import` and `tape bot-probe` take `--config`
+(default `/etc/rem/config.toml`) and record motion in the library log before
+moving anything. `rescan`, `lock` and `unlock` read `/etc/rem/config.toml`, take
+the state lock and accept no `--config` option. They move no tape and record no
+motion.
 
 To move the cartridge in slot `0x0400` of library `LIB001` into bay `0x0100` and load it:
 
@@ -2491,20 +2548,19 @@ To move the cartridge in slot `0x0400` of library `LIB001` into bay `0x0100` and
 rem-debug --allow LIB001 load --slot 0x0400 --bay 0x0100 LIB001
 ```
 
-`unload` first tries SSC UNLOAD without taking new locks or reading configuration. Only
-ILLEGAL REQUEST with sense `05/53/02` (MEDIUM REMOVAL PREVENTED) triggers recovery: take the
-drive's device lock `/run/lock/rem/<drive-serial>.lock` without waiting, issue ALLOW MEDIUM
-REMOVAL (audited as `AllowRemoval`), retry UNLOAD, then MOVE. The lock stays held through the
-MOVE. A busy lock refuses recovery without ALLOW; a failed ALLOW stops before the retry or
-MOVE. Other UNLOAD errors do not trigger recovery.
+`unload` reads `--config <PATH>` or `/etc/rem/config.toml`, requires the library
+to be configured there, and takes the state lock before any SSC UNLOAD. It
+refuses while a catalog-reset fence is present, opens the library runtime and
+reconciles earlier motion. Normal unload and recovery use this same admission.
 
-Without `--config`, the device lock is the recovery exclusion, and no configuration file,
-including `/etc/rem/config.toml`, is read. With an explicit `--config <PATH>`, recovery also
-takes that configuration's state-directory lock without waiting and records the recovery in
-its audit log. It takes only the bare state lock: it does not open or migrate the catalog or
-reconcile reset fences, so a catalog-reset fence does not block cartridge recovery. Normal
-unloads do not take this state lock even when `--config` is given. `rem-debug unlock`
-addresses the changer, so it does not clear a drive's PREVENT.
+Only ILLEGAL REQUEST with sense `05/53/02` (MEDIUM REMOVAL PREVENTED) triggers
+recovery after the initial UNLOAD. Recovery takes the drive's device lock,
+`/run/lock/rem/<drive-serial>.lock`, without waiting, issues ALLOW MEDIUM REMOVAL,
+retries UNLOAD and then returns the cartridge with MOVE MEDIUM. The device lock
+stays held through the MOVE. A busy device lock refuses recovery before ALLOW;
+a failed ALLOW stops before retry or MOVE. Other UNLOAD errors do not trigger
+recovery. `rem-debug unlock` addresses the changer and does not clear a drive's
+PREVENT.
 
 ### Direct tape data path
 
@@ -2520,7 +2576,7 @@ logs, and take `--config <PATH>` (default `/etc/rem/config.toml`).
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a loaded tape instead of a dump file. `--tape` takes the serial of the library that holds the tape and `--bay` the drive bay; that library must be on `--allow`. `restore` and `recover` also take `--dest <DIR>`. |
 | `rem-debug tape alerts --bay <BAY> [--library <SERIAL>]` | Read the loaded drive's TapeAlert LOG SENSE page directly. `--library` selects a configured library when there is more than one. `rem tape alerts` has no `--bay`; it is the daemon alias that takes a drive serial or UUID. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Destructive state reset
 
 ### rem-debug catalog reset-preflight
@@ -2530,18 +2586,17 @@ rem-debug catalog reset-preflight [OPTIONS]
 ```
 
 - `--config <PATH>` is the configuration. Default `/etc/rem/config.toml`.
-- `--preserve-tape-voltag <VOLTAG>` keeps this exact tape identity and geometry across the
-  reset; repeat it for several.
-- `--allow-erase-tape-voltag <VOLTAG>` permits this exact bound tape to be erased instead;
-  repeat it for several.
+- `--preserve-tape-voltag <VOLTAG>` is accepted but refused. Preflight prints
+  `declared reset does not import preserved catalog identities; reinitialize or adopt physical media afterward`.
+- `--allow-erase-tape-voltag <VOLTAG>` admits an exact labelled typed tape or
+  cleaning cartridge for erasure; repeat it for every such label. An unlabelled
+  live typed tape refuses scoped reset. Retired identities with cleared labels
+  need no selector.
 
-Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape,
-rejects any bound label outside the two exact selector sets, and returns a source-bound token
-plus `source_schema_version`. A predecessor catalog of schema 16 through 21 with the
-required tape identity and geometry columns is inspectable only when the preservation set is
-empty and every bound tape is explicitly allowed to be erased; such a catalog is never
-migrated and never accepted for preservation. Schema 22 has a separate declared-reset reader
-that permits identity preservation without retaining old commit authority.
+Read-only admission for a scoped catalog reset. It inventories the typed logs,
+refuses labels outside the exact allow-erase set and returns a token bound to
+that source, configuration and request. It does not import identities from an
+older catalog schema. Reinitialize or adopt tapes after reset.
 
 ### rem-debug catalog reset
 
@@ -2554,24 +2609,31 @@ rem-debug catalog reset [OPTIONS]
   history, drive health snapshots, cleaning runs and alarms.
 - `--expected-preflight-token <SHA256>` is the token from `reset-preflight`, required for a
   scoped reset.
-- `--preserve-tape-voltag` and `--allow-erase-tape-voltag` are as for `reset-preflight`.
-  Written or finalized tapes that are preserved return as `recovery_required`; no object,
-  tape-file, audit, tape-log or physical-prefix authority is kept.
+- `--preserve-tape-voltag` is accepted but refused with
+  `declared reset cannot restore SQL tape identities; reinitialize or adopt afterward`.
+- `--allow-erase-tape-voltag` has the exact typed-label scope described for
+  `reset-preflight`; it preserves no identity.
 
 Destructively reset local catalog state from the configured paths. Any scoped reset requires
-the exact current preflight token, and repeats selector and source-schema admission under
-the exclusive state lock before it changes anything. The reset moves the audit log and the
-tape logs into a numbered directory under `reset-archives` in the state directory.
+the exact current preflight token, and repeats typed-source and selector admission
+under the exclusive state lock before changing anything. Without that token,
+the CLI refuses with `scoped catalog reset requires --expected-preflight-token from reset-preflight`.
+
+The numbered archive under `state_dir/reset-archives` holds the prior library-log
+(`audit`) and tape-log (`journals`) directories, `catalog.sqlite` with `-wal` and
+`-shm` files when present, `authority-format`, `authority-manifest.json`,
+`config.snapshot` and any prior receipt as `previous-reset-receipt.json`.
+The reset publishes `authority-reset-receipt.json` in the active state directory.
 
 ### rem reset-catalog
 
 `rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`
 declares the offline reset required by an authority-layout change. It uses the
-same implementation and accepts the same preservation, erase and preflight
-arguments as `rem-debug catalog reset`. Stop the daemon first. Old state is
+same implementation and accepts the same refused preservation option, erase
+selectors and preflight arguments as `rem-debug catalog reset`. Stop the daemon first. Old state is
 refused rather than imported; reset archives the prior authority and installs
 the per-tape log layout. Configuration and calibration generation allocation
-survive. Reinitialize approved scratch tapes afterwards, with fresh UUIDs;
+survive. Reinitialize or adopt the approved tapes afterwards;
 see the [reset procedure](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
 
 `tape init` is not gated by `--allow`: it operates only on the libraries in the
@@ -2579,12 +2641,12 @@ configuration. `tape retire` and `catalog reset` change local state and carry th
 confirmations. `tape quarantine release` uses the daemon for tape-I/O fences when it runs;
 offline release needs exclusive state ownership.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/native_floor.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Catalog rebuild
 
 ### rem rebuild-catalog-from-journals
 
-Rebuild the SQLite catalog from the audit log and the tape logs.
+Rebuild the SQLite catalog from the library log and the tape logs.
 
 ```text
 rem rebuild-catalog-from-journals [OPTIONS]
@@ -2592,15 +2654,30 @@ rem rebuild-catalog-from-journals [OPTIONS]
 
 - `--config <PATH>` is the configuration. Default `/etc/rem/config.toml`.
 
-The name keeps an older word; the command reads the per-tape logs and the audit log. Stop the
-daemon first: the rebuild takes the state lock. It requires an existing `authority-format`
-marker and never installs one. It refuses when a tape's log ends below the sequence the
-catalog has already projected. It keeps the log and audit bytes, leaves ambiguity and repair
-fences in place, and does not reconcile startup authority or touch media. It evicts wrap maps
-and marks volumes uncalibrated while advancing calibration generation allocation. Operator
-decisions recorded in the audit log, such as retirements and label rebinds, are applied after
-the tape logs (see
-[Tape identity and the retire operation](tape-identity-lifecycle-explainer.md#5-retire-and-catalog-rebuild)).
+The name keeps an older word for the tape logs. The command reads the library
+log (`*.remlib` segments in `audit.dir`) and the per-tape logs. The audit log is
+not a rebuild source. Stop the daemon first: rebuild takes the state lock. It
+starts from an empty catalog, carrying over no rows from the previous catalog.
+Library-log decisions, including retirement and label rebinding, are applied
+before the tape logs.
+
+Rebuild requires `authority-format` and `authority-manifest.json` in the state
+directory and never installs them. Empty state without a marker refuses with
+`projection rebuild requires an existing authority-format marker`. Populated
+logs without a manifest refuse earlier with
+`Legacy or unbound authority requires the declared state reset`. A populated
+layout with a manifest but no marker gets
+`This state directory predates the current tape-log format.`.
+
+The command preserves both logs, leaves ambiguity and repair fences in place,
+and touches no media. A missing catalog file can be rebuilt; move a damaged
+catalog file and its `-wal`/`-shm` sidecars aside first, because rebuild opens an
+existing file before replay. A short tape log can also refuse with
+`RebuildWouldDropMarkEvidence:` if rebuilding would discard the catalog's mark
+evidence. See [recovery and release](#rem-tape-quarantine-list-show-and-release-library).
+Rebuild evicts wrap maps and marks volumes uncalibrated while advancing
+calibration generation allocation. See
+[Tape identity and the retire operation](tape-identity-lifecycle-explainer.md#5-retire-and-catalog-rebuild).
 
 To rebuild the catalog of the default configuration:
 
@@ -2615,13 +2692,12 @@ rebuild-catalog-from-journals ok
   tapes: 3
   tape files: 41
   object copies: 38
-  audit records: 112
+  audit records: 0
   tape logs: 3
 ```
 
-An audit record that disagrees with the rows the tape logs produced, or that the rebuild
-cannot apply (for example one with no valid tape identity), is reported on standard error as
-`WARN audit-replay-divergence: <DETAIL>; ledger value applied`.
+The `audit records` count is always zero; the rebuild does not replay audit
+segments.
 
 <!-- code-anchor: crates/remanence-cli/src/recovery_report.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-parity/src/scan.rs crates/remanence-parity/src/bootstrap.rs crates/remanence-parity/src/verify_protected.rs @ 625f7044 -->
 ## Output formats

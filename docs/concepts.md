@@ -119,26 +119,28 @@ data (section 6). A commit does not wait for parity: data can be committed and n
 protected, and parity catches up later. A commit is about the data being on tape at all;
 parity is about recovering from damage to the tape years later.
 
-## 5. The tape log, the audit log and the catalog
+<a id="5-the-tape-log-the-audit-log-and-the-catalog"></a>
+## 5. The tape log, the library log and the catalog
 
 The host keeps one **tape log** for each tape: an append-only file, `<uuid>.remtape` in the
 `tapes` directory under the configured `[journal]` directory. It records, in order, the
 commit records and everything else the host has decided about that tape, such as finalization
 progress. The tape log is the host's authority for its tape. The command
 `rem rebuild-catalog-from-journals` keeps an older word for these files; it
-rebuilds the catalog from the tape logs. `rem tape import-journals` is refused with
+rebuilds the catalog from the library log and the tape logs. `rem tape import-journals` is refused with
 `JournalImportDeferred: importing checkpoint journals is deferred; nothing was imported or changed`;
 it imports or changes nothing.
 
-Beside the tape logs sits the **audit log**, a hash-chained, append-only record of operations
-and who asked for them, in one segment file per day. Operator decisions that are not about one
-write, such as retiring a tape or moving a label, are recorded there.
+Beside the tape logs sits the **library log**, a hash-chained, append-only record
+of library decisions. Its `*.remlib` segments live in `audit.dir`; the state
+directory's `authority-manifest.json` binds that directory and the tape-log
+root. Retirement and label rebinding are recorded in the library log.
 
 The **catalog** is a SQLite database (`rem-state.sqlite`) that answers questions: which
 objects exist, which tapes hold their copies, which tapes in a pool are ready. The catalog is
-a **projection**: its rows are derived from the tape logs and the audit log, and can be
+a **projection**: its rows are derived from the tape logs and the library log, and can be
 rebuilt from them at any time with `rem rebuild-catalog-from-journals`. When the two disagree,
-the tape log and the audit log win. For that reason Remanence never treats a catalog row on
+the tape logs and the library log are the sources for the rebuilt catalog. For that reason Remanence never treats a catalog row on
 its own as proof that data is on tape.
 
 Each tape log also carries a **tape incarnation** number. It is always 1: when a cartridge is
@@ -202,12 +204,12 @@ reference](reference-cli.md#standalone-drives) lists which commands go where.
 
 When an operation on a tape or drive ends in a state that Remanence cannot prove, for example
 a load whose outcome is unknown, Remanence does not guess. It records
-a **fence**: a durable refusal against that tape or drive, written to the audit log and the
+a **fence**: a durable refusal against that tape or drive, written to the library log and the
 catalog, that survives restarts. Fenced media is refused for writes and initialization, and
 the daemon also refuses read sessions on it, until the cause is resolved. Other tapes and drives stay
 available. Every fence has a **quarantine id**, and the `rem tape quarantine` commands list,
 show and release fences by that id; in these pages "quarantine" and "fence" name the same
-record. Releasing a fence takes an acknowledgement text, which is recorded in the audit log.
+record. A tape-I/O fence release records the acknowledgement in the library log.
 
 There are two kinds of fence.
 
@@ -215,12 +217,16 @@ There are two kinds of fence.
   partial batch, a transfer error, an uncertain step of finalization, or a tape log
   that ends before the point the catalog has already projected.
   `rem catalog tapes --json`, `rem top` and `rem daemon health` show these fences.
-  An operator investigates, verifies the tape and drive, and releases the fence with
-  `rem tape quarantine release <ID> --ack <TEXT>`. A tape log behind the catalog's
-  projection (`native_log_behind_projection`) also requires `--force` in library
-  mode, after restoring the log or rebuilding the catalog. The standalone release
-  form has no `--force`.
-  On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses the home configuration when `/etc/rem/config.toml` is absent.
+  An operator investigates, verifies the tape and drive, and uses
+  `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
+  A present, noncontradicted tape log behind the catalog's projection
+  (`native_log_behind_projection`) can be restored from an exact copy, or the
+  catalog can be rebuilt, before release with `--force`. A contradicted log,
+  a floor conflict or an absent log still refuses forced release; restore the
+  exact log or retire the tape.
+  On a standalone host without `/etc/rem/config.toml`, the release form uses
+  the home configuration. The form without `--after-settled-inventory` is not
+  a release route for these tape fences; see the [CLI reference](reference-cli.md#rem-tape-quarantine-standalone).
   Under that cause, `rem get`, `rem tape identify`,
   `rem tape verify` and `rem tape restore` refuse on a standalone drive; only
   `rem tape restore --scan` proceeds, walking from the tape's start. Contradicted

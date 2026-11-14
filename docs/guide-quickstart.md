@@ -405,7 +405,7 @@ Slots:
 
 Both commands also take `--json`.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs crates/remanence-state/src/lock.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs crates/remanence-state/src/lock.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/read_session.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Running the daemon (requires hardware)
 
 The daemon reads a configuration file. Create the state directory, owned by
@@ -447,11 +447,14 @@ TOML
 The daemon acts only on the libraries listed under `[[libraries]]`. A **tape
 pool** is a named set of tapes that writes are directed to, and the rule puts
 every cartridge whose barcode begins with `RMJ` into the pool `archive`.
-`default_idle_timeout_seconds` is how long a session may sit idle before the
-daemon ends it. The `[journal]` directory holds the tape logs, the host's
-per-tape record of what has been committed; the section keeps an older name.
-The last three sections place the audit log, the catalog (a SQLite projection
-of the tape logs and the audit log) and a cache. The
+`default_idle_timeout_seconds` closes a write session if no append follows an
+automatic age-triggered checkpoint before that interval expires. It does not
+start a timer on session open or after client-, size- or count-triggered
+checkpoints. Read sessions have no idle timeout; append-stream stalls use
+`append_ingress_idle_secs`. The `[journal]` directory holds the tape logs, the
+host's per-tape record of what has been committed; the section keeps an older
+name. The last three sections place the library log, the catalog (a SQLite
+projection of the library log and the tape logs) and a cache. The
 [configuration reference](reference-configuration.md) describes every key.
 
 Creating `/etc/rem/config.toml` also changes how `rem` routes commands on this

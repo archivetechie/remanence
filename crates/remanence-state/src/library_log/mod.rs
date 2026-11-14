@@ -1,5 +1,4 @@
 //! Library authority v1: typed records, deterministic CBOR, causal fold and segmented storage.
-//! This module has no production caller until the B4b authority cutover.
 //!
 //! Fold retention is proportional to resources and open operations. Terminal
 //! operation chains and load-attempt indexes are removed. Lifetime idempotency

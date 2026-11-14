@@ -305,7 +305,7 @@ rewrites a cartridge under an existing barcode, the catalog still binds that
 barcode to the old UUID (recycle skew; see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/state.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## On disk: durable records and rebuildable state
 
 The host-side records that accompany the tapes. Paths are set by the operator;
@@ -355,13 +355,14 @@ closed groups. The transactional projection mark identifies the closing
 sequence and offset; a log below that sequence requires recovery. SQLite and
 per-tape catalog caches remain projections, not commit authority.
 
-Initialization, adoption and reset-preserved ready identities create no log.
+Initialization and adoption create no tape log.
 Initialization is grouped with the first actual barrier. A known written
 prefix without matching log authority cannot be treated as a fresh tape.
 
-<!-- code-anchor: crates/remanence-state/src/projector/index.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 The old `.remjournal`, `.remcheckpoint` and `.finalizing` layout is refused.
-Ordinary catalog opens also refuse schemas 1 through 25. There is no importer;
+The catalog schema is described in the [configuration reference](reference-configuration.md#what-ends-up-on-disk).
+Daemon startup, runtime commands and catalog rebuild refuse older catalog schemas. There is no importer;
 use the declared reset and reinitialize approved scratch tapes as described in
 [troubleshooting](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
 The per-tape log is not recorded on tape and changes no REM-PARITY media byte.

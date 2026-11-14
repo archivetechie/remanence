@@ -1,4 +1,4 @@
-<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 625f7044 -->
+<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 # Remanence: open-source LTO tape archival software
 
 Remanence writes archives to LTO tape and reads them back, so that the data can
@@ -29,7 +29,7 @@ formats explained, and how to verify them.
 Remanence is the mechanism layer of an archive system, written in Rust. A
 daemon and command-line tools discover tape libraries, move cartridges, write
 objects with parity to tape, and keep a catalog of where every byte is. The
-catalog can be rebuilt from the host's per-tape logs and audit log, and a
+catalog can be rebuilt from the host's library log and per-tape logs, and a
 finalized tape can be read without it. An object is the unit Remanence stores:
 an archive of one or more files, written to tape as one tape file. What to
 archive, when, and for how long are decisions for the orchestrator, the system
@@ -180,7 +180,7 @@ old tapes, and use the same scan, restore, recovery and catalog commands. The
 [foreign-format adapter reference](docs/reference-foreign-format-adapters.md)
 describes the boundary.
 
-<!-- code-anchor: Cargo.toml @ 625f7044 -->
+<!-- code-anchor: Cargo.toml crates/remanence-state/src/library_runtime.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Repository layout
 
 ```text
@@ -193,7 +193,7 @@ crates/remanence-format         The native rem-object-v1 body format
 crates/remanence-parity         Sidecar parity and recovery
 crates/remanence-stream         Restore and recovery streaming
 crates/remanence-order          Read-order planner for batch reads
-crates/remanence-state          Catalog, tape logs, audit log, configuration, state lock
+crates/remanence-state          Catalog, tape logs, library log, configuration, state lock
 crates/remanence-api            gRPC service implementations
 crates/remanence-daemon         The rem-daemon service host
 crates/remanence-cli            The rem and rem-debug binaries

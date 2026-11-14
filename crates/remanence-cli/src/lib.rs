@@ -511,7 +511,7 @@ enum RemCommand {
         coalesce_window: String,
     },
 
-    /// Rebuild the local SQLite catalog projection from the audit log and the tape logs.
+    /// Rebuild the local SQLite catalog projection from the library log and the tape logs.
     RebuildCatalogFromJournals {
         /// Path to `/etc/rem/config.toml`.
         #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -576,7 +576,7 @@ enum RemCommand {
         command: CatalogClientCommand,
     },
 
-    /// Query the daemon's append-only audit log.
+    /// Query earlier-version audit segments; this version records no operation history there.
     Audit {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -612,7 +612,7 @@ enum RemCommand {
         command: DriveClientCommand,
     },
 
-    /// List or acknowledge standing daemon alarms.
+    /// List standing alarms; CLI acknowledgement is refused for active unacknowledged alarms.
     Alarms {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -1198,7 +1198,7 @@ enum Command {
         coalesce_window: String,
     },
 
-    /// Rebuild the local SQLite catalog projection from the audit log and the tape logs.
+    /// Rebuild the local SQLite catalog projection from the library log and the tape logs.
     RebuildCatalogFromJournals {
         /// Path to `/etc/rem/config.toml`.
         #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -1269,7 +1269,7 @@ enum Command {
         command: CatalogClientCommand,
     },
 
-    /// Query the daemon audit log.
+    /// Query earlier-version audit segments; this version records no operation history there.
     #[command(name = "audit", hide = true)]
     AuditClient {
         /// Daemon gRPC endpoint URI.
@@ -1307,7 +1307,7 @@ enum Command {
         command: DriveClientCommand,
     },
 
-    /// List or acknowledge standing daemon alarms.
+    /// List standing alarms; CLI acknowledgement is refused for active unacknowledged alarms.
     #[command(name = "alarms", hide = true)]
     AlarmsClient {
         /// Daemon gRPC endpoint URI.
@@ -1566,18 +1566,18 @@ struct CatalogResetArgs {
     #[arg(long = "i-understand-this-erases-the-catalog")]
     i_understand_this_erases_the_catalog: bool,
 
-    /// Retain only this exact tape identity/geometry across reset (repeatable).
-    /// Written or finalized tapes return as recovery_required; no object,
-    /// tape-file, audit, journal, or physical-prefix authority is retained.
+    /// Accepted but refused: reset cannot preserve tape identities.
+    /// Reinitialize or adopt the physical tape afterwards.
     #[arg(long = "preserve-tape-voltag", value_name = "VOLTAG")]
     preserve_tape_voltags: Vec<String>,
 
-    /// Permit this exact bound tape to be erased instead of preserved
-    /// (repeatable). Every bound nonretired tape must appear in one list.
+    /// Admit this exact typed tape or cleaning-cartridge label for erasure (repeatable).
+    /// Every labelled typed tape and cleaning cartridge must be listed for scoped reset.
+    /// Unlabelled live tapes refuse; retired identities with cleared labels need no selector.
     #[arg(long = "allow-erase-tape-voltag", value_name = "VOLTAG")]
     allow_erase_tape_voltags: Vec<String>,
 
-    /// Exact admission token returned by `catalog reset-preflight`.
+    /// Exact admission token returned by `rem-debug catalog reset-preflight`.
     #[arg(long, value_name = "SHA256")]
     expected_preflight_token: Option<String>,
 }
@@ -1588,11 +1588,14 @@ struct CatalogResetPreflightArgs {
     #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
     config: PathBuf,
 
-    /// Retain this exact tape identity/geometry across reset (repeatable).
+    /// Accepted but refused: preflight does not import preserved catalog identities.
+    /// Reinitialize or adopt the physical tape after reset.
     #[arg(long = "preserve-tape-voltag", value_name = "VOLTAG")]
     preserve_tape_voltags: Vec<String>,
 
-    /// Permit this exact bound tape to be erased instead (repeatable).
+    /// Admit this exact typed tape or cleaning-cartridge label for erasure (repeatable).
+    /// Every such label must be listed; unlabelled live tapes refuse.
+    /// Retired identities with cleared labels need no selector.
     #[arg(long = "allow-erase-tape-voltag", value_name = "VOLTAG")]
     allow_erase_tape_voltags: Vec<String>,
 }
@@ -1794,7 +1797,8 @@ struct DriveUnloadArgs {
 
 #[derive(Subcommand, Debug)]
 enum AuditClientCommand {
-    /// Stream entries in the half-open interval [since, until).
+    /// Stream earlier-version audit segments in the half-open interval [since, until).
+    /// Shows no history of this version's operations and does not read the library log.
     Query {
         /// Inclusive RFC3339 lower bound.
         #[arg(long, value_name = "RFC3339")]
@@ -1858,7 +1862,8 @@ struct DriveReinstateArgs {
 
 #[derive(Subcommand, Debug)]
 enum AlarmsClientCommand {
-    /// Acknowledge one alarm condition key.
+    /// Refused for active, unacknowledged alarms over the local socket (SystemAcknowledgement).
+    /// This CLI cannot present a TCP client certificate; use an authorized mTLS gRPC AckAlarm client.
     Ack {
         /// Alarm condition key.
         condition_key: String,
@@ -2901,21 +2906,20 @@ impl TapeQuarantineCommand {
 Retiring ends an identity's life: the row becomes terminal (`retired`),
 its barcode is released for a fresh `rem tape init`, and every committed
 object copy on it is marked `missing` — the contents are declared
-permanently unreadable. The identity's journals and audit history stay
-attached to its uuid forever; a retired row is never reused, even with
-force.
+permanently unreadable. The library log records Retire before its catalog
+projection. The identity's tape-log history remains attached to its tape UUID;
+a retired identity is never reused.
 
-This command touches only the local catalog and audit log — no SCSI, no
-library allowlist. It takes the exclusive state lock, so it fails cleanly
-while the daemon is running: stop the daemon first (the recycle scripts
-already do)."
+This command records a library-log decision and updates local state. It sends
+no SCSI command and needs no library allowlist. It takes the exclusive state
+lock, so stop the daemon first."
 )]
 struct TapeRetireArgs {
     /// Barcode (voltag) or 32-hex tape UUID of the identity to retire.
     target: String,
 
     /// Why this identity is being retired, such as `recycled` or
-    /// `vtl-rebuilt` (free text, recorded in the audit log).
+    /// `vtl-rebuilt` (free text, recorded in the library-log Retire record).
     #[arg(long, value_name = "TEXT")]
     reason: String,
 

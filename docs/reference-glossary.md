@@ -301,7 +301,7 @@ An auxiliary, read-only parser linked into a separate Remanence distribution. Co
 owns the normalized reader and registry contract but ships with an empty registry and no
 concrete adapters. See [foreign-format adapters](reference-foreign-format-adapters.md).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/mount_support.rs @ 01bda1baf13dd4b2060e18ef0959ea8244491e66 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/read_session.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-api/src/auth.rs crates/remanence-api/src/library.rs crates/remanence-state/src/library_runtime/peer_observations.rs crates/remanence-state/src/library_log/fold.rs crates/remanence-cli/src/lib.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/audit_query_service.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Catalog and daemon
 
 ### tape log
@@ -324,20 +324,27 @@ commit.
 
 ### audit log
 
-The hash-chained, append-only record of every state-changing operation and who asked for it,
-kept as daily `.remaudit` segments. Operator decisions such as retiring a tape or moving a
-label are recorded here, and catalog rebuild replays them.
+Audit segments (`*.remaudit`) written by earlier versions. `rem audit query`
+reads them; it shows no history of this version's operations. They are not a
+catalog rebuild source.
+
+### library log
+
+The hash-chained, append-only record of library decisions, including retirement,
+label rebinding and fence release. Its `*.remlib` segments live in `audit.dir`,
+with the root binding and library identity in the state directory's
+`authority-manifest.json`. Catalog rebuild reads this log and the tape logs.
 
 ### catalog
 
 The queryable model of what is on which tape, kept in the SQLite file `rem-state.sqlite`. The
-durable truth is the tape logs plus the audit log; the catalog is a rebuildable
+durable truth is the tape logs plus the library log; the catalog is a rebuildable
 [projection](#projection) of them, and `rem rebuild-catalog-from-journals` rebuilds it.
 
 ### projection
 
 A store derived entirely from other records, which can be rebuilt from them. The catalog is a
-projection of the tape logs and the audit log. Each tape's catalog rows carry a **projection
+projection of the tape logs and the library log. Each tape's catalog rows carry a **projection
 mark**, the tape-log sequence they have been projected through; it speeds up incremental
 projection but does not prove the rows below it.
 
@@ -418,7 +425,12 @@ A daemon-tracked long-running action with a UUID, which `rem op` can query and c
 ### session
 
 The daemon's write or read transaction: open, append or
-read, checkpoint, close. Sessions have idle timeouts and abort paths.
+read, checkpoint, close. A write session's idle-close timer starts only after
+an automatic checkpoint triggered by `checkpoint_max_age_seconds`. If no append
+follows before `default_idle_timeout_seconds` expires, the session closes.
+Opening a session or taking a client-, size- or count-triggered checkpoint does
+not start that timer. Read sessions have no idle timeout. Append-stream stalls
+use `append_ingress_idle_secs`.
 Every open always mints a brand-new session id — sessions never
 continue across a client restart; see **cold resume** below for what a
 read session offers instead. Write sessions have no restart contract at
@@ -427,17 +439,22 @@ all (`recover_session_id` returns unimplemented).
 ### authority marker
 
 The file `authority-format` in the state directory, which names the layout of the host's
-durable state (the tape logs and the audit log). Only an empty state directory, or the
+durable state (the tape logs and the library log). Only an empty state directory, or the
 declared reset, may install it, and only under the exclusive state lock. A state directory in
 an older layout is refused, and `rem rebuild-catalog-from-journals` requires the marker and
 never installs it.
 
 ### declared reset
 
-The offline state reset that an authority-layout change requires, run as `rem reset-catalog`
-(the same operation as `rem-debug catalog reset`). It archives the audit log and the tape logs
-under `reset-archives` in the state directory, starts a new catalog that keeps only the tapes
-named with `--preserve-tape-voltag`, and installs the current authority marker. See the [CLI reference](reference-cli.md#destructive-state-reset).
+The offline state reset run as `rem reset-catalog` (the same operation as
+`rem-debug catalog reset`). It archives the prior catalog, library-log directory,
+tape logs, authority files and configuration snapshot, then starts an empty
+catalog and installs the current authority files. `--preserve-tape-voltag` is
+accepted but refused; reinitialize or adopt the tape afterwards. A scoped reset
+requires a token from `rem-debug catalog reset-preflight`. See the
+[CLI reference](reference-cli.md#destructive-state-reset). A restored state at a
+different path requires its recorded paths, rather than a reset; see
+[troubleshooting](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
 
 ### spool
 
@@ -453,7 +470,10 @@ polling, cleaning runs, history, annotation and retirement.
 
 A standing, catalog-persisted condition raised against a drive, tape or library resource (for
 example a repeated cleaning failure, or a fenced tape awaiting release) until an operator
-acknowledges or clears it. `rem alarms` lists and acknowledges alarms.
+acknowledges or clears it. `rem alarms` lists alarms. `rem alarms ack` cannot
+acknowledge an active, unacknowledged alarm over the local socket: it is refused
+with `SystemAcknowledgement`. The CLI has no client-certificate option for the
+TCP endpoint. An authorized mTLS gRPC client can call `AckAlarm`.
 
 <!-- code-anchor: crates/remanence-state/src/fence.rs crates/remanence-api/src/readiness_wait.rs crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs crates/remanence-state/src/library_runtime/native_floor.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-api/src/standalone_init.rs @ 25d266fa0ef327b208bc45f872a6e8575d5a5399 -->
 ## Safety and operations
@@ -471,7 +491,7 @@ Operating one requires a separate opt-in (`allow_derived_drive_identity`, `--all
 ### fence
 
 A durable refusal recorded against a tape or a drive after an operation on it ended in a state
-Remanence could not prove. It is written to the audit log and the catalog and survives
+Remanence could not prove. It is written to the library log and the catalog and survives
 restarts. Fenced media is refused for writes and initialization, and the daemon also refuses
 read sessions on it, until an operator resumes or releases the fence with an acknowledgement.
 Other media stay available. There are two kinds: the [tape-I/O fence](#tape-io-fence) and the
@@ -487,11 +507,15 @@ list, show and release fences by that id; quarantine and fence name the same rec
 A fence (quarantine id beginning `tioq-` or `library:`) recording a partial batch,
 a transfer error, an uncertain finalization step, or a tape log that ends before
 the catalog's projection. `rem catalog tapes --json`, `rem top` and
-`rem daemon health` show it. Release takes `rem tape quarantine release <ID> --ack <TEXT>`.
-A `native_log_behind_projection` fence also requires `--force` in library mode,
-after restoring the exact log or rebuilding the catalog. The standalone release
-form has no `--force`.
-On a standalone drive, use `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force` after restoring the exact tape log or rebuilding the catalog; `--after-settled-inventory` selects the library form, which uses the home configuration when `/etc/rem/config.toml` is absent.
+`rem daemon health` show it. The release form is
+`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
+For a present, noncontradicted `native_log_behind_projection` log, restore the
+exact tape log or rebuild the catalog, then add `--force` to release. A
+contradicted log, floor conflict or absent log still refuses forced release;
+restore the exact log or retire the tape. On a standalone host without
+`/etc/rem/config.toml`, this release form uses the home configuration. The bare
+`--ack` form is not a release route for these fences. See the
+[CLI reference](reference-cli.md#rem-tape-quarantine-standalone) for routing and listing.
 
 On a standalone drive, that cause refuses `rem get`, `rem tape identify`,
 `rem tape verify` and `rem tape restore`. Only `rem tape restore --scan` proceeds,

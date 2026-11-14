@@ -272,7 +272,12 @@ The first verification checks the tape's structure and terminal index. `--full`
 also reads all the data that the parity
 [sidecars](reference-glossary.md#formats-and-objects) protect, and the parity
 itself, and it can take hours. A repeated finalize uses the same automatically
-generated per-tape request key, so a retry does not finalize twice.
+generated per-tape request key. Explicitly repeat the first request's `--reason`
+and `--expected-pool`; the default pool comes from the catalog at each attempt.
+Matching retries resume an open operation or deduplicate a sealed success.
+After a completion-unknown ending, the intent stays pending and needs operator
+recovery: the same key is refused with `ClosedOperationRetry`, and a new key
+with `ALREADY_EXISTS`.
 
 Each command prints a JSON summary. A successful finalize reports
 `"finalized": true`. `rem tape verify` reports `"status": "verified"` with the
@@ -383,19 +388,35 @@ rem tape quarantine list
 rem tape restore --scan --out rescued
 ```
 
-The standalone release form has no `--force`. After restoring the exact tape log
-or rebuilding the catalog, run the command the refusal prints,
-`rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force`;
-`--after-settled-inventory` selects the library form, which uses your home
-configuration when `/etc/rem/config.toml` is absent. With no daemon listening,
-this form releases the fence offline with force.
-
-For other releasable fences, after checking the hardware and preserving the data,
-record what you checked:
+For a present, noncontradicted `native_log_behind_projection` log, restore the
+exact tape log or rebuild the catalog, then release the fence with:
 
 ```sh
-rem tape quarantine release <ID> --ack "checked drive and rescued readable files"
+rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT> --force
 ```
+
+A contradicted log, a floor conflict or an absent tape log still refuses forced
+release; restore the exact log or retire the tape. Rebuilding the catalog does
+not cure those conditions. `--after-settled-inventory` selects the library form,
+which uses your home configuration when `/etc/rem/config.toml` is absent. With
+no daemon socket answering, it runs offline under the state lock.
+
+For other releasable tape fences, after checking the hardware and preserving
+the data, record what you checked without `--force`:
+
+```sh
+rem tape quarantine release <ID> --after-settled-inventory --ack "checked drive and rescued readable files"
+```
+
+The bare form without `--after-settled-inventory` is not a release route for
+these tape fences. On a home host, or with `--device`, it refuses a `library:`
+fence with `fence raised by a library daemon:`. On a host with a system
+configuration, it prints `tape quarantine release requires --after-settled-inventory`.
+When both configurations exist, list the home state's fence ids with
+`rem tape quarantine list --device <SG> --allow-device <SERIAL> --config <PATH>`:
+`<SG>` and `<SERIAL>` name your standalone drive, and `<PATH>` is its home
+configuration. To choose a configuration for library-form release, put
+`--config <PATH>` on the `release` subcommand.
 
 A standalone initialization write that fails with an uncertain outcome raises no
 tape or drive fence. It is refused with
@@ -420,7 +441,7 @@ The command lists what it discards and asks for `SUPERSEDE HOME01`. For a
 non-interactive run, add `--confirm-supersede "SUPERSEDE HOME01"`. This is an
 audited destructive decision, not a routine retry step.
 
-<!-- code-anchor: crates/remanence-api/src/catalogless_restore.rs crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-api/src/catalogless_restore.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Recovery on another machine
 
 A finalized tape needs nothing from the machine that wrote it. On the new
@@ -495,9 +516,36 @@ rem tape adopt --label HOME01 --pool default
 ## What to keep besides the tape
 
 A finalized plaintext tape needs nothing from the original machine to restore
-its files; you still need compatible hardware and a reader. Keep the state
-directory as well, because it makes listing, ordinary restores and recovery of
-an interrupted write easier. Restore the whole directory to the same path.
+its files; you still need compatible hardware and a reader. Keep host records
+as well, because they make listing, ordinary restores and interrupted-write
+recovery easier.
+
+The library log (`audit.dir`) and the tape logs (`journal.dir`) are the records
+that cannot be rebuilt. Both grow only at the end. Copy them to another machine
+often, a minute or two apart on a working archive, and keep dated generations.
+Keep the state directory's `authority-format` and `authority-manifest.json`
+with them, together with the configuration. The catalog is rebuilt from the two
+logs. The tape-log, library-log, catalog and state-directory paths are configured
+independently, so check that a backup of "the state directory" includes each.
+
+Restore both logs, both authority files and the configuration together, each
+from its newest copy, to the configured paths. An older copy knows nothing
+decided after it: a tape withdrawn or fenced since then is not withdrawn or
+fenced in the restored state, and a tape first provisioned since then is unknown
+to it. Before starting the service on restored state, list the tapes used,
+withdrawn or fenced since the copy's date.
+
+Keep the recorded paths on a replacement server. State, tape-log or library-log
+roots that differ from `authority-manifest.json` refuse daemon startup, rebuild
+and direct state opens with
+`authority manifest format or configured root binding differs; declared reset required`.
+A runtime-loader command can instead print
+`This state directory predates the current tape-log format.` for a changed
+journal root. Reset also refuses this mismatch and erases nothing. Restore the
+recorded paths or point the configuration at them. Populated logs without a
+manifest refuse with `Legacy or unbound authority requires the declared state reset`;
+with a manifest but no marker, layout validation gives the format refusal.
+Restore both authority files with the logs.
 
 Keep the `.remp` private key files of encrypted files apart from the tapes, and
 keep the recovery key in a separate safe place from the working key. Never

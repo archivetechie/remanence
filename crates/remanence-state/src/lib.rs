@@ -107,5 +107,5 @@ pub use authority::{AuthorityCommit, AuthorityFinalization, AuthorityPrefixPlan,
 #[cfg(any(test, feature = "fixtures"))]
 pub use state::RejectResetHelpers;
 
-/// Typed segmented library authority, disconnected from production until B4b.
+/// Typed segmented library authority used by the production library runtime.
 pub mod library_log;

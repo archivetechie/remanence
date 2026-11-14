@@ -790,8 +790,9 @@ service Catalog {
   // ALREADY_EXISTS while its intent is pending. Matching live or successful
   // retries return the existing operation. Cancellation after acceptance is
   // refused durably. A tail write failure or an unproved tail leaves completion
-  // unknown and needs operator recovery; that terminal head refuses same-key
-  // retries with FAILED_PRECONDITION and ClosedOperationRetry.
+  // unknown and needs operator recovery. Its intent remains pending: that terminal
+  // head refuses same-key retries with FAILED_PRECONDITION and ClosedOperationRetry,
+  // and a new key fails with ALREADY_EXISTS while the intent is pending.
   // Transient motion faults after a bay reservation count toward the existing
   // close-out three-attempt media budget; contention does not consume it.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
@@ -1292,11 +1293,13 @@ message ProtectedContentFinding {
   optional string detail = 3;
 }
 
-// FINALIZING can coexist with a failed attempt. Inspect GetOperation for the
-// attempt outcome and detail for its error summary; the same key resumes intent.
-// The daemon retries accepted finalization when a drive is ready. RECOVERY_REQUIRED
-// carries a completion-unknown detail (the daemon's own summary while it runs; a
-// fixed sentence after a restart) and needs operator recovery.
+// FINALIZING can coexist with a failed attempt whose durable operation stays open.
+// Inspect GetOperation for the attempt outcome and detail for its error summary;
+// the same exact request key follows or resumes that open finalization. A matching
+// sealed-success retry deduplicates. After a completion-unknown ending, the intent
+// remains pending and needs operator recovery: a same-key retry is refused with
+// FAILED_PRECONDITION and ClosedOperationRetry, and a new key with ALREADY_EXISTS.
+// The daemon retries an open accepted finalization when a drive is ready.
 message TapeFinalization {
   bytes tape_uuid = 1;
   // Operator finalization operation. Absent for BUSY, and for a finalization
@@ -1416,7 +1419,8 @@ message ObjectCopy {
   // Within the object, the first BodyLba block of the first file's data.
   // For rem-object-v1, BodyLba is per-object and starts at 0.
   uint64 first_body_lba        = 3;
-  // Catalog-recorded freshness: when did scrub last confirm this copy?
+  // Not populated in this version. No periodic job re-reads copies.
+  // Tape verification is operator-started; this field has no freshness value.
   google.protobuf.Timestamp last_verified_at = 4;
   enum Health {
     OBJECT_COPY_HEALTH_UNSPECIFIED = 0;

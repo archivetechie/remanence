@@ -474,7 +474,7 @@ impl SegmentHistory<'_> {
         Err(FoldError::HistoryUnavailable)
     }
 }
-/// Sole append owner. Public producers are intentionally absent in B2.
+/// Sole append owner for the segmented library log.
 pub struct LibraryLog {
     dir: PathBuf,
     identity: PathBuf,
@@ -726,7 +726,7 @@ impl LibraryLog {
         Ok(())
     }
     /// Preflight under the append lease, publish, then advance in-memory authority.
-    #[allow(dead_code)] // No production caller until B4b.
+    #[allow(dead_code)] // Fixture-facing wrapper; production uses append_checked.
     pub(super) fn append(
         &mut self,
         body: Body,

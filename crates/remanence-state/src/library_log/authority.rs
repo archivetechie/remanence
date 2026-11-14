@@ -1,6 +1,5 @@
 //! Typed library writer. The state lease and append mutex cover finalization
 //! checks, fold preflight, durable publication and the resulting in-memory state.
-//! This API is deliberately disconnected from production until B4b-2.
 use super::store::{Clock, Origin, StoreError, UuidSource};
 use super::*;
 use crate::StateLockGuard;
