@@ -26,8 +26,9 @@ We answer every issue as well as we can, but we cannot promise how soon.
 
 ## Why we do not merge pull requests
 
-Every change to Remanence is written inside the project and goes through the same review and testing, so we do not
-merge code from outside the project, however good it is.
+We do not merge code from outside the project, however good it is, for two reasons. The first is security: a patch
+can do more than it appears to, and we would rather write each change ourselves than try to prove that an outside one
+does nothing else. The second is that every change to Remanence then goes through the same review and testing.
 
 When an issue shows us a problem, we reproduce it and write the fix ourselves, and the change links back to the
 issue. Please do not take this as a judgment of your work. A careful report with a diagnosis is the most valuable
