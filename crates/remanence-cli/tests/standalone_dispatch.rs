@@ -53,6 +53,89 @@ fn doctor_checks_journal_volume_via_existing_ancestor() {
     assert!(!xdg.join("rem/journals").exists());
 }
 
+/// A dangling journal link stops the probe and always publishes the row's remedy.
+#[test]
+fn doctor_journal_probe_stops_at_dangling_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let xdg = root.path().join("state");
+    let configured = xdg.join("rem/journals/tapes");
+    std::fs::create_dir_all(xdg.join("rem")).unwrap();
+    std::os::unix::fs::symlink(xdg.join("missing"), xdg.join("rem/journals")).unwrap();
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let code = remanence_cli::run_with_standalone_test_io(
+        &["rem", "--json", "doctor"],
+        root.path(),
+        &xdg,
+        &root.path().join("absent-system.toml"),
+        &root.path().join("locks"),
+        vec![],
+        |_: &Path| panic!("doctor without attachments must not open a device"),
+        &mut out,
+        &mut errors,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "no standalone drive is attached");
+    let response: serde_json::Value = serde_json::from_slice(&out)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&errors)));
+    let health = &response["result"];
+    let journals: Vec<_> = health["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["name"] == "journal volume")
+        .collect();
+    assert_eq!(journals.len(), 1, "{health}");
+    let journal = journals[0];
+    assert_eq!(journal["ok"], false);
+    let detail = journal["detail"].as_str().unwrap();
+    assert!(detail.contains(configured.to_str().unwrap()), "{detail}");
+    assert!(
+        detail.contains(&format!("(via {})", xdg.join("rem/journals").display())),
+        "{detail}"
+    );
+    assert_eq!(health["fixes"]["journal_volume"], journal["fix"]);
+    assert!(health["fixes"]["journal_volume"].is_string());
+}
+
+/// A file in the journal path stops the probe at the configured directory.
+#[test]
+fn doctor_journal_probe_stops_at_file() {
+    let root = tempfile::tempdir().unwrap();
+    let xdg = root.path().join("state");
+    let configured = xdg.join("rem/journals/tapes");
+    std::fs::create_dir_all(xdg.join("rem")).unwrap();
+    std::fs::write(xdg.join("rem/journals"), b"not a directory").unwrap();
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let code = remanence_cli::run_with_standalone_test_io(
+        &["rem", "--json", "doctor"],
+        root.path(),
+        &xdg,
+        &root.path().join("absent-system.toml"),
+        &root.path().join("locks"),
+        vec![],
+        |_: &Path| panic!("doctor without attachments must not open a device"),
+        &mut out,
+        &mut errors,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "no standalone drive is attached");
+    let response: serde_json::Value = serde_json::from_slice(&out)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&errors)));
+    let health = &response["result"];
+    let journals: Vec<_> = health["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["name"] == "journal volume")
+        .collect();
+    assert_eq!(journals.len(), 1, "{health}");
+    let journal = journals[0];
+    assert_eq!(journal["ok"], false);
+    let detail = journal["detail"].as_str().unwrap();
+    assert!(detail.contains(configured.to_str().unwrap()), "{detail}");
+    assert!(!detail.contains("(via "), "{detail}");
+}
+
 #[test]
 fn every_device_verb_refuses_missing_authorization_before_io() {
     let uuid = "31313131-3131-4131-8131-313131313131";
@@ -763,9 +846,14 @@ fn every_new_verb_routes_help_through_the_entry_point() {
 #[test]
 fn literal_help_operands_keep_library_entry_point_routing() {
     let root = tempfile::tempdir().unwrap();
+    let endpoint = format!("unix:{}", root.path().join("absent.sock").display());
+    let get_error = format!("connect daemon at {endpoint}");
     for (args, expected) in [
         (vec!["put", "help", "--pool", "example"], "stat help"),
-        (vec!["get", "help", "--dest", "out"], "connect daemon at"),
+        (
+            vec!["get", "help", "--dest", "out", "--endpoint", &endpoint],
+            get_error.as_str(),
+        ),
         (
             vec!["tape", "init", "help", "--config", "missing.toml"],
             "read config at missing.toml",

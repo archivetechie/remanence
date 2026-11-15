@@ -59,6 +59,7 @@ struct Cli {
     #[arg(long, global = true)]
     allow_unserialized_device: bool,
     /// Override only the state filesystem's type check when using an untrusted filesystem.
+    /// The journal directory's own check still applies.
     #[arg(long, global = true)]
     allow_untrusted_state_volume: bool,
     /// Acknowledge incomplete discovery for read-only access.
@@ -2565,9 +2566,12 @@ fn journal_volume_check(
     let mut check = json!({"name":"journal volume", "ok":result.is_ok(), "detail":prefix});
     if let Err(error) = result {
         check["detail"] = json!(format!("{prefix}: {error}"));
-        check["fix"] = json!(
-            "put journal.dir on a disk whose write cache is write-through or that supports FUA"
-        );
+        check["fix"] = json!(match error {
+            remanence_library::durability::VolumeError::UntrustedVolume(_) =>
+                "put journal.dir on a local filesystem with a block device of its own (such as ext4 or XFS on a disk or partition) whose write cache is write-through or supports FUA; the detail names the part that failed",
+            remanence_library::durability::VolumeError::Io(_) =>
+                "make journal.dir's existing parent directories readable and searchable by this user; remove a dangling or looping link or a file standing in a directory's place; the detail names the error",
+        });
     }
     check
 }
@@ -2615,7 +2619,8 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
     let trust = remanence_state::validate_trusted_volume_paths(&trusted).map_err(err);
     let journal_directory = config.journal.dir.join("tapes");
     let mut probe = journal_directory.as_path();
-    // Only absence permits walking up; inaccessible paths and symlinks must be judged.
+    // Only absence permits walking up. An existing entry (including a symlink,
+    // which the check resolves) or any other error stops the walk and is judged there.
     while let Err(error) = fs::symlink_metadata(probe) {
         if error.kind() != std::io::ErrorKind::NotFound {
             break;
@@ -3390,16 +3395,20 @@ mod tests {
         let reason = "/sys/dev/block/8:0/queue/fua=0: write back cache without FUA support";
         let rejected = journal_volume_check(
             configured,
-            configured,
+            probe,
             Err(VolumeError::UntrustedVolume(reason.into())),
         );
         assert_eq!(rejected["ok"], false);
         assert!(rejected.get("severity").is_none());
         assert_eq!(rejected["name"], "journal volume");
         let detail = rejected["detail"].as_str().unwrap();
-        assert!(detail.starts_with("/state/journals/tapes: "), "{detail}");
+        assert!(
+            detail.starts_with("/state/journals/tapes (via /state): "),
+            "{detail}"
+        );
         assert!(detail.contains(reason), "{detail}");
         assert!(rejected["fix"].as_str().unwrap().contains("journal.dir"));
+        assert!(rejected["fix"].as_str().unwrap().contains("FUA"));
         assert!(!rejected.to_string().contains("allow-untrusted"));
         assert!(!doctor_check_ready(&rejected));
 
@@ -3424,6 +3433,10 @@ mod tests {
             assert!(failure.get("severity").is_none());
             assert_eq!(failure["detail"], expected);
             assert!(failure["fix"].is_string());
+            let fix = failure["fix"].as_str().unwrap();
+            assert!(fix.contains("readable"), "{fix}");
+            assert!(!fix.contains("FUA"), "{fix}");
+            assert_ne!(failure["fix"], rejected["fix"]);
             assert!(!failure.to_string().contains("allow-untrusted"));
             assert!(!doctor_check_ready(&failure));
         }

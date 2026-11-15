@@ -50,9 +50,12 @@ is on NFS, SMB/CIFS, tmpfs, ramfs or overlayfs, `rem` refuses it as an untrusted
 state volume. In that case set `XDG_STATE_HOME` to a directory on a local disk,
 and set it the same way for every later `rem` command.
 
-The journal's disk must also use a write-through cache or support FUA.
-`rem doctor` checks this rule, using the nearest existing ancestor when the
-journal directory does not yet exist.
+The journal directory has its own check, which Remanence runs whenever it opens
+a tape's log (`rem put` among others). Its filesystem must be local with a block
+device of its own (btrfs and ZFS usually present none and are refused), and that
+disk's write cache must write through or support FUA. `rem doctor` shows this as
+`journal volume`, using the nearest existing ancestor when the journal directory
+does not yet exist.
 
 ## 1. Set up the drive
 
@@ -88,7 +91,7 @@ state directory row left out):
 ✓  capability        /usr/local/bin/rem
 ✓  lock directory    /run/lock/rem
 ✓  trusted volume    state paths support trusted durability
-✓  journal volume    /home/alex/.local/state/rem/journals/tapes (via /home/alex/.local/state/rem)
+✓  journal volume    ~/.local/state/rem/journals/tapes (via ~/.local/state/rem)
 ✓  standalone drive  1 standalone drives found; 0 drives with unknown ownership
 ready to use the drive
 ```

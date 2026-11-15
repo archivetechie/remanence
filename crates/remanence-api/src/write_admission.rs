@@ -22,10 +22,10 @@ struct WriteAdmissionState {
 
 /// Process-wide admission authority shared by every drive actor.
 ///
-/// SQLite remains the durable committed authority. These short-lived claims
-/// cover only the interval from the last pre-motion catalog read through the
-/// checkpoint projection, so two drive actors cannot both write an identity
-/// that the catalog can commit only once.
+/// The tape log is the durable commit authority; the catalog projects it.
+/// These short-lived claims cover only the interval from the last pre-motion
+/// catalog read through the checkpoint projection, so two drive actors cannot
+/// both write an identity that the catalog can commit only once.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WriteAdmissionCoordinator {
     state: Arc<Mutex<WriteAdmissionState>>,

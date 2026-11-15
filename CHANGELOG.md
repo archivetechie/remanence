@@ -11,8 +11,9 @@ per-release summaries.
   header, such as some HP LTO-6 drives, when the Medium Configuration page positively
   reports rewritable media.
 
-- `rem doctor` checks the journal disk's write-cache/FUA policy through the same
-  check as `rem put`, reporting a blocking `journal volume` row with a remedy.
+- `rem doctor` checks the journal directory's filesystem and its disk's write
+  cache through the same check as `rem put`, reporting a blocking `journal volume`
+  row with a remedy.
 
 - The catalog now uses one writable connection per state directory in each
   process, with its storage and behavior otherwise unchanged.

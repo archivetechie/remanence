@@ -237,8 +237,12 @@ mod tests {
             let volume = validate_trusted_journal_volume(&dir.join("x"));
             let directory = validate_trusted_journal_directory(&dir);
             if dir != root.path() {
-                assert!(matches!(volume, Err(VolumeError::Io(_))));
-                assert!(matches!(directory, Err(VolumeError::Io(_))));
+                let volume_error = volume.as_ref().expect_err("missing directory must fail");
+                let directory_error = directory.as_ref().expect_err("missing directory must fail");
+                assert_eq!(
+                    std::mem::discriminant(volume_error),
+                    std::mem::discriminant(directory_error)
+                );
             }
             assert_eq!(
                 volume.map_err(|e| e.to_string()),
