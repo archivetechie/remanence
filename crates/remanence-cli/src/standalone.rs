@@ -2568,9 +2568,9 @@ fn journal_volume_check(
         check["detail"] = json!(format!("{prefix}: {error}"));
         check["fix"] = json!(match error {
             remanence_library::durability::VolumeError::UntrustedVolume(_) =>
-                "put journal.dir on a local filesystem with a block device of its own (such as ext4 or XFS on a disk or partition) whose write cache is write-through or supports FUA; the detail names the part that failed",
+                "put journal.dir on a local filesystem with a block device of its own (such as ext4 or XFS on a disk or partition) whose write cache is write-through or supports FUA; the detail names the part that failed (if it cannot determine the filesystem or device, check that /proc and /sys are mounted)",
             remanence_library::durability::VolumeError::Io(_) =>
-                "make journal.dir's existing parent directories readable and searchable by this user; remove a dangling or looping link or a file standing in a directory's place; the detail names the error",
+                "make journal.dir, its tapes directory and their existing parent directories (and any link target on that path) readable and searchable by this user; remove a dangling or looping link or a file standing in a directory's place; the detail names the error",
         });
     }
     check
