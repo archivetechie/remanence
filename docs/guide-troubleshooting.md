@@ -1097,8 +1097,8 @@ All catalog writers in a process share one writable SQLite connection behind
 an in-process lock and take it in turn, so concurrent checkpoints wait for each
 other in memory rather than on SQLite. Tape-log projections start immediate
 transactions, which hold SQLite's writer from their first read. Read-only views
-open their own connections, and every connection, writable or read-only, has a
-five-second busy timeout.
+open their own connections; the writer's connection and the read-only views'
+connections each have a five-second busy timeout.
 
 A per-tape log lease is exclusive per tape and lasts through the write
 session. A competing lease for that tape returns a refusal; it does not block

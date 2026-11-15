@@ -181,8 +181,9 @@ the append-only library log, the per-tape logs, and the SQLite catalog. The two
 logs are the authority for library and tape state; the calibration-control store
 decides whether a cached read-order map may be served. Apart from its `wrap_maps`
 cache rows, the catalog is a projection of the two logs. The daemon updates it
-after each durable library-log append and when a tape-log checkpoint or
-finalization step commits, reads it to answer lookups and admission checks, and
+after each durable library-log append and after each tape-log record that
+commits a change the catalog shows (a checkpoint, a parity closeout, a tail
+recovery, a finalization step), reads it to answer lookups and admission checks, and
 can rebuild it from the logs. The library log's `*.remlib` segments
 live in `audit.dir`; `authority-manifest.json` in the state directory binds the
 roots. The projection-only rebuild starts from an empty catalog, applies the
@@ -401,9 +402,10 @@ finalization.
 5. At a checkpoint, the commit is the closing record in the tape's log. The
    writer stages the batch's rows in the log, proves the media barrier, writes
    and fsyncs the closing record, and only then projects the batch into the
-   catalog's object, copy, file, and tape-file rows. If the projection fails,
-   the checkpoint call reports the error and replay repairs the catalog from the
-   log. The locator returned to the caller ties each copy to physical media.
+   catalog's object, copy, file, and tape-file rows. If the projection fails
+   after the closing record is durable, the daemon still returns the committed
+   receipts, ends the session against further appends, and repairs the catalog
+   from the log on a later replay. The locator returned to the caller ties each copy to physical media.
 6. Failures stop the write, at three levels. When a staging-ring transfer
    fails, the first sink error discards any batches still queued for that
    `AppendObject` call. A failed `AppendGate` makes every later append in that
