@@ -30490,6 +30490,7 @@ blob Project/Render Files/
     }
 
     /// Exercise offline wait-ready with the same runtime and drive observation as tape init.
+    /// A crash-left intent belongs to a closed runtime; only the route reconciles it after reopen.
     #[cfg(target_os = "linux")]
     fn wbr_wait_route(
         keep_initializing: bool,
@@ -30499,13 +30500,13 @@ blob Project/Render Files/
         Result<TapeWaitReadyResult, TapeWaitReadyFailure>,
     ) {
         use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
-        let init = virtual_tape_init(0);
+        let mut init = virtual_tape_init(0);
         let library = {
             let mut world = init.world.lock().unwrap();
             world.leave_cartridge_unthreaded(0x0100);
             world.library_snapshot()
         };
-        if crash_left {
+        let handles = if crash_left {
             let command = MotionCommand::Move {
                 library_serial: "LIB-A".into(),
                 source: 0x0400,
@@ -30519,7 +30520,14 @@ blob Project/Render Files/
                 .state
                 .library_runtime()
                 .requires_reconciliation(&command));
-        }
+            drop(init.drive);
+            drop(init._handle);
+            drop(init.state);
+            init.state = runtime_backed_state(init.temp.path()).1;
+            None
+        } else {
+            Some((init._handle, init.drive))
+        };
         let factory_world = Arc::clone(&init.world);
         TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
             assert!(slot.borrow().is_none());
@@ -30560,6 +30568,36 @@ blob Project/Render Files/
             &mut init.state.write_handle(),
         );
         TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow().is_none()));
+        let (handle, drive) = match handles {
+            Some(handles) => handles,
+            None => {
+                let factory_world = Arc::clone(&init.world);
+                TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(move |path| {
+                        let role = factory_world
+                            .lock()
+                            .unwrap()
+                            .role_for_path(path)
+                            .expect("model path");
+                        Ok(Box::new(remanence_chaos::model::ModelTransport::new(
+                            Arc::clone(&factory_world),
+                            role,
+                        )))
+                    }));
+                });
+                let policy = StaticAllowlist::new(["LIB-A"]);
+                let mut handle =
+                    open_library_handle(&library, &policy).expect("open the model library");
+                handle.set_motion_authority(Arc::new(
+                    init.state.motion_authority().expect("the reopened runtime"),
+                ));
+                let drive = handle.open_drive(0x0100, &policy).expect("open the drive");
+                (handle, drive)
+            }
+        };
+        init._handle = handle;
+        init.drive = drive;
         (init, result)
     }
 
