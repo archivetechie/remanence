@@ -1489,6 +1489,127 @@ mod identity_refold_tests {
         refusal
     }
 
+    /// Newly available native evidence must replace the live fold's unresolved flag.
+    #[test]
+    fn identity_refold_clean_scan_installs_fold() {
+        let f = Fixture::new();
+        let (_new_root, new) = owner(TAPE, true, 262144);
+        let snapshot = new.freeze().unwrap().raw;
+        let at = lib::TapeAt {
+            tape: lib::TapeRef {
+                uuid: TAPE,
+                incarnation: 1,
+            },
+            sequence: 1,
+            record_digest: snapshot.record_evidence(1).unwrap().unwrap().digest,
+        };
+        let change = {
+            let mut view = f
+                .runtime
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            assert!(view.snapshot(TAPE).is_none());
+            view.replace_authoritative(snapshot).unwrap()
+        };
+        assert_eq!(change, lib::native_view::AuthoritativeChange::ChangedPrefix);
+        // Provision the library identity while its native log remains absent.
+        f.runtime
+            .append(|a, v| {
+                a.reprovision(
+                    lib::Reprovision {
+                        tape: at.tape,
+                        predecessor: None,
+                        mode: lib::ProvisionMode::Initialize,
+                        label: None,
+                        label_provenance: None,
+                        parity_scheme: None,
+                        medium: lib::MediumSpec {
+                            family: lib::MediumFamily::Lto(lib::LtoGen::Lto9),
+                            usable_logical_bytes: 18_000_000_000_000,
+                            record_size: 262144,
+                            rerecord: true,
+                            lifecycle_ops: true,
+                            source: lib::GenerationSource::Operator,
+                        },
+                        pool: None,
+                        endpoint: None,
+                        adoption: None,
+                        pool_source: None,
+                        operation: None,
+                        replaced_bot: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+        let key = crate::DriveKey::Standalone {
+            drive_serial: "LLR2-FR1".into(),
+        };
+        let fence = f
+            .runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(motion::endpoint(&key)),
+                        cause: lib::FenceCause::Cleaning,
+                        evidence: None,
+                        at: Some(at),
+                        operation: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        let before = f
+            .runtime
+            .0
+            .authority
+            .with_fold(|fold| fold.unresolved_fence_evidence.contains(&fence));
+        assert!(before, "absent native evidence must be unresolved");
+        f.runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                assert!(
+                    a.with_fold(|fold| fold.unresolved_fence_evidence.contains(&fence)),
+                    "the append alone must leave the old fold outcome"
+                );
+                Ok(result)
+            })
+            .unwrap();
+        f.assert_refolded();
+        assert!(!f.runtime.motion_fenced());
+        drop(
+            f.runtime
+                .0
+                .authority
+                .snapshot()
+                .expect("no refusal latched after a clean re-fold"),
+        );
+        let after = f
+            .runtime
+            .0
+            .authority
+            .with_fold(|fold| fold.unresolved_fence_evidence.contains(&fence));
+        println!(
+            "report={change:?} refold_scans={} refusal=none unresolved_before={before} unresolved_after={after}",
+            f.scans()
+        );
+        assert!(
+            !after,
+            "clean re-fold must install newly resolved fence evidence"
+        );
+    }
+
     /// A shortened native prefix invalidates both the fold and acknowledgement mark.
     #[test]
     fn identity_refold_shorter_prefix() {
