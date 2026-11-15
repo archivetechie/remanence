@@ -253,7 +253,7 @@ pub struct ChangerHandle {
     /// How MOVE MEDIUM waits out a transient not-ready changer. Disabled
     /// unless the owner enables it.
     ready_wait: changer_ready::ChangerReadyWait,
-    /// Fullness of any medium transport element in the last successful RES read.
+    /// Fullness of any medium transport element in the last `refresh` RES read.
     /// Set before `ops::reconcile`, including when a shape mismatch keeps the old snapshot.
     refresh_transport_full: bool,
 }
@@ -2297,7 +2297,7 @@ impl std::fmt::Debug for DriveHandle {
 impl DriveHandle {
     /// Resolve this standalone endpoint's interrupted motion from two real
     /// observations. A failed or inconsistent probe leaves its intent unresolved.
-    /// Returns `Ok` without resolving an intent this process still owns.
+    /// When the probes agree, returns `Ok` without resolving an intent this runtime instance still owns.
     pub fn reconcile_startup_motion(&mut self) -> Result<(), String> {
         let Some(key) = self.endpoint.durable_key().cloned() else {
             return Ok(());

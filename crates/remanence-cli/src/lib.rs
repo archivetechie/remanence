@@ -30489,8 +30489,8 @@ blob Project/Render Files/
         }
     }
 
-    /// Exercise offline wait-ready with the same runtime and drive observation as tape init.
-    /// A crash-left intent belongs to a closed runtime; only the route reconciles it after reopen.
+    /// Exercise offline wait-ready with the drive observation tape init makes. With `crash_left`, the intent
+    /// belongs to a runtime closed before the route, as after a crash; only the route reconciles it.
     #[cfg(target_os = "linux")]
     fn wbr_wait_route(
         keep_initializing: bool,
@@ -30524,6 +30524,15 @@ blob Project/Render Files/
             drop(init._handle);
             drop(init.state);
             init.state = runtime_backed_state(init.temp.path()).1;
+            // Reopening reconciles nothing: the intent is still unresolved and no longer owned.
+            assert!(init
+                .state
+                .library_runtime()
+                .requires_reconciliation(&command));
+            assert!(init
+                .state
+                .library_runtime()
+                .unowned_motion_unresolved("LIB-A"));
             None
         } else {
             Some((init._handle, init.drive))
@@ -30593,6 +30602,7 @@ blob Project/Render Files/
                     init.state.motion_authority().expect("the reopened runtime"),
                 ));
                 let drive = handle.open_drive(0x0100, &policy).expect("open the drive");
+                TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow().is_none()));
                 (handle, drive)
             }
         };

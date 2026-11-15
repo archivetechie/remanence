@@ -171,6 +171,8 @@ fn confirm_inventory_releases_move_ownership_without_notifying() {
 }
 
 /// Standalone LOAD confirmation releases its endpoint owner without notifying a library.
+/// The endpoint check pins the release; a standalone LOAD owns no library scope, so the later
+/// library check is a guard only.
 #[test]
 fn confirm_standalone_releases_load_ownership_without_notifying() {
     let f = Fixture::new();

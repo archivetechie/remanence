@@ -124,7 +124,7 @@ pub trait MotionAuthority: Send + Sync {
         false
     }
     /// Resolve only this changer's open/Unknown intents after a fresh full RES.
-    /// Intents still owned by this process are left open.
+    /// Intents still owned by this runtime instance are left open.
     fn reconcile_inventory(&self, _observed: &crate::Library) -> Result<(), MotionAuthorityError> {
         Err(MotionAuthorityError {
             message: "startup inventory resolver is unavailable".into(),
@@ -132,7 +132,7 @@ pub trait MotionAuthority: Send + Sync {
         })
     }
     /// Resolve only this standalone endpoint after matching TUR/READ POSITION.
-    /// Intents still owned by this process are left open.
+    /// Intents still owned by this runtime instance are left open.
     fn reconcile_standalone(&self, _endpoint: &DriveKey) -> Result<(), MotionAuthorityError> {
         Err(MotionAuthorityError {
             message: "startup standalone resolver is unavailable".into(),
