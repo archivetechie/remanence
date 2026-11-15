@@ -3965,7 +3965,10 @@ impl super::DriveHandle {
     /// 3. When the header's medium type leaves WORM state unknown,
     ///    MODE SENSE(6) page `0x1D` (Medium Configuration) supplies
     ///    the WORM-mode bit. Unsupported or malformed page data
-    ///    leaves WORM state unknown.
+    ///    leaves WORM state unknown; any other failure of this
+    ///    command (CHECK CONDITION other than a current ILLEGAL
+    ///    REQUEST, or a transport error) fails the call with this
+    ///    command's own outcome.
     ///
     /// Malformed block-limit or compression responses surface as
     /// [`TapeIoError::MalformedModeResponse`] (a CDB-succeeded /
