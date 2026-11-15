@@ -1096,7 +1096,8 @@ bound passes, the daemon stops, or nobody is waiting for the result.
 Catalog writers use immediate transactions and a five-second busy timeout.
 They reserve the SQLite writer before reading the rows they update, so
 concurrent checkpoints wait instead of failing on a deferred read-to-write
-upgrade. Each drive actor has its own connection to the same catalog.
+upgrade. All catalog writers in a process share one writable connection and
+take it in turn; read-only views open their own connections.
 
 A per-tape log lease is exclusive per tape and lasts through the write
 session. A competing lease for that tape returns a refusal; it does not block

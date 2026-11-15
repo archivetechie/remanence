@@ -29,7 +29,7 @@ formats, so other tools can build on them:
 Layer 5   remanence-api, remanence-daemon, remanence-cli
           gRPC services, drive actors, sessions, operator CLIs
 Layer 4   remanence-state
-          config, state lock, library log, rebuildable SQLite catalog
+          config, state lock, library and tape logs, rebuildable SQLite catalog
 Layer 3   remanence-format (3b: rem-object-v1 body)   remanence-parity (3c: parity)
           + remanence-aead (REMO HPKE envelope), remanence-format-driver (traits),
             remanence-stream (composition)
@@ -176,8 +176,11 @@ encrypted open without the daemon, catalog, or config.
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
-operator configuration, an exclusive state lock, the append-only library log,
-the per-tape logs and the SQLite catalog. The library log's `*.remlib` segments
+operator configuration, an exclusive state lock, the calibration-control store,
+the append-only library log, the per-tape logs and the SQLite catalog. The two
+logs are the authority. The catalog is a projection of them: the daemon updates
+it after each durable log append and reads it to answer lookups and admission
+checks, and the catalog can be rebuilt from the logs. The library log's `*.remlib` segments
 live in `audit.dir`; `authority-manifest.json` in the state directory binds the
 roots. The projection-only rebuild starts from an empty catalog, applies the
 library log before the tape logs, and carries over nothing from the old catalog.
@@ -392,9 +395,11 @@ finalization.
    default 1 GiB) catches silent drift between the host's idea of the position
    and the drive's. The object ends with a filemark, and parity sidecars follow
    according to the scheme.
-5. The commit is one SQLite transaction that records the object, copy, and
-   file rows and the tape-file bundle after the tape write has completed. The
-   locator returned to the caller ties the copy to physical media.
+5. The commit is the closing record in the tape's log. The writer proves the
+   media barrier after the tape write, then publishes and fsyncs that record,
+   and only then projects it into the catalog's object, copy, file and
+   tape-file rows. If the projection fails, replay repairs the catalog from the
+   log. The locator returned to the caller ties the copy to physical media.
 6. Failures stop the write, at three levels. When a staging-ring transfer
    fails, the first sink error discards any batches still queued for that
    `AppendObject` call. A failed `AppendGate` makes every later append in that
@@ -608,12 +613,13 @@ confirms that the drive supports the command, the actor issues `READ END OF
 WRAP POSITION` (`A3h/1Fh/45h`, long form) and validates the result through
 `remanence-order` before installing it.
 
-The map, the write epoch that guards it, and a monotonic calibration
-generation are stored in a durable calibration-control store under
-`remanence-state`, at `<state_dir>/calibration/control.remcalibration`. This
-store lies outside the rebuildable SQLite catalog. A `wrap_maps` SQLite row
-allows fast lookup. Any media-modifying command in the same load durably
-advances the write epoch and marks the volume uncalibrated again, so a stale
+The write epoch that guards the map, the volume's calibration state and a
+monotonic calibration generation are stored in a durable calibration-control
+store under `remanence-state`, at `<state_dir>/calibration/control.remcalibration`.
+This store lies outside the rebuildable SQLite catalog. The map itself is kept
+only in a `wrap_maps` catalog row, a cache that a catalog rebuild or reset
+discards and the next load harvests again. Any media-modifying command in the
+same load durably advances the write epoch and marks the volume uncalibrated again, so a stale
 map is never served; [Layers 1 and 2](#layers-1-and-2-the-tape-platform)
 describe the media-write fence that does this. Media the drive cannot
 recognize, and media where drive compression prevents deterministic wrap
@@ -625,8 +631,9 @@ boundaries, are classified as unsupported and skipped.
 Four rules shape the rest of the design.
 
 - **The tape is the authority.** Every tape describes itself through its
-  bootstrap, manifests, and sidecars. The host catalog is a projection that can
-  be rebuilt, so losing the SQLite file loses no data.
+  bootstrap, manifests, and sidecars. The host catalog is a projection of the
+  library log and the tape logs and can be rebuilt from them, so losing the
+  SQLite file loses no data while those logs are intact.
 - **Identity comes from serials and UUIDs.** `/dev/sg7` and barcodes are
   labels. They are resolved fresh each time and never trusted as identity.
 - **Uncertainty stops the operation.** When the outcome of a command is
