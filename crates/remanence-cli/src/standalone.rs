@@ -2568,12 +2568,73 @@ fn journal_volume_check(
         check["detail"] = json!(format!("{prefix}: {error}"));
         check["fix"] = json!(match error {
             remanence_library::durability::VolumeError::UntrustedVolume(_) =>
-                "put journal.dir on a local filesystem with a block device of its own (such as ext4 or XFS on a disk or partition) whose write cache is write-through or supports FUA; the detail names the part that failed (if it cannot determine the filesystem or device, check that /proc and /sys are mounted)",
+                "put journal.dir on a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on (no `nobarrier`, `barrier=0`, f2fs `fsync_mode=nobarrier` or `checkpoint=disable`, or bcachefs `journal_flush_disabled`; on ZFS, `zfs_nocacheflush` and `zil_nocacheflush` 0); the detail names what failed (if it cannot determine the filesystem, check that /proc is mounted)",
             remanence_library::durability::VolumeError::Io(_) =>
                 "make journal.dir, its tapes directory and their existing parent directories (and any link target on that path) readable and searchable by this user; remove a dangling or looping link or a file standing in a directory's place; the detail names the error",
         });
     }
     check
+}
+
+/// Explain the dataset's sync property without making the advisory a readiness gate.
+fn journal_sync_check(dataset: &str, output: Result<String, String>) -> Value {
+    let normalize = |text: String| text.trim().replace(['\r', '\n'], " ");
+    let output = output.map(normalize).map_err(normalize);
+    let (ok, detail, fix) = match output.as_deref().map_err(String::as_str) {
+        Ok(value) if matches!(value, "standard" | "always") => {
+            (true, format!("{dataset}: sync={value}"), None)
+        }
+        Ok("disabled") => (
+            false,
+            format!("{dataset}: sync=disabled: fsync returns before data is on disk, so a power cut can lose records the journal confirmed"),
+            Some(format!("zfs set sync=standard {dataset}")),
+        ),
+        Ok(text) | Err(text) => (
+            false,
+            format!("{dataset}: could not read sync: {text}"),
+            Some(format!("check that `zfs get sync {dataset}` prints standard or always")),
+        ),
+    };
+    let mut check = json!({"name":"journal sync", "ok":ok, "severity":"warning", "detail":detail});
+    if let Some(fix) = fix {
+        check["fix"] = json!(fix);
+    }
+    check
+}
+
+/// Keep the volume row first, followed by the sync advisory only for accepted ZFS.
+fn journal_checks(
+    directory: &Path,
+    probe: &Path,
+    volume: Result<
+        remanence_library::durability::JournalVolume,
+        remanence_library::durability::VolumeError,
+    >,
+    sync_output: Result<String, String>,
+) -> Vec<Value> {
+    let sync = volume
+        .as_ref()
+        .ok()
+        .filter(|v| v.fstype == "zfs")
+        .map(|v| journal_sync_check(&v.source, sync_output));
+    let mut checks = vec![journal_volume_check(directory, probe, volume.map(|_| ()))];
+    if let Some(sync) = sync {
+        checks.push(sync);
+    }
+    checks
+}
+
+/// Map display names to the stable JSON fixes keys used by doctor.
+fn doctor_fix_key(name: &str) -> &str {
+    match name {
+        "tape group" => "tape_group",
+        "lock directory" => "lock_dir",
+        "state directory" => "state_dir",
+        "trusted volume" => "trusted_volume",
+        "journal volume" => "journal_volume",
+        "journal sync" => "journal_sync",
+        other => other,
+    }
 }
 
 /// Advisory checks expose remedies without preventing setup or drive readiness.
@@ -2630,7 +2691,27 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
         };
         probe = parent;
     }
-    let journal_volume = remanence_library::durability::validate_trusted_journal_directory(probe);
+    let journal_volume = remanence_library::durability::inspect_journal_directory(probe);
+    let sync_output = match &journal_volume {
+        Ok(volume) if volume.fstype == "zfs" => std::process::Command::new("zfs")
+            .args(["get", "-H", "-o", "value", "sync"])
+            .arg(&volume.source)
+            .output()
+            .map_err(|error| error.to_string())
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(if stderr.trim().is_empty() {
+                        output.status.to_string()
+                    } else {
+                        stderr.trim().to_owned()
+                    })
+                }
+            }),
+        _ => Err("sync was not queried for this filesystem".into()),
+    };
     let check = |name: &str, ok: bool, detail: String, fix: &str| {
         let mut value = json!({"name":name,"ok":ok,"detail":detail});
         if !ok {
@@ -2638,7 +2719,7 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
         }
         value
     };
-    let checks = vec![
+    let mut checks = vec![
         memlock_check(config, remanence_api::read_core::read_memlock_soft_limit()),
         check(
             "tape group",
@@ -2691,20 +2772,18 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
                 .unwrap_or_else(|| "state paths support trusted durability".into()),
             "move state to a trusted local filesystem",
         ),
-        journal_volume_check(&journal_directory, probe, journal_volume),
     ];
+    checks.extend(journal_checks(
+        &journal_directory,
+        probe,
+        journal_volume,
+        sync_output,
+    ));
     let fixes: serde_json::Map<String, Value> = checks
         .iter()
         .filter_map(|check| {
             check.get("fix").map(|fix| {
-                let name = match check["name"].as_str().unwrap() {
-                    "tape group" => "tape_group",
-                    "lock directory" => "lock_dir",
-                    "state directory" => "state_dir",
-                    "trusted volume" => "trusted_volume",
-                    "journal volume" => "journal_volume",
-                    other => other,
-                };
+                let name = doctor_fix_key(check["name"].as_str().unwrap());
                 (name.to_owned(), fix.clone())
             })
         })
@@ -3392,7 +3471,7 @@ mod tests {
         use remanence_library::durability::VolumeError;
         let configured = Path::new("/state/journals/tapes");
         let probe = Path::new("/state");
-        let reason = "/sys/dev/block/8:0/queue/fua=0: write back cache without FUA support";
+        let reason = "/state: ext4 at / disables journal durability with nobarrier";
         let rejected = journal_volume_check(
             configured,
             probe,
@@ -3408,7 +3487,8 @@ mod tests {
         );
         assert!(detail.contains(reason), "{detail}");
         assert!(rejected["fix"].as_str().unwrap().contains("journal.dir"));
-        assert!(rejected["fix"].as_str().unwrap().contains("FUA"));
+        assert!(rejected["fix"].as_str().unwrap().contains("barrier"));
+        assert!(!rejected["fix"].as_str().unwrap().contains("FUA"));
         assert!(!rejected.to_string().contains("allow-untrusted"));
         assert!(!doctor_check_ready(&rejected));
         let rejected_in_place = journal_volume_check(
@@ -3449,6 +3529,120 @@ mod tests {
             assert!(!failure.to_string().contains("allow-untrusted"));
             assert!(!doctor_check_ready(&failure));
         }
+    }
+
+    #[test]
+    fn doctor_journal_sync_accepts_standard_and_always() {
+        use super::*;
+        for value in ["standard", "standard\n", "always"] {
+            let row = journal_sync_check("pool/journal", Ok(value.into()));
+            assert_eq!(row["name"], "journal sync");
+            assert_eq!(row["ok"], true);
+            assert_eq!(row["severity"], "warning");
+            assert_eq!(
+                row["detail"],
+                format!("pool/journal: sync={}", value.trim())
+            );
+            assert!(row.get("fix").is_none());
+            assert!(doctor_check_ready(&row));
+        }
+    }
+
+    #[test]
+    fn doctor_journal_sync_warns_when_disabled() {
+        use super::*;
+        let row = journal_sync_check("pool/journal", Ok("disabled".into()));
+        assert_eq!(row["name"], "journal sync");
+        assert_eq!(row["ok"], false);
+        assert_eq!(row["severity"], "warning");
+        assert_eq!(row["detail"], "pool/journal: sync=disabled: fsync returns before data is on disk, so a power cut can lose records the journal confirmed");
+        assert_eq!(row["fix"], "zfs set sync=standard pool/journal");
+        assert!(doctor_check_ready(&row));
+    }
+
+    #[test]
+    fn doctor_journal_sync_reports_unreadable_and_unknown_values() {
+        use super::*;
+        for (output, expected) in [
+            (Ok("weird".into()), "weird"),
+            (Ok(" unexpected\nvalue\n".into()), "unexpected value"),
+            (
+                Err("permission denied\ntry again\n".into()),
+                "permission denied try again",
+            ),
+            (
+                Err("No such file or directory".into()),
+                "No such file or directory",
+            ),
+            (Err("exit status: 1".into()), "exit status: 1"),
+            (Ok(String::new()), ""),
+        ] {
+            let row = journal_sync_check("pool/journal", output);
+            assert_eq!(row["name"], "journal sync");
+            assert_eq!(row["ok"], false);
+            assert_eq!(row["severity"], "warning");
+            assert_eq!(
+                row["detail"],
+                format!("pool/journal: could not read sync: {expected}")
+            );
+            assert_eq!(
+                row["fix"],
+                "check that `zfs get sync pool/journal` prints standard or always"
+            );
+            assert!(doctor_check_ready(&row));
+        }
+    }
+
+    #[test]
+    fn doctor_journal_rows_follow_volume_and_map_sync_fix() {
+        use super::*;
+        use remanence_library::durability::{JournalVolume, VolumeError};
+        let dir = Path::new("/journal/tapes");
+        let probe = Path::new("/journal");
+        for (fstype, expected_names) in [
+            ("zfs", vec!["journal volume", "journal sync"]),
+            ("ext4", vec!["journal volume"]),
+        ] {
+            let rows = journal_checks(
+                dir,
+                probe,
+                Ok(JournalVolume {
+                    fstype: fstype.into(),
+                    mount_point: probe.into(),
+                    source: "pool/journal".into(),
+                }),
+                Ok("disabled".into()),
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected_names
+            );
+            assert_eq!(rows[0]["ok"], true);
+            assert_eq!(rows[0]["detail"], "/journal/tapes (via /journal)");
+            assert!(rows[0].get("fix").is_none());
+            assert!(rows.iter().all(doctor_check_ready));
+            if fstype == "zfs" {
+                assert_eq!(
+                    rows[1],
+                    journal_sync_check("pool/journal", Ok("disabled".into()))
+                );
+                assert_eq!(
+                    doctor_fix_key(rows[1]["name"].as_str().unwrap()),
+                    "journal_sync"
+                );
+            }
+        }
+        let rows = journal_checks(
+            dir,
+            probe,
+            Err(VolumeError::UntrustedVolume("refused".into())),
+            Ok("standard".into()),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "journal volume");
+        assert!(!doctor_check_ready(&rows[0]));
     }
 
     /// Inject boundary limits and nondefault settings so host privileges cannot mask a failure.

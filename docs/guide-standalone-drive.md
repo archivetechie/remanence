@@ -51,11 +51,27 @@ state volume. In that case set `XDG_STATE_HOME` to a directory on a local disk,
 and set it the same way for every later `rem` command.
 
 The journal directory has its own check, which Remanence runs whenever it opens
-a tape's log (`rem put` among others). Its filesystem must be local with a block
-device of its own (btrfs and ZFS usually present none and are refused), and that
-disk's write cache must write through or support FUA. `rem doctor` shows this as
+a tape's log (`rem put` among others). It requires a local ext3, ext4, XFS,
+btrfs, ZFS, f2fs or bcachefs filesystem, checks the mount's write-barrier
+options and, on ZFS, the flush switches. `rem doctor` shows this as
 `journal volume`, using the nearest existing ancestor when the journal directory
-does not yet exist.
+does not yet exist. On ZFS it adds an advisory `journal sync` row; `sync=disabled`
+means fsync can return before data reaches disk.
+
+Remanence makes its records durable with fsync, as a database does; it cannot
+test whether a disk keeps what it confirms. If a power cut loses the last
+journal records, nothing on tape is lost or overwritten. The next write to
+that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
+with `rem tape restore --scan --out rescued`, then run
+`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
+an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
+`put`. A UPS, or a disk with power-loss protection, removes this power-cut
+exposure.
+
+Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
+`fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
+or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and
+`zil_nocacheflush` at `0` and the dataset's `sync=standard`.
 
 ## 1. Set up the drive
 

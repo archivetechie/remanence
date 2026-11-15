@@ -255,8 +255,9 @@ Every standalone command accepts these flags:
   path.
 - `--allow-unserialized-device` allows reads from a drive that has no VPD serial.
 - `--allow-untrusted-state-volume` accepts a state filesystem of an untrusted type.
-  The journal directory's own check (its filesystem type and its disk's write cache)
-  always applies, regardless of this flag or `journal.require_trusted_volume`.
+  The journal directory's own check (the local-filesystem allow-list, mount write
+  barriers and ZFS flush switches) always applies, regardless of this flag or
+  `journal.require_trusted_volume`; see [`rem doctor`](#rem-doctor).
 - `--acknowledge-unknown-ownership` acknowledges incomplete discovery, for read-only
   access.
 - `--reserve` adds SCSI RESERVE(6) and RELEASE(6) around the invocation, for drives that
@@ -311,14 +312,36 @@ Check that this host is ready to use a standalone drive.
 rem doctor [OPTIONS]
 ```
 
-The command checks the effective group, the binary's capability, the lock directory, the
-state directory, the `trusted volume` filesystem-type check, the `journal volume`
-check of the journal directory's filesystem and write cache, discovery, active fences
-and the memory-lock limit. It loads no tape. It prints a table with one row per check:
-a mark (passed, failed, or `!` for an advisory warning), the check's name, and its detail
-with a `fix:` where one applies. The last line is
-`ready to use the drive` or `fix the items above`. The memory-lock check is advisory and
-never blocks readiness.
+The command checks the effective group, the binary's capability, the lock directory,
+the state directory, the `trusted volume` filesystem-type check, discovery, active
+fences and the memory-lock limit. Its `journal volume` check requires a local ext3,
+ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on, checks
+mount options and, on ZFS, the flush switches. On accepted ZFS volumes a
+`journal sync` row follows, using `zfs get -H -o value sync <dataset>`: `standard`
+and `always` pass, `disabled` warns that fsync can return before data is on disk,
+and an unreadable or unknown value warns that the property could not be checked.
+
+It loads no tape. It prints a table with one row per check: a mark (passed,
+failed, or `!` for an advisory warning), the check's name, and its detail with a
+`fix:` where one applies. The last line is `ready to use the drive` or
+`fix the items above`. The memory-lock and `journal sync` checks are advisory
+and never block readiness. JSON remedies use `journal_volume` and `journal_sync`
+under `fixes`.
+
+Remanence makes its records durable with fsync, as a database does; it cannot
+test whether a disk keeps what it confirms. If a power cut loses the last
+journal records, nothing on tape is lost or overwritten. The next write to
+that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
+with `rem tape restore --scan --out rescued`, then run
+`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
+an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
+`put`. A UPS, or a disk with power-loss protection, removes this power-cut
+exposure.
+
+Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
+`fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
+or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and
+`zil_nocacheflush` at `0` and the dataset's `sync=standard`.
 
 To check the host:
 

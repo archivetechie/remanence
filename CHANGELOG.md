@@ -11,9 +11,12 @@ per-release summaries.
   header, such as some HP LTO-6 drives, when the Medium Configuration page positively
   reports rewritable media.
 
-- `rem doctor` checks the journal directory's filesystem and its disk's write
-  cache through the same check as `rem put`, reporting a blocking `journal volume`
-  row with a remedy.
+- Journal volumes now require a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs
+  filesystem, with mount lookup following reachable mounts and cross-checked by
+  statfs. Mounts with write barriers or durable checkpoints disabled and ZFS
+  no-flush switches are refused. The disk write-cache/FUA inspection is removed;
+  durability relies on fsync. `rem doctor` shares the blocking `journal volume`
+  check with `rem put` and adds an advisory `journal sync` row on ZFS.
 
 - The catalog now uses one writable connection per state directory in each
   process, with its storage and behavior otherwise unchanged.

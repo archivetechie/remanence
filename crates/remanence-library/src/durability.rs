@@ -1,9 +1,8 @@
 //! Local-volume durability policy shared by authority stores.
-//! Verifies filesystem placement and the underlying disk's write-cache/FUA policy.
+//! Verifies filesystem placement, write barriers and ZFS flush switches for fsync.
 
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Failure to establish the existing journal durability policy.
@@ -12,202 +11,221 @@ pub enum VolumeError {
     /// Filesystem inspection failed.
     #[error("journal I/O: {0}")]
     Io(#[from] std::io::Error),
-    /// Filesystem or device policy rejected this placement.
+    /// Filesystem policy rejected this placement.
     #[error(
-        "journal volume rejected: {0} (must be a trusted local volume with honored fsync; §10.6)"
+        "journal volume rejected: {0} (the journal needs a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on)"
     )]
     UntrustedVolume(String),
 }
 
-/// Require a local block-backed volume whose filesystem and write-cache
-/// behavior are suitable for an fsync-based recovery authority.
+/// A journal directory's reachable mount after the shared durability checks pass.
+#[derive(Debug)]
+pub struct JournalVolume {
+    /// Supported filesystem type reported by mountinfo and checked against statfs.
+    pub fstype: String,
+    /// Mount point reached by pathname lookup.
+    pub mount_point: PathBuf,
+    /// Unescaped mount source (the dataset name on ZFS).
+    pub source: String,
+}
+
+/// Require a local filesystem with write barriers suitable for an fsync-based
+/// recovery authority.
 ///
 /// Tape-log creation uses this shared policy before publishing durable authority.
 pub fn validate_trusted_journal_volume(path: &Path) -> Result<(), VolumeError> {
     validate_trusted_journal_directory(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
-/// Require a journal directory to satisfy the shared filesystem and write-cache policy.
+/// Require a journal directory to satisfy the shared filesystem durability policy.
 pub fn validate_trusted_journal_directory(dir: &Path) -> Result<(), VolumeError> {
-    let canonical_parent = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let fstype = filesystem_type_for_path(&canonical_parent);
-    validate_journal_fstype(&canonical_parent, fstype.as_deref())?;
-    validate_journal_write_cache(&canonical_parent)
+    inspect_journal_directory(dir).map(|_| ())
 }
 
-fn validate_journal_fstype(
-    canonical_parent: &Path,
-    fstype: Option<&str>,
-) -> Result<(), VolumeError> {
-    let fstype = fstype.ok_or_else(|| {
+/// Inspect the reachable journal mount and require supported fsync durability.
+/// This checks kernel-reported policy, not whether hardware honors its flushes.
+pub fn inspect_journal_directory(dir: &Path) -> Result<JournalVolume, VolumeError> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    #[cfg(target_os = "linux")]
+    {
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|_| unknown_journal_filesystem(&dir))?;
+        inspect_journal_mountinfo(
+            &dir,
+            &mountinfo,
+            |path| {
+                nix::sys::statfs::statfs(path)
+                    .map(|stat| stat.filesystem_type().0 as u64)
+                    .map_err(std::io::Error::from)
+            },
+            Path::new("/sys/module/zfs/parameters"),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(unknown_journal_filesystem(&dir))
+    }
+}
+
+fn unknown_journal_filesystem(dir: &Path) -> VolumeError {
+    VolumeError::UntrustedVolume(format!(
+        "cannot determine filesystem type for {}",
+        dir.display()
+    ))
+}
+
+/// The only accepted filesystem names and their Linux statfs magics.
+#[cfg(any(target_os = "linux", test))]
+fn journal_filesystem_magic(fstype: &str) -> Option<u64> {
+    match fstype {
+        "ext3" | "ext4" => Some(0xEF53),
+        "xfs" => Some(0x58465342),
+        "btrfs" => Some(0x9123683E),
+        "zfs" => Some(0x2FC12FC1),
+        "f2fs" => Some(0xF2F52010),
+        "bcachefs" => Some(0xCA451A4E),
+        _ => None,
+    }
+}
+
+/// Mount-tree identity and the fields needed by the journal policy.
+#[cfg(any(target_os = "linux", test))]
+struct JournalMount<'a> {
+    id: u64,
+    parent: u64,
+    volume: JournalVolume,
+    super_options: &'a str,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_journal_mount(line: &str) -> Option<JournalMount<'_>> {
+    let (left, right) = line.split_once(" - ")?;
+    let mut left = left.split_whitespace();
+    let id = left.next()?.parse().ok()?;
+    let parent = left.next()?.parse().ok()?;
+    let mount_point = PathBuf::from(unescape_mountinfo_path(left.nth(2)?));
+    left.next()?; // The mandatory per-mount options must be present too.
+    let mut right = right.split_whitespace();
+    let fstype = right.next()?.to_owned();
+    let source = unescape_mountinfo_path(right.next()?);
+    let super_options = right.next()?;
+    Some(JournalMount {
+        id,
+        parent,
+        volume: JournalVolume {
+            fstype,
+            mount_point,
+            source,
+        },
+        super_options,
+    })
+}
+
+/// Follow only reachable children; a covering ancestor hides its older subtree.
+#[cfg(any(target_os = "linux", test))]
+fn reachable_journal_mount<'a>(
+    dir: &Path,
+    mounts: &'a [JournalMount<'_>],
+) -> Option<&'a JournalMount<'a>> {
+    let mut current = mounts.iter().rfind(|mount| {
+        mount.volume.mount_point == Path::new("/")
+            && (mount.parent == mount.id || !mounts.iter().any(|m| m.id == mount.parent))
+    })?;
+    if !dir.starts_with(&current.volume.mount_point) {
+        return None;
+    }
+    // A valid mount tree cannot revisit a node. Bound the walk so malformed
+    // cyclic input also fails closed instead of hanging.
+    for _ in 0..mounts.len() {
+        let child = mounts
+            .iter()
+            .rev()
+            .filter(|mount| {
+                mount.parent == current.id
+                    && mount.id != current.id
+                    && dir.starts_with(&mount.volume.mount_point)
+            })
+            .min_by_key(|mount| mount.volume.mount_point.as_os_str().len());
+        match child {
+            Some(child) => current = child,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// Host-independent funnel: callers supply mountinfo, statfs and ZFS parameters.
+#[cfg(any(target_os = "linux", test))]
+fn inspect_journal_mountinfo(
+    dir: &Path,
+    mountinfo: &str,
+    statfs: impl Fn(&Path) -> std::io::Result<u64>,
+    zfs_parameters: &Path,
+) -> Result<JournalVolume, VolumeError> {
+    let mounts: Vec<_> = mountinfo.lines().filter_map(parse_journal_mount).collect();
+    let mount =
+        reachable_journal_mount(dir, &mounts).ok_or_else(|| unknown_journal_filesystem(dir))?;
+    let volume = &mount.volume;
+    let magic = journal_filesystem_magic(&volume.fstype).ok_or_else(|| {
         VolumeError::UntrustedVolume(format!(
-            "cannot determine filesystem type for {}",
-            canonical_parent.display()
+            "{} is on {}, which is not a supported journal filesystem",
+            dir.display(),
+            volume.fstype
         ))
     })?;
-    if is_untrusted_journal_fstype(fstype) {
+    let actual_magic = statfs(dir)?;
+    if actual_magic != magic {
         return Err(VolumeError::UntrustedVolume(format!(
-            "{} is on {fstype}",
-            canonical_parent.display()
+            "{}: mountinfo reports {} at {} but statfs reports magic 0x{actual_magic:X}",
+            dir.display(),
+            volume.fstype,
+            volume.mount_point.display()
         )));
     }
-    Ok(())
-}
-
-fn is_untrusted_journal_fstype(fstype: &str) -> bool {
-    fstype == "fuse"
-        || fstype == "fuseblk"
-        || fstype.starts_with("fuse.")
-        || matches!(
-            fstype,
-            "tmpfs" | "ramfs" | "nfs" | "nfs4" | "cifs" | "smbfs" | "9p" | "overlay" | "overlayfs"
-        )
-}
-
-#[cfg(target_os = "linux")]
-fn validate_journal_write_cache(canonical_parent: &Path) -> Result<(), VolumeError> {
-    let metadata = fs::metadata(canonical_parent)?;
-    let dev = metadata.dev();
-    let major = nix::sys::stat::major(dev);
-    let minor = nix::sys::stat::minor(dev);
-    validate_journal_write_cache_for_dev(
-        canonical_parent,
-        major,
-        minor,
-        Path::new("/sys/dev/block"),
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_journal_write_cache(canonical_parent: &Path) -> Result<(), VolumeError> {
-    Err(VolumeError::UntrustedVolume(format!(
-        "cannot verify write-cache flush behavior for {} on this platform",
-        canonical_parent.display()
-    )))
-}
-
-#[cfg(target_os = "linux")]
-fn validate_journal_write_cache_for_dev(
-    canonical_parent: &Path,
-    major: u64,
-    minor: u64,
-    sys_dev_block: &Path,
-) -> Result<(), VolumeError> {
-    const PLACEMENT_HINT: &str = "virtual or stacked filesystems such as btrfs may expose anonymous devices without queue/write_cache, so place journals on a trusted local block-backed volume or add explicit operator support";
-    // sys_dev_block/<major>:<minor> is a symlink into the sysfs devices tree.
-    // Resolve it so a partition can be recognised and walked up to its disk.
-    let dev_link = sys_dev_block.join(format!("{major}:{minor}"));
-    let device_dir = dev_link.canonicalize().map_err(|err| {
-        VolumeError::UntrustedVolume(format!(
-            "cannot resolve {} for {} (device {major}:{minor}; {PLACEMENT_HINT}): {err}",
-            dev_link.display(),
-            canonical_parent.display()
-        ))
-    })?;
-    let device_name = sysfs_node_name(&device_dir);
-    // A partition directory carries a `partition` file and has no `queue/`:
-    // the request queue, and with it the write-cache mode the partition's
-    // flushes reach, belongs to the whole disk one level up. Anything not
-    // recognisably a partition must own its queue, so an unexpected layout
-    // fails closed on the read below.
-    let (queue_owner, consulted) = if device_dir.join("partition").is_file() {
-        let disk_dir = device_dir.parent().ok_or_else(|| {
-            VolumeError::UntrustedVolume(format!(
-                "{} is on partition {} (device {major}:{minor}) with no parent disk in sysfs",
-                canonical_parent.display(),
-                device_dir.display()
-            ))
-        })?;
-        let consulted = format!(
-            "device {major}:{minor}, partition {device_name} of disk {}",
-            sysfs_node_name(disk_dir)
-        );
-        (disk_dir.to_path_buf(), consulted)
-    } else {
-        let consulted = format!("device {major}:{minor}, {device_name}");
-        (device_dir, consulted)
-    };
-    let queue = queue_owner.join("queue");
-    let write_cache_path = queue.join("write_cache");
-    let write_cache = fs::read_to_string(&write_cache_path)
-        .map_err(|err| {
-            VolumeError::UntrustedVolume(format!(
-                "cannot read {} for {} ({consulted}; {PLACEMENT_HINT}): {err}",
-                write_cache_path.display(),
-                canonical_parent.display()
-            ))
-        })?
-        .trim()
-        .to_string();
-    match write_cache.as_str() {
-        "write through" => Ok(()),
-        "write back" => {
-            // Conservative v0.7.2 policy: require FUA for write-back journal
-            // volumes even though some devices also honor fsync through flush.
-            // Operators who hit this rejection need an explicit allowlist before
-            // this commit point can be relaxed.
-            let fua_path = queue.join("fua");
-            let fua = fs::read_to_string(&fua_path)
-                .map_err(|err| {
-                    VolumeError::UntrustedVolume(format!(
-                        "{} reports write back cache ({consulted}) but {} is unavailable: {err}",
-                        canonical_parent.display(),
-                        fua_path.display()
-                    ))
-                })?
-                .trim()
-                .to_string();
-            if fua == "1" {
-                Ok(())
-            } else {
-                Err(VolumeError::UntrustedVolume(format!(
-                    "{} reports write back cache without FUA support ({consulted}; {}={fua})",
-                    canonical_parent.display(),
-                    fua_path.display()
-                )))
-            }
+    for token in mount.super_options.split(',') {
+        if matches!(
+            token,
+            "nobarrier"
+                | "barrier=0"
+                | "fsync_mode=nobarrier"
+                | "checkpoint=disable"
+                | "journal_flush_disabled"
+        ) || token.starts_with("checkpoint=disable:")
+        {
+            return Err(VolumeError::UntrustedVolume(format!(
+                "{}: {} at {} disables journal durability with {token}",
+                dir.display(),
+                volume.fstype,
+                volume.mount_point.display()
+            )));
         }
-        other => Err(VolumeError::UntrustedVolume(format!(
-            "{} has unsupported write-cache mode {other:?} ({consulted}; {})",
-            canonical_parent.display(),
-            write_cache_path.display()
-        ))),
     }
-}
-
-/// Last component of a sysfs device directory (`sda`, `sda1`, `nvme0n1p2`).
-#[cfg(target_os = "linux")]
-fn sysfs_node_name(dir: &Path) -> String {
-    dir.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.display().to_string())
-}
-
-fn filesystem_type_for_path(path: &Path) -> Option<String> {
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let mut best: Option<(usize, String)> = None;
-    for line in mountinfo.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let mut left_fields = left.split_whitespace();
-        let Some(mount_point) = left_fields.nth(4) else {
-            continue;
-        };
-        let Some(fstype) = right.split_whitespace().next().map(str::to_string) else {
-            continue;
-        };
-        let mount_path = PathBuf::from(unescape_mountinfo_path(mount_point));
-        if path.starts_with(&mount_path) {
-            let len = mount_path.as_os_str().len();
-            if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
-                best = Some((len, fstype));
+    if volume.fstype == "zfs" {
+        for name in ["zfs_nocacheflush", "zil_nocacheflush"] {
+            let path = zfs_parameters.join(name);
+            let value = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let value = value.trim();
+            if value != "0" {
+                return Err(VolumeError::UntrustedVolume(format!(
+                    "{}: {}={value} disables ZFS cache flushes",
+                    dir.display(),
+                    path.display()
+                )));
             }
         }
     }
-    best.map(|(_, fstype)| fstype)
+    Ok(JournalVolume {
+        fstype: volume.fstype.clone(),
+        mount_point: volume.mount_point.clone(),
+        source: volume.source.clone(),
+    })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn unescape_mountinfo_path(value: &str) -> String {
     value
         .replace("\\040", " ")
@@ -219,15 +237,6 @@ fn unescape_mountinfo_path(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_policy_path(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("remanence-{name}-{stamp}"))
-    }
 
     /// File and directory entry points apply the same policy to the log directory.
     #[test]
@@ -249,15 +258,68 @@ mod tests {
                 directory.map_err(|e| e.to_string())
             );
         }
+        #[cfg(target_os = "linux")]
+        {
+            let volume = inspect_journal_directory(root.path()).unwrap();
+            assert!(journal_filesystem_magic(&volume.fstype).is_some());
+            assert!(!volume.mount_point.as_os_str().is_empty());
+            assert!(!volume.source.is_empty());
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(inspect_journal_directory(root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("cannot determine filesystem type"));
+    }
+
+    fn mount(
+        id: u64,
+        parent: u64,
+        point: &str,
+        fstype: &str,
+        source: &str,
+        options: &str,
+    ) -> String {
+        format!("{id} {parent} 8:1 / {point} rw shared:1 - {fstype} {source} {options}\n")
+    }
+
+    fn root_mount() -> String {
+        mount(1, 0, "/", "ext4", "/fixture/disk", "rw")
+    }
+
+    fn inspect(text: &str, path: &str, magic: u64) -> Result<JournalVolume, VolumeError> {
+        let params = tempfile::tempdir().unwrap();
+        inspect_journal_mountinfo(Path::new(path), text, |_| Ok(magic), params.path())
+    }
+
+    fn refusal(result: Result<JournalVolume, VolumeError>) -> String {
+        match result {
+            Err(VolumeError::UntrustedVolume(detail)) => detail,
+            other => panic!("expected UntrustedVolume, got {other:?}"),
+        }
     }
 
     #[test]
-    fn trusted_volume_policy_fails_closed_and_rejects_virtual_filesystems() {
-        let path = Path::new("/journal-dir");
-        let err = validate_journal_fstype(path, None)
-            .expect_err("unknown filesystem type should fail closed");
-        assert!(matches!(err, VolumeError::UntrustedVolume(_)));
+    fn trusted_volume_policy_accepts_only_supported_filesystems() {
+        for (fstype, magic) in [
+            ("ext3", 0xEF53),
+            ("ext4", 0xEF53),
+            ("xfs", 0x58465342),
+            ("btrfs", 0x9123683E),
+            ("zfs", 0x2FC12FC1),
+            ("f2fs", 0xF2F52010),
+            ("bcachefs", 0xCA451A4E),
+        ] {
+            let text = root_mount() + &mount(2, 1, "/journal", fstype, "pool/journal", "rw");
+            let volume = inspect(&text, "/journal/log", magic).unwrap();
+            assert_eq!(volume.fstype, fstype);
+            assert_eq!(volume.mount_point, Path::new("/journal"));
+            assert_eq!(volume.source, "pool/journal");
+        }
+    }
 
+    #[test]
+    fn journal_allow_list_refuses_unsupported_filesystems() {
         for fstype in [
             "tmpfs",
             "ramfs",
@@ -271,320 +333,260 @@ mod tests {
             "fuse",
             "fuseblk",
             "fuse.s3fs",
+            "ext2",
+            "vfat",
+            "fuse.sshfs",
+            "virtiofs",
         ] {
-            let err = validate_journal_fstype(path, Some(fstype))
-                .expect_err("untrusted filesystem should reject");
-            assert!(matches!(err, VolumeError::UntrustedVolume(_)));
-        }
-
-        validate_journal_fstype(path, Some("ext4")).expect("ordinary local fs passes");
-        validate_journal_fstype(path, Some("xfs")).expect("ordinary local fs passes");
-    }
-
-    /// SCSI/SATA disk `sda` as the kernel places it under `/sys/devices`.
-    #[cfg(target_os = "linux")]
-    const MOCK_SDA: &str = "pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0/block/sda";
-    /// NVMe namespace `nvme0n1` as the kernel places it under `/sys/devices`.
-    #[cfg(target_os = "linux")]
-    const MOCK_NVME0N1: &str = "pci0000:00/0000:00:03.1/0000:0a:00.0/nvme/nvme0/nvme0n1";
-    /// eMMC user area `mmcblk0` as the kernel places it under `/sys/devices`.
-    #[cfg(target_os = "linux")]
-    const MOCK_MMCBLK0: &str = "platform/fe310000.mmc/mmc_host/mmc0/mmc0:0001/block/mmcblk0";
-
-    /// A fake sysfs laid out the way the kernel lays it out:
-    /// `dev/block/<major>:<minor>` is a relative symlink into `devices/`, a
-    /// partition directory sits inside its disk's directory, carries a
-    /// `partition` file and has no `queue/`, and only the whole disk owns
-    /// `queue/write_cache` and `queue/fua`.
-    #[cfg(target_os = "linux")]
-    struct MockSysfs {
-        root: PathBuf,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl MockSysfs {
-        fn new(name: &str) -> Self {
-            let root = temp_policy_path(name).with_extension("sysfs");
-            fs::create_dir_all(root.join("dev").join("block")).expect("mock sysfs dev/block");
-            Self { root }
-        }
-
-        fn sys_dev_block(&self) -> PathBuf {
-            self.root.join("dev").join("block")
-        }
-
-        /// Create `devices/<device_path>` and link `dev/block/<dev>` to it.
-        fn block_device(&self, dev: &str, device_path: &str) -> PathBuf {
-            let dir = self.root.join("devices").join(device_path);
-            fs::create_dir_all(&dir).expect("mock device dir");
-            std::os::unix::fs::symlink(
-                Path::new("../../devices").join(device_path),
-                self.sys_dev_block().join(dev),
-            )
-            .expect("mock dev/block symlink");
-            dir
-        }
-
-        /// A whole disk: a block device that owns an (initially empty) queue.
-        fn disk(&self, dev: &str, device_path: &str) -> PathBuf {
-            let dir = self.block_device(dev, device_path);
-            fs::create_dir_all(dir.join("queue")).expect("mock disk queue dir");
-            dir
-        }
-
-        /// A partition of the disk at `disk_path`: a `partition` file, no queue.
-        fn partition(&self, dev: &str, disk_path: &str, name: &str, number: u32) -> PathBuf {
-            let dir = self.block_device(dev, &format!("{disk_path}/{name}"));
-            fs::write(dir.join("partition"), format!("{number}\n")).expect("mock partition file");
-            dir
-        }
-
-        fn check(&self, major: u64, minor: u64) -> Result<(), VolumeError> {
-            validate_journal_write_cache_for_dev(
-                Path::new("/journal-dir"),
-                major,
-                minor,
-                &self.sys_dev_block(),
-            )
+            let text = mount(1, 0, "/", fstype, "fixture", "rw");
+            let detail = refusal(inspect(&text, "/journal", 0x01021994));
+            assert_eq!(
+                detail,
+                format!("/journal is on {fstype}, which is not a supported journal filesystem")
+            );
         }
     }
 
-    #[cfg(target_os = "linux")]
-    impl Drop for MockSysfs {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+    #[test]
+    fn journal_mount_lookup_requires_covering_root_and_skips_malformed_lines() {
+        for text in [
+            String::new(),
+            mount(2, 1, "/other", "ext4", "disk", "rw"),
+            "bad mountinfo\n1 0 - ext4\n".into(),
+        ] {
+            assert_eq!(
+                refusal(inspect(&text, "/journal", 0xEF53)),
+                "cannot determine filesystem type for /journal"
+            );
         }
+        for parent in [0, 1] {
+            let text = mount(1, parent, "/", "ext4", "disk", "rw")
+                + "broken\n2 1 8:1 / /journal rw - tmpfs\n";
+            assert_eq!(
+                inspect(&text, "/journal", 0xEF53).unwrap().mount_point,
+                Path::new("/")
+            );
+        }
+        assert!(refusal(inspect(&root_mount(), "relative", 0xEF53))
+            .contains("cannot determine filesystem type"));
     }
 
-    /// Set a disk's `queue/write_cache`, and write or remove its `queue/fua`.
-    #[cfg(target_os = "linux")]
-    fn set_mock_queue(disk_dir: &Path, write_cache: &str, fua: Option<&str>) {
-        let queue = disk_dir.join("queue");
-        fs::create_dir_all(&queue).expect("mock queue dir");
-        fs::write(queue.join("write_cache"), format!("{write_cache}\n"))
-            .expect("write mock write_cache");
-        match fua {
-            Some(fua) => fs::write(queue.join("fua"), format!("{fua}\n")).expect("write mock fua"),
-            None => {
-                let _ = fs::remove_file(queue.join("fua"));
+    /// All three covering cases must refuse for the reachable mount's own policy.
+    #[test]
+    fn journal_mount_lookup_rejects_covered_mounts() {
+        let base = root_mount() + &mount(2, 1, "/mnt", "ext4", "lower", "rw");
+        let cases = [
+            (
+                "tie",
+                base.clone() + &mount(3, 2, "/mnt", "tmpfs", "upper", "rw"),
+                0x01021994,
+                "is on tmpfs, which is not a supported journal filesystem",
+            ),
+            (
+                "covered nested",
+                base + &mount(3, 2, "/mnt/sub", "ext4", "hidden", "rw")
+                    + &mount(4, 2, "/mnt", "ext4", "upper", "rw,nobarrier"),
+                0xEF53,
+                "nobarrier",
+            ),
+            (
+                "covered ancestor",
+                root_mount()
+                    + &mount(2, 1, "/mnt/sub", "ext4", "hidden", "rw")
+                    + &mount(3, 1, "/mnt", "ext4", "cover", "rw,nobarrier"),
+                0xEF53,
+                "nobarrier",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, text, magic, expected) in cases {
+            let result = inspect(&text, "/mnt/sub/log", magic);
+            if !matches!(&result, Err(VolumeError::UntrustedVolume(detail)) if detail.contains(expected))
+            {
+                failures.push(format!("{name}: expected {expected}, got {result:?}"));
             }
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    #[cfg(target_os = "linux")]
-    fn untrusted_message(result: Result<(), VolumeError>, why: &str) -> String {
-        match result {
-            Err(VolumeError::UntrustedVolume(message)) => message,
-            other => panic!("{why}: expected UntrustedVolume, got {other:?}"),
+    #[test]
+    fn journal_mount_lookup_follows_stacks_and_reachable_children() {
+        let text = root_mount()
+            + &mount(2, 1, "/mnt", "ext4", "bottom", "rw")
+            + &mount(3, 2, "/mnt", "ext4", "middle", "rw")
+            + &mount(4, 3, "/mnt", "xfs", "top", "rw");
+        assert_eq!(
+            inspect(&text, "/mnt/log", 0x58465342).unwrap().source,
+            "top"
+        );
+        let text = text + &mount(5, 4, "/mnt/sub", "btrfs", "deep", "rw");
+        let volume = inspect(&text, "/mnt/sub/log", 0x9123683E).unwrap();
+        assert_eq!(volume.source, "deep");
+        assert_eq!(volume.mount_point, Path::new("/mnt/sub"));
+        // Component-wise matching must not mistake /mnt for /mnt-other.
+        assert_eq!(
+            inspect(&text, "/mnt-other/log", 0xEF53)
+                .unwrap()
+                .mount_point,
+            Path::new("/")
+        );
+        let siblings = root_mount()
+            + &mount(2, 1, "/mnt", "ext4", "older", "rw")
+            + &mount(3, 1, "/mnt", "xfs", "later", "rw");
+        assert_eq!(
+            inspect(&siblings, "/mnt/log", 0x58465342).unwrap().source,
+            "later"
+        );
+        let roots = root_mount() + &mount(9, 9, "/", "xfs", "last-root", "rw");
+        assert_eq!(
+            inspect(&roots, "/log", 0x58465342).unwrap().source,
+            "last-root"
+        );
+    }
+
+    #[test]
+    fn journal_statfs_disagreement_is_refused() {
+        let detail = refusal(inspect(&root_mount(), "/journal", 0x01021994));
+        assert!(detail.contains("/journal"));
+        assert!(
+            detail.contains("mountinfo reports ext4 at / but statfs reports magic 0x1021994"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn journal_statfs_error_is_io() {
+        let params = tempfile::tempdir().unwrap();
+        let result = inspect_journal_mountinfo(
+            Path::new("/journal"),
+            &root_mount(),
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+            params.path(),
+        );
+        assert!(
+            matches!(result, Err(VolumeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    /// Collect each unsafe option's outcome so one mutation check witnesses them all.
+    #[test]
+    fn journal_barrier_options_refuse_disabled_flushes() {
+        let mut failures = Vec::new();
+        for (fstype, magic, token) in [
+            ("ext4", 0xEF53, "nobarrier"),
+            ("ext4", 0xEF53, "barrier=0"),
+            ("f2fs", 0xF2F52010, "fsync_mode=nobarrier"),
+            ("f2fs", 0xF2F52010, "checkpoint=disable"),
+            ("f2fs", 0xF2F52010, "checkpoint=disable:10%"),
+            ("bcachefs", 0xCA451A4E, "journal_flush_disabled"),
+        ] {
+            let text = mount(
+                1,
+                0,
+                "/",
+                fstype,
+                "fixture",
+                &format!("rw,{token},relatime"),
+            );
+            let result = inspect(&text, "/journal", magic);
+            if !matches!(&result, Err(VolumeError::UntrustedVolume(detail)) if detail.contains(token) && detail.contains("/journal"))
+            {
+                failures.push(format!(
+                    "{token}: expected refusal naming token and directory, got {result:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn journal_barrier_options_accept_safe_tokens() {
+        for (fstype, magic, options) in [
+            ("ext4", 0xEF53, "rw,barrier=1,data=writeback,commit=30"),
+            ("f2fs", 0xF2F52010, "rw,fsync_mode=posix,checkpoint=enable"),
+            ("f2fs", 0xF2F52010, "rw,fsync_mode=strict"),
+            ("bcachefs", 0xCA451A4E, "rw"),
+            // Only whole tokens (and the prescribed checkpoint prefix) are refused.
+            ("ext4", 0xEF53, "rw,notnobarrier,barrier=01,nobarrier_extra"),
+        ] {
+            inspect(
+                &mount(1, 0, "/", fstype, "fixture", options),
+                "/journal",
+                magic,
+            )
+            .unwrap();
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn trusted_volume_policy_checks_write_cache_and_fua() {
-        // 8:1 is sda1, a partition. As in real sysfs, sda1 has no queue/; the
-        // write-cache mode it inherits is sda's.
-        let sysfs = MockSysfs::new("mock-sysfs");
-        let disk = sysfs.disk("8:0", MOCK_SDA);
-        sysfs.partition("8:1", MOCK_SDA, "sda1", 1);
-
-        let message = untrusted_message(
-            sysfs.check(259, 0),
-            "missing sysfs device is rejected with a useful hint",
-        );
-        assert!(message.contains("device 259:0"), "{message}");
-        assert!(message.contains("btrfs"), "{message}");
-        assert!(message.contains("trusted local block-backed"), "{message}");
-
-        set_mock_queue(&disk, "write through", None);
-        sysfs.check(8, 1).expect("write-through cache is trusted");
-
-        set_mock_queue(&disk, "write back", None);
-        untrusted_message(
-            sysfs.check(8, 1),
-            "write-back cache without FUA is rejected",
-        );
-
-        set_mock_queue(&disk, "write back", Some("0"));
-        untrusted_message(sysfs.check(8, 1), "write-back cache with FUA=0 is rejected");
-
-        set_mock_queue(&disk, "write back", Some("1"));
-        sysfs
-            .check(8, 1)
-            .expect("write-back cache with FUA=1 is trusted");
-
-        set_mock_queue(&disk, "mystery", Some("1"));
-        untrusted_message(sysfs.check(8, 1), "unknown write-cache modes fail closed");
+    fn journal_zfs_parameters_require_zero_or_absence() {
+        let params = tempfile::tempdir().unwrap();
+        let text = mount(1, 0, "/", "zfs", "pool/journal", "rw");
+        let check = || {
+            inspect_journal_mountinfo(
+                Path::new("/journal"),
+                &text,
+                |_| Ok(0x2FC12FC1),
+                params.path(),
+            )
+        };
+        check().unwrap();
+        for name in ["zfs_nocacheflush", "zil_nocacheflush"] {
+            for value in ["1\n", "unexpected", ""] {
+                fs::write(params.path().join(name), value).unwrap();
+                let detail = refusal(check());
+                assert!(detail.contains("/journal"));
+                assert!(
+                    detail.contains(&format!("{name}={}", value.trim())),
+                    "{detail}"
+                );
+            }
+            fs::write(params.path().join(name), " 0\n").unwrap();
+            check().unwrap();
+        }
+        // Both switches now exist and are zero.
+        check().unwrap();
+        fs::remove_file(params.path().join("zil_nocacheflush")).unwrap();
+        check().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn trusted_volume_policy_reads_partition_cache_from_parent_disk() {
-        let sysfs = MockSysfs::new("sysfs-partition-write-through");
-        let disk = sysfs.disk("8:0", MOCK_SDA);
-        let partition = sysfs.partition("8:1", MOCK_SDA, "sda1", 1);
-        set_mock_queue(&disk, "write through", None);
-        assert!(
-            !partition.join("queue").exists(),
-            "a partition has no queue/"
-        );
-
-        sysfs
-            .check(8, 1)
-            .expect("a partition of a write-through disk is trusted");
+    fn journal_zfs_parameter_read_error_is_io_and_other_types_ignore_parameters() {
+        let params = tempfile::tempdir().unwrap();
+        // A directory is an unreadable parameter file even when tests run as root.
+        fs::create_dir(params.path().join("zfs_nocacheflush")).unwrap();
+        let text = mount(1, 0, "/", "zfs", "pool/journal", "rw");
+        assert!(matches!(
+            inspect_journal_mountinfo(
+                Path::new("/journal"),
+                &text,
+                |_| Ok(0x2FC12FC1),
+                params.path()
+            ),
+            Err(VolumeError::Io(_))
+        ));
+        inspect_journal_mountinfo(
+            Path::new("/journal"),
+            &root_mount(),
+            |_| Ok(0xEF53),
+            params.path(),
+        )
+        .unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn trusted_volume_policy_partition_on_write_back_disk_requires_fua() {
-        let sysfs = MockSysfs::new("sysfs-partition-write-back");
-        let disk = sysfs.disk("8:0", MOCK_SDA);
-        sysfs.partition("8:1", MOCK_SDA, "sda1", 1);
-
-        set_mock_queue(&disk, "write back", Some("1"));
-        sysfs
-            .check(8, 1)
-            .expect("a partition of a write-back disk with FUA is trusted");
-
-        set_mock_queue(&disk, "write back", Some("0"));
-        let message = untrusted_message(
-            sysfs.check(8, 1),
-            "a partition of a write-back disk without FUA is rejected",
-        );
-        assert!(message.contains("sda/queue/fua"), "{message}");
-        assert!(message.contains("partition sda1 of disk sda"), "{message}");
-
-        set_mock_queue(&disk, "write back", None);
-        let message = untrusted_message(
-            sysfs.check(8, 1),
-            "a partition of a write-back disk with no fua file is rejected",
-        );
-        assert!(message.contains("sda/queue/fua"), "{message}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn trusted_volume_policy_whole_disk_reads_its_own_queue() {
-        let sysfs = MockSysfs::new("sysfs-whole-disk");
-        let disk = sysfs.disk("8:0", MOCK_SDA);
-        sysfs.partition("8:1", MOCK_SDA, "sda1", 1);
-
-        set_mock_queue(&disk, "write through", None);
-        sysfs
-            .check(8, 0)
-            .expect("a write-through whole disk is trusted");
-
-        set_mock_queue(&disk, "write back", Some("1"));
-        sysfs
-            .check(8, 0)
-            .expect("a write-back whole disk with FUA is trusted");
-
-        set_mock_queue(&disk, "write back", Some("0"));
-        let message = untrusted_message(
-            sysfs.check(8, 0),
-            "a write-back whole disk without FUA is rejected",
-        );
-        assert!(message.contains("sda/queue/fua"), "{message}");
-        assert!(!message.contains("partition"), "{message}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn trusted_volume_policy_resolves_nvme_partition_to_namespace() {
-        let sysfs = MockSysfs::new("sysfs-nvme-partition");
-        let namespace = sysfs.disk("259:0", MOCK_NVME0N1);
-        sysfs.partition("259:1", MOCK_NVME0N1, "nvme0n1p1", 1);
-        let partition = sysfs.partition("259:2", MOCK_NVME0N1, "nvme0n1p2", 2);
-        assert!(
-            !partition.join("queue").exists(),
-            "a partition has no queue/"
-        );
-
-        set_mock_queue(&namespace, "write back", Some("1"));
-        sysfs
-            .check(259, 2)
-            .expect("a partition of a write-back NVMe namespace with FUA is trusted");
-
-        set_mock_queue(&namespace, "write back", Some("0"));
-        let message = untrusted_message(
-            sysfs.check(259, 2),
-            "a partition of a write-back NVMe namespace without FUA is rejected",
-        );
-        assert!(message.contains("nvme0n1/queue/fua"), "{message}");
-        assert!(
-            message.contains("partition nvme0n1p2 of disk nvme0n1"),
-            "{message}"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn trusted_volume_policy_nested_device_with_own_queue_reads_its_own_queue() {
-        // An eMMC boot area such as mmcblk0boot0 sits inside its disk's
-        // directory like a partition, but it is a separate block device: it
-        // owns a queue and carries no `partition` file.
-        let sysfs = MockSysfs::new("sysfs-nested-device");
-        let disk = sysfs.disk("179:0", MOCK_MMCBLK0);
-        let boot = sysfs.disk("179:8", &format!("{MOCK_MMCBLK0}/mmcblk0boot0"));
-        assert!(
-            !boot.join("partition").exists(),
-            "a nested device is not a partition"
-        );
-
-        set_mock_queue(&disk, "write through", None);
-        set_mock_queue(&boot, "write back", Some("0"));
-        let message = untrusted_message(
-            sysfs.check(179, 8),
-            "the nested device's own write-back queue without FUA is rejected",
-        );
-        assert!(message.contains("mmcblk0boot0/queue/fua"), "{message}");
-        assert!(message.contains("device 179:8, mmcblk0boot0"), "{message}");
-        assert!(!message.contains("partition"), "{message}");
-
-        set_mock_queue(&disk, "write back", Some("0"));
-        set_mock_queue(&boot, "write through", None);
-        sysfs
-            .check(179, 8)
-            .expect("the nested device's own write-through queue is trusted");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn trusted_volume_policy_rejects_partition_whose_disk_has_no_queue() {
-        let sysfs = MockSysfs::new("sysfs-partition-no-parent-queue");
-        sysfs.block_device("8:0", MOCK_SDA);
-        sysfs.partition("8:1", MOCK_SDA, "sda1", 1);
-
-        let message = untrusted_message(
-            sysfs.check(8, 1),
-            "a partition whose disk exposes no queue fails closed",
-        );
-        assert!(message.contains("sda/queue/write_cache"), "{message}");
-        assert!(message.contains("device 8:1"), "{message}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn trusted_volume_policy_rejects_anonymous_and_queueless_devices() {
-        let sysfs = MockSysfs::new("sysfs-anonymous");
-        let disk = sysfs.disk("8:0", MOCK_SDA);
-        set_mock_queue(&disk, "write through", None);
-        sysfs.block_device("252:9", "virtual/block/stacked0");
-
-        // Anonymous devices (major 0: btrfs subvolumes, overlay, tmpfs) have no
-        // /sys/dev/block entry at all.
-        let message = untrusted_message(
-            sysfs.check(0, 45),
-            "an anonymous device has no sysfs entry and is rejected",
-        );
-        assert!(message.contains("device 0:45"), "{message}");
-        assert!(message.contains("btrfs"), "{message}");
-
-        let message = untrusted_message(
-            sysfs.check(252, 9),
-            "a virtual block device without a queue is rejected",
-        );
-        assert!(message.contains("device 252:9"), "{message}");
-        assert!(message.contains("stacked0/queue/write_cache"), "{message}");
+    fn journal_mount_lookup_unescapes_mount_point_and_source() {
+        let text = root_mount()
+            + &mount(
+                2,
+                1,
+                "/mnt/my\\040journal",
+                "ext4",
+                "disk\\040name\\134suffix",
+                "rw",
+            );
+        let volume = inspect(&text, "/mnt/my journal/log", 0xEF53).unwrap();
+        assert_eq!(volume.mount_point, Path::new("/mnt/my journal"));
+        assert_eq!(volume.source, "disk name\\suffix");
     }
 }
