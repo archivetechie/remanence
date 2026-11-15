@@ -2542,6 +2542,9 @@ async fn session_epochs_end_at_close_and_full_epoch_ignores_checkpoint_boundarie
 #[path = "characterisation/b10_pool.rs"]
 mod b10_pool;
 
+#[path = "characterisation/full_pass.rs"]
+mod full_pass;
+
 #[path = "characterisation/x22_restore.rs"]
 mod x22_restore;
 

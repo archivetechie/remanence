@@ -326,6 +326,7 @@ impl Store {
         })
     }
     /// Capture inode/header/end under a short shared lease, then validate unlocked.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn snapshot(&self) -> Result<super::snapshot::Snapshot, StoreError> {
         let lease = self.lock(false)?;
         self.check_ambiguity()?;
@@ -336,14 +337,17 @@ impl Store {
     }
     /// Acquire the only mutation capability. Torn tails are replaced before append.
     /// `fresh` refuses an existing active file even if it contains no closed group.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn acquire(&self, fresh: bool) -> Result<Lease, StoreError> {
         self.acquire_inner(fresh, false)
     }
     /// Recovery-only owner: inspection is allowed, but publication stays fenced
     /// until the caller proves the physical tail under this same lease.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn acquire_for_tail_reconciliation(&self) -> Result<Lease, StoreError> {
         self.acquire_inner(false, true)
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     fn acquire_inner(&self, fresh: bool, recovery: bool) -> Result<Lease, StoreError> {
         let lock = self.lock(true)?;
         self.cleanup_temporary()?;
@@ -414,10 +418,12 @@ impl Store {
     /// Explicit recovery of uncertain host durability. Revalidate, copy the closed
     /// prefix to a new inode, fsync it and its replacement name, then retire the
     /// ambiguity fence durably. A physical-tail repair fence is never cleared here.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn clear_ambiguity(&self) -> Result<(), StoreError> {
         self.clear_ambiguity_above(0)
     }
     /// Restart reconciliation may not discard an acknowledged projected group.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn clear_ambiguity_above(&self, projected: u64) -> Result<(), StoreError> {
         let _lock = self.lock(true)?;
         self.cleanup_temporary()?;
@@ -477,6 +483,7 @@ impl Store {
     /// Read-only: inspection never creates the lease file. Every owner creates
     /// it before publishing, so a log without one (for example, restored from a
     /// copy) has no live owner and is captured without a shared lease.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn inspect_tail(&self) -> Result<TailInspection, StoreError> {
         let lease = match File::open(self.path.with_extension("lock")) {
             Ok(file) => Some(lock(file, FlockArg::LockSharedNonblock)?),
@@ -503,6 +510,7 @@ impl Store {
     }
     /// Explicit corruption repair, retaining every valid closed group. The
     /// caller must rebuild the tape projection when cutting below its mark.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn repair_tail(&self, through: u64, projected: u64) -> Result<RepairEvidence, StoreError> {
         if through < projected {
             return Err(StoreError::BelowProjection {
@@ -565,6 +573,7 @@ impl Store {
         replace_prefix(self, end)?;
         Ok(record.evidence)
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     fn resume_repair(&self, through: u64) -> Result<RepairEvidence, StoreError> {
         let file = fs::File::open(self.path.with_extension("repair-required"))?;
         let record: RepairRecord = serde_json::from_reader(file.take(16 * 1024))

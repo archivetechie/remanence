@@ -127,7 +127,12 @@ impl Captured {
             Ok((fold.summary().clone(), Tail::Complete, metrics, None))
         }
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn inspect_tail(&self) -> Result<super::store::TailInspection, StoreError> {
+        #[cfg(any(test, feature = "fixtures"))]
+        if self.end > self.start {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeValidate);
+        }
         let file = self
             .file
             .as_ref()
@@ -181,6 +186,7 @@ impl Captured {
             damage,
         })
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn validate_through(&self, through: u64) -> Result<(TapeSummary, u64), StoreError> {
         if through == 0 {
             return Err(StoreError::Refused(
@@ -247,7 +253,12 @@ impl Captured {
             plan_base,
         }
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn validate(self) -> Result<Snapshot, StoreError> {
+        #[cfg(any(test, feature = "fixtures"))]
+        if self.end > self.start {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeValidate);
+        }
         let (summary, tail, metrics, plan_base) = self.fold()?;
         if self.file.is_some()
             && summary.is_fresh()
@@ -368,6 +379,7 @@ impl Snapshot {
     /// corruption remain errors, never absence. Acquiring a snapshot does not
     /// replace the writer's obligation to finish a successful native sync before
     /// appending a dependent decision; ambiguous leases cannot yield snapshots.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn record_evidence(&self, sequence: u64) -> Result<Option<RecordEvidence>, StoreError> {
         if sequence == 0 || sequence > self.summary.last_closed_sequence {
             return Ok(None);
@@ -394,6 +406,7 @@ impl Snapshot {
         )))
     }
     /// Bind a projection checkpoint to exact frozen bytes using bounded memory.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn projection_prefix_digest(&self, end: u64) -> Result<[u8; 32], StoreError> {
         use sha2::{Digest, Sha256};
         if end > self.summary.closed_end {
@@ -407,6 +420,10 @@ impl Snapshot {
                 .file
                 .as_ref()
                 .ok_or(StoreError::Refused("projection source file absent"))?;
+            #[cfg(any(test, feature = "fixtures"))]
+            if end > self.start {
+                crate::full_pass::count(crate::full_pass::PassKind::TapePrefixHash);
+            }
             let mut reader = PrefixReader {
                 file: file.clone(),
                 position: 0,
@@ -480,6 +497,7 @@ impl Snapshot {
     }
     /// Run a structural pass over the already validated closed prefix, skipping
     /// catalog bytes. Directory/prefix planning rows are not durable media rows.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn visit_file_rows(
         &self,
         mut visitor: impl FnMut(&TapeFileEntry) -> Result<(), StoreError>,
@@ -521,6 +539,7 @@ impl Snapshot {
     }
     /// Full validated-frame visitor for payload/metadata adapters. Only closed
     /// groups are included; clients distinguish plan rows from physical rows.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn visit_frames(
         &self,
         mut visitor: impl FnMut(&Frame<'_>) -> Result<(), StoreError>,
@@ -534,6 +553,7 @@ impl Snapshot {
     }
     /// Visit only frames appended after a prefix already validated by the same
     /// process owner. Explicit repair must discard that owner's progress mark.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn visit_frames_after(
         &self,
         through: u64,
@@ -579,6 +599,7 @@ impl Snapshot {
         Ok(())
     }
 
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn before(&self, sequence: u64) -> Result<Self, StoreError> {
         if let Some((first, summary)) = &self.plan_base {
             if *first == sequence {
@@ -616,6 +637,7 @@ impl Snapshot {
     }
     /// Seek directly to the projection's closing frame. Full snapshot validation
     /// already proved the prefix; this checks the mark without replaying it.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn projection_decoder(
         &self,
         sequence: u64,
@@ -663,7 +685,12 @@ impl Snapshot {
         }
         Ok(Some(decoder))
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn decoder(&self) -> Option<Decoder<PrefixReader>> {
+        #[cfg(any(test, feature = "fixtures"))]
+        if self.file.is_some() && self.first_sequence == 1 && self.start < self.summary.closed_end {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeFirstFrame);
+        }
         self.file.as_ref().map(|file| {
             Decoder::at(
                 PrefixReader {
@@ -713,6 +740,7 @@ impl Snapshot {
     /// Stream one catalog item at a time across arbitrary frame boundaries.
     /// Member lists are never materialized. A single variable-length field is
     /// owned by its event consumer; the frame/continuation history is not retained.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn visit_catalog(
         &self,
         mut visitor: impl FnMut(&crate::authority::CatalogPayload) -> Result<(), StoreError>,

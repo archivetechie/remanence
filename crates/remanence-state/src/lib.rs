@@ -20,6 +20,8 @@ pub mod config;
 pub mod error;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fence;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod full_pass;
 pub mod projector;
 pub use projector::index;
 pub use projector::{CatalogReader, ProjectionClient};

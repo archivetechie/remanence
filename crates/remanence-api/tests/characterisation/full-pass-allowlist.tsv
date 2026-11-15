@@ -1,0 +1,10 @@
+# Full history passes observed at LLR-2b; conversion orders shrink this list.
+# Union of three isolated T3 and T3b runs; kind names use PassKind Debug.
+# Kind	file
+LibraryReplay	crates/remanence-state/src/library_runtime/drive_observation.rs
+LibraryReplay	crates/remanence-state/src/library_runtime/peer_observations.rs
+LibraryReplay	crates/remanence-state/src/library_runtime/restart.rs
+LibraryReplay	crates/remanence-state/src/projector/thread.rs
+TapeFirstFrame	crates/remanence-state/src/library_log/session_ack.rs
+TapePrefixHash	crates/remanence-state/src/projector/tape_log_projection.rs
+TapeValidate	crates/remanence-state/src/tape_log/authority.rs

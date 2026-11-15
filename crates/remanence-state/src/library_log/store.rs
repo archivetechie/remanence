@@ -186,6 +186,7 @@ fn directory_lock(dir: &Path, exclusive: bool) -> Result<Flock<fs::File>, StoreE
     .map_err(|(_, e)| StoreError::Locked(e))
 }
 /// Replay under shared leases without creating any file, including the lock.
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 pub fn replay(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreError> {
     let _directory = directory_lock(dir, false)?;
     let _lock = if dir.join("library-log.lock").try_exists()? {
@@ -195,10 +196,12 @@ pub fn replay(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, S
     };
     scan(dir, log_uuid, view)
 }
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 fn scan(dir: &Path, log_uuid: Id, view: &dyn TapeView) -> Result<Replay, StoreError> {
     scan_observed(dir, log_uuid, view, &mut |_| Ok(()))
 }
 /// Stream validated applications without retaining a decoded history.
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 pub fn replay_observed(
     dir: &Path,
     log_uuid: Id,
@@ -209,6 +212,7 @@ pub fn replay_observed(
 }
 /// Observe every validated received record, including excluded and pending records,
 /// under exactly the same directory and library-log leases as ordinary replay.
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 pub fn replay_observed_with_received(
     dir: &Path,
     log_uuid: Id,
@@ -224,6 +228,7 @@ pub fn replay_observed_with_received(
     };
     scan_observed_with_received(dir, log_uuid, view, applied, received)
 }
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 fn scan_observed(
     dir: &Path,
     log_uuid: Id,
@@ -232,6 +237,7 @@ fn scan_observed(
 ) -> Result<Replay, StoreError> {
     scan_observed_with_received(dir, log_uuid, view, applied, &mut |_, _| Ok(()))
 }
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 fn scan_observed_with_received(
     dir: &Path,
     log_uuid: Id,
@@ -253,6 +259,7 @@ fn scan_observed_with_received(
         .collect::<Vec<_>>();
     scan_prefixes_observed(dir, log_uuid, view, applied, received, &files)
 }
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 fn scan_prefixes(
     dir: &Path,
     log_uuid: Id,
@@ -265,6 +272,7 @@ fn scan_prefixes(
 
 /// Received observations follow byte-chain and fold validation, including
 /// pending/excluded dispositions; they never grant projector application proof.
+#[cfg_attr(any(test, feature = "fixtures"), track_caller)]
 fn scan_prefixes_observed(
     dir: &Path,
     log_uuid: Id,
@@ -273,6 +281,8 @@ fn scan_prefixes_observed(
     received: &mut dyn FnMut(&Record, &Receipt) -> Result<(), StoreError>,
     files: &[(PathBuf, Option<u64>)],
 ) -> Result<Replay, StoreError> {
+    #[cfg(any(test, feature = "fixtures"))]
+    crate::full_pass::count(crate::full_pass::PassKind::LibraryReplay);
     let mut out = Replay::default();
     for (index, (path, limit)) in files.iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -557,6 +567,7 @@ impl LibraryHistory for LibraryLog {
 }
 impl LibraryLog {
     /// Acquire ownership, validate every segment and replace an absent final suffix.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn open(
         dir: &Path,
         log_uuid: Id,
@@ -613,6 +624,7 @@ impl LibraryLog {
         &self.state
     }
     /// Read-only inspection using the already held exclusive lease.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn inspect_tail(&self, view: &dyn TapeView) -> Result<Replay, StoreError> {
         scan(&self.dir, self.log_uuid, view)
     }
@@ -635,6 +647,7 @@ impl LibraryLog {
     }
     /// Explicit recovery retains every complete valid frame, including a landed failed append.
     /// Republish even a complete final segment, then verify its retained end before clearing the fence.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn clear_ambiguity(&mut self, view: &dyn TapeView) -> Result<(), StoreError> {
         let state = scan(&self.dir, self.log_uuid, view)?;
         if let Some(e) = state.refusal {
@@ -684,6 +697,7 @@ impl LibraryLog {
         Ok(())
     }
     /// Archive damaged final bytes, then atomically retain exactly the authoritative prefix.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn repair_tail(&mut self, through: u64, view: &dyn TapeView) -> Result<(), StoreError> {
         let state = scan(&self.dir, self.log_uuid, view)?;
         let refusal = state.refusal.as_ref().ok_or(StoreError::RepairBoundary)?;
@@ -1128,6 +1142,7 @@ pub(super) struct ReadSnapshot {
     _directory_lock: Arc<Flock<fs::File>>,
 }
 impl ReadSnapshot {
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn inspect(
         &self,
         view: &dyn TapeView,
@@ -1136,6 +1151,7 @@ impl ReadSnapshot {
     ) -> Result<Replay, StoreError> {
         scan_prefixes_observed(&self.dir, self.uuid, view, applied, received, &self.files)
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn replay(
         &self,
         view: &dyn TapeView,

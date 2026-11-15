@@ -951,6 +951,7 @@ pub struct LibrarySnapshot {
     _state_lock: Arc<StateLockGuard>,
 }
 impl LibrarySnapshot {
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn inspect(
         &self,
         view: &dyn TapeView,
@@ -959,6 +960,7 @@ impl LibrarySnapshot {
     ) -> Result<store::Replay, StoreError> {
         self.source.inspect(view, applied, received)
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn replay(
         &self,
         view: &dyn TapeView,
