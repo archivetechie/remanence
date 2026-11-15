@@ -50,6 +50,10 @@ is on NFS, SMB/CIFS, tmpfs, ramfs or overlayfs, `rem` refuses it as an untrusted
 state volume. In that case set `XDG_STATE_HOME` to a directory on a local disk,
 and set it the same way for every later `rem` command.
 
+The journal's disk must also use a write-through cache or support FUA.
+`rem doctor` checks this rule, using the nearest existing ancestor when the
+journal directory does not yet exist.
+
 ## 1. Set up the drive
 
 Find the drive, save it as this host's drive, and check the host:
@@ -84,6 +88,7 @@ state directory row left out):
 ✓  capability        /usr/local/bin/rem
 ✓  lock directory    /run/lock/rem
 ✓  trusted volume    state paths support trusted durability
+✓  journal volume    /home/alex/.local/state/rem/journals/tapes (via /home/alex/.local/state/rem)
 ✓  standalone drive  1 standalone drives found; 0 drives with unknown ownership
 ready to use the drive
 ```

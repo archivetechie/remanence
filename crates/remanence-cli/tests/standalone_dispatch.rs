@@ -2,6 +2,57 @@
 //! may open a transport before the explicit device authorization is supplied.
 use std::{path::Path, process::ExitCode};
 
+/// Doctor checks the journal's disk even before the tape-log directory exists.
+#[test]
+fn doctor_checks_journal_volume_via_existing_ancestor() {
+    let root = tempfile::tempdir().unwrap();
+    let xdg = root.path().join("state");
+    let configured = xdg.join("rem/journals/tapes");
+    assert!(!xdg.join("rem/journals").exists());
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let code = remanence_cli::run_with_standalone_test_io(
+        &["rem", "--json", "doctor"],
+        root.path(),
+        &xdg,
+        &root.path().join("absent-system.toml"),
+        &root.path().join("locks"),
+        vec![],
+        |_: &Path| panic!("doctor without attachments must not open a device"),
+        &mut out,
+        &mut errors,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "no standalone drive is attached");
+    let response: serde_json::Value = serde_json::from_slice(&out)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&errors)));
+    let health = &response["result"];
+    let checks = health["checks"].as_array().unwrap();
+    let trusted = checks
+        .iter()
+        .position(|c| c["name"] == "trusted volume")
+        .unwrap();
+    let journals: Vec<_> = checks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c["name"] == "journal volume")
+        .collect();
+    assert_eq!(journals.len(), 1, "{health}");
+    let (position, journal) = journals[0];
+    assert_eq!(position, trusted + 1);
+    let detail = journal["detail"].as_str().unwrap();
+    assert!(detail.contains(configured.to_str().unwrap()), "{detail}");
+    assert!(!detail.contains("No such file or directory"), "{detail}");
+    assert!(
+        detail.contains(&format!("(via {})", xdg.join("rem").display())),
+        "{detail}"
+    );
+    if journal["ok"] == false {
+        assert_eq!(health["fixes"]["journal_volume"], journal["fix"]);
+        assert!(health["fixes"]["journal_volume"].is_string());
+    }
+    assert!(!xdg.join("rem/journals").exists());
+}
+
 #[test]
 fn every_device_verb_refuses_missing_authorization_before_io() {
     let uuid = "31313131-3131-4131-8131-313131313131";
@@ -712,14 +763,23 @@ fn every_new_verb_routes_help_through_the_entry_point() {
 #[test]
 fn literal_help_operands_keep_library_entry_point_routing() {
     let root = tempfile::tempdir().unwrap();
-    for args in [
-        vec!["put", "help", "--pool", "example"],
-        vec!["get", "help", "--dest", "out"],
-        vec!["tape", "init", "help", "--config", "missing.toml"],
-        vec!["tape", "finalize", "--reason", "help"],
+    for (args, expected) in [
+        (vec!["put", "help", "--pool", "example"], "stat help"),
+        (vec!["get", "help", "--dest", "out"], "connect daemon at"),
+        (
+            vec!["tape", "init", "help", "--config", "missing.toml"],
+            "read config at missing.toml",
+        ),
+        (vec!["tape", "finalize", "--reason", "help"], "--tape-uuid"),
     ] {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
             .env("REM_TEST_NO_LIVE_SCSI", "1")
+            .env("HOME", root.path())
+            .env("XDG_STATE_HOME", root.path())
+            .env(
+                "REM_TEST_SYSTEM_CONFIG",
+                root.path().join("absent-system.toml"),
+            )
             .current_dir(root.path())
             .args(&args)
             .output()
@@ -733,11 +793,11 @@ fn literal_help_operands_keep_library_entry_point_routing() {
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(!output.contains("requires --device"), "{args:?}: {output}");
         assert!(
-            !output.contains("Standalone device interface:"),
-            "{args:?}: {output}"
+            output.contains(expected),
+            "{args:?}: missing {expected}: {output}"
         );
+        assert!(!output.contains("requires --device"), "{args:?}: {output}");
     }
 }
 

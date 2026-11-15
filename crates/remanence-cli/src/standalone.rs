@@ -58,7 +58,7 @@ struct Cli {
     /// Allow reads from a drive that has no VPD serial.
     #[arg(long, global = true)]
     allow_unserialized_device: bool,
-    /// Override volume durability checks when intentionally using an untrusted state filesystem.
+    /// Override only the state filesystem's type check when using an untrusted filesystem.
     #[arg(long, global = true)]
     allow_untrusted_state_volume: bool,
     /// Acknowledge incomplete discovery for read-only access.
@@ -333,6 +333,21 @@ enum Tape {
 /// Select explicit standalone operations before the legacy library discovery path.
 pub(crate) fn selected(args: &[OsString]) -> bool {
     selected_in(args, &Environment::from_process())
+}
+
+/// Exercise library routing with no developer home or system configuration.
+#[cfg(test)]
+pub(crate) fn selected_without_home_config(args: &[OsString]) -> bool {
+    let root = tempfile::tempdir().unwrap();
+    let env = Environment {
+        xdg: root.path().into(),
+        system_config: root.path().join("system.toml"),
+        locks: root.path().join("locks"),
+        test_input: true,
+        euid: 1000,
+        doctor_checks: None,
+    };
+    selected_in(args, &env)
 }
 
 fn selected_in(args: &[OsString], env: &Environment) -> bool {
@@ -2536,6 +2551,27 @@ fn memlock_check(
     check
 }
 
+/// Describe the journal policy result without inspecting the filesystem or disk.
+fn journal_volume_check(
+    directory: &Path,
+    probe: &Path,
+    result: Result<(), remanence_library::durability::VolumeError>,
+) -> Value {
+    let prefix = if directory == probe {
+        directory.display().to_string()
+    } else {
+        format!("{} (via {})", directory.display(), probe.display())
+    };
+    let mut check = json!({"name":"journal volume", "ok":result.is_ok(), "detail":prefix});
+    if let Err(error) = result {
+        check["detail"] = json!(format!("{prefix}: {error}"));
+        check["fix"] = json!(
+            "put journal.dir on a disk whose write cache is write-through or that supports FUA"
+        );
+    }
+    check
+}
+
 /// Advisory checks expose remedies without preventing setup or drive readiness.
 fn doctor_check_ready(check: &Value) -> bool {
     check["ok"] == true || check["severity"] == "warning"
@@ -2577,6 +2613,19 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
     let mut trusted = config.clone();
     trusted.journal.require_trusted_volume = true;
     let trust = remanence_state::validate_trusted_volume_paths(&trusted).map_err(err);
+    let journal_directory = config.journal.dir.join("tapes");
+    let mut probe = journal_directory.as_path();
+    // Only absence permits walking up; inaccessible paths and symlinks must be judged.
+    while let Err(error) = fs::symlink_metadata(probe) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            break;
+        }
+        let Some(parent) = probe.parent() else {
+            break;
+        };
+        probe = parent;
+    }
+    let journal_volume = remanence_library::durability::validate_trusted_journal_directory(probe);
     let check = |name: &str, ok: bool, detail: String, fix: &str| {
         let mut value = json!({"name":name,"ok":ok,"detail":detail});
         if !ok {
@@ -2637,6 +2686,7 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
                 .unwrap_or_else(|| "state paths support trusted durability".into()),
             "move state to a trusted local filesystem",
         ),
+        journal_volume_check(&journal_directory, probe, journal_volume),
     ];
     let fixes: serde_json::Map<String, Value> = checks
         .iter()
@@ -2647,6 +2697,7 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
                     "lock directory" => "lock_dir",
                     "state directory" => "state_dir",
                     "trusted volume" => "trusted_volume",
+                    "journal volume" => "journal_volume",
                     other => other,
                 };
                 (name.to_owned(), fix.clone())
@@ -3329,6 +3380,55 @@ mod tests {
         }
     }
 
+    /// Journal failures block readiness and retain the configured path and probed ancestor.
+    #[test]
+    fn doctor_journal_volume_row_enforces_durability() {
+        use super::*;
+        use remanence_library::durability::VolumeError;
+        let configured = Path::new("/state/journals/tapes");
+        let probe = Path::new("/state");
+        let reason = "/sys/dev/block/8:0/queue/fua=0: write back cache without FUA support";
+        let rejected = journal_volume_check(
+            configured,
+            configured,
+            Err(VolumeError::UntrustedVolume(reason.into())),
+        );
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected.get("severity").is_none());
+        assert_eq!(rejected["name"], "journal volume");
+        let detail = rejected["detail"].as_str().unwrap();
+        assert!(detail.starts_with("/state/journals/tapes: "), "{detail}");
+        assert!(detail.contains(reason), "{detail}");
+        assert!(rejected["fix"].as_str().unwrap().contains("journal.dir"));
+        assert!(!rejected.to_string().contains("allow-untrusted"));
+        assert!(!doctor_check_ready(&rejected));
+
+        for actual_probe in [configured, probe] {
+            let prefix = if actual_probe == configured {
+                "/state/journals/tapes"
+            } else {
+                "/state/journals/tapes (via /state)"
+            };
+            let success = journal_volume_check(configured, actual_probe, Ok(()));
+            assert_eq!(success["ok"], true);
+            assert!(success.get("severity").is_none());
+            assert!(success.get("fix").is_none());
+            assert_eq!(success["detail"], prefix);
+            assert!(doctor_check_ready(&success));
+
+            let io_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+            let expected = format!("{prefix}: journal I/O: {io_error}");
+            let failure =
+                journal_volume_check(configured, actual_probe, Err(VolumeError::Io(io_error)));
+            assert_eq!(failure["ok"], false);
+            assert!(failure.get("severity").is_none());
+            assert_eq!(failure["detail"], expected);
+            assert!(failure["fix"].is_string());
+            assert!(!failure.to_string().contains("allow-untrusted"));
+            assert!(!doctor_check_ready(&failure));
+        }
+    }
+
     /// Inject boundary limits and nondefault settings so host privileges cannot mask a failure.
     #[test]
     fn doctor_memlock_limit_is_advisory_and_uses_configured_minimum() {
@@ -3780,7 +3880,7 @@ mod tests {
             vec!["rem", "put", "--pool", "example", "--", "--help"],
         ] {
             let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-            assert!(!selected(&args), "{args:?}");
+            assert!(!selected_without_home_config(&args), "{args:?}");
             assert!(shared_help(&args).is_none(), "{args:?}");
         }
         for args in [

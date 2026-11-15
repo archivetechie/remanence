@@ -469,7 +469,7 @@ minimal config above puts them there.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `journal.dir` | absolute path | required | Directory containing `tapes/<lowercase-simple-uuid>.remtape`, one authority log per tape with or without parity. The authority marker binds this configured root to the state directory. |
-| `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. |
+| `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. This controls filesystem types only; the journal disk's separate write-cache rule always applies. |
 | `audit.dir` | absolute path | required | Directory holding the library log's `*.remlib` segments, `library-log.lock`, `library-log.ambiguous` and `library-log.fence-reconcile`. The segments record withdrawals, fences, barcodes and pools. The state directory's `authority-manifest.json` binds the log's root and identity. |
 | `audit.fsync` | bool | `true` | Sync each library-log `Diagnostic` append before returning. Other record types sync regardless of this setting; segment rotation also syncs. |
 | `audit.clock_forward_tolerance_seconds` | integer | `300` | Accepted and range-validated, but has no effect in this version; production does not read it. |

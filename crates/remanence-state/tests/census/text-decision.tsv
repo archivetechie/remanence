@@ -246,7 +246,7 @@ crates/remanence-cli/src/standalone.rs::confirm_setup::text-matches	1
 crates/remanence-cli/src/standalone.rs::dispatch::text-equality	14
 crates/remanence-cli/src/standalone.rs::dispatch::text-find	4
 crates/remanence-cli/src/standalone.rs::doctor::text-equality	1
-crates/remanence-cli/src/standalone.rs::doctor::text-match	4
+crates/remanence-cli/src/standalone.rs::doctor::text-match	5
 crates/remanence-cli/src/standalone.rs::doctor_check_ready::text-equality	1
 crates/remanence-cli/src/standalone.rs::receipt::text-equality	2
 crates/remanence-cli/src/standalone.rs::render_doctor::text-equality	1

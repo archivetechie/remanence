@@ -114,7 +114,7 @@ mod tests {
             "--confirm-supersede",
             "SUPERSEDE LABEL",
         ];
-        assert!(!crate::standalone::selected(
+        assert!(!crate::standalone::selected_without_home_config(
             &words
                 .iter()
                 .map(std::ffi::OsString::from)

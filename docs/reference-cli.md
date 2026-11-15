@@ -254,8 +254,8 @@ Every standalone command accepts these flags:
 - `--allow-device <ALLOW_DEVICE>` authorizes a drive by its discovered serial or device
   path.
 - `--allow-unserialized-device` allows reads from a drive that has no VPD serial.
-- `--allow-untrusted-state-volume` accepts a state filesystem that fails the durability
-  checks.
+- `--allow-untrusted-state-volume` accepts a state filesystem of an untrusted type.
+  It does not override the journal disk's write-cache check.
 - `--acknowledge-unknown-ownership` acknowledges incomplete discovery, for read-only
   access.
 - `--reserve` adds SCSI RESERVE(6) and RELEASE(6) around the invocation, for drives that
@@ -311,8 +311,9 @@ rem doctor [OPTIONS]
 ```
 
 The command checks the effective group, the binary's capability, the lock directory, the
-state directory, discovery, active fences and the memory-lock limit. It loads no tape. It
-prints a table with one row per check: a mark (passed, failed, or `!` for an advisory
+state directory, the `trusted volume` filesystem-type check, the `journal volume`
+write-cache/FUA check, discovery, active fences and the memory-lock limit. It loads no
+tape. It prints a table with one row per check: a mark (passed, failed, or `!` for an advisory
 warning), the check's name, and its detail with a `fix:` where one applies. The last line is
 `ready to use the drive` or `fix the items above`. The memory-lock check is advisory and
 never blocks readiness.

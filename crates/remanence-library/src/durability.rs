@@ -24,10 +24,12 @@ pub enum VolumeError {
 ///
 /// Tape-log creation uses this shared policy before publishing durable authority.
 pub fn validate_trusted_journal_volume(path: &Path) -> Result<(), VolumeError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    validate_trusted_journal_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+/// Require a journal directory to satisfy the shared filesystem and write-cache policy.
+pub fn validate_trusted_journal_directory(dir: &Path) -> Result<(), VolumeError> {
+    let canonical_parent = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let fstype = filesystem_type_for_path(&canonical_parent);
     validate_journal_fstype(&canonical_parent, fstype.as_deref())?;
     validate_journal_write_cache(&canonical_parent)
@@ -225,6 +227,24 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("remanence-{name}-{stamp}"))
+    }
+
+    /// File and directory entry points apply the same policy to the log directory.
+    #[test]
+    fn trusted_journal_directory_matches_volume_parent() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in [root.path().to_path_buf(), root.path().join("missing")] {
+            let volume = validate_trusted_journal_volume(&dir.join("x"));
+            let directory = validate_trusted_journal_directory(&dir);
+            if dir != root.path() {
+                assert!(matches!(volume, Err(VolumeError::Io(_))));
+                assert!(matches!(directory, Err(VolumeError::Io(_))));
+            }
+            assert_eq!(
+                volume.map_err(|e| e.to_string()),
+                directory.map_err(|e| e.to_string())
+            );
+        }
     }
 
     #[test]

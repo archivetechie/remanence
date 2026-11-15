@@ -259,7 +259,8 @@ whether read buffers can be swapped out, not whether the data is correct.
 On a host with a tape drive, `rem doctor` checks the tape group, the
 capability on the `rem` binary it runs from, the lock directory, the state
 directory, whether the state directory is on a filesystem it trusts for
-durable writes, and the memory-lock limit. It then looks for drives. Each
+durable writes, whether the journal's disk writes through or supports FUA,
+and the memory-lock limit. It then looks for drives. Each
 failed check names its fix. The
 [standalone-drive guide](guide-standalone-drive.md#1-set-up-the-drive) shows
 it in use.
