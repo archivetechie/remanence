@@ -33,6 +33,8 @@ crates/remanence-library/src/handle/tape_io/mod.rs::map_scsi::decode_usable_sens
 crates/remanence-library/src/handle/tape_io/mod.rs::read_block::decode_sense_key_asc	1
 # read_block_batch: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
 crates/remanence-library/src/handle/tape_io/mod.rs::read_block_batch::decode_sense_key_asc	1
+# read_config_internal: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
+crates/remanence-library/src/handle/tape_io/mod.rs::read_config_internal::decode_sense_key_asc	1
 # read_filemark_signal: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
 crates/remanence-library/src/handle/tape_io/mod.rs::read_filemark_signal::decode_usable_sense	1
 # require_single_partition: Layer-3 completion predicate produces transfer, boundary, or refusal evidence before the final result.
