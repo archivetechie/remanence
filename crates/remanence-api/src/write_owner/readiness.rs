@@ -18,22 +18,29 @@ pub(crate) const SESSION_OPEN_CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration
 #[cfg(not(test))]
 pub(crate) const SESSION_OPEN_CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_secs(1);
 
+/// Tape-fence policy for the shared readiness probe, before any LOAD.
+pub(crate) enum FenceAdmission {
+    Refuse,
+    Read,
+    Recover(crate::TapeUuid),
+}
+
 pub(crate) fn session_open_short_probe_or_load(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
-    session_open_short_probe_or_load_inner(index, drive, ctx, None)
+    session_open_short_probe_or_load_inner(index, drive, ctx, FenceAdmission::Refuse)
 }
 
-/// The supersede alone supplies a recovery identity; all probing stays shared.
+/// Read and recovery admission share the same readiness probing.
 pub(crate) fn session_open_short_probe_or_load_inner(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
-    recovering_tape: Option<crate::TapeUuid>,
+    admission: FenceAdmission,
 ) -> Result<(), Status> {
-    session_open_reject_admission_conflicts_inner(index, &ctx, recovering_tape)?;
+    session_open_reject_admission_conflicts_inner(index, &ctx, admission)?;
     let family = session_open_media_family(
         index
             .readiness_media_observation(ctx.barcode)
@@ -461,14 +468,14 @@ pub(crate) fn session_open_reject_admission_conflicts(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
-    session_open_reject_admission_conflicts_inner(index, ctx, None)
+    session_open_reject_admission_conflicts_inner(index, ctx, FenceAdmission::Refuse)
 }
 
 /// Keep drive, readiness and motion admission intact around the tail-recovery exception.
 pub(crate) fn session_open_reject_admission_conflicts_inner(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
-    recovering_tape: Option<crate::TapeUuid>,
+    admission: FenceAdmission,
 ) -> Result<(), Status> {
     let endpoint = remanence_state::DriveKey::new(ctx.library_serial, ctx.bay);
     if let Some(runtime) = index.library_runtime() {
@@ -483,22 +490,25 @@ pub(crate) fn session_open_reject_admission_conflicts_inner(
     let fences = index
         .tape_io_matching_fences(None, ctx.barcode, Some(&endpoint))
         .map_err(status_from_state_error)?;
-    if !fences.is_empty() {
-        // Only the supersede supplies its resolved tape UUID; every row must name that tape.
-        let allowed = recovering_tape.is_some_and(|tape| {
-            index.library_runtime().is_some_and(|runtime| {
-                runtime.tape_io_fences_pass(
-                    &fences,
-                    Some(&tape),
-                    remanence_state::library_runtime::TapeIoPass::Motion,
-                )
-            })
-        });
-        if !allowed {
-            return Err(Status::failed_precondition(
-                "readiness blocked by active tape-I/O fence",
-            ));
-        }
+    let blocks = match admission {
+        FenceAdmission::Refuse => !fences.is_empty(),
+        FenceAdmission::Read => crate::tape_admission::tape_io_rows_block(
+            &fences,
+            index.library_runtime().as_ref(),
+            None,
+            remanence_state::library_runtime::TapeIoPass::Read,
+        ),
+        FenceAdmission::Recover(tape) => crate::tape_admission::tape_io_rows_block(
+            &fences,
+            index.library_runtime().as_ref(),
+            Some(&tape),
+            remanence_state::library_runtime::TapeIoPass::Motion,
+        ),
+    };
+    if blocks {
+        return Err(Status::failed_precondition(
+            "readiness blocked by active tape-I/O fence",
+        ));
     }
     let conflicts = index
         .media_readiness_admission_conflicts(ctx.library_serial, Some(ctx.bay), ctx.barcode, false)

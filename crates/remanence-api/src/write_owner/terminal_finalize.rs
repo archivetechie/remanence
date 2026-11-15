@@ -141,7 +141,7 @@ pub(crate) fn finalize_mounted_tape(
     finish: impl FnOnce(&mut CatalogIndex, &mut DriveHandle),
 ) -> Result<ManualFinalizeTapeActorReply, Status> {
     validate_manual_finalize_owned_request(index, request)?;
-    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape", false)?;
 
     let checkpoint_journal = remanence_state::TapeAuthority::open(
         cfg.checkpoint_journal_dir.as_path(),
@@ -1049,7 +1049,13 @@ pub(crate) fn preflight_manual_finalize_cancellable(
         }));
     }
     if !had_existing_intent {
-        session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+        session_open_reject_tape_io_fences(
+            index,
+            &request.tape_uuid,
+            barcode,
+            "finalize tape",
+            false,
+        )?;
     }
 
     let new_acceptance = existing_intent.is_none();
@@ -1357,7 +1363,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             projection: result.projection,
         }));
     }
-    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape", false)?;
     Ok(None)
 }
 

@@ -4,6 +4,17 @@ use remanence_state::{
     library_log as lib, library_runtime::RefusalSubject, CatalogIndex, TapeIoFenceRecord,
 };
 
+/// Empty matches admit; nonempty matches require the live authority's pass.
+pub(crate) fn tape_io_rows_block(
+    rows: &[TapeIoFenceRecord],
+    runtime: Option<&remanence_state::library_runtime::LibraryRuntime>,
+    tape: Option<&crate::TapeUuid>,
+    pass: remanence_state::library_runtime::TapeIoPass,
+) -> bool {
+    !rows.is_empty()
+        && !runtime.is_some_and(|runtime| runtime.tape_io_fences_pass(rows, tape, pass))
+}
+
 pub(crate) fn typed_cause(
     index: &CatalogIndex,
     fence: &TapeIoFenceRecord,
@@ -447,6 +458,151 @@ mod tests {
     use remanence_state::authority::TapeAuthorityView;
     use remanence_state::library_runtime::TapeIoPass;
     use tonic::{Code, Request};
+
+    /// The row gate distinguishes reads from motion and fails closed without authority.
+    #[test]
+    fn x22_rows_block_matrix() {
+        use lib::FenceCause::{AppendAdmissionRefused, SessionSuffixContradiction, TransferError};
+        for (causes, expected) in [
+            (vec![], (false, false)),
+            (vec![AppendAdmissionRefused], (false, false)),
+            (vec![SessionSuffixContradiction], (true, false)),
+            (vec![AppendAdmissionRefused, TransferError], (true, true)),
+        ] {
+            let fixture = Fixture::new();
+            for cause in causes {
+                fixture.raise(T, cause);
+            }
+            let index = fixture.index();
+            let runtime = index.library_runtime().unwrap();
+            let rows = index.tape_io_matching_fences(Some(&T), None, None).unwrap();
+            for (pass, blocks) in [
+                (TapeIoPass::Read, expected.0),
+                (TapeIoPass::Motion, expected.1),
+            ] {
+                assert_eq!(
+                    super::tape_io_rows_block(&rows, Some(&runtime), Some(&T), pass),
+                    blocks
+                );
+                assert_eq!(
+                    super::tape_io_rows_block(&rows, None, Some(&T), pass),
+                    !rows.is_empty()
+                );
+            }
+        }
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: T,
+                barcode: None,
+                reason: "append_admission_refused".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        let rows = index.tape_io_matching_fences(Some(&T), None, None).unwrap();
+        for pass in [TapeIoPass::Read, TapeIoPass::Motion] {
+            assert!(super::tape_io_rows_block(
+                &rows,
+                index.library_runtime().as_ref(),
+                Some(&T),
+                pass
+            ));
+        }
+        let fixture = Fixture::new();
+        fixture.raise(B, AppendAdmissionRefused);
+        let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+        assert_eq!(conn.execute(
+            "UPDATE tapes SET voltag = 'OTHER', voltag_source = 'operator' WHERE tape_uuid = ?1",
+            [B.as_slice()],
+        ).unwrap(), 1);
+        let index = fixture.index();
+        let rows = index
+            .tape_io_matching_fences(None, Some("OTHER"), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tape_uuid, B);
+        for pass in [TapeIoPass::Read, TapeIoPass::Motion] {
+            assert!(super::tape_io_rows_block(
+                &rows,
+                index.library_runtime().as_ref(),
+                Some(&T),
+                pass
+            ));
+        }
+    }
+
+    /// Rank typed conflicts stably, with legacy rows in the last rank.
+    #[test]
+    fn x22_order_conflicts_stable_ranks() {
+        use lib::FenceCause::*;
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        // ContainerQuarantine is reserved and cannot be raised by the live authority.
+        let causes = [
+            TransferError,
+            AppendAdmissionRefused,
+            NativeLogBehindProjection,
+            PartialBatch,
+            SessionSuffixContradiction,
+            CloseoutCheckMismatch,
+            SupersedeTailFailed,
+            StandaloneWriteLostByRestart,
+            ResetUnitAttention,
+            PositionDrift,
+            AuthorityAmbiguous,
+            CloseoutReadContradiction,
+            Cleaning,
+            CheckpointBarrierFailed,
+            AppendAdmissionRefused,
+            NativeLogBehindProjection,
+            SessionSuffixContradiction,
+        ];
+        let mut rows = Vec::new();
+        for cause in causes {
+            let sequence = fixture.raise(T, cause);
+            rows.push(
+                index
+                    .tape_io_matching_fences(Some(&T), None, None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.quarantine_id == format!("library:{sequence}"))
+                    .unwrap(),
+            );
+        }
+        let legacy = index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: T,
+                barcode: None,
+                reason: "append_admission_refused".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        rows.insert(6, legacy);
+        let expected_indices = [1, 4, 15, 17, 2, 16, 0, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        let expected: Vec<_> = expected_indices
+            .into_iter()
+            .map(|i| rows[i].quarantine_id.clone())
+            .collect();
+        let mut without_runtime = rows.clone();
+        let reader =
+            remanence_state::CatalogReader::open(&fixture.root.paths().sqlite_path).unwrap();
+        super::order_conflicts(&reader, &mut without_runtime);
+        assert_eq!(
+            without_runtime
+                .iter()
+                .map(|r| &r.quarantine_id)
+                .collect::<Vec<_>>(),
+            rows.iter().map(|r| &r.quarantine_id).collect::<Vec<_>>()
+        );
+        super::order_conflicts(&index, &mut rows);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.quarantine_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 
     /// Recovery and read passes check every typed cause and fail closed on another tape.
     #[test]

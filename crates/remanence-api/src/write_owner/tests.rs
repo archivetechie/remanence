@@ -3059,6 +3059,7 @@ fn session_open_refuses_active_tape_io_fence_until_operator_release() {
         &tape_uuid,
         Some("AOX044L9"),
         "open write session",
+        false,
     )
     .expect_err("active tape-I/O fence must block session open");
 
@@ -3070,8 +3071,14 @@ fn session_open_refuses_active_tape_io_fence_until_operator_release() {
         .release_tape_io_fence(&fence.quarantine_id, "operator released")
         .expect("release tape-I/O fence")
         .expect("released fence");
-    session_open_reject_tape_io_fences(&index, &tape_uuid, Some("AOX044L9"), "open write session")
-        .expect("released tape-I/O fence no longer blocks session open");
+    session_open_reject_tape_io_fences(
+        &index,
+        &tape_uuid,
+        Some("AOX044L9"),
+        "open write session",
+        false,
+    )
+    .expect("released tape-I/O fence no longer blocks session open");
 }
 
 #[test]
@@ -3918,6 +3925,7 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
         &tape_uuid,
         None,
         "open write session after failed parity append",
+        false,
     )
     .expect_err("the durable partial fence must block the next session");
 
@@ -5654,80 +5662,109 @@ fn test_state_write_owner_config(
 /// G3 preserves ordinary admission and unrelated tape/drive fences during recovery.
 #[test]
 fn c0b3c_supersede_readiness_admits_only_own_suffix_fences() {
-    let tape_uuid = [0x71; 16];
-    let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "SUFFIX001L9")]);
-    let mut index = typed.catalog().write_handle();
-    let runtime = index.library_runtime().unwrap();
-    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
-        "LIB-SUFFIX",
-        0x100,
-        "DRV-SUFFIX",
-        0x400,
-        1,
-    )));
-    let library = open_model_library(world.clone());
-    let cfg = test_typed_write_owner_config(
-        &typed,
-        &library,
-        library_snapshot_cell(library.library().clone()),
-    );
-    let ctx = SessionOpenReadinessContext {
-        action: "supersede tape tail",
-        bay: 0x100,
-        library_serial: "LIB-SUFFIX",
-        barcode: Some("SUFFIX001L9"),
-        source_slot: None,
-        drive_serial: Some("DRV-SUFFIX"),
-        needs_drive_load: false,
-        load_continues_move: false,
-        lifecycle: None,
-    };
-    let raise = |index: &mut CatalogIndex, reason: &str| {
-        raise_tape_io_fence(
-            index,
-            &cfg,
-            TapeIoFenceInput {
-                tape_uuid,
-                barcode: None,
-                reason: reason.into(),
-                evidence_json: None,
-            },
-            None,
-            None,
+    use super::readiness::FenceAdmission;
+    for (cause, reads) in [
+        ("append_admission_refused", true),
+        ("session_suffix_contradiction", false),
+    ] {
+        let tape_uuid = [0x71; 16];
+        let typed = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "SUFFIX001L9")]);
+        let mut index = typed.catalog().write_handle();
+        let runtime = index.library_runtime().unwrap();
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-SUFFIX",
+            0x100,
+            "DRV-SUFFIX",
+            0x400,
+            1,
+        )));
+        let library = open_model_library(world.clone());
+        let cfg = test_typed_write_owner_config(
+            &typed,
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        let ctx = SessionOpenReadinessContext {
+            action: "supersede tape tail",
+            bay: 0x100,
+            library_serial: "LIB-SUFFIX",
+            barcode: Some("SUFFIX001L9"),
+            source_slot: None,
+            drive_serial: Some("DRV-SUFFIX"),
+            needs_drive_load: false,
+            load_continues_move: false,
+            lifecycle: None,
+        };
+        let raise = |index: &mut CatalogIndex, reason: &str| {
+            raise_tape_io_fence(
+                index,
+                &cfg,
+                TapeIoFenceInput {
+                    tape_uuid,
+                    barcode: None,
+                    reason: reason.into(),
+                    evidence_json: None,
+                },
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let suffix = raise(&mut index, cause);
+        let read =
+            session_open_reject_admission_conflicts_inner(&mut index, &ctx, FenceAdmission::Read);
+        assert_eq!(read.is_ok(), reads, "read readiness for {cause}: {read:?}");
+        if let Err(error) = read {
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                error.message(),
+                "readiness blocked by active tape-I/O fence"
+            );
+        }
+        session_open_reject_admission_conflicts_inner(
+            &mut index,
+            &ctx,
+            super::readiness::FenceAdmission::Recover(tape_uuid),
         )
-        .unwrap()
-    };
-    let suffix = raise(&mut index, "session_suffix_contradiction");
-    session_open_reject_admission_conflicts_inner(&mut index, &ctx, Some(tape_uuid))
         .expect("supersede readiness admits its suffix fence");
-    let error = session_open_reject_admission_conflicts(&mut index, &ctx)
-        .expect_err("ordinary open must refuse the suffix fence even with the same action text");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        error.message(),
-        "readiness blocked by active tape-I/O fence"
-    );
-    raise(&mut index, "transfer_error");
-    let error = session_open_reject_admission_conflicts_inner(&mut index, &ctx, Some(tape_uuid))
+        let error = session_open_reject_admission_conflicts(&mut index, &ctx).expect_err(
+            "ordinary open must refuse the suffix fence even with the same action text",
+        );
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "readiness blocked by active tape-I/O fence"
+        );
+        raise(&mut index, "transfer_error");
+        let error = session_open_reject_admission_conflicts_inner(
+            &mut index,
+            &ctx,
+            super::readiness::FenceAdmission::Recover(tape_uuid),
+        )
         .expect_err("supersede must refuse an unrelated tape fence");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        error.message(),
-        "readiness blocked by active tape-I/O fence"
-    );
-    drive_fence_api_tests::raise(
-        &runtime,
-        &remanence_state::DriveKey::new("LIB-SUFFIX", 0x100),
-    );
-    let before = world.lock().unwrap().command_log.len();
-    let error = session_open_reject_admission_conflicts_inner(&mut index, &ctx, Some(tape_uuid))
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "readiness blocked by active tape-I/O fence"
+        );
+        drive_fence_api_tests::raise(
+            &runtime,
+            &remanence_state::DriveKey::new("LIB-SUFFIX", 0x100),
+        );
+        let before = world.lock().unwrap().command_log.len();
+        let error = session_open_reject_admission_conflicts_inner(
+            &mut index,
+            &ctx,
+            super::readiness::FenceAdmission::Recover(tape_uuid),
+        )
         .expect_err("drive admission still precedes the suffix exception");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error.message().starts_with("DriveFenced: "), "{error}");
-    assert_eq!(world.lock().unwrap().command_log.len(), before);
-    assert!(runtime
-        .fence_for_quarantine_id(&suffix.quarantine_id)
-        .is_some());
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().starts_with("DriveFenced: "), "{error}");
+        assert_eq!(world.lock().unwrap().command_log.len(), before);
+        assert!(runtime
+            .fence_for_quarantine_id(&suffix.quarantine_id)
+            .is_some());
+    }
 }
 
 fn test_io_memory() -> Arc<crate::io_memory::IoMemoryReservation> {
@@ -8752,6 +8789,48 @@ async fn read_only_mount_harvest_calibrates_the_volume() {
         .await
         .expect("read close reply")
         .expect("close read session");
+}
+
+/// A fresh discard load harvests before the no-authority tail-recovery refusal.
+#[tokio::test]
+async fn x22_supersede_load_harvest_calibrates_before_refusal() {
+    let temp = tempfile::tempdir().unwrap();
+    let tape_uuid = [0x79; 16];
+    let (_, store, drive_tx, serial, voltag, _world) =
+        read_harvest_world(&temp, tape_uuid, "RDH001L9");
+    assert_eq!(store.row(tape_uuid).calibration_generation, 0);
+    let (reply, response) = oneshot::channel();
+    drive_tx
+        .send(DriveCommand::SupersedeTail {
+            request: pb::SupersedeTailRequest {
+                tape_uuid: tape_uuid.to_vec(),
+                ack_tape_uuid: tape_uuid.to_vec(),
+                confirm_supersede: None,
+                observed_tape_log_sequence: None,
+                expected_found: vec![],
+            },
+            actor: AuditActor::System,
+            needs_drive_load: true,
+            library_serial: serial,
+            barcode: Some(voltag),
+            source_slot: None,
+            drive_serial: Some("DRV-READ-HARVEST".into()),
+            reply,
+        })
+        .await
+        .unwrap();
+    let error = response.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "shared library authority is required for tail recovery"
+    );
+    let row = store.row(tape_uuid);
+    assert_eq!(
+        row.state,
+        remanence_state::VolumeCalibrationState::Calibrated
+    );
+    assert!(row.calibration_generation > 0);
 }
 
 /// The failure half of the same placement rule: when the harvest cannot
@@ -16298,6 +16377,46 @@ fn robotics_fence_admission_reads_current_catalog() {
         )
         .unwrap();
         super::robotics::admit_fenced_elements(&index, &library, &[bay]).unwrap();
+    }
+    use remanence_state::library_log as lib;
+    for (cause, allowed) in [
+        (lib::FenceCause::AppendAdmissionRefused, true),
+        (lib::FenceCause::SessionSuffixContradiction, true),
+        (lib::FenceCause::TransferError, false),
+    ] {
+        let tape = [0x72; 16];
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(tape, "FENCEDL9")]);
+        let index = root.catalog().write_handle();
+        let runtime = index.library_runtime().unwrap();
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(runtime.tape_state(tape).unwrap().tape),
+                        cause,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+        library.drive_bays[0].loaded_tape = Some("FENCEDL9".into());
+        let result = super::robotics::admit_fenced_elements(&index, &library, &[bay]);
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "typed motion {cause:?}: {result:?}"
+        );
+        if let Err(error) = result {
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(error.message(), "robotics blocked by active tape-I/O fence");
+        }
     }
 }
 

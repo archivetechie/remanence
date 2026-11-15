@@ -302,7 +302,7 @@ pub(crate) fn ensure_media_readiness_admitted(
     )
 }
 
-/// Only explicit tail recovery may admit its own typed recoverable write fences at G1.
+/// Motion admits recoverable write fences; explicit recovery also pins their tape.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_media_readiness_admitted_inner(
     index: &CatalogIndex,
@@ -318,22 +318,15 @@ pub(crate) fn ensure_media_readiness_admitted_inner(
     let fences = index
         .tape_io_matching_fences(None, barcode, endpoint.as_ref())
         .map_err(status_from_state_error)?;
-    if !fences.is_empty() {
-        // Only the supersede supplies its resolved tape UUID; every row must name that tape.
-        let allowed = recovering_tape.is_some_and(|tape| {
-            motion.is_some_and(|runtime| {
-                runtime.tape_io_fences_pass(
-                    &fences,
-                    Some(&tape),
-                    remanence_state::library_runtime::TapeIoPass::Motion,
-                )
-            })
-        });
-        if !allowed {
-            return Err(Status::failed_precondition(format!(
-                "{action} blocked by active tape-I/O fence; inspect rem tape quarantine list"
-            )));
-        }
+    if crate::tape_admission::tape_io_rows_block(
+        &fences,
+        motion,
+        recovering_tape.as_ref(),
+        remanence_state::library_runtime::TapeIoPass::Motion,
+    ) {
+        return Err(Status::failed_precondition(format!(
+            "{action} blocked by active tape-I/O fence; inspect rem tape quarantine list"
+        )));
     }
     ensure_media_readiness_unconflicted(
         index,
@@ -518,10 +511,15 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
 ) -> Result<usize, Status> {
     let mut found = 0usize;
     for record in records {
-        if index
-            .tape_io_is_fenced(None, record.barcode.as_deref(), Some(&record.endpoint))
-            .map_err(status_from_state_error)?
-        {
+        let rows = index
+            .tape_io_matching_fences(None, record.barcode.as_deref(), Some(&record.endpoint))
+            .map_err(status_from_state_error)?;
+        if crate::tape_admission::tape_io_rows_block(
+            &rows,
+            index.library_runtime().as_ref(),
+            None,
+            remanence_state::library_runtime::TapeIoPass::Read,
+        ) {
             continue;
         }
         let operation_id = parse_media_readiness_operation_id(&record)?;

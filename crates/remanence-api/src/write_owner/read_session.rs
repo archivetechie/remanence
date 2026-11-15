@@ -12,7 +12,7 @@ use super::actor_runtime::{
     record_read_session, record_session_close_snapshot, record_session_snapshot,
     OpenReadActorRequest, ReadSessionInput, WriteOwnerConfig,
 };
-use super::readiness::session_open_short_probe_or_load;
+use super::readiness::{session_open_short_probe_or_load_inner, FenceAdmission};
 use super::restore::{
     now_rfc3339, position_read_resume, read_session_proto, stream_one_file_range,
     stream_one_object, verify_loaded_tape_identity,
@@ -57,8 +57,14 @@ pub(super) fn handle_drive_open_read(
     }
 
     let endpoint = remanence_state::DriveKey::new(&library_serial, bay);
-    match index.tape_io_is_fenced(Some(&tape_uuid), barcode.as_deref(), Some(&endpoint)) {
-        Ok(false) => {}
+    match index.tape_io_matching_fences(Some(&tape_uuid), barcode.as_deref(), Some(&endpoint)) {
+        Ok(rows)
+            if !crate::tape_admission::tape_io_rows_block(
+                &rows,
+                index.library_runtime().as_ref(),
+                Some(&tape_uuid),
+                remanence_state::library_runtime::TapeIoPass::Read,
+            ) => {}
         result => {
             let status = match result {
                 Err(error) => status_from_state_error(error),
@@ -87,7 +93,7 @@ pub(super) fn handle_drive_open_read(
             return;
         }
     }
-    if let Err(status) = session_open_short_probe_or_load(
+    if let Err(status) = session_open_short_probe_or_load_inner(
         index,
         drive,
         SessionOpenReadinessContext {
@@ -101,6 +107,7 @@ pub(super) fn handle_drive_open_read(
             load_continues_move: needs_drive_load,
             lifecycle: cfg.lifecycle.as_ref(),
         },
+        FenceAdmission::Read,
     ) {
         let _ = reply.send(Err(status));
         return;
@@ -110,6 +117,7 @@ pub(super) fn handle_drive_open_read(
         &tape_uuid,
         barcode.as_deref(),
         "open read session",
+        true,
     ) {
         let _ = reply.send(Err(status));
         return;
@@ -536,10 +544,22 @@ pub(super) fn session_open_reject_tape_io_fences(
     tape_uuid: &TapeUuid,
     barcode: Option<&str>,
     action: &str,
+    reading: bool,
 ) -> Result<(), Status> {
     let mut conflicts = index
         .tape_io_admission_conflicts(tape_uuid, barcode)
         .map_err(status_from_state_error)?;
+    if reading {
+        if let Some(runtime) = index.library_runtime() {
+            conflicts.retain(|row| {
+                !runtime.tape_io_fences_pass(
+                    std::slice::from_ref(row),
+                    Some(tape_uuid),
+                    remanence_state::library_runtime::TapeIoPass::Read,
+                )
+            });
+        }
+    }
     crate::tape_admission::order_conflicts(index, &mut conflicts);
     let Some(first) = conflicts.first() else {
         if let Some(message) = crate::tape_admission::contradicted_payload(
@@ -582,9 +602,32 @@ mod admission_tests {
     /// other payloads, and counts native-loss or operator-retry D3 once.
     #[test]
     fn l1b_session_admission_payload_precedence_and_count() {
-        for case in ["native", "ordinary", "suffix", "contradicted"] {
+        for case in [
+            "append_read",
+            "append_write",
+            "append_transfer",
+            "append_contradicted",
+            "native",
+            "ordinary",
+            "suffix",
+            "contradicted",
+        ] {
             let mut f = Fixture::new();
             let expected = match case {
+                "append_read" | "append_write" => {
+                    f.raise(T, lib::FenceCause::AppendAdmissionRefused);
+                    None
+                }
+                "append_transfer" => {
+                    f.raise(T, lib::FenceCause::AppendAdmissionRefused);
+                    f.raise(T, lib::FenceCause::TransferError);
+                    None
+                }
+                "append_contradicted" => {
+                    f.contradict(T);
+                    f.raise(T, lib::FenceCause::AppendAdmissionRefused);
+                    Some(2)
+                }
                 "native" => {
                     f.raise(T, lib::FenceCause::NativeLogBehindProjection);
                     f.raise(T, lib::FenceCause::TransferError);
@@ -605,9 +648,21 @@ mod admission_tests {
                 }
             };
             let index = f.index();
-            let error = session_open_reject_tape_io_fences(&index, &T, None, "open read session")
-                .unwrap_err();
-            if case == "contradicted" {
+            let result = session_open_reject_tape_io_fences(
+                &index,
+                &T,
+                None,
+                "open read session",
+                case != "append_write",
+            );
+            if case == "append_read" {
+                assert!(result.is_ok(), "cause-5 reads pass: {result:?}");
+                drop(index);
+                assert!(f.refusals().is_empty());
+                continue;
+            }
+            let error = result.unwrap_err();
+            if case == "contradicted" || case == "append_contradicted" {
                 assert_eq!(error.metadata().get("remanence-retry").unwrap(), "operator");
             }
             if let Some(code) = expected {
@@ -622,6 +677,8 @@ mod admission_tests {
             } else {
                 let cause = if case == "suffix" {
                     "session_suffix_contradiction"
+                } else if case == "append_write" {
+                    "append_admission_refused"
                 } else {
                     "transfer_error"
                 };
@@ -645,15 +702,23 @@ mod admission_tests {
     /// The read actor's first fence refusal is coded before its readiness probe.
     #[test]
     fn l1b_read_first_fence_payload_precedence_and_count() {
-        for case in ["native", "ordinary", "suffix"] {
+        for case in ["append", "native", "ordinary", "suffix"] {
             let mut f = Fixture::new();
+            if case == "append" {
+                f.raise(T, lib::FenceCause::AppendAdmissionRefused);
+                let conn = rusqlite::Connection::open(&f.root.paths().sqlite_path).unwrap();
+                assert_eq!(conn.execute(
+                    "UPDATE tapes SET voltag = 'READ001L9', voltag_source = 'operator' WHERE tape_uuid = ?1",
+                    [T.as_slice()],
+                ).unwrap(), 1);
+            }
             if case == "suffix" {
                 f.raise(T, lib::FenceCause::SessionSuffixContradiction);
             }
-            if case != "ordinary" {
+            if case == "native" || case == "suffix" {
                 f.raise(T, lib::FenceCause::NativeLogBehindProjection);
             }
-            if case != "suffix" {
+            if case == "native" || case == "ordinary" {
                 f.raise(T, lib::FenceCause::TransferError);
             }
             let mut drive = drive();
@@ -673,7 +738,7 @@ mod admission_tests {
                     tape_uuid: T,
                     needs_drive_load: false,
                     library_serial: "ADMISSION".into(),
-                    barcode: None,
+                    barcode: (case == "append").then(|| "READ001L9".into()),
                     source_slot: None,
                     drive_uuid: None,
                     drive_serial: None,
@@ -683,14 +748,21 @@ mod admission_tests {
                 },
             );
             let error = answer.try_recv().unwrap().unwrap_err();
-            assert_eq!(
-                error.message(),
-                if case == "native" {
-                    "TapeLogBehindProjection: session blocked by active tape-I/O fence"
-                } else {
-                    "session blocked by active tape-I/O fence"
-                }
-            );
+            if case == "append" {
+                assert!(
+                    error.message().starts_with("tape identity: "),
+                    "read must reach identity after admission: {error}"
+                );
+            } else {
+                assert_eq!(
+                    error.message(),
+                    if case == "native" {
+                        "TapeLogBehindProjection: session blocked by active tape-I/O fence"
+                    } else {
+                        "session blocked by active tape-I/O fence"
+                    }
+                );
+            }
             drop(index);
             drop(cfg);
             drop(drive);

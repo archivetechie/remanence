@@ -954,7 +954,7 @@ pub(super) fn drive_loop(
                             load_continues_move: needs_drive_load,
                             lifecycle: cfg.lifecycle.as_ref(),
                         },
-                        Some(tape_uuid),
+                        super::readiness::FenceAdmission::Recover(tape_uuid),
                     )?;
                     let tape = index
                         .get_tape(&tape_uuid)
@@ -973,6 +973,15 @@ pub(super) fn drive_loop(
                         super::write_session::WriteMediaPolicy::RewritableObject,
                     )?;
                     let generation = drive.identity_generation();
+                    if needs_drive_load {
+                        super::write_session::run_load_calibration_harvest(
+                            &mut index,
+                            drive,
+                            &cfg,
+                            &tape_uuid,
+                            barcode.as_deref(),
+                        );
+                    }
                     let mut preview = None;
                     let result = crate::write_owner::supersede_mounted_tail(
                         &mut index,

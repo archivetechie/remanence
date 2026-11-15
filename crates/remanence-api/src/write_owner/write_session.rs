@@ -2007,6 +2007,7 @@ pub(super) fn handle_drive_open_write(
         &tape_uuid,
         barcode.as_deref(),
         "open write session",
+        false,
     ) {
         let _ = reply.send(Err(status));
         return None;

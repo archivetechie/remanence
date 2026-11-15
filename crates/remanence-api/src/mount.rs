@@ -830,6 +830,20 @@ async fn tape_inventory_critical(
     let result = response
         .await
         .map_err(|_| Status::unavailable("drive actor stopped during tape inventory"))?;
+    // An error after a slot move can park a load that never harvested.
+    if result.is_err() && mount.source_slot.is_some() {
+        if let Err(err) = state
+            .calibration_store()
+            .record_possible_write_recovery(tape_uuid)
+        {
+            tracing::warn!(
+                target: "remanence_calibration",
+                tape_uuid = %Uuid::from_bytes(tape_uuid),
+                error = %err,
+                "tape_inventory_critical parked-cartridge calibration invalidation failed"
+            );
+        }
+    }
     if let Some(home_slot) = mount.home_slot {
         let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
             bay: mount.bay,
@@ -940,6 +954,20 @@ async fn verify_tape_index_critical(
         }
         Ok((report, evidence))
     });
+    // An error after a slot move can park a load that never harvested.
+    if result.is_err() && mount.source_slot.is_some() {
+        if let Err(err) = state
+            .calibration_store()
+            .record_possible_write_recovery(tape_uuid)
+        {
+            tracing::warn!(
+                target: "remanence_calibration",
+                tape_uuid = %Uuid::from_bytes(tape_uuid),
+                error = %err,
+                "verify_tape_index_critical parked-cartridge calibration invalidation failed"
+            );
+        }
+    }
     if let Some(home_slot) = mount.home_slot {
         let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
             bay: mount.bay,
@@ -3097,11 +3125,19 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
                 .index()
                 .and_then(|index| {
                     index
-                        .tape_io_is_fenced(
+                        .tape_io_matching_fences(
                             parked.seated.tape_uuid.as_ref(),
                             parked.seated.barcode.as_deref(),
                             Some(&parked.seated.drive_key()),
                         )
+                        .map(|rows| {
+                            crate::tape_admission::tape_io_rows_block(
+                                &rows,
+                                state.catalog.library_runtime().as_ref(),
+                                parked.seated.tape_uuid.as_ref(),
+                                remanence_state::library_runtime::TapeIoPass::Motion,
+                            )
+                        })
                         .map_err(status_from_state_error)
                 })
                 .unwrap_or(true)
@@ -3252,11 +3288,19 @@ pub(crate) fn register_startup_seated_cartridges(
                 .index()
                 .and_then(|index| {
                     index
-                        .tape_io_is_fenced(
+                        .tape_io_matching_fences(
                             tape_uuid.as_ref(),
                             bay.loaded_tape.as_deref(),
                             Some(&drive_key),
                         )
+                        .map(|rows| {
+                            crate::tape_admission::tape_io_rows_block(
+                                &rows,
+                                state.catalog.library_runtime().as_ref(),
+                                tape_uuid.as_ref(),
+                                remanence_state::library_runtime::TapeIoPass::Read,
+                            )
+                        })
                         .map_err(status_from_state_error)
                 })
                 .unwrap_or(true)
@@ -4382,6 +4426,20 @@ pub(crate) async fn supersede_tail(
         let result = response
             .await
             .map_err(|_| Status::unavailable("drive actor stopped during tail recovery"))?;
+        // An error after a slot move can park a load that never harvested.
+        if result.is_err() && mount.source_slot.is_some() {
+            if let Err(err) = state
+                .calibration_store()
+                .record_possible_write_recovery(tape_uuid)
+            {
+                tracing::warn!(
+                    target: "remanence_calibration",
+                    tape_uuid = %Uuid::from_bytes(tape_uuid),
+                    error = %err,
+                    "supersede_tail parked-cartridge calibration invalidation failed"
+                );
+            }
+        }
         if let Some(home_slot) = mount.home_slot {
             let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
                 bay: mount.bay,
@@ -4544,6 +4602,20 @@ async fn closeout_tape_reserved(
             .map_err(|_| Status::unavailable("drive actor stopped during closeout"))?
     }
     .await;
+    // An error after a slot move can park a load that never harvested.
+    if result.is_err() && mount.source_slot.is_some() {
+        if let Err(err) = state
+            .calibration_store()
+            .record_possible_write_recovery(tape_uuid)
+        {
+            tracing::warn!(
+                target: "remanence_calibration",
+                tape_uuid = %Uuid::from_bytes(tape_uuid),
+                error = %err,
+                "closeout_tape_reserved parked-cartridge calibration invalidation failed"
+            );
+        }
+    }
     if let Some(home_slot) = mount.home_slot {
         let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
             bay: mount.bay,

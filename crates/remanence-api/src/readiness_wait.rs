@@ -124,10 +124,15 @@ impl ApiState {
             .media_readiness_operation(operation_id)
             .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("media-readiness operation not found"))?;
-        if index
-            .tape_io_is_fenced(None, record.barcode.as_deref(), Some(&record.endpoint))
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-        {
+        let rows = index
+            .tape_io_matching_fences(None, record.barcode.as_deref(), Some(&record.endpoint))
+            .map_err(crate::startup_media_readiness::status_from_state_error)?;
+        if crate::tape_admission::tape_io_rows_block(
+            &rows,
+            self.catalog.library_runtime().as_ref(),
+            None,
+            remanence_state::library_runtime::TapeIoPass::Motion,
+        ) {
             return Err(Status::failed_precondition(
                 "readiness blocked by active tape-I/O fence",
             ));
@@ -329,11 +334,19 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
                         let mut eligible = std::collections::HashSet::new();
                         for record in records {
                             if index
-                                .tape_io_is_fenced(
+                                .tape_io_matching_fences(
                                     None,
                                     record.barcode.as_deref(),
                                     Some(&record.endpoint),
                                 )
+                                .map(|rows| {
+                                    crate::tape_admission::tape_io_rows_block(
+                                        &rows,
+                                        state.catalog.library_runtime().as_ref(),
+                                        None,
+                                        remanence_state::library_runtime::TapeIoPass::Motion,
+                                    )
+                                })
                                 .unwrap_or(true)
                             {
                                 continue;

@@ -53,6 +53,7 @@ pub(super) fn handle(
         &tape_uuid,
         tape.voltag.as_deref(),
         "closeout tape",
+        false,
     )?;
     let (block_size, parity_config) = crate::pool_write::selected_tape_geometry(
         &tape,

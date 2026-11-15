@@ -473,14 +473,13 @@ async fn c0b3c_supersede_mount_admits_only_own_suffix_fences() {
     assert_eq!(mount.bay, BAY);
     assert_eq!(mount.source_slot, None, "seated recovery does not reach G2");
     drop(reservation);
-    let error = resolve_and_reserve_actor_mount(&state, state.drive_pool().unwrap(), SERIAL, &TAPE)
-        .await
-        .expect_err("ordinary mount must refuse the suffix fence");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        error.message(),
-        "open session blocked by active tape-I/O fence; inspect rem tape quarantine list"
-    );
+    let (mount, reservation) =
+        resolve_and_reserve_actor_mount(&state, state.drive_pool().unwrap(), SERIAL, &TAPE)
+            .await
+            .expect("ordinary motion admits the suffix fence");
+    assert_eq!(mount.bay, BAY);
+    assert_eq!(mount.source_slot, None);
+    drop(reservation);
     raise(lib::FenceCause::TransferError);
     let error = resolve_and_reserve_actor_mount_inner(
         &state,
@@ -504,10 +503,9 @@ async fn c0b3c_supersede_mount_admits_only_own_suffix_fences() {
     assert!(drives.iter_mut().all(|rx| rx.try_recv().is_err()));
 }
 
-/// A suffix-fenced slot cartridge refuses before loading or evicting a healthy tape.
+/// A suffix-fenced slot cartridge admits mounting, including eviction of a healthy tape.
 #[tokio::test]
-async fn c0b3c_fr1_supersede_slot_refuses_without_motion() {
-    // Exercise eviction first so the red proof exposes its command before admission.
+async fn c0b3c_fr1_supersede_slot_admits_motion() {
     for occupied in [true, false] {
         let root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
         let mut inventory = VirtualWorld::single_drive(SERIAL, BAY, "G4-DRIVE", SLOT, 2);
@@ -548,47 +546,197 @@ async fn c0b3c_fr1_supersede_slot_refuses_without_motion() {
                 )
             })
             .unwrap();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            resolve_and_reserve_actor_mount_inner(
-                &state,
-                state.drive_pool().unwrap(),
-                SERIAL,
-                &TAPE,
-                Some(TAPE),
-            ),
-        )
-        .await;
-        assert!(
-            changer.try_recv().is_err(),
-            "slot recovery dispatched a changer command: occupied={occupied}"
+        let mount = resolve_and_reserve_actor_mount_inner(
+            &state,
+            state.drive_pool().unwrap(),
+            SERIAL,
+            &TAPE,
+            Some(TAPE),
         );
-        assert!(
-            drives.iter_mut().all(|rx| rx.try_recv().is_err()),
-            "slot recovery dispatched a drive command: occupied={occupied}"
+        let answer = async {
+            if occupied {
+                let crate::write_owner::DriveCommand::Unload { reply, .. } =
+                    drives[0].recv().await.unwrap()
+                else {
+                    panic!("eviction must unload first");
+                };
+                reply.send(Ok(Duration::from_millis(7).into())).unwrap();
+                let crate::write_owner::ChangerCommand::Move {
+                    src, dst, reply, ..
+                } = changer.recv().await.unwrap()
+                else {
+                    panic!("eviction must move home");
+                };
+                assert_eq!((src, dst), (BAY, SLOT + 1));
+                reply.send(Ok(())).unwrap();
+            }
+        };
+        let ((mount, reservation), ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            let (result, ()) = tokio::join!(mount, answer);
+            (result.expect("slot recovery admits its suffix fence"), ())
+        })
+        .await
+        .expect("slot recovery completes motion");
+        assert_eq!(mount.source_slot, Some(SLOT));
+        assert_eq!(mount.bay, BAY);
+        assert!(changer.try_recv().is_err());
+        assert!(drives.iter_mut().all(|rx| rx.try_recv().is_err()));
+        drop(reservation);
+        state.begin_shutdown();
+    }
+}
+
+/// Raise a typed tape fence so mount and startup gates use the live authority.
+fn raise_tape(runtime: &remanence_state::library_runtime::LibraryRuntime, cause: lib::FenceCause) {
+    runtime
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::Write,
+                    scope: lib::FenceScope::Tape(runtime.tape_state(TAPE).unwrap().tape),
+                    cause,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+}
+
+/// Startup registers a cause-5 cartridge and its idle timer unloads and moves it home.
+#[tokio::test]
+async fn x22_startup_read_pass_parks_and_idle_unloads() {
+    for (cause, parks) in [
+        (lib::FenceCause::AppendAdmissionRefused, true),
+        (lib::FenceCause::SessionSuffixContradiction, false),
+    ] {
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+        let world = world(true, false);
+        let (mut state, mut changer, mut drives) = actor_state(&root, &world);
+        state.drive_idle_unload_seconds = 1;
+        raise_tape(&state.catalog.library_runtime().unwrap(), cause);
+        let snapshot = state.current_library_snapshot().unwrap();
+        register_startup_seated_cartridges(&state, &snapshot.report);
+        let pool = state.drive_pool().unwrap();
+        let key = crate::drive_pool::DriveKey::new(SERIAL, BAY);
+        assert_eq!(pool.parked_at(&key).is_some(), parks, "startup {cause:?}");
+        if parks {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let crate::write_owner::DriveCommand::Unload { reply, .. } =
+                    drives[0].recv().await.unwrap()
+                else {
+                    panic!("idle dismount must unload first");
+                };
+                reply.send(Ok(Duration::from_millis(7).into())).unwrap();
+                let crate::write_owner::ChangerCommand::Move {
+                    src, dst, reply, ..
+                } = changer.recv().await.unwrap()
+                else {
+                    panic!("idle dismount must move home");
+                };
+                assert_eq!((src, dst), (BAY, SLOT));
+                reply.send(Ok(())).unwrap();
+                while pool.parked_at(&key).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cause-5 idle unload and move");
+        } else {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        assert!(drives.iter_mut().all(|rx| rx.try_recv().is_err()));
+        assert!(changer.try_recv().is_err());
+        state.begin_shutdown();
+    }
+}
+
+/// A failed inventory after a slot move advances the epoch before parking; success does not.
+#[tokio::test]
+async fn x22_inventory_slot_error_invalidates_calibration() {
+    for fails in [true, false] {
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+        let world = world(false, false);
+        let (mut state, mut changer, mut drives) = actor_state(&root, &world);
+        state.drive_idle_unload_seconds = 0;
+        raise_tape(
+            &state.catalog.library_runtime().unwrap(),
+            lib::FenceCause::AppendAdmissionRefused,
         );
-        if occupied {
-            let snapshot = state.current_library_snapshot().unwrap();
+        let before = state.calibration_store().row(TAPE);
+        let (stream, _stream_rx) = mpsc::channel(4);
+        let inventory = tape_inventory_critical(state.clone(), TAPE, stream);
+        let answer = async {
+            let crate::write_owner::ChangerCommand::Move {
+                src, dst, reply, ..
+            } = tokio::time::timeout(Duration::from_secs(5), changer.recv())
+                .await
+                .expect("inventory moves the cause-5 tape")
+                .unwrap()
+            else {
+                panic!("inventory must move from slot");
+            };
+            assert_eq!((src, dst), (SLOT, BAY));
+            reply.send(Ok(())).unwrap();
+            let crate::write_owner::DriveCommand::TapeInventory {
+                tape_uuid,
+                needs_drive_load,
+                reply,
+                ..
+            } = drives[0].recv().await.unwrap()
+            else {
+                panic!("inventory actor command");
+            };
+            assert_eq!(tape_uuid, TAPE);
+            assert!(needs_drive_load);
+            reply
+                .send(if fails {
+                    Err(Status::failed_precondition("fixture inventory refusal"))
+                } else {
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(inventory, answer)
+        })
+        .await
+        .expect("inventory completes after replies");
+        if fails {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(error.message(), "fixture inventory refusal");
+        } else {
+            result.unwrap();
+        }
+        let row = state.calibration_store().row(TAPE);
+        assert_eq!(
+            row.state,
+            remanence_state::VolumeCalibrationState::Uncalibrated
+        );
+        assert_eq!(
+            row.write_epoch,
+            before.write_epoch + u64::from(fails),
+            "slot inventory error invalidates calibration"
+        );
+        if !fails {
             assert_eq!(
-                snapshot.report.libraries[0].drive_bays[0]
-                    .loaded_tape
-                    .as_deref(),
-                Some("HEALTHYL9")
-            );
-            assert_eq!(
-                world.lock().unwrap().library_snapshot().drive_bays[0]
-                    .loaded_tape
-                    .as_deref(),
-                Some("HEALTHYL9")
+                row, before,
+                "successful inventory does not invalidate calibration"
             );
         }
-        let error = result
-            .expect("slot recovery refuses without waiting for motion")
-            .expect_err("slot recovery must refuse its suffix fence");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            error.message(),
-            "open session blocked by active tape-I/O fence; inspect rem tape quarantine list"
-        );
+        assert!(state
+            .drive_pool()
+            .unwrap()
+            .parked_at(&crate::drive_pool::DriveKey::new(SERIAL, BAY))
+            .is_some());
+        assert!(changer.try_recv().is_err());
+        assert!(drives.iter_mut().all(|rx| rx.try_recv().is_err()));
+        state.begin_shutdown();
     }
 }

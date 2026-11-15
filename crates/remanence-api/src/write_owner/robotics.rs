@@ -926,10 +926,15 @@ pub(super) fn admit_fenced_elements(
                     .and_then(|slot| slot.cartridge.as_deref())
             });
         let endpoint = bay.map(|_| remanence_state::DriveKey::new(&library.serial, *element));
-        if index
-            .tape_io_is_fenced(None, barcode, endpoint.as_ref())
-            .map_err(crate::status_from_state_error)?
-        {
+        let rows = index
+            .tape_io_matching_fences(None, barcode, endpoint.as_ref())
+            .map_err(crate::status_from_state_error)?;
+        if crate::tape_admission::tape_io_rows_block(
+            &rows,
+            index.library_runtime().as_ref(),
+            None,
+            remanence_state::library_runtime::TapeIoPass::Motion,
+        ) {
             return Err(Status::failed_precondition(
                 "robotics blocked by active tape-I/O fence",
             ));

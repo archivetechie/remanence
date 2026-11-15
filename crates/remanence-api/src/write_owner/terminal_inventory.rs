@@ -215,7 +215,13 @@ pub(crate) fn handle_drive_tape_inventory(
             lifecycle: cfg.lifecycle.as_ref(),
         },
     )?;
-    session_open_reject_tape_io_fences(index, &tape_uuid, barcode, "read terminal tape inventory")?;
+    session_open_reject_tape_io_fences(
+        index,
+        &tape_uuid,
+        barcode,
+        "read terminal tape inventory",
+        false,
+    )?;
     let prepared = prepare_catalog_recovery_read(index, drive, &tape_uuid)?;
     let hints = &prepared.hints;
     let block_size = hints.block_size;
@@ -687,6 +693,7 @@ pub(crate) fn handle_drive_verify_tape_index(
             &tape_uuid,
             barcode,
             "fully verify terminal tape index",
+            false,
         )?;
         let context = drive.verification_context();
         let _control = operation.as_ref().map(|(handle, progress)| {

@@ -1112,9 +1112,14 @@ async fn check_crash(
     for fence in index.list_active_tape_io_fences().unwrap() {
         assert_eq!(fence.tape_uuid, TAPE);
         assert_eq!(fence.reason, "supersede_tail_failed");
-        let status =
-            session_open_reject_tape_io_fences(&index, &TAPE, Some(BARCODE), "open read session")
-                .unwrap_err();
+        let status = session_open_reject_tape_io_fences(
+            &index,
+            &TAPE,
+            Some(BARCODE),
+            "open read session",
+            true,
+        )
+        .unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(status
             .message()
@@ -1834,10 +1839,18 @@ fn check_typed_fence_before_lift(
             ),
         ));
     }
-    let read = session_open_reject_tape_io_fences(index, &TAPE, Some(BARCODE), "open read session");
+    let read =
+        session_open_reject_tape_io_fences(index, &TAPE, Some(BARCODE), "open read session", true);
+    let append_refused = crate::tape_admission::typed_cause(index, fence)
+        == Some(remanence_state::library_log::FenceCause::AppendAdmissionRefused);
     match read {
+        Ok(()) if append_refused => Ok(serde_json::json!({
+            "quarantine_id": fence.quarantine_id, "tape_uuid": fence.tape_uuid,
+            "barcode": fence.barcode, "read_refused": false, "read_refusal": null,
+        })),
         Err(status)
-            if status.code() == tonic::Code::FailedPrecondition
+            if !append_refused
+                && status.code() == tonic::Code::FailedPrecondition
                 && status
                     .message()
                     .contains(&Uuid::from_bytes(TAPE).to_string()) =>
