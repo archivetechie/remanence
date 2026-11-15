@@ -294,7 +294,11 @@ impl LibraryRuntime {
         self.motion_scope_owned_locked(&lib::fold::Scope::Endpoint(endpoint(key)))
     }
 
-    /// Install the library reconciliation request callback, invoked outside dispatch.
+    /// Install the library reconciliation request callback, invoked outside dispatch
+    /// and the owned-motion set's lock. It may run on actor or admission threads
+    /// while the caller holds a changer or drive transport. The callback must not
+    /// block, acquire a transport or runtime lock, or open a handle.
+    /// A later call replaces the previously installed callback.
     pub fn set_motion_reconcile_notifier(&self, notifier: impl Fn(&str) + Send + Sync + 'static) {
         *self
             .0

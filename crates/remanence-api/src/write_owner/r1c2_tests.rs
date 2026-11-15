@@ -297,10 +297,17 @@ fn mounted_admission_refuses_the_endpoints_own_unresolved_motion() {
         "{refused}"
     );
     t.runtime.reconcile_inventory(&library_state).unwrap();
+    let refused = cfg.mounted_admission(&index, &drive).unwrap_err();
     assert_eq!(
-        cfg.mounted_admission(&index, &drive).unwrap_err().code(),
+        refused.code(),
         tonic::Code::FailedPrecondition,
         "inventory reconciliation leaves an owned LOAD unresolved"
+    );
+    assert!(
+        refused.message().contains("mounted write blocked")
+            && refused.message().contains("unresolved")
+            && refused.message().contains("restart the daemon"),
+        "{refused}"
     );
     t.runtime.unconfirmed(&pending(&load, ticket)).unwrap();
     t.runtime.reconcile_inventory(&library_state).unwrap();

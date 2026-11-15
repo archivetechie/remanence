@@ -69,6 +69,23 @@ impl Fixture {
             .reconcile_motion_observation(lib::InventorySubject::Library("L".into()), vec![])
             .unwrap();
     }
+    /// Query MOVE ownership under the same dispatch lock as the runtime's callers.
+    fn library_motion_owned(&self) -> bool {
+        let _dispatch = self.runtime.0.dispatch.lock().unwrap();
+        self.runtime
+            .motion_scope_owned_locked(&lib::fold::Scope::Library("L".into()))
+    }
+    /// A completed closer stays quiet and cannot mask a later unowned motion on L.
+    fn assert_later_unowned_motion_visible(&self, calls: &Mutex<Vec<String>>) {
+        assert!(calls.lock().unwrap().is_empty(), "closer must not notify");
+        let later = self.pending(move_command());
+        self.runtime.unconfirmed(&later).unwrap();
+        assert!(
+            self.runtime.unowned_motion_unresolved("L"),
+            "a stale owner must not mask the later unconfirmed motion"
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["L"]);
+    }
 }
 fn move_command() -> MotionCommand {
     MotionCommand::Move {
@@ -90,6 +107,161 @@ fn unknown() -> outcome::CompletionEvidence {
         failed: true,
         ..outcome::CompletionEvidence::success()
     }
+}
+
+/// Fresh inventory after the fixture's MOVE: the source is empty and the bay is full.
+fn moved_inventory() -> remanence_library::Library {
+    use remanence_library::{DriveBay, ElementLayout, Library, Slot};
+    let mut inquiry = [0; 36];
+    inquiry[0] = 0x08; // Medium changer.
+    inquiry[2] = 0x06; // SPC-4.
+    inquiry[3] = 2; // SPC-3+ response data format.
+    inquiry[4] = 31; // Remaining bytes of the standard INQUIRY response.
+    Library {
+        serial: "L".into(),
+        changer_sg: "fixture-changer".into(),
+        changer_sysfs: "fixture-sysfs".into(),
+        changer_inquiry: remanence_library::scsi::Inquiry::parse(&inquiry).unwrap(),
+        chassis_designator: None,
+        layout: ElementLayout {
+            robot_address: 0,
+            drive_start: 0x100,
+            drive_count: 1,
+            slot_start: 0x400,
+            slot_count: 1,
+            ie_start: 0,
+            ie_count: 0,
+        },
+        drive_bays: vec![DriveBay {
+            element_address: 0x100,
+            accessible: true,
+            exception: None,
+            installed: None,
+            loaded: true,
+            loaded_tape: Some("MOVED1L9".into()),
+            source_slot: Some(0x400),
+        }],
+        slots: vec![Slot {
+            element_address: 0x400,
+            accessible: true,
+            exception: None,
+            full: false,
+            cartridge: None,
+        }],
+        ie_ports: vec![],
+    }
+}
+
+/// A successful MOVE releases its library owner without requesting reconciliation.
+#[test]
+fn confirm_inventory_releases_move_ownership_without_notifying() {
+    let f = Fixture::new();
+    let calls = f.notifications();
+    let pending = f.pending(move_command());
+    assert!(f.library_motion_owned());
+    f.runtime
+        .confirm_inventory(&pending, &moved_inventory())
+        .unwrap();
+    assert!(
+        !f.library_motion_owned(),
+        "confirmed MOVE releases ownership"
+    );
+    assert!(!f.runtime.requires_reconciliation(&pending.command));
+    f.assert_later_unowned_motion_visible(&calls);
+}
+
+/// Standalone LOAD confirmation releases its endpoint owner without notifying a library.
+#[test]
+fn confirm_standalone_releases_load_ownership_without_notifying() {
+    let f = Fixture::new();
+    let calls = f.notifications();
+    let key = DriveKey::Standalone {
+        drive_serial: "D".into(),
+    };
+    let pending = f.pending(MotionCommand::Load(key.clone()));
+    assert!(f.runtime.endpoint_motion_owned(&key));
+    f.runtime.confirm_standalone(&pending).unwrap();
+    assert!(!f.runtime.endpoint_motion_owned(&key));
+    assert!(!f.runtime.requires_reconciliation(&pending.command));
+    f.assert_later_unowned_motion_visible(&calls);
+}
+
+/// A bay LOAD with a real readiness owner releases ownership when its ready probe closes it.
+#[test]
+fn confirm_readiness_releases_bay_load_ownership_without_notifying() {
+    let f = Fixture::new();
+    let calls = f.notifications();
+    let key = bay(0x100);
+    let operation = f
+        .runtime
+        .start_owned_operation(
+            lib::OperationKind::MediaReadinessWait,
+            lib::AuditActor::System,
+        )
+        .unwrap();
+    f.runtime
+        .begin_owned_readiness(&crate::MediaReadinessOperationInput {
+            operation_id: uuid::Uuid::from_bytes(operation),
+            run_id: None,
+            endpoint: key.clone(),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: None,
+            source_slot: Some(0x400),
+            media_generation: None,
+            media_family: None,
+            phase: "readiness_poll".into(),
+            state: "planned".into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    let command = MotionCommand::Load(key.clone());
+    let context = MotionContext {
+        parent_operation: Some(operation),
+        load_confirmation: LoadConfirmation::Readiness,
+        ..Default::default()
+    };
+    let pending = PendingMotion {
+        ticket: f.runtime.intent(&command, &context).unwrap(),
+        command,
+        context,
+        evidence: outcome::CompletionEvidence::success(),
+    };
+    assert!(f.runtime.endpoint_motion_owned(&key));
+    f.runtime
+        .confirm_readiness(
+            &pending,
+            &remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(!f.runtime.endpoint_motion_owned(&key));
+    assert!(!f.library_motion_owned());
+    assert!(!f.runtime.requires_reconciliation(&pending.command));
+    f.assert_later_unowned_motion_visible(&calls);
+}
+
+/// A known CHECK CONDITION closes a failed MOVE and releases its owner without notifying.
+#[test]
+fn failed_known_check_condition_releases_move_ownership_without_notifying() {
+    let f = Fixture::new();
+    let calls = f.notifications();
+    let pending = f.pending(move_command());
+    assert!(f.library_motion_owned());
+    let completion = outcome::CompletionEvidence {
+        dispatch: outcome::Dispatch::Issued,
+        completion: outcome::Completion::Known,
+        scsi_status: Some(2),
+        failed: true,
+        ..outcome::CompletionEvidence::success()
+    };
+    f.runtime.failed(pending.ticket, &completion).unwrap();
+    assert!(!f.library_motion_owned());
+    assert!(!f.runtime.requires_reconciliation(&pending.command));
+    f.assert_later_unowned_motion_visible(&calls);
 }
 
 #[test]
