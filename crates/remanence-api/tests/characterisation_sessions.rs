@@ -2542,6 +2542,9 @@ async fn session_epochs_end_at_close_and_full_epoch_ignores_checkpoint_boundarie
 #[path = "characterisation/b10_pool.rs"]
 mod b10_pool;
 
+#[path = "characterisation/x22_restore.rs"]
+mod x22_restore;
+
 /// Shutting down the real actor pool releases its runtime and permits a second start.
 #[tokio::test]
 async fn shutdown_releases_actor_state_lock_and_allows_restart() {
