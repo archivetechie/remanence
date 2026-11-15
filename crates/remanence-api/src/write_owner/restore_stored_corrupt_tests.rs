@@ -215,6 +215,7 @@ fn write_owner_config(
         reservations: Arc::new(HashMap::new()),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
+                opener: crate::write_owner::LibraryActorContext::shared_opener(|l, p| l.open(p)),
                 serial: serial.clone(),
                 snapshot: Arc::new(RwLock::new(Arc::new(crate::LibrarySnapshot {
                     report: discovery_report(library),

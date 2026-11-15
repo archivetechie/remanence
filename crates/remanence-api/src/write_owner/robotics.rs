@@ -86,9 +86,21 @@ pub(crate) fn handle_robotics(
     action: RoboticsAction,
     handle: &crate::operations::OperationHandle,
 ) -> RoboticsOutcome {
-    handle_robotics_with_opener(index, cfg, library_serial, action, handle, |lib, policy| {
-        lib.open(policy)
-    })
+    handle_robotics_with_opener(
+        index,
+        cfg,
+        library_serial,
+        action,
+        handle,
+        |lib, _policy| {
+            let mut open = cfg
+                .library()
+                .opener
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            open(lib, &cfg.policy)
+        },
+    )
 }
 
 /// Execute the same robotics route with a caller-supplied library opener for model tests.
@@ -358,7 +370,7 @@ pub(crate) fn run_load_sequence(
     bay: u16,
     wait_ready: bool,
 ) -> Result<(), String> {
-    library.with_motion_context(
+    let result = library.with_motion_context(
         remanence_library::motion::MotionContext {
             parent_operation: Some(*handle.op_id_uuid().as_bytes()),
             load_confirmation: if wait_ready {
@@ -369,7 +381,14 @@ pub(crate) fn run_load_sequence(
             ..Default::default()
         },
         |library| run_load_sequence_owned(index, cfg, handle, library, slot, bay, wait_ready),
-    )
+    );
+    // A failed second drive open leaves its readiness LOAD on this library handle.
+    if wait_ready && !handle.is_shutting_down() {
+        if let Err(error) = library.abandon_handed_off_loads(bay) {
+            tracing::warn!(operation_id = %handle.op_id_uuid(), bay, %error, "abandon handed-off LOADs failed");
+        }
+    }
+    result
 }
 
 fn run_load_sequence_owned(

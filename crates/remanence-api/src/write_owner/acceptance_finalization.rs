@@ -301,6 +301,10 @@ fn start(
         incomplete_evidence: vec![],
         warnings: vec![],
     };
+    let opener_root = root.to_owned();
+    let opener_world = world.clone();
+    let opener_trace = trace.clone();
+    let opener_files = files.clone();
     let api = ApiState::with_drive_pool_opener(
         catalog.clone(),
         &cfg,
@@ -308,12 +312,12 @@ fn start(
         remanence_library::StaticAllowlist::new([LIBRARY]),
         root.join("spool"),
         64 * 1024 * 1024,
-        |library, policy| {
+        move |library, policy| {
             library.open_with(policy, {
-                let world = world.clone();
-                let trace = trace.clone();
-                let files = files.clone();
-                let root = root.to_owned();
+                let world = opener_world.clone();
+                let trace = opener_trace.clone();
+                let files = opener_files.clone();
+                let root = opener_root.clone();
                 move |path| {
                     let role = world.lock().unwrap().role_for_path(path).unwrap();
                     Ok(Box::new(FinalTransport {

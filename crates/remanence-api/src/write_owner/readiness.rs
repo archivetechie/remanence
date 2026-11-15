@@ -241,40 +241,42 @@ pub(crate) struct DriveReadinessPoll<'a> {
 /// a second resume) does not repeat a LOAD the operation already sent; a
 /// `ready` observation re-arms it. Only the dispatch gate's durable MotionIntent
 /// consumes the attempt; a pre-intent refusal consumes no budget.
+/// Every non-shutdown exit attempts to record any still-parked LOAD Unknown; the result is unchanged.
 pub(crate) fn poll_drive_media_readiness(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     request: DriveReadinessPoll<'_>,
     handle: &crate::operations::OperationHandle,
 ) -> Result<MediaReadinessPoll, DriveReadinessError> {
-    let DriveReadinessPoll {
-        bay,
-        operation_id,
-        family,
-        options,
-        cartridge_in_drive,
-        phase,
-    } = request;
-    let load_budget = if cartridge_in_drive {
-        crate::startup_media_readiness::media_readiness_initializing_load_budget(
-            index,
+    let result = (|| {
+        let DriveReadinessPoll {
+            bay,
             operation_id,
-        )
-        .map_err(|error| format!("count media readiness LOAD attempts: {error}"))?
-    } else {
-        0
-    };
-    let endpoint = drive
-        .library_serial()
-        .map(|serial| format!("library={serial} drive=0x{bay:04x}"))
-        .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
-    let mut last_logged: Option<LoggedReadiness> = None;
-    let mut interruption = None;
-    let mut load_admission = None;
-    let refused = std::cell::Cell::new(false);
-    #[cfg(test)]
-    let mut attempted_readiness = None;
-    let result = drive.with_readiness_operation(*operation_id.as_bytes(), |drive| drive.wait_for_media_readiness_with_load_admission(
+            family,
+            options,
+            cartridge_in_drive,
+            phase,
+        } = request;
+        let load_budget = if cartridge_in_drive {
+            crate::startup_media_readiness::media_readiness_initializing_load_budget(
+                index,
+                operation_id,
+            )
+            .map_err(|error| format!("count media readiness LOAD attempts: {error}"))?
+        } else {
+            0
+        };
+        let endpoint = drive
+            .library_serial()
+            .map(|serial| format!("library={serial} drive=0x{bay:04x}"))
+            .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
+        let mut last_logged: Option<LoggedReadiness> = None;
+        let mut interruption = None;
+        let mut load_admission = None;
+        let refused = std::cell::Cell::new(false);
+        #[cfg(test)]
+        let mut attempted_readiness = None;
+        let result = drive.with_readiness_operation(*operation_id.as_bytes(), |drive| drive.wait_for_media_readiness_with_load_admission(
         family,
         None,
         options,
@@ -406,20 +408,27 @@ pub(crate) fn poll_drive_media_readiness(
             Ok(())
         },
     ));
-    if refused.get() {
-        #[cfg(test)]
-        if index.library_runtime().is_none() {
-            record_refused_load(
-                index,
-                operation_id,
-                attempted_readiness
-                    .as_ref()
-                    .expect("LOAD write-ahead precedes admission"),
-            )?;
+        if refused.get() {
+            #[cfg(test)]
+            if index.library_runtime().is_none() {
+                record_refused_load(
+                    index,
+                    operation_id,
+                    attempted_readiness
+                        .as_ref()
+                        .expect("LOAD write-ahead precedes admission"),
+                )?;
+            }
+            return Err(DriveReadinessError::Shutdown);
         }
-        return Err(DriveReadinessError::Shutdown);
+        result.map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
+    })();
+    if !matches!(result, Err(DriveReadinessError::Shutdown)) {
+        if let Err(error) = drive.abandon_readiness_loads() {
+            tracing::warn!(operation_id = %handle.op_id_uuid(), %error, "abandon readiness LOADs failed");
+        }
     }
-    result.map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
+    result
 }
 
 /// Append proof that the immediately preceding LOAD write-ahead sent no command.

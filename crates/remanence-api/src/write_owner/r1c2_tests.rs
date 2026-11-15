@@ -777,6 +777,192 @@ fn waited_world() -> Arc<Mutex<VirtualWorld>> {
     Arc::new(Mutex::new(model))
 }
 
+/// A cancelled service LOAD is reconciled before terminal publication, then resume frees MOVE.
+#[test]
+fn mr_b_service_cancel_resume_and_move_reconciles_load() {
+    use crate::pb::daemon_server::Daemon;
+    use crate::pb::library_service_server::LibraryService;
+    use remanence_state::library_log as lib;
+
+    /// Watch the real registry until the service publishes a terminal state.
+    async fn terminal(api: &crate::ApiState, operation: Uuid) -> pb::OperationStatus {
+        let mut watch = api.operations.watch(&operation).unwrap();
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while let Some(status) = watch.next().await {
+                let status = status.unwrap();
+                if crate::operations::is_terminal(&status) {
+                    return status;
+                }
+            }
+            panic!("operation stream ended before terminal publication");
+        })
+        .await
+        .expect("service operation became terminal")
+    }
+
+    let root = root();
+    let mut model = VirtualWorld::single_drive(SERIAL, BAY_A, "DRV-R1C2", 0x400, 3);
+    model.put_tape_in_slot(0x400, "R1C2L01L8", VirtualTape::default());
+    model.put_tape_in_slot(0x401, "MRBMOVE1L8", VirtualTape::default());
+    let world = Arc::new(Mutex::new(model));
+    let snapshot = world.lock().unwrap().library_snapshot();
+    let sense = Arc::new(Mutex::new(Some((2, 4, 1))));
+    let (state, api, runtime) = start_daemon_with_snapshot(&root, &world, snapshot, {
+        let sense = sense.clone();
+        move |inner| {
+            Box::new(LifecycleDrive {
+                inner,
+                sense: sense.clone(),
+                fail_load: false,
+            })
+        }
+    })
+    .unwrap();
+    let chain_uuid = state.library_runtime().manifest().library_uuid();
+    let operation = runtime.block_on(async {
+        let library = api.library_service();
+        let response = library
+            .load_drive(tonic::Request::new(pb::LoadDriveRequest {
+                library_uuid: crate::library::library_uuid(SERIAL).to_vec(),
+                slot_element_address: 0x400,
+                drive_element_address: u32::from(BAY_A),
+                no_wait: false,
+                idempotency_key: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = Uuid::from_slice(&response.operation_id).unwrap();
+        let mut watch = api.operations.watch(&operation).unwrap();
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while let Some(status) = watch.next().await {
+                let status = status.unwrap();
+                assert!(
+                    !crate::operations::is_terminal(&status),
+                    "LOAD ended before readiness_poll: {status:?}"
+                );
+                if status.progress.get("phase").map(String::as_str) == Some("readiness_poll")
+                    && status.progress.get("sense").map(String::as_str) == Some("02/04/01")
+                {
+                    return;
+                }
+            }
+            panic!("LOAD never published readiness_poll");
+        })
+        .await
+        .expect("waited LOAD reached its held not-ready poll");
+        api.daemon_service()
+            .cancel_operation(tonic::Request::new(pb::CancelOperationRequest {
+                operation_id: operation.as_bytes().to_vec(),
+                idempotency_key: None,
+                force: false,
+            }))
+            .await
+            .unwrap();
+        terminal(&api, operation).await;
+        assert!(
+            !state
+                .library_runtime()
+                .endpoint_motion_unresolved(&key(BAY_A)),
+            "terminal waited LOAD has no unresolved motion on its bay"
+        );
+
+        *sense.lock().unwrap() = None;
+        library
+            .resume_media_readiness(tonic::Request::new(pb::ResumeMediaReadinessRequest {
+                operation_id: operation.as_bytes().to_vec(),
+                timeout_seconds: 5,
+                poll_interval_seconds: 1,
+            }))
+            .await
+            .unwrap();
+        let ready = terminal(&api, operation).await;
+        assert_eq!(
+            ready.state,
+            pb::OperationState::Succeeded as i32,
+            "{ready:?}"
+        );
+        assert_eq!(
+            ready.progress.get("state").map(String::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            state
+                .catalog()
+                .media_readiness_operation(operation)
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready"
+        );
+        let moved = library
+            .move_medium(tonic::Request::new(pb::MoveMediumRequest {
+                library_uuid: crate::library::library_uuid(SERIAL).to_vec(),
+                source_element_address: 0x401,
+                destination_element_address: 0x402,
+                idempotency_key: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let moved = terminal(&api, Uuid::from_slice(&moved.operation_id).unwrap()).await;
+        assert_eq!(
+            moved.state,
+            pb::OperationState::Succeeded as i32,
+            "{moved:?}"
+        );
+        operation
+    });
+    assert_eq!(drive_load_commands_on(&world, BAY_A), 1);
+    runtime.block_on(api.shutdown_drive_pool()).unwrap();
+    drop(api);
+    drop(runtime);
+    drop(state);
+    wait_for_lifecycle_close(&root);
+    let records =
+        crate::tests::read_library_records(&root.paths, chain_uuid, &mut |r| Some(r.clone()))
+            .unwrap_or_else(|_| panic!("library log must be readable after daemon shutdown"));
+    let loads: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.motion_intent().is_some_and(|intent| {
+                intent.parent_operation == Some(*operation.as_bytes())
+                    && matches!(intent.motion, lib::Motion::Load(_))
+            })
+        })
+        .collect();
+    assert_eq!(loads.len(), 1);
+    let load = loads[0].envelope.record_uuid;
+    let outcomes: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            record
+                .motion_outcome()
+                .filter(|outcome| outcome.intent.record_uuid == load)
+                .map(|outcome| (position, outcome))
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].1.result, lib::MotionResult::Unknown);
+    let reconciled = records
+        .iter()
+        .position(|record| {
+            record.inventory_observation().is_some_and(|observation| {
+                observation
+                    .resolves
+                    .0
+                    .iter()
+                    .any(|reference| reference.record_uuid == load)
+            })
+        })
+        .expect("InventoryReconciled resolves the service LOAD");
+    assert!(
+        outcomes[0].0 < reconciled,
+        "Unknown precedes InventoryReconciled"
+    );
+}
+
 /// A waited `LoadDrive` that reaches Ready closes its readiness-owned LOAD: the endpoint has
 /// nothing unresolved, every MotionIntent in the library log has a MotionOutcome, and the UNLOAD
 /// the robotics executor runs next (the same call and context as its Unload arm) is admitted

@@ -68,6 +68,8 @@ impl From<StdDuration> for DriveUnloadOutcome {
 }
 
 pub(crate) enum ChangerCommand {
+    /// Re-read inventory for unresolved library motion that has no live owner.
+    ReconcileMotion,
     Move {
         src: u16,
         dst: u16,

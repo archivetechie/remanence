@@ -214,6 +214,8 @@ fn start(
         warnings: vec![],
     };
     let policy = StaticAllowlist::new((0..worlds.len()).map(serial));
+    let worlds = worlds.to_vec();
+    let controls = controls.to_vec();
     ApiState::with_drive_pool_opener(
         state.projection_client(),
         config,
@@ -221,7 +223,7 @@ fn start(
         policy,
         config.daemon.state_dir.join("spool"),
         64 * 1024 * 1024,
-        |library, policy| {
+        move |library, policy| {
             let n = (0..worlds.len())
                 .find(|n| library.serial == serial(*n))
                 .unwrap();

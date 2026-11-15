@@ -74,6 +74,149 @@ impl SgTransport for GatedTransport {
     }
 }
 
+/// Changer requests must leave a drive actor's in-flight UNLOAD for that actor to close.
+#[tokio::test]
+async fn mr_b_running_unload_is_not_reconciled() {
+    use remanence_state::library_log as lib;
+    const BAY_B: u16 = 0x101;
+    let (mut typed, _root) = typed_root();
+    let runtime = typed.catalog().library_runtime().unwrap();
+    let mut model = VirtualWorld::single_drive(LIBRARY, BAY_B, DRIVE, 0x400, 2);
+    model.put_tape_in_drive(BAY_B, BARCODE, Some(0x401), VirtualTape::default());
+    model.put_tape_in_slot(0x400, "MRBMOVE1L9", VirtualTape::default());
+    let world = Arc::new(Mutex::new(model));
+    let (entered, reached) = oneshot::channel();
+    let gate = Arc::new(CommandGate {
+        armed: AtomicBool::new(false),
+        entered: Mutex::new(Some(entered)),
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+        sidecar: false,
+        opcode: Some(0x1b),
+        lost: false,
+    });
+    // Release the simulated CDB even if an earlier test assertion fails.
+    struct ReleaseOnDrop(Arc<CommandGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let _release = ReleaseOnDrop(gate.clone());
+    let model = world.lock().unwrap().library_snapshot();
+    let mut library = model
+        .open_with(&remanence_library::StaticAllowlist::new([LIBRARY]), {
+            let gate = gate.clone();
+            move |path| {
+                let role = world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(GatedTransport {
+                    inner: ModelTransport::new(world.clone(), role),
+                    gate: gate.clone(),
+                }))
+            }
+        })
+        .unwrap();
+    library.set_motion_authority(Arc::new(runtime.clone()));
+    let cfg = typed_config(&typed, &library);
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut typed.catalog().write_handle(),
+        [library.library()],
+        &HashSet::from([LIBRARY.to_string()]),
+    )
+    .unwrap();
+    let drive = library.open_drive(BAY_B, &cfg.policy).unwrap();
+    let drive_tx = spawn_drive_actor(BAY_B, drive, cfg.clone());
+    let changer_tx = spawn_changer_actor(library.into_changer(), cfg.clone());
+    // Setup sent no LOAD; arm only for the UNLOAD issued below.
+    gate.armed.store(true, Ordering::SeqCst);
+    let (reply, unloaded) = oneshot::channel();
+    drive_tx
+        .send(DriveCommand::Unload {
+            continuation_return: false,
+            reply,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(StdDuration::from_secs(5), reached)
+        .await
+        .expect("UNLOAD entered its transport")
+        .unwrap();
+    assert!(runtime.endpoint_motion_owned(&DriveKey::new(LIBRARY, BAY_B)));
+    changer_tx
+        .send(ChangerCommand::ReconcileMotion)
+        .await
+        .unwrap();
+    let (reply, moved) = oneshot::channel();
+    changer_tx
+        .send(ChangerCommand::Move {
+            src: 0x400,
+            dst: 0x401,
+            after_unload: false,
+            dismount_guard: None,
+            recovery_guard: None,
+            caller_gone: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    // FIFO plus this reply proves both changer commands completed while UNLOAD was held.
+    let moved = tokio::time::timeout(StdDuration::from_secs(5), moved).await;
+    gate.release();
+    let _move_result = moved
+        .expect("changer completed while UNLOAD was held")
+        .unwrap();
+    let unloaded = tokio::time::timeout(StdDuration::from_secs(5), unloaded)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        unloaded.is_ok(),
+        "B's outcome is Done, not a semantic refusal: {unloaded:?}"
+    );
+    drop(unloaded);
+    assert!(!runtime.motion_fenced());
+    drop(drive_tx);
+    drop(changer_tx);
+    drop(cfg);
+    drop(runtime);
+    let records = typed.records(|record| Some(record.clone())).await;
+    let unloads: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.motion_intent().is_some_and(|intent| {
+                matches!(&intent.motion, lib::Motion::Unload(value)
+                if value.endpoint == lib::DriveKey::Bay(lib::Bay {
+                    library_serial: LIBRARY.into(), bay: BAY_B,
+                }))
+            })
+        })
+        .collect();
+    assert_eq!(unloads.len(), 1);
+    let id = unloads[0].envelope.record_uuid;
+    let outcomes: Vec<_> = records
+        .iter()
+        .filter_map(|record| record.motion_outcome())
+        .filter(|outcome| outcome.intent.record_uuid == id)
+        .collect();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].result,
+        lib::MotionResult::Done,
+        "B's outcome is Done"
+    );
+    let sequence = outcomes[0].intent.sequence;
+    assert!(
+        records
+            .iter()
+            .filter_map(|record| record.inventory_observation())
+            .all(|observation| !observation
+                .resolves
+                .0
+                .iter()
+                .any(|reference| reference.sequence == sequence)),
+        "no InventoryReconciled resolves B's running UNLOAD"
+    );
+}
+
 /// Expire while a command is issued, then settle it without dispatching another.
 async fn interrupted_session(sidecar: bool, lost: bool) {
     let root = tempfile::tempdir().unwrap();

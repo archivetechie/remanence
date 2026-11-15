@@ -6,10 +6,40 @@ use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
 use uuid::Uuid;
 
+/// Share the daemon's mutable opener without requiring its transport factory to be Sync.
+type LibraryOpener = Arc<
+    Mutex<
+        Box<
+            dyn FnMut(
+                    &remanence_library::Library,
+                    &remanence_library::StaticAllowlist,
+                )
+                    -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>
+                + Send,
+        >,
+    >,
+>;
+
 #[derive(Clone)]
 pub(crate) struct LibraryActorContext {
     pub serial: String,
     pub snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
+    pub opener: LibraryOpener,
+}
+
+impl LibraryActorContext {
+    /// Retain the same opener for startup and every robotics operation.
+    pub(crate) fn shared_opener(
+        open: impl FnMut(
+                &remanence_library::Library,
+                &remanence_library::StaticAllowlist,
+            )
+                -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>
+            + Send
+            + 'static,
+    ) -> LibraryOpener {
+        Arc::new(Mutex::new(Box::new(open)))
+    }
 }
 
 #[derive(Clone)]

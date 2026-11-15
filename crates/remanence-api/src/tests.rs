@@ -7421,6 +7421,7 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         reservations: Arc::clone(&reservations),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
+                opener: crate::write_owner::LibraryActorContext::shared_opener(|l, p| l.open(p)),
                 serial: LIBRARY_SERIAL.to_string(),
                 snapshot: Arc::clone(&library_snapshot),
             },

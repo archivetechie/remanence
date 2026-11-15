@@ -2,6 +2,8 @@
 mod b5_fix2_tests;
 #[path = "closeout_tests.rs"]
 mod closeout_tests;
+#[path = "motion_reconcile_tests.rs"]
+mod motion_reconcile_tests;
 #[path = "r1c2_tests.rs"]
 mod r1c2_tests;
 use remanence_parity::authority::StructuralAuthority;
@@ -5577,6 +5579,7 @@ fn test_write_owner_config(
         reservations: Arc::new(HashMap::new()),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
+                opener: crate::write_owner::LibraryActorContext::shared_opener(|l, p| l.open(p)),
                 serial: serial.clone(),
                 snapshot: library_snapshot,
             },
@@ -8014,6 +8017,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         reservations: Arc::new(HashMap::new()),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
+                opener: crate::write_owner::LibraryActorContext::shared_opener(|l, p| l.open(p)),
                 serial: library.serial.clone(),
                 snapshot: Arc::clone(&snapshot_cell),
             },
