@@ -154,12 +154,17 @@ struct ProjectionLag {
     error: String,
     last_closed_sequence: u64,
 }
+type MotionReconcileNotifier = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct Inner {
     authority: LibraryAuthority,
     view: Mutex<NativeTapeView>,
     // This dispatch lock orders append receipts and projection submissions; it
     // is not a tape lock or LibraryAuthority's append lock.
     dispatch: Mutex<()>,
+    // Process-local intent ownership. Lock only under dispatch; transport comes first.
+    owned_motion: Mutex<std::collections::BTreeMap<u64, Vec<lib::fold::Scope>>>,
+    motion_reconcile_notifier: Mutex<Option<MotionReconcileNotifier>>,
     projector: ProjectionClient,
     manifest: AuthorityManifest,
     motion_fenced: AtomicBool,
@@ -354,6 +359,8 @@ impl LibraryRuntime {
                 authority,
                 view: Mutex::new(view),
                 dispatch: Mutex::new(()),
+                owned_motion: Mutex::new(std::collections::BTreeMap::new()),
+                motion_reconcile_notifier: Mutex::new(None),
                 projector,
                 manifest,
                 motion_fenced: AtomicBool::new(false),

@@ -47,6 +47,31 @@ pub(crate) fn evidence(value: &outcome::CompletionEvidence) -> lib::CompletionEv
         residual: value.residual,
     }
 }
+/// Ownership carries the same library and endpoint scopes as motion admission.
+fn owned_scopes(command: &MotionCommand) -> Vec<lib::fold::Scope> {
+    match command {
+        MotionCommand::Move { library_serial, .. } => {
+            vec![lib::fold::Scope::Library(library_serial.as_str().into())]
+        }
+        MotionCommand::Load(key) | MotionCommand::Unload(key) => {
+            let mut scopes = vec![lib::fold::Scope::Endpoint(endpoint(key))];
+            if let remanence_library::DriveKey::Bay { library_serial, .. } = key {
+                scopes.push(lib::fold::Scope::Library(library_serial.as_str().into()));
+            }
+            scopes
+        }
+    }
+}
+fn command_library(command: &MotionCommand) -> Option<&str> {
+    match command {
+        MotionCommand::Move { library_serial, .. }
+        | MotionCommand::Load(remanence_library::DriveKey::Bay { library_serial, .. })
+        | MotionCommand::Unload(remanence_library::DriveKey::Bay { library_serial, .. }) => {
+            Some(library_serial)
+        }
+        _ => None,
+    }
+}
 fn inventory_elements(observed: &remanence_library::Library) -> Vec<lib::Element> {
     let mut elements = Vec::new();
     for slot in &observed.slots {
@@ -130,6 +155,14 @@ impl LibraryRuntime {
             )
             .into());
         }
+        {
+            let owned = self
+                .0
+                .owned_motion
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            open.retain(|sequence, _| !owned.contains_key(sequence));
+        }
         let resolves = open
             .into_values()
             .filter(|(_, motion)| match (&subject, motion) {
@@ -195,6 +228,9 @@ impl LibraryRuntime {
                 lib::AuthorityError::Store(lib::store::StoreError::Fold(
                     lib::FoldError::TapeUnavailable(_),
                 )) => MotionAuthorityFailure::EvidenceFailure,
+                lib::AuthorityError::Store(lib::store::StoreError::Fold(
+                    lib::FoldError::HistoryUnavailable,
+                )) => MotionAuthorityFailure::StoreFailure,
                 lib::AuthorityError::Store(lib::store::StoreError::Fold(_))
                 | lib::AuthorityError::FinalizationInProgress(_)
                 | lib::AuthorityError::TapeHoldsCommittedInstances { .. }
@@ -240,7 +276,99 @@ impl LibraryRuntime {
     /// every further MOVE, LOAD and UNLOAD in that library, so no new cartridge reaches an
     /// endpoint this answers no for.
     pub fn endpoint_motion_unresolved(&self, key: &remanence_library::DriveKey) -> bool {
-        self.0.authority.endpoint_motion_unresolved(&endpoint(key))
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let unresolved = self.0.authority.endpoint_motion_unresolved(&endpoint(key));
+        let owned = self.motion_scope_owned_locked(&lib::fold::Scope::Endpoint(endpoint(key)));
+        drop(_dispatch);
+        if unresolved && !owned {
+            if let remanence_library::DriveKey::Bay { library_serial, .. } = key {
+                self.notify_motion_reconcile(library_serial);
+            }
+        }
+        unresolved
+    }
+
+    /// Whether this process still owns a LOAD or UNLOAD on the endpoint.
+    pub fn endpoint_motion_owned(&self, key: &remanence_library::DriveKey) -> bool {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        self.motion_scope_owned_locked(&lib::fold::Scope::Endpoint(endpoint(key)))
+    }
+
+    /// Install the library reconciliation request callback, invoked outside dispatch.
+    pub fn set_motion_reconcile_notifier(&self, notifier: impl Fn(&str) + Send + Sync + 'static) {
+        *self
+            .0
+            .motion_reconcile_notifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(notifier));
+    }
+
+    fn notify_motion_reconcile(&self, library_serial: &str) {
+        let notifier = self
+            .0
+            .motion_reconcile_notifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(notifier) = notifier {
+            notifier(library_serial);
+        }
+    }
+
+    fn notify_removed_motion(&self, scopes: Option<Vec<lib::fold::Scope>>) {
+        for scope in scopes.into_iter().flatten() {
+            if let lib::fold::Scope::Library(serial) = scope {
+                self.notify_motion_reconcile(serial.as_str());
+            }
+        }
+    }
+
+    // Every caller holds dispatch, including callers inside append's write closure.
+    fn motion_scope_owned_locked(&self, scope: &lib::fold::Scope) -> bool {
+        self.0
+            .owned_motion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|scopes| scopes.contains(scope))
+    }
+
+    fn unowned_motion_unresolved_locked(&self, library_serial: &str) -> bool {
+        self.0
+            .authority
+            .motion_requires_reconciliation(&lib::Motion::Move(lib::Move {
+                library_serial: library_serial.into(),
+                source: 0,
+                destination: 0,
+            }))
+            && !self.motion_scope_owned_locked(&lib::fold::Scope::Library(library_serial.into()))
+    }
+
+    /// A successful outcome or proof that its intent is already closed releases ownership.
+    /// All other failures keep it, even when an applied prefix accompanied the refusal.
+    fn leave_motion_locked(
+        &self,
+        sequence: u64,
+        result: &Result<lib::AuthorityReceipt, lib::AuthorityError>,
+    ) -> Option<Vec<lib::fold::Scope>> {
+        fn already_closed(error: &lib::AuthorityError) -> bool {
+            match error {
+                lib::AuthorityError::AppliedBeforeRefusal { error, .. } => already_closed(error),
+                lib::AuthorityError::Store(lib::store::StoreError::Fold(
+                    lib::FoldError::OutcomeWithoutOpenIntent,
+                )) => true,
+                _ => false,
+            }
+        }
+        if result.as_ref().map_or_else(already_closed, |_| true) {
+            self.0
+                .owned_motion
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sequence)
+        } else {
+            None
+        }
     }
 }
 impl MotionAuthority for LibraryRuntime {
@@ -271,6 +399,10 @@ impl MotionAuthority for LibraryRuntime {
             }),
         };
         self.0.authority.motion_requires_reconciliation(&motion)
+    }
+    fn unowned_motion_unresolved(&self, library_serial: &str) -> bool {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        self.unowned_motion_unresolved_locked(library_serial)
     }
     fn reconcile_inventory(
         &self,
@@ -427,15 +559,35 @@ impl MotionAuthority for LibraryRuntime {
                     view,
                 )
             })
-            .map_err(|error| self.motion_error(error))?;
+            .map_err(|error| self.motion_error(error));
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let notify = command_library(command).filter(|serial| {
+                    error.kind == MotionAuthorityFailure::UnresolvedMotion
+                        && self.unowned_motion_unresolved_locked(serial)
+                });
+                drop(_dispatch);
+                if let Some(serial) = notify {
+                    self.notify_motion_reconcile(serial);
+                }
+                return Err(error);
+            }
+        };
+        self.0
+            .owned_motion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(receipt.sequence, owned_scopes(command));
         Ok(MotionTicket {
             sequence: receipt.sequence,
             record_uuid: receipt.record_uuid,
         })
     }
     fn unconfirmed(&self, pending: &PendingMotion) -> Result<(), MotionAuthorityError> {
+        let mut removed_scopes = None;
         self.append(|authority, view| {
-            authority.motion_outcome(
+            let outcome = authority.motion_outcome(
                 lib::MotionOutcome {
                     intent: lib::DecisionRef {
                         sequence: pending.ticket.sequence,
@@ -448,10 +600,15 @@ impl MotionAuthority for LibraryRuntime {
                 lib::AuditActor::System,
                 lib::SourceLayer::Layer2,
                 view,
-            )
+            );
+            let removed = self.leave_motion_locked(pending.ticket.sequence, &outcome);
+            removed_scopes = removed;
+            outcome
         })
         .map(|_| ())
-        .map_err(|error| self.motion_error(error))
+        .map_err(|error| self.motion_error(error))?;
+        self.notify_removed_motion(removed_scopes);
+        Ok(())
     }
     fn confirm_inventory(
         &self,
@@ -491,7 +648,7 @@ impl MotionAuthority for LibraryRuntime {
             })
             .map_err(|error| self.motion_error(error))?;
         self.append(|authority, view| {
-            authority.motion_outcome(
+            let outcome = authority.motion_outcome(
                 lib::MotionOutcome {
                     intent: lib::DecisionRef {
                         sequence: pending.ticket.sequence,
@@ -504,7 +661,9 @@ impl MotionAuthority for LibraryRuntime {
                 lib::AuditActor::System,
                 lib::SourceLayer::Layer2,
                 view,
-            )
+            );
+            let _ = self.leave_motion_locked(pending.ticket.sequence, &outcome);
+            outcome
         })
         .map(|_| ())
         .map_err(|error| self.motion_error(error))
@@ -542,7 +701,7 @@ impl MotionAuthority for LibraryRuntime {
             })
             .map_err(|error| self.motion_error(error))?;
         self.append(|authority, view| {
-            authority.motion_outcome(
+            let outcome = authority.motion_outcome(
                 lib::MotionOutcome {
                     intent: lib::DecisionRef {
                         sequence: pending.ticket.sequence,
@@ -555,7 +714,9 @@ impl MotionAuthority for LibraryRuntime {
                 lib::AuditActor::System,
                 lib::SourceLayer::Layer2,
                 view,
-            )
+            );
+            let _ = self.leave_motion_locked(pending.ticket.sequence, &outcome);
+            outcome
         })
         .map(|_| ())
         .map_err(|error| self.motion_error(error))
@@ -671,7 +832,7 @@ impl MotionAuthority for LibraryRuntime {
             .sequence
         };
         self.append_locked(|authority, view| {
-            authority.motion_outcome(
+            let outcome = authority.motion_outcome(
                 lib::MotionOutcome {
                     intent,
                     result: lib::MotionResult::Done,
@@ -681,7 +842,9 @@ impl MotionAuthority for LibraryRuntime {
                 lib::AuditActor::System,
                 lib::SourceLayer::Layer2,
                 view,
-            )
+            );
+            let _ = self.leave_motion_locked(pending.ticket.sequence, &outcome);
+            outcome
         })
         .map(|_| ())
         .map_err(|error| self.motion_error(error))
@@ -701,8 +864,9 @@ impl MotionAuthority for LibraryRuntime {
         } else {
             lib::MotionResult::Unknown
         };
+        let mut removed_scopes = None;
         self.append(|authority, view| {
-            authority.motion_outcome(
+            let outcome = authority.motion_outcome(
                 lib::MotionOutcome {
                     intent: lib::DecisionRef {
                         sequence: ticket.sequence,
@@ -715,13 +879,24 @@ impl MotionAuthority for LibraryRuntime {
                 lib::AuditActor::System,
                 lib::SourceLayer::Layer2,
                 view,
-            )
+            );
+            let removed = self.leave_motion_locked(ticket.sequence, &outcome);
+            removed_scopes = removed;
+            outcome
         })
         .map(|_| ())
-        .map_err(|error| self.motion_error(error))
+        .map_err(|error| self.motion_error(error))?;
+        if result == lib::MotionResult::Unknown {
+            self.notify_removed_motion(removed_scopes);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 #[path = "drive_fence_motion_tests.rs"]
 mod drive_fence_tests;
+
+#[cfg(test)]
+#[path = "owned_motion_tests.rs"]
+mod owned_motion_tests;

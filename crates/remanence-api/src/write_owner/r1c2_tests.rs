@@ -287,7 +287,7 @@ fn mounted_admission_refuses_the_endpoints_own_unresolved_motion() {
         });
     cfg.mounted_admission(&index, &drive).unwrap();
     let load = MotionCommand::Load(key(BAY_A));
-    intent(&t.runtime, &load);
+    let ticket = intent(&t.runtime, &load);
     let refused = cfg.mounted_admission(&index, &drive).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(
@@ -296,6 +296,13 @@ fn mounted_admission_refuses_the_endpoints_own_unresolved_motion() {
             && refused.message().contains("restart the daemon"),
         "{refused}"
     );
+    t.runtime.reconcile_inventory(&library_state).unwrap();
+    assert_eq!(
+        cfg.mounted_admission(&index, &drive).unwrap_err().code(),
+        tonic::Code::FailedPrecondition,
+        "inventory reconciliation leaves an owned LOAD unresolved"
+    );
+    t.runtime.unconfirmed(&pending(&load, ticket)).unwrap();
     t.runtime.reconcile_inventory(&library_state).unwrap();
     cfg.mounted_admission(&index, &drive).unwrap();
 }

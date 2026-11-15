@@ -253,6 +253,8 @@ pub struct ChangerHandle {
     /// How MOVE MEDIUM waits out a transient not-ready changer. Disabled
     /// unless the owner enables it.
     ready_wait: changer_ready::ChangerReadyWait,
+    /// Fullness of any medium transport element in the last successful RES read.
+    refresh_transport_full: bool,
 }
 
 /// A policy-gated, identity-revalidated facade for one library.
@@ -517,6 +519,9 @@ impl ChangerHandle {
             /* dvcid */ true,
             /* curdata */ true,
         )?;
+        self.refresh_transport_full = new_es
+            .by_type(remanence_scsi::ElementType::MediumTransport)
+            .any(|element| element.full);
         match ops::reconcile(&self.library, new_es) {
             Ok((new_lib, warnings)) => {
                 self.library = new_lib;
@@ -556,6 +561,29 @@ impl ChangerHandle {
                 Ok(())
             }
         }
+    }
+
+    /// Re-read and resolve this library's unowned motion, refusing stale or moving inventory.
+    /// Returns whether a changer read was performed; failed reads record no reconciliation.
+    pub fn reconcile_unowned_motion(&mut self) -> Result<bool, String> {
+        let authority = lock_drive_shared(&self.shared).motion_authority.clone();
+        let Some(authority) = authority else {
+            return Ok(false);
+        };
+        if !authority.unowned_motion_unresolved(&self.library.serial) {
+            return Ok(false);
+        }
+        self.refresh().map_err(|error| error.to_string())?;
+        if self.is_dirty() {
+            return Err("motion reconciliation requires a fresh matching inventory".into());
+        }
+        if self.refresh_transport_full {
+            return Err("motion reconciliation requires an empty robot hand".into());
+        }
+        authority
+            .reconcile_inventory(&self.library)
+            .map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     /// Issue INITIALIZE ELEMENT STATUS, then re-read the element
@@ -1208,28 +1236,56 @@ impl std::fmt::Debug for LibraryHandle {
     }
 }
 
+/// Abandon only readiness LOADs, preserving parked work when its outcome cannot be recorded.
+fn abandon_readiness_motion(
+    parked: &mut Vec<crate::motion::PendingMotion>,
+    authority: &dyn crate::motion::MotionAuthority,
+) -> Result<(), crate::motion::MotionAuthorityError> {
+    let pending: Vec<_> = parked
+        .iter()
+        .filter(|pending| {
+            pending.context.load_confirmation == crate::motion::LoadConfirmation::Readiness
+                && matches!(pending.command, crate::motion::MotionCommand::Load(_))
+        })
+        .cloned()
+        .collect();
+    for pending in pending {
+        match authority.unconfirmed(&pending) {
+            Ok(()) => (),
+            Err(error) if error.kind == crate::motion::MotionAuthorityFailure::SemanticRefusal => {}
+            Err(error) => return Err(error),
+        }
+        parked.retain(|candidate| candidate.ticket != pending.ticket);
+    }
+    Ok(())
+}
+
 impl LibraryHandle {
     /// Observe the complete changer after restart before permitting new motion.
     /// Resolving this scope never dispatches MOVE/LOAD/UNLOAD or an old outcome.
     pub fn reconcile_startup_motion(&mut self) -> Result<(), String> {
-        let authority = lock_drive_shared(&self.changer.shared)
+        self.changer.reconcile_unowned_motion().map(|_| ())
+    }
+
+    /// Record Unknown for readiness LOADs handed off by a dropped drive handle in this bay.
+    /// A storage or evidence failure retains that LOAD and every remaining parked LOAD.
+    pub fn abandon_handed_off_loads(
+        &mut self,
+        bay: u16,
+    ) -> Result<(), crate::motion::MotionAuthorityError> {
+        let Some(authority) = lock_drive_shared(&self.changer.shared)
             .motion_authority
-            .clone();
-        let Some(authority) = authority else {
+            .clone()
+        else {
             return Ok(());
         };
-        let command = crate::motion::MotionCommand::Move {
-            library_serial: self.library().serial.clone(),
-            source: 0,
-            destination: 0,
-        };
-        if !authority.requires_reconciliation(&command) {
-            return Ok(());
+        if let Some(pending) = self.handed_off_motion.get_mut(&bay) {
+            abandon_readiness_motion(pending, authority.as_ref())?;
+            if pending.is_empty() {
+                self.handed_off_motion.remove(&bay);
+            }
         }
-        self.refresh().map_err(|e| e.to_string())?;
-        authority
-            .reconcile_inventory(self.library())
-            .map_err(|e| e.to_string())
+        Ok(())
     }
     /// Install shared typed authority on the changer and all opened drive peers.
     pub fn set_motion_authority(&mut self, authority: Arc<dyn crate::motion::MotionAuthority>) {
@@ -2828,6 +2884,15 @@ impl DriveHandle {
         Ok(())
     }
 
+    /// Record Unknown for this handle's parked readiness LOADs before abandoning their wait.
+    /// A storage or evidence failure retains that LOAD and every remaining parked LOAD.
+    pub fn abandon_readiness_loads(&mut self) -> Result<(), crate::motion::MotionAuthorityError> {
+        let Some(authority) = lock_drive_shared(&self.shared).motion_authority.clone() else {
+            return Ok(());
+        };
+        abandon_readiness_motion(&mut self.pending_motion, authority.as_ref())
+    }
+
     /// Read the actual endpoint after a successful LOAD/UNLOAD. Bay observations
     /// use the shared changer transport; standalone observations require both
     /// TUR and READ POSITION, including matching no-medium responses.
@@ -3287,6 +3352,7 @@ impl Library {
             transport,
             shared,
             ready_wait: changer_ready::ChangerReadyWait::default(),
+            refresh_transport_full: false,
         };
 
         Ok(LibraryHandle {
