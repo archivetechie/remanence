@@ -424,6 +424,142 @@ fn streaming_report_preserves_original_write_check() {
     assert_eq!(observed, 1);
 }
 
+/// Commit streamed members through the production writer, measure the committed
+/// catalog frames, and decode the Object again after releasing the writer lease.
+fn committed_catalog_chunks(member_count: usize, tail: usize) -> Vec<(usize, bool)> {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0x79; 16];
+    let (seed, _, _) = crate::authority::contract_tests::structural_fixture(id);
+    let mut report: AuthorityCommit = (&seed).into();
+    report.object_files[0].files.truncate(1);
+    report.barrier = None;
+    report.object_files[0].protected = 0;
+    report.payloads[0]
+        .projection
+        .instance
+        .protected_until_ordinal = Some(0);
+    report.payloads[0].files.clear();
+    report.protected = 0;
+    report.next_file = 2;
+    report.cursor.lba = 6;
+    report.check = Some((CheckValue(7), CheckProvenance::OriginalWrite));
+    assert_eq!(report.payloads.len(), 1);
+    let object_id = report.payloads[0].projection.object.object_id.clone();
+    let file = report.payloads[0].projection.instance.tape_file_number;
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    writer
+        .publish_report_streaming(&report, &mut |index, emit| {
+            assert_eq!(index, 0);
+            for i in 0..member_count {
+                emit(&crate::NativeObjectFileProjectionInput {
+                    object_id: object_id.clone(),
+                    file_id: format!("f{i:07}"),
+                    path: "x".repeat(if i + 1 == member_count { tail } else { 100 }),
+                    size_bytes: 1,
+                    file_sha256: vec![0x77; 32],
+                    first_chunk_lba: Some(0),
+                    chunk_count: 1,
+                    mtime: None,
+                    executable: None,
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    drop(writer);
+    let mut chunks = Vec::new();
+    authority
+        .freeze()
+        .unwrap()
+        .raw
+        .visit_frames(|frame| {
+            if let Record::PayloadContinuation(Continuation {
+                chunk:
+                    Chunk::Catalog {
+                        tape_file_number,
+                        last,
+                        ..
+                    },
+                ..
+            }) = &frame.record
+            {
+                assert_eq!(*tape_file_number, file);
+                chunks.push((frame.payload.len(), *last));
+            }
+            Ok(())
+        })
+        .unwrap();
+    drop(authority);
+    let reopened = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let decoded = reopened.replay().unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].objects.len(), 1);
+    assert_eq!(decoded[0].objects[0].object.object_id, object_id);
+    assert_eq!(decoded[0].objects[0].files.len(), member_count);
+    println!(
+        "catalog members={member_count} tail={tail} bytes={} chunks={chunks:?}",
+        chunks.iter().map(|(len, _)| len).sum::<usize>()
+    );
+    chunks
+}
+
+/// Infer the header and fixed member sizes from two small committed catalogs.
+fn catalog_size_calibration() -> (usize, usize) {
+    let measure = |count| {
+        committed_catalog_chunks(count, 100)
+            .iter()
+            .map(|(len, _)| len)
+            .sum::<usize>()
+    };
+    let one = measure(1);
+    let two = measure(2);
+    let per_member = two - one;
+    let base = one - per_member;
+    println!("catalog calibration one={one} two={two} base={base} per_member={per_member}");
+    (base, per_member)
+}
+
+/// Keep the tail path in the same two-byte CBOR length class as the other paths.
+fn catalog_members_for_size(target: usize, base: usize, per_member: usize) -> (usize, usize) {
+    (1..=target / per_member + 1)
+        .find_map(|count| {
+            let tail = (target + 100).checked_sub(base + count * per_member)?;
+            (24..=255).contains(&tail).then_some((count, tail))
+        })
+        .expect("target must be reachable with an ASCII tail path of 24..=255 bytes")
+}
+
+/// Exact 64 KiB multiples must commit and replay through the streaming API.
+#[test]
+fn streaming_report_commits_exact_catalog_multiples() {
+    let (base, per_member) = catalog_size_calibration();
+    for target in [131072, 65536] {
+        let (count, tail) = catalog_members_for_size(target, base, per_member);
+        let chunks = committed_catalog_chunks(count, tail);
+        assert_eq!(chunks.iter().map(|(len, _)| len).sum::<usize>(), target);
+    }
+}
+
+/// Pin the last flags and payload sizes at and around both frame boundaries.
+#[test]
+fn streaming_report_catalog_chunk_form_at_boundaries() {
+    let (base, per_member) = catalog_size_calibration();
+    for (target, expected) in [
+        (65535, vec![(65535, true)]),
+        (65536, vec![(65536, true)]),
+        (65537, vec![(65536, false), (1, true)]),
+        (131071, vec![(65536, false), (65535, true)]),
+        (131072, vec![(65536, false), (65536, true)]),
+        (131073, vec![(65536, false), (65536, false), (1, true)]),
+    ] {
+        let (count, tail) = catalog_members_for_size(target, base, per_member);
+        let chunks = committed_catalog_chunks(count, tail);
+        assert_eq!(chunks.iter().map(|(len, _)| len).sum::<usize>(), target);
+        assert_eq!(chunks, expected, "catalog length {target}");
+    }
+}
+
 /// The writer holds the core across a slow media call; readers use its frozen
 /// pre-barrier snapshot and must finish before the media callback can return.
 #[test]

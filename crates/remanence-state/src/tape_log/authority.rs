@@ -1627,12 +1627,13 @@ impl Write for CatalogWriter<'_> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let len = bytes.len();
         while !bytes.is_empty() {
-            let n = bytes.len().min(65536 - self.bytes.len());
-            self.bytes.extend_from_slice(&bytes[..n]);
-            bytes = &bytes[n..];
+            // Keep a full final frame until another byte requires a successor.
             if self.bytes.len() == 65536 {
                 self.flush_frame(false)?;
             }
+            let n = bytes.len().min(65536 - self.bytes.len());
+            self.bytes.extend_from_slice(&bytes[..n]);
+            bytes = &bytes[n..];
         }
         Ok(len)
     }
