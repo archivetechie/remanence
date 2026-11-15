@@ -17914,6 +17914,18 @@ fn k67_fast_eject_case(expired: bool, before_move: bool) {
             library.set_motion_authority(Arc::new(RejectMoveEvidence));
         }
         let result = run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive, "now");
+        if expired && !before_move {
+            assert_eq!(
+                index
+                    .get_alarm("cln-cart-expired:CLNU01L9")
+                    .unwrap()
+                    .unwrap()
+                    .detail
+                    .as_deref(),
+                Some("{\"reason\":\"fast-eject\"}"),
+                "a successful re-read keeps the exact fast-eject reason"
+            );
+        }
         let event = if expired {
             let error = result.unwrap_err();
             assert!(
@@ -19655,13 +19667,24 @@ fn wbr_session_initializing_budget_survives_restart_without_second_load() {
     );
 }
 
-/// Model-only transport for T5's known UNLOAD failure and T6's shutdown cutoff.
+/// Read fault after the LOAD confirmation and the separate empty-bay observation.
+/// Count full RES responses, since each inventory read first probes its header.
+struct K67RereadFault {
+    after_load: bool,
+    full_reads: usize,
+    failures_left: usize,
+}
+
+const MR_C_REREAD_ERROR: &str = "MR-C inventory \"reread\" failed\\path\n\t\u{0001}";
+
+/// Model-only transport for UNLOAD failures, shutdown and fast-eject re-read faults.
 struct K67CleaningTransport {
     inner: ModelTransport,
     lifecycle: crate::drive_pool::DrivePoolLifecycle,
     fail_unload: bool,
     stop_before_unload: bool,
     unloads: Arc<AtomicU64>,
+    reread_fault: Option<Arc<Mutex<K67RereadFault>>>,
 }
 
 impl SgTransport for K67CleaningTransport {
@@ -19670,6 +19693,20 @@ impl SgTransport for K67CleaningTransport {
         cdb: &[u8],
         buf: &mut [u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if cdb[0] == 0xb8 && buf.len() > 8 {
+            if let Some(fault) = &self.reread_fault {
+                let mut fault = fault.lock().unwrap();
+                if fault.after_load {
+                    fault.full_reads += 1;
+                    if fault.full_reads > 2 && fault.failures_left > 0 {
+                        fault.failures_left -= 1;
+                        return Err(remanence_library::ScsiError::Io(std::io::Error::other(
+                            MR_C_REREAD_ERROR,
+                        )));
+                    }
+                }
+            }
+        }
         let result = self.inner.execute_in(cdb, buf);
         if cdb[0] == 0x4d && self.stop_before_unload {
             self.lifecycle.shutting_down.store(true, Ordering::SeqCst);
@@ -19696,7 +19733,13 @@ impl SgTransport for K67CleaningTransport {
                 });
             }
         }
-        self.inner.execute_none(cdb)
+        let result = self.inner.execute_none(cdb);
+        if cdb[0] == 0x1b && cdb[4] & 1 != 0 && result.is_ok() {
+            if let Some(fault) = &self.reread_fault {
+                fault.lock().unwrap().after_load = true;
+            }
+        }
+        result
     }
 
     fn execute_out(
@@ -19768,6 +19811,7 @@ fn k67_failed_clean(occupied: bool, flag: Option<u8>, fail_unload: bool, stop_be
                     fail_unload,
                     stop_before_unload,
                     unloads: opener_unloads.clone(),
+                    reread_fault: None,
                 }))
             },
         )
@@ -20033,6 +20077,248 @@ fn k67_failed_clean(occupied: bool, flag: Option<u8>, fail_unload: bool, stop_be
         usize::from(flag.is_some()),
         "TapeAlert alarm raised exactly once"
     );
+}
+
+/// Limit 4: the typed fast-eject owner explains a failed re-read in its alarm.
+/// One failed read can be retried through the same changer; persistent failure
+/// makes the changer actor refuse its next MOVE before dispatch.
+#[tokio::test]
+async fn mr_c_cleaning_fast_eject_reread_failure_is_explained_and_retried() {
+    use remanence_state::library_log as lib;
+    use time::format_description::well_known::Rfc3339;
+
+    for persistent in [false, true] {
+        let mut typed = crate::tests::TypedRoot::open();
+        let catalog = typed.catalog();
+        let runtime = catalog.library_runtime().expect("typed cleaning runtime");
+        let mut index = catalog.write_handle();
+        let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 3);
+        model.put_tape_in_slot(
+            0x400,
+            "CLNU01L9",
+            VirtualTape {
+                cleaning_cart: true,
+                cleaning_cart_expired: true,
+                ..VirtualTape::default()
+            },
+        );
+        model.put_tape_in_slot(0x401, "DATA01L9", VirtualTape::default());
+        let world = Arc::new(Mutex::new(model));
+        let snapshot = world.lock().unwrap().library_snapshot();
+        let fault = Arc::new(Mutex::new(K67RereadFault {
+            after_load: false,
+            full_reads: 0,
+            failures_left: if persistent { usize::MAX } else { 1 },
+        }));
+        let mut library = snapshot
+            .open_with(&remanence_library::StaticAllowlist::new(["LIB-CLEAN"]), {
+                let world = world.clone();
+                let fault = fault.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(K67CleaningTransport {
+                        inner: ModelTransport::new(world.clone(), role),
+                        lifecycle: crate::drive_pool::DrivePoolLifecycle::default(),
+                        fail_unload: false,
+                        stop_before_unload: false,
+                        unloads: Arc::new(AtomicU64::new(0)),
+                        reread_fault: Some(fault.clone()),
+                    }))
+                }
+            })
+            .unwrap();
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut index,
+            [library.library()],
+            &HashSet::from(["LIB-CLEAN".into()]),
+        )
+        .unwrap();
+        let drive = index.list_drives(true, true).unwrap()[0].drive_uuid.clone();
+        let mut cfg = test_typed_write_owner_config(
+            &typed,
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        cfg.cleaning.min_cycle_duration = "0s".into();
+        let api = typed.api_state();
+        let action = crate::write_owner::RoboticsAction::Clean {
+            drive_uuid: drive.clone(),
+            trigger: "now".into(),
+        };
+        let operation = api
+            .accept_owner_request(
+                AuditActor::User("real-cleaner".into()),
+                "clean_drive",
+                "library",
+                "LIB-CLEAN".into(),
+                crate::operation_source::robotics_fingerprint("LIB-CLEAN", &action),
+            )
+            .unwrap();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(operation, "clean_drive");
+        super::robotics::record_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-CLEAN",
+            lib::OperationEvent::Started(lib::Unit),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        cfg.configure_operation_library(&mut library, &handle);
+        let before = OffsetDateTime::now_utc();
+        let error = run_cleaning_sequence(&mut index, &cfg, &handle, &mut library, &drive, "now")
+            .unwrap_err();
+        let after = OffsetDateTime::now_utc();
+        assert_eq!(
+            error.message(),
+            "cleaning cartridge fast-ejected before LOAD admission"
+        );
+        assert_eq!(
+            fault.lock().unwrap().full_reads,
+            4,
+            "confirmation and branch empty-bay reads precede the failed funnel; finalization reads again"
+        );
+        let endpoint = remanence_state::DriveKey::new("LIB-CLEAN", 0x100);
+        assert!(
+            runtime.endpoint_motion_unresolved(&endpoint),
+            "LOAD remains Unknown"
+        );
+        assert!(
+            !runtime.endpoint_motion_owned(&endpoint),
+            "no LOAD owner remains"
+        );
+        let alarm = index
+            .get_alarm("cln-cart-expired:CLNU01L9")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (alarm.kind.as_str(), alarm.state.as_str()),
+            ("cln-cart-expired", "open")
+        );
+        let detail = alarm.detail.expect("alarm has its fast-eject reason");
+        let reason: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(reason["reason"], "fast-eject");
+        let reread = reason["reread"]
+            .as_str()
+            .expect("alarm reason carries reread failure");
+        assert_eq!(reason.as_object().unwrap().len(), 2);
+        let (at, explanation) = reread
+            .strip_prefix("at ")
+            .unwrap()
+            .split_once(" an inventory re-read failed: ")
+            .unwrap();
+        let at = OffsetDateTime::parse(at, &Rfc3339).unwrap();
+        assert_eq!(at.offset(), time::UtcOffset::UTC);
+        assert!(before <= at && at <= after);
+        assert_eq!(
+            explanation,
+            format!(
+                "SG_IO ioctl failed: {MR_C_REREAD_ERROR}; robot moves wait for the next re-read"
+            )
+        );
+        super::robotics::record_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-CLEAN",
+            lib::OperationEvent::Failed(lib::Failed {
+                retry: None,
+                refusal_code: None,
+                summary: error.message().into(),
+            }),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let mut changer = library.into_changer();
+        if persistent {
+            let moves = world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .filter(|c| c.opcode == 0xa5)
+                .count();
+            let actor = spawn_changer_actor(changer, cfg.clone());
+            let (reply, result) = oneshot::channel();
+            actor
+                .send(ChangerCommand::Move {
+                    src: 0x401,
+                    dst: 0x402,
+                    after_unload: false,
+                    dismount_guard: None,
+                    recovery_guard: None,
+                    caller_gone: None,
+                    reply,
+                })
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(StdDuration::from_secs(5), result)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                error.message(),
+                format!("reconcile library motion: SG_IO ioctl failed: {MR_C_REREAD_ERROR}")
+            );
+            assert_eq!(
+                world
+                    .lock()
+                    .unwrap()
+                    .command_log
+                    .iter()
+                    .filter(|c| c.opcode == 0xa5)
+                    .count(),
+                moves,
+                "the refused MOVE sends no motion CDB"
+            );
+            assert!(runtime.endpoint_motion_unresolved(&endpoint));
+            drop(actor);
+        } else {
+            assert_eq!(changer.reconcile_unowned_motion(), Ok(true));
+            assert!(!runtime.endpoint_motion_unresolved(&endpoint));
+            assert_eq!(changer.reconcile_unowned_motion(), Ok(false));
+            drop(changer);
+        }
+        drop(api);
+        drop(cfg);
+        drop(index);
+        drop(catalog);
+        drop(runtime);
+        let records = typed.records(|r| Some(r.clone())).await;
+        let loads: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r.motion_intent()
+                    .is_some_and(|v| matches!(v.motion, lib::Motion::Load(_)))
+            })
+            .collect();
+        assert_eq!(loads.len(), 1);
+        let load = loads[0].envelope.record_uuid;
+        let outcomes: Vec<_> = records
+            .iter()
+            .filter_map(|r| r.motion_outcome().filter(|v| v.intent.record_uuid == load))
+            .collect();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].result, lib::MotionResult::Unknown);
+        assert!(outcomes[0].confirmation.is_none());
+        assert_eq!(
+            records
+                .iter()
+                .any(|r| r.inventory_observation().is_some_and(|v| v
+                    .resolves
+                    .0
+                    .iter()
+                    .any(|reference| reference.record_uuid == load))),
+            !persistent
+        );
+        assert_eq!(records.iter().filter_map(|r| r.alarm_changed())
+            .filter(|v| v.condition_key.as_str() == "cln-cart-expired:CLNU01L9")
+            .filter(|v| matches!(&v.action, lib::AlarmAction::Raise(raise) if raise.reason.as_str() == detail))
+            .count(), 1, "the reread reason is durable in the original alarm");
+    }
 }
 
 /// T1: a manual clean of a busy bay never moves its cleaning cartridge.

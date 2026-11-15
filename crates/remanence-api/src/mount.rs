@@ -9362,13 +9362,16 @@ tape_catalog_dir="{0}/cache"
             &MotionContext::default(),
         )
         .unwrap();
-        for result in all(0x100) {
+        for (result, action) in
+            all(0x100)
+                .into_iter()
+                .zip(["open session", "close session", "evicted"])
+        {
             let refused = result.unwrap_err();
             assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-            assert!(
-                refused.message().contains("LIB-WRAP drive bay 0x0100")
-                    && refused.message().contains("unresolved"),
-                "{refused}"
+            assert_eq!(
+                refused.message(),
+                format!("{action} blocked: a LOAD or UNLOAD on LIB-WRAP drive bay 0x0100 has not finished; retry when it has; if none is running, restart the daemon")
             );
         }
         for result in all(0x101) {
@@ -9414,11 +9417,9 @@ tape_catalog_dir="{0}/cache"
             Ok(_) => panic!("the seated bay's own LOAD is open"),
         };
         assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            refused.message().contains("open session blocked")
-                && refused.message().contains("LIB-RESOLVE drive bay 0x0100")
-                && refused.message().contains("unresolved"),
-            "{refused}"
+        assert_eq!(
+            refused.message(),
+            "open session blocked: a LOAD or UNLOAD on LIB-RESOLVE drive bay 0x0100 has not finished; retry when it has; if none is running, restart the daemon"
         );
     }
 }

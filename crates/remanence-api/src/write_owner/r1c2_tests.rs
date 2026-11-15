@@ -162,16 +162,9 @@ fn admission_funnel_refuses_only_the_endpoints_own_unresolved_motion() {
     let refused = admit(Some(BAY_A), false).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     let text = refused.message();
-    assert!(text.contains("open session blocked"), "{text}");
-    assert!(
-        text.contains(&format!("{SERIAL} drive bay 0x{BAY_A:04x}")),
-        "{text}"
-    );
-    assert!(text.contains("unresolved"), "{text}");
-    assert!(text.contains("restart the daemon"), "{text}");
-    assert!(
-        text.ends_with("restart the daemon to reconcile library motion"),
-        "{text}"
+    assert_eq!(
+        text,
+        format!("open session blocked: a LOAD or UNLOAD on {SERIAL} drive bay 0x{BAY_A:04x} has not finished; retry when it has; if none is running, restart the daemon")
     );
     assert!(
         !text.contains("rem ") && !text.contains("CLI"),
@@ -192,7 +185,17 @@ fn admission_funnel_refuses_only_the_endpoints_own_unresolved_motion() {
     // Bay B is another endpoint: admitted while bay A's LOAD is open, and while it is Unknown.
     admit(Some(BAY_B), false).unwrap();
     runtime.unconfirmed(&pending(&load_a, ticket)).unwrap();
-    assert!(admit(Some(BAY_A), false).is_err(), "Unknown still refuses");
+    let refused = admit(Some(BAY_A), false).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    let text = refused.message();
+    assert_eq!(
+        text,
+        format!("open session blocked: motion on {SERIAL} drive bay 0x{BAY_A:04x} is unresolved; the daemon is re-reading the library inventory; retry in a moment")
+    );
+    assert!(
+        !text.contains("rem ") && !text.contains("CLI"),
+        "no CLI command is named as a remedy: {text}"
+    );
     admit(Some(BAY_B), false).unwrap();
     // A reconcile ends it; so does a known Failed.
     runtime.reconcile_inventory(&library).unwrap();
@@ -243,13 +246,9 @@ fn session_open_refuses_the_endpoints_own_unresolved_motion() {
     intent(&t.runtime, &MotionCommand::Unload(key(BAY_A)));
     let refused = session_open_reject_admission_conflicts(&mut index, &ctx(BAY_A)).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        refused.message().contains("open write session blocked")
-            && refused
-                .message()
-                .contains(&format!("{SERIAL} drive bay 0x{BAY_A:04x}"))
-            && refused.message().contains("restart the daemon"),
-        "{refused}"
+    assert_eq!(
+        refused.message(),
+        format!("open write session blocked: a LOAD or UNLOAD on {SERIAL} drive bay 0x{BAY_A:04x} has not finished; retry when it has; if none is running, restart the daemon")
     );
     session_open_reject_admission_conflicts(&mut index, &ctx(BAY_B)).unwrap();
 }
@@ -290,12 +289,8 @@ fn mounted_admission_refuses_the_endpoints_own_unresolved_motion() {
     let ticket = intent(&t.runtime, &load);
     let refused = cfg.mounted_admission(&index, &drive).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        refused.message().contains("mounted write blocked")
-            && refused.message().contains("unresolved")
-            && refused.message().contains("restart the daemon"),
-        "{refused}"
-    );
+    let expected = format!("mounted write blocked: a LOAD or UNLOAD on {SERIAL} drive bay 0x{BAY_A:04x} has not finished; retry when it has; if none is running, restart the daemon");
+    assert_eq!(refused.message(), expected);
     t.runtime.reconcile_inventory(&library_state).unwrap();
     let refused = cfg.mounted_admission(&index, &drive).unwrap_err();
     assert_eq!(
@@ -303,12 +298,7 @@ fn mounted_admission_refuses_the_endpoints_own_unresolved_motion() {
         tonic::Code::FailedPrecondition,
         "inventory reconciliation leaves an owned LOAD unresolved"
     );
-    assert!(
-        refused.message().contains("mounted write blocked")
-            && refused.message().contains("unresolved")
-            && refused.message().contains("restart the daemon"),
-        "{refused}"
-    );
+    assert_eq!(refused.message(), expected);
     t.runtime.unconfirmed(&pending(&load, ticket)).unwrap();
     t.runtime.reconcile_inventory(&library_state).unwrap();
     cfg.mounted_admission(&index, &drive).unwrap();
@@ -2247,6 +2237,156 @@ fn fx1_measure_startup_after_move_done_and_begin_without_load_intent() {
             drive_load_commands_on(&world, BAY_A)
         ),
     }
+}
+
+/// A startup LOAD that keeps conditioning becomes Unknown and is reconciled in
+/// that same start. Read the log only after shutdown, without a live motion
+/// query that could request reconciliation through the daemon's notifier.
+#[test]
+fn startup_slow_first_load_is_abandoned_and_reconciled() {
+    use remanence_state::library_log as lib;
+
+    let root = root();
+    let world = waited_world();
+    let operation;
+    let chain_uuid;
+    {
+        let state = root.open();
+        let mut index = state.write_handle();
+        let mut library = open_model_library(world.clone());
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut index,
+            [library.library()],
+            &HashSet::from([SERIAL.to_string()]),
+        )
+        .unwrap();
+        let mut cfg = test_write_owner_config(
+            root.paths.sqlite_path.clone(),
+            root.paths.audit_dir.clone(),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        cfg.catalog = state.projection_client();
+        cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
+        let api = crate::ApiState::new(state.projection_client());
+        operation = api
+            .accept_owner_request(
+                AuditActor::User("loader".into()),
+                "load_drive",
+                "library",
+                SERIAL.into(),
+                [0x38; 32],
+            )
+            .unwrap();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(operation, "load_drive");
+        cfg.configure_operation_library(&mut library, &handle);
+        library
+            .with_motion_context(
+                MotionContext {
+                    parent_operation: Some(*operation.as_bytes()),
+                    ..Default::default()
+                },
+                |library| library.move_medium(0x400, BAY_A, &cfg.policy),
+            )
+            .unwrap();
+        world.lock().unwrap().leave_cartridge_unthreaded(BAY_A);
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: operation,
+                run_id: None,
+                endpoint: key(BAY_A),
+                changer_sg: Some(library.library().changer_sg.display().to_string()),
+                drive_sg: library.library().drive_bays[0]
+                    .installed
+                    .as_ref()
+                    .unwrap()
+                    .sg_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                drive_serial: Some("DRV-R1C2".into()),
+                barcode: Some("R1C2L01L9".into()),
+                source_slot: Some(0x400),
+                media_generation: None,
+                media_family: None,
+                phase: "load_drive_readiness".into(),
+                state: "planned".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        chain_uuid = state.library_runtime().manifest().library_uuid();
+        assert_eq!(drive_load_commands_on(&world, BAY_A), 0);
+    }
+    let snapshot = world.lock().unwrap().library_snapshot();
+    let (state, api, runtime) = start_daemon_with_snapshot(&root, &world, snapshot, |inner| {
+        Box::new(LifecycleDrive {
+            inner,
+            sense: Arc::new(Mutex::new(Some((2, 4, 1)))),
+            fail_load: false,
+        })
+    })
+    .expect("startup completes while the first LOAD is still conditioning");
+    assert_eq!(drive_load_commands_on(&world, BAY_A), 1);
+    let row = state
+        .catalog()
+        .media_readiness_operation(operation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.last_sense_key, row.last_asc, row.last_ascq),
+        (Some(2), Some(4), Some(1))
+    );
+    runtime.block_on(api.shutdown_drive_pool()).unwrap();
+    drop(api);
+    drop(runtime);
+    drop(state);
+    wait_for_lifecycle_close(&root);
+    assert_eq!(drive_load_commands_on(&world, BAY_A), 1);
+    let records =
+        crate::tests::read_library_records(&root.paths, chain_uuid, &mut |r| Some(r.clone()))
+            .unwrap_or_else(|_| panic!("library log readable after daemon shutdown"));
+    let loads: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            r.motion_intent()
+                .is_some_and(|v| matches!(v.motion, lib::Motion::Load(_)))
+        })
+        .collect();
+    assert_eq!(loads.len(), 1, "the only LOAD belongs to startup");
+    let load = loads[0].envelope.record_uuid;
+    assert_eq!(
+        loads[0].motion_intent().unwrap().parent_operation,
+        Some(*operation.as_bytes())
+    );
+    let outcomes: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, r)| {
+            r.motion_outcome()
+                .filter(|v| v.intent.record_uuid == load)
+                .map(|v| (position, v))
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1, "the log holds the Unknown outcome");
+    assert_eq!(outcomes[0].1.result, lib::MotionResult::Unknown);
+    assert!(outcomes[0].1.confirmation.is_none());
+    let reconciled = records
+        .iter()
+        .position(|r| {
+            r.inventory_observation().is_some_and(|v| {
+                v.resolves.0.iter().any(|reference| {
+                    reference.record_uuid == load
+                        && reference.sequence == outcomes[0].1.intent.sequence
+                })
+            })
+        })
+        .expect("InventoryReconciled resolving it in the same startup");
+    assert!(
+        outcomes[0].0 < reconciled,
+        "Unknown precedes InventoryReconciled"
+    );
 }
 
 /// T13: three real daemon constructors retain identity across a missing host

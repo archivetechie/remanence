@@ -484,6 +484,15 @@ impl ApiState {
                 library.library(),
                 &mut opened_drives,
             )?;
+            if index.library_runtime().is_some() {
+                if let Err(error) = library.reconcile_startup_motion() {
+                    tracing::warn!(
+                        library_serial,
+                        %error,
+                        "reconcile library motion after startup readiness"
+                    );
+                }
+            }
             opened_libraries.push((library_serial.to_string(), library, opened_drives));
         }
         replay_checkpoint_journal_projections_with_audit(

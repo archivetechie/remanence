@@ -22,9 +22,15 @@ pub(crate) const INITIALIZING_LOAD_PHASE: &str = "initializing_command_load";
 /// Bound on the startup poll that follows a startup initializing LOAD. A
 /// drive that only needed the LOAD reports ready within seconds; one still
 /// conditioning media stays fenced in a resumable state for the next wait.
+#[cfg(not(test))]
 const STARTUP_INITIALIZING_LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const STARTUP_INITIALIZING_LOAD_TIMEOUT: Duration = Duration::from_secs(2);
 /// Steady poll interval of that startup poll, after the shared fast ramp.
+#[cfg(not(test))]
 const STARTUP_INITIALIZING_LOAD_POLL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const STARTUP_INITIALIZING_LOAD_POLL: Duration = Duration::from_secs(1);
 
 pub(crate) fn status_from_state_error(err: impl std::borrow::Borrow<StateError>) -> Status {
     let err = err.borrow();
@@ -231,21 +237,28 @@ pub(crate) fn log_media_readiness_not_ready(
     );
 }
 
-/// The refusal for a write admitted on an endpoint whose own LOAD or UNLOAD the motion authority
-/// calls open or Unknown. It names the endpoint and the one remedy, a daemon restart, which
-/// reconciles every configured library at startup. It names no CLI command: none only
-/// reconciles (`rem load`, `rem move` and `rem unload` then move media, `rem tape init` writes a
-/// label). It does not promise the restart works: the reconcile reads the library's inventory
-/// and can itself fail, and that error is reported as it is.
+/// Refuse a write while the endpoint's own LOAD or UNLOAD is unresolved. An
+/// owned motion must finish; an unowned motion already requested an inventory
+/// re-read through the runtime. Name that wait and its remedy without naming
+/// a CLI command that would itself move media or write a label.
 pub(crate) fn endpoint_motion_unresolved_status(
     action: &str,
     endpoint: &remanence_state::DriveKey,
+    owned: bool,
 ) -> Status {
-    Status::failed_precondition(format!(
-        "{action} blocked: motion on {} is unresolved, because a LOAD or UNLOAD there has no \
-         confirmed outcome; restart the daemon to reconcile library motion",
-        endpoint.label()
-    ))
+    let label = endpoint.label();
+    let message = if owned {
+        format!(
+            "{action} blocked: a LOAD or UNLOAD on {label} has not finished; retry when it has; \
+             if none is running, restart the daemon"
+        )
+    } else {
+        format!(
+            "{action} blocked: motion on {label} is unresolved; the daemon is re-reading the \
+             library inventory; retry in a moment"
+        )
+    };
+    Status::failed_precondition(message)
 }
 
 /// Refuse a write on `endpoint` while the motion authority holds an open or Unknown intent for
@@ -258,8 +271,12 @@ pub(crate) fn ensure_endpoint_motion_resolved(
     action: &str,
     endpoint: &remanence_state::DriveKey,
 ) -> Result<(), Status> {
-    if runtime.is_some_and(|runtime| runtime.endpoint_motion_unresolved(endpoint)) {
-        return Err(endpoint_motion_unresolved_status(action, endpoint));
+    if let Some(runtime) = runtime.filter(|runtime| runtime.endpoint_motion_unresolved(endpoint)) {
+        return Err(endpoint_motion_unresolved_status(
+            action,
+            endpoint,
+            runtime.endpoint_motion_owned(endpoint),
+        ));
     }
     Ok(())
 }
@@ -469,6 +486,15 @@ pub fn reconcile_media_readiness_on_startup(
             &mut opened_drives,
             active,
         )?);
+        if index.library_runtime().is_some() {
+            if let Err(error) = handle.reconcile_startup_motion() {
+                tracing::warn!(
+                    library_serial = %library.serial,
+                    %error,
+                    "reconcile library motion after startup readiness"
+                );
+            }
+        }
     }
     Ok(found)
 }
@@ -672,6 +698,13 @@ fn startup_media_readiness_initializing_load(
                 "startup readiness LOAD for operation {operation_id}: {error}"
             ))
         })?;
+    if !poll.readiness.is_ready() {
+        drive.abandon_readiness_loads().map_err(|error| {
+            Status::internal(format!(
+                "startup readiness abandon LOADs for operation {operation_id}: {error}"
+            ))
+        })?;
+    }
     Ok(poll.readiness)
 }
 
