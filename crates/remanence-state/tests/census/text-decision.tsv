@@ -420,6 +420,7 @@ crates/remanence-state/src/library_log/authority.rs::write_with_readiness_owner:
 crates/remanence-state/src/library_log/fold.rs::validate_at::text-equality	2
 crates/remanence-state/src/library_runtime.rs::fence_for_quarantine_id::text-strip_prefix	1
 crates/remanence-state/src/library_runtime.rs::release_tape_fence::text-strip_prefix	1
+crates/remanence-state/src/library_runtime/drive_fence.rs::release_standalone_drive_hold::text-strip_prefix	1
 crates/remanence-state/src/library_runtime/drive_observation.rs::observe_drives::text-match	6
 crates/remanence-state/src/library_runtime/native_floor.rs::carries_floor::text-equality	2
 crates/remanence-state/src/library_runtime/native_floor.rs::carries_mark::text-equality	4

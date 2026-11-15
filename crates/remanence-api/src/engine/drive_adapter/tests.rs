@@ -2646,6 +2646,69 @@ fn suffix_fence_release_requires_explicit_physical_recovery_and_replays() {
     }
 }
 
+/// A suffix-caused standalone hold needs acknowledgment before physical tail recovery.
+#[test]
+fn standalone_hold_release_allows_suffix_recovery() {
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::new(false);
+    let runtime = state.library_runtime();
+    let tape = runtime.tape_state(UUID).unwrap().tape;
+    let raise = |scope, kind| {
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
+                        kind,
+                        scope,
+                        cause: lib::FenceCause::SessionSuffixContradiction,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                    },
+                    remanence_state::AuditActor::System,
+                    remanence_state::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let tape_fence = raise(lib::FenceScope::Tape(tape), lib::FenceKind::Write);
+    let hold = raise(
+        lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+            drive_serial: SERIAL.into(),
+        })),
+        lib::FenceKind::DriveFault,
+    );
+    let mut owner = fixture.owner(state);
+    let error = owner
+        .supersede_tail_confirmed("HAND", |_, _| panic!("held drive reached confirmation"))
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("DriveFenced: drive STEP1-MOUNTED library:{hold}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("rem tape quarantine release library:{hold} --device PATH --allow-device STEP1-MOUNTED --ack TEXT")), "{text}");
+    assert!(runtime.active_fence(tape_fence).is_some());
+    let released = runtime
+        .release_standalone_drive_hold(
+            &format!("library:{hold}"),
+            "drive checked",
+            remanence_state::AuditActor::local_user(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.cause, lib::FenceCause::SessionSuffixContradiction);
+    owner
+        .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+        .unwrap();
+    assert!(runtime.active_fence(tape_fence).is_none());
+    assert!(runtime.active_fence(hold).is_none());
+    owner.finish().unwrap();
+}
+
 /// DEC-1 and D-N-1-2: an undurable ending retains exactly the append classifier fence.
 #[test]
 fn mounted_append_failure_with_an_undurable_ending_keeps_the_classifier_fence() {

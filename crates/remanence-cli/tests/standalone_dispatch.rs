@@ -2340,6 +2340,124 @@ fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
     );
 }
 
+/// A seeded hold blocks put, lists and releases without device work, then permits put.
+#[test]
+fn standalone_drive_hold_release_frees_the_drive() {
+    use remanence_state::library_log as lib;
+    let mut f = VersionFixture::new();
+    f.home_default = true;
+    let config = std::fs::read_to_string(f.config()).unwrap();
+    std::fs::write(
+        f.config(),
+        format!("{config}\n[home]\ndrive_serial = \"HOME-DRIVE\"\n"),
+    )
+    .unwrap();
+    let source = f.root.path().join("hold.txt");
+    std::fs::write(&source, b"held drive bytes").unwrap();
+    let raise_hold = |state: &remanence_state::StateHandle| {
+        state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+                            drive_serial: "HOME-DRIVE".into(),
+                        })),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![lib::DiagnosticEntry(
+                            "barcode".into(),
+                            lib::DiagnosticValue::Text("FIRST".into()),
+                        )]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let sequence = raise_hold(&state);
+    drop(state);
+    let id = format!("library:{sequence}");
+    let before = f.writes();
+    let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert_eq!(f.writes(), before);
+    let text = format!("{out}\n{errors}");
+    let prefix = format!("DriveFenced: drive HOME-DRIVE library:{sequence} TransferError");
+    assert!(text.contains(&prefix), "{text}");
+    let advice = format!("{prefix}; release the hold with `rem tape quarantine release {id} --device PATH --allow-device HOME-DRIVE --ack TEXT`");
+    assert!(text.contains(&advice), "{text}");
+    let commands = f.world.lock().unwrap().command_log.len();
+    let row = serde_json::json!({"quarantine_id":id,"drive_serial":"HOME-DRIVE","cause":"TransferError","detail":{"barcode":"FIRST"},"state":"active"});
+    let listed = f.ok(&["tape", "quarantine", "list"]);
+    assert_eq!(listed["standalone_holds"], serde_json::json!([row]));
+    assert_eq!(listed["active_fences"], serde_json::json!([]));
+    let release_args = [
+        "tape",
+        "quarantine",
+        "release",
+        &id,
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
+        "--ack",
+        "drive checked",
+    ];
+    let (code, out, errors) = f.run(&release_args, true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    let mut released = row.clone();
+    released["state"] = serde_json::json!("released");
+    released["active_fences"] = serde_json::json!([]);
+    assert_eq!(VersionFixture::envelope(&out)["result"], released);
+    assert_eq!(
+        f.ok(&["tape", "quarantine", "list"])["standalone_holds"],
+        serde_json::json!([])
+    );
+    assert_eq!(f.world.lock().unwrap().command_log.len(), commands);
+    f.ok(&["put", source.to_str().unwrap()]);
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let tape = state
+        .catalog()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap();
+    l1b_raise(
+        &state,
+        tape.tape_uuid.try_into().unwrap(),
+        lib::FenceCause::PartialBatch,
+    );
+    let tape_id = state.catalog().list_active_tape_io_fences().unwrap()[0]
+        .quarantine_id
+        .clone();
+    let second = format!("library:{}", raise_hold(&state));
+    drop(state);
+    let (code, out, errors) = f.run(
+        &[
+            "tape",
+            "quarantine",
+            "release",
+            &second,
+            "--device",
+            "/dev/home-model",
+            "--allow-device",
+            "HOME-DRIVE",
+            "--ack",
+            "drive checked",
+        ],
+        false,
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert!(out.contains(&tape_id), "{out}");
+}
+
 /// D-L2-CLI-1-1: endpoint release waits for ruling 29; its audit read moves
 /// to the typed FenceReleased when that ruling lands.
 #[test]

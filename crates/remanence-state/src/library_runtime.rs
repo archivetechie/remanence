@@ -714,6 +714,12 @@ impl LibraryRuntime {
             })?;
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(fence) = self.0.authority.active_fence(sequence) {
+            if let lib::FenceScope::Drive(lib::DriveKey::Standalone(drive)) = &fence.scope {
+                let serial = drive.drive_serial.as_str();
+                return Err(StateError::ConfigInvalid(format!(
+                    "fence library:{sequence} holds standalone drive {serial}; stop the daemon and run `rem tape quarantine release library:{sequence} --device PATH --allow-device {serial} --ack TEXT` as a standalone command"
+                )).into());
+            }
             if !matches!(fence.scope, lib::FenceScope::Tape(_)) {
                 return Err(StateError::ConfigInvalid("fence is not tape-scoped".into()).into());
             }
@@ -1234,7 +1240,7 @@ impl LibraryRuntime {
 }
 
 mod drive_fence;
-pub use drive_fence::{DriveDataRefusal, DriveFenced};
+pub use drive_fence::{DriveDataRefusal, DriveFenced, StandaloneDriveHold};
 mod motion;
 mod native_fences;
 pub(crate) mod native_floor;

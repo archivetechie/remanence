@@ -810,6 +810,25 @@ fn read_only(command: &Command) -> bool {
     )
 }
 
+/// Render an authoritative standalone hold for list and release output.
+fn standalone_hold_json(
+    hold: &remanence_state::library_runtime::StandaloneDriveHold,
+    state: &str,
+) -> Value {
+    let detail: serde_json::Map<String, Value> = hold
+        .detail
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+    json!({
+        "quarantine_id": format!("library:{}", hold.fence),
+        "drive_serial": hold.drive_serial,
+        "cause": format!("{:?}", hold.cause),
+        "detail": detail,
+        "state": state,
+    })
+}
+
 /// Build first-use configuration without persisting operator choices.
 fn default_home_config(root: &Path) -> String {
     let q = |p: PathBuf| toml::Value::String(p.to_string_lossy().into_owned()).to_string();
@@ -1180,13 +1199,36 @@ where
                     .catalog()
                     .list_active_media_readiness_operations(None)
                     .map_err(err)?;
+                let holds = state
+                    .library_runtime()
+                    .standalone_drive_holds()
+                    .map_err(err)?;
                 Ok(
-                    json!({"active_fences":output.active_fences,"media_readiness":ops.iter().map(crate::media_readiness_record_json).collect::<Vec<_>>()}),
+                    json!({"active_fences":output.active_fences,"media_readiness":ops.iter().map(crate::media_readiness_record_json).collect::<Vec<_>>(),"standalone_holds":holds.iter().map(|hold| standalone_hold_json(hold, "active")).collect::<Vec<_>>()}),
                 )
             }
             Quarantine::Release { id, ack } => {
                 if ack.trim().is_empty() {
                     return Err("--ack must be non-empty".into());
+                }
+                if let Some(hold) = state
+                    .library_runtime()
+                    .release_standalone_drive_hold(
+                        id,
+                        ack.trim(),
+                        remanence_state::AuditActor::local_user(),
+                    )
+                    .map_err(err)?
+                {
+                    output.active_fences =
+                        remanence_api::standalone_fence_policy(state.catalog(), None, None, false)
+                            .map_err(err)?
+                            .iter()
+                            .map(crate::tape_io_fence_json)
+                            .collect();
+                    let mut row = standalone_hold_json(&hold, "released");
+                    row["active_fences"] = json!(output.active_fences);
+                    return Ok(row);
                 }
                 let fences = state.catalog().list_active_tape_io_fences().map_err(err)?;
                 if fences.iter().any(|f| {
@@ -3764,6 +3806,72 @@ mod tests {
             local_quarantine_config_in(&env.system_config, &env, &mut Vec::new()).unwrap(),
             home
         );
+    }
+
+    /// Explicit device advice selects standalone release regardless of host configuration.
+    #[test]
+    fn quarantine_release_with_device_routes_standalone_on_every_host() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().join("state"),
+            system_config: root.path().join("system.toml"),
+            locks: root.path().join("locks"),
+            test_input: true,
+            euid: 1000,
+            doctor_checks: None,
+        };
+        let path = config_path(&Cli::try_parse_from(["rem", "doctor"]).unwrap(), &env).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        for (system, saved) in [(false, false), (false, true), (true, false), (true, true)] {
+            fs::write(
+                &path,
+                if saved {
+                    format!("{original}\n[home]\ndrive_serial = \"HOLD-1\"\n")
+                } else {
+                    original.clone()
+                },
+            )
+            .unwrap();
+            if system {
+                fs::write(&env.system_config, "").unwrap();
+            } else if env.system_config.exists() {
+                fs::remove_file(&env.system_config).unwrap();
+            }
+            let args = [
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                "library:1",
+                "--device",
+                "PATH",
+                "--allow-device",
+                "HOLD-1",
+                "--ack",
+                "TEXT",
+            ]
+            .map(OsString::from);
+            assert!(
+                selected_in(&args, &env),
+                "explicit device: system={system} saved={saved}"
+            );
+            let args = [
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                "library:1",
+                "--ack",
+                "TEXT",
+            ]
+            .map(OsString::from);
+            assert_eq!(
+                selected_in(&args, &env),
+                saved && !system,
+                "bare: system={system} saved={saved}"
+            );
+        }
     }
 
     /// Shared quarantine routing follows home-mode configuration, never reason text.

@@ -18079,6 +18079,83 @@ mod tests {
         assert!(release_fence_via_daemon(&config, "tioq-missing", " ", false).is_err());
     }
 
+    /// The offline config route names the standalone hold and refuses before appending.
+    #[test]
+    fn fence_release_config_route_names_a_standalone_hold() {
+        use remanence_state::library_log as lib;
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        let sequence = state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+                            drive_serial: "HOLD-CONFIG".into(),
+                        })),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        drop(state);
+        let rem = |id: &str| {
+            let cli = Cli::try_parse_from([
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                id,
+                "--after-settled-inventory",
+                "--ack",
+                "checked",
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .unwrap();
+            let mut out = Vec::new();
+            let mut errors = Vec::new();
+            let code = run(
+                cli,
+                || panic!("quarantine release must not discover devices"),
+                &mut out,
+                &mut errors,
+            );
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(errors).unwrap(),
+            )
+        };
+        assert_eq!(rem("library:999999").0, ExitCode::from(1));
+        let bytes = || -> u64 {
+            fs::read_dir(root.path().join("audit"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+                .map(|path| fs::metadata(path).unwrap().len())
+                .sum()
+        };
+        let before = bytes();
+        let (code, out, errors) = rem(&format!("library:{sequence}"));
+        assert_eq!(code, ExitCode::from(1), "{out}\n{errors}");
+        let expected = format!("fence library:{sequence} holds standalone drive HOLD-CONFIG; stop the daemon and run `rem tape quarantine release library:{sequence} --device PATH --allow-device HOLD-CONFIG --ack TEXT` as a standalone command");
+        assert!(errors.contains(&expected), "{errors}");
+        assert_eq!(bytes(), before);
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert!(state.library_runtime().active_fence(sequence).is_some());
+    }
+
     /// Keep typed daemon ownership and raise a tape fence through its library authority.
     fn fence_release_test_state(config: &Path) -> (remanence_state::StateHandle, String) {
         use remanence_state::library_log as lib;

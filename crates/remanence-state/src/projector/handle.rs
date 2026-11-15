@@ -261,6 +261,10 @@ impl CatalogIndex {
     pub fn delete_wrap_map(&mut self, tape_uuid: &[u8; 16]) -> Result<bool, StateError> {
         self.with_core(|core| core.delete_wrap_map(tape_uuid))
     }
+    /// Locate active drive raises for the library runtime's authoritative scope check.
+    pub(crate) fn active_drive_fence_sequences(&self) -> Result<Vec<u64>, StateError> {
+        self.with_core(|core| core.active_drive_fence_sequences())
+    }
     /// List active tape-I/O fences.
     pub fn list_active_tape_io_fences(&self) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         self.with_core(|core| core.list_active_tape_io_fences())

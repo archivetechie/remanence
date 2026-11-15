@@ -10654,6 +10654,61 @@ async fn release_fence_rpc_and_live_admission() {
     ));
 }
 
+/// The RPC names the standalone release route without appending or clearing the hold.
+#[tokio::test]
+async fn release_fence_rpc_names_a_standalone_hold() {
+    use pb::library_service_server::LibraryService;
+    use remanence_state::library_log as lib;
+
+    let typed = TypedRoot::open();
+    let runtime = typed.catalog().library_runtime().unwrap();
+    let sequence = runtime
+        .append(|a, v| {
+            a.fence_raised(
+                lib::FenceRaised {
+                    kind: lib::FenceKind::DriveFault,
+                    scope: lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+                        drive_serial: "HOLD-RPC".into(),
+                    })),
+                    cause: lib::FenceCause::TransferError,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap()
+        .sequence;
+    let bytes = || -> u64 {
+        std::fs::read_dir(&typed.paths().audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum()
+    };
+    let state = ApiState::new(typed.catalog());
+    let before = bytes();
+    let error = state
+        .library_service()
+        .release_tape_io_fence(tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+            quarantine_id: format!("library:{sequence}"),
+            acknowledgment: "drive checked".into(),
+            force: false,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    let expected = format!("fence library:{sequence} holds standalone drive HOLD-RPC; stop the daemon and run `rem tape quarantine release library:{sequence} --device PATH --allow-device HOLD-RPC --ack TEXT` as a standalone command");
+    assert!(error.message().contains(&expected), "{error}");
+    assert_eq!(bytes(), before);
+    assert!(runtime.active_fence(sequence).is_some());
+}
+
 /// Startup logs one warning per scoped fence and rejects malformed endpoint evidence.
 #[test]
 fn startup_reports_each_fence_and_refuses_malformed_scope() {

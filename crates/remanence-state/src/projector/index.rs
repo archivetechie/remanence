@@ -1883,6 +1883,21 @@ impl CatalogCore {
         Ok(changed > 0)
     }
 
+    /// Locate active drive raises; the library fold decides their current scope and liveness.
+    pub(crate) fn active_drive_fence_sequences(&self) -> Result<Vec<u64>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select sequence from library_drive_fences where released = 0 order by sequence",
+            )
+            .map_err(|err| sqlite_error("prepare active drive fence sequences", err))?;
+        let rows = stmt
+            .query_map([], |row| Ok(row.get::<_, SqliteU64>(0)?.get()))
+            .map_err(|err| sqlite_error("query active drive fence sequences", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read active drive fence sequence", err))
+    }
+
     /// List active tape-I/O fences.
     pub fn list_active_tape_io_fences(&self) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         let mut stmt = self
