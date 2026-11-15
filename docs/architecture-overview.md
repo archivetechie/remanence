@@ -181,10 +181,12 @@ the append-only library log, the per-tape logs, and the SQLite catalog. The two
 logs are the authority for library and tape state; the calibration-control store
 decides whether a cached read-order map may be served. Apart from its `wrap_maps`
 cache rows, the catalog is a projection of the two logs. The daemon updates it
-after each durable library-log append and after each tape-log record that
-commits a change the catalog shows (a checkpoint, a parity closeout, a tail
-recovery, a finalization step), reads it to answer lookups and admission checks, and
-can rebuild it from the logs. The library log's `*.remlib` segments
+after each durable library-log append. A tape-log record reaches it when the
+step that wrote it commits (a first write's bootstrap, a checkpoint, a parity
+closeout, a tail recovery, a finalization step) or, for a session's opening and
+ending, at the tape's next projection. The daemon reads the catalog to answer
+lookups and admission checks, and can rebuild it from the logs. The library
+log's `*.remlib` segments
 live in `audit.dir`; `authority-manifest.json` in the state directory binds the
 roots. The projection-only rebuild starts from an empty catalog, applies the
 library log before the tape logs, and carries over nothing from the old catalog.
