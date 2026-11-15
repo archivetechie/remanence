@@ -320,6 +320,12 @@ pub struct PendingRecord {
     receipt: Receipt,
     deferred_fence: bool,
 }
+impl PendingRecord {
+    /// Retained canonical source and chain identity for an append's applications.
+    pub(super) fn application_bytes(&self) -> (&[u8], Hash) {
+        (&self.bytes, self.receipt.record_hash)
+    }
+}
 /// Result of validation, reused by append and replay.
 #[derive(Clone, Debug)]
 pub enum Validated {

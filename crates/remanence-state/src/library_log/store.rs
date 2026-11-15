@@ -83,6 +83,8 @@ pub struct SegmentTail {
     pub through: u64,
     /// Shared byte tail class.
     pub tail: log_frame::Tail,
+    /// Every 64th validated frame: sequence, byte offset, and preceding chain hash.
+    history_index: Vec<(u64, u64, Hash)>,
 }
 /// Streaming replay result; errors preserve all previously accepted authority.
 #[derive(Clone, Debug, Default)]
@@ -99,6 +101,18 @@ pub struct Replay {
     pub refusal: Option<Refusal>,
     /// Peak encoded decoder buffer, not a frame history.
     pub decoder_peak_bytes: usize,
+}
+#[cfg(test)]
+impl Replay {
+    /// Allocated sparse-index bytes only; fold and segment metadata are excluded.
+    pub(super) fn history_index_bytes(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| {
+                segment.history_index.capacity() * std::mem::size_of::<(u64, u64, Hash)>()
+            })
+            .sum()
+    }
 }
 /// Storage refusal, distinguished from uncertain durability.
 #[derive(Debug, thiserror::Error)]
@@ -283,6 +297,7 @@ fn scan_prefixes_observed(
                     header: None,
                     through: 0,
                     tail: log_frame::Tail::Complete,
+                    history_index: Vec::new(),
                 });
                 break;
             }
@@ -301,6 +316,7 @@ fn scan_prefixes_observed(
             header: Some(header.clone()),
             through: HEADER_LEN,
             tail: log_frame::Tail::Complete,
+            history_index: Vec::new(),
         });
         if let Some(fault) = fault {
             out.refusal = Some(Refusal {
@@ -370,9 +386,17 @@ fn scan_prefixes_observed(
                             progress: super::authority::FoldProgress::capture(&out.fold),
                         })?;
                     }
+                    let segment = out.segments.last_mut().unwrap();
+                    if (frame.sequence - header.first_sequence).is_multiple_of(64) {
+                        segment.history_index.push((
+                            frame.sequence,
+                            frame.offset,
+                            out.terminal_hash,
+                        ));
+                    }
                     out.last_sequence = frame.sequence;
                     out.terminal_hash = hash;
-                    out.segments.last_mut().unwrap().through = frame.end;
+                    segment.through = frame.end;
                 }
                 Ok(None) => break,
                 Err(codec::Error::Io(e)) => return Err(e.into()),
@@ -417,8 +441,13 @@ fn scan_prefixes_observed(
     }
     Ok(out)
 }
+#[cfg(test)]
+thread_local! {
+    /// Successful frame decodes in history lookups on this test's thread only.
+    static HISTORY_FRAMES_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Borrow the validated segment list, binary-search its header sequence boundaries,
-/// then stream only that segment. No historical index or decoded cache is created.
+/// then stream at most 64 frames from a sparse chain anchor. No decoded cache is kept.
 struct SegmentHistory<'a> {
     dir: &'a Path,
     segments: &'a [SegmentTail],
@@ -461,25 +490,26 @@ impl SegmentHistory<'_> {
         let Some(segment) = index.checked_sub(1).map(|i| &segments[i]) else {
             return Ok(None);
         };
-        let header = segment
-            .header
-            .as_ref()
+        let anchor = segment
+            .history_index
+            .partition_point(|entry| entry.0 <= sequence);
+        let &(first_sequence, offset, mut previous) = anchor
+            .checked_sub(1)
+            .map(|index| &segment.history_index[index])
             .ok_or(FoldError::HistoryUnavailable)?;
         let mut file = fs::File::open(self.dir.join(&segment.name))
             .map_err(|_| FoldError::HistoryUnavailable)?;
         use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(HEADER_LEN))
+        file.seek(SeekFrom::Start(offset))
             .map_err(|_| FoldError::HistoryUnavailable)?;
-        let mut decoder = codec::Decoder::at(
-            file.take(segment.through - HEADER_LEN),
-            header.first_sequence,
-            HEADER_LEN,
-        );
-        let mut previous = header.previous_segment_hash;
+        let mut decoder =
+            codec::Decoder::at(file.take(segment.through - offset), first_sequence, offset);
         while let Some(frame) = decoder
             .next_frame()
             .map_err(|_| FoldError::HistoryUnavailable)?
         {
+            #[cfg(test)]
+            HISTORY_FRAMES_DECODED.with(|count| count.set(count.get() + 1));
             previous =
                 codec::verify(&frame, previous).map_err(|_| FoldError::HistoryUnavailable)?;
             if frame.sequence == sequence {
@@ -577,7 +607,8 @@ impl LibraryLog {
     pub(super) fn log_uuid(&self) -> Id {
         self.log_uuid
     }
-    /// Last validated replay, including any recovery-required boundary.
+    /// Last validated replay. Its refusal may also be an in-memory re-fold
+    /// latch, not a scan boundary or permission to repair the durable stream.
     pub fn state(&self) -> &Replay {
         &self.state
     }
@@ -765,7 +796,14 @@ impl LibraryLog {
         view: &dyn TapeView,
         applied: &mut dyn FnMut(u64),
     ) -> Result<Receipt, StoreError> {
-        self.append_checked(body, actor, source_layer, view, applied, &|_, _| Ok(()))
+        self.append_checked(
+            body,
+            actor,
+            source_layer,
+            view,
+            &mut |sequence, _, _| applied(sequence),
+            &|_, _| Ok(()),
+        )
     }
     /// Writer-specific checks run after pending retry, under the same append ownership.
     pub(super) fn append_checked(
@@ -774,7 +812,7 @@ impl LibraryLog {
         actor: AuditActor,
         source_layer: SourceLayer,
         view: &dyn TapeView,
-        applied: &mut dyn FnMut(u64),
+        applied: &mut dyn FnMut(u64, Record, Hash),
         check: &dyn Fn(&LibraryFold, &Body) -> Result<(), StoreError>,
     ) -> Result<Receipt, StoreError> {
         let lost = match &body {
@@ -805,7 +843,38 @@ impl LibraryLog {
             segments: &self.state.segments,
             before: self.state.last_sequence.saturating_add(1),
         };
-        self.state.fold.resolve_observed(view, &history, applied)?;
+        // Retain only the bounded pending set before resolution consumes it.
+        // A decode error belongs to resolve's own refusal unless that record
+        // actually applies; preserve applications emitted before any refusal.
+        {
+            let mut pending: std::collections::BTreeMap<_, _> = self
+                .state
+                .fold
+                .pending
+                .iter()
+                .map(|pending| {
+                    let (bytes, hash) = pending.application_bytes();
+                    (
+                        pending.sequence,
+                        wire::decode(pending.tag as u16, bytes)
+                            .map(|record| (record, hash))
+                            .map_err(|_| FoldError::InvalidSchema),
+                    )
+                })
+                .collect();
+            let mut sequences = Vec::new();
+            let resolution = self
+                .state
+                .fold
+                .resolve_observed(view, &history, &mut |sequence| sequences.push(sequence));
+            for sequence in sequences {
+                let (record, hash) = pending
+                    .remove(&sequence)
+                    .ok_or(FoldError::HistoryUnavailable)??;
+                applied(sequence, record, hash);
+            }
+            resolution?;
+        }
         check(&self.state.fold, &body)?;
         let sequence = self
             .state
@@ -848,6 +917,21 @@ impl LibraryLog {
             return Ok(r);
         }
         let (bytes, hash) = codec::encode(sequence, self.state.terminal_hash, &record)?;
+        // The projector receives the codec's interpretation, checked entirely
+        // in memory before a file is opened for publication.
+        let decoded = {
+            let mut decoder = codec::Decoder::at(bytes.as_slice(), sequence, 0);
+            let frame = decoder
+                .next_frame()
+                .map_err(io::Error::other)?
+                .ok_or_else(|| io::Error::other("encoded library frame is absent"))?;
+            let decoded_hash =
+                codec::verify(&frame, self.state.terminal_hash).map_err(io::Error::other)?;
+            if decoded_hash != hash {
+                return Err(io::Error::other("encoded library frame hash differs").into());
+            }
+            frame.record
+        };
         let date = date(now)?;
         let rotate = self
             .state
@@ -880,6 +964,7 @@ impl LibraryLog {
                     header: Some(header),
                     through: HEADER_LEN + bytes.len() as u64,
                     tail: log_frame::Tail::Complete,
+                    history_index: Vec::new(),
                 });
             } else {
                 let target = self.dir.join(&self.state.segments.last().unwrap().name);
@@ -911,7 +996,7 @@ impl LibraryLog {
             record,
             receipt.clone(),
             view,
-            applied,
+            &mut |sequence| applied(sequence, decoded.clone(), hash),
         ) {
             // Publication already happened: fail closed if a future scope lacks apply semantics.
             if let Some(tape) = lost {
@@ -920,13 +1005,22 @@ impl LibraryLog {
             publication::fence_ambiguity(&self.dir, &self.identity);
             return Err(StoreError::Ambiguous(io::Error::other(error)));
         }
+        if let Some(mut segment) = new_segment {
+            segment
+                .history_index
+                .push((sequence, HEADER_LEN, self.state.terminal_hash));
+            self.state.segments.push(segment);
+        } else {
+            let segment = self.state.segments.last_mut().unwrap();
+            if (sequence - segment.header.as_ref().unwrap().first_sequence).is_multiple_of(64) {
+                segment
+                    .history_index
+                    .push((sequence, segment.through, self.state.terminal_hash));
+            }
+            segment.through += bytes.len() as u64;
+        }
         self.state.last_sequence = sequence;
         self.state.terminal_hash = hash;
-        if let Some(s) = new_segment {
-            self.state.segments.push(s);
-        } else {
-            self.state.segments.last_mut().unwrap().through += bytes.len() as u64;
-        }
         Ok(receipt)
     }
     /// Fixture-only producer; no production authority escape.
@@ -1062,6 +1156,19 @@ impl LibraryLog {
         }
         .read_application(sequence)
     }
+    /// Snapshot's storage gates plus resolved dependencies, without copying history.
+    pub(super) fn check_fold_read(&self) -> Result<(), StoreError> {
+        if publication::has_ambiguity(&self.identity)? {
+            return Err(StoreError::Fenced);
+        }
+        if let Some(refusal) = &self.state.refusal {
+            return Err(StoreError::RecoveryRequired(refusal.clone()));
+        }
+        if !self.state.fold.pending.is_empty() {
+            return Err(StoreError::Fold(FoldError::HistoryUnavailable));
+        }
+        Ok(())
+    }
     pub(super) fn snapshot(&self) -> Result<ReadSnapshot, StoreError> {
         if publication::has_ambiguity(&self.identity)? {
             return Err(StoreError::Fenced);
@@ -1069,7 +1176,13 @@ impl LibraryLog {
         if let Some(refusal) = &self.state.refusal {
             return Err(StoreError::RecoveryRequired(refusal.clone()));
         }
-        Ok(ReadSnapshot {
+        Ok(self.bounded_source())
+    }
+
+    /// Copy validated byte limits under append ownership. A replacement re-fold
+    /// deliberately bypasses ambiguity, but never reads a frame past `through`.
+    pub(super) fn bounded_source(&self) -> ReadSnapshot {
+        ReadSnapshot {
             dir: self.dir.clone(),
             uuid: self.log_uuid,
             files: self
@@ -1080,6 +1193,173 @@ impl LibraryLog {
                 .collect(),
             _lock: self._lock.clone(),
             _directory_lock: self._directory_lock.clone(),
-        })
+        }
+    }
+
+    /// Install only an exact clean re-fold. A failure latches only refusal in
+    /// memory: this is not necessarily a scan boundary, and writes no marker.
+    /// Existing refusals belong to this process and are never cleared or replaced.
+    pub(super) fn install_refold(
+        &mut self,
+        scanned: Result<Replay, StoreError>,
+    ) -> Option<Refusal> {
+        if self.state.refusal.is_some() {
+            return None;
+        }
+        let live_sequence = self.state.last_sequence;
+        let live_hash = self.state.terminal_hash;
+        let (live_segment, live_offset) = self
+            .state
+            .segments
+            .last()
+            .map(|segment| (segment.name.clone(), segment.through))
+            .unwrap_or_default();
+        let at_live_end = |fault| Refusal {
+            segment: live_segment.clone(),
+            offset: live_offset,
+            sequence: Some(live_sequence.saturating_add(1)),
+            fault: RefusalKind::Fold(fault),
+        };
+        let refusal = match scanned {
+            Ok(scan) => {
+                if let Some(refusal) = scan.refusal {
+                    tracing::error!(?refusal, live_sequence, ?live_hash,
+                        scan_sequence = scan.last_sequence, scan_hash = ?scan.terminal_hash,
+                        "replacement re-fold found a refusal; retaining the live fold");
+                    refusal
+                } else if scan.last_sequence == live_sequence && scan.terminal_hash == live_hash {
+                    self.state.fold = scan.fold;
+                    return None;
+                } else {
+                    let mut refusal = at_live_end(FoldError::HistoryUnavailable);
+                    if scan.last_sequence < live_sequence {
+                        if let Some(segment) = scan.segments.last() {
+                            refusal.segment = segment.name.clone();
+                            refusal.offset = segment.through;
+                        }
+                        refusal.sequence = Some(scan.last_sequence.saturating_add(1));
+                    }
+                    tracing::error!(?refusal, live_sequence, ?live_hash,
+                        scan_sequence = scan.last_sequence, scan_hash = ?scan.terminal_hash,
+                        "replacement re-fold ends differ; retaining the live fold");
+                    refusal
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, live_sequence, ?live_hash,
+                    segment = %live_segment, offset = live_offset,
+                    "replacement re-fold failed; retaining the live fold");
+                at_live_end(match error {
+                    StoreError::Fold(error) => error,
+                    _ => FoldError::HistoryUnavailable,
+                })
+            }
+        };
+        self.state.refusal = Some(refusal.clone());
+        Some(refusal)
+    }
+}
+
+#[cfg(test)]
+mod sparse_history_tests {
+    use super::*;
+    use crate::library_log::tests as fixture;
+    use std::io::{Seek, SeekFrom};
+
+    /// Independent oracle: decode each complete segment from its header anchor.
+    fn full_scan(log: &LibraryLog) -> Vec<(Record, Hash)> {
+        let mut records = Vec::new();
+        for segment in &log.state.segments {
+            let header = segment.header.as_ref().unwrap();
+            let mut file = fs::File::open(log.dir.join(&segment.name)).unwrap();
+            file.seek(SeekFrom::Start(HEADER_LEN)).unwrap();
+            let mut decoder = codec::Decoder::at(
+                file.take(segment.through - HEADER_LEN),
+                header.first_sequence,
+                HEADER_LEN,
+            );
+            let mut previous = header.previous_segment_hash;
+            while let Some(frame) = decoder.next_frame().unwrap() {
+                previous = codec::verify(&frame, previous).unwrap();
+                records.push((frame.record, previous));
+            }
+        }
+        records
+    }
+
+    /// Append and replay build identical anchors; every lookup, including a
+    /// rotated segment's first frame, matches a full scan within 64 decodes.
+    #[test]
+    fn sparse_history_matches_full_scan_and_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut log, clock) = fixture::open(root.path(), &fixture::Present);
+        for _ in 0..257 {
+            fixture::put(&mut log, fixture::diagnostic());
+        }
+        clock.0.store(
+            fixture::NOW + 86_400_000_000_000,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        for _ in 0..65 {
+            fixture::put(&mut log, fixture::diagnostic());
+        }
+        assert_eq!(log.state.segments.len(), 2);
+        let expected = full_scan(&log);
+        assert_eq!(expected.len(), 322);
+        let appended: Vec<_> = log
+            .state
+            .segments
+            .iter()
+            .map(|s| s.history_index.clone())
+            .collect();
+        assert_eq!(appended[0].len(), 5);
+        assert_eq!(appended[1].len(), 2);
+        let check = |log: &LibraryLog| {
+            for sequence in 1..=322 {
+                HISTORY_FRAMES_DECODED.with(|count| count.set(0));
+                let actual = log
+                    .lookup_application(sequence)
+                    .expect("indexed lookup must verify from the preceding frame hash")
+                    .unwrap();
+                let count = HISTORY_FRAMES_DECODED.with(|count| count.get());
+                assert!(count <= 64, "sequence {sequence} decoded {count} frames");
+                assert_eq!(
+                    actual,
+                    expected[sequence as usize - 1],
+                    "sequence {sequence}"
+                );
+            }
+            for segment in &log.state.segments {
+                for &(sequence, offset, _) in &segment.history_index {
+                    assert!(sequence <= log.state.last_sequence);
+                    assert!(offset < segment.through);
+                }
+            }
+            assert_eq!(log.lookup_application(0).unwrap(), None);
+            assert_eq!(log.lookup_application(323).unwrap(), None);
+        };
+        check(&log);
+        let snapshot = log.snapshot().unwrap();
+        let replay = snapshot.replay(&fixture::Present, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            replay
+                .segments
+                .iter()
+                .map(|s| s.history_index.clone())
+                .collect::<Vec<_>>(),
+            appended
+        );
+        drop(snapshot);
+        drop(log);
+        let (log, _) = fixture::open(root.path(), &fixture::Present);
+        assert_eq!(
+            log.state
+                .segments
+                .iter()
+                .map(|s| s.history_index.clone())
+                .collect::<Vec<_>>(),
+            appended
+        );
+        check(&log);
     }
 }

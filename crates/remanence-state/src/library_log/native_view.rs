@@ -19,6 +19,16 @@ pub(crate) struct DroppedTapeLog {
     pub error: Option<String>,
 }
 
+/// Effect of one authoritative snapshot replacement on the previously held prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthoritativeChange {
+    Unchanged,
+    ChangedPrefix,
+    Removed,
+    ShorterPrefix,
+    IdentityOnly,
+}
+
 /// A frozen set of probed native logs. A genuinely missing or corrupt log is
 /// absent from the map and can never produce a pending (`NotYet`) reference.
 #[derive(Clone)]
@@ -30,7 +40,10 @@ pub struct NativeTapeView {
 impl NativeTapeView {
     /// Replace evidence under the current exclusive native owner. Unlike an
     /// ordinary append refresh, this can represent a proved absent/repaired log.
-    pub(crate) fn replace_authoritative(&mut self, snapshot: Snapshot) -> Result<(), StoreError> {
+    pub(crate) fn replace_authoritative(
+        &mut self,
+        snapshot: Snapshot,
+    ) -> Result<AuthoritativeChange, StoreError> {
         let uuid = snapshot.header().tape_uuid;
         if let Some(prior) = self.tapes.get(&uuid) {
             if prior.file_identity()? != snapshot.file_identity()? {
@@ -44,12 +57,39 @@ impl NativeTapeView {
                 retired.remove(&identity);
             }
         }
-        if snapshot.header_digest()?.is_some() {
+        // Keep replacement bookkeeping in its existing position: a failed
+        // digest read leaves tapes unchanged, but may have retired an identity.
+        let has_header = snapshot.header_digest()?.is_some();
+        let change = match (self.tapes.get(&uuid), has_header) {
+            (None, false) => AuthoritativeChange::Unchanged,
+            (None, true) => AuthoritativeChange::ChangedPrefix,
+            (Some(_), false) => AuthoritativeChange::Removed,
+            (Some(prior), true)
+                if snapshot.summary().closed_end < prior.summary().closed_end
+                    || snapshot.summary().last_closed_sequence
+                        < prior.summary().last_closed_sequence =>
+            {
+                AuthoritativeChange::ShorterPrefix
+            }
+            (Some(prior), true) => {
+                let old_identity = prior.file_identity()?;
+                if old_identity.is_some() && old_identity == snapshot.file_identity()? {
+                    AuthoritativeChange::Unchanged
+                } else if prior.projection_prefix_digest(prior.summary().closed_end)?
+                    != snapshot.projection_prefix_digest(prior.summary().closed_end)?
+                {
+                    AuthoritativeChange::ChangedPrefix
+                } else {
+                    AuthoritativeChange::IdentityOnly
+                }
+            }
+        };
+        if has_header {
             self.tapes.insert(uuid, snapshot);
         } else {
             self.tapes.remove(&uuid);
         }
-        Ok(())
+        Ok(change)
     }
     /// Validate every native log before opening the library authority. The tape
     /// directory must already exist; failure to read it is never an empty view.
@@ -271,3 +311,148 @@ impl crate::library_runtime::native_floor::PrefixDigestSource for NativePrefixDi
 #[cfg(test)]
 #[path = "native_view_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod replacement_report_tests {
+    use super::*;
+    use crate::authority::TapeAuthorityView;
+    use crate::tape_log::CommitCursor;
+    const ID: Id = [0xd2; 16];
+
+    /// Independent native owner, allowing real file identities and byte digests.
+    fn initialized(block_size: u32) -> (tempfile::TempDir, Snapshot) {
+        let root = tempfile::tempdir().unwrap();
+        let authority = crate::TapeAuthority::open_fixture(root.path(), ID).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                block_size,
+                None,
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        (root, owner.freeze().unwrap().raw)
+    }
+
+    /// Same number of valid frames, with different session identity lengths.
+    fn session_prefix(serial: &str) -> (tempfile::TempDir, Snapshot) {
+        let root = tempfile::tempdir().unwrap();
+        let authority = crate::TapeAuthority::open_fixture(root.path(), ID).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                262144,
+                None,
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        owner
+            .open_session(
+                [7; 16],
+                "2026-11-11T00:00:00Z".into(),
+                crate::tape_log::SessionDrive {
+                    serial: serial.into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: serial.into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
+        (root, owner.freeze().unwrap().raw)
+    }
+
+    /// Pin every ordered report branch, especially shortening before identity
+    /// or prefix hashing and a changed prefix with the same closed length.
+    #[test]
+    fn authoritative_replacement_reports_each_prefix_change() {
+        use AuthoritativeChange::*;
+        let root = tempfile::tempdir().unwrap();
+        let authority = crate::TapeAuthority::open_fixture(root.path(), ID).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        let absent = owner.freeze().unwrap().raw;
+        let mut view = NativeTapeView {
+            tapes: BTreeMap::new(),
+            dropped: Vec::new(),
+            replaced: BTreeMap::new(),
+        };
+        assert_eq!(
+            view.replace_authoritative(absent.clone()).unwrap(),
+            Unchanged
+        );
+        let empty = owner.publish_empty_prefix(262144, None).unwrap();
+        assert_eq!(
+            view.replace_authoritative(empty.clone()).unwrap(),
+            ChangedPrefix
+        );
+        owner
+            .publish_initialized(
+                262144,
+                None,
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        let grown = owner.freeze().unwrap().raw;
+        assert!(grown.summary().closed_end > empty.summary().closed_end);
+        assert_eq!(
+            grown.file_identity().unwrap(),
+            empty.file_identity().unwrap()
+        );
+        assert_eq!(
+            view.replace_authoritative(grown.clone()).unwrap(),
+            Unchanged,
+            "same file grown"
+        );
+        assert_eq!(
+            view.replace_authoritative(empty).unwrap(),
+            ShorterPrefix,
+            "shorter despite same identity"
+        );
+        assert_eq!(
+            view.replace_authoritative(grown.clone()).unwrap(),
+            Unchanged
+        );
+        let (_same_root, same) = initialized(262144);
+        assert_ne!(
+            same.file_identity().unwrap(),
+            grown.file_identity().unwrap()
+        );
+        assert_eq!(view.replace_authoritative(same).unwrap(), IdentityOnly);
+        let (_changed_root, changed) = initialized(524288);
+        assert_eq!(changed.summary().closed_end, grown.summary().closed_end);
+        assert_eq!(
+            view.replace_authoritative(changed).unwrap(),
+            ChangedPrefix,
+            "changed-prefix report"
+        );
+        let (_long_root, long) = session_prefix("LONG-DRIVE-SERIAL");
+        view.replace_authoritative(long.clone()).unwrap();
+        let (_short_root, short) = session_prefix("DRV");
+        assert_eq!(
+            short.summary().last_closed_sequence,
+            long.summary().last_closed_sequence
+        );
+        assert!(short.summary().closed_end < long.summary().closed_end);
+        assert_eq!(
+            view.replace_authoritative(short).unwrap(),
+            ShorterPrefix,
+            "shorter by bytes alone"
+        );
+        assert_eq!(view.replace_authoritative(absent.clone()).unwrap(), Removed);
+        assert!(!view.tapes.contains_key(&ID));
+        assert_eq!(view.replace_authoritative(absent).unwrap(), Unchanged);
+    }
+}

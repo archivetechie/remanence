@@ -176,12 +176,18 @@ fn library_replay_memory_is_per_resource() {
         assert_eq!(r.fold.tapes.len(), 10);
         assert!(r.fold.pending.is_empty());
         assert!(r.decoder_peak_bytes < 4096);
+        assert!(
+            r.history_index_bytes() <= r.last_sequence.div_ceil(64) as usize * 96,
+            "sparse history index: {} bytes for {} frames",
+            r.history_index_bytes(),
+            r.last_sequence
+        );
         assert!(peak < 512 * 1024, "{n}: {peak} bytes");
         eprintln!(
             "records={n} peak_live_delta={peak} decoder_buffer={}",
             r.decoder_peak_bytes
         );
-        peaks.push(peak);
+        peaks.push(peak - r.history_index_bytes());
         // Repeat the same fixed-resource workload with exactly 4096 pending
         // records. Canonical pending bytes are bounded separately from metadata.
         let path = d.path().join(&r.segments.last().unwrap().name);
@@ -239,6 +245,12 @@ fn library_replay_memory_is_per_resource() {
         assert_eq!(r.fold.applied_through, n);
         assert_eq!(r.last_sequence, n + MAX_PENDING_RECORDS as u64);
         assert!(r.fold.pending_bytes() <= MAX_PENDING_BYTES);
+        assert!(
+            r.history_index_bytes() <= r.last_sequence.div_ceil(64) as usize * 96,
+            "sparse history index: {} bytes for {} frames",
+            r.history_index_bytes(),
+            r.last_sequence
+        );
         assert!(peak < 16 * 1024 * 1024, "{peak}");
         assert!(r.decoder_peak_bytes < 4096);
         eprintln!(
@@ -247,7 +259,7 @@ fn library_replay_memory_is_per_resource() {
             r.fold.pending_bytes(),
             r.decoder_peak_bytes
         );
-        capped_peaks.push(peak);
+        capped_peaks.push(peak - r.history_index_bytes());
     }
     assert!(
         capped_peaks[1] <= capped_peaks[0] + 32 * 1024,

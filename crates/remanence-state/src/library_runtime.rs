@@ -188,6 +188,8 @@ struct Inner {
     ack_progress: Mutex<std::collections::BTreeMap<lib::Id, (u64, u64)>>,
     #[cfg(test)]
     ack_frames_checked: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    refold_scans: std::sync::atomic::AtomicUsize,
 }
 impl std::fmt::Debug for LibraryRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -211,6 +213,66 @@ fn store_failure(error: &AuthorityError) -> bool {
 }
 /// Per owed tape, the reconciliation disposition and its existing skip reason.
 pub(crate) type ReconciliationSummary = Vec<(lib::Id, &'static str)>;
+
+/// Respond to every completed evidence replacement before releasing dispatch,
+/// including an owners-loop error, an append refusal, or unwinding from write.
+struct IdentityReplacement<'a> {
+    runtime: &'a LibraryRuntime,
+    changes: Vec<(lib::Id, lib::native_view::AuthoritativeChange)>,
+}
+impl Drop for IdentityReplacement<'_> {
+    fn drop(&mut self) {
+        use lib::native_view::AuthoritativeChange;
+        let refold = self.changes.iter().any(|(_, change)| {
+            matches!(
+                change,
+                AuthoritativeChange::Removed
+                    | AuthoritativeChange::ShorterPrefix
+                    | AuthoritativeChange::ChangedPrefix
+            )
+        });
+        if refold {
+            // Establish recovery obligations before a refusal check or any scan.
+            self.runtime
+                .0
+                .projection_dirty
+                .store(true, Ordering::Release);
+        }
+        {
+            let mut progress = self
+                .runtime
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (tape, change) in &self.changes {
+                if !matches!(change, AuthoritativeChange::Unchanged) {
+                    progress.remove(tape);
+                }
+            }
+        }
+        if refold {
+            let view = self
+                .runtime
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let (scanned, refusal) = self.runtime.0.authority.refold_replaced_view(&view);
+            #[cfg(test)]
+            if scanned {
+                self.runtime.0.refold_scans.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(not(test))]
+            let _ = scanned;
+            if let Some(refusal) = refusal {
+                self.runtime.0.motion_fenced.store(true, Ordering::Release);
+                tracing::error!(?refusal, "replacement evidence fenced library motion");
+            }
+        }
+    }
+}
 
 impl LibraryRuntime {
     /// Admit the bound namespaces under an existing state lease, probe every
@@ -365,6 +427,8 @@ impl LibraryRuntime {
                 ack_progress: Mutex::new(ack_progress),
                 #[cfg(test)]
                 ack_frames_checked: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                refold_scans: std::sync::atomic::AtomicUsize::new(0),
                 authority,
                 view: Mutex::new(view),
                 dispatch: Mutex::new(()),
@@ -406,12 +470,21 @@ impl LibraryRuntime {
         ) -> Result<AuthorityReceipt, AuthorityError>,
     ) -> Result<lib::Receipt, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        // Declared after dispatch so every exit responds before dispatch drops.
+        let mut response = IdentityReplacement {
+            runtime: self,
+            changes: Vec::new(),
+        };
         use crate::authority::TapeAuthorityView;
         let view = {
             let mut view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
             for owner in owners {
-                view.replace_authoritative(owner.freeze()?.raw)
+                let snapshot = owner.freeze()?.raw;
+                let tape = snapshot.header().tape_uuid;
+                let change = view
+                    .replace_authoritative(snapshot)
                     .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+                response.changes.push((tape, change));
             }
             view.clone()
         };
@@ -1266,3 +1339,462 @@ mod measurements;
 
 #[cfg(test)]
 mod projection_lag_tests;
+
+#[cfg(test)]
+mod identity_refold_tests {
+    use super::*;
+    use crate::authority::TapeAuthorityView;
+    use crate::tape_log::{snapshot::Snapshot, CommitCursor};
+    use std::{cell::Cell, fs, path::PathBuf};
+    const TAPE: lib::Id = [0xd3; 16];
+
+    /// Runtime plus an independently held old tape snapshot; no device or service.
+    struct Fixture {
+        runtime: LibraryRuntime,
+        _root: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let paths = StatePaths {
+                config_path: root.path().join("config"),
+                state_dir: root.path().join("state"),
+                audit_dir: root.path().join("library"),
+                journal_dir: root.path().join("native"),
+                sqlite_path: root.path().join("catalog.sqlite"),
+                tape_cache_dir: root.path().join("cache"),
+                calibration_dir: root.path().join("calibration"),
+            };
+            let runtime = LibraryRuntime::open(
+                &paths,
+                true,
+                Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+            )
+            .unwrap();
+            runtime.append(diagnostic).unwrap();
+            Self {
+                runtime,
+                _root: root,
+            }
+        }
+        fn seed(&self, snapshot: Snapshot) {
+            let _dispatch = self
+                .runtime
+                .0
+                .dispatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let progress = (
+                snapshot.summary().last_closed_sequence,
+                snapshot.summary().closed_end,
+            );
+            self.runtime
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .refresh(snapshot)
+                .unwrap();
+            self.runtime
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(TAPE, progress);
+        }
+        fn scans(&self) -> usize {
+            self.runtime.0.refold_scans.load(Ordering::Relaxed)
+        }
+        fn assert_refolded(&self) {
+            assert_eq!(self.scans(), 1, "replacement must re-fold exactly once");
+            assert!(self.runtime.0.projection_dirty.load(Ordering::Acquire));
+            assert!(!self
+                .runtime
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&TAPE));
+        }
+        fn segment(&self) -> PathBuf {
+            fs::read_dir(self.runtime.manifest().library_root())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+                .unwrap()
+        }
+    }
+
+    /// A native lease can supply an absent, header-only or initialized prefix.
+    fn owner(
+        id: lib::Id,
+        initialized: bool,
+        block_size: u32,
+    ) -> (tempfile::TempDir, crate::TapeAuthorityLease) {
+        let root = tempfile::tempdir().unwrap();
+        let authority = crate::TapeAuthority::open_fixture(root.path(), id).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        if initialized {
+            owner
+                .publish_initialized(
+                    block_size,
+                    None,
+                    CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+        } else {
+            owner.publish_empty_prefix(block_size, None).unwrap();
+        }
+        (root, owner)
+    }
+
+    /// A real writer call with no native dependencies, also used after a latch.
+    fn diagnostic(
+        a: &LibraryAuthority,
+        v: &dyn TapeView,
+    ) -> Result<AuthorityReceipt, AuthorityError> {
+        a.diagnostic(
+            lib::Diagnostic {
+                event: lib::DiagnosticEvent::RequestReceived,
+                subject_kind: "identity-refold".into(),
+                subject_id: None,
+                detail: lib::Bounded(vec![]),
+            },
+            lib::AuditActor::System,
+            lib::SourceLayer::Layer4,
+            v,
+        )
+    }
+
+    /// Check append refusal first, then the health bit; return its exact boundary.
+    fn latched(runtime: &LibraryRuntime) -> lib::store::Refusal {
+        let error = runtime.append(diagnostic).unwrap_err();
+        let RuntimeError::Authority(AuthorityError::Store(StoreError::RecoveryRequired(refusal))) =
+            error
+        else {
+            panic!("next append must refuse RecoveryRequired: {error:?}");
+        };
+        assert!(runtime.motion_fenced(), "re-fold refusal must fence motion");
+        assert!(
+            !runtime
+                .manifest()
+                .library_root()
+                .join("library-log.ambiguous")
+                .exists(),
+            "re-fold refusal is in-memory only"
+        );
+        refusal
+    }
+
+    /// A shortened native prefix invalidates both the fold and acknowledgement mark.
+    #[test]
+    fn identity_refold_shorter_prefix() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        f.runtime
+            .append_identity(&[&new], |a, v, _| diagnostic(a, v))
+            .unwrap();
+        f.assert_refolded();
+        assert!(!f.runtime.motion_fenced());
+    }
+
+    /// Same identity preserves the mark; identical bytes in a new inode drop it
+    /// without scanning or dirtying an otherwise successful append.
+    #[test]
+    fn identity_refold_identity_only_and_unchanged() {
+        for identity_only in [false, true] {
+            let f = Fixture::new();
+            let (_old_root, old) = owner(TAPE, true, 262144);
+            f.seed(old.freeze().unwrap().raw);
+            let (_new_root, new) = owner(TAPE, true, 262144);
+            let chosen = if identity_only { &new } else { &old };
+            f.runtime
+                .append_identity(&[chosen], |a, v, _| diagnostic(a, v))
+                .unwrap();
+            assert_eq!(f.scans(), 0);
+            assert!(!f.runtime.0.projection_dirty.load(Ordering::Acquire));
+            assert_eq!(
+                f.runtime
+                    .0
+                    .ack_progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&TAPE),
+                !identity_only
+            );
+        }
+    }
+
+    /// A later owner's freeze error must still respond to the earlier replacement.
+    #[test]
+    fn identity_refold_owners_loop_error() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let (bad_root, bad) = owner([0xd4; 16], false, 262144);
+        fs::write(
+            bad_root.path().join(format!(
+                "{}.remtape",
+                uuid::Uuid::from_bytes([0xd4; 16]).simple()
+            )),
+            b"bad header",
+        )
+        .unwrap();
+        let called = Cell::new(false);
+        assert!(f
+            .runtime
+            .append_identity(&[&new, &bad], |a, v, _| {
+                called.set(true);
+                diagnostic(a, v)
+            })
+            .is_err());
+        assert!(!called.get());
+        f.assert_refolded();
+    }
+
+    /// A real typed append refusal does not suppress the replacement response.
+    #[test]
+    fn identity_refold_append_error() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let error = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                a.fence_released(
+                    lib::FenceReleased {
+                        fence: u64::MAX,
+                        evidence: "invalid forward cause".into(),
+                        forced: true,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Authority(AuthorityError::Store(StoreError::Fold(
+                lib::FoldError::ForwardReference
+            )))
+        ));
+        f.assert_refolded();
+    }
+
+    /// Unwinding poisons the held view mutex; the response recovers it and scans.
+    #[test]
+    fn identity_refold_write_panic() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = f.runtime.append_identity(&[&new], |a, v, _| {
+                diagnostic(a, v).unwrap();
+                panic!("write panic after append");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(f.runtime.0.view.is_poisoned());
+        f.assert_refolded();
+        assert!(f
+            .runtime
+            .0
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(TAPE)
+            .is_some());
+    }
+
+    /// Raise the same source-backed drive fence as the runtime motion tests.
+    fn raise(runtime: &LibraryRuntime, key: &crate::DriveKey) -> u64 {
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(motion::endpoint(key)),
+                        cause: lib::FenceCause::Cleaning,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    }
+
+    /// Locate a real frame without relying on record sizes or guessed offsets.
+    fn frame_offset(path: &std::path::Path, uuid: lib::Id, sequence: u64) -> u64 {
+        let bytes = fs::read(path).unwrap();
+        let mut input = bytes.as_slice();
+        let header = lib::codec::Header::decode(&mut input, uuid).unwrap();
+        let mut decoder =
+            lib::codec::Decoder::at(input, header.first_sequence, lib::codec::HEADER_LEN);
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            if frame.sequence == sequence {
+                return frame.offset;
+            }
+        }
+        panic!("fixture frame missing");
+    }
+
+    /// A refusing scan may not erase a drive fence from the live fold.
+    #[test]
+    fn identity_refold_scan_refusal_keeps_drive_fence() {
+        let f = Fixture::new();
+        let key = crate::DriveKey::Standalone {
+            drive_serial: "LLR2".into(),
+        };
+        let fence = raise(&f.runtime, &key);
+        assert_eq!(f.runtime.drive_fenced(&key).unwrap().fence, fence);
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let path = f.segment();
+        let offset = frame_offset(&path, f.runtime.manifest().library_uuid(), fence);
+        let receipt = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[offset as usize + crate::log_frame::PREFIX_LEN] ^= 1;
+                fs::write(&path, bytes).unwrap();
+                Ok(result)
+            })
+            .unwrap();
+        let refusal = latched(&f.runtime);
+        assert_eq!(
+            f.runtime.drive_fenced(&key).map(|fence| fence.fence),
+            Some(fence),
+            "refusing scan must retain drive fence"
+        );
+        assert_eq!(refusal.sequence, Some(fence));
+        assert_eq!(refusal.offset, offset);
+        assert!(matches!(refusal.fault, lib::store::RefusalKind::Bytes(_)));
+        assert_eq!(
+            f.runtime
+                .0
+                .authority
+                .with_fold(|fold| fold.received_through),
+            receipt.sequence
+        );
+        f.assert_refolded();
+    }
+
+    /// A scan I/O error latches the live end; a later changed prefix cannot retry.
+    #[test]
+    fn identity_refold_scan_error_latches_live_end() {
+        let f = Fixture::new();
+        let key = crate::DriveKey::Standalone {
+            drive_serial: "LLR2".into(),
+        };
+        let fence = raise(&f.runtime, &key);
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let path = f.segment();
+        let mut live_end = 0;
+        let receipt = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                live_end = fs::metadata(&path).unwrap().len();
+                fs::remove_file(&path).unwrap();
+                Ok(result)
+            })
+            .unwrap();
+        let refusal = latched(&f.runtime);
+        assert_eq!(refusal.sequence, Some(receipt.sequence + 1));
+        assert_eq!(refusal.offset, live_end);
+        assert_eq!(refusal.segment, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            refusal.fault,
+            lib::store::RefusalKind::Fold(lib::FoldError::HistoryUnavailable)
+        );
+        assert_eq!(
+            f.runtime
+                .0
+                .authority
+                .with_fold(|fold| fold.received_through),
+            receipt.sequence
+        );
+        assert_eq!(
+            f.runtime.drive_fenced(&key).map(|fence| fence.fence),
+            Some(fence)
+        );
+        f.assert_refolded();
+        let (_changed_root, changed) = owner(TAPE, true, 524288);
+        f.runtime
+            .0
+            .ack_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(TAPE, (1, 1));
+        assert!(f
+            .runtime
+            .append_identity(&[&changed], |_, _, _| panic!(
+                "latched refusal must precede write"
+            ))
+            .is_err());
+        assert_eq!(latched(&f.runtime), refusal);
+        f.assert_refolded();
+    }
+
+    /// A complete shorter library prefix is a refusal, not a replacement fold;
+    /// its boundary is the scanned through, one sequence before the live end.
+    #[test]
+    fn identity_refold_clean_short_scan_keeps_fold() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let path = f.segment();
+        let prior_through = fs::metadata(&path).unwrap().len();
+        let receipt = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(prior_through)
+                    .unwrap();
+                Ok(result)
+            })
+            .unwrap();
+        let refusal = latched(&f.runtime);
+        assert_eq!(
+            f.runtime
+                .0
+                .authority
+                .with_fold(|fold| fold.received_through),
+            receipt.sequence,
+            "clean-short scan must retain live fold"
+        );
+        assert_eq!(refusal.sequence, Some(receipt.sequence));
+        assert_eq!(refusal.offset, prior_through);
+        assert_eq!(refusal.segment, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            refusal.fault,
+            lib::store::RefusalKind::Fold(lib::FoldError::HistoryUnavailable)
+        );
+        f.assert_refolded();
+    }
+}

@@ -226,6 +226,14 @@ impl LibraryAuthority {
         })
     }
 
+    /// Read the live fold only while storage and pending-dependency gates permit it.
+    /// The callback runs under the append lock and must not re-enter this authority.
+    pub fn gated_fold<T>(&self, read: impl FnOnce(&LibraryFold) -> T) -> Result<T, StoreError> {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        log.check_fold_read()?;
+        Ok(read(&log.state().fold))
+    }
+
     /// Read derived authority under the same log lock used by the writer.
     pub fn with_fold<T>(&self, f: impl FnOnce(&LibraryFold) -> T) -> T {
         let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
@@ -277,14 +285,14 @@ impl LibraryAuthority {
         } else {
             None
         };
-        let mut sequences = Vec::new();
+        let mut records = Vec::new();
         let result = log
             .append_checked(
                 body,
                 actor,
                 layer,
                 view,
-                &mut |n| sequences.push(n),
+                &mut |sequence, record, hash| records.push((sequence, record, hash)),
                 &|fold, body| {
                     if require_readiness_owner {
                         let Body::ReadinessObserved(readiness) = body else {
@@ -371,22 +379,16 @@ impl LibraryAuthority {
                 AuthorityError::Store(error)
             });
         let progress = FoldProgress::capture(&log.state().fold);
-        let applied = sequences
+        let applied: Vec<_> = records
             .into_iter()
-            .map(|sequence| {
-                let (record, record_hash) = log
-                    .lookup_application(sequence)
-                    .map_err(StoreError::Fold)?
-                    .ok_or(StoreError::Fold(FoldError::HistoryUnavailable))?;
-                Ok(AppliedLibraryRecord {
-                    log_uuid: log.log_uuid(),
-                    record_hash,
-                    sequence,
-                    record,
-                    progress,
-                })
+            .map(|(sequence, record, record_hash)| AppliedLibraryRecord {
+                log_uuid: log.log_uuid(),
+                record_hash,
+                sequence,
+                record,
+                progress,
             })
-            .collect::<Result<_, StoreError>>()?;
+            .collect();
         match result {
             Ok(receipt) => Ok(AuthorityReceipt { receipt, applied }),
             Err(error) if applied.is_empty() => Err(error),
@@ -975,6 +977,36 @@ impl LibraryAuthority {
             _state_lock: self._state_lock.clone(),
         })
     }
+    /// Re-fold replaced native evidence while the runtime retains dispatch.
+    /// Return whether a scan ran and any refusal it latched. Neither the view
+    /// nor the log lock is held during scanning; ambiguity does not widen limits.
+    pub(crate) fn refold_replaced_view(
+        &self,
+        view: &dyn TapeView,
+    ) -> (bool, Option<store::Refusal>) {
+        let source = {
+            let log = self.log.lock().unwrap_or_else(|error| error.into_inner());
+            if log.state().refusal.is_some() {
+                return (false, None);
+            }
+            log.bounded_source()
+        };
+        let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.replay(view, &mut |_| Ok(()))
+        }))
+        .unwrap_or_else(|_| {
+            Err(StoreError::Io(std::io::Error::other(
+                "panic while re-folding replaced native evidence",
+            )))
+        });
+        let refusal = self
+            .log
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .install_refold(scanned);
+        (true, refusal)
+    }
+
     /// Tapes whose fence publication was lost, read under append ownership.
     pub(crate) fn fence_reconciliation_tapes(&self) -> Result<Vec<Id>, AuthorityError> {
         Ok(self
@@ -1250,5 +1282,338 @@ mod refusal_delivery_tests {
             writer.normalized_authority_dump()["idempotency_keys"].len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod append_application_tests {
+    use super::*;
+    use crate::library_log::tests as fixture;
+
+    /// The pre-LLR-2 readback path, driven only by the row's expected sequences.
+    fn history_oracle(log: &LibraryLog, sequences: &[u64]) -> Vec<AppliedLibraryRecord> {
+        let progress = FoldProgress::capture(&log.state().fold);
+        sequences
+            .iter()
+            .copied()
+            .map(|sequence| {
+                let (record, record_hash) = log
+                    .lookup_application(sequence)
+                    .map_err(StoreError::Fold)?
+                    .ok_or(StoreError::Fold(FoldError::HistoryUnavailable))?;
+                Ok(AppliedLibraryRecord {
+                    log_uuid: log.log_uuid(),
+                    record_hash,
+                    sequence,
+                    record,
+                    progress,
+                })
+            })
+            .collect::<Result<_, StoreError>>()
+            .unwrap()
+    }
+
+    /// Compare every field, including progress captured after the whole attempt.
+    fn assert_applications(
+        authority: &LibraryAuthority,
+        actual: &[AppliedLibraryRecord],
+        expected_sequences: &[u64],
+        row: &str,
+    ) {
+        let expected = history_oracle(&authority.log.lock().unwrap(), expected_sequences);
+        assert_eq!(actual.len(), expected.len(), "{row}: application count");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.log_uuid, expected.log_uuid, "{row}: log UUID");
+            assert_eq!(actual.sequence, expected.sequence, "{row}: sequence");
+            assert_eq!(actual.record_hash, expected.record_hash, "{row}: hash");
+            assert_eq!(actual.record, expected.record, "{row}: decoded record");
+            assert_eq!(
+                actual.progress.received, expected.progress.received,
+                "{row}: received"
+            );
+            assert_eq!(
+                actual.progress.pending, expected.progress.pending,
+                "{row}: pending"
+            );
+            assert_eq!(
+                actual.progress.non_applications, expected.progress.non_applications,
+                "{row}: non-applications"
+            );
+        }
+    }
+
+    /// Pending resolution, duplicates and a refused candidate all preserve the
+    /// old readback's exact list; a confirmed motion still looks up its evidence.
+    #[test]
+    fn append_applications_match_history_oracle() {
+        for row in ["pending", "duplicate", "refusal"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("library");
+            let (mut log, _) = fixture::open(&dir, &fixture::Present);
+            fixture::put(&mut log, fixture::provision(1, None));
+            let pending = Body::ManualFinalizationAccepted(ManualFinalizationAccepted {
+                at: fixture::at(1, 1),
+                operation: [8; 16],
+                actor_fingerprint: "operator".into(),
+                idempotency_key: [8; 16],
+                request_fingerprint: [1; 32],
+                assignment_generation: 1,
+            });
+            fixture::put(&mut log, pending.clone());
+            drop(log);
+            let (log, _) = fixture::open(&dir, &fixture::View::default());
+            assert_eq!(log.state().fold.pending.len(), 1);
+            let authority = LibraryAuthority {
+                log: Mutex::new(log),
+                _state_lock: Arc::new(StateLockGuard::acquire(root.path()).unwrap()),
+            };
+            let body = match row {
+                "duplicate" => pending,
+                "refusal" => fixture::pool(1, 999),
+                _ => fixture::diagnostic(),
+            };
+            let result = authority.write(
+                body,
+                AuditActor::System,
+                SourceLayer::Layer4,
+                &fixture::Present,
+                None,
+            );
+            let (applied, sequences): (_, &[u64]) = match row {
+                "refusal" => {
+                    let AuthorityError::AppliedBeforeRefusal { error, applied } =
+                        result.unwrap_err()
+                    else {
+                        panic!("refusal: pending applications lost");
+                    };
+                    assert!(matches!(
+                        *error,
+                        AuthorityError::Store(StoreError::Fold(FoldError::GenerationMismatch))
+                    ));
+                    (applied, &[2])
+                }
+                "duplicate" => {
+                    let receipt = result.unwrap();
+                    assert_eq!(receipt.receipt.sequence, 2);
+                    (receipt.applied, &[2])
+                }
+                _ => (result.unwrap().applied, &[2, 3]),
+            };
+            assert_applications(&authority, &applied, sequences, row);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (mut log, _) = fixture::open(&root.path().join("library"), &fixture::Present);
+        fixture::put(&mut log, fixture::provision(1, None));
+        fixture::put(&mut log, fixture::intent(1));
+        fixture::put(
+            &mut log,
+            Body::InventoryReconciled(InventoryReconciled {
+                subject: InventorySubject::Library("LIBA0001".into()),
+                observation_generation: 1,
+                resolves: Bounded(vec![]),
+                complete: true,
+                elements: Bounded(vec![]),
+            }),
+        );
+        let authority = LibraryAuthority {
+            log: Mutex::new(log),
+            _state_lock: Arc::new(StateLockGuard::acquire(root.path()).unwrap()),
+        };
+        let result = authority
+            .motion_outcome(
+                MotionOutcome {
+                    intent: fixture::decision(2),
+                    result: MotionResult::Done,
+                    evidence: fixture::evidence(),
+                    confirmation: Some(Confirmation::Inventory(3)),
+                },
+                AuditActor::System,
+                SourceLayer::Layer4,
+                &fixture::Present,
+            )
+            .unwrap();
+        assert_applications(&authority, &result.applied, &[4], "confirmed motion");
+    }
+}
+
+#[cfg(test)]
+mod gated_fold_tests {
+    use super::*;
+    use crate::library_log::tests as fixture;
+    use crate::log_frame::publication;
+    use std::{cell::Cell, fs};
+
+    /// Every refusal precedes the callback; the process fence survives removal
+    /// of its marker, and a pending fold is unavailable even with clean bytes.
+    #[test]
+    fn gated_fold_checks_storage_and_pending_before_reading() {
+        for row in ["clean", "marker", "process", "refusal", "pending", "io"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("library");
+            let (mut log, _) = fixture::open(&dir, &fixture::Present);
+            if row == "pending" {
+                fixture::put(&mut log, fixture::provision(1, None));
+                fixture::put(
+                    &mut log,
+                    Body::ManualFinalizationAccepted(ManualFinalizationAccepted {
+                        at: fixture::at(1, 1),
+                        operation: [8; 16],
+                        actor_fingerprint: "operator".into(),
+                        idempotency_key: [8; 16],
+                        request_fingerprint: [1; 32],
+                        assignment_generation: 1,
+                    }),
+                );
+                drop(log);
+                (log, _) = fixture::open(&dir, &fixture::View::default());
+                assert_eq!(log.state().fold.pending.len(), 1);
+            } else {
+                fixture::put(&mut log, fixture::diagnostic());
+            }
+            if row == "refusal" {
+                let path = dir.join(&log.state().segments[0].name);
+                drop(log);
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[codec::HEADER_LEN as usize] ^= 1;
+                fs::write(path, bytes).unwrap();
+                (log, _) = fixture::open(&dir, &fixture::Present);
+                assert!(log.state().refusal.is_some());
+            }
+            let expected_refusal = log.state().refusal.clone();
+            let authority = LibraryAuthority {
+                log: Mutex::new(log),
+                _state_lock: Arc::new(StateLockGuard::acquire(root.path()).unwrap()),
+            };
+            let identity = dir.join("library-log");
+            match row {
+                "marker" => fs::write(identity.with_extension("ambiguous"), []).unwrap(),
+                "process" => {
+                    publication::fence_ambiguity(&dir, &identity);
+                    fs::remove_file(identity.with_extension("ambiguous")).unwrap();
+                }
+                "io" => {
+                    fs::rename(&dir, root.path().join("saved-library")).unwrap();
+                    fs::write(&dir, b"not a directory").unwrap();
+                }
+                _ => (),
+            }
+            let called = Cell::new(false);
+            let result = authority.gated_fold(|fold| {
+                called.set(true);
+                fold.received_through
+            });
+            match row {
+                "clean" => assert_eq!(result.unwrap(), 1),
+                "marker" | "process" => assert!(matches!(result, Err(StoreError::Fenced)), "{row}"),
+                "refusal" => {
+                    let Err(StoreError::RecoveryRequired(refusal)) = result else {
+                        panic!("refusal gate did not refuse");
+                    };
+                    assert_eq!(Some(refusal), expected_refusal);
+                }
+                "pending" => assert!(
+                    matches!(result, Err(StoreError::Fold(FoldError::HistoryUnavailable))),
+                    "pending gate did not refuse"
+                ),
+                "io" => assert!(matches!(result, Err(StoreError::Io(_)))),
+                _ => unreachable!(),
+            }
+            assert_eq!(called.get(), row == "clean", "{row}: callback gate");
+        }
+    }
+}
+
+#[cfg(test)]
+mod refold_boundary_tests {
+    use super::*;
+    use crate::library_log::tests as fixture;
+    use crate::log_frame::publication;
+    use std::{fs, io::Write};
+
+    /// An ambiguity fence can coexist with a complete unacknowledged frame.
+    /// Re-folding must scan only the live through and keep that fence intact.
+    #[test]
+    fn refold_is_bounded_under_ambiguity() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("library");
+        let (mut log, _) = fixture::open(&dir, &fixture::Present);
+        fixture::put(&mut log, fixture::diagnostic());
+        let (bytes, _) = codec::encode(
+            2,
+            log.state().terminal_hash,
+            &fixture::record(fixture::diagnostic(), 2),
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(&log.state().segments[0].name))
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        publication::fence_ambiguity(&dir, &dir.join("library-log"));
+        let authority = LibraryAuthority {
+            log: Mutex::new(log),
+            _state_lock: Arc::new(StateLockGuard::acquire(root.path()).unwrap()),
+        };
+        assert!(matches!(
+            authority.snapshot(),
+            Err(AuthorityError::Store(StoreError::Fenced))
+        ));
+        let (scanned, refusal) = authority.refold_replaced_view(&fixture::Present);
+        assert!(scanned);
+        assert_eq!(refusal, None);
+        assert_eq!(authority.with_fold(|fold| fold.received_through), 1);
+        assert!(matches!(
+            authority.gated_fold(|_| ()),
+            Err(StoreError::Fenced)
+        ));
+    }
+
+    /// A panic in tape evidence is handled like scan I/O, with no marker or retry.
+    #[test]
+    fn refold_catches_scan_panic_and_keeps_live_fold() {
+        struct PanicView;
+        impl TapeView for PanicView {
+            fn lookup(&self, _: &TapeAt) -> Result<TapeLookup, FoldError> {
+                panic!("scan evidence panic");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("library");
+        let (mut log, _) = fixture::open(&dir, &fixture::Present);
+        fixture::put(&mut log, fixture::provision(1, None));
+        fixture::put(
+            &mut log,
+            Body::ManualFinalizationAccepted(ManualFinalizationAccepted {
+                at: fixture::at(1, 1),
+                operation: [8; 16],
+                actor_fingerprint: "operator".into(),
+                idempotency_key: [8; 16],
+                request_fingerprint: [1; 32],
+                assignment_generation: 1,
+            }),
+        );
+        let segment = log.state().segments.last().unwrap();
+        let expected = store::Refusal {
+            segment: segment.name.clone(),
+            offset: segment.through,
+            sequence: Some(3),
+            fault: store::RefusalKind::Fold(FoldError::HistoryUnavailable),
+        };
+        let authority = LibraryAuthority {
+            log: Mutex::new(log),
+            _state_lock: Arc::new(StateLockGuard::acquire(root.path()).unwrap()),
+        };
+        assert_eq!(
+            authority.refold_replaced_view(&PanicView),
+            (true, Some(expected.clone()))
+        );
+        assert_eq!(authority.with_fold(|fold| fold.received_through), 2);
+        assert_eq!(authority.refold_replaced_view(&PanicView), (false, None));
+        assert!(
+            matches!(authority.gated_fold(|_| ()), Err(StoreError::RecoveryRequired(r)) if r == expected)
+        );
+        assert!(!dir.join("library-log.ambiguous").exists());
     }
 }
