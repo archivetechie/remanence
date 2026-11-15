@@ -500,8 +500,8 @@ raises no tape or drive fence. It is refused with
 `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
 counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
 drive motion until it exits. Append admission also checks the physical tail:
-`TailBeyondKnownState` means local state cannot authorize overwriting complete
-data. Restore newer state or rescue with `tape restore --scan` before considering
+`TailBeyondKnownState` means local state cannot authorize overwriting data it
+does not record (complete files or only a torn fragment). Restore newer state or rescue with `tape restore --scan` before considering
 supersede-tail.
 
 ### rem get (standalone)

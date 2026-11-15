@@ -232,7 +232,9 @@ There are two kinds of fence.
   `rem catalog tapes --json`, `rem top` and `rem daemon health --json` show these fences.
   In a library, a tape fenced only by `append_admission_refused` stays readable
   and closed for writing; robot motion, eviction and idle unload proceed. A tape fenced only by
-  `session_suffix_contradiction` allows that motion but refuses reads and writing.
+  `session_suffix_contradiction` allows robot motion and eviction, and idle unload
+  once the running service has parked it (a cartridge already seated when the
+  service starts stays until moved), but refuses reads and writing.
   Neither is released by `rem tape quarantine release`. Use `rem tape supersede-tail`
   where recovery applies; it refuses a contradicting recorded session ending or a
   state that shows the tape's last session closed. Otherwise withdraw the tape with

@@ -461,7 +461,8 @@ command; there is no endpoint fence to release for this failure.
 
 Release records your acknowledgement; it does not prove that the append point
 is safe. Every append checks the physical tail. `TailBeyondKnownState` means
-complete data exists beyond the position your local state knows. Restore a
+the tape holds data your local state does not record (complete files or only a
+torn fragment) beyond the position it knows. Restore a
 newer state backup, or rescue with `--scan`. Do not delete the tape logs in the
 state directory to make the refusal go away.
 

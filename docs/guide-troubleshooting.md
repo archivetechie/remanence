@@ -343,13 +343,14 @@ Two tape-I/O recovery fences have different admission rules:
   Writing, closeout, finalization and terminal-index reads (`rem tape inventory`,
   `rem tape verify-index`) stay refused.
 - `session_suffix_contradiction` records a tape that contradicts its recorded
-  session ending. Robot motion, eviction and idle unload proceed; read sessions
-  and writing stay refused.
+  session ending. Robot motion and eviction proceed, and a cartridge the running
+  service parks idle-unloads; read sessions and writing stay refused.
 
 These permissions apply only when all matching fences allow the operation.
 Idle dismount and readiness waits can move a cartridge whose only fences are
-these two causes. Startup readiness reconciliation also proceeds when the only
-fence is `append_admission_refused`. Other fenced tapes and drives are left
+these two causes. Startup readiness reconciliation, and the parking and idle
+unload of a cartridge already seated when the service starts, proceed only when
+the only fence is `append_admission_refused`. Other fenced tapes and drives are left
 untouched by checkpoint replay and projection, append recovery, manual-finalize
 relaunch, terminal recovery, readiness reconciliation and automatic waits,
 session closeout handling, and idle dismount. Other media remain available.
