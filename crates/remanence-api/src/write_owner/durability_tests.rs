@@ -2125,11 +2125,11 @@ fn record_typed_writer_open(
                 };
                 let identities_ok = fences.iter().all(|fence| {
                     fence.tape_uuid == TAPE && runtime.fence_for_quarantine_id(&fence.quarantine_id)
-                        .is_some_and(|f| f.cause == remanence_state::library_log::FenceCause::SessionSuffixContradiction)
+                        .is_some_and(|f| f.cause == remanence_state::library_log::FenceCause::AppendAdmissionRefused)
                 });
                 if !count_ok || !identities_ok {
                     note_typed_failure(evidence, typed_violation("writer refusal fences", format!(
-                        "{} refusal must leave {} SessionSuffixContradiction fence(s) on the case's tape; got {fences:?}",
+                        "{} refusal must leave {} AppendAdmissionRefused fence(s) on the case's tape; got {fences:?}",
                         refusal["category"], if refusal["category"] == "uncommitted tape tail" { "exactly one" } else { "zero or one" }
                     )));
                 }
@@ -2506,7 +2506,8 @@ async fn check_typed_crash(
         if row["released"] == true {
             continue;
         }
-        let suffix = row["cause"] == "SessionSuffixContradiction";
+        let suffix = row["cause"] == "SessionSuffixContradiction"
+            || row["cause"] == "AppendAdmissionRefused";
         if suffix {
             let opens = evidence["writer_opens"].as_array().unwrap();
             let under_fence = |open: &&serde_json::Value| {
@@ -2787,8 +2788,8 @@ const TYPED_REFUSAL_CATEGORIES: &[&str] = &["missing bootstrap", "uncommitted ta
 /// Both matrices must observe the same production supersede protocol.
 fn decided_typed_fences(_full: bool) -> BTreeSet<(String, String, String)> {
     BTreeSet::from([(
-        "SessionSuffixContradiction".into(),
-        "session_suffix_contradiction".into(),
+        "AppendAdmissionRefused".into(),
+        "append_admission_refused".into(),
         "supersede".into(),
     )])
 }

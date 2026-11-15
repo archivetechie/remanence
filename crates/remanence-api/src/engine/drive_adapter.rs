@@ -334,10 +334,9 @@ impl MountedDrive {
             .map_err(crate::standalone_write::legacy_status)
     }
 
-    /// Explicit tail recovery may cross only its exact typed suffix fences.
+    /// Explicit tail recovery may cross only its exact typed recoverable write fences.
     /// Endpoint and unrelated tape quarantines retain the ordinary refusal.
     fn standalone_tail_recovery_admission(&mut self) -> std::result::Result<(), crate::MountError> {
-        use remanence_state::library_log as lib;
         let owner = self
             .owner
             .as_ref()
@@ -346,7 +345,7 @@ impl MountedDrive {
         runtime
             .ensure_motion_allowed()
             .map_err(crate::mount_support::refusal)?;
-        let tape = runtime.tape_state(self.client.tape_uuid).ok_or_else(|| {
+        runtime.tape_state(self.client.tape_uuid).ok_or_else(|| {
             crate::mount_support::refusal("tail recovery requires Reprovision authority")
         })?;
         let row = owner
@@ -354,37 +353,23 @@ impl MountedDrive {
             .catalog()
             .get_tape(&self.client.tape_uuid)
             .map_err(crate::mount_support::refusal)?;
-        let mut conflicts = owner
+        let conflicts = owner
             .state
             .catalog()
-            .tape_io_admission_conflicts(
-                &self.client.tape_uuid,
+            .tape_io_matching_fences(
+                Some(&self.client.tape_uuid),
                 row.as_ref().and_then(|r| r.voltag.as_deref()),
+                Some(&self.client.endpoint),
             )
             .map_err(crate::mount_support::refusal)?;
-        conflicts.extend(
-            owner
-                .state
-                .catalog()
-                .list_active_tape_io_fences()
-                .map_err(crate::mount_support::refusal)?
-                .into_iter()
-                .filter(|f| f.endpoint.as_ref() == Some(&self.client.endpoint)),
-        );
-        for fence in conflicts {
-            let allowed = fence
-                .quarantine_id
-                .strip_prefix("library:")
-                .and_then(|n| n.parse::<u64>().ok())
-                .and_then(|n| runtime.active_fence(n))
-                .is_some_and(|raise| {
-                    raise.scope == lib::FenceScope::Tape(tape.tape)
-                        && raise.kind == lib::FenceKind::Write
-                        && raise.cause == lib::FenceCause::SessionSuffixContradiction
-                });
-            if !allowed {
-                return self.standalone_write_admission();
-            }
+        if !conflicts.is_empty()
+            && !runtime.tape_io_fences_pass(
+                &conflicts,
+                Some(&self.client.tape_uuid),
+                remanence_state::library_runtime::TapeIoPass::Motion,
+            )
+        {
+            return self.standalone_write_admission();
         }
         Ok(())
     }

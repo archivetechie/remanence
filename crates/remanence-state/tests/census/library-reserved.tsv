@@ -56,7 +56,6 @@ crates/remanence-api/src/append_admission.rs::daemon_admission_error::library_lo
 crates/remanence-api/src/audit_projection.rs::ensure_manual_finalize_finished_authority::library_log	1
 crates/remanence-api/src/closeout_progress.rs::for_owner::library_log	1
 crates/remanence-api/src/closeout_progress.rs::record::library_log	1
-crates/remanence-api/src/engine/drive_adapter.rs::standalone_tail_recovery_admission::library_log	1
 crates/remanence-api/src/mount.rs::record_finalize_attempt::library_log	2
 crates/remanence-api/src/operation_source.rs::<module>::library_log	1
 crates/remanence-api/src/tape_closeout.rs::start::library_log	1

@@ -464,7 +464,7 @@ pub(crate) fn session_open_reject_admission_conflicts(
     session_open_reject_admission_conflicts_inner(index, ctx, None)
 }
 
-/// Keep drive, readiness and motion admission intact around the suffix exception.
+/// Keep drive, readiness and motion admission intact around the tail-recovery exception.
 pub(crate) fn session_open_reject_admission_conflicts_inner(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
@@ -480,22 +480,20 @@ pub(crate) fn session_open_reject_admission_conflicts_inner(
             )
             .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
     }
-    if index
-        .tape_io_is_fenced(None, ctx.barcode, Some(&endpoint))
-        .map_err(status_from_state_error)?
-    {
-        // Only the supersede supplies its resolved tape UUID; a mismatch fails closed by scope.
-        let allowed = match recovering_tape {
-            Some(tape) => crate::tape_admission::only_recoverable_suffix_fences(
-                index,
-                index.library_runtime().as_ref(),
-                &tape,
-                ctx.barcode,
-                Some(&endpoint),
-            )
-            .map_err(status_from_state_error)?,
-            None => false,
-        };
+    let fences = index
+        .tape_io_matching_fences(None, ctx.barcode, Some(&endpoint))
+        .map_err(status_from_state_error)?;
+    if !fences.is_empty() {
+        // Only the supersede supplies its resolved tape UUID; every row must name that tape.
+        let allowed = recovering_tape.is_some_and(|tape| {
+            index.library_runtime().is_some_and(|runtime| {
+                runtime.tape_io_fences_pass(
+                    &fences,
+                    Some(&tape),
+                    remanence_state::library_runtime::TapeIoPass::Motion,
+                )
+            })
+        });
         if !allowed {
             return Err(Status::failed_precondition(
                 "readiness blocked by active tape-I/O fence",

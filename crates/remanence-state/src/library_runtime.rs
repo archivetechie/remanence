@@ -26,6 +26,15 @@ use std::sync::{
 pub const TAIL_REPAIR_DEFERRED: &str =
     "TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed";
 
+/// The operation a set of active tape-I/O fences may permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapeIoPass {
+    /// Motion may pass append-refusal and suffix-contradiction write fences.
+    Motion,
+    /// Reads may pass only append-refusal write fences.
+    Read,
+}
+
 /// Typed errors retain the distinction between semantic refusal and authority
 /// storage failure needed by continuation-LOAD compensation.
 #[derive(Debug, thiserror::Error)]
@@ -684,7 +693,7 @@ impl LibraryRuntime {
     }
 
     /// Release an operator-addressed tape fence through its source identity.
-    /// Suffix contradictions require the separate physical recovery producer.
+    /// Append refusals and suffix contradictions require physical tail recovery.
     pub fn release_tape_fence(
         &self,
         id: &str,
@@ -708,7 +717,11 @@ impl LibraryRuntime {
             if !matches!(fence.scope, lib::FenceScope::Tape(_)) {
                 return Err(StateError::ConfigInvalid("fence is not tape-scoped".into()).into());
             }
-            if fence.cause == lib::FenceCause::SessionSuffixContradiction {
+            if matches!(
+                fence.cause,
+                lib::FenceCause::AppendAdmissionRefused
+                    | lib::FenceCause::SessionSuffixContradiction
+            ) {
                 return Err(StateError::ConfigInvalid(
                     "suffix fence requires explicit physical tail recovery".into(),
                 )
@@ -1152,6 +1165,41 @@ impl LibraryRuntime {
                 incarnation: 1,
             })
         })
+    }
+
+    /// Permit a nonempty set only when every row names a live write fence for
+    /// its own current tape identity and its cause permits the requested pass.
+    /// When supplied, `tape` also restricts every row to the recovering tape.
+    /// This reads authority state without taking the dispatch lock.
+    pub fn tape_io_fences_pass(
+        &self,
+        fences: &[crate::TapeIoFenceRecord],
+        tape: Option<&lib::Id>,
+        pass: TapeIoPass,
+    ) -> bool {
+        !fences.is_empty()
+            && fences.iter().all(|row| {
+                let Some(raise) = self.fence_for_quarantine_id(&row.quarantine_id) else {
+                    return false;
+                };
+                let Ok(row_tape) = <lib::Id>::try_from(row.tape_uuid.as_slice()) else {
+                    return false;
+                };
+                let Some(identity) = self.tape_state(row_tape) else {
+                    return false;
+                };
+                raise.kind == lib::FenceKind::Write
+                    && raise.scope == lib::FenceScope::Tape(identity.tape)
+                    && tape.is_none_or(|tape| *tape == row_tape)
+                    && match pass {
+                        TapeIoPass::Motion => matches!(
+                            raise.cause,
+                            lib::FenceCause::AppendAdmissionRefused
+                                | lib::FenceCause::SessionSuffixContradiction
+                        ),
+                        TapeIoPass::Read => raise.cause == lib::FenceCause::AppendAdmissionRefused,
+                    }
+            })
     }
 
     /// Exact source identity and cause of active tape raises.

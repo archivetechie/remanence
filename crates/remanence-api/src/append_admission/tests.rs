@@ -2132,7 +2132,15 @@ pub(crate) fn golden_production_admission_rows() {
                 | "MissingBootstrapFilemark"
         ) {
             assert_eq!(fences.len(), 1, "{name}: {fences:?}");
-            assert_eq!(fences[0].reason, "session_suffix_contradiction");
+            assert_eq!(
+                fences[0].reason,
+                if name == "SessionSuffixContradiction" {
+                    "session_suffix_contradiction"
+                } else {
+                    "append_admission_refused"
+                },
+                "{name}"
+            );
         } else {
             assert!(fences.is_empty(), "{name}: {fences:?}");
         }

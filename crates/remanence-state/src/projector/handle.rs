@@ -277,6 +277,15 @@ impl CatalogIndex {
     ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         self.with_core(|core| core.tape_io_admission_conflicts(tape_uuid, barcode))
     }
+    /// Return every matching active fence once, including catalogue-resolved identities.
+    pub fn tape_io_matching_fences(
+        &self,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+        self.with_core(|core| core.tape_io_matching_fences(tape_uuid, barcode, endpoint))
+    }
     /// Check current tape identity, barcode, and endpoint fences without a cached view.
     pub fn tape_io_is_fenced(
         &self,

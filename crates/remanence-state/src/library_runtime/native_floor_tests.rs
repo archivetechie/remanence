@@ -1217,6 +1217,11 @@ fn l1b_force_preserves_scope_and_suffix_refusals() {
             lib::FenceCause::SessionSuffixContradiction,
             "suffix fence requires explicit physical tail recovery",
         ),
+        (
+            lib::FenceScope::Tape(tape(T)),
+            lib::FenceCause::AppendAdmissionRefused,
+            "suffix fence requires explicit physical tail recovery",
+        ),
     ] {
         let f = Fixture::new();
         f.provision(T);

@@ -11601,24 +11601,24 @@ pub(crate) async fn daemon_rollback_refusal(
         .map(|catalog| catalog.write_handle())
         .unwrap();
     let fences = index.list_active_tape_io_fences().unwrap();
-    // Ruling 13: a typed suffix fence protects the ready tape until physical recovery.
+    // Ruling 13: a typed append-refusal fence protects the ready tape until physical recovery.
     let fences: Vec<_> = fences.iter().filter(|f| f.tape_uuid == tape_uuid).collect();
     assert_eq!(fences.len(), 1);
     let fence = fences[0];
-    assert_eq!(fence.reason, "session_suffix_contradiction");
+    assert_eq!(fence.reason, "append_admission_refused");
     assert_eq!(index.get_tape(&tape_uuid).unwrap().unwrap().state, "ready");
     crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
     let runtime = state.library_runtime();
     let source = runtime
         .fence_for_quarantine_id(&fence.quarantine_id)
-        .expect("live typed suffix fence");
+        .expect("live typed append-refusal fence");
     assert_eq!(
         source.scope,
         remanence_state::library_log::FenceScope::Tape(runtime.tape_state(tape_uuid).unwrap().tape)
     );
     assert_eq!(
         source.cause,
-        remanence_state::library_log::FenceCause::SessionSuffixContradiction
+        remanence_state::library_log::FenceCause::AppendAdmissionRefused
     );
     error.to_string()
 }
@@ -11840,16 +11840,20 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
         index.get_tape(&selected.tape_uuid).unwrap().unwrap().state,
         "ready"
     );
-    // Ruling 13: the durable suffix fence replaces the recovery_required flag.
+    // Ruling 13: the durable append-refusal fence replaces the recovery_required flag.
     let fences = index.list_active_tape_io_fences().unwrap();
-    assert_eq!(fences.len(), 1, "exactly one global active suffix fence");
+    assert_eq!(
+        fences.len(),
+        1,
+        "exactly one global active append-refusal fence"
+    );
     let fence = &fences[0];
     assert_eq!(fence.tape_uuid, selected.tape_uuid);
-    assert_eq!(fence.reason, "session_suffix_contradiction");
+    assert_eq!(fence.reason, "append_admission_refused");
     let runtime = state.library_runtime();
     let source = runtime
         .fence_for_quarantine_id(&fence.quarantine_id)
-        .expect("live typed suffix fence");
+        .expect("live typed append-refusal fence");
     assert_eq!(
         source.scope,
         remanence_state::library_log::FenceScope::Tape(
@@ -11858,7 +11862,7 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
     );
     assert_eq!(
         source.cause,
-        remanence_state::library_log::FenceCause::SessionSuffixContradiction
+        remanence_state::library_log::FenceCause::AppendAdmissionRefused
     );
     crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
     let mut request = pb::SupersedeTailRequest {

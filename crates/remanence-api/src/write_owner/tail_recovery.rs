@@ -51,34 +51,33 @@ pub(crate) fn supersede_mounted_tail(
         ));
     }
     use remanence_state::library_log as lib;
-    let identity = library
+    library
         .tape_state(tape_uuid)
         .ok_or_else(|| failure("tail recovery requires Reprovision authority".into()))?;
     let conflicts = index
-        .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
+        .tape_io_matching_fences(Some(&tape_uuid), tape.voltag.as_deref(), None)
         .map_err(crate::status_from_state_error)?;
-    let mut suffix_fences = Vec::new();
-    for fence in conflicts {
-        // The projection supplies only a locator; the fold validates current
-        // liveness, tape identity, kind and cause before any bypass or release.
-        let sequence = fence
-            .quarantine_id
-            .strip_prefix("library:")
-            .and_then(|n| n.parse::<u64>().ok());
-        let allowed = sequence
-            .and_then(|n| library.active_fence(n))
-            .is_some_and(|raise| {
-                raise.kind == lib::FenceKind::Write
-                    && raise.scope == lib::FenceScope::Tape(identity.tape)
-                    && raise.cause == lib::FenceCause::SessionSuffixContradiction
-            });
-        if !allowed {
-            return Err(failure(
-                "release the unrelated tape I/O fence before superseding".into(),
-            ));
-        }
-        suffix_fences.push(sequence.unwrap());
+    if !conflicts.is_empty()
+        && !library.tape_io_fences_pass(
+            &conflicts,
+            Some(&tape_uuid),
+            remanence_state::library_runtime::TapeIoPass::Motion,
+        )
+    {
+        return Err(failure(
+            "release the unrelated tape I/O fence before superseding".into(),
+        ));
     }
+    // The shared predicate validated each locator's live typed source before release.
+    let suffix_fences: Vec<u64> = conflicts
+        .iter()
+        .filter_map(|fence| {
+            fence
+                .quarantine_id
+                .strip_prefix("library:")
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .collect();
     let uuid = uuid::Uuid::from_bytes(tape_uuid).to_string();
     let label = tape.voltag.as_deref().unwrap_or(&uuid);
     if acknowledge != uuid && acknowledge != label {

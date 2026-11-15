@@ -397,14 +397,12 @@ crates/remanence-stream/src/lib.rs::removed_xattr_flag_message::text-matches	1
 crates/remanence-stream/src/recovery.rs::assign_output_path::text-equality	1
 crates/remanence-stream/src/recovery.rs::sanitized_recovery_path::text-equality	1
 crates/remanence-api/src/api_state.rs::record_cancel_requested::text-equality	1
-crates/remanence-api/src/engine/drive_adapter.rs::standalone_tail_recovery_admission::text-strip_prefix	1
 crates/remanence-api/src/motion_status.rs::classified::text-match	5
 crates/remanence-api/src/motion_status.rs::continuation_return::text-equality	1
 crates/remanence-api/src/mount.rs::resolve_and_reserve_actor_mount_with_resource_inner::text-contains	4
 crates/remanence-api/src/mount.rs::resolve_and_reserve_actor_mount_with_resource_inner::text-equality	3
 crates/remanence-api/src/mount_support.rs::fence_release_options::text-equality	1
 crates/remanence-api/src/operation_source.rs::kind::text-match	13
-crates/remanence-api/src/tape_admission.rs::only_recoverable_suffix_fences::text-strip_prefix	1
 crates/remanence-api/src/tape_closeout.rs::spawn_closeout::text-starts_with	1
 crates/remanence-api/src/write_owner/actor_runtime.rs::collect_drive_health_snapshot::text-find	1
 crates/remanence-api/src/write_owner/actor_runtime.rs::collect_drive_health_snapshot::text-match	5

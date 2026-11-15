@@ -900,7 +900,7 @@ fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() 
         let fences = fixture.index().list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].tape_uuid, UUID);
-        assert_eq!(fences[0].reason, "session_suffix_contradiction");
+        assert_eq!(fences[0].reason, "append_admission_refused");
         let preview = owner
             .supersede_tail(pb::SupersedeTailRequest {
                 observed_tape_log_sequence: None,
@@ -2060,7 +2060,7 @@ fn gate2b_rejected_tail_remains_ineligible() {
         let fences = fixture.index().list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].tape_uuid, UUID);
-        assert_eq!(fences[0].reason, "session_suffix_contradiction");
+        assert_eq!(fences[0].reason, "append_admission_refused");
         owner.finish().unwrap();
         let selected = crate::pool_write::select_tape_in_pool_for_write_session(
             &fixture.index(),
@@ -2446,6 +2446,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
     };
     let ordinary = raise(lib::FenceCause::TransferError);
     let suffix = raise(lib::FenceCause::SessionSuffixContradiction);
+    let admission = raise(lib::FenceCause::AppendAdmissionRefused);
     let service = crate::library::LibraryServiceApi {
         state: crate::ApiState::new(state.projection_client()),
     };
@@ -2453,7 +2454,12 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
         .enable_all()
         .build()
         .unwrap();
-    for sequence in [ordinary.sequence, ordinary.sequence, suffix.sequence] {
+    for sequence in [
+        ordinary.sequence,
+        ordinary.sequence,
+        suffix.sequence,
+        admission.sequence,
+    ] {
         let mut request = tonic::Request::new(crate::pb::ReleaseTapeIoFenceRequest {
             force: false,
             quarantine_id: format!("library:{sequence}"),
@@ -2463,7 +2469,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
             .metadata_mut()
             .insert("x-remanence-actor", "actual-operator".parse().unwrap());
         let result = executor.block_on(service.release_tape_io_fence(request));
-        if sequence == suffix.sequence {
+        if sequence == suffix.sequence || sequence == admission.sequence {
             assert!(result
                 .unwrap_err()
                 .message()
@@ -2473,6 +2479,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
         }
     }
     assert!(runtime.active_fence(suffix.sequence).is_some());
+    assert!(runtime.active_fence(admission.sequence).is_some());
     let manifest = runtime.manifest().clone();
     drop(service);
     drop(runtime);
@@ -2504,7 +2511,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
     let state = fixture.reopen().unwrap();
     assert_eq!(
         state.catalog().list_active_tape_io_fences().unwrap().len(),
-        1
+        2
     );
     assert!(fixture.commands.lock().unwrap().is_empty());
 }

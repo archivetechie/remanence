@@ -738,7 +738,7 @@ pub(crate) fn daemon_admission_error(
                 detail: tape_fence_detail(barcode.as_deref(), Some(&evidence)),
                 kind: lib::FenceKind::Write,
                 scope: lib::FenceScope::Tape(tape.tape),
-                cause: lib::FenceCause::SessionSuffixContradiction,
+                cause: lib::FenceCause::AppendAdmissionRefused,
                 evidence: None,
                 at: None,
                 operation: None,

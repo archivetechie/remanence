@@ -1941,6 +1941,54 @@ impl CatalogCore {
             .collect())
     }
 
+    /// Match a projected fence by the supplied tape, barcode, or endpoint identity.
+    fn tape_io_fence_matches(
+        fence: &TapeIoFenceRecord,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> bool {
+        tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
+            || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
+            || barcode.is_some_and(|barcode| {
+                !barcode.trim().is_empty()
+                    && fence
+                        .barcode
+                        .as_deref()
+                        .is_some_and(|b| b.trim().eq_ignore_ascii_case(barcode.trim()))
+            })
+    }
+
+    /// Return every matching active fence once, in active-fence order, including
+    /// catalogue-resolved tape and barcode identities. An empty set needs no lookup.
+    pub fn tape_io_matching_fences(
+        &self,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+        let fences = self.list_active_tape_io_fences()?;
+        if fences.is_empty() {
+            return Ok(fences);
+        }
+        let tape = if let Some(uuid) = tape_uuid {
+            self.get_tape(uuid)?
+        } else if let Some(barcode) = barcode {
+            self.get_tape_by_voltag(barcode)?
+        } else {
+            None
+        };
+        let resolved_uuid = tape
+            .as_ref()
+            .and_then(|t| <[u8; 16]>::try_from(t.tape_uuid.as_slice()).ok());
+        let tape_uuid = tape_uuid.or(resolved_uuid.as_ref());
+        let barcode = barcode.or_else(|| tape.as_ref().and_then(|tape| tape.voltag.as_deref()));
+        Ok(fences
+            .into_iter()
+            .filter(|fence| Self::tape_io_fence_matches(fence, tape_uuid, barcode, endpoint))
+            .collect())
+    }
+
     /// Check current tape identity, barcode, and endpoint fences without a cached view.
     pub fn tape_io_is_fenced(
         &self,
@@ -1952,17 +2000,11 @@ impl CatalogCore {
         if fences.is_empty() {
             return Ok(false);
         }
-        if fences.iter().any(|fence| {
-            tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
-                || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
-                || barcode.is_some_and(|barcode| {
-                    !barcode.trim().is_empty()
-                        && fence
-                            .barcode
-                            .as_deref()
-                            .is_some_and(|b| b.trim().eq_ignore_ascii_case(barcode.trim()))
-                })
-        }) {
+        // Preserve direct matches even if a catalogue identity lookup would fail.
+        if fences
+            .iter()
+            .any(|fence| Self::tape_io_fence_matches(fence, tape_uuid, barcode, endpoint))
+        {
             return Ok(true);
         }
         let tape = if let Some(uuid) = tape_uuid {
@@ -1977,16 +2019,9 @@ impl CatalogCore {
             .and_then(|t| <[u8; 16]>::try_from(t.tape_uuid.as_slice()).ok());
         let tape_uuid = tape_uuid.or(resolved_uuid.as_ref());
         let barcode = barcode.or_else(|| tape.as_ref().and_then(|tape| tape.voltag.as_deref()));
-        Ok(fences.iter().any(|fence| {
-            tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
-                || barcode.filter(|b| !b.trim().is_empty()).is_some_and(|b| {
-                    fence
-                        .barcode
-                        .as_deref()
-                        .is_some_and(|f| f.trim().eq_ignore_ascii_case(b.trim()))
-                })
-                || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
-        }))
+        Ok(fences
+            .iter()
+            .any(|fence| Self::tape_io_fence_matches(fence, tape_uuid, barcode, endpoint)))
     }
 
     /// Release an active tape-I/O fence by quarantine id.

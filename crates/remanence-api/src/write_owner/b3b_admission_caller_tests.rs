@@ -244,7 +244,14 @@ async fn caller_matrix(caller: &str) {
         );
         if let Some(fence) = fences.first() {
             assert_eq!(fence.tape_uuid, TAPE);
-            assert_eq!(fence.reason, "session_suffix_contradiction");
+            assert_eq!(
+                fence.reason,
+                if kind == "structural" {
+                    "append_admission_refused"
+                } else {
+                    "session_suffix_contradiction"
+                }
+            );
         }
         assert_eq!(
             index.tape_io_is_fenced(Some(&TAPE), None, None).unwrap(),
@@ -332,7 +339,14 @@ async fn caller_matrix(caller: &str) {
         for (_, fence) in sources {
             assert_eq!(fence.kind, lib::FenceKind::Write);
             assert!(matches!(fence.scope, lib::FenceScope::Tape(tape) if tape.uuid == TAPE));
-            assert_eq!(fence.cause, lib::FenceCause::SessionSuffixContradiction);
+            assert_eq!(
+                fence.cause,
+                if kind == "structural" {
+                    lib::FenceCause::AppendAdmissionRefused
+                } else {
+                    lib::FenceCause::SessionSuffixContradiction
+                }
+            );
         }
         println!("ROW {caller}/{kind}/{fail_projection} code={:?} retry={retry:?} fences={} mutations={mutations:?} FenceRaised={} status={:?}", status.code(), fences.len(), raised.len(), status.message());
     }

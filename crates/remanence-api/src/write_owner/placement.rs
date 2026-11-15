@@ -141,24 +141,23 @@ impl super::WriteOwnerConfig {
                 "mounted media identity invalidated",
             ));
         }
-        if index
-            .tape_io_is_fenced(
+        let fences = index
+            .tape_io_matching_fences(
                 Some(&mounted.tape_uuid),
                 mounted.barcode.as_deref(),
                 Some(&mounted.endpoint),
             )
-            .map_err(crate::status_from_state_error)?
-        {
+            .map_err(crate::status_from_state_error)?;
+        if !fences.is_empty() {
             use remanence_state::library_log as lib;
             let allowed = recovering_tail
-                && crate::tape_admission::only_recoverable_suffix_fences(
-                    index,
-                    self.authority.runtime(),
-                    &mounted.tape_uuid,
-                    mounted.barcode.as_deref(),
-                    Some(&mounted.endpoint),
-                )
-                .map_err(crate::status_from_state_error)?;
+                && self.authority.runtime().is_some_and(|runtime| {
+                    runtime.tape_io_fences_pass(
+                        &fences,
+                        Some(&mounted.tape_uuid),
+                        remanence_state::library_runtime::TapeIoPass::Motion,
+                    )
+                });
             if !allowed {
                 let mut conflicts = index
                     .tape_io_admission_conflicts(&mounted.tape_uuid, mounted.barcode.as_deref())
@@ -219,7 +218,7 @@ impl super::WriteOwnerConfig {
     ) -> Result<(), Status> {
         self.mounted_ready_inner(index, drive, false)
     }
-    /// Recovery preserves every admission gate except its exact suffix raises.
+    /// Recovery preserves every admission gate except its exact recoverable write fences.
     pub(super) fn mounted_recovery_ready(
         &self,
         index: &CatalogIndex,
