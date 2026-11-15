@@ -573,17 +573,24 @@ pub(super) fn session_open_reject_tape_io_fences(
         }
         return Ok(());
     };
+    let advice = if crate::tape_admission::release_refused(index, first) {
+        "this fence is not released: recover the tape's tail with `rem tape supersede-tail`, withdraw the tape with `rem tape retire`, or start from a newer copy of the state directory".to_owned()
+    } else {
+        format!(
+            "release via `rem tape quarantine release {}` before retrying",
+            first.quarantine_id
+        )
+    };
     let message = crate::tape_admission::fence_payload(
         index,
         *tape_uuid,
         first,
         format!(
-        "{action} blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; release via `rem tape quarantine release {}` before retrying",
+        "{action} blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; {advice}",
         first.quarantine_id,
         Uuid::from_bytes(*tape_uuid),
         barcode.unwrap_or("(unknown)"),
-        first.reason,
-        first.quarantine_id
+        first.reason
         ),
         true,
         remanence_state::library_log::AuditActor::System,
@@ -688,7 +695,15 @@ mod admission_tests {
                     .into_iter()
                     .find(|r| r.reason == cause)
                     .unwrap();
-                assert_eq!(error.message(),format!("open read session blocked by active tape-I/O fence {} tape_uuid={} barcode=(unknown) reason={cause}; release via `rem tape quarantine release {}` before retrying",fence.quarantine_id,Uuid::from_bytes(T),fence.quarantine_id));
+                if case == "suffix" || case == "append_write" {
+                    assert_eq!(
+                        error.message(),
+                        format!("open read session blocked by active tape-I/O fence {} tape_uuid={} barcode=(unknown) reason={cause}; this fence is not released: recover the tape's tail with `rem tape supersede-tail`, withdraw the tape with `rem tape retire`, or start from a newer copy of the state directory", fence.quarantine_id, Uuid::from_bytes(T)),
+                        "{case}"
+                    );
+                } else {
+                    assert_eq!(error.message(),format!("open read session blocked by active tape-I/O fence {} tape_uuid={} barcode=(unknown) reason={cause}; release via `rem tape quarantine release {}` before retrying",fence.quarantine_id,Uuid::from_bytes(T),fence.quarantine_id));
+                }
             }
             drop(index);
             let records = f.refusals();

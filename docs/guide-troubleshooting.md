@@ -225,6 +225,23 @@ fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,
 withdrawn or fenced since the copy's date.
 
+In a library, each tape a pool has written since the copy is refused once on
+the pool's first write to it and closed for writing. The same request moves on
+to the pool's next tape; a pool may have several tapes in this condition. Before
+starting the service on restored state, each pool needs a writable tape that
+the restored state knows and that the pool has not written since the copy.
+A refused tape stays readable, but its data written since the copy is not
+listed. Do not discard that data unless its objects are known to be unneeded.
+If the restored state shows the tape's last session closed, that data cannot
+be discarded in this release: keep the tape closed for writing, withdraw it
+with `rem tape retire`, or start from a newer copy of the state directory.
+
+On a parity pool, if the restored tape log still owes closeout, retirement
+refuses with `CloseoutRequired`. Closeout stays refused under either
+`append_admission_refused` or `session_suffix_contradiction`.
+For that tape, use `rem tape supersede-tail` only where discard applies, or
+start from a newer copy of the state directory.
+
 Populated state without `authority-manifest.json` refuses with
 `Legacy or unbound authority requires the declared state reset`. With a manifest
 but no `authority-format`, layout validation refuses with
@@ -299,7 +316,7 @@ standalone refusals are:
 | State volume is untrusted | Put home-mode state on a local persistent filesystem. `--allow-untrusted-state-volume` is an explicit development override, not a normal archive setup. |
 | `journal volume rejected` | With a write-back cache, the disk confirms a write while the data may still be in its volatile cache. Remanence conservatively requires such a disk to support FUA (forced unit access, which writes a record through to stable media) and does not rely on cache flushes alone, even though many disks honour them. The same refusal also names an untrusted filesystem type or a filesystem without a block device of its own. Put `journal.dir` on a local filesystem with a block device of its own (such as ext4 or XFS on a disk or partition) whose disk writes through or supports FUA. `rem doctor` shows this check as `journal volume`; neither `--allow-untrusted-state-volume` nor `journal.require_trusted_volume = false` changes it. |
 | Cannot write `/run/lock/rem`, especially after reboot | Create it with `sudo install -d -o root -g tape -m 0770 /run/lock/rem`. Put `d /run/lock/rem 0770 root tape -` in `/etc/tmpfiles.d/rem.conf` so boot recreates it. |
-| `TailBeyondKnownState` | Tape holds complete data beyond local checkpoint authority, often after restoring old state. Restore newer state or rescue with `rem tape restore --scan --out rescued`. Do not delete journals. Only deliberately discard a rescued suffix with `rem tape supersede-tail --acknowledge-tape LABEL` and its exact confirmation. |
+| `TailBeyondKnownState` | Tape holds data this state does not record, often after restoring an older copy of the state directory. It stays readable and closed for writing. To keep the data, start from a newer copy of the state directory, or copy files out of this standalone drive with `rem tape restore --scan --out rescued`. Do not delete journals or discard data unless its objects are known to be unneeded. Unless this state shows the tape's last session closed, `rem tape supersede-tail --acknowledge-tape <label\|uuid>` (home mode; for an explicit device add `--device <path> --allow-device <serial>`) discards it with exact confirmation. A closed last session refuses discard in this release. |
 | `holds … data at the beginning` | Nonblank media needs `rem tape init --label LABEL --generation <yours> --clobber-data`, then `CLOBBER LABEL`. For non-interactive use, pass `--confirm-clobber "CLOBBER LABEL"`. This also applies after retirement. Clobber also erases a Remanence tape whose files are still in your catalog; run `rem list --tape LABEL` first. It does not bypass write protection, partition, label/identity-swap or cross-pool checks. |
 | `has 2 partitions` | LTFS media needs repartitioning, which erases the cartridge. Install `mt-st` with `sudo apt install mt-st` (Debian/Ubuntu) or `sudo dnf install mt-st` (Fedora). Find `nstN` with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` using the drive's sg name. The listing includes the node name; use `/dev/<the listed nstN>` (for example `/dev/nst0`). Run `sudo mt -f /dev/nstN stsetoptions can-partitions`, then `mt -f /dev/nstN mkpartition 0`. Re-run `rem tape init --label LABEL --generation <yours>`; add `--clobber-data` only if it still reports data at BOT. See [step 2](guide-standalone-drive.md#2-initialize-a-cartridge). |
 | Active tape-I/O quarantine | Run `rem tape quarantine list`. For `native_log_behind_projection`, only `rem tape restore --scan --out rescued` proceeds; `get`, `tape identify`, `tape verify` and ordinary `tape restore` refuse. Contradicted tape admission refuses every read, including `--scan`. Other fence causes leave standalone reads available. The standalone release form has no `--force`; see [Tape-I/O fences](#tape-io-fences). Release does not bypass the physical append check. |
@@ -318,10 +335,34 @@ reason, and release command. `rem top`, `rem catalog tapes --json`, and
 `Daemon.Health` list active fences and their count. A fence with missing or
 unparseable scope still refuses startup.
 
-Checkpoint replay and projection, append recovery, manual-finalize relaunch,
-terminal recovery, readiness reconciliation and automatic waits, session closeout
-handling, and idle dismount leave fenced tapes and drives untouched. Other
-media remain available. Investigate the recorded evidence and verify the medium
+Two tape-I/O recovery fences have different admission rules:
+
+- `append_admission_refused` records a write this state could not admit at the
+  tape's end: data it does not record, a missing bootstrap filemark or an
+  unproved tail. Read sessions, robot motion, eviction and idle unload proceed.
+  Writing, closeout, finalization and terminal-index reads (`rem tape inventory`,
+  `rem tape verify-index`) stay refused.
+- `session_suffix_contradiction` records a tape that contradicts its recorded
+  session ending. Robot motion, eviction and idle unload proceed; read sessions
+  and writing stay refused.
+
+These permissions apply only when all matching fences allow the operation.
+Idle dismount and readiness waits can move a cartridge whose only fences are
+these two causes. Startup readiness reconciliation also proceeds when the only
+fence is `append_admission_refused`. Other fenced tapes and drives are left
+untouched by checkpoint replay and projection, append recovery, manual-finalize
+relaunch, terminal recovery, readiness reconciliation and automatic waits,
+session closeout handling, and idle dismount. Other media remain available.
+
+Neither recovery fence is released by `rem tape quarantine release`.
+`rem tape supersede-tail` recovers the tail where it can: it refuses a tape
+that contradicts its recorded session ending, and refuses discard when this
+state shows the tape's last session closed. Otherwise withdraw the tape with
+`rem tape retire` or start from a newer copy of the state directory. Retirement
+refuses with `CloseoutRequired` while parity closeout is due; closeout itself
+stays refused under these fences.
+
+For a releasable cause, investigate the recorded evidence and verify the medium
 and drive before release:
 
 ```sh
@@ -471,8 +512,11 @@ until the fence is cleared. You will see messages like:
 run `rem tape quarantine show <id>` or wait-ready/resume before retrying
 ```
 
-Unless a tape-I/O fence blocks the same tape or drive, the daemon resumes load-transient fences itself with a 9000 s timeout and
-30 s steady polls, including after startup reconciliation. Calls to
+The daemon resumes load-transient fences itself with a 9000 s timeout and
+30 s steady polls, including after startup reconciliation, unless a tape-I/O
+fence blocks motion on the same tape or drive. Tape-scoped
+`append_admission_refused` and `session_suffix_contradiction` fences allow that
+motion when they are the only matching fences. Calls to
 `ResumeMediaReadiness` attach to a running readiness wait or LoadDrive for the
 same operation. `rem tape wait-ready --resume <UUID> --endpoint <URI>` watches
 that operation and prints readiness state changes. Its local `--timeout` returns
@@ -875,15 +919,23 @@ Rebuild compares the committed range to the original-write check and retries a
 mismatch once after re-proving identity. A second mismatch raises
 `CloseoutCheckMismatch`. Committed extent contradictions raise
 `CloseoutReadContradiction`; a suffix contradicting its named ending raises
-`SessionSuffixContradiction`. A durable live end alone raises no tape-I/O fence.
+`SessionSuffixContradiction`. Data beyond the known state raises
+`append_admission_refused`, which leaves the tape readable and closed for
+writing. Neither recovery fence is released by `rem tape quarantine release`.
+Use `rem tape supersede-tail` where the tail can be recovered; it refuses a
+contradicting recorded ending or a state that shows the tape's last session
+closed. Otherwise withdraw the tape with `rem tape retire`, subject to due
+closeout, or start from a newer copy of the state directory. A durable live end
+alone raises no tape-I/O fence.
 An ambiguous native append still stops media work with `AuthorityAmbiguous`.
 Checked resumes retain original-write check provenance. A commit disagreeing
 with the frozen range is refused rather than used for reconstruction.
 
 Manual finalization refuses a due closeout with `CloseoutRequired` and names
-the closeout command. Retirement changes the offline catalog without checking
-or completing closeout debt. `CloseoutUnprotectedFinalizationUnavailable`
-refuses finalization when that range cannot be proved; operator acceptance of
+the closeout command. Retirement changes the offline catalog without media
+work and refuses with `CloseoutRequired` while parity closeout is due.
+`CloseoutUnprotectedFinalizationUnavailable` refuses finalization when that range
+cannot be proved; operator acceptance of
 unprotected finalization is not implemented. Cartridge removal performs no parity
 work. Graceful shutdown closes sessions and leaves cartridges seated; its
 shared shutdown deadline covers maintenance as well as write sessions.

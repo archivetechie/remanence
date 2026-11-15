@@ -403,6 +403,23 @@ fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,
 withdrawn or fenced since the copy's date.
 
+In a library, each tape a pool has written since the copy is refused once on
+the pool's first write to it and closed for writing. The same request moves on
+to the pool's next tape; a pool may have several tapes in this condition. Before
+starting the service on restored state, each pool needs a writable tape that
+the restored state knows and that the pool has not written since the copy.
+A refused tape stays readable, but its data written since the copy is not
+listed. Do not discard that data unless its objects are known to be unneeded.
+If the restored state shows the tape's last session closed, that data cannot
+be discarded in this release: keep the tape closed for writing, withdraw it
+with `rem tape retire`, or start from a newer copy of the state directory.
+
+On a parity pool, if the restored tape log still owes closeout, retirement
+refuses with `CloseoutRequired`. Closeout stays refused under either
+`append_admission_refused` or `session_suffix_contradiction`.
+For that tape, use `rem tape supersede-tail` only where discard applies, or
+start from a newer copy of the state directory.
+
 Stop the daemon before restoring or rebuilding. Keep the recorded paths on a
 replacement server. Roots that differ from `authority-manifest.json` refuse
 daemon startup, rebuild and direct state opens with

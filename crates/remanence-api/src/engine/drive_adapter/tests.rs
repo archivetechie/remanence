@@ -2469,11 +2469,16 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
             .metadata_mut()
             .insert("x-remanence-actor", "actual-operator".parse().unwrap());
         let result = executor.block_on(service.release_tape_io_fence(request));
-        if sequence == suffix.sequence || sequence == admission.sequence {
+        if sequence == suffix.sequence {
             assert!(result
                 .unwrap_err()
                 .message()
-                .contains("physical tail recovery"));
+                .contains("a session_suffix_contradiction fence stays until"));
+        } else if sequence == admission.sequence {
+            assert!(result
+                .unwrap_err()
+                .message()
+                .contains("an append_admission_refused fence keeps the tape closed for writing"));
         } else {
             assert_eq!(result.unwrap().into_inner().state, "released");
         }

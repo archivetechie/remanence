@@ -25,6 +25,14 @@ pub(crate) fn typed_cause(
         .map(|raise| raise.cause)
 }
 
+/// These recovery fences cannot be released; session refusals name their recovery exits.
+pub(crate) fn release_refused(index: &CatalogIndex, fence: &TapeIoFenceRecord) -> bool {
+    matches!(
+        typed_cause(index, fence),
+        Some(lib::FenceCause::SessionSuffixContradiction | lib::FenceCause::AppendAdmissionRefused)
+    )
+}
+
 /// Stable ordering preserves existing order within each cause rank and in fixtures.
 pub(crate) fn order_conflicts(index: &CatalogIndex, conflicts: &mut [TapeIoFenceRecord]) {
     if index.library_runtime().is_none() {

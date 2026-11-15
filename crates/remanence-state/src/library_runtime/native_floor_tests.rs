@@ -1215,12 +1215,12 @@ fn l1b_force_preserves_scope_and_suffix_refusals() {
         (
             lib::FenceScope::Tape(tape(T)),
             lib::FenceCause::SessionSuffixContradiction,
-            "suffix fence requires explicit physical tail recovery",
+            "release refused: a session_suffix_contradiction fence stays until rem tape supersede-tail recovers the tape's tail (it refuses when the tape contradicts its recorded session ending); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory",
         ),
         (
             lib::FenceScope::Tape(tape(T)),
             lib::FenceCause::AppendAdmissionRefused,
-            "suffix fence requires explicit physical tail recovery",
+            "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail (it refuses when this state shows the tape's last session closed); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory",
         ),
     ] {
         let f = Fixture::new();

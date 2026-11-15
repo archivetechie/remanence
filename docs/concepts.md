@@ -218,9 +218,9 @@ reference](reference-cli.md#standalone-drives) lists which commands go where.
 When an operation on a tape or drive ends in a state that Remanence cannot prove, for example
 a load whose outcome is unknown, Remanence does not guess. It records
 a **fence**: a durable refusal against that tape or drive, written to the library log and the
-catalog, that survives restarts. Fenced media is refused for writes and initialization, and
-the daemon also refuses read sessions on it, until the cause is resolved. Other tapes and drives stay
-available. Every fence has a **quarantine id**, and the `rem tape quarantine` commands list,
+catalog, that survives restarts. Fenced media is refused for writes and initialization
+until the cause is resolved. Read sessions and motion depend on the cause; other tapes
+and drives stay available. Every fence has a **quarantine id**, and the `rem tape quarantine` commands list,
 show and release fences by that id; in these pages "quarantine" and "fence" name the same
 record. A tape-I/O fence release records the acknowledgement in the library log.
 
@@ -230,7 +230,15 @@ There are two kinds of fence.
   partial batch, a transfer error, an uncertain step of finalization, or a tape log
   that ends before the point the catalog has already projected.
   `rem catalog tapes --json`, `rem top` and `rem daemon health --json` show these fences.
-  An operator investigates, verifies the tape and drive, and uses
+  In a library, a tape fenced only by `append_admission_refused` stays readable
+  and closed for writing; robot motion, eviction and idle unload proceed. A tape fenced only by
+  `session_suffix_contradiction` allows that motion but refuses reads and writing.
+  Neither is released by `rem tape quarantine release`. Use `rem tape supersede-tail`
+  where recovery applies; it refuses a contradicting recorded session ending or a
+  state that shows the tape's last session closed. Otherwise withdraw the tape with
+  `rem tape retire` or start from a newer copy of the state directory. Retirement
+  refuses while parity closeout is due. For a releasable cause, an operator
+  investigates, verifies the tape and drive, and uses
   `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
   A present, noncontradicted tape log behind the catalog's projection
   (`native_log_behind_projection`) can be restored from an exact copy, or the

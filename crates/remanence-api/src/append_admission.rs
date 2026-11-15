@@ -107,7 +107,7 @@ impl From<TapeIoError> for AdmissionError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AdmissionErrorKind {
-    #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`).", capped_found(.found))]
+    #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {}. The tape holds data this state does not record, often after restoring an older copy of the state directory. It stays readable and closed for writing. To keep the data, start from a newer copy of the state directory. Unless this state shows the tape's last session closed, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library) or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`) discards it; a drive outside a library can first copy its files out with `rem tape restore --scan`.", capped_found(.found))]
     TailBeyondKnownState {
         tape_uuid: uuid::Uuid,
         expected_eod_lba: u64,

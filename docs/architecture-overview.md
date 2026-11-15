@@ -258,7 +258,8 @@ due. No abandonment filemark is written and no accumulator survives its session.
 `Catalog.CloseoutTape`, exposed as `rem tape closeout`, performs the same
 idempotent operation explicitly and succeeds without media work when none is due.
 Manual finalization requires due closeout to complete first. Retirement is an
-offline catalog change and does not check or complete closeout debt.
+offline catalog change and refuses with `CloseoutRequired` while parity
+closeout is due.
 Removal is an exclusion handshake and performs no parity work.
 
 Checkpoint batching defaults to 32 GiB of pending logical bytes, 200 pending

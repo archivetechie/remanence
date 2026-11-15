@@ -465,7 +465,16 @@ complete data exists beyond the position your local state knows. Restore a
 newer state backup, or rescue with `--scan`. Do not delete the tape logs in the
 state directory to make the refusal go away.
 
-If you deliberately discard that suffix after rescuing it, run:
+Neither `append_admission_refused` nor `session_suffix_contradiction` is
+released by `rem tape quarantine release`. Tail recovery refuses a tape that
+contradicts its recorded session ending. If the state shows the tape's last
+session closed, its unrecorded data cannot be discarded in this release:
+keep the tape closed for writing, withdraw it with `rem tape retire` and
+`--config` with this configuration's path, or start from a newer copy of the
+state directory. Retirement refuses while parity closeout is due.
+
+Otherwise, to deliberately discard that suffix after rescuing it, and only
+when its objects are known to be unneeded, run:
 
 ```sh
 rem tape supersede-tail --acknowledge-tape HOME01
@@ -566,8 +575,25 @@ Restore both logs, both authority files and the configuration together, each
 from its newest copy, to the configured paths. An older copy knows nothing
 decided after it: a tape withdrawn or fenced since then is not withdrawn or
 fenced in the restored state, and a tape first provisioned since then is unknown
-to it. Before starting the service on restored state, list the tapes used,
-withdrawn or fenced since the copy's date.
+to it. Before using restored state, list the tapes used, withdrawn or fenced
+since the copy's date.
+
+Each tape written since the copy is refused on its first write under the
+restored state and closed for writing. Before writing with restored state,
+have a writable tape the state knows and that has not been written since the
+copy. A refused tape stays readable, but its data written since the copy is
+not listed. Copy those files out with `rem tape restore --scan`; do not discard
+the data unless its objects are known to be unneeded. If the restored state
+shows the tape's last session closed, that data cannot be discarded in this
+release: keep the tape closed for writing, withdraw it with `rem tape retire`
+and `--config` with this configuration's path, or start from a newer copy of
+the state directory.
+
+On a parity pool, if the restored tape log still owes closeout, retirement
+refuses with `CloseoutRequired`. Closeout stays refused under either
+`append_admission_refused` or `session_suffix_contradiction`.
+For that tape, use `rem tape supersede-tail` only where discard applies, or
+start from a newer copy of the state directory.
 
 Keep the recorded paths on a replacement server. State, tape-log or library-log
 roots that differ from `authority-manifest.json` refuse daemon startup, rebuild

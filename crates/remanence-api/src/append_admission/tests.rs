@@ -1621,7 +1621,7 @@ fn x22_tail_refusal_caps_only_display_at_eight_entries() {
     );
     let expected = |listing: String| {
         format!(
-        "TailBeyondKnownState: tape {}, expected EOD LBA 2, found {listing}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`).",
+        "TailBeyondKnownState: tape {}, expected EOD LBA 2, found {listing}. The tape holds data this state does not record, often after restoring an older copy of the state directory. It stays readable and closed for writing. To keep the data, start from a newer copy of the state directory. Unless this state shows the tape's last session closed, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library) or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`) discards it; a drive outside a library can first copy its files out with `rem tape restore --scan`.",
         uuid::Uuid::from_bytes(UUID),
     )
     };

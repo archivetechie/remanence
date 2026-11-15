@@ -672,8 +672,16 @@ rem tape supersede-tail --acknowledge-tape <LABEL|UUID> [--confirm-supersede "SU
 ```
 
 List and explicitly discard the suffix beyond local authority, with typed
-confirmation. The decision is recorded as `SupersedeTail` in the library log.
-Rescue files first.
+confirmation, unless this state shows the tape's last session closed. That
+shape cannot be discarded in this release: keep the tape closed for writing,
+withdraw it with `rem tape retire` (pass `--config` with this configuration's
+path), or start from a newer copy of the state directory. Retirement refuses
+while parity closeout is due. For an explicit device, add
+`--device <PATH> --allow-device <SERIAL>`.
+
+The decision is recorded as `SupersedeTail` in the library log. Copy files out
+with `rem tape restore --scan` first; discard only data whose objects are known
+to be unneeded.
 
 ### rem tape quarantine (standalone)
 
@@ -699,7 +707,13 @@ rem tape quarantine list --device <SG> --allow-device <SERIAL> --config <PATH>
 configuration. The library parser's `list` prints media-readiness records and
 does not list `library:` tape fences.
 
-Release these tape fences with the library form:
+For releasable causes, use the library form below. Neither
+`append_admission_refused` nor `session_suffix_contradiction` is released by
+this command. Use `rem tape supersede-tail` where recovery applies; it refuses
+a contradicting recorded session ending or a state that shows the tape's last
+session closed. Otherwise withdraw the tape with `rem tape retire` (pass
+`--config` with this configuration's path), or start from a newer copy of the
+state directory. Retirement refuses while parity closeout is due.
 
 ```sh
 rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>
@@ -1325,9 +1339,15 @@ an empty list prints `(no active media-readiness quarantines)`. `show` adds the 
 its JSON carries `last_sense` (`KK/AA/QQ`) and `last_sense_name` beside the raw sense
 fields. The JSON schema of `list` is `rem.tape.quarantine.list.v1`.
 
-`release` also releases tape-I/O fences, with `library:` ids; `rem catalog tapes --json`,
-`rem top` and `rem daemon health --json` list those. A tape-I/O fence is released through the
-configured daemon socket after the operator's acknowledgement. Only an absent listener
+`release` also releases tape-I/O fences with releasable causes and `library:`
+ids; `rem catalog tapes --json`, `rem top` and `rem daemon health --json` list
+those. Neither `append_admission_refused` nor `session_suffix_contradiction`
+is released. Use `rem tape supersede-tail` where recovery applies; it refuses
+a contradicting recorded session ending or a state that shows the tape's last
+session closed. Otherwise withdraw the tape with `rem tape retire` or start
+from a newer copy of the state directory. Retirement refuses while parity
+closeout is due. A releasable tape-I/O fence is released through the configured
+daemon socket after the operator's acknowledgement. Only an absent listener
 permits the offline fallback, which needs the exclusive state lock. Repeating a release
 returns its original evidence. Media-readiness (`mrq-`) release runs offline;
 stop the daemon so it can take the state lock.
@@ -1392,8 +1412,8 @@ rem tape retire [OPTIONS] --reason <TEXT> <TARGET>
 - `--json` emits `rem.tape.retire.v1`.
 
 Every copy on the tape becomes `missing` in the catalog, and the barcode is released. The
-command touches no media and does not check or complete closeout debt. A retire
-that changes anything takes the state lock, so stop the
+command touches no media and refuses with `CloseoutRequired` while parity
+closeout is due. A retire that changes anything takes the state lock, so stop the
 daemon first. [Tape identity and the retire operation](tape-identity-lifecycle-explainer.md)
 explains the effects and how they survive a catalog rebuild.
 
@@ -1522,7 +1542,14 @@ rem tape finalize --tape-uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f \
 rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> [--confirm-supersede <TEXT>]
 ```
 
-Through the daemon, list and explicitly discard a suffix beyond checkpoint authority using the same append checks. Rescue first; confirm the exact text requested.
+Through the daemon, list and explicitly discard a suffix beyond checkpoint
+authority using the same append checks. Discard refuses when this state shows
+the tape's last session closed; keep the tape closed for writing, withdraw it
+with `rem tape retire`, or start from a newer copy of the state directory.
+Retirement refuses while parity closeout is due. To keep the unlisted data,
+start from a newer copy of the state directory; `rem tape restore --scan` is
+available only on a drive outside a library. Discard only data whose objects
+are known to be unneeded, and confirm the exact text requested.
 
 ### rem tape inventory
 

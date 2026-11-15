@@ -492,9 +492,9 @@ Operating one requires a separate opt-in (`allow_derived_drive_identity`, `--all
 
 A durable refusal recorded against a tape or a drive after an operation on it ended in a state
 Remanence could not prove. It is written to the library log and the catalog and survives
-restarts. Fenced media is refused for writes and initialization, and the daemon also refuses
-read sessions on it, until an operator resumes or releases the fence with an acknowledgement.
-Other media stay available. There are two kinds: the [tape-I/O fence](#tape-io-fence) and the
+restarts. Fenced media is refused for writes and initialization until its cause is
+resolved. Some tape-I/O causes allow reads or motion, as described below; other
+media stay available. There are two kinds: the [tape-I/O fence](#tape-io-fence) and the
 [media-readiness fence](#media-readiness-fence). See [Concepts](concepts.md#9-fences).
 
 ### quarantine
@@ -507,7 +507,17 @@ list, show and release fences by that id; quarantine and fence name the same rec
 A fence (quarantine id beginning `library:`) recording a partial batch,
 a transfer error, an uncertain finalization step, or a tape log that ends before
 the catalog's projection. `rem catalog tapes --json`, `rem top` and
-`rem daemon health --json` show it. The release form is
+`rem daemon health --json` show it. In a library, a tape fenced only by
+`append_admission_refused` stays readable and closed for writing, and allows
+robot motion, eviction and idle unload. A tape fenced only by
+`session_suffix_contradiction` allows that motion but refuses reads and writing.
+Neither is released by `rem tape quarantine release`. Use `rem tape supersede-tail`
+where recovery applies; it refuses a contradicting recorded session ending or
+a state that shows the tape's last session closed. Otherwise withdraw the tape
+with `rem tape retire` or start from a newer copy of the state directory.
+Retirement refuses while parity closeout is due. See [Tape-I/O
+fences](guide-troubleshooting.md#tape-io-fences) for admission details.
+For a releasable cause, the release form is
 `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
 For a present, noncontradicted `native_log_behind_projection` log, restore the
 exact tape log or rebuild the catalog, then add `--force` to release. A running

@@ -717,15 +717,20 @@ impl LibraryRuntime {
             if !matches!(fence.scope, lib::FenceScope::Tape(_)) {
                 return Err(StateError::ConfigInvalid("fence is not tape-scoped".into()).into());
             }
-            if matches!(
-                fence.cause,
-                lib::FenceCause::AppendAdmissionRefused
-                    | lib::FenceCause::SessionSuffixContradiction
-            ) {
-                return Err(StateError::ConfigInvalid(
-                    "suffix fence requires explicit physical tail recovery".into(),
-                )
-                .into());
+            match fence.cause {
+                lib::FenceCause::SessionSuffixContradiction => {
+                    return Err(StateError::ConfigInvalid(
+                        "release refused: a session_suffix_contradiction fence stays until rem tape supersede-tail recovers the tape's tail (it refuses when the tape contradicts its recorded session ending); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory".into(),
+                    )
+                    .into());
+                }
+                lib::FenceCause::AppendAdmissionRefused => {
+                    return Err(StateError::ConfigInvalid(
+                        "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail (it refuses when this state shows the tape's last session closed); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory".into(),
+                    )
+                    .into());
+                }
+                _ => {}
             }
             let forced = fence.cause == lib::FenceCause::NativeLogBehindProjection;
             let detail = if forced {

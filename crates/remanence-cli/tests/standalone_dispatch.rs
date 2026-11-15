@@ -2891,7 +2891,7 @@ fn standalone_cannot_release_a_library_fence() {
         assert_ne!(code, ExitCode::SUCCESS);
         assert!(
             out.contains(
-                "bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction fence is released by rem tape supersede-tail instead"
+                "bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction or append_admission_refused fence is not released: use rem tape supersede-tail, or withdraw the tape with rem tape retire, passing --config with this configuration's path"
             ),
             "{out}"
         );
