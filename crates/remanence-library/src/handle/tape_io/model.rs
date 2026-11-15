@@ -806,11 +806,54 @@ pub enum WormMediaState {
     Unknown,
 }
 
+/// Combined cartridge evidence, with either positive WORM signal acting as a veto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WormVerdict {
+    /// At least one source reports rewritable media and neither reports WORM.
+    NotWorm,
+    /// At least one source reports WORM and neither reports rewritable media.
+    Worm,
+    /// Neither source establishes the cartridge's WORM state.
+    Unknown,
+    /// The two sources disagree; consumers must treat the cartridge as WORM.
+    Conflict {
+        /// WORM state reported by the MODE SENSE header.
+        header: WormMediaState,
+        /// WORM state reported by the Medium Configuration page.
+        page: WormMediaState,
+    },
+}
+
+impl WormVerdict {
+    /// Reduce the verdict to media state, treating conflicting evidence as WORM.
+    pub fn media_state(self) -> WormMediaState {
+        match self {
+            Self::NotWorm => WormMediaState::NotWorm,
+            Self::Worm | Self::Conflict { .. } => WormMediaState::Worm,
+            Self::Unknown => WormMediaState::Unknown,
+        }
+    }
+}
+
+/// Combine the two WORM signals without letting either override a positive veto.
+/// `None` means the page was not asked or gave no reply; `Some(Unknown)` means
+/// it was unsupported or malformed.
+pub fn combine_worm_evidence(header: WormMediaState, page: Option<WormMediaState>) -> WormVerdict {
+    use WormMediaState::{NotWorm, Unknown, Worm};
+    match (header, page) {
+        (NotWorm, Some(page @ Worm)) | (Worm, Some(page @ NotWorm)) => {
+            WormVerdict::Conflict { header, page }
+        }
+        (NotWorm, _) | (Unknown, Some(NotWorm)) => WormVerdict::NotWorm,
+        (Worm, _) | (Unknown, Some(Worm)) => WormVerdict::Worm,
+        (Unknown, None | Some(Unknown)) => WormVerdict::Unknown,
+    }
+}
+
 /// Current block-size + compression configuration of a loaded tape.
-/// Returned by `DriveHandle::read_config` (queried via MODE SENSE
-/// page 0x0F, plus 0x1D when the header's medium type is inconclusive)
-/// and consumed by `write_config` (issued as a
-/// MODE SELECT).
+/// Returned by `DriveHandle::read_config` using MODE SENSE page 0x0F, or by
+/// `DriveHandle::read_config_resolving_worm` with page 0x1D as a fallback for an
+/// inconclusive header. Consumed by `write_config` (issued as MODE SELECT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapeConfig {
     /// Recorded density from the MODE SENSE block descriptor; ignored on write_config.
@@ -841,8 +884,9 @@ pub struct TapeConfig {
     pub max_block_size_bytes: u32,
     /// Write-protect bit from the MODE SENSE parameter header.
     pub write_protected: bool,
-    /// WORM state from the MODE SENSE header's medium type, falling back to
-    /// the Medium Configuration page when the header is inconclusive.
+    /// WORM evidence from the MODE SENSE header for `DriveHandle::read_config`.
+    /// An inconclusive header remains `Unknown` unless the caller uses
+    /// `DriveHandle::read_config_resolving_worm` to ask the Medium Configuration page.
     pub worm: WormMediaState,
 }
 

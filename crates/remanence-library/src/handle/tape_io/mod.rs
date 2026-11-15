@@ -46,11 +46,12 @@ pub use media_gate::{
     MediaWriteFenceError, NoCalibrationControl,
 };
 pub use model::{
-    BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
-    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
-    ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
-    TapeConfig, TapePosition, TapePositionReport, WormMediaState, WriteBatchOutcome,
-    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
+    combine_worm_evidence, BlockSize, ComputedPosition, DevicePositionProof,
+    PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome,
+    ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags,
+    SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapePosition, TapePositionReport,
+    WormMediaState, WormVerdict, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    WriteUnpositionedOutcome,
 };
 pub use readiness::{
     classify_media_readiness_error, classify_media_readiness_error_ref,
@@ -3952,7 +3953,7 @@ impl super::DriveHandle {
 
     /// Read the drive's current block-size + compression
     /// configuration plus its reported maximum block size. Issues
-    /// **two CDBs**, plus a third when the header does not type the cartridge:
+    /// **two CDBs**; WORM evidence comes only from the header:
     ///
     /// 1. READ BLOCK LIMITS (CDB `0x05`) for
     ///    [`TapeConfig::max_block_size_bytes`]. MODE SENSE pages do
@@ -3962,18 +3963,20 @@ impl super::DriveHandle {
     ///    block descriptor — block size comes from the
     ///    descriptor's 3-byte BLOCK LENGTH field; compression
     ///    comes from the page's DCE bit.
-    /// 3. When the header's medium type leaves WORM state unknown,
-    ///    MODE SENSE(6) page `0x1D` (Medium Configuration) supplies
-    ///    the WORM-mode bit. Unsupported or malformed page data
-    ///    leaves WORM state unknown; any other failure of this
-    ///    command (CHECK CONDITION other than a current ILLEGAL
-    ///    REQUEST, or a transport error) fails the call with this
-    ///    command's own outcome.
     ///
     /// Malformed block-limit or compression responses surface as
     /// [`TapeIoError::MalformedModeResponse`] (a CDB-succeeded /
     /// payload-wrong condition, distinct from CHECK CONDITION).
     pub fn read_config(&mut self) -> Result<TapeConfig, TapeIoError> {
+        self.read_config_internal(false)
+    }
+
+    /// Read configuration and resolve an inconclusive header's WORM state using
+    /// MODE SENSE(6) page 0x1D (Medium Configuration). Typed headers need no page.
+    /// Unsupported or malformed page data leaves WORM state unknown. Other
+    /// failures return the page command's own outcome, within the same
+    /// `TapeReadConfig` audit pair as the header read.
+    pub fn read_config_resolving_worm(&mut self) -> Result<TapeConfig, TapeIoError> {
         self.read_config_internal(true)
     }
 
@@ -4063,7 +4066,7 @@ impl super::DriveHandle {
         // The page has its own top-level result boundary so a failure carries
         // its own evidence, not the compression page's successful completion.
         if resolve_worm && mode.worm == WormMediaState::Unknown {
-            mode.worm = self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
+            let page = self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
                 let cdb = remanence_scsi::mode::build_mode_sense6_cdb(
                     remanence_scsi::mode::PageControl::Current,
                     remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION,
@@ -4089,6 +4092,7 @@ impl super::DriveHandle {
                     }
                 }
             })?;
+            mode.worm = combine_worm_evidence(mode.worm, Some(page)).media_state();
         }
 
         self.finish_tape_success(op, started.elapsed());
@@ -4960,7 +4964,7 @@ fn parse_mode_sense_data_compression(buf: &[u8]) -> Result<ModeSenseDataCompress
 
 /// Read WORMM from a MODE SENSE(6) Medium Configuration page. Missing,
 /// truncated or unrelated page data cannot establish that media is rewritable.
-fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
+pub fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
     if response.len() < 4 {
         return WormMediaState::Unknown;
     }
@@ -4982,7 +4986,8 @@ fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
     }
 }
 
-fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {
+/// Decode the cartridge medium-type byte; unlisted codes provide no WORM evidence.
+pub fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {
     match medium_type {
         0x00 => WormMediaState::Unknown,
         0x01 | 0x3C | 0x4C | 0x5C | 0x6C | 0x7C | 0x8C | 0x9C => WormMediaState::Worm,

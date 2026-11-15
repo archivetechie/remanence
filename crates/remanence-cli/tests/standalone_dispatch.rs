@@ -2644,6 +2644,166 @@ fn clobber_catalogued_tape_and_refuse_another_label_owner() {
     f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
 }
 
+/// A blank typed WORM cartridge is refused before bootstrap or filemark writes.
+#[test]
+fn blank_worm_init_refuses_before_writes() {
+    let f = VersionFixture::new();
+    let mut tape = remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144);
+    tape.worm = true;
+    f.world
+        .lock()
+        .unwrap()
+        .put_tape_in_drive(0x100, "WORM", None, tape);
+    let before = f.writes();
+    let (code, out, errors) = f.run(
+        &["tape", "init", "--label", "WORM", "--generation", "L9"],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert!(
+        out.contains("tape init refused before any media write"),
+        "{out}"
+    );
+    assert!(out.contains("ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail"), "{out}");
+    assert_eq!(f.writes(), before);
+}
+
+/// Untyped init requires positive rewritable evidence from the configuration page.
+#[test]
+fn untyped_init_resolves_media_before_writes() {
+    use remanence_chaos::model::{MediumTypeReporting, VirtualTape};
+    for (worm, reporting, refusal) in [
+        (true, MediumTypeReporting::ConfigurationPage, Some("ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail")),
+        (false, MediumTypeReporting::Unsupported, Some("ordinary Object writes require media positively identified as rewritable; the loaded tape's WORM state is unknown")),
+        (false, MediumTypeReporting::ConfigurationPage, None),
+    ] {
+        let f = VersionFixture::new();
+        let mut tape = VirtualTape::empty(256 * 1024 * 1024, 262144);
+        tape.worm = worm;
+        {
+            let mut world = f.world.lock().unwrap();
+            world.put_tape_in_drive(0x100, "UNTYPED", None, tape);
+            world.drive_states.get_mut(&0x100).unwrap().medium_type_reporting = reporting;
+        }
+        let before = f.writes();
+        let (code, out, errors) = f.run(&["tape", "init", "--label", "UNTYPED", "--generation", "L9"], true);
+        if let Some(message) = refusal {
+            assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+            assert!(out.contains("tape init refused before any media write"), "{out}");
+            assert!(out.contains(message), "{out}");
+            assert_eq!(f.writes(), before);
+        } else {
+            assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+            assert!(f.writes() > before);
+        }
+    }
+}
+
+/// Both JSON surfaces preserve the independently decoded header and page evidence.
+#[test]
+fn diagnostics_capture_reports_both_worm_signals() {
+    use remanence_chaos::model::{MediumTypeReporting, VirtualTape};
+    for (worm, reporting, medium_type, header, page, wormm, verdict) in [
+        (
+            false,
+            MediumTypeReporting::Header,
+            "0x98",
+            "not_worm",
+            Some("not_worm"),
+            Some(0),
+            "not_worm",
+        ),
+        (
+            true,
+            MediumTypeReporting::Header,
+            "0x9c",
+            "worm",
+            Some("worm"),
+            Some(1),
+            "worm",
+        ),
+        (
+            true,
+            MediumTypeReporting::ConfigurationPage,
+            "0x00",
+            "unknown",
+            Some("worm"),
+            Some(1),
+            "worm",
+        ),
+        (
+            false,
+            MediumTypeReporting::Unsupported,
+            "0x00",
+            "unknown",
+            None,
+            None,
+            "unknown",
+        ),
+    ] {
+        let f = VersionFixture::new();
+        let mut tape = VirtualTape::empty(256 * 1024 * 1024, 262144);
+        tape.worm = worm;
+        {
+            let mut world = f.world.lock().unwrap();
+            world.put_tape_in_drive(0x100, "DIAG", None, tape);
+            world
+                .drive_states
+                .get_mut(&0x100)
+                .unwrap()
+                .medium_type_reporting = reporting;
+        }
+        let before = f.world.lock().unwrap().command_log.len();
+        let archive = f.root.path().join("worm-diagnostics.tar");
+        let result = f.ok(&["diagnostics", "capture", "--out", archive.to_str().unwrap()]);
+        assert_eq!(
+            result["worm"],
+            serde_json::json!([{
+                "device": "/dev/home-model",
+                "header_medium_type": medium_type,
+                "header": header,
+                "wormm": wormm,
+                "medium_configuration": page,
+                "verdict": verdict,
+            }])
+        );
+        let extracted = std::process::Command::new("tar")
+            .arg("-xOf")
+            .arg(&archive)
+            .arg("./manifest.json")
+            .output()
+            .unwrap();
+        assert!(
+            extracted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&extracted.stderr)
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&extracted.stdout).unwrap();
+        assert_eq!(manifest["worm"], result["worm"]);
+        let command = manifest["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["command"] == "mode-sense-medium-configuration")
+            .expect("page command recorded");
+        if page.is_none() {
+            assert!(command["error"].is_string(), "{command}");
+        } else {
+            let raw = std::process::Command::new("tar")
+                .arg("-xOf")
+                .arg(&archive)
+                .arg(format!("./{}", command["file"].as_str().unwrap()))
+                .output()
+                .unwrap();
+            assert!(raw.status.success());
+            assert_eq!(raw.stdout.len() as u64, command["bytes"].as_u64().unwrap());
+        }
+        assert!(f.world.lock().unwrap().command_log[before..]
+            .iter()
+            .all(|command| matches!(command.opcode, 0x12 | 0x1a | 0x4d)));
+    }
+}
+
 /// Every init checks the partition page, including an explicitly confirmed clobber.
 #[test]
 fn partitioned_init_refuses_before_writes() {

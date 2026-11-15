@@ -25,7 +25,7 @@ release yet, so you build from source
   Fedora). The first part uses it to list an object's contents.
 - Python 3, for one key-file conversion in the encrypted part.
 - For the second part only: a tape library (physical, or a virtual one such as
-  QuadStor), a blank LTO cartridge in one of its slots, and `sudo` on the host.
+  QuadStor), a blank rewritable LTO cartridge (not WORM) in one of its slots, and `sudo` on the host.
 
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 625f7044 -->
 ## Build
@@ -325,7 +325,7 @@ The rest of this page is for a changer library.
 <!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs @ 625f7044 -->
 ## Talking to a library (requires hardware)
 
-From here on you need a tape library with a blank LTO cartridge in one of its
+From here on you need a tape library with a blank rewritable LTO cartridge (not WORM) in one of its
 slots. The examples use barcode `RMJ101L9` for that cartridge. The barcode is
 the label the changer reads from the cartridge, and its last two characters
 (`L9`) name the LTO generation. Run the commands from the checkout directory.
@@ -537,7 +537,7 @@ tape init RMJ101L9: dry-run-would-write
   decision: fresh-init
 ```
 
-`fresh-init` means the checks found a blank cartridge that may be initialized.
+`fresh-init` means the checks found a blank rewritable cartridge that may be initialized.
 Now initialize it. `--parity default` selects Remanence's default Reed-Solomon
 parity, which lets a reader rebuild unreadable regions of the tape:
 

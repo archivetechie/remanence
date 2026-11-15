@@ -19,6 +19,8 @@ version 0.2.0.
 ## What you need
 
 - Linux, an LTO drive and a compatible rewritable cartridge.
+  Buy rewritable media, not WORM, because recovery replaces an interrupted write's
+  unfinished tail; see [Concepts §7](concepts.md#7-worm-media).
 - Remanence built and installed as described in
   [Installing Remanence](guide-install.md). There is no binary release yet.
 - The host prepared for tape hardware, as in

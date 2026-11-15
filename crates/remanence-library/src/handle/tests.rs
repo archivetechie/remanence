@@ -5896,6 +5896,23 @@ fn assert_read_config_audit(audit: &Arc<Mutex<Vec<CapturedEvent>>>, success: boo
     }
 }
 
+/// A plain read never asks page 1Dh, even when the queued reply would type the cartridge.
+#[test]
+fn drive_handle_read_config_untyped_header_is_header_only() {
+    let (mut drive, log, audit) = read_config_fixture(
+        0x00,
+        Some(Ok(read_config_medium_configuration_response(true))),
+        false,
+    );
+    let config = drive.read_config().expect("header-only config");
+    assert_eq!(
+        log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
+        [0x05, 0x1a]
+    );
+    assert_eq!(config.worm, WormMediaState::Unknown);
+    assert_read_config_audit(&audit, true);
+}
+
 /// Both zero and unlisted medium types take the same WORMM fallback.
 #[test]
 fn drive_handle_read_config_resolves_untyped_medium() {
@@ -5909,7 +5926,9 @@ fn drive_handle_read_config_resolves_untyped_medium() {
                 Some(Ok(read_config_medium_configuration_response(worm))),
                 false,
             );
-            let config = drive.read_config().expect("page resolves WORM state");
+            let config = drive
+                .read_config_resolving_worm()
+                .expect("page resolves WORM state");
             assert_eq!(config.worm, expected);
             let commands = log.borrow();
             assert_eq!(
@@ -5940,7 +5959,7 @@ fn drive_handle_read_config_unsupported_medium_configuration() {
         );
         assert_eq!(
             drive
-                .read_config()
+                .read_config_resolving_worm()
                 .expect("unsupported page is unknown")
                 .worm,
             WormMediaState::Unknown
@@ -5966,7 +5985,7 @@ fn drive_handle_read_config_medium_configuration_error_outcome() {
         false,
     );
     let error = drive
-        .read_config()
+        .read_config_resolving_worm()
         .expect_err("medium error must propagate");
     let evidence = &error.outcome().evidence;
     assert_eq!(evidence.sense.as_ref(), Some(&sense));
@@ -5995,7 +6014,7 @@ fn drive_handle_read_config_medium_configuration_unusable_or_deferred_error() {
             false,
         );
         let error = drive
-            .read_config()
+            .read_config_resolving_worm()
             .expect_err("sense does not prove unsupported page");
         assert_eq!(error.outcome().evidence.requested_bytes, Some(255));
         assert_read_config_audit(&audit, false);
@@ -6009,7 +6028,10 @@ fn drive_handle_read_config_malformed_medium_configuration_is_unknown() {
     page.truncate(14);
     let (mut drive, _, audit) = read_config_fixture(0, Some(Ok(page)), false);
     assert_eq!(
-        drive.read_config().expect("malformed page is unknown").worm,
+        drive
+            .read_config_resolving_worm()
+            .expect("malformed page is unknown")
+            .worm,
         WormMediaState::Unknown
     );
     assert_read_config_audit(&audit, true);
@@ -6018,17 +6040,22 @@ fn drive_handle_read_config_malformed_medium_configuration_is_unknown() {
 /// A recognized header remains authoritative and never requests page 1Dh.
 #[test]
 fn drive_handle_read_config_typed_medium_skips_configuration_page() {
-    for (medium_type, expected) in [
-        (0x98, WormMediaState::NotWorm),
-        (0x9c, WormMediaState::Worm),
+    for read in [
+        DriveHandle::read_config,
+        DriveHandle::read_config_resolving_worm,
     ] {
-        let (mut drive, log, audit) = read_config_fixture(medium_type, None, false);
-        assert_eq!(drive.read_config().expect("typed header").worm, expected);
-        assert_eq!(
-            log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
-            [0x05, 0x1a]
-        );
-        assert_read_config_audit(&audit, true);
+        for (medium_type, expected) in [
+            (0x98, WormMediaState::NotWorm),
+            (0x9c, WormMediaState::Worm),
+        ] {
+            let (mut drive, log, audit) = read_config_fixture(medium_type, None, false);
+            assert_eq!(read(&mut drive).expect("typed header").worm, expected);
+            assert_eq!(
+                log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
+                [0x05, 0x1a]
+            );
+            assert_read_config_audit(&audit, true);
+        }
     }
 }
 

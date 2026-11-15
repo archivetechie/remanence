@@ -6,6 +6,36 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
+## WORM and unknown-media refusals
+
+```text
+ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail
+```
+
+The loaded cartridge reports WORM (write once, read many). Use a compatible rewritable
+cartridge. Recovery needs to replace an unfinished write, including one interrupted by
+cancellation or a disconnected client; WORM media forbids that. Reading and adoption are
+designed for WORM but untested on a physical WORM cartridge. See [Concepts §7](concepts.md#7-worm-media).
+
+```text
+ordinary Object writes require media positively identified as rewritable; the loaded tape's WORM state is unknown
+```
+
+The drive supplies neither a recognized header medium type nor usable WORM-mode evidence
+from the Medium Configuration page. Remanence refuses the write because it cannot establish
+that the cartridge is rewritable. Send the failing command and its output with a
+`rem diagnostics capture --out diagnostics.tar` archive; the capture records both signals
+and their combined verdict.
+
+```text
+tape init refused before any media write: <reason>
+```
+
+Both library and standalone init use the same media gate and give one of the reasons above.
+A blank WORM cartridge is refused too, and clobber or force flags do not override this check.
+Use rewritable media for the WORM refusal; send a diagnostics capture for an unknown-state
+refusal. No media write occurs on either refusal.
+
 <!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/state/initialization.rs crates/remanence-api/src/tape_identity.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/mount_support.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-state/src/library_runtime.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs @ 35fc920573f5b874c26c0dd9e2c443d43451bca5 -->
 ## Authority-layout refusals and declared reset
 

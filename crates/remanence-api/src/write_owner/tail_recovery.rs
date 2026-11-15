@@ -175,7 +175,9 @@ pub(crate) fn supersede_mounted_tail(
     drive.rewind().map_err(|e| failure(e.to_string()))?;
     crate::verify_tape_identity(&mut DriveHandleSource(drive), &tape_uuid)
         .map_err(|e| failure(e.to_string()))?;
-    let config = drive.read_config().map_err(|e| failure(e.to_string()))?;
+    let config = drive
+        .read_config_resolving_worm()
+        .map_err(|e| failure(e.to_string()))?;
     crate::pool_write::require_rewritable_object_media(config)
         .map_err(|e| failure(e.to_string()))?;
     crate::drive_mode::configure_fixed_uncompressed_write(drive, config, size)

@@ -57,8 +57,9 @@ pub use handle::changer_ready::{
     DEFAULT_CHANGER_NOT_READY_WAIT, MAX_CHANGER_NOT_READY_WAIT, MIN_CHANGER_NOT_READY_POLL,
 };
 pub use handle::tape_io::{
-    classify_media_readiness_error_ref, media_readiness_poll_interval, media_readiness_sense_label,
-    media_readiness_sense_name, verification_read_completion, wrap_map_is_servable,
+    classify_media_readiness_error_ref, combine_worm_evidence, media_readiness_poll_interval,
+    media_readiness_sense_label, media_readiness_sense_name, verification_read_completion,
+    worm_state_from_medium_configuration, worm_state_from_medium_type, wrap_map_is_servable,
     AppendBoundaryProof, AppendSession, BlockSize, ComputedPosition, DevicePositionProof,
     DriveErrorCounters, InMemoryCalibrationControl, MediaDispatchObserver, MediaFamily,
     MediaReadiness, MediaReadinessKind, MediaReadinessPoll, MediaReadinessWaitEvent,
@@ -66,7 +67,7 @@ pub use handle::tape_io::{
     PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome,
     ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags,
     SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError, TapeIoErrorKind,
-    TapePosition, TapePositionReport, VerificationReadCompletion, WormMediaState,
+    TapePosition, TapePositionReport, VerificationReadCompletion, WormMediaState, WormVerdict,
     WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
     MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };

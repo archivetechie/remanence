@@ -984,6 +984,50 @@ fn parse_mode_sense_rejects_wrong_page_code() {
     }
 }
 
+/// Each header/page combination preserves either WORM veto, including both conflicts.
+#[test]
+fn combine_worm_evidence_all_rows() {
+    use WormMediaState::{NotWorm, Unknown, Worm};
+    for (header, page, expected, media) in [
+        (NotWorm, None, WormVerdict::NotWorm, NotWorm),
+        (NotWorm, Some(Unknown), WormVerdict::NotWorm, NotWorm),
+        (NotWorm, Some(NotWorm), WormVerdict::NotWorm, NotWorm),
+        (
+            NotWorm,
+            Some(Worm),
+            WormVerdict::Conflict {
+                header: NotWorm,
+                page: Worm,
+            },
+            Worm,
+        ),
+        (Worm, None, WormVerdict::Worm, Worm),
+        (Worm, Some(Unknown), WormVerdict::Worm, Worm),
+        (Worm, Some(Worm), WormVerdict::Worm, Worm),
+        (
+            Worm,
+            Some(NotWorm),
+            WormVerdict::Conflict {
+                header: Worm,
+                page: NotWorm,
+            },
+            Worm,
+        ),
+        (Unknown, Some(NotWorm), WormVerdict::NotWorm, NotWorm),
+        (Unknown, Some(Worm), WormVerdict::Worm, Worm),
+        (Unknown, None, WormVerdict::Unknown, Unknown),
+        (Unknown, Some(Unknown), WormVerdict::Unknown, Unknown),
+    ] {
+        let verdict = combine_worm_evidence(header, page);
+        assert_eq!(verdict, expected, "header={header:?}, page={page:?}");
+        assert_eq!(
+            verdict.media_state(),
+            media,
+            "header={header:?}, page={page:?}"
+        );
+    }
+}
+
 #[test]
 fn build_compression_param_list_variable_no_compression() {
     let cfg = TapeConfig {

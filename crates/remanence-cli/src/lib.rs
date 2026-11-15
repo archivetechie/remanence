@@ -78,7 +78,7 @@ use remanence_library::{
     DriveBay, DriveHandle, DriveHandleSource, ElementException, FileBlockSink, FileBlockSource,
     IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, MediaReadinessWaitEvent,
     MediaReadinessWaitOptions, OpenError, Slot, StaticAllowlist, TapeAlerts, TapeConfig,
-    VecBlockSource, WormMediaState, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+    VecBlockSource, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -12837,7 +12837,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         "after_read_medium_partitions",
         || signal_guard.requested_signal_name(),
     )?;
-    let drive_config = match drive.read_config() {
+    let drive_config = match drive.read_config_resolving_worm() {
         Ok(config) => config,
         Err(error) => {
             if let Some(signal) = record_media_readiness_signal_or_command_failure(
@@ -12856,6 +12856,9 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     };
     if drive_config.write_protected {
         return Err("media is write-protected according to MODE SENSE".to_string());
+    }
+    if let Err(e) = remanence_api::require_rewritable_object_media(drive_config) {
+        return Err(format!("tape init refused before any media write: {e}"));
     }
 
     record_media_readiness_signal_if_requested(
@@ -12901,18 +12904,6 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         Some(voltag.as_str()),
         remanence_api::bot_classification_uuid(&bot_projection.classification).as_ref(),
     )?;
-    if matches!(drive_config.worm, WormMediaState::Worm)
-        && !matches!(
-            bot_projection.classification,
-            remanence_api::BotClassification::BlankCheckEod
-        )
-    {
-        return Err(
-            "WORM media already contains data/bootstrap; init refuses to append or rewrite it"
-                .to_string(),
-        );
-    }
-
     let catalog_projection = state.project_catalog_inputs(
         voltag.as_str(),
         &bot_projection.classification,
@@ -19704,7 +19695,7 @@ mod tests {
             compression,
             max_block_size_bytes: 8 * 1024 * 1024,
             write_protected: false,
-            worm: WormMediaState::NotWorm,
+            worm: remanence_library::WormMediaState::NotWorm,
         }
     }
 
@@ -23865,6 +23856,22 @@ pool_id = "init-test"
         .expect("seed committed copy");
     }
 
+    /// Blank WORM media must be refused before its otherwise valid bootstrap writes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_blank_worm_refuses_before_writes() {
+        let run = run_tape_init_on_bot_with_medium_type(Some(vec![]), |_, _| {}, &[], "", 0x9c);
+        assert_ne!(run.code, ExitCode::SUCCESS, "{}", run.stderr);
+        assert!(
+            run.stderr
+                .contains("tape init refused before any media write"),
+            "{}",
+            run.stderr
+        );
+        assert!(run.stderr.contains("ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail"), "{}", run.stderr);
+        assert_eq!(run.writes, 0);
+    }
+
     /// Like [`run_tape_init_on_bot`], with `seed(config_path, state_root)`
     /// preparing state before init runs; init may refuse before any device IO.
     #[cfg(target_os = "linux")]
@@ -23873,6 +23880,18 @@ pool_id = "init-test"
         seed: impl FnOnce(&Path, &Path),
         extra: &[&str],
         input_text: &str,
+    ) -> UnknownTapeInitRun {
+        run_tape_init_on_bot_with_medium_type(bot_reads, seed, extra, input_text, 0x98)
+    }
+
+    /// Script the medium-type header independently of blank or used BOT contents.
+    #[cfg(target_os = "linux")]
+    fn run_tape_init_on_bot_with_medium_type(
+        bot_reads: Option<Vec<Option<Vec<u8>>>>,
+        seed: impl FnOnce(&Path, &Path),
+        extra: &[&str],
+        input_text: &str,
+        medium_type: u8,
     ) -> UnknownTapeInitRun {
         let temp = tempfile::tempdir().expect("temp state directory");
         let config_path = write_retire_test_config(temp.path());
@@ -23913,7 +23932,7 @@ pool_id = "init-test"
         }];
         let mut mode_page = vec![0u8; 28];
         mode_page[0] = 27;
-        mode_page[1] = 0x98;
+        mode_page[1] = medium_type;
         mode_page[2] = 0x10;
         mode_page[3] = 8;
         mode_page[12] = 0x0f;

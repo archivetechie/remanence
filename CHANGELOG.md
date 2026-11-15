@@ -7,9 +7,15 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Unreleased
 
-- Object writes now work on drives that report medium type `0x00` in the MODE SENSE
+- Object writes work on drives that report medium type `0x00` in the MODE SENSE
   header, such as some HP LTO-6 drives, when the Medium Configuration page positively
-  reports rewritable media.
+  reports rewritable media. Only write paths that need WORM state ask that page when
+  the header is inconclusive; plain settings reads use the header alone.
+- Both library and standalone `tape init` refuse WORM and unknown media before any
+  media write, including blank cartridges.
+- `rem diagnostics capture` saves a separate Medium Configuration reply and reports
+  both WORM signals and their combined verdict in the manifest and result JSON.
+  Conflicting signals are treated as WORM.
 
 - `rem doctor` checks the journal directory's filesystem and its disk's write
   cache through the same check as `rem put`, reporting a blocking `journal volume`

@@ -86,8 +86,9 @@ For a transfer between sites, the destination must support the tape's bootstrap
 and on-tape format versions. Its configuration also needs a pool rule that maps
 the barcode to a configured pool. Adoption does not decrypt or restore objects,
 and encrypted objects still need their private keys. A WORM (write-once)
-cartridge is safe for this read-only identity step, but Remanence does not write
-ordinary objects to WORM media.
+cartridge is supported by the design of this read-only identity step, but adoption
+is untested on a physical WORM cartridge. Remanence does not write ordinary objects
+to WORM media.
 
 <!-- code-anchor: crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state.rs crates/remanence-state/src/config.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Which tapes can be adopted
@@ -542,8 +543,9 @@ two pieces that need Remanence-specific joining.
 This cannot be done in place on WORM media, where the incomplete tail cannot be
 erased. Remanence admits ordinary object sessions only when the drive reports
 `NotWorm`; `Worm` and `Unknown` are both refused before the drive mode is
-changed. Read-only adoption and recovery are safe on WORM, and terminal-index
-finalization has its own append-only recovery path for WORM. Remanence does not
+changed. Read-only adoption, restore and recovery are designed for WORM, and
+terminal-index finalization has its own append-only recovery path for WORM;
+these paths are untested on a physical WORM cartridge. Remanence does not
 implement WORM object ingest.
 
 The caller keeps the source until `CheckpointSession` reports the object

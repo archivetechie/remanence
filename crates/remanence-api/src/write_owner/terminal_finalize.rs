@@ -271,7 +271,7 @@ pub(crate) fn finalize_mounted_tape(
             .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
     }
     prepare(index, drive)?;
-    let drive_config = drive.read_config().map_err(|error| {
+    let drive_config = drive.read_config_resolving_worm().map_err(|error| {
         super::restore::attach_outcome_retry(
             error.outcome(),
             Status::unavailable(format!("read finalization drive config: {error}")),

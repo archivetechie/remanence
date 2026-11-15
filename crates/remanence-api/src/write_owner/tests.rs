@@ -9313,6 +9313,15 @@ fn prepare_object_write_with_untyped_header(
     worm: bool,
     reporting: remanence_chaos::model::MediumTypeReporting,
 ) -> (Result<(), Status>, Vec<u8>) {
+    prepare_write_with_untyped_header(worm, reporting, WriteMediaPolicy::RewritableObject)
+}
+
+/// Run the same untyped-header fixture under either write admission policy.
+fn prepare_write_with_untyped_header(
+    worm: bool,
+    reporting: remanence_chaos::model::MediumTypeReporting,
+    media_policy: WriteMediaPolicy,
+) -> (Result<(), Status>, Vec<u8>) {
     const BLOCK_SIZE: u32 = 256 * 1024;
     let tape_uuid = [0x4e; 16];
     let bootstrap = BootstrapPayload {
@@ -9353,13 +9362,58 @@ fn prepare_object_write_with_untyped_header(
         &tape_uuid,
         BLOCK_SIZE,
         Uuid::new_v4(),
-        WriteMediaPolicy::RewritableObject,
+        media_policy,
     );
     let opcodes = world.lock().expect("world lock").command_log[command_start..]
         .iter()
         .map(|command| command.opcode)
         .collect();
     (result, opcodes)
+}
+
+/// The post-MODE SELECT read-back needs settings only, not a second WORM resolution.
+#[test]
+fn prepare_object_write_untyped_readback_skips_configuration_page() {
+    let (result, opcodes) = prepare_object_write_with_untyped_header(
+        false,
+        remanence_chaos::model::MediumTypeReporting::ConfigurationPage,
+    );
+    result.expect("untyped rewritable admission");
+    let select = opcodes
+        .iter()
+        .position(|opcode| *opcode == 0x15)
+        .expect("MODE SELECT");
+    assert_eq!(
+        opcodes[select + 1..]
+            .iter()
+            .filter(|opcode| **opcode == 0x1a)
+            .count(),
+        1,
+        "{opcodes:02x?}"
+    );
+}
+
+/// Append-only admission asks only for write protection, even on an untyped WORM tape.
+#[test]
+fn prepare_terminal_append_untyped_worm_skips_configuration_page() {
+    let (result, opcodes) = prepare_write_with_untyped_header(
+        true,
+        remanence_chaos::model::MediumTypeReporting::ConfigurationPage,
+        WriteMediaPolicy::TerminalAppend,
+    );
+    result.expect("append-only policy admits WORM");
+    let select = opcodes
+        .iter()
+        .position(|opcode| *opcode == 0x15)
+        .expect("MODE SELECT");
+    assert_eq!(
+        opcodes[..select]
+            .iter()
+            .filter(|opcode| **opcode == 0x1a)
+            .count(),
+        1,
+        "{opcodes:02x?}"
+    );
 }
 
 /// Positive WORMM=0 evidence admits the reporter's cartridge before selecting mode.

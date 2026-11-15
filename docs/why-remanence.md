@@ -369,9 +369,10 @@ These non-goals are listed so that you can rule Remanence out quickly.
   configuration on its own host. Coordination between hosts is the
   orchestrator's job.
 - No ordinary object writes to WORM (write once, read many) media. Recovery from
-  a crash during a write replaces the uncommitted tail of the tape, so writes
-  require the drive to report the loaded cartridge as rewritable. Read-only
-  recovery and the append-only finalization path handle WORM media.
+  an interrupted write, including cancellation or disconnection, replaces the
+  uncommitted tail of the tape, so writes require the drive to report the loaded
+  cartridge as rewritable. Read-only recovery and the append-only finalization
+  path are designed for WORM media but untested on a physical WORM cartridge.
 
 If any of these is a requirement for you, Remanence is the wrong tool.
 

@@ -2170,10 +2170,14 @@ fn prepare_init(
     drive.prevent_medium_removal().map_err(err)?;
     let proof = drive.identity_generation();
     drive.require_single_partition().map_err(err)?;
-    let mut cfg = drive.read_config().map_err(err)?;
+    let mut cfg = drive.read_config_resolving_worm().map_err(err)?;
     if cfg.write_protected {
         return Err("tape is write protected".into());
     }
+    if let Err(e) = remanence_api::require_rewritable_object_media(cfg) {
+        return Err(format!("tape init refused before any media write: {e}"));
+    }
+
     let hint = generation
         .map(|g| {
             parse_generation(g).map(|generation| MediaObservation {
@@ -2921,6 +2925,47 @@ fn confirm_setup(
     std::io::stdin().read_line(&mut answer).map_err(err)?;
     Ok(matches!(answer.trim(), "y" | "Y"))
 }
+/// Decode a diagnostic record from the two mode replies using the library's WORM rules.
+fn worm_diagnostic_record(
+    device: &Path,
+    header_reply: Option<&[u8]>,
+    page_reply: Option<&[u8]>,
+) -> Value {
+    use remanence_library::{
+        combine_worm_evidence, worm_state_from_medium_configuration, worm_state_from_medium_type,
+        WormMediaState, WormVerdict,
+    };
+    let medium_type = header_reply.and_then(|reply| reply.get(1)).copied();
+    let header = medium_type
+        .map(worm_state_from_medium_type)
+        .unwrap_or(WormMediaState::Unknown);
+    let page = page_reply.map(worm_state_from_medium_configuration);
+    let state_name = |state| match state {
+        WormMediaState::NotWorm => "not_worm",
+        WormMediaState::Worm => "worm",
+        WormMediaState::Unknown => "unknown",
+    };
+    let wormm = match page {
+        Some(WormMediaState::Worm) => Some(1),
+        Some(WormMediaState::NotWorm) => Some(0),
+        Some(WormMediaState::Unknown) | None => None,
+    };
+    let verdict = match combine_worm_evidence(header, page) {
+        WormVerdict::NotWorm => "not_worm",
+        WormVerdict::Worm => "worm",
+        WormVerdict::Unknown => "unknown",
+        WormVerdict::Conflict { .. } => "conflict",
+    };
+    json!({
+        "device": device,
+        "header_medium_type": medium_type.map(|value| format!("0x{value:02x}")),
+        "header": state_name(header),
+        "wormm": wormm,
+        "medium_configuration": page.map(state_name),
+        "verdict": verdict,
+    })
+}
+
 /// Fixed command allowlist: no READ, SPACE, LOCATE, or data-out commands occur here.
 fn diagnostics<F>(
     cli: &Cli,
@@ -2961,6 +3006,7 @@ where
     }
     let policy = StaticAllowlist::new(cli.allow_device.clone());
     let mut records = vec![];
+    let mut worm = vec![];
     for (i, (path, changer, serial)) in devices.iter().enumerate() {
         if cli.device.is_some() && !policy.allows_device(path, serial.as_deref()) {
             return Err("diagnostic device requires matching --allow-device".into());
@@ -2979,6 +3025,11 @@ where
             ));
         } else {
             commands.push(("mode-sense", vec![0x1a, 0, 0x3f, 0, 255, 0], 255));
+            commands.push((
+                "mode-sense-medium-configuration",
+                vec![0x1a, 0, 0x1d, 0, 255, 0],
+                255,
+            ));
             for (name, page) in [
                 ("log-supported", 0),
                 ("log-write-errors", 2),
@@ -2992,18 +3043,35 @@ where
                 ));
             }
         }
-        for (name, cdb, size) in commands {
+        // These positions follow the three inquiry commands above; changers have no WORM record.
+        let mut header_reply = None;
+        let mut page_reply = None;
+        for (command_index, (name, cdb, size)) in commands.into_iter().enumerate() {
             let mut buf = vec![0; size];
             match transport.execute_in(&cdb, &mut buf) {
                 Ok(result) => {
                     let filename = format!("device-{i}-{name}.bin");
                     let count = (result.bytes_transferred as usize).min(buf.len());
                     fs::write(temp.path().join(&filename), &buf[..count]).map_err(err)?;
+                    if !*changer {
+                        match command_index {
+                            3 => header_reply = Some(buf[..count].to_vec()),
+                            4 => page_reply = Some(buf[..count].to_vec()),
+                            _ => {}
+                        }
+                    }
                     records
                         .push(json!({"device":path,"command":name,"file":filename,"bytes":count}));
                 }
                 Err(e) => records.push(json!({"device":path,"command":name,"error":e.to_string()})),
             }
+        }
+        if !*changer {
+            worm.push(worm_diagnostic_record(
+                path,
+                header_reply.as_deref(),
+                page_reply.as_deref(),
+            ));
         }
     }
     for (name, program, args) in [
@@ -3023,7 +3091,7 @@ where
         };
         fs::write(temp.path().join(name), text).map_err(err)?;
     }
-    fs::write(temp.path().join("manifest.json"),serde_json::to_vec_pretty(&json!({"commands":records,"observed_endpoints":remanence_api::observed_endpoint_json(report),"tape_data_captured":false})).map_err(err)?).map_err(err)?;
+    fs::write(temp.path().join("manifest.json"),serde_json::to_vec_pretty(&json!({"worm":worm,"commands":records,"observed_endpoints":remanence_api::observed_endpoint_json(report),"tape_data_captured":false})).map_err(err)?).map_err(err)?;
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3041,7 +3109,7 @@ where
     if !status.success() {
         return Err(format!("tar failed: {status}"));
     }
-    Ok(json!({"tarball":out,"tape_data_captured":false}))
+    Ok(json!({"tarball":out,"worm":worm,"tape_data_captured":false}))
 }
 
 /// Retry display-only reads once if the database or WAL changed, including a

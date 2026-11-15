@@ -179,14 +179,25 @@ tell whether it looked at the same index.
 
 ## 7. WORM media
 
-**WORM** (write once, read many) cartridges cannot be overwritten, by design of the medium.
-Remanence refuses to write ordinary objects to a WORM cartridge, and to a cartridge whose
-WORM state the drive does not report. The reason is crash recovery: after an interrupted
-write, Remanence may need to overwrite the uncommitted tail of the tape at the last commit,
-and a WORM cartridge would refuse that. The drive reports the medium type in the MODE SENSE
-header. If that type is unspecified or unrecognized, Remanence asks the Medium Configuration
-page for its WORM-mode bit. A cartridge is accepted for object writes only when the header
-or that page positively reports it as rewritable.
+**WORM** (write once, read many) cartridges cannot be overwritten.
+Remanence writes only to rewritable cartridges. After a write is interrupted it replaces the
+unfinished end of the tape, and a WORM cartridge forbids that. Tapes written elsewhere on WORM
+can still be read. An interrupted write includes a cancelled write or a disconnected client,
+not only a crash. Reading, adoption and restore of supported tape formats on WORM are designed
+for but untested on a physical WORM cartridge.
+
+Buy rewritable cartridges, not WORM. Both library and standalone `tape init` refuse WORM
+and media whose WORM state cannot be established, before any media write, even on a blank
+cartridge. Ordinary object writes also require positive evidence of rewritable media.
+[WORM writing is on the public roadmap](https://github.com/archivetechie/remanence/issues/70).
+
+The drive's MODE SENSE header supplies the cartridge's medium type. Object-write admission,
+tail recovery, finalization and init ask the Medium Configuration page for its WORM-mode bit
+only when that header is unspecified or unrecognized. Plain settings reads used by mounting,
+reading, verification, append re-proof and the all-bays check use the header alone and do not
+request that page. `rem diagnostics capture` reads both signals, even for a typed header,
+and reports a conflict if they disagree. A conflict is treated as WORM; neither signal can
+overrule the other's positive WORM evidence.
 
 ## 8. Libraries, standalone drives and home mode
 

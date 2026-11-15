@@ -371,7 +371,10 @@ rem pool new archive --scheme default
 
 ### rem tape init (standalone)
 
-Initialize the loaded cartridge with an operator label.
+Initialize the loaded cartridge with an operator label. The cartridge must be positively
+identified as rewritable. WORM and unknown media, including blank cartridges, are refused
+with `tape init refused before any media write: <reason>`. Clobber flags do not override
+this check; see [WORM refusals](guide-troubleshooting.md#worm-and-unknown-media-refusals).
 
 ```text
 rem tape init [OPTIONS] --label <LABEL>
@@ -742,7 +745,22 @@ rem diagnostics capture [OPTIONS] --out <OUT>
 - `--out <OUT>` is the tar archive to write.
 - `--device` and `--allow-device` select the drive to describe.
 
-The command reads no tape data and does not position the media.
+The command reads no tape data and does not position the media. For each drive, it saves
+both the all-pages MODE SENSE reply and a separate Medium Configuration page reply as raw
+files. The tar's `manifest.json` and the command's result JSON both contain a `worm` array,
+with one record per drive:
+
+| Field | Meaning |
+|---|---|
+| `device` | Drive device path. |
+| `header_medium_type` | Header byte 1 as lowercase `0xNN`, or `null` if unavailable. |
+| `header` | `not_worm`, `worm` or `unknown`, decoded from the medium type. |
+| `wormm` | `0` or `1` from the decoded Medium Configuration evidence, or `null` when unknown or unavailable. |
+| `medium_configuration` | `not_worm`, `worm` or `unknown`; `null` if the command failed. The failure stays in its command record. |
+| `verdict` | `not_worm`, `worm`, `unknown` or `conflict`, combining both signals. A conflict is treated as WORM. |
+
+A successful reply with missing, malformed or unrelated page data gives `unknown`; a failed
+command gives `null`. The result JSON includes this array beside `tarball`.
 
 To capture diagnostics for the drive at `/dev/sg5`:
 
@@ -1151,7 +1169,10 @@ for those verbs.
 
 ### rem tape init (library)
 
-Initialize one tape, or every tape in a slot range.
+Initialize one tape, or every tape in a slot range. Each cartridge must be positively
+identified as rewritable. WORM and unknown media, including blank cartridges, are refused
+with `tape init refused before any media write: <reason>`. Force and clobber flags do not
+override this check; see [WORM refusals](guide-troubleshooting.md#worm-and-unknown-media-refusals).
 
 ```text
 rem tape init [OPTIONS] <TARGET>

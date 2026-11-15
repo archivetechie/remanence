@@ -752,7 +752,7 @@ impl WriteSessionState<'_> {
                 self.session_id,
                 WriteMediaPolicy::RewritableObject,
             )?;
-            let config = self.drive.read_config().map_err(|e| {
+            let config = self.drive.read_config_resolving_worm().map_err(|e| {
                 super::restore::attach_outcome_retry(
                     e.outcome(),
                     Status::unavailable(e.to_string()),
@@ -2216,7 +2216,7 @@ pub(super) fn handle_drive_open_write(
             ))));
             return None;
         }
-        let drive_config = match drive.read_config() {
+        let drive_config = match drive.read_config_resolving_worm() {
             Ok(config) => config,
             Err(error) => {
                 let _ = reply.send(Err(Status::unavailable(format!(
@@ -3147,7 +3147,12 @@ pub(super) fn prepare_drive_for_write_observing_identity(
     })?;
     let rewind_write_elapsed = rewind_write_started.elapsed();
     let read_config_started = Instant::now();
-    let current_cfg = drive.read_config().map_err(|err| {
+    let current_cfg = if media_policy == WriteMediaPolicy::RewritableObject {
+        drive.read_config_resolving_worm()
+    } else {
+        drive.read_config()
+    }
+    .map_err(|err| {
         crate::closeout_obligation::RetryCause::tape_io(&err).attach(Status::internal(format!(
             "read drive config before write: {err}"
         )))

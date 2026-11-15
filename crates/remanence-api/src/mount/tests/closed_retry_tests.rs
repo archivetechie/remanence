@@ -4284,3 +4284,105 @@ async fn fx2_closed_failed_head_preserves_attempt_error() {
     );
     assert_eq!(durable_bytes(typed.paths()), before);
 }
+
+/// An untyped rewritable cartridge can replace a torn terminal tail and reach Finalized.
+#[tokio::test]
+async fn u7_untyped_rewritable_torn_tail_finalizes() {
+    use remanence_chaos::model::{ModelTransport, Record, VirtualTape, VirtualWorld};
+    let typed = TypedRoot::open_with_tapes(&[(TAPE, LABEL)]);
+    let tapes = install_checkpoint(&typed);
+    let mut state = ApiState::new(typed.catalog());
+    state.checkpoint_journal_dir = Arc::new(tapes);
+    let (mut drive_rx, _changer_rx) = load_drive(&mut state);
+    let first = admission(0x7C01);
+    let request = admit_first_request(&state, first.clone());
+    let operation = request.candidate_operation_id;
+    let pool = state.drive_pool().unwrap().clone();
+    let reserved = pool.reserve_tape(TAPE).unwrap();
+    let worker = tokio::spawn(run_manual_finalize_worker_with_budget(
+        state.clone(),
+        pool.clone(),
+        reserved.into(),
+        request,
+        Duration::ZERO,
+    ));
+    let (request, reply) = take_finalize_command(&mut drive_rx, operation).await;
+    let mut world = VirtualWorld::single_drive("LIB001", 0x0101, "U7-DRIVE", 0x400, 1);
+    let mut tape = VirtualTape::empty(18_000_000_000_000, BLOCK_SIZE);
+    let bootstrap = crate::build_tape_bootstrap(
+        TAPE,
+        BLOCK_SIZE,
+        remanence_parity::ParityConfig::None,
+        "2026-11-11T00:00:00Z",
+        "test",
+    );
+    let mut block = vec![0; BLOCK_SIZE as usize];
+    remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut block).unwrap();
+    tape.records = vec![
+        Record::Block(block),
+        Record::Filemark,
+        Record::Block(vec![0; BLOCK_SIZE as usize]),
+        Record::Block(vec![0; BLOCK_SIZE as usize]),
+        Record::Block(vec![0; BLOCK_SIZE as usize]),
+        Record::Filemark,
+    ];
+    tape.written_bytes = 4 * u64::from(BLOCK_SIZE);
+    tape.durable_frontier = tape.records.len();
+    tape.worm = false;
+    tape.records
+        .push(Record::Block(vec![0x55; BLOCK_SIZE as usize]));
+    world.put_tape_in_drive(0x0101, LABEL, Some(0x400), tape);
+    world
+        .drive_states
+        .get_mut(&0x0101)
+        .unwrap()
+        .medium_type_reporting = remanence_chaos::model::MediumTypeReporting::ConfigurationPage;
+    let world = Arc::new(std::sync::Mutex::new(world));
+    let library = world.lock().unwrap().library_snapshot();
+    let policy = remanence_library::StaticAllowlist::new(["LIB001"]);
+    let mut library = library
+        .open_with(&policy, {
+            let world = world.clone();
+            move |path| {
+                let role = world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(world.clone(), role))
+                    as Box<dyn remanence_library::SgTransport>)
+            }
+        })
+        .unwrap();
+    let mut drive = library.open_drive(0x0101, &policy).unwrap();
+    let cfg = crate::write_owner::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::from_api(&state).unwrap(),
+        io_memory: crate::io_memory::IoMemoryReservation::new(64 * 1024 * 1024).unwrap(),
+        mounted_endpoint: None,
+        checkpoint_journal_dir: state.checkpoint_journal_dir.as_ref().clone(),
+    };
+    let result = crate::write_owner::finalize_mounted_tape(
+        &mut state.catalog.write_handle(),
+        &cfg,
+        &mut drive,
+        &request,
+        Some(LABEL),
+        |_, drive| {
+            drive.load().map_err(|e| Status::internal(e.to_string()))?;
+            let generation = drive.identity_generation();
+            crate::verify_tape_identity(&mut remanence_library::DriveHandleSource(drive), &TAPE)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            drive
+                .bind_identity_generation(generation)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            drive
+                .locate(6)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(())
+        },
+        |_, _| {},
+    );
+    let completed = result.expect("untyped rewritable finalization");
+    assert_eq!(
+        completed.projection.outcome,
+        remanence_state::TerminalFinalizationOutcome::Finalized
+    );
+    reply.send(Ok(completed)).unwrap();
+    worker.await.unwrap().unwrap();
+}
