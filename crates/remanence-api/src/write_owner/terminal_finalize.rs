@@ -3245,7 +3245,9 @@ fn admit_ended_tail_for_terminal(
             Ok(Some(admission))
         }
         Err(crate::append_admission::AdmissionError {
-            kind: crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. },
+            kind:
+                crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. }
+                | crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { .. },
             ..
         }) => Ok(None),
         Err(error) => Err(super::restore::attach_outcome_retry(

@@ -1445,6 +1445,203 @@ fn native_session_suffix_rows_and_unknown_command_frontiers() {
     }
 }
 
+/// Build closed native authority and pin both the extra-tail boundary and its refusal under confirmation.
+fn x22_closed_tail_row(row: &str) {
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    const NATIVE_SIZE: u32 = 262144;
+    const ID: &str = "00000000-0000-4000-8000-000000000001";
+    let object = plain_blocks_with_size(NATIVE_SIZE);
+    let named = matches!(row, "named" | "proved_eod");
+    let conflicting_eod = row == "proved_eod";
+    let mut f = fixture_with_size(NATIVE_SIZE);
+    let root = tempfile::tempdir().unwrap();
+    let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .unwrap()
+        .write_handle();
+    std::fs::create_dir(root.path().join("tapes")).unwrap();
+    let authority =
+        remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
+            .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    lease
+        .publish_initialized(
+            NATIVE_SIZE,
+            None,
+            remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    lease
+        .open_session(
+            [0x61; 16],
+            "2026-11-02T00:00:00Z".into(),
+            remanence_state::tape_log::SessionDrive {
+                serial: "DRV-TEST".into(),
+                vendor: None,
+                product: None,
+                endpoint: remanence_state::library_log::DriveKey::Standalone(
+                    remanence_state::library_log::Standalone {
+                        drive_serial: "DRV-TEST".into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
+        .unwrap();
+    let files = if named {
+        vec![TailFile {
+            tape_file_number: 1,
+            identity: TailIdentity::Object(ID.into()),
+            known_blocks: object.len() as u64,
+            synchronized_blocks: if conflicting_eod {
+                0
+            } else {
+                object.len() as u64
+            },
+            unknown_blocks: 0,
+            filemark: TailFilemark::Present,
+            synchronized_filemark: !conflicting_eod,
+        }]
+    } else {
+        vec![]
+    };
+    lease
+        .end_session(
+            [0x61; 16],
+            "2026-11-02T00:00:01Z".into(),
+            SessionEndReason::FailedAppend,
+            None,
+            files.into_iter().map(Ok),
+        )
+        .unwrap();
+    if conflicting_eod {
+        lease.record_session_tail_eod(2).unwrap();
+    }
+    let snapshot = lease.freeze().unwrap();
+    {
+        let mut world = f.world.lock().unwrap();
+        let records = &mut world.tapes.get_mut("TAIL").unwrap().records;
+        if row == "filemark" {
+            records.push(Record::Filemark);
+        } else {
+            for _ in 0..2 {
+                records.extend(object.iter().cloned().map(Record::Block));
+                records.push(Record::Filemark);
+            }
+        }
+    }
+    let expected_lba = if named { object.len() as u64 + 3 } else { 2 };
+    let (found, object_ids) = if row == "filemark" {
+        (vec!["empty filemark at LBA 2".to_owned()], vec![])
+    } else {
+        let ids = vec![ID.to_owned(); if named { 1 } else { 2 }];
+        (ids.clone(), ids)
+    };
+    for confirmed in [false, true] {
+        let mut ctx = context(UUID, NATIVE_SIZE, 0, 2);
+        ctx.confirmed_discard = confirmed.then(|| found.clone());
+        let error = admit_append_boundary(
+            &mut f.drive,
+            AppendAuthority::Session {
+                snapshot: &snapshot,
+                closeout: None,
+            },
+            ctx,
+        )
+        .unwrap_err();
+        if conflicting_eod {
+            assert!(
+                matches!(
+                    error.kind,
+                    AdmissionErrorKind::SessionSuffixContradiction { .. }
+                ),
+                "{row} confirmed={confirmed}: {error}"
+            );
+        } else {
+            assert!(
+                matches!(error.kind, AdmissionErrorKind::TailBeyondKnownState { .. }),
+                "{row} confirmed={confirmed}: {error}"
+            );
+            let AdmissionErrorKind::TailBeyondKnownState {
+                tape_uuid,
+                expected_eod_lba,
+                found: actual_found,
+                object_ids: actual_ids,
+            } = error.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(tape_uuid, uuid::Uuid::from_bytes(UUID));
+            assert_eq!(
+                expected_eod_lba, expected_lba,
+                "{row} confirmed={confirmed}"
+            );
+            assert_eq!(actual_found, found, "{row} confirmed={confirmed}");
+            assert_eq!(actual_ids, object_ids, "{row} confirmed={confirmed}");
+        }
+        assert_eq!(
+            writes(&f.commands.lock().unwrap()),
+            0,
+            "{row} confirmed={confirmed}"
+        );
+    }
+}
+
+/// Extra objects, a lone mark, and an object after a proved named file all remain refused tails.
+#[test]
+fn x22_closed_session_scans_all_extra_tail_and_refuses_confirmation() {
+    for row in ["empty", "filemark", "named"] {
+        x22_closed_tail_row(row);
+    }
+}
+
+/// A recorded EOD that differs from the named suffix end must remain a contradiction.
+#[test]
+fn x22_closed_session_preserves_conflicting_proved_eod() {
+    x22_closed_tail_row("proved_eod");
+}
+
+/// The RPC diagnostic is bounded; the error's found and object-id vectors stay complete.
+#[test]
+fn x22_tail_refusal_caps_only_display_at_eight_entries() {
+    let found: Vec<_> = (1..=10).map(|n| format!("tail-entry-{n:02}")).collect();
+    let make = |found: Vec<String>| AdmissionErrorKind::TailBeyondKnownState {
+        tape_uuid: uuid::Uuid::from_bytes(UUID),
+        expected_eod_lba: 2,
+        object_ids: found.clone(),
+        found,
+    };
+    let error = make(found.clone());
+    let text = error.to_string();
+    assert!(
+        !text.contains(&found[8]),
+        "ninth entry must not be rendered: {text}"
+    );
+    let expected = |listing: String| {
+        format!(
+        "TailBeyondKnownState: tape {}, expected EOD LBA 2, found {listing}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`).",
+        uuid::Uuid::from_bytes(UUID),
+    )
+    };
+    assert_eq!(text, expected(format!("{:?} and 2 more", &found[..8])));
+    assert_eq!(
+        make(found[..8].to_vec()).to_string(),
+        expected(format!("{:?}", &found[..8]))
+    );
+    let AdmissionErrorKind::TailBeyondKnownState {
+        found: retained,
+        object_ids,
+        ..
+    } = error
+    else {
+        unreachable!()
+    };
+    assert_eq!(retained, found);
+    assert_eq!(object_ids, found);
+}
+
 /// Decision 4 admits only exact deterministic sidecar prefixes, including a
 /// header too short to identify itself; neither an extra block nor a second
 /// filemark can be hidden by that alternative.

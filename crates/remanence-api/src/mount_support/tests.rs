@@ -1941,16 +1941,11 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                 };
 
                 assert!(
-                    error.contains(if fresh {
-                        "TailBeyondKnownState"
-                    } else {
-                        "SessionSuffixContradiction"
-                    }),
+                    error.contains("TailBeyondKnownState"),
                     "parity={parity_on} fresh={fresh}: {error}"
                 );
                 assert!(
-                    !fresh
-                        || error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
+                    error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
                     "{error}"
                 );
                 assert_eq!(dispatched_writes(&world), before);

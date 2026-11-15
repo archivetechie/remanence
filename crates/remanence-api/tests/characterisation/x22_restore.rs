@@ -513,6 +513,42 @@ async fn x22_take_live_copy(parity: bool) -> (RestoredInsideSession, tempfile::T
     )
 }
 
+/// Copy after A's durable ending, then retain B from a separate pinned session only on tape.
+async fn x22_take_between_sessions_copy() -> (RestoredInsideSession, tempfile::TempDir) {
+    let fixture = Harness::new(false);
+    x22_second_tape_in_slot(&fixture, false);
+    let snapshot = tempfile::tempdir().unwrap();
+    let bytes_a: Vec<u8> = (0..175_000_u32).flat_map(u32::to_le_bytes).collect();
+    let bytes_z = vec![0xc7; 700_000];
+    let bytes_b = vec![0xb6; 700_000];
+    let client = fixture.start().await;
+    let z = x22_pinned_write(&client, X22_UUID2, "Z", &bytes_z)
+        .await
+        .unwrap();
+    let session = client.open().await;
+    let a = client.append(&session, "A", &bytes_a).await;
+    client.checkpoint(&session).await;
+    client.close(&session).await;
+    // The close reply precedes SessionEnded; read-open waits for the tape's closing work.
+    assert_eq!(x22_read_on(&client, UUID, &a, None).await.unwrap(), bytes_a);
+    x22_copy_tree(&fixture.root, &snapshot.path().join("copy"));
+    let copied_records = fixture.world.lock().unwrap().tapes[BARCODE].records.clone();
+    let b = x22_pinned_write(&client, UUID, "B", &bytes_b)
+        .await
+        .unwrap();
+    x22_stop(&fixture, client).await;
+    (
+        RestoredInsideSession {
+            fixture,
+            a: (a, bytes_a),
+            z: (z, bytes_z),
+            b: (b, bytes_b),
+            copied_records,
+        },
+        snapshot,
+    )
+}
+
 fn x22_save_tapes(fixture: &Harness, path: &std::path::Path) {
     let world = fixture.world.lock().unwrap();
     let mut saved = serde_json::Map::new();
@@ -622,65 +658,120 @@ async fn restored_inside_session(parity: bool) -> RestoredInsideSession {
     }
 }
 
-/// The child owns a fresh projector registry. Require both its exit status and its final marker:
-/// an incorrect --exact selector otherwise runs zero tests and still exits successfully.
+/// Keep both child streams without pipe backpressure and bound the exact process lifetime.
+async fn x22_child(name: &str, parity: bool, role: &str, dir: &std::path::Path) {
+    let closing = format!("X22 {role} completed {name} parity={parity}");
+    let stdout_path = dir.join(format!("{role}.stdout"));
+    let stderr_path = dir.join(format!("{role}.stderr"));
+    let spec = serde_json::json!({"dir": dir, "parity": parity, "role": role});
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &format!("x22_restore::{name}"), "--nocapture"])
+        .env("X22_RESTORE_CHILD_SPEC", spec.to_string())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
+    if role == "writer" {
+        command.env("CHARACTERISATION_CRASH_PARENT", dir);
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (status, expired) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            // Child::kill targets this child's PID, and wait reaps it before failure.
+            child.kill().expect("kill expired X22 child");
+            break (child.wait().expect("reap expired X22 child"), true);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let stdout = std::fs::read_to_string(stdout_path).unwrap();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    print!("{stdout}");
+    eprint!("{stderr}");
+    assert!(
+        !expired && status.success(),
+        "{role} child PID {}: {status}, deadline expired={expired}: stdout:\n{stdout}\nstderr:\n{stderr}",
+        child.id()
+    );
+    assert!(
+        stdout.lines().any(|line| line == closing),
+        "{role} child missing closing line {closing:?}:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Use A3's inside-session copy with process-isolated writing and restoration.
 async fn x22_run_restored_test<F, Fut>(name: &str, parity: bool, steps: F)
 where
     F: FnOnce(RestoredInsideSession) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    const SPEC: &str = "X22_RESTORE_CHILD_SPEC";
-    let closing = format!("X22 child completed {name} parity={parity}");
-    if let Some(spec) = std::env::var_os(SPEC) {
+    x22_run_restore_pattern(name, parity, false, steps).await;
+}
+
+/// The parent owns only scratch storage. The writer must exit before the restore child
+/// touches its manifest-bound root, so no writer projector can race with restoration.
+async fn x22_run_restore_pattern<F, Fut>(name: &str, parity: bool, closed_copy: bool, steps: F)
+where
+    F: FnOnce(RestoredInsideSession) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if let Some(spec) = std::env::var_os("X22_RESTORE_CHILD_SPEC") {
         let spec: serde_json::Value = serde_json::from_str(spec.to_str().unwrap()).unwrap();
-        // M0 measures both parity values, each in a separate child invocation.
+        // M0 measures both parity values, each in separate child invocations.
         if spec["parity"].as_bool().unwrap() != parity {
             return;
         }
-        let restored = restored_inside_session(parity).await;
-        steps(restored).await;
-        println!("{closing}");
+        let role = spec["role"].as_str().unwrap();
+        match role {
+            "writer" => {
+                let dir = std::path::Path::new(spec["dir"].as_str().unwrap());
+                let (mut saved, snapshot) = if closed_copy {
+                    assert!(!parity, "between-sessions fixture uses no parity");
+                    x22_take_between_sessions_copy().await
+                } else {
+                    x22_take_live_copy(parity).await
+                };
+                x22_copy_tree(&snapshot.path().join("copy"), &dir.join("copy"));
+                x22_save_tapes(&saved.fixture, &dir.join("tapes.json"));
+                let copied_records: Vec<(u8, Vec<u8>, u32)> = saved
+                    .copied_records
+                    .iter()
+                    .map(|record| match record {
+                        Record::Block(bytes) => (0, bytes.clone(), 0),
+                        Record::ZeroBlock(size) => (1, vec![], *size),
+                        Record::Filemark => (2, vec![], 0),
+                    })
+                    .collect();
+                std::fs::write(
+                    dir.join("meta.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "root": saved.fixture.root, "config": saved.fixture.config,
+                        "a": saved.a.0.object_id, "z": saved.z.0.object_id, "b": saved.b.0.object_id,
+                        "copied_records": copied_records,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                // The parent scratch directory will remove this root after both children exit.
+                assert_eq!(
+                    saved.fixture._temp.take().unwrap().keep(),
+                    saved.fixture.root
+                );
+            }
+            "restore" => {
+                let restored = restored_inside_session(parity).await;
+                steps(restored).await;
+            }
+            _ => panic!("unknown X22 child role: {role}"),
+        }
+        println!("X22 {role} completed {name} parity={parity}");
         return;
     }
-    let (saved, snapshot) = x22_take_live_copy(parity).await;
-    x22_save_tapes(&saved.fixture, &snapshot.path().join("tapes.json"));
-    let copied_records: Vec<(u8, Vec<u8>, u32)> = saved
-        .copied_records
-        .iter()
-        .map(|record| match record {
-            Record::Block(bytes) => (0, bytes.clone(), 0),
-            Record::ZeroBlock(size) => (1, vec![], *size),
-            Record::Filemark => (2, vec![], 0),
-        })
-        .collect();
-    std::fs::write(
-        snapshot.path().join("meta.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "root": saved.fixture.root, "config": saved.fixture.config,
-            "a": saved.a.0.object_id, "z": saved.z.0.object_id, "b": saved.b.0.object_id,
-            "copied_records": copied_records,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let spec = serde_json::json!({"dir": snapshot.path(), "parity": parity});
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &format!("x22_restore::{name}"), "--nocapture"])
-        .env(SPEC, spec.to_string())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    print!("{stdout}");
-    assert!(
-        output.status.success(),
-        "restore child {}: stdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status
-    );
-    assert!(
-        stdout.lines().any(|line| line == closing),
-        "restore child missing closing line {closing:?}:\n{stdout}\n{stderr}"
-    );
+    let scratch = tempfile::tempdir().unwrap();
+    x22_child(name, parity, "writer", scratch.path()).await;
+    x22_child(name, parity, "restore", scratch.path()).await;
 }
 
 #[tokio::test]
@@ -920,10 +1011,13 @@ async fn check_pool_placement(restored: RestoredInsideSession, parity: bool) {
         .await
         .expect("first non-busy pool open succeeds");
     let bytes_c = vec![0x5a; 300_000];
-    let c = client
-        .try_append(&session, "C", &bytes_c)
-        .await
-        .expect("C append");
+    let c = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.try_append(&session, "C", &bytes_c),
+    )
+    .await
+    .expect("C append deadline")
+    .expect("C append");
     let closed = x22_rpc(
         client
             .writer()
@@ -1122,4 +1216,75 @@ async fn parity_pool_write_reselects_with_one_drive() {
         },
     )
     .await;
+}
+
+/// Test 1: an older closed-session copy leaves a readable, fenced tail that cannot be discarded.
+#[tokio::test]
+async fn between_sessions_tail_reads_reselects_and_refuses_discard() {
+    x22_run_restore_pattern(
+        "between_sessions_tail_reads_reselects_and_refuses_discard",
+        false,
+        true,
+        |restored| async move {
+            let fixture = &restored.fixture;
+            // Before daemon startup, establish that the restored tape log ends session 1
+            // and contains no opening for B's later session.
+            let records = ruling24_native_records(&fixture.config);
+            use remanence_state::tape_log::Record as NativeRecord;
+            let opens: Vec<_> = records.iter().filter_map(|record| match record {
+                NativeRecord::SessionOpened(open) => Some(open.session_id),
+                _ => None,
+            }).collect();
+            assert_eq!(opens.len(), 1, "copied log contains session 1 only");
+            let ending = records.iter().rposition(|record| matches!(record,
+                NativeRecord::SessionEnded(end) if end.session_id == opens[0]
+                    && end.tail_file_count == 0)).expect("session 1 has a closed empty tail before startup");
+            assert!(!records[ending + 1..].iter().any(|record|
+                matches!(record, NativeRecord::SessionOpened(_))),
+                "no later SessionOpened in restored tape 1 log");
+            let intact = fixture.world.lock().unwrap().tapes[BARCODE].records.clone();
+            let client = x22_try_start(fixture).await.expect("between-sessions restored start");
+            // Finish on tape 1 so the one pool request must encounter its unknown tail.
+            assert_eq!(x22_read_on(&client, X22_UUID2, &restored.z.0, None).await.unwrap(), restored.z.1);
+            assert_eq!(x22_read_on(&client, UUID, &restored.a.0, None).await.unwrap(), restored.a.1);
+            let (c, closed) = x22_pool_write(&client, "C", false).await.expect("one pool write stores C");
+            assert_eq!(closed.tape_uuid.as_deref(), Some(X22_UUID2.as_slice()));
+            assert_eq!(x22_read_on(&client, X22_UUID2, &c, None).await.unwrap(), vec![0x5a; 300_000]);
+            let fences = x22_fences(&client).await.unwrap();
+            assert_eq!(fences.len(), 1, "one active fence: {fences:?}");
+            assert_eq!(fences[0].tape_uuid, UUID);
+            assert_eq!(fences[0].reason, "append_admission_refused");
+            assert_eq!(x22_read_on(&client, X22_UUID2, &restored.z.0, None).await.unwrap(), restored.z.1);
+            assert_eq!(x22_read_on(&client, UUID, &restored.a.0, None).await.unwrap(), restored.a.1);
+            let mut catalog = pb::catalog_client::CatalogClient::new(client.channel.clone());
+            let preview = x22_rpc(catalog.supersede_tail(pb::SupersedeTailRequest {
+                observed_tape_log_sequence: None,
+                tape_uuid: UUID.to_vec(), ack_tape_uuid: UUID.to_vec(),
+                confirm_supersede: None, expected_found: Vec::new(),
+            })).await;
+            // Inspect the code before the message so M2 pins the pre-confirm refusal.
+            let code = preview.as_ref().err().map(tonic::Status::code);
+            assert_eq!(code, Some(tonic::Code::FailedPrecondition), "closed-tail preview: {preview:?}");
+            let error = preview.unwrap_err();
+            assert_eq!(error.message(), "tape CHAR01L9 holds data written after its last closed session that this state does not record, such as after a restore from an older copy of the state; supersede-tail cannot discard it in this release. The tape stays readable and closed for writing. Keep it so, withdraw it with rem tape retire, or start the service from a newer copy of the state directory.");
+            assert_eq!(x22_fences(&client).await.unwrap(), fences, "preview keeps the same active fence");
+            assert_eq!(fixture.world.lock().unwrap().tapes[BARCODE].records, intact,
+                "reads, refused append and refused discard preserve every tape 1 record");
+            let listed = tokio::time::timeout(Duration::from_secs(20), async {
+                let mut stream = catalog.enumerate_objects(pb::EnumerateObjectsRequest {
+                    scope: Some(pb::enumerate_objects_request::Scope::All(())),
+                    reconcile_from_tape: false,
+                }).await.unwrap().into_inner();
+                let mut ids = Vec::new();
+                while let Some(object) = stream.message().await.unwrap() {
+                    ids.push(object.object_id);
+                }
+                ids
+            }).await.expect("catalogue enumeration deadline");
+            drop(catalog);
+            assert!(listed.contains(&restored.a.0.object_id), "A remains listed");
+            assert!(!listed.contains(&restored.b.0.object_id), "B is not listed after restore or refused discard");
+            x22_stop(fixture, client).await;
+        },
+    ).await;
 }

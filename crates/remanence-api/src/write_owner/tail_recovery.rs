@@ -187,22 +187,32 @@ pub(crate) fn supersede_mounted_tail(
         .is_some_and(|ack| {
             ack.session_id.is_none() && ack.preview_digest.is_none() && ack.tail_file_count == 0
         });
-    let (found, missing_filemark, already_recovered) =
-        match admit_append_boundary(drive, authority(), make_context()) {
-            Err(crate::append_admission::AdmissionError {
-                kind:
-                    crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { found, .. },
-                ..
-            }) => (found, false, false),
-            Err(crate::append_admission::AdmissionError {
-                kind: crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
-                ..
-            }) => (Vec::new(), true, false),
-            Err(e) => return Err(failure(e.to_string())),
-            Ok(_) if repaired_tail => (Vec::new(), false, false),
-            Ok(_) if !suffix_fences.is_empty() || prior_empty_recovery => (Vec::new(), false, true),
-            Ok(_) => return Err(failure("no foreign tail requires superseding".into())),
-        };
+    let (found, missing_filemark, already_recovered) = match admit_append_boundary(
+        drive,
+        authority(),
+        make_context(),
+    ) {
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { .. },
+            ..
+        }) if last.is_some() && snapshot.tape_summary().open_session.is_none() => {
+            return Err(failure(format!(
+                    "tape {label} holds data written after its last closed session that this state does not record, such as after a restore from an older copy of the state; supersede-tail cannot discard it in this release. The tape stays readable and closed for writing. Keep it so, withdraw it with rem tape retire, or start the service from a newer copy of the state directory."
+                )));
+        }
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { found, .. },
+            ..
+        }) => (found, false, false),
+        Err(crate::append_admission::AdmissionError {
+            kind: crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
+            ..
+        }) => (Vec::new(), true, false),
+        Err(e) => return Err(failure(e.to_string())),
+        Ok(_) if repaired_tail => (Vec::new(), false, false),
+        Ok(_) if !suffix_fences.is_empty() || prior_empty_recovery => (Vec::new(), false, true),
+        Ok(_) => return Err(failure("no foreign tail requires superseding".into())),
+    };
     confirm(&format!("SUPERSEDE {label}"), &found, sequence).map_err(failure)?;
     let mut ctx = make_context();
     ctx.confirmed_discard = Some(found.clone());
