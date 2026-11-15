@@ -3411,6 +3411,15 @@ mod tests {
         assert!(rejected["fix"].as_str().unwrap().contains("FUA"));
         assert!(!rejected.to_string().contains("allow-untrusted"));
         assert!(!doctor_check_ready(&rejected));
+        let rejected_in_place = journal_volume_check(
+            configured,
+            configured,
+            Err(VolumeError::UntrustedVolume(reason.into())),
+        );
+        let detail = rejected_in_place["detail"].as_str().unwrap();
+        assert!(detail.starts_with("/state/journals/tapes: "), "{detail}");
+        assert!(detail.contains(reason), "{detail}");
+        assert_eq!(rejected_in_place["fix"], rejected["fix"]);
 
         for actual_probe in [configured, probe] {
             let prefix = if actual_probe == configured {
