@@ -177,10 +177,13 @@ encrypted open without the daemon, catalog, or config.
 
 `remanence-state` holds everything the daemon remembers: the validated
 operator configuration, an exclusive state lock, the calibration-control store,
-the append-only library log, the per-tape logs and the SQLite catalog. The two
-logs are the authority. The catalog is a projection of them: the daemon updates
-it after each durable log append and reads it to answer lookups and admission
-checks, and the catalog can be rebuilt from the logs. The library log's `*.remlib` segments
+the append-only library log, the per-tape logs, and the SQLite catalog. The two
+logs are the authority for library and tape state; the calibration-control store
+decides whether a cached read-order map may be served. Apart from its `wrap_maps`
+cache rows, the catalog is a projection of the two logs. The daemon updates it
+after each durable library-log append and when a tape-log checkpoint or
+finalization step commits, reads it to answer lookups and admission checks, and
+can rebuild it from the logs. The library log's `*.remlib` segments
 live in `audit.dir`; `authority-manifest.json` in the state directory binds the
 roots. The projection-only rebuild starts from an empty catalog, applies the
 library log before the tape logs, and carries over nothing from the old catalog.
@@ -395,11 +398,12 @@ finalization.
    default 1 GiB) catches silent drift between the host's idea of the position
    and the drive's. The object ends with a filemark, and parity sidecars follow
    according to the scheme.
-5. The commit is the closing record in the tape's log. The writer proves the
-   media barrier after the tape write, then publishes and fsyncs that record,
-   and only then projects it into the catalog's object, copy, file and
-   tape-file rows. If the projection fails, replay repairs the catalog from the
-   log. The locator returned to the caller ties the copy to physical media.
+5. At a checkpoint, the commit is the closing record in the tape's log. The
+   writer stages the batch's rows in the log, proves the media barrier, writes
+   and fsyncs the closing record, and only then projects the batch into the
+   catalog's object, copy, file, and tape-file rows. If the projection fails,
+   the checkpoint call reports the error and replay repairs the catalog from the
+   log. The locator returned to the caller ties each copy to physical media.
 6. Failures stop the write, at three levels. When a staging-ring transfer
    fails, the first sink error discards any batches still queued for that
    `AppendObject` call. A failed `AppendGate` makes every later append in that
@@ -613,9 +617,10 @@ confirms that the drive supports the command, the actor issues `READ END OF
 WRAP POSITION` (`A3h/1Fh/45h`, long form) and validates the result through
 `remanence-order` before installing it.
 
-The write epoch that guards the map, the volume's calibration state and a
-monotonic calibration generation are stored in a durable calibration-control
-store under `remanence-state`, at `<state_dir>/calibration/control.remcalibration`.
+The write epoch that guards the map, the volume's calibration state and
+write-path trust marker, and a monotonic calibration generation are stored in a
+durable calibration-control store under `remanence-state`, at
+`<state_dir>/calibration/control.remcalibration`.
 This store lies outside the rebuildable SQLite catalog. The map itself is kept
 only in a `wrap_maps` catalog row, a cache that a catalog rebuild or reset
 discards and the next load harvests again. Any media-modifying command in the
@@ -664,8 +669,9 @@ Lean and Aeneas, tools for machine-checked proofs about Rust code) is under
 The write-owner durability tests checkpoint three objects on the in-memory tape
 and restart from cuts at command completions, file appends and syncs, namespace
 operations, and client receipts, including session close. Both suites check
-acknowledged bytes through the read engine, durable catalog authority, operator
-tail confirmation, and the next append position.
+acknowledged bytes through the read engine, agreement between the catalog
+projection and the durable tape-log prefix, operator tail confirmation, and the
+next append position.
 
 The default suite visits every cut once with maximum loss: it retains exactly
 the durable tape frontier, drops all unsynced file bytes, and drops unsynced

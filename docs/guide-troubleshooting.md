@@ -1093,11 +1093,12 @@ bound passes, the daemon stops, or nobody is waiting for the result.
 
 ## Catalog and checkpoint lock refusals
 
-Catalog writers use immediate transactions and a five-second busy timeout.
-They reserve the SQLite writer before reading the rows they update, so
-concurrent checkpoints wait instead of failing on a deferred read-to-write
-upgrade. All catalog writers in a process share one writable connection and
-take it in turn; read-only views open their own connections.
+All catalog writers in a process share one writable SQLite connection behind
+an in-process lock and take it in turn, so concurrent checkpoints wait for each
+other in memory rather than on SQLite. Tape-log projections start immediate
+transactions, which hold SQLite's writer from their first read. Read-only views
+open their own connections, and every connection, writable or read-only, has a
+five-second busy timeout.
 
 A per-tape log lease is exclusive per tape and lasts through the write
 session. A competing lease for that tape returns a refusal; it does not block

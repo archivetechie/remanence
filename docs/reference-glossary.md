@@ -373,7 +373,7 @@ pending batch reaches the `checkpoint_max_bytes`, `checkpoint_max_objects` or
 
 ### copy
 
-One object as stored on one tape: a row of the catalog's `object_copies` table with a status.
+One object as stored on one tape: a row of the catalog's `object_instances` table with a status.
 A copy is `committed` when its commit record is durable, and becomes `missing` when its tape is
 retired. Writing an object to two pools gives it copies on two tapes.
 
@@ -840,7 +840,7 @@ slowdown.
 ### calibration (read-order)
 
 The per-volume state (`Uncalibrated`, `Calibrated`, `UnsupportedFormat`) that tracks whether a
-durable [wrap map](#wrap-map) is safe to serve for
+cached [wrap map](#wrap-map) is safe to serve for
 [read-order planning](architecture-overview.md#read-order-planning). It is harvested once per
 drive load and invalidated by the [write epoch](#write-epoch). Not to be confused with
 [media optimization](#media-optimization-and-conditioning).
