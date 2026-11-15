@@ -1395,6 +1395,25 @@ fn occupied_tape_pool_changes_quote_instance_refusal() {
     assert_eq!(f.ok(&["tape", "identify"])["pool"], "default");
 }
 
+/// Standalone put succeeds when only the Medium Configuration page types the cartridge.
+#[test]
+fn put_writes_when_header_does_not_type_cartridge() {
+    let f = VersionFixture::new();
+    f.world
+        .lock()
+        .unwrap()
+        .drive_states
+        .get_mut(&0x100)
+        .unwrap()
+        .medium_type_reporting = remanence_chaos::model::MediumTypeReporting::ConfigurationPage;
+    let source = f.root.path().join("untyped.txt");
+    std::fs::write(&source, b"rewritable cartridge with untyped header").unwrap();
+    let before = f.writes();
+    let written = f.ok(&["put", source.to_str().unwrap()]);
+    assert_eq!(written["summary"]["written"], 1);
+    assert!(f.writes() > before, "put must dispatch media writes");
+}
+
 #[test]
 fn put_versions_are_pool_scoped_and_get_is_loaded_tape_scoped() {
     let f = VersionFixture::new();

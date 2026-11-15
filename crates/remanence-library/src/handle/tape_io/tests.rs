@@ -818,6 +818,94 @@ fn mode_sense_compression_response(
     buf
 }
 
+/// IBM-shaped Medium Configuration response, with the usual eight-byte descriptor.
+fn medium_configuration_response() -> Vec<u8> {
+    let mut response = vec![0; 44];
+    response[0] = 43;
+    response[3] = 8;
+    response[12..18].copy_from_slice(&[0x1d, 0x1e, 0, 0, 1, 2]);
+    response
+}
+
+/// WORMM alone determines WORM state in a well-formed page.
+#[test]
+fn medium_configuration_parser_decodes_wormm() {
+    let mut response = medium_configuration_response();
+    assert_eq!(
+        worm_state_from_medium_configuration(&response),
+        WormMediaState::NotWorm
+    );
+    response[14] = 1;
+    assert_eq!(
+        worm_state_from_medium_configuration(&response),
+        WormMediaState::Worm
+    );
+    response[12] |= 0x80; // PS is allowed; it is not SPF.
+    response[14] = 0x80; // Unrelated bits do not mean WORM.
+    assert_eq!(
+        worm_state_from_medium_configuration(&response),
+        WormMediaState::NotWorm
+    );
+}
+
+/// The block descriptor length locates the page; it need not be eight.
+#[test]
+fn medium_configuration_parser_without_block_descriptor() {
+    let mut response = medium_configuration_response();
+    response.drain(4..12);
+    response[0] = 35;
+    response[3] = 0;
+    assert_eq!(
+        worm_state_from_medium_configuration(&response),
+        WormMediaState::NotWorm
+    );
+    response[6] = 1;
+    assert_eq!(
+        worm_state_from_medium_configuration(&response),
+        WormMediaState::Worm
+    );
+}
+
+/// A different page must never supply the WORM-mode bit.
+#[test]
+fn medium_configuration_parser_rejects_wrong_page() {
+    let mut response = medium_configuration_response();
+    response[12] = 0x0f;
+    assert_eq!(
+        worm_state_from_medium_configuration(&response),
+        WormMediaState::Unknown
+    );
+}
+
+/// Each length and format guard must leave incomplete evidence unknown.
+#[test]
+fn medium_configuration_parser_rejects_malformed() {
+    let response = medium_configuration_response();
+    for len in 0..15 {
+        assert_eq!(
+            worm_state_from_medium_configuration(&response[..len]),
+            WormMediaState::Unknown,
+            "response truncated to {len}"
+        );
+    }
+    let mut spf = response.clone();
+    spf[12] |= 0x40;
+    let mut empty_page = response.clone();
+    empty_page[13] = 0;
+    let mut short_header_length = response.clone();
+    short_header_length[0] = 13;
+    short_header_length[14..].fill(1);
+    let mut descriptor_past_end = response.clone();
+    descriptor_past_end[3] = 255;
+    for malformed in [spf, empty_page, short_header_length, descriptor_past_end] {
+        assert_eq!(
+            worm_state_from_medium_configuration(&malformed),
+            WormMediaState::Unknown,
+            "malformed response {malformed:02x?}"
+        );
+    }
+}
+
 #[test]
 fn parse_mode_sense_variable_block_no_compression() {
     let buf = mode_sense_compression_response(0, false, 0x98, 0x10);

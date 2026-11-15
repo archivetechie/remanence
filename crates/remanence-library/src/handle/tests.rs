@@ -5765,6 +5765,291 @@ fn drive_handle_read_config_surfaces_wp_and_worm() {
     assert_eq!(cfg.worm, WormMediaState::Worm);
 }
 
+/// Queue exact input commands, including failed page reads, without device I/O.
+struct ReadConfigScriptTransport {
+    steps: VecDeque<(u8, Result<Vec<u8>, ScsiError>)>,
+    timeout: TimeoutClass,
+}
+
+impl SgTransport for ReadConfigScriptTransport {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let (opcode, response) = self
+            .steps
+            .pop_front()
+            .expect("read_config script exhausted");
+        assert_eq!(cdb[0], opcode, "unexpected read_config command: {cdb:02x?}");
+        if cdb[0] == 0x1a && cdb[2] == 0x1d {
+            assert_eq!(self.timeout, TimeoutClass::ModeConfig);
+            assert_eq!(buf.len(), 255);
+        }
+        let response = response?;
+        let len = response.len().min(buf.len());
+        buf[..len].copy_from_slice(&response[..len]);
+        Ok(TransferOutcome::clean(len as u32))
+    }
+
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        panic!("unexpected no-data command: {cdb:02x?}");
+    }
+
+    fn execute_out(&mut self, cdb: &[u8], _: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        panic!("unexpected output command: {cdb:02x?}");
+    }
+
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.timeout = class;
+    }
+}
+
+/// Open with queued MODE SENSE answers and capture only the operation under test.
+#[allow(clippy::type_complexity)]
+fn read_config_fixture(
+    medium_type: u8,
+    page: Option<Result<Vec<u8>, ScsiError>>,
+    reverify: bool,
+) -> (DriveHandle, RecordingLog, Arc<Mutex<Vec<CapturedEvent>>>) {
+    let lib = open_drive_test_lib("LIB_MEDIUM_CONFIG");
+    let policy = StaticAllowlist::new(["LIB_MEDIUM_CONFIG"]);
+    let mut mode = mode_sense_response(4, false);
+    mode[1] = medium_type;
+    let mut steps = VecDeque::from([
+        (0x12, Ok(lto9_inquiry())),
+        (0x12, Ok(vpd80_response("DRV_A"))),
+        (0x05, Ok(rbl_response(0x80_0000, 1))),
+        (0x1a, Ok(mode)),
+    ]);
+    if let Some(page) = page {
+        steps.push_back((0x1a, page));
+    }
+    if reverify {
+        steps.push_back((0x34, Ok(rp_long_response(0, 0, 0))));
+    }
+    let mut changer = Some(FixtureTransport::new().with_responses([
+        changer_inquiry_response(),
+        vpd80_response("LIB_MEDIUM_CONFIG"),
+    ]));
+    let mut transport = Some(ReadConfigScriptTransport {
+        steps,
+        timeout: TimeoutClass::TapeStatus,
+    });
+    let log = RecordingLog::new();
+    let log_clone = log.clone();
+    let factory = move |path: &Path| -> Result<Box<dyn SgTransport>, IoErrorKind> {
+        if path == Path::new("/dev/sg-mock") {
+            Ok(Box::new(changer.take().expect("changer opened once")))
+        } else {
+            assert_eq!(path, Path::new("/dev/sg-drive-mock"));
+            Ok(Box::new(RecordingTransport::with_log(
+                transport.take().expect("drive opened once"),
+                log_clone.clone(),
+            )))
+        }
+    };
+    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let (hook, audit) = capture_audit();
+    handle.set_audit_hook(hook);
+    let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+    if reverify {
+        drive.mode_reverification_required = Some(4);
+    }
+    log.borrow_mut().clear();
+    audit.lock().unwrap().clear();
+    (drive, log, audit)
+}
+
+/// Supply the 44-byte Medium Configuration response used by the fallback.
+fn read_config_medium_configuration_response(worm: bool) -> Vec<u8> {
+    let mut response = vec![0; 44];
+    response[0] = 43;
+    response[3] = 8;
+    response[12..18].copy_from_slice(&[0x1d, 0x1e, u8::from(worm), 0, 1, 2]);
+    response
+}
+
+/// Each complete configuration read emits one Started and one Finished event.
+fn assert_read_config_audit(audit: &Arc<Mutex<Vec<CapturedEvent>>>, success: bool) {
+    let events = audit.lock().unwrap();
+    let op = AuditOp::TapeReadConfig { bay: Some(0x0100) };
+    let config_events = events
+        .iter()
+        .filter(|event| match event {
+            CapturedEvent::Started { op: actual, .. }
+            | CapturedEvent::Refused { op: actual, .. }
+            | CapturedEvent::FinishedSuccess { op: actual, .. }
+            | CapturedEvent::FinishedRecovered { op: actual, .. }
+            | CapturedEvent::FinishedScsiError { op: actual, .. }
+            | CapturedEvent::Warning { op: actual, .. } => *actual == op,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(config_events.len(), 2, "one config audit pair: {events:?}");
+    assert!(matches!(config_events[0], CapturedEvent::Started { cdb, .. } if cdb[0] == 0x05));
+    if success {
+        assert!(matches!(
+            config_events[1],
+            CapturedEvent::FinishedSuccess { .. }
+        ));
+    } else {
+        assert!(matches!(
+            config_events[1],
+            CapturedEvent::FinishedScsiError { .. }
+        ));
+    }
+}
+
+/// Both zero and unlisted medium types take the same WORMM fallback.
+#[test]
+fn drive_handle_read_config_resolves_untyped_medium() {
+    for medium_type in [0x00, 0x02] {
+        for (worm, expected) in [
+            (false, WormMediaState::NotWorm),
+            (true, WormMediaState::Worm),
+        ] {
+            let (mut drive, log, audit) = read_config_fixture(
+                medium_type,
+                Some(Ok(read_config_medium_configuration_response(worm))),
+                false,
+            );
+            let config = drive.read_config().expect("page resolves WORM state");
+            assert_eq!(config.worm, expected);
+            let commands = log.borrow();
+            assert_eq!(
+                commands.iter().map(|c| c[0]).collect::<Vec<_>>(),
+                [0x05, 0x1a, 0x1a]
+            );
+            assert_eq!(commands[2], [0x1a, 0, 0x1d, 0, 255, 0]);
+            assert_read_config_audit(&audit, true);
+        }
+    }
+}
+
+/// Any current usable ILLEGAL REQUEST means the page is unsupported.
+#[test]
+fn drive_handle_read_config_unsupported_medium_configuration() {
+    for sense in [
+        current_sense(5, 0, 0x24, 0),
+        current_sense(5, 0, 0x20, 1),
+        vec![0x72, 5, 0x24, 0],
+    ] {
+        let (mut drive, log, audit) = read_config_fixture(
+            0,
+            Some(Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            })),
+            false,
+        );
+        assert_eq!(
+            drive
+                .read_config()
+                .expect("unsupported page is unknown")
+                .worm,
+            WormMediaState::Unknown
+        );
+        assert_eq!(
+            log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
+            [0x05, 0x1a, 0x1a]
+        );
+        assert_read_config_audit(&audit, true);
+    }
+}
+
+/// A medium error must publish page 1Dh's evidence and finish the audit as failed.
+#[test]
+fn drive_handle_read_config_medium_configuration_error_outcome() {
+    let sense = current_sense(3, 0, 0x11, 0);
+    let (mut drive, log, audit) = read_config_fixture(
+        0,
+        Some(Err(ScsiError::CheckCondition {
+            sense: sense.clone(),
+            bytes_transferred: 0,
+        })),
+        false,
+    );
+    let error = drive
+        .read_config()
+        .expect_err("medium error must propagate");
+    let evidence = &error.outcome().evidence;
+    assert_eq!(evidence.sense.as_ref(), Some(&sense));
+    assert_eq!(evidence.requested_bytes, Some(255));
+    assert_eq!(evidence.opcode, Some(0x1a));
+    assert!(evidence.failed);
+    assert_eq!(
+        log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
+        [0x05, 0x1a, 0x1a]
+    );
+    assert_read_config_audit(&audit, false);
+}
+
+/// Deferred and unusable sense cannot turn a failed command into an unsupported page.
+#[test]
+fn drive_handle_read_config_medium_configuration_unusable_or_deferred_error() {
+    let mut deferred = current_sense(5, 0, 0x24, 0);
+    deferred[0] = 0x71;
+    for sense in [deferred, vec![0x73, 5, 0x24, 0], vec![0x70, 0, 5]] {
+        let (mut drive, _, audit) = read_config_fixture(
+            0,
+            Some(Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            })),
+            false,
+        );
+        let error = drive
+            .read_config()
+            .expect_err("sense does not prove unsupported page");
+        assert_eq!(error.outcome().evidence.requested_bytes, Some(255));
+        assert_read_config_audit(&audit, false);
+    }
+}
+
+/// A short successful transfer cannot borrow WORMM from the zeroed allocation buffer.
+#[test]
+fn drive_handle_read_config_malformed_medium_configuration_is_unknown() {
+    let mut page = read_config_medium_configuration_response(false);
+    page.truncate(14);
+    let (mut drive, _, audit) = read_config_fixture(0, Some(Ok(page)), false);
+    assert_eq!(
+        drive.read_config().expect("malformed page is unknown").worm,
+        WormMediaState::Unknown
+    );
+    assert_read_config_audit(&audit, true);
+}
+
+/// A recognized header remains authoritative and never requests page 1Dh.
+#[test]
+fn drive_handle_read_config_typed_medium_skips_configuration_page() {
+    for (medium_type, expected) in [
+        (0x98, WormMediaState::NotWorm),
+        (0x9c, WormMediaState::Worm),
+    ] {
+        let (mut drive, log, audit) = read_config_fixture(medium_type, None, false);
+        assert_eq!(drive.read_config().expect("typed header").worm, expected);
+        assert_eq!(
+            log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
+            [0x05, 0x1a]
+        );
+        assert_read_config_audit(&audit, true);
+    }
+}
+
+/// Reverify checks fixed mode and position; its outer boundary must never ask page 1Dh.
+#[test]
+fn drive_handle_read_config_reverify_skips_medium_configuration() {
+    let (mut drive, log, audit) = read_config_fixture(0, None, true);
+    drive
+        .reverify_invalidated_state()
+        .expect("mode and position reverified");
+    assert_eq!(drive.mode_reverification_required, None);
+    assert_eq!(drive.validated_fixed_block_size, Some(4));
+    assert_eq!(drive.max_write_block_size_bytes, Some(0x80_0000));
+    assert!(drive.position_known);
+    assert_eq!(
+        log.borrow().iter().map(|c| c[0]).collect::<Vec<_>>(),
+        [0x05, 0x1a, 0x34]
+    );
+    assert_read_config_audit(&audit, true);
+}
+
 #[test]
 fn drive_handle_read_config_surfaces_malformed_mode_response() {
     let lib = open_drive_test_lib("LIB_RC03");

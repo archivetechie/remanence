@@ -387,9 +387,34 @@ pub struct RemovedMagazine {
     pub unit_attention_on_insert: bool,
 }
 
+/// How a simulated drive reports whether its loaded cartridge is WORM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediumTypeReporting {
+    /// Type the cartridge in the MODE SENSE header (the default behavior).
+    #[default]
+    Header,
+    /// Report header medium type zero and answer the Medium Configuration page.
+    ConfigurationPage,
+    /// Report header medium type zero and refuse the Medium Configuration page.
+    Unsupported,
+}
+
+impl MediumTypeReporting {
+    /// Produce the header medium type without changing the loaded tape's state.
+    fn medium_type(self, worm: bool) -> u8 {
+        match self {
+            Self::Header if worm => 0x9c,
+            Self::Header => 0x98,
+            Self::ConfigurationPage | Self::Unsupported => 0,
+        }
+    }
+}
+
 /// Per-drive mechanical, removal-lock and cleaning simulation state.
 #[derive(Clone, Debug, Default)]
 pub struct VirtualDriveState {
+    /// How MODE SENSE reports the loaded cartridge's WORM state.
+    pub medium_type_reporting: MediumTypeReporting,
     /// This model's single initiator PREVENT survives transport close/reopen.
     pub removal_prevented: bool,
     /// After how many drive ops the drive becomes dirty.
@@ -1037,6 +1062,28 @@ impl ModelTransport {
                 self.with_loaded_tape(&mut world, |tape| Ok(tape.additional_partitions))?;
             return copy_response(buf, &[11, 0, 0, 0, 0x11, 6, 1, additional, 0, 0, 0, 0]);
         }
+        if cdb
+            .get(2)
+            .is_some_and(|page| page & 0x3f == remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION)
+        {
+            let worm = self.with_loaded_tape(&mut world, |tape| Ok(tape.worm))?;
+            let reporting = world
+                .drive_states
+                .entry(self.drive_bay()?)
+                .or_default()
+                .medium_type_reporting;
+            if reporting == MediumTypeReporting::Unsupported {
+                return Err(check_condition(fixed_sense(0x05, 0x24, 0x00, None, 0), 0));
+            }
+            let mut response = [0u8; 44];
+            response[0] = 43;
+            response[1] = reporting.medium_type(worm);
+            response[3] = 8;
+            response[12] = remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION;
+            response[13] = 0x1e;
+            response[14] = u8::from(worm);
+            return copy_response(buf, &response);
+        }
         let (block_length, compression, write_protected, worm) =
             self.with_loaded_tape(&mut world, |tape| {
                 Ok((
@@ -1046,9 +1093,15 @@ impl ModelTransport {
                     tape.worm,
                 ))
             })?;
+        let medium_type = world
+            .drive_states
+            .entry(self.drive_bay()?)
+            .or_default()
+            .medium_type_reporting
+            .medium_type(worm);
         copy_response(
             buf,
-            &mode_sense_response(block_length, compression, write_protected, worm),
+            &mode_sense_response(block_length, compression, write_protected, medium_type),
         )
     }
 
@@ -1816,10 +1869,15 @@ fn rbl_response(max_block_length: u32, min_block_length: u16) -> Vec<u8> {
     buf
 }
 
-fn mode_sense_response(block_length: u32, dce: bool, write_protected: bool, worm: bool) -> Vec<u8> {
+fn mode_sense_response(
+    block_length: u32,
+    dce: bool,
+    write_protected: bool,
+    medium_type: u8,
+) -> Vec<u8> {
     let mut buf = vec![0u8; 28];
     buf[0] = 27;
-    buf[1] = if worm { 0x9C } else { 0x98 };
+    buf[1] = medium_type;
     buf[2] = if write_protected { 0x90 } else { 0x10 };
     buf[3] = 8;
     let bl = block_length.to_be_bytes();
@@ -2116,6 +2174,103 @@ mod tests {
         let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 2);
         world.put_tape_in_slot(0x0400, "TAPE001", VirtualTape::default());
         Arc::new(Mutex::new(world))
+    }
+
+    /// The drive setting controls headers and support; the tape controls WORMM.
+    #[test]
+    fn medium_configuration_reports_loaded_tape_worm_mode() {
+        use remanence_scsi::mode::{build_mode_sense6_cdb, PageControl, PAGE_MEDIUM_CONFIGURATION};
+        for reporting in [
+            MediumTypeReporting::Header,
+            MediumTypeReporting::ConfigurationPage,
+            MediumTypeReporting::Unsupported,
+        ] {
+            for worm in [false, true] {
+                let world = world();
+                {
+                    let mut world = world.lock().unwrap();
+                    let tape = VirtualTape {
+                        worm,
+                        ..Default::default()
+                    };
+                    world.put_tape_in_drive(0x100, "TAPE001", Some(0x400), tape);
+                    world
+                        .drive_states
+                        .get_mut(&0x100)
+                        .unwrap()
+                        .medium_type_reporting = reporting;
+                }
+                let mut drive = ModelTransport::new(world, DeviceRole::Drive { bay: 0x100 });
+                let mut response = [0; 255];
+                drive
+                    .execute_in(
+                        &build_mode_sense6_cdb(PageControl::Current, 0x0f, 255),
+                        &mut response,
+                    )
+                    .unwrap();
+                let expected_type = if reporting == MediumTypeReporting::Header {
+                    if worm {
+                        0x9c
+                    } else {
+                        0x98
+                    }
+                } else {
+                    0
+                };
+                assert_eq!(response[1], expected_type);
+                let result = drive.execute_in(
+                    &build_mode_sense6_cdb(PageControl::Current, PAGE_MEDIUM_CONFIGURATION, 255),
+                    &mut response,
+                );
+                if reporting == MediumTypeReporting::Unsupported {
+                    assert!(
+                        matches!(result, Err(ScsiError::CheckCondition { sense, .. })
+                        if sense[2] == 5 && sense[12..14] == [0x24, 0])
+                    );
+                } else {
+                    assert_eq!(result.unwrap().bytes_transferred, 44);
+                    assert_eq!(&response[..4], &[43, expected_type, 0, 8]);
+                    assert_eq!(&response[12..15], &[0x1d, 0x1e, u8::from(worm)]);
+                }
+            }
+        }
+    }
+
+    /// Page support must not hide an absent or unthreaded cartridge.
+    #[test]
+    fn medium_configuration_checks_readiness_before_page_support() {
+        use remanence_scsi::mode::{build_mode_sense6_cdb, PageControl, PAGE_MEDIUM_CONFIGURATION};
+        let world = world();
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&0x100)
+            .unwrap()
+            .medium_type_reporting = MediumTypeReporting::Unsupported;
+        let mut drive = ModelTransport::new(world.clone(), DeviceRole::Drive { bay: 0x100 });
+        let cdb = build_mode_sense6_cdb(PageControl::Current, PAGE_MEDIUM_CONFIGURATION, 255);
+        let mut response = [0; 255];
+        assert!(matches!(
+            drive.execute_in(&cdb, &mut response),
+            Err(ScsiError::InvalidInput("drive bay has no loaded tape"))
+        ));
+        world.lock().unwrap().put_tape_in_drive(
+            0x100,
+            "TAPE001",
+            Some(0x400),
+            VirtualTape::default(),
+        );
+        for (initializing, expected) in [(true, [0x04, 0x02]), (false, [0x3a, 0])] {
+            {
+                let mut world = world.lock().unwrap();
+                let state = world.drive_states.get_mut(&0x100).unwrap();
+                state.initializing_command_required = initializing;
+                state.no_medium_until_loads = u32::from(!initializing);
+            }
+            assert!(matches!(drive.execute_in(&cdb, &mut response),
+                Err(ScsiError::CheckCondition { sense, .. }) if sense[2] == 2 && sense[12..14] == expected));
+        }
     }
 
     /// READ POSITION must not acquire the media/readiness preconditions of READ.

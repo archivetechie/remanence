@@ -2481,6 +2481,7 @@ mod compat_tests {
     fn mode_sense_response(block_length: u32, dce: bool) -> Vec<u8> {
         let mut buf = vec![0u8; 28];
         buf[0] = 27;
+        buf[1] = 0x98;
         buf[3] = 8;
         let bl = block_length.to_be_bytes();
         buf[9] = bl[1];

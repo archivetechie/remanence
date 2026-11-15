@@ -14,6 +14,8 @@
 //!   live in the block descriptor (not the page itself), but the
 //!   page exposes other knobs (active partition, BIS, etc.) that
 //!   Layer 3a touches indirectly.
+//! - **0x1D — Medium Configuration Mode Page.** Supplies the WORM-mode
+//!   bit when the MODE SENSE header does not type the cartridge.
 //!
 //! Block size is controlled by the **block descriptor** in the mode
 //! parameter list — a **3-byte** BLOCK LENGTH at descriptor bytes
@@ -34,6 +36,9 @@ pub const PAGE_DATA_COMPRESSION: u8 = 0x0F;
 /// Mode page code for Device Configuration. Companion to 0x0F for
 /// LTO tape drives.
 pub const PAGE_DEVICE_CONFIGURATION: u8 = 0x10;
+
+/// Mode page code for Medium Configuration, including the WORM-mode bit.
+pub const PAGE_MEDIUM_CONFIGURATION: u8 = 0x1D;
 
 /// Special page code: return all supported pages.
 pub const PAGE_ALL: u8 = 0x3F;
@@ -118,6 +123,13 @@ mod tests {
     fn sense_current_data_compression_page() {
         let cdb = build_mode_sense6_cdb(PageControl::Current, PAGE_DATA_COMPRESSION, 64);
         assert_eq!(cdb, [0x1A, 0x00, 0x0F, 0x00, 0x40, 0x00]);
+    }
+
+    /// The WORM fallback asks for current page 1Dh with the full allocation.
+    #[test]
+    fn sense_current_medium_configuration_page() {
+        let cdb = build_mode_sense6_cdb(PageControl::Current, PAGE_MEDIUM_CONFIGURATION, 255);
+        assert_eq!(cdb, [0x1A, 0x00, 0x1D, 0x00, 0xFF, 0x00]);
     }
 
     #[test]

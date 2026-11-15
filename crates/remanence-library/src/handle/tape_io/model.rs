@@ -801,13 +801,15 @@ pub enum WormMediaState {
     NotWorm,
     /// The loaded medium is WORM.
     Worm,
-    /// The drive did not report a recognized loaded-medium type.
+    /// Neither the header's medium type nor the Medium Configuration page
+    /// established the loaded medium's WORM state.
     Unknown,
 }
 
 /// Current block-size + compression configuration of a loaded tape.
 /// Returned by `DriveHandle::read_config` (queried via MODE SENSE
-/// pages 0x10 + 0x0F) and consumed by `write_config` (issued as a
+/// page 0x0F, plus 0x1D when the header's medium type is inconclusive)
+/// and consumed by `write_config` (issued as a
 /// MODE SELECT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapeConfig {
@@ -839,7 +841,8 @@ pub struct TapeConfig {
     pub max_block_size_bytes: u32,
     /// Write-protect bit from the MODE SENSE parameter header.
     pub write_protected: bool,
-    /// WORM/non-WORM media state inferred from the MODE SENSE medium type.
+    /// WORM state from the MODE SENSE header's medium type, falling back to
+    /// the Medium Configuration page when the header is inconclusive.
     pub worm: WormMediaState,
 }
 

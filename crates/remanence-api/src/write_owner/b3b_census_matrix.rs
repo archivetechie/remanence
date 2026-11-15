@@ -287,6 +287,7 @@ fn open_cell(
 ) {
     let mut mode = vec![0; 28];
     mode[0] = 27;
+    mode[1] = 0x98;
     mode[3] = 8;
     mode[10] = 2;
     mode[12] = 15;

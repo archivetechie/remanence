@@ -9303,6 +9303,121 @@ fn prepare_object_write_rejects_worm_before_mode_select_or_media_write() {
     }
 }
 
+/// Exercise write admission with a valid BOT identity on a drive that leaves
+/// the header medium type unspecified; only the page can supply WORM evidence.
+fn prepare_object_write_with_untyped_header(
+    worm: bool,
+    reporting: remanence_chaos::model::MediumTypeReporting,
+) -> (Result<(), Status>, Vec<u8>) {
+    const BLOCK_SIZE: u32 = 256 * 1024;
+    let tape_uuid = [0x4e; 16];
+    let bootstrap = BootstrapPayload {
+        scheme: None,
+        no_parity_flag: true,
+        filemark_map_digest: None,
+        tape_uuid,
+        written_by_version: "test".to_string(),
+        written_at: "2026-08-11T00:00:00Z".to_string(),
+        sequence: 0,
+        block_size_bytes: BLOCK_SIZE,
+        drive_compression: false,
+    };
+    let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
+    write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+    let mut tape = VirtualTape::empty(1024 * 1024, BLOCK_SIZE);
+    tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
+    tape.written_bytes = u64::from(BLOCK_SIZE);
+    tape.worm = worm;
+
+    let mut world = VirtualWorld::single_drive("LIB-UNTYPED", 0x0100, "DRV-UNTYPED", 0x0400, 1);
+    world.put_tape_in_drive(0x0100, "UNTYPEDL9", Some(0x0400), tape);
+    world
+        .drive_states
+        .get_mut(&0x0100)
+        .unwrap()
+        .medium_type_reporting = reporting;
+    let world = Arc::new(Mutex::new(world));
+    let mut library = open_model_library(Arc::clone(&world));
+    let serial = library.library().serial.clone();
+    let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+    let mut drive = library
+        .open_drive(0x0100, &policy)
+        .expect("open model drive");
+    let command_start = world.lock().expect("world lock").command_log.len();
+    let result = prepare_drive_for_write(
+        &mut drive,
+        &tape_uuid,
+        BLOCK_SIZE,
+        Uuid::new_v4(),
+        WriteMediaPolicy::RewritableObject,
+    );
+    let opcodes = world.lock().expect("world lock").command_log[command_start..]
+        .iter()
+        .map(|command| command.opcode)
+        .collect();
+    (result, opcodes)
+}
+
+/// Positive WORMM=0 evidence admits the reporter's cartridge before selecting mode.
+#[test]
+fn prepare_object_write_untyped_rewritable_uses_configuration_page() {
+    let (result, opcodes) = prepare_object_write_with_untyped_header(
+        false,
+        remanence_chaos::model::MediumTypeReporting::ConfigurationPage,
+    );
+    result.expect("Medium Configuration identifies rewritable media");
+    let select = opcodes
+        .iter()
+        .position(|opcode| *opcode == 0x15)
+        .expect("MODE SELECT after admission");
+    assert_eq!(
+        opcodes[..select]
+            .iter()
+            .filter(|opcode| **opcode == 0x1a)
+            .count(),
+        2,
+        "both mode pages must precede MODE SELECT: {opcodes:02x?}"
+    );
+}
+
+/// Positive WORMM=1 evidence retains the existing refusal before media mutation.
+#[test]
+fn prepare_object_write_untyped_worm_is_refused() {
+    let (result, opcodes) = prepare_object_write_with_untyped_header(
+        true,
+        remanence_chaos::model::MediumTypeReporting::ConfigurationPage,
+    );
+    let error = result.expect_err("WORM page must refuse ordinary Object writes");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("WORM tape"), "{error}");
+    assert_eq!(opcodes.iter().filter(|opcode| **opcode == 0x1a).count(), 2);
+    for forbidden in [0x15, 0x0a, 0x10] {
+        assert!(
+            !opcodes.contains(&forbidden),
+            "refusal issued {forbidden:02x}: {opcodes:02x?}"
+        );
+    }
+}
+
+/// An unsupported page retains the gate's unknown-state refusal.
+#[test]
+fn prepare_object_write_untyped_unsupported_page_is_refused() {
+    let (result, opcodes) = prepare_object_write_with_untyped_header(
+        false,
+        remanence_chaos::model::MediumTypeReporting::Unsupported,
+    );
+    let error = result.expect_err("unsupported page leaves media unknown");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("state is unknown"), "{error}");
+    assert_eq!(opcodes.iter().filter(|opcode| **opcode == 0x1a).count(), 2);
+    for forbidden in [0x15, 0x0a, 0x10] {
+        assert!(
+            !opcodes.contains(&forbidden),
+            "refusal issued {forbidden:02x}: {opcodes:02x?}"
+        );
+    }
+}
+
 #[test]
 fn prepare_drive_for_read_sets_catalog_fixed_block_size_and_rejects_missing_geometry() {
     let temp = tempfile::Builder::new()

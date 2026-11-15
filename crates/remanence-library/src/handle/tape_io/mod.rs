@@ -3952,7 +3952,7 @@ impl super::DriveHandle {
 
     /// Read the drive's current block-size + compression
     /// configuration plus its reported maximum block size. Issues
-    /// **two CDBs** at session open:
+    /// **two CDBs**, plus a third when the header does not type the cartridge:
     ///
     /// 1. READ BLOCK LIMITS (CDB `0x05`) for
     ///    [`TapeConfig::max_block_size_bytes`]. MODE SENSE pages do
@@ -3962,28 +3962,40 @@ impl super::DriveHandle {
     ///    block descriptor — block size comes from the
     ///    descriptor's 3-byte BLOCK LENGTH field; compression
     ///    comes from the page's DCE bit.
+    /// 3. When the header's medium type leaves WORM state unknown,
+    ///    MODE SENSE(6) page `0x1D` (Medium Configuration) supplies
+    ///    the WORM-mode bit. Unsupported or malformed page data
+    ///    leaves WORM state unknown.
     ///
-    /// Malformed responses surface as
+    /// Malformed block-limit or compression responses surface as
     /// [`TapeIoError::MalformedModeResponse`] (a CDB-succeeded /
     /// payload-wrong condition, distinct from CHECK CONDITION).
     pub fn read_config(&mut self) -> Result<TapeConfig, TapeIoError> {
-        self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
-            let op = AuditOp::TapeReadConfig {
-                bay: drive.bay_address(),
-            };
-            let cdb_rbl = remanence_scsi::read_block_limits::build_cdb();
-            drive.fire_tape_started(op, &cdb_rbl);
+        self.read_config_internal(true)
+    }
 
-            let started = Instant::now();
+    /// Resolve WORM state only for callers outside the reverify outcome boundary.
+    fn read_config_internal(&mut self, resolve_worm: bool) -> Result<TapeConfig, TapeIoError> {
+        let (op, started, max_block_size_bytes, mut mode) =
+            self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
+                let op = AuditOp::TapeReadConfig {
+                    bay: drive.bay_address(),
+                };
+                let cdb_rbl = remanence_scsi::read_block_limits::build_cdb();
+                drive.fire_tape_started(op, &cdb_rbl);
 
-            // 1. READ BLOCK LIMITS.
-            drive.transport.set_timeout_for(TimeoutClass::TapeStatus);
-            let mut rbl_buf = [0u8; 6];
-            let max_block_size_bytes = drive.with_command_outcome(
-                crate::outcome::CommandClass::OtherControl,
-                |drive| {
-                    let max_block_size_bytes =
-                        match drive.transport.execute_in(&cdb_rbl, &mut rbl_buf) {
+                let started = Instant::now();
+
+                // 1. READ BLOCK LIMITS.
+                drive.transport.set_timeout_for(TimeoutClass::TapeStatus);
+                let mut rbl_buf = [0u8; 6];
+                let max_block_size_bytes = drive.with_command_outcome(
+                    crate::outcome::CommandClass::OtherControl,
+                    |drive| {
+                        let max_block_size_bytes = match drive
+                            .transport
+                            .execute_in(&cdb_rbl, &mut rbl_buf)
+                        {
                             Ok(outcome) => {
                                 // Slice to
                                 // bytes_transferred so a short successful transfer
@@ -4012,54 +4024,87 @@ impl super::DriveHandle {
                                 return Err(mapped);
                             }
                         };
-                    Ok(max_block_size_bytes)
-                },
-            )?;
+                        Ok(max_block_size_bytes)
+                    },
+                )?;
 
-            // 2. MODE SENSE(6) page 0x0F.
-            let cdb_ms = remanence_scsi::mode::build_mode_sense6_cdb(
-                remanence_scsi::mode::PageControl::Current,
-                remanence_scsi::mode::PAGE_DATA_COMPRESSION,
-                64,
-            );
-            drive.transport.set_timeout_for(TimeoutClass::ModeConfig);
-            let mut ms_buf = [0u8; 64];
-            let mode = match drive.transport.execute_in(&cdb_ms, &mut ms_buf) {
-                Ok(outcome) => {
-                    let bytes = (outcome.bytes_transferred as usize).min(ms_buf.len());
-                    match parse_mode_sense_data_compression(&ms_buf[..bytes]) {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            drive.finish_tape_error(op, &err);
-                            return Err(err);
+                // 2. MODE SENSE(6) page 0x0F.
+                let cdb_ms = remanence_scsi::mode::build_mode_sense6_cdb(
+                    remanence_scsi::mode::PageControl::Current,
+                    remanence_scsi::mode::PAGE_DATA_COMPRESSION,
+                    64,
+                );
+                drive.transport.set_timeout_for(TimeoutClass::ModeConfig);
+                let mut ms_buf = [0u8; 64];
+                let mode = match drive.transport.execute_in(&cdb_ms, &mut ms_buf) {
+                    Ok(outcome) => {
+                        let bytes = (outcome.bytes_transferred as usize).min(ms_buf.len());
+                        match parse_mode_sense_data_compression(&ms_buf[..bytes]) {
+                            Ok(parsed) => parsed,
+                            Err(err) => {
+                                drive.finish_tape_error(op, &err);
+                                return Err(err);
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    let mapped = map_scsi(e);
-                    drive.finish_tape_error(op, &mapped);
-                    return Err(mapped);
-                }
-            };
+                    Err(e) => {
+                        let mapped = map_scsi(e);
+                        drive.finish_tape_error(op, &mapped);
+                        return Err(mapped);
+                    }
+                };
 
-            drive.finish_tape_success(op, started.elapsed());
+                Ok((op, started, max_block_size_bytes, mode))
+            })?;
 
-            drive.max_write_block_size_bytes = Some(max_block_size_bytes);
-            if let BlockSize::Fixed { size_bytes } = mode.block_size {
-                drive.validated_fixed_block_size = Some(size_bytes);
-                if drive.mode_reverification_required == Some(size_bytes) {
-                    drive.mode_reverification_required = None;
+        // The page has its own top-level result boundary so a failure carries
+        // its own evidence, not the compression page's successful completion.
+        if resolve_worm && mode.worm == WormMediaState::Unknown {
+            mode.worm = self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
+                let cdb = remanence_scsi::mode::build_mode_sense6_cdb(
+                    remanence_scsi::mode::PageControl::Current,
+                    remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION,
+                    255,
+                );
+                drive.transport.set_timeout_for(TimeoutClass::ModeConfig);
+                let mut data = [0u8; 255];
+                match drive.transport.execute_in(&cdb, &mut data) {
+                    Ok(outcome) => {
+                        let bytes = (outcome.bytes_transferred as usize).min(data.len());
+                        Ok(worm_state_from_medium_configuration(&data[..bytes]))
+                    }
+                    Err(ScsiError::CheckCondition { ref sense, .. })
+                        if !sense_is_deferred(sense)
+                            && matches!(decode_sense_key_asc(sense), Some((0x05, _, _))) =>
+                    {
+                        Ok(WormMediaState::Unknown)
+                    }
+                    Err(error) => {
+                        let mapped = map_scsi(error);
+                        drive.finish_tape_error(op, &mapped);
+                        Err(mapped)
+                    }
                 }
+            })?;
+        }
+
+        self.finish_tape_success(op, started.elapsed());
+
+        self.max_write_block_size_bytes = Some(max_block_size_bytes);
+        if let BlockSize::Fixed { size_bytes } = mode.block_size {
+            self.validated_fixed_block_size = Some(size_bytes);
+            if self.mode_reverification_required == Some(size_bytes) {
+                self.mode_reverification_required = None;
             }
+        }
 
-            Ok(TapeConfig {
-                density_code: mode.density_code,
-                block_size: mode.block_size,
-                compression: mode.compression,
-                max_block_size_bytes,
-                write_protected: mode.write_protected,
-                worm: mode.worm,
-            })
+        Ok(TapeConfig {
+            density_code: mode.density_code,
+            block_size: mode.block_size,
+            compression: mode.compression,
+            max_block_size_bytes,
+            write_protected: mode.write_protected,
+            worm: mode.worm,
         })
     }
 
@@ -4070,7 +4115,7 @@ impl super::DriveHandle {
         let Some(required_block_size) = drive.mode_reverification_required else {
             return Ok(());
         };
-        let config = drive.read_config()?;
+        let config = drive.read_config_internal(false)?;
         if config.block_size
             != (BlockSize::Fixed {
                 size_bytes: required_block_size,
@@ -4908,6 +4953,30 @@ fn parse_mode_sense_data_compression(buf: &[u8]) -> Result<ModeSenseDataCompress
         worm: worm_state_from_medium_type(medium_type),
         medium_type,
     })
+}
+
+/// Read WORMM from a MODE SENSE(6) Medium Configuration page. Missing,
+/// truncated or unrelated page data cannot establish that media is rewritable.
+fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
+    if response.len() < 4 {
+        return WormMediaState::Unknown;
+    }
+    let usable_length = response.len().min(response[0] as usize + 1);
+    let page_start = 4 + response[3] as usize;
+    if page_start + 2 >= usable_length {
+        return WormMediaState::Unknown;
+    }
+    if response[page_start] & 0x3F != remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION
+        || response[page_start] & 0x40 != 0
+        || response[page_start + 1] < 1
+    {
+        return WormMediaState::Unknown;
+    }
+    if response[page_start + 2] & 1 != 0 {
+        WormMediaState::Worm
+    } else {
+        WormMediaState::NotWorm
+    }
 }
 
 fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {

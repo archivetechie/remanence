@@ -183,8 +183,10 @@ tell whether it looked at the same index.
 Remanence refuses to write ordinary objects to a WORM cartridge, and to a cartridge whose
 WORM state the drive does not report. The reason is crash recovery: after an interrupted
 write, Remanence may need to overwrite the uncommitted tail of the tape at the last commit,
-and a WORM cartridge would refuse that. The drive reports the medium type, and only a
-cartridge positively reported as rewritable is accepted for object writes.
+and a WORM cartridge would refuse that. The drive reports the medium type in the MODE SENSE
+header. If that type is unspecified or unrecognized, Remanence asks the Medium Configuration
+page for its WORM-mode bit. A cartridge is accepted for object writes only when the header
+or that page positively reports it as rewritable.
 
 ## 8. Libraries, standalone drives and home mode
 
