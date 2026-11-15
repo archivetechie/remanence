@@ -3980,7 +3980,8 @@ impl super::DriveHandle {
         self.read_config_internal(true)
     }
 
-    /// Resolve WORM state only for callers outside the reverify outcome boundary.
+    /// Resolve WORM state only for the write routes' resolving read; the plain read and the reverify
+    /// outcome boundary pass `false` and keep the header's evidence alone.
     fn read_config_internal(&mut self, resolve_worm: bool) -> Result<TapeConfig, TapeIoError> {
         let (op, started, max_block_size_bytes, mut mode) =
             self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {

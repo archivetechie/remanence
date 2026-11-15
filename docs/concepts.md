@@ -180,7 +180,7 @@ tell whether it looked at the same index.
 ## 7. WORM media
 
 **WORM** (write once, read many) cartridges cannot be overwritten.
-Remanence writes only to rewritable cartridges. After a write is interrupted it replaces the
+Remanence writes objects only to rewritable cartridges. After a write is interrupted it replaces the
 unfinished end of the tape, and a WORM cartridge forbids that. Tapes written elsewhere on WORM
 can still be read. An interrupted write includes a cancelled write or a disconnected client,
 not only a crash. Reading, adoption and restore of supported tape formats on WORM are designed

@@ -8,8 +8,7 @@ per-release summaries.
 ## Unreleased
 
 - Object writes work on drives that report medium type `0x00` in the MODE SENSE
-  header, such as some HP LTO-6 drives, when the Medium Configuration page positively
-  reports rewritable media. Only write paths that need WORM state ask that page when
+  header when the Medium Configuration page positively reports rewritable media. Only write paths that need WORM state ask that page when
   the header is inconclusive; plain settings reads use the header alone.
 - Both library and standalone `tape init` refuse WORM and unknown media before any
   media write, including blank cartridges.

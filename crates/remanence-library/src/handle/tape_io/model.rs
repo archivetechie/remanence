@@ -801,8 +801,8 @@ pub enum WormMediaState {
     NotWorm,
     /// The loaded medium is WORM.
     Worm,
-    /// Neither the header's medium type nor the Medium Configuration page
-    /// established the loaded medium's WORM state.
+    /// The inspected mode data did not establish the loaded medium's WORM state: the header's
+    /// medium type was inconclusive and the Medium Configuration page, if asked, did not settle it.
     Unknown,
 }
 

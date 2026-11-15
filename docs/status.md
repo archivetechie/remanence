@@ -319,7 +319,7 @@ failure in either is not by itself evidence of a regression.
 | Real hardware below LTO-7 | No testing. That `--generation` accepts L5 and L6 is not a hardware qualification. |
 | Autoloader | No testing. |
 | Real standalone drive | No testing yet. Model tests and a VTL view do not substitute for a physical standalone drive. |
-| WORM cartridges | Not accepted for writing or initialization. Reading, adoption and restore are designed for but untested on a physical WORM cartridge. Buy rewritable media for writing. |
+| WORM cartridges | Not accepted for object writes or initialization; finalizing a WORM tape already in a catalog uses an append-only path. Reading, adoption and restore are designed for but untested on a physical WORM cartridge. Buy rewritable media for writing. |
 | Drives with an untyped MODE SENSE header | Supported through the Medium Configuration page for WORM decisions. Tested by model and one outside report. |
 
 A hardware report that cannot be reproduced stays open once a
