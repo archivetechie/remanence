@@ -97,6 +97,7 @@ struct JournalMount<'a> {
     super_options: &'a str,
 }
 
+/// Preserve an empty mount source and the full super-options for journal checks.
 #[cfg(any(target_os = "linux", test))]
 fn parse_journal_mount(line: &str) -> Option<JournalMount<'_>> {
     let (left, right) = line.split_once(" - ")?;
@@ -105,10 +106,13 @@ fn parse_journal_mount(line: &str) -> Option<JournalMount<'_>> {
     let parent = left.next()?.parse().ok()?;
     let mount_point = PathBuf::from(unescape_mountinfo_path(left.nth(2)?));
     left.next()?; // The mandatory per-mount options must be present too.
-    let mut right = right.split_whitespace();
-    let fstype = right.next()?.to_owned();
-    let source = unescape_mountinfo_path(right.next()?);
-    let super_options = right.next()?;
+    let (fstype, rest) = right.split_once(' ')?;
+    let (source, super_options) = rest.split_once(' ')?;
+    if fstype.is_empty() || super_options.is_empty() {
+        return None;
+    }
+    let fstype = fstype.to_owned();
+    let source = unescape_mountinfo_path(source);
     Some(JournalMount {
         id,
         parent,
@@ -145,7 +149,7 @@ fn reachable_journal_mount<'a>(
                     && mount.id != current.id
                     && dir.starts_with(&mount.volume.mount_point)
             })
-            .min_by_key(|mount| mount.volume.mount_point.as_os_str().len());
+            .min_by_key(|mount| mount.volume.mount_point.components().count());
         match child {
             Some(child) => current = child,
             None => return Some(current),
@@ -442,6 +446,54 @@ mod tests {
             inspect(&roots, "/log", 0x58465342).unwrap().source,
             "last-root"
         );
+    }
+
+    /// An empty source is valid mountinfo and must still reach the allow-list.
+    #[test]
+    fn journal_empty_source_mount_is_parsed_and_refused() {
+        let line = mount(2, 1, "/mnt", "tmpfs", "", "rw");
+        let parsed = parse_journal_mount(line.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed.volume.source, "");
+        assert_eq!(parsed.volume.fstype, "tmpfs");
+        assert_eq!(parsed.super_options, "rw");
+        let text = root_mount() + &line;
+        assert_eq!(
+            refusal(inspect(&text, "/mnt/log", 0x01021994)),
+            "/mnt/log is on tmpfs, which is not a supported journal filesystem"
+        );
+    }
+
+    /// A valid empty-source parent must not orphan a child's barrier policy.
+    #[test]
+    fn journal_empty_source_parent_preserves_child_refusal() {
+        let text = root_mount()
+            + &mount(2, 1, "/mnt", "tmpfs", "", "rw")
+            + &mount(3, 2, "/mnt/journal", "ext4", "child", "rw,nobarrier");
+        assert_eq!(
+            refusal(inspect(&text, "/mnt/journal/log", 0xEF53)),
+            "/mnt/journal/log: ext4 at /mnt/journal disables journal durability with nobarrier"
+        );
+    }
+
+    /// A space inside a security option must not hide a later barrier token.
+    #[test]
+    fn journal_security_option_space_preserves_barrier_refusal() {
+        let text = mount(1, 0, "/", "ext4", "disk", "rw,context=\"a b\",nobarrier");
+        assert_eq!(
+            refusal(inspect(&text, "/journal", 0xEF53)),
+            "/journal: ext4 at / disables journal durability with nobarrier"
+        );
+    }
+
+    /// Equal component depths select the later sibling despite a trailing slash.
+    #[test]
+    fn journal_mount_lookup_trailing_slash_tie_reaches_later_mount() {
+        let text = root_mount()
+            + &mount(2, 1, "/mnt", "ext4", "older", "rw")
+            + &mount(3, 1, "/mnt/", "ext4", "later", "rw");
+        let volume = inspect(&text, "/mnt/log", 0xEF53).unwrap();
+        assert_eq!(volume.source, "later");
+        assert_eq!(volume.mount_point, Path::new("/mnt/"));
     }
 
     #[test]
