@@ -630,6 +630,15 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/motion_reconcile_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 2,
+                execute_none: 2,
+                why: "cfg(test) InitializingDrive and FailReadsAfterMove forwarders \
+                      to in-memory ModelTransport only; no production dispatch",
+            },
+        ),
+        (
             "remanence-api/src/write_owner/r1c2_tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 3,

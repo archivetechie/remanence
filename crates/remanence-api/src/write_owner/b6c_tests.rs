@@ -142,7 +142,9 @@ async fn mr_b_running_unload_is_not_reconciled() {
         .unwrap();
     assert!(runtime.endpoint_motion_owned(&DriveKey::new(LIBRARY, BAY_B)));
     changer_tx
-        .send(ChangerCommand::ReconcileMotion)
+        .send(ChangerCommand::ReconcileMotion {
+            pending: Arc::new(AtomicBool::new(true)),
+        })
         .await
         .unwrap();
     let (reply, moved) = oneshot::channel();

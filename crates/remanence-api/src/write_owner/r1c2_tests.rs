@@ -784,6 +784,77 @@ fn waited_world() -> Arc<Mutex<VirtualWorld>> {
     Arc::new(Mutex::new(model))
 }
 
+/// The daemon-installed notifier alone sends an abandoned LOAD to the changer's handler.
+#[test]
+fn mr_b_fr1_daemon_notifier_reconciles_unowned_load() {
+    use remanence_state::library_log as lib;
+
+    let root = root();
+    let world = seated_world();
+    let snapshot = world.lock().unwrap().library_snapshot();
+    let (state, api, runtime) =
+        start_daemon_with_snapshot(&root, &world, snapshot, |inner| Box::new(inner)).unwrap();
+    let authority = state.library_runtime();
+    let chain_uuid = authority.manifest().library_uuid();
+    let load = MotionCommand::Load(key(BAY_A));
+    let ticket = intent(&authority, &load);
+    authority.unconfirmed(&pending(&load, ticket)).unwrap();
+    let reconciled = runtime.block_on(async {
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while authority.requires_reconciliation(&load) {
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+    });
+    runtime.block_on(api.shutdown_drive_pool()).unwrap();
+    drop(authority);
+    drop(api);
+    drop(runtime);
+    drop(state);
+    wait_for_lifecycle_close(&root);
+    reconciled.expect("daemon notifier reconciles the unowned LOAD within 5 s");
+    let records =
+        crate::tests::read_library_records(&root.paths, chain_uuid, &mut |r| Some(r.clone()))
+            .unwrap_or_else(|_| panic!("library log readable after daemon shutdown"));
+    let load = ticket.record_uuid;
+    let intent = records
+        .iter()
+        .find(|record| record.envelope.record_uuid == load)
+        .and_then(|record| record.motion_intent())
+        .expect("the ticket identifies the LOAD intent");
+    assert!(matches!(intent.motion, lib::Motion::Load(_)));
+    assert_eq!(intent.parent_operation, None);
+    let outcomes: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            record
+                .motion_outcome()
+                .filter(|outcome| outcome.intent.record_uuid == load)
+                .map(|outcome| (position, outcome))
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].1.result, lib::MotionResult::Unknown);
+    let reconciled = records
+        .iter()
+        .position(|record| {
+            record.inventory_observation().is_some_and(|observation| {
+                observation
+                    .resolves
+                    .0
+                    .iter()
+                    .any(|reference| reference.record_uuid == load)
+            })
+        })
+        .expect("InventoryReconciled resolves the notified LOAD");
+    assert!(
+        outcomes[0].0 < reconciled,
+        "Unknown precedes InventoryReconciled"
+    );
+}
+
 /// A cancelled service LOAD is reconciled before terminal publication, then resume frees MOVE.
 #[test]
 fn mr_b_service_cancel_resume_and_move_reconciles_load() {
