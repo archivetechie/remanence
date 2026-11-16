@@ -227,6 +227,23 @@ The standalone interface operates one manually loaded drive directly. It needs n
 `rem-daemon`, no changer and no `[[libraries]]` entry. The complete walkthrough is
 [Using a standalone LTO drive](guide-standalone-drive.md).
 
+A failed write, finalize or tail replacement that fences its tape for write
+uncertainty also holds the standalone drive. The hold refuses `put`,
+`tape finalize`, `tape supersede-tail`, `tape init`, `tape adopt`,
+`tape assign-pool`, `tape rebind` and `tape set-generation` in that drive,
+including on any other cartridge.
+The `assign-pool --tape <UUID>` form opens no drive and does not consult its hold.
+On the failed cartridge, put, finalize and the four catalogue commands report
+the tape fence first; init reports `DriveFenced` on any cartridge. Reads and
+`rem tape release` do not consult the hold; their other admission checks still
+apply. An append-admission refusal can fence only the tape.
+
+The standalone refusal names the hold and its release command:
+
+```text
+DriveFenced: drive <serial> library:<n> <cause>; release the hold with `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT`
+```
+
 ### Routing
 
 `rem` has two command parsers: the library parser and the standalone parser. Which one
@@ -495,11 +512,22 @@ Reads report active tape-I/O fences. With a `native_log_behind_projection` fence
 proceeds under that cause, walking the tape from its start. A contradicted tape
 admission refuses every read, including `--scan`. Other tape-I/O fence causes
 leave standalone reads available. Writes refuse active fences on the loaded tape
-or endpoint. A standalone initialization write that fails with an uncertain outcome
-raises no tape or drive fence. It is refused with
-`cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
-drive motion until it exits. Append admission also checks the physical tail:
+or drive.
+
+A standalone initialization write with an uncertain outcome holds the drive and
+returns the write's own error. It creates no tape fence; the hold's
+`evidence_json` names the planned tape UUID. The next init refuses with
+`DriveFenced` before RESERVE or preparation, on any cartridge. If the hold
+cannot be recorded, the refusal is:
+
+```text
+cannot durably record standalone write uncertainty for <uuid> at <endpoint> (<reason>): <detail>; the drive hold was not recorded: <error>; motion is fenced and recovery is required
+```
+
+That failure is counted as `StandaloneFenceUnrecorded` and stops further motion
+for the rest of the process.
+
+Append admission also checks the physical tail:
 `TailBeyondKnownState` means local state cannot authorize overwriting data it
 does not record (complete files or only a torn fragment). Restore newer state or rescue with `tape restore --scan` before considering
 supersede-tail.
@@ -685,7 +713,8 @@ to be unneeded.
 
 ### rem tape quarantine (standalone)
 
-List and release tape fences in the home state.
+List tape fences and standalone drive holds in the selected state root.
+A drive hold is released by acknowledgement independently of any tape fence.
 
 ```text
 rem tape quarantine list [OPTIONS]
@@ -696,7 +725,8 @@ rem tape quarantine release [OPTIONS] --ack <ACK> <ID>
 - `--ack <ACK>` records why the fence is being released. It must not be empty.
 
 On a home host without `/etc/rem/config.toml`, `list` prints active tape-I/O
-fences, including `library:` ids, and media-readiness records. On a host with
+fences, including `library:` ids, media-readiness records and `standalone_holds`.
+On a host with
 both system and home configurations, select the standalone parser explicitly:
 
 ```sh
@@ -707,8 +737,30 @@ rem tape quarantine list --device <SG> --allow-device <SERIAL> --config <PATH>
 configuration. The library parser's `list` prints media-readiness records and
 does not list `library:` tape fences.
 
-For releasable causes, use the library form below. Neither
-`append_admission_refused` nor `session_suffix_contradiction` is released by
+`rem tape quarantine list` on the standalone route includes `standalone_holds`:
+each row has `quarantine_id`, `drive_serial`, `cause`, `detail` and `state`.
+It lists all active standalone holds in the selected state root without opening
+a device. After checking the drive, acknowledge its hold with:
+
+```sh
+rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack "drive checked"
+```
+
+This opens no device and sends no device command. It prints the released hold
+with `state: "released"` and the tape fences still present in `active_fences`.
+The hold and tape fences have separate releases: acknowledgement of the drive
+never releases a tape fence. Use the library release form below for releasable
+tape fences; tape fences requiring physical recovery keep that requirement.
+
+If a daemon answers on the selected configuration's socket, it refuses the hold
+with this text; there is no offline fallback after that refusal:
+
+```text
+fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT` as a standalone command
+```
+
+For releasable tape-fence causes, use the library form below. Tape fences for
+`append_admission_refused` or `session_suffix_contradiction` are not released by
 this command. Use `rem tape supersede-tail` where recovery applies; it refuses
 a contradicting recorded session ending or a state that shows the tape's last
 session closed. Otherwise withdraw the tape with `rem tape retire` (pass
@@ -1351,6 +1403,16 @@ daemon socket after the operator's acknowledgement. Only an absent listener
 permits the offline fallback, which needs the exclusive state lock. Repeating a release
 returns its original evidence. Media-readiness (`mrq-`) release runs offline;
 stop the daemon so it can take the state lock.
+
+A standalone drive hold's `library:<n>` id is refused by this library release
+form, including offline, with:
+
+```text
+fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT` as a standalone command
+```
+
+This refusal records no release. A bay-scoped drive fence keeps the refusal
+`fence is not tape-scoped`; the standalone acknowledgement form cannot release it.
 
 For a present, noncontradicted `native_log_behind_projection` log, restore the
 exact tape log or rebuild the catalog with `rem rebuild-catalog-from-journals`,

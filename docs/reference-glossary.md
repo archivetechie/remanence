@@ -494,13 +494,17 @@ A durable refusal recorded against a tape or a drive after an operation on it en
 Remanence could not prove. It is written to the library log and the catalog and survives
 restarts. Fenced media is refused for writes and initialization until its cause is
 resolved. Some tape-I/O causes allow reads or motion, as described below; other
-media stay available. There are two kinds: the [tape-I/O fence](#tape-io-fence) and the
-[media-readiness fence](#media-readiness-fence). See [Concepts](concepts.md#9-fences).
+media stay available. Scopes include tape-I/O fences, media-readiness fences and
+drive fences, including standalone drive holds. See [Concepts](concepts.md#9-fences).
 
 ### quarantine
 
 The record behind a fence, named by its **quarantine id**. The `rem tape quarantine` commands
 list, show and release fences by that id; quarantine and fence name the same record.
+The standalone list also reports `standalone_holds`: drive-scoped `library:<n>`
+fences released by acknowledgement with
+`rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT`.
+Releasing a standalone drive hold leaves the tape fences active.
 
 ### tape-I/O fence
 
@@ -554,11 +558,18 @@ On a standalone drive, that cause refuses `rem get`, `rem tape identify`,
 `rem tape verify` and `rem tape restore`. Only `rem tape restore --scan` proceeds,
 walking the tape from its start. Contradicted tape admission refuses every read,
 including `--scan`. Reads under other fence causes remain available.
-A standalone initialization write that fails with an uncertain outcome raises no
-tape or drive fence. It is refused with
-`cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
-drive motion until it exits.
+A standalone initialization write with an uncertain outcome holds the drive and
+returns the write's own error. It creates no tape fence; the hold's
+`evidence_json` names the planned tape UUID. The next init refuses with
+`DriveFenced` before RESERVE or preparation, on any cartridge. If the hold
+cannot be recorded, the refusal is:
+
+```text
+cannot durably record standalone write uncertainty for <uuid> at <endpoint> (<reason>): <detail>; the drive hold was not recorded: <error>; motion is fenced and recovery is required
+```
+
+That failure is counted as `StandaloneFenceUnrecorded` and stops further motion
+for the rest of the process.
 
 ### media-readiness fence
 

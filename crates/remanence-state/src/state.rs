@@ -1498,7 +1498,8 @@ impl StateHandle {
                 .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
             count += 1;
         }
-        // A native write session has no endpoint or restart-ending vocabulary.
+        // A native write session records its drive but has no restart-ending vocabulary.
+        // Holding that drive after a cut-off write is deferred to rule A.
         // Preserve its unresolved source; never manufacture a read-session row
         // or a classified fence from broad native end reasons (C8-G2). Only ruling 21,
         // at open, derives a fence for a tape whose fence append was lost.

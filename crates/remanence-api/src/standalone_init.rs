@@ -29,6 +29,18 @@ impl OperatorMount<'_> {
         }
         let mut reserved = false;
         let result = (|| {
+            if let Some(key @ remanence_library::DriveKey::Standalone { .. }) =
+                drive.endpoint().durable_key()
+            {
+                self.state
+                    .library_runtime()
+                    .admit_drive_data(
+                        key,
+                        remanence_state::library_runtime::RefusalSubject::Tape(None),
+                        remanence_state::AuditActor::local_user(),
+                    )
+                    .map_err(|e| refusal(e.to_string()))?;
+            }
             if reserve {
                 drive.reserve().map_err(refusal)?;
                 reserved = true;

@@ -20,7 +20,6 @@ crates/remanence-api/src/daemon_catalog_services.rs::reconcile_tape::library_log
 crates/remanence-api/src/drive_collection.rs::foreign_drive_poll_loop::library_log	1
 crates/remanence-api/src/library.rs::drive_stewardship_refused::library_log	1
 crates/remanence-api/src/mount_support.rs::import_journals::library_log	1
-crates/remanence-api/src/mount_support.rs::raise_standalone_fence::library_log	1
 crates/remanence-api/src/write_owner/write_session.rs::record_barrier_alarm_unrecorded::library_log	1
 crates/remanence-cli/src/standalone.rs::dispatch::library_log	1
 # L1 trial rung R2b (af4b6546)
@@ -115,3 +114,4 @@ crates/remanence-cli/src/lib.rs::run_with_mode::LibraryLog	3
 crates/remanence-cli/src/lib.rs::state_changing_target::LibraryLog	1
 crates/remanence-state/src/rebuild_sources.rs::<module>::library_log	1
 crates/remanence-state/src/state/pool_rules.rs::<module>::library_log	1
+crates/remanence-api/src/write_owner/write_session.rs::write_fence_cause::library_log	2

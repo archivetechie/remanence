@@ -745,6 +745,18 @@ impl<'a> OperatorMount<'a> {
             mounted.endpoint.durable_key(),
             true,
         )?;
+        if let Some(key @ remanence_library::DriveKey::Standalone { .. }) =
+            mounted.endpoint.durable_key()
+        {
+            self.state
+                .library_runtime()
+                .admit_drive_data(
+                    key,
+                    remanence_state::library_runtime::RefusalSubject::Tape(Some(mounted.tape_uuid)),
+                    remanence_state::AuditActor::local_user(),
+                )
+                .map_err(|e| refusal(e.to_string()))?;
+        }
         if mounted.identity_generation != mounted.drive.identity_generation() {
             return Err(refusal("media identity invalidated"));
         }
@@ -1032,7 +1044,7 @@ impl OperatorMount<'_> {
 /// Error text of the 32-L1 refusal of a journal import. The text starts with the code.
 pub const JOURNAL_IMPORT_DEFERRED: &str =
     "JournalImportDeferred: importing checkpoint journals is deferred; nothing was imported or changed";
-/// Sync uncertainty evidence before projecting its tape and endpoint fence.
+/// Ruling 29 records initialization uncertainty as a typed standalone drive hold.
 pub(crate) fn raise_standalone_fence(
     state: &mut StateHandle,
     tape_uuid: TapeUuid,
@@ -1040,19 +1052,39 @@ pub(crate) fn raise_standalone_fence(
     reason: &str,
     detail: &str,
 ) -> Result<(), MountError> {
-    // C8-G10: the original producer couples tape, endpoint and free-form
-    // evidence. FenceRaised has a single scope and CompletionEvidence only;
-    // neither an invented DriveFault nor dropping the endpoint is equivalent.
+    // Ruling 29 supersedes C8-G10: the planned tape is detail on a DriveFault,
+    // not a tape fence for an identity that initialization has not provisioned.
     let runtime = state.library_runtime();
-    runtime.fence_motion_after_evidence_failure();
-    // Each raise is counted in the library log as one `RefusalRecorded` naming the tape.
-    runtime.record_refusal(
-        remanence_state::library_log::RefusalCode::StandaloneFenceUnrecorded,
-        remanence_state::library_runtime::RefusalSubject::Tape(Some(tape_uuid)),
-        remanence_state::AuditActor::local_user(),
-    );
+    let error = if let Some(key @ remanence_library::DriveKey::Standalone { .. }) = endpoint {
+        if let Some(cause) = crate::write_owner::write_fence_cause(reason) {
+            match runtime.raise_standalone_drive_hold(
+                key,
+                tape_uuid,
+                cause,
+                crate::append_admission::tape_fence_detail(
+                    None,
+                    Some(
+                        &serde_json::json!({
+                            "error": detail,
+                            "tape_uuid": uuid::Uuid::from_bytes(tape_uuid),
+                        })
+                        .to_string(),
+                    ),
+                ),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => error.to_string(),
+            }
+        } else {
+            runtime.fence_motion_after_evidence_failure();
+            format!("unrepresented write fence cause: {reason}")
+        }
+    } else {
+        runtime.fence_motion_after_evidence_failure();
+        "no standalone drive to hold".into()
+    };
     Err(refusal(format!(
-        "cannot durably record standalone write uncertainty for {} at {:?} ({reason}): {detail}; motion is fenced and recovery is required",
+        "cannot durably record standalone write uncertainty for {} at {:?} ({reason}): {detail}; the drive hold was not recorded: {error}; motion is fenced and recovery is required",
         uuid::Uuid::from_bytes(tape_uuid), endpoint
     )))
 }

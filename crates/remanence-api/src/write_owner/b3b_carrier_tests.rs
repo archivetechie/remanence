@@ -411,7 +411,19 @@ fn check_settle_audit(scenario: &str) {
     .unwrap();
     assert_eq!(counters(), before);
     assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
-    // The typed fence record is the audit: one across both settlements.
+    // Each scope has one typed raise across both settlements.
+    let holds = cfg
+        .authority
+        .runtime()
+        .unwrap()
+        .standalone_drive_holds()
+        .unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, "C6A");
+    assert_eq!(
+        holds[0].cause,
+        remanence_state::library_log::FenceCause::TransferError
+    );
     drop((index, cfg));
     let raised = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -420,7 +432,156 @@ fn check_settle_audit(scenario: &str) {
         .block_on(typed.records(|record| {
             (record.tag() == remanence_state::library_log::Tag::FenceRaised).then_some(())
         }));
-    assert_eq!(raised.len(), 1);
+    assert_eq!(raised.len(), 2);
+}
+
+/// Use the settlement fixture's production Mounted placement and its C6A endpoint.
+fn standalone_hold_config(typed: &crate::tests::TypedRoot) -> WriteOwnerConfig {
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        "C6", 0x100, "C6D", 0x400, 1,
+    )));
+    let library = open_model_library(world);
+    let snapshot = library_snapshot_cell(library.library().clone());
+    let mut cfg = test_typed_write_owner_config(typed, &library, snapshot);
+    let (drive, _) = drive(255);
+    cfg.placement =
+        crate::write_owner::ActorPlacement::Mounted(crate::write_owner::MountedDriveContext {
+            endpoint: drive.endpoint().durable_key().unwrap().clone(),
+            tape_uuid: [94; 16],
+            barcode: None,
+            cartridge_generation: None,
+            identity_generation: drive.identity_generation(),
+            actor: remanence_state::AuditActor::System,
+            audit_error: Arc::new(Mutex::new(None)),
+            audit_session: Arc::new(Mutex::new(None)),
+            direct_replay_fault: None,
+        });
+    cfg
+}
+
+/// A failed tape-fence attempt still holds the drive; a failed hold preserves tape success and latches.
+#[test]
+fn standalone_hold_survives_tape_fence_error_and_latches_its_own_error() {
+    use remanence_state::library_log as lib;
+    for missing_tape in [true, false] {
+        let typed = crate::tests::TypedRoot::open_with_tapes(&[([94; 16], "SETTLE94L9")]);
+        let mut index = typed.catalog().write_handle();
+        let cfg = standalone_hold_config(&typed);
+        let runtime = cfg.authority.runtime().unwrap();
+        let endpoint = &cfg.mounted().unwrap().endpoint;
+        if !missing_tape {
+            runtime.fail_next_standalone_hold_for_test();
+        }
+        let result = raise_tape_io_fence(
+            &mut index,
+            &cfg,
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: if missing_tape { [0x5a; 16] } else { [94; 16] },
+                barcode: None,
+                reason: "transfer_error".into(),
+                evidence_json: None,
+            },
+            Some(endpoint),
+            None,
+        );
+        if missing_tape {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("write fence requires Reprovision identity"));
+            let hold = runtime
+                .drive_fenced(endpoint)
+                .expect("tape-fence error must still hold C6A");
+            assert_eq!(hold.cause, lib::FenceCause::TransferError);
+            assert_eq!(
+                hold.endpoint,
+                lib::DriveKey::Standalone(lib::Standalone {
+                    drive_serial: "C6A".into()
+                })
+            );
+            assert!(!runtime.motion_fenced());
+            assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+        } else {
+            result.unwrap();
+            assert!(runtime.motion_fenced());
+            assert!(runtime.drive_fenced(endpoint).is_none());
+            assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
+        }
+    }
+}
+
+/// Closeout of an already fenced tape records its drive obligation with the new evidence once.
+#[test]
+fn standalone_closeout_existing_tape_fence_holds_drive_once() {
+    use remanence_state::library_log as lib;
+    let mut typed = crate::tests::TypedRoot::open_with_tapes(&[([94; 16], "SETTLE94L9")]);
+    let mut index = typed.catalog().write_handle();
+    let cfg = standalone_hold_config(&typed);
+    raise_tape_io_fence(
+        &mut index,
+        &cfg,
+        remanence_state::TapeIoFenceInput {
+            tape_uuid: [94; 16],
+            barcode: Some("SETTLE94L9".into()),
+            reason: "transfer_error".into(),
+            evidence_json: None,
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(cfg
+        .authority
+        .runtime()
+        .unwrap()
+        .standalone_drive_holds()
+        .unwrap()
+        .is_empty());
+    crate::write_owner::record_closeout_fence(
+        &mut index,
+        &cfg,
+        [94; 16],
+        "transfer_error",
+        r#"{"t":3}"#.into(),
+    );
+    let holds = cfg
+        .authority
+        .runtime()
+        .unwrap()
+        .standalone_drive_holds()
+        .unwrap();
+    assert_eq!(
+        holds.len(),
+        1,
+        "closeout must hold C6A even when the tape is already fenced"
+    );
+    assert_eq!(holds[0].drive_serial, "C6A");
+    assert_eq!(holds[0].cause, lib::FenceCause::TransferError);
+    assert_eq!(
+        holds[0].detail,
+        vec![
+            ("barcode".into(), "SETTLE94L9".into()),
+            ("evidence_json".into(), r#"{"t":3}"#.into())
+        ]
+    );
+    assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
+    crate::write_owner::record_closeout_fence(
+        &mut index,
+        &cfg,
+        [94; 16],
+        "transfer_error",
+        r#"{"t":3}"#.into(),
+    );
+    assert_eq!(
+        cfg.authority
+            .runtime()
+            .unwrap()
+            .standalone_drive_holds()
+            .unwrap(),
+        holds
+    );
+    drop((index, cfg));
+    assert_eq!(fence_raised_records(&mut typed), 2);
 }
 
 /// Two successful mounted WRITEs followed by unknown completion leave one transfer_error fence and one audit.
@@ -504,8 +665,20 @@ fn mounted_message_failure(
         .to_str()
         .unwrap()
         .into();
+    let holds = cfg
+        .authority
+        .runtime()
+        .unwrap()
+        .standalone_drive_holds()
+        .unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, "C6A");
+    assert_eq!(
+        holds[0].cause,
+        remanence_state::library_log::FenceCause::TransferError
+    );
     drop((index, cfg));
-    assert_eq!(fence_raised_records(&mut typed), 1);
+    assert_eq!(fence_raised_records(&mut typed), 2);
     (outcome, reason, retry)
 }
 

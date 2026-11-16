@@ -413,7 +413,7 @@ crates/remanence-api/src/write_owner/cleaning.rs::run_cleaning_body::text-match	
 crates/remanence-api/src/write_owner/cleaning_source.rs::begin::text-match	3
 crates/remanence-api/src/write_owner/readiness.rs::record_session_open_readiness_poll_transition::text-equality	1
 crates/remanence-api/src/write_owner/tail_recovery.rs::supersede_mounted_tail::text-strip_prefix	1
-crates/remanence-api/src/write_owner/write_session.rs::raise_tape_io_fence::text-match	12
+crates/remanence-api/src/write_owner/write_session.rs::write_fence_cause::text-match	12
 crates/remanence-state/src/authority_manifest.rs::has_authority::text-equality	1
 crates/remanence-state/src/index.rs::project_session_record::text-equality	2
 crates/remanence-state/src/library_log/authority.rs::write_with_readiness_owner::text-equality	1

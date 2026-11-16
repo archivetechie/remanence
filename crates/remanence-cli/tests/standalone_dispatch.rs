@@ -960,9 +960,7 @@ fn diagnostics_accepts_discovered_library_device_serials() {
     }
 }
 
-/// An actual bootstrap uses the requested block-size geometry, and a failed
-/// bootstrap records the ruling-29 stand-in refusal instead of main's endpoint fence.
-/// Each attempt plans a fresh tape identity (D-L2-29-1, D-L2-CLI-1-1).
+/// A bootstrap uses the requested geometry; a failed write holds the drive before another init can prepare.
 #[test]
 fn init_geometry_and_failed_bootstrap_are_guarded() {
     use remanence_chaos::model::{DeviceRole, ModelTransport, VirtualTape, VirtualWorld};
@@ -1043,70 +1041,65 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
             .unwrap();
         if fail {
             use remanence_state::library_log::{DiagnosticEvent, DiagnosticValue};
-            // D-L2-CLI-1-1: use ruling23's public diagnostic reader for code 5.
-            let refusal_ids = |expected| {
-                let records = ruling24_library_records(&root.path().join("state/rem/config.toml"));
-                let refusals: Vec<_> = records
-                    .iter()
-                    .filter_map(|record| record.diagnostic())
-                    .filter(|diagnostic| diagnostic.event == DiagnosticEvent::RefusalRecorded)
-                    .collect();
-                assert_eq!(refusals.len(), expected, "D-L2-CLI-1-1: refusal count");
-                refusals
-                    .iter()
-                    .map(|refusal| {
-                        assert_eq!(refusal.subject_kind.as_str(), "tape");
-                        let id = refusal
-                            .subject_id
-                            .as_ref()
-                            .expect("D-L2-CLI-1-1: tape subject");
-                        assert_eq!(
-                            refusal
-                                .detail
-                                .0
-                                .iter()
-                                .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
-                                .collect::<Vec<_>>(),
-                            [
-                                ("code".to_owned(), DiagnosticValue::Unsigned(5)),
-                                (
-                                    "name".to_owned(),
-                                    DiagnosticValue::Text("StandaloneFenceUnrecorded".into())
-                                ),
-                            ]
-                        );
-                        id.as_str().to_owned()
-                    })
-                    .collect::<Vec<_>>()
-            };
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
             let text = output["error"].as_str().expect("the error is a string");
             assert!(
-                text.starts_with("cannot durably record standalone write uncertainty for "),
-                "{text}"
-            );
-            assert!(
-                text.ends_with("; motion is fenced and recovery is required"),
+                !text.contains("cannot durably record standalone write uncertainty"),
                 "{text}"
             );
             assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 0);
             assert!(index.get_tape_by_voltag("HOMEL9").unwrap().is_none());
             drop(index);
-            let first = refusal_ids(1);
+            let config_path = root.path().join("state/rem/config.toml");
+            let records = ruling24_library_records(&config_path);
+            assert!(!records
+                .iter()
+                .filter_map(|r| r.diagnostic())
+                .any(|d| d.event == DiagnosticEvent::RefusalRecorded));
+            let holds = {
+                let state =
+                    remanence_state::StateHandle::open_from_config_file(&config_path).unwrap();
+                assert!(!state.library_runtime().motion_fenced());
+                state.library_runtime().standalone_drive_holds().unwrap()
+            };
+            assert_eq!(holds.len(), 1);
+            assert_eq!(holds[0].drive_serial, "HOME-DRIVE");
+            assert_eq!(
+                holds[0].cause,
+                remanence_state::library_log::FenceCause::TransferError
+            );
             let (code, output) = run(&init);
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
             let text = output["error"].as_str().expect("the error is a string");
             assert!(
-                text.starts_with("cannot durably record standalone write uncertainty for "),
+                text.starts_with(&format!(
+                    "DriveFenced: drive HOME-DRIVE library:{}",
+                    holds[0].fence
+                )),
                 "{text}"
             );
-            assert!(
-                text.ends_with("; motion is fenced and recovery is required"),
-                "{text}"
+            let records = ruling24_library_records(&config_path);
+            let refusals: Vec<_> = records
+                .iter()
+                .filter_map(|r| r.diagnostic())
+                .filter(|d| d.event == DiagnosticEvent::RefusalRecorded)
+                .collect();
+            assert_eq!(refusals.len(), 1);
+            let refusal = refusals[0];
+            assert_eq!(refusal.subject_kind.as_str(), "tape");
+            assert!(refusal.subject_id.is_none());
+            assert_eq!(
+                refusal
+                    .detail
+                    .0
+                    .iter()
+                    .map(|e| (e.0.as_str(), e.1.clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("code", DiagnosticValue::Unsigned(12)),
+                    ("name", DiagnosticValue::Text("DriveFenced".into())),
+                ]
             );
-            let retried = refusal_ids(2);
-            assert_eq!(retried[0], first[0]);
-            assert_ne!(retried[0], retried[1]);
             let index = remanence_state::projector::open(&config.index.sqlite_path)
                 .map(|catalog| catalog.write_handle())
                 .unwrap();
@@ -1170,6 +1163,7 @@ fn skipped_disk_is_informational_without_any_tape_endpoints() {
 /// Persistent virtual media with fresh production dispatch and state locks per invocation.
 struct VersionFixture {
     interrupt_finalize: bool,
+    fail_writes: bool,
     home_default: bool,
     terminal_input: bool,
     fail_after_path: std::sync::Mutex<Option<String>>,
@@ -1184,6 +1178,7 @@ impl VersionFixture {
     fn with_parity(parity: bool) -> Self {
         let fixture = Self {
             interrupt_finalize: false,
+            fail_writes: false,
             home_default: false,
             terminal_input: false,
             fail_after_path: std::sync::Mutex::new(None),
@@ -1348,7 +1343,7 @@ impl VersionFixture {
                             remanence_chaos::model::DeviceRole::Drive { bay: 0x100 },
                         ),
                         config: self.config(),
-                        fail_writes: false,
+                        fail_writes: self.fail_writes,
                         check_all_writes: !extra.starts_with(&["tape", "finalize"]),
                         writes_observed: 0,
                         world: self.world.clone(),
@@ -2458,45 +2453,153 @@ fn standalone_drive_hold_release_frees_the_drive() {
     assert!(out.contains(&tape_id), "{out}");
 }
 
-/// D-L2-CLI-1-1: endpoint release waits for ruling 29; its audit read moves
-/// to the typed FenceReleased when that ruling lands.
+/// A failed first parity bootstrap fences its tape once and holds the drive across cartridges.
 #[test]
-#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1, D-L2-CLI-1-1"]
 fn standalone_endpoint_fence_releases_by_ack_with_audit() {
-    let f = VersionFixture::new();
+    use remanence_state::library_log as lib;
+    let mut f = VersionFixture::new();
+    f.new_tape("SECOND");
+    f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
+    f.ok(&["pool", "new", "offsite"]);
+    f.world
+        .lock()
+        .unwrap()
+        .drive_bays
+        .insert(0x100, Some("FIRST".into()));
     let source = f.root.path().join("rescue.txt");
     std::fs::write(&source, b"rescue bytes").unwrap();
-    f.ok(&["put", source.to_str().unwrap()]);
-    let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
-    let fence = f
+    f.fail_writes = true;
+    let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    let fences = f.index().list_active_tape_io_fences().unwrap();
+    assert_eq!(
+        fences.len(),
+        1,
+        "fresh parity bootstrap must leave exactly one tape fence"
+    );
+    assert_eq!(fences[0].barcode.as_deref(), Some("FIRST"));
+    assert_eq!(fences[0].reason, "transfer_error");
+    let listed = f.ok(&[
+        "tape",
+        "quarantine",
+        "list",
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
+    ]);
+    let holds = listed["standalone_holds"].as_array().unwrap();
+    assert_eq!(
+        holds.len(),
+        1,
+        "failed standalone put must list one drive hold"
+    );
+    let hold = &holds[0];
+    assert_eq!(hold["drive_serial"], "HOME-DRIVE");
+    assert_eq!(hold["cause"], "TransferError");
+    assert_eq!(hold["detail"]["barcode"], "FIRST");
+    assert_eq!(hold["state"], "active");
+    let id = hold["quarantine_id"].as_str().unwrap();
+    let sequence: u64 = id.strip_prefix("library:").unwrap().parse().unwrap();
+
+    f.world
+        .lock()
+        .unwrap()
+        .drive_bays
+        .insert(0x100, Some("SECOND".into()));
+    f.fail_writes = false;
+    let before = f.writes();
+    let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert_eq!(f.writes(), before);
+    let prefix = format!("DriveFenced: drive HOME-DRIVE {id} TransferError");
+    let advice = format!("{prefix}; release the hold with `rem tape quarantine release {id} --device PATH --allow-device HOME-DRIVE --ack TEXT`");
+    assert!(
+        format!("{out}\n{errors}").contains(&advice),
+        "{out}\n{errors}"
+    );
+    let pool = f
         .index()
-        .record_tape_io_fence_at_endpoint(
-            remanence_state::TapeIoFenceInput {
-                tape_uuid: tape.tape_uuid.try_into().unwrap(),
-                barcode: Some("FIRST".into()),
-                reason: "standalone_test".into(),
-                evidence_json: None,
-            },
-            Some(&remanence_library::DriveKey::Standalone {
-                drive_serial: "HOME-DRIVE".into(),
-            }),
-        )
-        .unwrap();
-    f.ok(&[
+        .get_tape_by_voltag("SECOND")
+        .unwrap()
+        .unwrap()
+        .pool_id;
+    let (code, out, errors) = f.run(&["tape", "assign-pool", "--pool", "offsite"], true);
+    assert_ne!(
+        code,
+        ExitCode::SUCCESS,
+        "held drive must refuse assign-pool: {out}\n{errors}"
+    );
+    assert!(
+        format!("{out}\n{errors}").contains(&advice),
+        "{out}\n{errors}"
+    );
+    assert_eq!(
+        f.index()
+            .get_tape_by_voltag("SECOND")
+            .unwrap()
+            .unwrap()
+            .pool_id,
+        pool
+    );
+    assert_eq!(f.writes(), before);
+    f.ok(&["tape", "identify"]);
+
+    let commands = f.world.lock().unwrap().command_log.len();
+    let released = f.ok(&[
         "tape",
         "quarantine",
         "release",
-        &fence.quarantine_id,
+        id,
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
         "--ack",
-        "recovered",
+        "drive checked",
     ]);
-    assert!(f.index().list_active_tape_io_fences().unwrap().is_empty());
-    let cfg = remanence_state::load_config(f.config()).unwrap();
-    let audit = remanence_state::FileAuditLog::replay(cfg.audit.dir).unwrap();
-    assert!(audit.iter().any(
-        |r| r.event == remanence_state::AuditEvent::TapeIoFenceReleased
-            && r.subject.id.as_deref() == Some(&fence.quarantine_id)
-    ));
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["active_fences"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        released["active_fences"][0]["quarantine_id"],
+        fences[0].quarantine_id
+    );
+    assert_eq!(
+        f.world.lock().unwrap().command_log.len(),
+        commands,
+        "acknowledgement opens no device"
+    );
+    f.ok(&["put", source.to_str().unwrap()]);
+    assert!(f.writes() > before);
+    assert_eq!(f.index().list_active_tape_io_fences().unwrap(), fences);
+    let records = ruling24_library_records(&f.config());
+    let releases: Vec<_> = records
+        .iter()
+        .filter(|r| r.tag() == lib::Tag::FenceReleased)
+        .collect();
+    assert_eq!(releases.len(), 1);
+    // Inspect canonical body fields as ruling24_reprovision_predecessor does.
+    let (bytes, _) = lib::codec::encode(1, [0; 32], releases[0]).unwrap();
+    let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let start = remanence_state::log_frame::PREFIX_LEN;
+    let value: ciborium::Value = ciborium::from_reader(&bytes[start..start + size]).unwrap();
+    let field = |value: &ciborium::Value, key: u64| {
+        let ciborium::Value::Map(map) = value else {
+            panic!("canonical map")
+        };
+        map.iter()
+            .find(|(k, _)| *k == ciborium::Value::Integer(key.into()))
+            .unwrap()
+            .1
+            .clone()
+    };
+    let body = field(&value, 1);
+    assert_eq!(field(&body, 0), ciborium::Value::Integer(sequence.into()));
+    assert_eq!(
+        field(&body, 1),
+        ciborium::Value::Text("drive checked".into())
+    );
+    assert_eq!(field(&body, 2), ciborium::Value::Bool(false));
 }
 
 /// The child runs production confirmation on a real terminal, with model media.
@@ -5492,8 +5595,8 @@ fn ruling24_standalone_init_crash_requires_unknown_identity_confirmation() {
         .all(|r| r.tag() != remanence_state::library_log::Tag::Reprovision));
 }
 
-/// A transport fault after the Bootstrap delimiter publishes no identity;
-/// a new invocation must name that unknown BOT before replacing it.
+/// A transport fault after the Bootstrap delimiter holds the drive without publishing identity;
+/// after acknowledgement, a new invocation must name that unknown BOT before replacing it.
 #[test]
 fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
     use remanence_state::library_log::{ProvisionMode, Tag};
@@ -5502,18 +5605,15 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
     let config = root.path().join("state/rem/config.toml");
     let (code, out, errors) = ruling24_run_init(root.path(), &world, None, true, &[]);
     assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+    assert!(
+        !format!("{out} {errors}").contains("cannot durably record standalone write uncertainty")
+    );
     ruling24_assert_no_init_session(&config);
     let records = ruling24_library_records(&config);
-    // Home-mode configuration predates the attempted media write. The failed init adds no
-    // provisioning, session or fence record. Its one other record counts the refusal to record the
-    // write's uncertainty (`StandaloneFenceUnrecorded`, code 5).
-    let (counted, others): (Vec<_>, Vec<_>) = records
-        .iter()
-        .partition(|record| record.diagnostic().is_some());
-    assert!(others
-        .iter()
-        .all(|record| record.tag() == Tag::ConfigurationAccepted));
-    assert_eq!(counted.len(), 1, "{counted:?}");
+    // Configuration precedes the failed write; its only new source is the drive hold.
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].tag(), Tag::ConfigurationAccepted);
+    assert_eq!(records[1].tag(), Tag::FenceRaised);
     let (unknown, before) = {
         let w = world.lock().unwrap();
         let tape = &w.tapes["FIRST"];
@@ -5531,37 +5631,60 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
             tape.records.clone(),
         )
     };
-    let refusal = counted[0].diagnostic().unwrap();
-    assert_eq!(
-        refusal.event,
-        remanence_state::library_log::DiagnosticEvent::RefusalRecorded
-    );
-    assert_eq!(refusal.subject_kind.as_str(), "tape");
-    assert_eq!(
-        refusal.subject_id.as_ref().map(|id| id.as_str().to_owned()),
-        Some(uuid::Uuid::from_bytes(unknown).to_string()),
-        "the refusal names the tape whose write was uncertain"
-    );
-    assert_eq!(
-        refusal
+    let holds = {
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert!(state
+            .catalog()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty());
+        state.library_runtime().standalone_drive_holds().unwrap()
+    };
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, "HOME-DRIVE");
+    let evidence: serde_json::Value = serde_json::from_str(
+        &holds[0]
             .detail
-            .0
             .iter()
-            .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
-            .collect::<Vec<_>>(),
-        [
-            (
-                "code".to_owned(),
-                remanence_state::library_log::DiagnosticValue::Unsigned(5)
-            ),
-            (
-                "name".to_owned(),
-                remanence_state::library_log::DiagnosticValue::Text(
-                    "StandaloneFenceUnrecorded".into()
-                )
-            ),
-        ]
+            .find(|(k, _)| k == "evidence_json")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(
+        evidence["tape_uuid"],
+        uuid::Uuid::from_bytes(unknown).to_string()
     );
+    world.lock().unwrap().command_log.clear();
+    let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
+    assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+    assert!(
+        format!("{out} {errors}").contains(&format!(
+            "DriveFenced: drive HOME-DRIVE library:{}",
+            holds[0].fence
+        )),
+        "{out} {errors}"
+    );
+    assert_eq!(world.lock().unwrap().tapes["FIRST"].records, before);
+    assert!(world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19 | 0x16)));
+    {
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert!(state
+            .library_runtime()
+            .release_standalone_drive_hold(
+                &format!("library:{}", holds[0].fence),
+                "drive checked",
+                remanence_state::AuditActor::local_user(),
+            )
+            .unwrap()
+            .is_some());
+    }
+    let records = ruling24_library_records(&config);
     world.lock().unwrap().command_log.clear();
     let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
     assert_ne!(code, ExitCode::SUCCESS, "{out}");

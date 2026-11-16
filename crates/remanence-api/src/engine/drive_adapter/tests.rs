@@ -2521,11 +2521,11 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
     assert!(fixture.commands.lock().unwrap().is_empty());
 }
 
-/// The closed fence schema cannot preserve the original coupled tape/endpoint
-/// uncertainty and error text. Refuse without inventing a different source.
+/// A standalone uncertainty records one typed drive hold without a legacy append, tape fence or latch.
 #[test]
 fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
-    let (fixture, mut state) = Fixture::initialized(false);
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::initialized(false);
     let source_bytes = || {
         let mut files: Vec<_> = std::fs::read_dir(&fixture.config.audit.dir)
             .unwrap()
@@ -2541,8 +2541,11 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
     let before = source_bytes();
     let paths = state.paths().clone();
     let library_uuid = state.library_runtime().manifest().library_uuid();
-    let counted = crate::tests::refusal_tests::mark(&fixture.config.index.sqlite_path);
-    let error = crate::mount_support::raise_standalone_fence(
+    let config = state.config().clone();
+    drop(state);
+    let before_records = crate::tests::refusal_tests::read_log(&paths, library_uuid).len();
+    let mut state = remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
+    crate::mount_support::raise_standalone_fence(
         &mut state,
         UUID,
         Some(&remanence_library::DriveKey::Standalone {
@@ -2551,12 +2554,37 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
         "standalone_write_lost_by_restart",
         "unfinished durable write session requires recovery",
     )
-    .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("cannot durably record standalone write uncertainty"));
-    assert!(state.library_runtime().motion_fenced());
-    // The library log only grew, by the one record that counts the refusal.
+    .unwrap();
+    let runtime = state.library_runtime();
+    assert!(!runtime.motion_fenced());
+    let holds = runtime.standalone_drive_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, SERIAL);
+    assert_eq!(
+        holds[0].cause,
+        remanence_state::library_log::FenceCause::StandaloneWriteLostByRestart
+    );
+    let raised = runtime.active_fence(holds[0].fence).unwrap();
+    assert_eq!(raised.kind, lib::FenceKind::DriveFault);
+    assert_eq!(
+        raised.scope,
+        lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+            drive_serial: SERIAL.into(),
+        }))
+    );
+    assert_eq!(raised.cause, holds[0].cause);
+    let evidence = serde_json::json!({
+        "error": "unfinished durable write session requires recovery",
+        "tape_uuid": uuid::Uuid::from_bytes(UUID),
+    })
+    .to_string();
+    assert_eq!(
+        raised.detail,
+        crate::append_admission::tape_fence_detail(None, Some(&evidence))
+    );
+    assert_eq!(holds[0].detail, vec![("evidence_json".into(), evidence)]);
+    drop(runtime);
+    // The library log grows by the independent typed hold.
     let after = source_bytes();
     assert_eq!(after.len(), before.len());
     assert!(
@@ -2566,7 +2594,6 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
             .all(|(now, was)| now.starts_with(was)),
         "the library log is append-only"
     );
-    crate::tests::refusal_tests::assert_grew_by(&fixture.config.index.sqlite_path, &counted, 1);
     assert!(state
         .catalog()
         .list_active_tape_io_fences()
@@ -2575,15 +2602,29 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
     assert!(fixture.commands.lock().unwrap().is_empty());
     drop(state);
     let log = crate::tests::refusal_tests::read_log(&paths, library_uuid);
+    assert_eq!(log.len(), before_records + 1);
     assert_eq!(
-        crate::tests::refusal_tests::refusals(&log),
-        [crate::tests::refusal_tests::RecordedRefusal::expect(
-            5,
-            "StandaloneFenceUnrecorded",
-            "tape",
-            Some(UUID),
-            remanence_state::AuditActor::local_user(),
-        )]
+        log.last().unwrap().0,
+        remanence_state::library_log::Tag::FenceRaised
+    );
+    assert!(crate::tests::refusal_tests::refusals(&log).is_empty());
+    // Replay the exact new record, following typed_fence_release_rpc's public reader.
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+        records.push((applied.sequence(), applied.record().tag()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(records.len(), before_records + 1);
+    // This is the exact sequence whose authoritative body was checked above.
+    assert_eq!(
+        records[before_records],
+        (holds[0].fence, lib::Tag::FenceRaised)
     );
 }
 

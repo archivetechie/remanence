@@ -3,6 +3,12 @@
 use super::{lib, LibraryRuntime, RefusalSubject, RuntimeError};
 use std::sync::atomic::Ordering;
 
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    /// Fail one hold publication on this thread without the store-failure latch.
+    static FAIL_NEXT_STANDALONE_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// An active standalone drive hold, rendered from its authoritative raise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandaloneDriveHold {
@@ -154,6 +160,67 @@ impl LibraryRuntime {
         Ok(Some(hold))
     }
 
+    /// Hold a standalone drive after write uncertainty, independently of its tape fence.
+    /// The fold decides whether publication succeeded, including after an append error.
+    pub fn raise_standalone_drive_hold(
+        &self,
+        endpoint: &crate::DriveKey,
+        tape: lib::Id,
+        cause: lib::FenceCause,
+        detail: lib::Bounded<lib::DiagnosticEntry, 256>,
+    ) -> Result<(), RuntimeError> {
+        if !matches!(endpoint, crate::DriveKey::Standalone { .. }) {
+            return Ok(());
+        }
+        let endpoint = super::motion::endpoint(endpoint);
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.0.authority.active_drive_fences(&endpoint).is_empty() {
+            return Ok(());
+        }
+        let result = self.append_locked(|authority, view| {
+            #[cfg(any(test, feature = "fixtures"))]
+            if FAIL_NEXT_STANDALONE_HOLD.with(|fail| fail.replace(false)) {
+                return Err(super::AuthorityError::Store(super::StoreError::Fold(
+                    lib::FoldError::InvalidSchema,
+                )));
+            }
+            authority.fence_raised(
+                lib::FenceRaised {
+                    detail,
+                    kind: lib::FenceKind::DriveFault,
+                    scope: lib::FenceScope::Drive(endpoint.clone()),
+                    cause,
+                    evidence: None,
+                    at: None,
+                    operation: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer5,
+                view,
+            )
+        });
+        if let Err(error) = result {
+            if !self.0.authority.active_drive_fences(&endpoint).is_empty() {
+                tracing::warn!(%error, ?endpoint, "standalone drive hold recorded despite append error");
+                return Ok(());
+            }
+            self.fence_motion_after_evidence_failure();
+            self.record_refusal_locked(
+                lib::RefusalCode::StandaloneFenceUnrecorded,
+                RefusalSubject::Tape(Some(tape)),
+                lib::AuditActor::local_user(),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Fail the next standalone hold append on this thread; an already held drive does not consume it.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn fail_next_standalone_hold_for_test(&self) {
+        FAIL_NEXT_STANDALONE_HOLD.with(|fail| fail.set(true));
+    }
+
     /// Admit data work in the same dispatch order as fence publication.
     pub fn admit_drive_data(
         &self,
@@ -214,6 +281,130 @@ mod tests {
         let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
         let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
         (root, paths, lease, runtime)
+    }
+
+    /// One drive hold retains the first cause and detail; bays and repeated raises add nothing.
+    #[test]
+    fn standalone_hold_records_once_with_typed_scope() {
+        let (_root, _paths, _lease, runtime) = hold_fixture();
+        let endpoint = crate::DriveKey::Standalone {
+            drive_serial: "HOLD-A".into(),
+        };
+        let detail = lib::Bounded(vec![lib::DiagnosticEntry(
+            "evidence_json".into(),
+            lib::DiagnosticValue::Text("E".into()),
+        )]);
+        let before = runtime.test_source_records().len();
+        runtime
+            .raise_standalone_drive_hold(
+                &endpoint,
+                [0x42; 16],
+                lib::FenceCause::TransferError,
+                detail.clone(),
+            )
+            .unwrap();
+        let records = runtime.test_source_records();
+        assert_eq!(records.len(), before + 1);
+        let record = records.last().unwrap();
+        let lib::BodyView::FenceRaised(raised) = record.body_view() else {
+            panic!("expected FenceRaised")
+        };
+        assert_eq!(
+            runtime.active_fence(runtime.standalone_drive_holds().unwrap()[0].fence),
+            Some(raised.clone())
+        );
+        assert_eq!(raised.kind, lib::FenceKind::DriveFault);
+        assert_eq!(
+            raised.scope,
+            lib::FenceScope::Drive(super::super::motion::endpoint(&endpoint))
+        );
+        assert_eq!(raised.cause, lib::FenceCause::TransferError);
+        assert_eq!(raised.detail, detail);
+        assert_eq!(raised.evidence, None);
+        assert_eq!(raised.at, None);
+        assert_eq!(raised.operation, None);
+        assert_eq!(record.envelope.actor, lib::AuditActor::System);
+        assert_eq!(record.envelope.source_layer, lib::SourceLayer::Layer5);
+        assert_eq!(
+            runtime.drive_fenced(&endpoint).unwrap(),
+            DriveFenced {
+                endpoint: super::super::motion::endpoint(&endpoint),
+                fence: runtime.standalone_drive_holds().unwrap()[0].fence,
+                cause: lib::FenceCause::TransferError,
+            }
+        );
+        runtime
+            .raise_standalone_drive_hold(
+                &endpoint,
+                [0x42; 16],
+                lib::FenceCause::PartialBatch,
+                lib::Bounded(vec![]),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.test_source_records().len(),
+            before + 1,
+            "second call must retain the existing hold"
+        );
+        runtime
+            .raise_standalone_drive_hold(
+                &crate::DriveKey::new("LIB", 1),
+                [0x42; 16],
+                lib::FenceCause::PartialBatch,
+                lib::Bounded(vec![]),
+            )
+            .unwrap();
+        assert_eq!(runtime.test_source_records().len(), before + 1);
+        assert!(!runtime.motion_fenced());
+    }
+
+    /// A missing hold latches and counts once; the one-shot seam permits the next publication.
+    #[test]
+    fn standalone_hold_failure_latches_and_counts_once() {
+        let (_root, _paths, _lease, runtime) = hold_fixture();
+        let endpoint = crate::DriveKey::Standalone {
+            drive_serial: "HOLD-B".into(),
+        };
+        let tape = [0x42; 16];
+        let before = runtime.test_source_records().len();
+        runtime.fail_next_standalone_hold_for_test();
+        runtime
+            .raise_standalone_drive_hold(
+                &endpoint,
+                tape,
+                lib::FenceCause::TransferError,
+                lib::Bounded(vec![]),
+            )
+            .unwrap_err();
+        assert!(runtime.motion_fenced(), "unrecorded hold must latch motion");
+        assert!(runtime.drive_fenced(&endpoint).is_none());
+        let records = runtime.test_source_records();
+        assert_eq!(records.len(), before + 1);
+        assert!(matches!(
+            records.last().unwrap().body_view(),
+            lib::BodyView::Diagnostic(_)
+        ));
+        assert_eq!(
+            super::super::refusal_tests::refusals(&runtime),
+            vec![(
+                5,
+                "StandaloneFenceUnrecorded".into(),
+                "tape".into(),
+                Some(uuid::Uuid::from_bytes(tape).to_string()),
+                lib::AuditActor::local_user(),
+                lib::SourceLayer::Layer5,
+            )]
+        );
+        runtime
+            .raise_standalone_drive_hold(
+                &endpoint,
+                tape,
+                lib::FenceCause::TransferError,
+                lib::Bounded(vec![]),
+            )
+            .unwrap();
+        assert_eq!(runtime.test_source_records().len(), before + 2);
+        assert!(runtime.drive_fenced(&endpoint).is_some());
     }
 
     /// Seed the same typed raise that a drive producer publishes.

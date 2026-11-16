@@ -30,7 +30,14 @@ These additions extend `proto/layer5.proto` without changing existing field tags
 `INVALID_ARGUMENT` and `acknowledgment must not be empty`. Release requires a
 `library:` tape-fence id. An id without a typed source identity is refused with
 `FAILED_PRECONDITION` and `fence has no typed library source identity`; a
-drive-scoped source is refused with `fence is not tape-scoped`. For a typed tape
+bay-scoped drive fence is refused with `fence is not tape-scoped`. A standalone
+drive hold is refused with `FAILED_PRECONDITION` and:
+
+```text
+fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT` as a standalone command
+```
+
+The hold refusal appends no release record. For a typed tape
 id with no record, the RPC returns `NOT_FOUND`. A released id returns its
 original record unchanged.
 
