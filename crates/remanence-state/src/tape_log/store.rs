@@ -386,6 +386,7 @@ impl Store {
             observation: Arc::new(RwLock::new(Ok(snapshot.summary.clone()))),
             fold,
             plan_base: snapshot.plan_base,
+            position_index: snapshot.position_index,
             tail: snapshot.tail,
             fenced: false,
             repair_pending,
@@ -663,6 +664,7 @@ pub struct Lease {
     fold: Fold,
     observation: Arc<RwLock<Result<TapeSummary, String>>>,
     plan_base: super::snapshot::PlanBase,
+    position_index: super::snapshot::PositionIndex,
     tail: Tail,
     fenced: bool,
     repair_pending: bool,
@@ -825,6 +827,7 @@ impl Lease {
             self.summary().clone(),
             self.tail,
             self.plan_base.clone(),
+            self.position_index.clone(),
         ))
     }
     /// Create a bounded disk spool at this lease's next sequence and offset.
@@ -896,6 +899,7 @@ impl Lease {
         if self.tail != Tail::Complete {
             self.fenced = true;
             replace_prefix(&self.store, self.summary().closed_end)?;
+            self.position_index = Default::default();
             tracing::warn!(path = %self.store.path.display(), tail = ?self.tail, "replaced torn tape-log suffix");
             self.tail = Tail::Complete;
             self.fenced = false;
@@ -939,6 +943,7 @@ impl Lease {
                     // If rollback itself fails, retain the live owner's guard;
                     // that is a separate cleanup failure, not an ambiguous commit.
                     replace_prefix(&self.store, self.summary().closed_end)?;
+                    self.position_index = Default::default();
                 }
                 self.fenced = false;
                 return Err(StoreError::Io(error));
@@ -1010,6 +1015,7 @@ impl Lease {
             File::open(&self.store.directory)?.sync_all()?;
         } else {
             replace_prefix(&self.store, self.summary().closed_end)?;
+            self.position_index = Default::default();
         }
         self.fenced = false;
         Ok(())
@@ -1159,8 +1165,35 @@ impl Staged<'_> {
             self.group.sequence,
             self.group.offset,
         );
+        // Copy the last bookmark under the leaf lock, then release it before
+        // reading the newly durable frames. An empty map starts at the header,
+        // whose encoded length may have changed before first publication.
+        let previous = self
+            .lease
+            .position_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_key_value()
+            .map(|(_, &offset)| offset);
+        let mut previous = match previous {
+            Some(offset) => offset,
+            None => self
+                .lease
+                .store
+                .header
+                .bytes()
+                .map_err(|e| StoreError::AfterDurable(Box::new(e)))?
+                .len() as u64,
+        };
+        let mut positions = std::collections::BTreeMap::new();
         let folded = (|| -> Result<(), CodecError> {
             while let Some(frame) = decoder.next_frame()? {
+                super::snapshot::seed_position(
+                    &mut positions,
+                    &mut previous,
+                    frame.sequence,
+                    frame.offset,
+                );
                 match &frame.record {
                     Record::FinalizationPrepared(plan) | Record::FinalizationDecided(plan) => {
                         self.lease.plan_base = Some((
@@ -1176,6 +1209,11 @@ impl Staged<'_> {
             Ok(())
         })();
         folded.map_err(|error| StoreError::AfterDurable(Box::new(StoreError::Codec(error))))?;
+        self.lease
+            .position_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(positions);
         self.lease.fenced = false;
         *self
             .lease

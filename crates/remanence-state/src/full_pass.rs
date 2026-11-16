@@ -189,7 +189,7 @@ mod tests {
                     .unwrap();
             },
         );
-        delta(TapeFirstFrame, 1, "record_evidence", || {
+        delta(TapeFirstFrame, 0, "record_evidence", || {
             assert!(snapshot.record_evidence(1).unwrap().is_some());
         });
         delta(

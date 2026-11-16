@@ -34,10 +34,41 @@ pub(crate) enum AuthoritativeChange {
 #[derive(Clone)]
 pub struct NativeTapeView {
     tapes: BTreeMap<Id, Snapshot>,
+    mutations: u64,
+    // Two ordered views of the latest change per tape, including removals.
+    // Repeated refreshes replace the old entry rather than retain history.
+    changed: BTreeMap<Id, u64>,
+    changes: BTreeMap<u64, Id>,
     dropped: Vec<DroppedTapeLog>,
     replaced: BTreeMap<Id, std::collections::BTreeSet<(u64, u64)>>,
 }
 impl NativeTapeView {
+    /// Number of tape entries inserted, replaced or removed since the probe.
+    /// Probing establishes the initial view without counting a mutation.
+    pub fn mutations(&self) -> u64 {
+        self.mutations
+    }
+
+    /// Tapes changed after this count, once each, including removed tapes.
+    /// Reads only memory and visits only the changes after the ordered seek;
+    /// it never clones snapshots or scans unchanged tape entries.
+    pub fn changed_since(&self, mutations: u64) -> Vec<Id> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.changes
+            .range((Excluded(mutations), Unbounded))
+            .map(|(_, &tape)| tape)
+            .collect()
+    }
+
+    /// Retain just the latest mutation for each tape in both lookup orders.
+    fn changed_tape(&mut self, tape: Id) {
+        self.mutations += 1;
+        if let Some(previous) = self.changed.insert(tape, self.mutations) {
+            self.changes.remove(&previous);
+        }
+        self.changes.insert(self.mutations, tape);
+    }
+
     /// Replace evidence under the current exclusive native owner. Unlike an
     /// ordinary append refresh, this can represent a proved absent/repaired log.
     pub(crate) fn replace_authoritative(
@@ -86,8 +117,9 @@ impl NativeTapeView {
         };
         if has_header {
             self.tapes.insert(uuid, snapshot);
-        } else {
-            self.tapes.remove(&uuid);
+            self.changed_tape(uuid);
+        } else if self.tapes.remove(&uuid).is_some() {
+            self.changed_tape(uuid);
         }
         Ok(change)
     }
@@ -171,6 +203,9 @@ impl NativeTapeView {
             tapes,
             dropped,
             replaced: BTreeMap::new(),
+            mutations: 0,
+            changed: BTreeMap::new(),
+            changes: BTreeMap::new(),
         })
     }
 
@@ -223,7 +258,9 @@ impl NativeTapeView {
         {
             return Ok(());
         }
-        self.tapes.insert(snapshot.header().tape_uuid, snapshot);
+        let tape = snapshot.header().tape_uuid;
+        self.tapes.insert(tape, snapshot);
+        self.changed_tape(tape);
         Ok(())
     }
 
@@ -243,6 +280,7 @@ impl NativeTapeView {
             if let std::collections::btree_map::Entry::Vacant(entry) = self.tapes.entry(id) {
                 let snapshot = Store::open(directory, id, index_path)?.snapshot()?;
                 entry.insert(snapshot);
+                self.changed_tape(id);
             }
         }
         Ok(())
@@ -385,6 +423,9 @@ mod replacement_report_tests {
             tapes: BTreeMap::new(),
             dropped: Vec::new(),
             replaced: BTreeMap::new(),
+            mutations: 0,
+            changed: BTreeMap::new(),
+            changes: BTreeMap::new(),
         };
         assert_eq!(
             view.replace_authoritative(absent.clone()).unwrap(),

@@ -8,19 +8,71 @@ use super::{
     *,
 };
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::FileExt,
-    sync::Arc,
+    os::unix::fs::{FileExt, MetadataExt},
+    sync::{Arc, Mutex},
 };
 
 pub(super) type PlanBase = Option<(u64, Arc<TapeSummary>)>;
-type ValidatedPrefix = (TapeSummary, Tail, ReplayMetrics, PlanBase);
+type ValidatedPrefix = (
+    TapeSummary,
+    Tail,
+    ReplayMetrics,
+    PlanBase,
+    BTreeMap<u64, u64>,
+);
+
+const POSITION_INDEX_INTERVAL: u64 = 1024 * 1024;
+
+#[cfg(any(test, feature = "fixtures"))]
+static POSITION_INDEX_INTERVAL_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(POSITION_INDEX_INTERVAL);
+
+/// Set the process-wide bookmark interval for an isolated fixture. Call before
+/// constructing any snapshots; production builds always use one MiB.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn set_position_index_interval(bytes: u64) {
+    assert!(bytes > 0, "position index interval must be positive");
+    POSITION_INDEX_INTERVAL_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the same interval for bookmark spacing and full-pass accounting.
+fn position_index_interval() -> u64 {
+    #[cfg(any(test, feature = "fixtures"))]
+    {
+        POSITION_INDEX_INTERVAL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(any(test, feature = "fixtures")))]
+    {
+        POSITION_INDEX_INTERVAL
+    }
+}
+
+/// Sparse frame boundaries for one pinned file. This is a leaf lock: copy or
+/// insert only, never hold it across I/O or acquisition of another lock.
+pub(super) type PositionIndex = Arc<Mutex<BTreeMap<u64, u64>>>;
+
+/// Keep the first frame at least one interval beyond the previous bookmark.
+/// The log/decode start is the implicit first bookmark, even in an empty map.
+pub(super) fn seed_position(
+    entries: &mut BTreeMap<u64, u64>,
+    previous: &mut u64,
+    sequence: u64,
+    offset: u64,
+) {
+    if offset.saturating_sub(*previous) >= position_index_interval() {
+        entries.insert(sequence, offset);
+        *previous = offset;
+    }
+}
 
 /// Unvalidated capture, deliberately not an authority token.
 #[derive(Clone)]
 pub(super) struct Captured {
     file: Option<Arc<File>>,
+    identity: Option<(u64, u64)>,
     end: u64,
     start: u64,
     header: Header,
@@ -34,9 +86,9 @@ impl Captured {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let end = file
-            .as_ref()
-            .map_or(Ok(0), |f| f.metadata().map(|m| m.len()))?;
+        let metadata = file.as_ref().map(|f| f.metadata()).transpose()?;
+        let end = metadata.as_ref().map_or(0, |m| m.len());
+        let identity = metadata.as_ref().map(|m| (m.dev(), m.ino()));
         let start = if let Some(file) = &file {
             Header::read(
                 &mut PrefixReader {
@@ -55,6 +107,7 @@ impl Captured {
         };
         Ok(Self {
             file,
+            identity,
             end,
             start,
             header: store.header.clone(),
@@ -70,6 +123,8 @@ impl Captured {
             ..ReplayMetrics::default()
         };
         let mut plan_base = None;
+        let mut positions = BTreeMap::new();
+        let mut previous = self.start;
         if let Some(file) = &self.file {
             let mut decoder = Decoder::at(
                 PrefixReader {
@@ -89,6 +144,7 @@ impl Captured {
                         return Err(StoreError::Header);
                     }
                 }
+                seed_position(&mut positions, &mut previous, frame.sequence, frame.offset);
                 metrics.frames += 1;
                 metrics.structural_bytes += frame.structural.len() as u64;
                 metrics.payload_bytes += frame.payload.len() as u64;
@@ -122,9 +178,16 @@ impl Captured {
             let (summary, tail) = fold
                 .finish(decoder.tail())
                 .map_err(CodecError::EncodeSchema)?;
-            Ok((summary, tail, metrics, plan_base))
+            positions.retain(|_, offset| *offset < summary.closed_end);
+            Ok((summary, tail, metrics, plan_base, positions))
         } else {
-            Ok((fold.summary().clone(), Tail::Complete, metrics, None))
+            Ok((
+                fold.summary().clone(),
+                Tail::Complete,
+                metrics,
+                None,
+                positions,
+            ))
         }
     }
     #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
@@ -239,9 +302,17 @@ impl Captured {
     }
     /// The exclusive owner has already fully validated and incrementally folded
     /// these bytes. Reuse that proof without a catalog scan under its lock.
-    pub(super) fn trusted(self, summary: TapeSummary, tail: Tail, plan_base: PlanBase) -> Snapshot {
+    pub(super) fn trusted(
+        self,
+        summary: TapeSummary,
+        tail: Tail,
+        plan_base: PlanBase,
+        position_index: PositionIndex,
+    ) -> Snapshot {
         Snapshot {
             file: self.file,
+            identity: self.identity,
+            position_index,
             first_sequence: 1,
             start: self.start,
             captured_end: self.end,
@@ -259,7 +330,8 @@ impl Captured {
         if self.end > self.start {
             crate::full_pass::count(crate::full_pass::PassKind::TapeValidate);
         }
-        let (summary, tail, metrics, plan_base) = self.fold()?;
+        let (summary, tail, metrics, plan_base, positions) = self.fold()?;
+        let position_index = Arc::new(Mutex::new(positions));
         if self.file.is_some()
             && summary.is_fresh()
             && tail == Tail::Complete
@@ -271,6 +343,8 @@ impl Captured {
         }
         Ok(Snapshot {
             file: self.file,
+            identity: self.identity,
+            position_index,
             first_sequence: 1,
             start: self.start,
             captured_end: self.end,
@@ -316,8 +390,10 @@ pub struct RecordEvidence {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub(super) plan_base: PlanBase,
+    pub(super) position_index: PositionIndex,
     first_sequence: u64,
     file: Option<Arc<File>>,
+    identity: Option<(u64, u64)>,
     start: u64,
     captured_end: u64,
     pub(super) summary: TapeSummary,
@@ -330,15 +406,7 @@ impl Snapshot {
     /// Identity of the pinned native source, used to reject an old inode after
     /// an explicit authority repair atomically replaces the file.
     pub(crate) fn file_identity(&self) -> Result<Option<(u64, u64)>, StoreError> {
-        use std::os::unix::fs::MetadataExt;
-        self.file
-            .as_ref()
-            .map(|file| {
-                file.metadata()
-                    .map(|m| (m.dev(), m.ino()))
-                    .map_err(StoreError::from)
-            })
-            .transpose()
+        Ok(self.identity)
     }
     /// Measurements of the full validation pass performed outside the lock.
     pub fn replay_metrics(&self) -> ReplayMetrics {
@@ -381,6 +449,72 @@ impl Snapshot {
     /// appending a dependent decision; ambiguous leases cannot yield snapshots.
     #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn record_evidence(&self, sequence: u64) -> Result<Option<RecordEvidence>, StoreError> {
+        if sequence == 0 || sequence > self.summary.last_closed_sequence {
+            return Ok(None);
+        }
+        let (first, start) = {
+            let positions = self
+                .position_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            positions
+                .range(..=sequence)
+                .rev()
+                .find(|(_, offset)| **offset >= self.start && **offset < self.summary.closed_end)
+                .map(|(&sequence, &offset)| (sequence, offset))
+                .unwrap_or((self.first_sequence, self.start))
+        };
+        let mut positions = BTreeMap::new();
+        let mut previous = start;
+        let mut answer = Err(StoreError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "native evidence disappeared from a validated snapshot",
+        )));
+        let mut _reached = self.summary.closed_end;
+        if let Some(file) = &self.file {
+            let mut decoder = Decoder::at(
+                PrefixReader {
+                    file: file.clone(),
+                    position: start,
+                    end: self.summary.closed_end,
+                },
+                first,
+                start,
+            );
+            while let Some(frame) = decoder.next_frame()? {
+                seed_position(&mut positions, &mut previous, frame.sequence, frame.offset);
+                if frame.sequence == sequence {
+                    _reached = frame.offset;
+                    answer = Ok(
+                        (!matches!(frame.record, Record::PayloadContinuation(_))).then(|| {
+                            RecordEvidence {
+                                kind: frame.record.tag(),
+                                digest: super::codec::record_digest(&frame),
+                            }
+                        }),
+                    );
+                    break;
+                }
+            }
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        if _reached.saturating_sub(start) >= position_index_interval() {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeFirstFrame);
+        }
+        if answer.is_ok() {
+            self.position_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(positions);
+        }
+        answer
+    }
+    /// Original first-frame lookup retained as an independent differential oracle.
+    #[cfg(test)]
+    pub(super) fn record_evidence_oracle(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<RecordEvidence>, StoreError> {
         if sequence == 0 || sequence > self.summary.last_closed_sequence {
             return Ok(None);
         }
