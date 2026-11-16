@@ -29,6 +29,7 @@ enum PoolRuleEvidence {
 }
 
 /// Keep terminal/recovery exclusions ahead of evidence that would refuse a move.
+/// Any remaining tape log is uncertain, even with no committed objects.
 fn classify_pool_rule_evidence(
     summary: Option<&TapeSummary>,
     dropped: bool,
@@ -45,12 +46,7 @@ fn classify_pool_rule_evidence(
         PoolRuleEvidence::Skip
     } else if summary.is_some_and(|s| s.object_count > 0) {
         PoolRuleEvidence::Written
-    } else if summary.is_some_and(|s| s.open_session.is_some())
-        || dropped
-        || !row_present
-        || copies
-        || session
-    {
+    } else if summary.is_some() || dropped || !row_present || copies || session {
         PoolRuleEvidence::Unknown
     } else {
         PoolRuleEvidence::Blank
@@ -128,6 +124,7 @@ pub fn accept_configuration(
             }
             PoolRuleEvidence::Blank => moves.push((
                 tape.tape,
+                tape.assignment_generation,
                 label.as_str().to_owned(),
                 recorded.map(str::to_owned),
                 derived.map(str::to_owned),
@@ -137,7 +134,7 @@ pub fn accept_configuration(
     }
     if !conflicts.is_empty() {
         return Err(StateError::TapePoolAssignmentConflict(format!(
-            "the barcode pool rules would move tapes that may hold data: {}; restore the rule, or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again",
+            "the barcode pool rules would move tapes that may hold data: {}; restore the rule (and its pool, for \"recorded pool not configured\"), or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again",
             conflicts.join("; "),
         )));
     }
@@ -159,7 +156,7 @@ pub fn accept_configuration(
             .map_err(|e| StateError::ConfigInvalid(e.to_string()))?;
     }
     let mut warnings = Vec::new();
-    for (tape, barcode, from, to, rule) in moves {
+    for (tape, expected, barcode, from, to, rule) in moves {
         let uuid = tape.uuid;
         let authority =
             TapeAuthority::open(paths.journal_dir.join("tapes"), uuid, &paths.sqlite_path)?;
@@ -171,18 +168,14 @@ pub fn accept_configuration(
             || current.finalization.is_some()
             || current.object_count != 0
             || current.open_session.is_some()
+            || current.last_closed_sequence != 0
+            || current.incarnation != 0
         {
             return Err(StateError::TapePoolAssignmentConflict(format!(
                 "tape {} changed before its pool rule move; start again",
                 uuid::Uuid::from_bytes(uuid),
             )));
         }
-        let expected = runtime
-            .tape_state(uuid)
-            .ok_or_else(|| {
-                StateError::TapePoolAssignmentConflict("tape has no Reprovision authority".into())
-            })?
-            .assignment_generation;
         runtime
             .append_identity(&[&owner], |a, v, native| {
                 let (reference, _) =

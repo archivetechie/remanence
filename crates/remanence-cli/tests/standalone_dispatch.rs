@@ -6858,7 +6858,7 @@ pool_id = "camera.copy-a"
     let tape_text = uuid::Uuid::from_bytes(tape).to_string();
     let error = StateHandle::open_from_config_file(&config_path)
         .expect_err("T8(i): normal open must refuse the rule move");
-    assert_eq!(error.to_string(), format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {tape_text} (ACM001L9) recorded camera.copy-a derived camera.copy-b; restore the rule, or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again"));
+    assert_eq!(error.to_string(), format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {tape_text} (ACM001L9) recorded camera.copy-a derived camera.copy-b; restore the rule (and its pool, for \"recorded pool not configured\"), or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again"));
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let code = remanence_cli::run_with_standalone_test_io(

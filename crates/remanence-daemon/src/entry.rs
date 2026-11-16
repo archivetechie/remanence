@@ -1187,7 +1187,7 @@ pool_id = "{rule}"
             .with_library_runtime(library.clone());
         let before = service_library_bytes(&paths);
         assert_eq!(accept_start_configuration(&paths, &library, &config).unwrap_err(), format!(
-            "error: pool rules: tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {} (ACM001L9) recorded camera.copy-a derived camera.copy-b, unpinnable: tape log unreadable; restore the rule, or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again", uuid::Uuid::from_bytes(tape)));
+            "error: pool rules: tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {} (ACM001L9) recorded camera.copy-a derived camera.copy-b, unpinnable: tape log unreadable; restore the rule (and its pool, for \"recorded pool not configured\"), or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again", uuid::Uuid::from_bytes(tape)));
         assert_eq!(service_library_bytes(&paths), before);
         std::fs::write(&config_path, service_pool_config(root.path(), false)).unwrap();
         let restored = remanence_state::load_config(&config_path).unwrap();

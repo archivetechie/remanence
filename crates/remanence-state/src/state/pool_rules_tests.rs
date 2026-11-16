@@ -1,6 +1,6 @@
 //! Classifier cases pin conservative data evidence and terminal exclusions independently.
 use super::*;
-use crate::tape_log::{SessionCursor, SessionDrive, SessionOpened};
+use crate::tape_log::{SessionCursor, SessionDrive, SessionEndReason, SessionEnded, SessionOpened};
 
 #[test]
 fn classification_table() {
@@ -33,6 +33,42 @@ fn classification_table() {
             drive_uuid: None,
         },
     });
+    let mut ended = blank.clone();
+    let opened = open.open_session.as_ref().unwrap();
+    ended.last_session_end = Some(SessionEnded {
+        session_id: opened.session_id,
+        incarnation: opened.incarnation,
+        base_media_sequence: opened.base_media_sequence,
+        cursor: opened.cursor,
+        ended_at_utc: "2026-11-02T00:01:00Z".into(),
+        reason: SessionEndReason::FailedAppend,
+        tail: Default::default(),
+        tail_file_count: 2,
+        crash_ack_audit_sequence: None,
+        synchronized_tail_blocks: 2,
+        possible_tail_blocks: 4,
+        proved_eod: None,
+    });
+    // Reuse a native fixture to obtain the opaque finalization state, then
+    // isolate that evidence from the fixture's committed object count.
+    let dir = tempfile::tempdir().unwrap();
+    let id = [7; 16];
+    let report: crate::authority::AuthorityCommit = (&crate::checkpoint::tests::record(id)).into();
+    let authority = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), id)
+        .commit(report)
+        .plan(crate::checkpoint::tests::finalization_intent(id))
+        .build()
+        .unwrap();
+    let mut finalizing = blank.clone();
+    finalizing.finalization = Some(
+        authority
+            .freeze()
+            .unwrap()
+            .tape_summary()
+            .finalization
+            .clone()
+            .unwrap(),
+    );
     for (name, summary, dropped, row, terminal, recovery, copies, session, expected) in [
         (
             "no log", None, false, true, false, false, false, false, Blank,
@@ -46,7 +82,29 @@ fn classification_table() {
             false,
             false,
             false,
-            Blank,
+            Unknown,
+        ),
+        (
+            "ended session with tail",
+            Some(&ended),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            Unknown,
+        ),
+        (
+            "finalizing",
+            Some(&finalizing),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            Skip,
         ),
         (
             "written",

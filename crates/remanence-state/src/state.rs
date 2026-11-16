@@ -2719,7 +2719,7 @@ pool_id = "camera.copy-a"
 
     /// Match the complete operator-facing refusal, including the recorded-pool remedy.
     fn pool_rule_conflict_text(tape: [u8; 16], barcode: &str, from: &str, to: &str) -> String {
-        format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {} ({barcode}) recorded {from} derived {to}; restore the rule, or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again", Uuid::from_bytes(tape))
+        format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {} ({barcode}) recorded {from} derived {to}; restore the rule (and its pool, for \"recorded pool not configured\"), or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again", Uuid::from_bytes(tape))
     }
 
     /// A restart moves only blank rule-assigned tapes and records the current configuration reference.
@@ -2902,6 +2902,122 @@ pool_id = "camera.copy-a"
             handle.library_runtime().tape_state(id).unwrap().pool_source,
             Some(lib::PoolSource::Operator(lib::Unit))
         );
+    }
+
+    /// An ended first session with an uncommitted tail refuses a rule move
+    /// without appending library records, even though no object was committed.
+    #[test]
+    fn pool_rules_ended_first_session_with_tail_refuses_a_rule_change() {
+        use crate::tape_log::{
+            SessionDrive, SessionEndReason, TailFile, TailFilemark, TailIdentity,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-a"),
+        )
+        .unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let id = [0x65; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "ACM003L9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = handle.paths().clone();
+        let authority =
+            crate::TapeAuthority::open(paths.journal_dir.join("tapes"), id, &paths.sqlite_path)
+                .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                262144,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        owner
+            .open_session(
+                [9; 16],
+                "2026-11-02T00:00:00Z".into(),
+                SessionDrive {
+                    serial: "pool-rules-test".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "pool-rules-test".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
+        owner
+            .end_session(
+                [9; 16],
+                "2026-11-02T00:01:00Z".into(),
+                SessionEndReason::FailedAppend,
+                None,
+                [
+                    Ok(TailFile {
+                        tape_file_number: 1,
+                        identity: TailIdentity::Object("uncommitted-first-object".into()),
+                        known_blocks: 1,
+                        unknown_blocks: 0,
+                        filemark: TailFilemark::Present,
+                        synchronized_blocks: 1,
+                        synchronized_filemark: true,
+                    }),
+                    Ok(TailFile {
+                        tape_file_number: 2,
+                        identity: TailIdentity::Object("failed-second-object".into()),
+                        known_blocks: 0,
+                        unknown_blocks: 2,
+                        filemark: TailFilemark::Absent,
+                        synchronized_blocks: 0,
+                        synchronized_filemark: false,
+                    }),
+                ],
+            )
+            .unwrap();
+        let frozen = owner.freeze().unwrap();
+        let summary = frozen.tape_summary();
+        assert_eq!(summary.object_count, 0);
+        assert!(summary.open_session.is_none());
+        assert_eq!(
+            summary.last_session_end.as_ref().unwrap().tail_file_count,
+            2
+        );
+        handle.index.project_tape_log(&frozen).unwrap();
+        drop(frozen);
+        drop(owner);
+        drop(authority);
+        drop(handle);
+        drop(
+            StateHandle::open_from_config_file(&config_path)
+                .expect("T9 premise: ended session must reopen under unchanged rules"),
+        );
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let before = pool_rule_library_bytes(&paths);
+        let error = StateHandle::open_from_config_file(&config_path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            pool_rule_conflict_text(id, "ACM003L9", "camera.copy-a", "camera.copy-c")
+        );
+        assert_eq!(pool_rule_library_bytes(&paths), before);
     }
 
     /// Catalogue copies refuse a logless move, recovery adoption is skipped, and blank adoption moves.
