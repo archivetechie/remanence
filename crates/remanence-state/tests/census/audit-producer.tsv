@@ -290,7 +290,7 @@ crates/remanence-state/src/library_runtime/motion.rs::failed::audit-append	1
 crates/remanence-state/src/library_runtime/motion.rs::unconfirmed::audit-append	1
 crates/remanence-state/src/library_runtime/restart.rs::append_diagnostic::audit-append	1
 crates/remanence-state/src/library_runtime/restart.rs::start_owned_operation::audit-append	1
-crates/remanence-state/src/state.rs::open_with_config::audit-append	1
+crates/remanence-state/src/state/pool_rules.rs::accept_configuration::audit-append	1
 crates/remanence-state/src/state.rs::provision_replacing_media::audit-append	1
 crates/remanence-state/src/state.rs::recover_library_sessions_after_restart::audit-append	1
 crates/remanence-state/src/state.rs::recover_sessions_after_restart::audit-append	1

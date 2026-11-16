@@ -1173,9 +1173,22 @@ where
     let mut state = if discovery_only {
         None
     } else {
-        let mut state =
-            StateHandle::open_with_config(StatePaths::from_config(&path, &config), config.clone())
-                .map_err(err)?;
+        let pass = if matches!(
+            cli.command,
+            Command::Tape {
+                command: Tape::AssignPool { .. }
+            }
+        ) {
+            remanence_state::ConfigurationPass::ReportOnly
+        } else {
+            remanence_state::ConfigurationPass::Apply
+        };
+        let mut state = StateHandle::open_with_config_pass(
+            StatePaths::from_config(&path, &config),
+            config.clone(),
+            pass,
+        )
+        .map_err(err)?;
         state.replay_audit_projection().map_err(err)?;
         output.active_fences =
             remanence_api::standalone_fence_policy(state.catalog(), None, None, false)

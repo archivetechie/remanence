@@ -650,6 +650,32 @@ impl CatalogCore {
                         &at,
                     )?;
                 }
+                let configured = v
+                    .definitions
+                    .pools
+                    .0
+                    .iter()
+                    .map(|pool| &pool.id.0)
+                    .collect::<HashSet<_>>();
+                let existing = {
+                    let mut statement = self
+                        .conn
+                        .prepare("select pool_id from tape_pools")
+                        .map_err(|e| sqlite_error("read configured tape pools", e))?;
+                    let pools = statement
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .map_err(|e| sqlite_error("query configured tape pools", e))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| sqlite_error("decode configured tape pools", e))?;
+                    pools
+                };
+                for pool_id in existing {
+                    if !configured.contains(&pool_id) {
+                        self.conn
+                            .execute("delete from tape_pools where pool_id = ?1", [&pool_id])
+                            .map_err(|e| sqlite_error("remove unconfigured tape pool", e))?;
+                    }
+                }
             }
             Body::DriveObserved(v) => {
                 let endpoint = v.endpoint.as_ref().map(endpoint);

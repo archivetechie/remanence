@@ -1212,6 +1212,35 @@ impl LibraryRuntime {
     pub fn tape_state(&self, uuid: lib::Id) -> Option<lib::fold::TapeState> {
         self.0.authority.tape_state(uuid)
     }
+    /// Snapshot live data-tape identities and their probed evidence in UUID order.
+    pub(crate) fn pool_rule_tapes(
+        &self,
+    ) -> Vec<(
+        lib::fold::TapeState,
+        Option<crate::tape_log::fold::TapeSummary>,
+        bool,
+    )> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+        let mut summaries = view
+            .snapshots()
+            .map(|snapshot| (snapshot.header().tape_uuid, snapshot.summary().clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let dropped = view
+            .dropped_logs()
+            .iter()
+            .map(|entry| entry.tape)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.0.authority.with_fold(|fold| {
+            fold.tapes
+                .iter()
+                .filter(|(uuid, tape)| {
+                    !tape.retired && !fold.cleaning_cartridges.contains_key(*uuid)
+                })
+                .map(|(uuid, tape)| (tape.clone(), summaries.remove(uuid), dropped.contains(uuid)))
+                .collect()
+        })
+    }
     /// Resolve a shell label from current authenticated fold state, never SQL.
     pub fn tape_for_label(&self, label: &str) -> Result<Option<lib::Id>, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());

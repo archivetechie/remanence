@@ -6796,3 +6796,108 @@ fn k94_t11_no_rebuild_daemon_refuses() {
 fn k94_t11_after_refused_rebuild_daemon_refuses() {
     k94_daemon_refuses(true);
 }
+
+/// T8: the production assign-pool dispatcher can pin a tape while a normal open refuses its rules.
+#[test]
+fn assign_pool_pins_a_tape_while_the_rules_refuse() {
+    use remanence_state::{library_log as lib, StateHandle};
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let toml = format!(
+        r#"[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+[audit]
+dir = "{0}/audit"
+fsync = true
+[index]
+sqlite_path = "{0}/index.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+[[tape_pools]]
+id = "camera.copy-a"
+[[tape_pools]]
+id = "camera.copy-b"
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "camera.copy-a"
+"#,
+        root.path().display()
+    );
+    std::fs::write(&config_path, &toml).unwrap();
+    let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+    let tape = [0x72; 16];
+    state
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: tape,
+            voltag: "ACM001L9".into(),
+            block_size: 262144,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    let paths = state.paths().clone();
+    assert!(!paths
+        .journal_dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(tape).simple()))
+        .exists());
+    drop(state);
+    let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+    conn.execute("insert into object_instances(object_id, tape_uuid, tape_file_number, status) values('seeded-object', ?1, ?2, 'committed')",
+        rusqlite::params![tape.to_vec(), 1u64.to_be_bytes().to_vec()]).unwrap();
+    drop(conn);
+    std::fs::write(
+        &config_path,
+        toml.replace("pool_id = \"camera.copy-a\"", "pool_id = \"camera.copy-b\""),
+    )
+    .unwrap();
+    let tape_text = uuid::Uuid::from_bytes(tape).to_string();
+    let error = StateHandle::open_from_config_file(&config_path)
+        .expect_err("T8(i): normal open must refuse the rule move");
+    assert_eq!(error.to_string(), format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {tape_text} (ACM001L9) recorded camera.copy-a derived camera.copy-b; restore the rule, or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again"));
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let code = remanence_cli::run_with_standalone_test_io(
+        &[
+            "rem",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--allow-untrusted-state-volume",
+            "--json",
+            "tape",
+            "assign-pool",
+            "--tape",
+            &tape_text,
+            "--pool",
+            "camera.copy-a",
+        ],
+        root.path(),
+        &root.path().join("xdg"),
+        &root.path().join("absent-system.toml"),
+        &root.path().join("locks"),
+        vec![],
+        |_: &Path| panic!("assign-pool by UUID must not open a device"),
+        &mut out,
+        &mut errors,
+    );
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "T8(ii): assign-pool must succeed: {}",
+        String::from_utf8_lossy(&errors)
+    );
+    let state = StateHandle::open_from_config_file(&config_path).unwrap();
+    let assigned = state.library_runtime().tape_state(tape).unwrap();
+    assert_eq!(
+        assigned.pool.as_ref().map(|p| p.as_str()),
+        Some("camera.copy-a")
+    );
+    assert_eq!(
+        assigned.pool_source,
+        Some(lib::PoolSource::Operator(lib::Unit))
+    );
+}

@@ -438,3 +438,4 @@ crates/remanence-state/src/state.rs::adoption_assignment_source::text-equality	1
 crates/remanence-state/src/state/initialization.rs::prepare_tape_initialization::text-equality	1
 crates/remanence-state/src/ambiguity_recovery.rs::inventory::text-equality	1
 crates/remanence-state/src/ambiguity_recovery.rs::marker_inventory::text-equality	3
+crates/remanence-state/src/state/pool_rules.rs::accept_configuration::text-equality	1

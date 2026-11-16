@@ -99,10 +99,11 @@ pub use index::{
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;
 pub use state::{
-    BootstrapAdoptionEvidence, BootstrapAdoptionTailEvidence, CatalogResetPathEvidence,
-    CatalogResetPreflightPaths, CatalogResetPreflightReport, CatalogResetPreflightTape,
-    CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState, InitializationGuard,
-    StartupReplayReport, StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
+    accept_configuration, BootstrapAdoptionEvidence, BootstrapAdoptionTailEvidence,
+    CatalogResetPathEvidence, CatalogResetPreflightPaths, CatalogResetPreflightReport,
+    CatalogResetPreflightTape, CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState,
+    ConfigurationPass, InitializationGuard, StartupReplayReport, StateConfigWarning, StateHandle,
+    TapeJournalIngestionOutcome,
 };
 
 pub use authority::{AuthorityCommit, AuthorityFinalization, AuthorityPrefixPlan, ObjectPayload};

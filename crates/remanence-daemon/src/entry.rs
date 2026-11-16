@@ -154,7 +154,7 @@ pub async fn main_entry_with_registry(
         .unwrap_or_else(|| config.daemon.socket_path_or_default());
 
     let index = match remanence_state::projector::open(&config.index.sqlite_path) {
-        Ok(index) => index.with_library_runtime(library),
+        Ok(index) => index.with_library_runtime(library.clone()),
         Err(error) => {
             stderr_message!(
                 "error: open index {}: {error}",
@@ -163,6 +163,19 @@ pub async fn main_entry_with_registry(
             return ExitCode::from(1);
         }
     };
+    if !config.daemon.read_only {
+        match accept_start_configuration(&state_paths, &library, &config) {
+            Ok(lines) => {
+                for line in lines {
+                    stderr_message!("{line}");
+                }
+            }
+            Err(error) => {
+                stderr_message!("{error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
     let state = if config.daemon.read_only {
         match remanence_api::ApiState::new_with_config(index, &config) {
             Ok(state) => state,
@@ -1009,5 +1022,178 @@ mod ambiguity_recovery_tests {
                 assert!(message.contains("library-log.ambiguous"), "{message}");
             }
         }
+    }
+}
+
+/// Accept startup pool rules before constructing API state or admitting tape work.
+fn accept_start_configuration(
+    paths: &remanence_state::StatePaths,
+    library: &remanence_state::library_runtime::LibraryRuntime,
+    config: &remanence_state::RemConfig,
+) -> Result<Vec<String>, String> {
+    remanence_state::accept_configuration(
+        paths,
+        library,
+        config,
+        remanence_state::ConfigurationPass::Apply,
+    )
+    .map(|warnings| {
+        warnings
+            .into_iter()
+            .filter_map(|warning| match warning {
+                remanence_state::StateConfigWarning::TapePoolMoved {
+                    tape,
+                    barcode,
+                    from,
+                    to,
+                    rule,
+                } => Some(format!(
+                    "rem-daemon: pool rules moved tape {tape} ({barcode}) from {} to {} (rule {})",
+                    from.as_deref().unwrap_or("<unassigned>"),
+                    to.as_deref().unwrap_or("<unassigned>"),
+                    rule.as_deref().unwrap_or("<none>"),
+                )),
+                remanence_state::StateConfigWarning::TapePoolsWithoutRules { .. } => None,
+            })
+            .collect()
+    })
+    .map_err(|e| format!("error: pool rules: {e}"))
+}
+
+#[cfg(test)]
+mod pool_rule_start_tests {
+    use super::*;
+    use remanence_state::{
+        library_runtime::LibraryRuntime, StateHandle, StateLockGuard, StatePaths,
+    };
+    use std::sync::Arc;
+
+    /// Service-start fixtures use only host logs and catalogue state, never a library device.
+    fn service_pool_config(root: &Path, changed: bool) -> String {
+        let pools = if changed {
+            "[[tape_pools]]\nid = \"camera.copy-b\"\n"
+        } else {
+            "[[tape_pools]]\nid = \"camera.copy-a\"\n\n[[tape_pools]]\nid = \"camera.copy-b\"\n"
+        };
+        let rule = if changed {
+            "camera.copy-b"
+        } else {
+            "camera.copy-a"
+        };
+        format!(
+            r#"[daemon]
+default_idle_timeout_seconds = 1800
+read_only = false
+state_dir = "{0}/state"
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+[audit]
+dir = "{0}/audit"
+[index]
+sqlite_path = "{0}/index.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+{pools}
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "{rule}"
+"#,
+            root.display()
+        )
+    }
+
+    /// Provision a blank barcode-derived identity without publishing a native tape log.
+    fn seed_service_pool_tape(root: &Path, config_path: &Path) -> (StatePaths, [u8; 16]) {
+        std::fs::write(config_path, service_pool_config(root, false)).unwrap();
+        let mut state = StateHandle::open_from_config_file(config_path).unwrap();
+        let tape = [0x71; 16];
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: tape,
+                voltag: "ACM001L9".into(),
+                block_size: 262144,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        (state.paths().clone(), tape)
+    }
+
+    /// Measure only library authority bytes, excluding lock and projection files.
+    fn service_library_bytes(paths: &StatePaths) -> u64 {
+        std::fs::read_dir(&paths.audit_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "remlib"))
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum()
+    }
+
+    /// D1: the service accepts the new configuration and moves blank tapes before selection.
+    #[test]
+    fn service_start_moves_blank_tape_and_removes_old_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let (paths, tape) = seed_service_pool_tape(root.path(), &config_path);
+        std::fs::write(&config_path, service_pool_config(root.path(), true)).unwrap();
+        let config = remanence_state::load_config(&config_path).unwrap();
+        let lock = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+        let library = LibraryRuntime::open(&paths, config.audit.fsync, lock).unwrap();
+        let index = remanence_state::projector::open(&paths.sqlite_path)
+            .unwrap()
+            .with_library_runtime(library.clone());
+        assert_eq!(accept_start_configuration(&paths, &library, &config).unwrap(), vec![format!(
+            "rem-daemon: pool rules moved tape {} (ACM001L9) from camera.copy-a to camera.copy-b (rule ACM)", uuid::Uuid::from_bytes(tape))]);
+        assert_eq!(
+            library
+                .tape_state(tape)
+                .unwrap()
+                .pool
+                .as_ref()
+                .map(|p| p.as_str()),
+            Some("camera.copy-b")
+        );
+        let writer = index.write_handle();
+        assert!(writer.get_tape_pool("camera.copy-a").unwrap().is_none());
+        let tapes = writer
+            .list_tapes(Some("camera.copy-b"), remanence_state::TapeKindFilter::Data)
+            .unwrap();
+        assert_eq!(tapes.len(), 1);
+        assert_eq!(tapes[0].tape_uuid, tape.to_vec());
+    }
+
+    /// D2: unreadable native evidence refuses without appending; restoring the rule allows startup.
+    #[test]
+    fn service_start_refuses_dropped_log_until_rule_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let (paths, tape) = seed_service_pool_tape(root.path(), &config_path);
+        std::fs::write(
+            paths
+                .journal_dir
+                .join("tapes")
+                .join(format!("{}.remtape", uuid::Uuid::from_bytes(tape).simple())),
+            [0u8; 64],
+        )
+        .unwrap();
+        std::fs::write(&config_path, service_pool_config(root.path(), true)).unwrap();
+        let config = remanence_state::load_config(&config_path).unwrap();
+        let lock = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+        let library = LibraryRuntime::open(&paths, config.audit.fsync, lock)
+            .expect("D2 premise: runtime must accept dropped native log fixture");
+        let _index = remanence_state::projector::open(&paths.sqlite_path)
+            .unwrap()
+            .with_library_runtime(library.clone());
+        let before = service_library_bytes(&paths);
+        assert_eq!(accept_start_configuration(&paths, &library, &config).unwrap_err(), format!(
+            "error: pool rules: tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {} (ACM001L9) recorded camera.copy-a derived camera.copy-b, unpinnable: tape log unreadable; restore the rule, or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again", uuid::Uuid::from_bytes(tape)));
+        assert_eq!(service_library_bytes(&paths), before);
+        std::fs::write(&config_path, service_pool_config(root.path(), false)).unwrap();
+        let restored = remanence_state::load_config(&config_path).unwrap();
+        assert!(accept_start_configuration(&paths, &library, &restored)
+            .unwrap()
+            .is_empty());
+        assert_eq!(service_library_bytes(&paths), before);
     }
 }

@@ -48,9 +48,9 @@ crates/remanence-cli/src/lib.rs::run_tape_wait_ready::write_handle	1
 # Daemon opens the catalog once after acquiring its lifetime state lock.
 crates/remanence-daemon/src/entry.rs::main_entry_with_registry::projector::open	1
 # The state lock owner opens and retains the catalog client and its writer.
-crates/remanence-state/src/state.rs::open_with_config::projector::open	1
+crates/remanence-state/src/state.rs::open_with_config_pass::projector::open	1
 # The state lock owner opens and retains the catalog client and its writer.
-crates/remanence-state/src/state.rs::open_with_config::write_handle	1
+crates/remanence-state/src/state.rs::open_with_config_pass::write_handle	1
 # Offline rebuild issues its writer under the existing state lock.
 crates/remanence-state/src/state.rs::rebuild_projection_from_config_file::projector::open	1
 # Offline rebuild issues its writer under the existing state lock.

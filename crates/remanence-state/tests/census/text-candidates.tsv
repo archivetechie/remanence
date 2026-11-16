@@ -434,3 +434,4 @@ crates/remanence-stream/src/recovery.rs	assign_output_path	text-equality	1	other
 crates/remanence-stream/src/recovery.rs	sanitized_recovery_path	text-equality	1	path	Recognizes or compares path names/components in sanitized_recovery_path. Evidence: ( & entry . path ) ; let leaf = if path = = "entry" { file_id } else { format ! ( "{file_id}_{path}" ) } ;
 crates/remanence-state/src/ambiguity_recovery.rs	inventory	text-equality	1	path	Selects .remlib segment paths for read-only size accounting; no error-text decision.
 crates/remanence-state/src/ambiguity_recovery.rs	marker_inventory	text-equality	3	path	Selects .remtape and .ambiguous entries and validates canonical UUID stems before publication::has_ambiguity; no error-text decision.
+crates/remanence-state/src/state/pool_rules.rs	accept_configuration	text-equality	1	enum-as-text	Recognizes the recovery_required adoption state spelling of the catalogue tape row (projector/apply.rs:579); L2-1.
