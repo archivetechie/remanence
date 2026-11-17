@@ -241,6 +241,11 @@ the tape fence first; init reports `DriveFenced` on any cartridge. Reads and
 apply. An append-admission refusal (`append_admission_refused`) fences only
 the tape; a session-suffix contradiction (`session_suffix_contradiction`)
 found at append admission also holds the standalone drive.
+The hold is recorded in the library log. If that record fails, the command prints
+`error: cannot record the hold on standalone drive <serial>: <error>; motion is fenced and recovery is required`
+and motion stops for the rest of the process. The hold is not on record, so a
+later command does not find the drive held: check the drive and the tape before
+using that drive again.
 
 The standalone refusal names the hold and its release command:
 
@@ -1417,7 +1422,8 @@ fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem 
 ```
 
 This refusal records no release. A bay-scoped drive fence keeps the refusal
-`fence is not tape-scoped`; the standalone acknowledgement form cannot release it.
+whose message contains `fence is not tape-scoped`; the standalone acknowledgement
+form cannot release it.
 
 For a present, noncontradicted `native_log_behind_projection` log, restore the
 exact tape log or rebuild the catalog with `rem rebuild-catalog-from-journals`,

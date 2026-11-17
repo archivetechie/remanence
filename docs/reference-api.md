@@ -29,8 +29,9 @@ These additions extend `proto/layer5.proto` without changing existing field tags
 `ReleaseTapeIoFence` refuses an empty or whitespace-only acknowledgment with
 `INVALID_ARGUMENT` and `acknowledgment must not be empty`. Release requires a
 `library:` tape-fence id. An id without a typed source identity is refused with
-`FAILED_PRECONDITION` and `fence has no typed library source identity`; a
-bay-scoped drive fence is refused with `fence is not tape-scoped`. A standalone
+`FAILED_PRECONDITION` and a message containing
+`fence has no typed library source identity`; a bay-scoped drive fence is
+refused with a message containing `fence is not tape-scoped`. A standalone
 drive hold is refused with `FAILED_PRECONDITION` and a message containing:
 
 ```text

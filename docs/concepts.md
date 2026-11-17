@@ -288,6 +288,11 @@ Fences can protect a tape or a drive.
   standalone quarantine list includes `standalone_holds`; release the hold with
   `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT`.
   Tape fences remain active and keep their own release requirements.
+  The hold is recorded in the library log. If that record fails, the command prints
+  `error: cannot record the hold on standalone drive <serial>: <error>; motion is fenced and recovery is required`
+  and motion stops for the rest of the process. The hold is not on record, so a
+  later command does not find the drive held: check the drive and the tape before
+  using that drive again.
   An uncertain initialization write holds the drive, returns the write's error
   and creates no tape fence; its detail names the planned tape UUID. The next
   init refuses before RESERVE or preparation. If the hold cannot be recorded,
