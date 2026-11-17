@@ -304,6 +304,12 @@ pub(crate) fn stream_one_object(
 
     let block_size_u32 = u32::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
+    // The catalog records this object; keep its read context through positioning and streaming.
+    let _read = drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+        phase: remanence_library::outcome::Phase::Read,
+        region: remanence_library::outcome::Region::Committed(0..u64::MAX),
+        ..Default::default()
+    });
     let position = crate::position_to_object(
         &mut *drive,
         crate::BotRelativeTapeFile(copy.tape_file_number),
@@ -391,6 +397,14 @@ pub(crate) fn stream_one_file_range(
     let block_size_u32 = u32::try_from(request.block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
 
+    // Positioning happens inside the range reader, under this same read context.
+    let _read = drive.scoped_outcome_context(remanence_library::outcome::OperationContext {
+        phase: remanence_library::outcome::Phase::Read,
+        region: remanence_library::outcome::Region::Committed(
+            request.physical_file_start_lba.unwrap_or(0)..u64::MAX,
+        ),
+        ..Default::default()
+    });
     drive.reset_pipelined_diagnostics();
     let wall_started = Instant::now();
     let (result, phases) = {
@@ -1089,7 +1103,7 @@ fn status_from_read_object_error(err: &FormatError, message: String) -> Status {
 
 /// Keep typed media refusals distinct from arbitrary transport diagnostics.
 fn status_from_tape_io_error(error: &remanence_library::TapeIoError, message: String) -> Status {
-    crate::closeout_obligation::RetryCause::tape_io(error).attach(Status::internal(message))
+    crate::closeout_obligation::attach_outcome_labels(error.outcome(), Status::internal(message))
 }
 
 pub(crate) fn status_from_parity_error(err: &ParityError, message: String) -> Status {
@@ -1142,25 +1156,18 @@ pub(crate) fn now_rfc3339() -> Result<String, time::error::Format> {
     OffsetDateTime::now_utc().format(&Rfc3339)
 }
 
-/// Render retry metadata from the command's existing decision, preserving its cause.
+/// Render labels from the command's existing decision, preserving its cause.
 pub(super) fn attach_outcome_retry(
     outcome: &remanence_library::outcome::ClassifiedOutcome,
-    mut status: Status,
+    status: Status,
 ) -> Status {
-    use remanence_library::outcome::RetryCause;
-    status.metadata_mut().insert(
-        "remanence-retry",
-        match outcome.retry {
-            RetryCause::Transient => "transient",
-            RetryCause::Operator => "operator",
-            RetryCause::Media => "media",
-        }
-        .parse()
-        .expect("fixed retry metadata"),
-    );
-    status
+    crate::closeout_obligation::attach_outcome_labels(outcome, status)
 }
 
 #[cfg(test)]
 #[path = "restore_stored_corrupt_tests.rs"]
 mod stored_corrupt_tests;
+
+#[cfg(test)]
+#[path = "read_finding_tests.rs"]
+mod read_finding_tests;

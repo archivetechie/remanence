@@ -397,6 +397,24 @@ impl RetryCauseExt for RetryCause {
         status
     }
 }
+/// Render the command's existing retry and read-finding decisions without reclassifying.
+pub(crate) fn attach_outcome_labels(
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
+    status: Status,
+) -> Status {
+    let mut status = outcome.retry.attach(status);
+    if matches!(
+        outcome.effect,
+        remanence_library::outcome::Effect::ReadFinding(_)
+    ) {
+        status.metadata_mut().insert(
+            "remanence-finding",
+            "media-damage".parse().expect("fixed finding metadata"),
+        );
+    }
+    status
+}
+
 pub(crate) fn transient(error: &Status) -> bool {
     if crate::readiness_wait::ReadinessFence::from_status(error).is_some()
         || crate::drive_pool::TapeBusy::from_status(error).is_some()

@@ -1987,9 +1987,11 @@ service ReadSessionService {
   // stored bytes. Non-empty file_id resolves that catalog member and treats the
   // range as member-relative. The daemon does not decrypt or interpret payload
   // bytes; both-zero range reads the whole payload/member.
+  // Classified read findings carry remanence-finding: media-damage on the failing status.
   rpc ReadObjectRange  (ReadObjectRangeRequest)  returns (stream BytesChunk);
 
   // Read an entire file from an object.
+  // Classified read findings carry remanence-finding: media-damage on the failing status.
   rpc ReadFile         (ReadFileRequest)         returns (stream BytesChunk);
 }
 

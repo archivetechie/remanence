@@ -1015,6 +1015,8 @@ struct Injection {
     crash_writes: usize,
     /// Stall the next WRITE this long before the model sees it, then clear.
     write_delay: Duration,
+    /// One READ failure after skipping this many READ dispatches, with current sense key/ASC.
+    read_failure: Option<(usize, u8, u8)>,
 }
 struct Transport {
     inner: ModelTransport,
@@ -1091,6 +1093,17 @@ fn check_condition(key: u8, asc: u8, ascq: u8) -> ScsiError {
 impl SgTransport for Transport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         self.before(cdb)?;
+        if cdb[0] == 0x08 && matches!(self.role, DeviceRole::Drive { .. }) {
+            let mut injection = self.injection.lock().unwrap();
+            if let Some((remaining, key, asc)) = injection.read_failure.as_mut() {
+                if *remaining == 0 {
+                    let error = check_condition(*key, *asc, 0);
+                    injection.read_failure = None;
+                    return Err(error);
+                }
+                *remaining -= 1;
+            }
+        }
         let result = self.inner.execute_in(cdb, buf);
         if let Err(ScsiError::CheckCondition { sense, .. }) = &result {
             let mut injection = self.injection.lock().unwrap();
@@ -2947,5 +2960,150 @@ async fn l1r3e_drive_fence_excludes_seated_ready_session_across_restart() {
     let client = fixture.start().await;
     let session = client.open().await;
     client.close(&session).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+}
+
+/// Both production read scopes must report damage without fencing later reads.
+#[tokio::test]
+async fn read_finding_medium_error_on_object_and_member() {
+    check_read_finding_wire(3, 0x11, true, &[false, true]).await;
+}
+
+/// A hardware fault shares the media retry axis but is not a read finding.
+#[tokio::test]
+async fn read_finding_hardware_fault_has_retry_only() {
+    check_read_finding_wire(4, 0x44, false, &[false]).await;
+}
+
+/// Fail the measured first object READ, observe wire metadata and both fence surfaces,
+/// then prove a fresh session can still read the committed object.
+async fn check_read_finding_wire(key: u8, asc: u8, finding: bool, members: &[bool]) {
+    let fixture = Harness::new(false);
+    let client = fixture.start().await;
+    let write = client.open().await;
+    let bytes = b"read finding fixture";
+    let object = client.append(&write, "read-finding", bytes).await;
+    client.close(&write).await;
+    let files = pb::catalog_client::CatalogClient::new(client.channel.clone())
+        .list_files_in_object(pb::ListFilesInObjectRequest {
+            object_id: object.object_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .files;
+    assert_eq!(files.len(), 1);
+    assert!(!files[0].file_id.is_empty());
+    let catalog = remanence_state::projector::open(&fixture.config.index.sqlite_path)
+        .unwrap()
+        .write_handle();
+    let fences_before = catalog.list_active_tape_io_fences().unwrap().len();
+    let serial = fixture.world.lock().unwrap().drive_serials[&BAY].clone();
+    let mut library = pb::library_service_client::LibraryServiceClient::new(client.channel.clone());
+    let drive_before = library
+        .get_drive(pb::GetDriveRequest {
+            drive: serial.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!drive_before.fenced);
+    for &member in members {
+        let mut reader = client.reader();
+        let before_open = fixture.injection.lock().unwrap().commands.len();
+        let session = reader
+            .open_read_session(pb::OpenReadSessionRequest {
+                target: Some(pb::open_read_session_request::Target::TapeTarget(
+                    tape_target("archive"),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        {
+            let mut injection = fixture.injection.lock().unwrap();
+            // S0: READ #1 since open is the bootstrap; READ #2 is object data.
+            // Both routes position without a READ between open and object data.
+            assert_eq!(
+                injection.commands[before_open..]
+                    .iter()
+                    .filter(|c| c[0] == 0x08)
+                    .count(),
+                1
+            );
+            injection.read_failure = Some((0, key, asc));
+        }
+        let mut stream = if member {
+            reader
+                .read_file(pb::ReadFileRequest {
+                    session_id: session.session_id.clone(),
+                    object_id: object.object_id.clone(),
+                    file_id: files[0].file_id.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        } else {
+            reader
+                .read_object_range(pb::ReadObjectRangeRequest {
+                    session_id: session.session_id.clone(),
+                    object_id: object.object_id.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        let error = loop {
+            match stream.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("injected READ must fail the stream"),
+                Err(status) => break status,
+            }
+        };
+        assert!(fixture.injection.lock().unwrap().read_failure.is_none());
+        assert_eq!(
+            error.code(),
+            tonic::Code::Internal,
+            "member={member}: {error:?}"
+        );
+        assert_eq!(
+            error
+                .metadata()
+                .get("remanence-retry")
+                .map(|v| v.to_str().unwrap()),
+            Some("media"),
+            "member={member}: retry label"
+        );
+        assert_eq!(
+            error
+                .metadata()
+                .get("remanence-finding")
+                .map(|v| v.to_str().unwrap()),
+            if finding { Some("media-damage") } else { None },
+            "member={member}: finding label"
+        );
+        reader
+            .close_read_session(pb::CloseReadSessionRequest {
+                session_id: session.session_id,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        catalog.list_active_tape_io_fences().unwrap().len(),
+        fences_before
+    );
+    let drive_after = library
+        .get_drive(pb::GetDriveRequest { drive: serial })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(drive_after.fenced, drive_before.fenced);
+    client.assert_object(&object, bytes).await;
     client.state.shutdown_drive_pool().await.unwrap();
 }

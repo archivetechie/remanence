@@ -362,6 +362,10 @@ fn assert_stored_corrupt_data_loss(test: &str, read: ModelObjectRead) {
         status.metadata().get("remanence-retry").is_none(),
         "{test}: DATA_LOSS carries no retry metadata"
     );
+    assert!(
+        status.metadata().get("remanence-finding").is_none(),
+        "{test}: DATA_LOSS carries no finding metadata"
+    );
 }
 
 /// Rung D-R, T3 (D1 and D1b): one block per READ and the minimum reservoir, so

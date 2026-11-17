@@ -70,3 +70,12 @@ Tape and drive failures can reach clients as gRPC `INTERNAL`,
 what kind of intervention helps. A status without the label gives no such
 advice; the label is not promised for every failure or RPC. `DATA_LOSS` means
 a digest or checksum failure.
+
+A read-session `ReadObjectRange` or `ReadFile` fails with `INTERNAL` carrying
+`remanence-finding: media-damage` and `remanence-retry` when the drive reports a
+medium or unrecovered read error at a recorded position, a blank recorded
+region, or a record length different from the expected length (a current
+incorrect-length indication, ILI). This finding is not promised for a short
+transfer reported as good, a filemark, or a transport fault. It means this copy
+could not be read here: read another copy. It does not by itself prove the
+medium is bad; a dirty head in one drive can give the same answer.
