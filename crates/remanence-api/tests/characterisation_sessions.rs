@@ -2681,6 +2681,47 @@ fn ruling24_library_bytes(config: &RemConfig) -> std::collections::BTreeMap<Stri
         .collect()
 }
 
+/// Wait for the start's one code-9 record from its own thread before taking the crash snapshot.
+/// Requiring stable bytes preserves the parent's whole-file check for new library authority.
+fn ruling24_settled_library_bytes(
+    config: &RemConfig,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let name = b"ForeignDrivePollDisabled";
+    let mut previous = None;
+    loop {
+        let library = ruling24_library_bytes(config);
+        let count: usize = library
+            .values()
+            .map(|bytes| {
+                bytes
+                    .windows(name.len())
+                    .filter(|window| *window == name)
+                    .count()
+            })
+            .sum();
+        assert!(
+            count <= 1,
+            "expected one record from src/drive_collection.rs::foreign_drive_poll_loop; found {count} ForeignDrivePollDisabled names"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no stable library snapshot within 30 seconds: last read contained {count} ForeignDrivePollDisabled names from src/drive_collection.rs::foreign_drive_poll_loop"
+        );
+        if count == 1 && previous.as_ref() == Some(&library) {
+            return library;
+        }
+        let delay = if count == 1 {
+            previous = Some(library);
+            Duration::from_millis(100)
+        } else {
+            previous = None;
+            Duration::from_millis(20)
+        };
+        std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 /// Run the real gRPC writer in a child that exits at the media/native publication boundary.
 async fn ruling24_crash_test(name: &str, after_commit: bool) {
     if let Some(parent) = std::env::var_os("R2A_CRASH_PARENT") {
@@ -2691,7 +2732,7 @@ async fn ruling24_crash_test(name: &str, after_commit: bool) {
             parent.join("state.json"),
             serde_json::to_vec(&serde_json::json!({
                 "root": fixture.root, "config": fixture.config,
-                "library": ruling24_library_bytes(&fixture.config),
+                "library": ruling24_settled_library_bytes(&fixture.config),
             }))
             .unwrap(),
         )
