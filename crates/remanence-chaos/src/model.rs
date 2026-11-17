@@ -415,6 +415,8 @@ impl MediumTypeReporting {
 pub struct VirtualDriveState {
     /// How MODE SENSE reports the loaded cartridge's WORM state.
     pub medium_type_reporting: MediumTypeReporting,
+    /// One-shot current fixed sense (key, ASC, ASCQ) for the next READ POSITION; off by default.
+    pub next_read_position_sense: Option<(u8, u8, u8)>,
     /// This model's single initiator PREVENT survives transport close/reopen.
     pub removal_prevented: bool,
     /// After how many drive ops the drive becomes dirty.
@@ -898,6 +900,11 @@ impl ModelTransport {
         // INQUIRY does not consume a pending unit attention.
         if opcode != 0x12 && std::mem::take(&mut state.reset_unit_attention) {
             return Err(check_condition(fixed_sense(0x06, 0x29, 0x00, None, 0), 0));
+        }
+        if opcode == 0x34 {
+            if let Some((key, asc, ascq)) = state.next_read_position_sense.take() {
+                return Err(check_condition(fixed_sense(key, asc, ascq, None, 0), 0));
+            }
         }
         if state.position_unknown && matches!(opcode, 0x08 | 0x0a | 0x10 | 0x11 | 0x91) {
             return Err(check_condition(fixed_sense(0x03, 0x15, 0x02, None, 0), 0));

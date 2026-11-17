@@ -4119,24 +4119,25 @@ impl super::DriveHandle {
     /// Re-establish reset-invalidated fixed mode and device position before
     /// any identity probe or data command reuses this daemon-lifetime handle.
     pub fn reverify_invalidated_state(&mut self) -> Result<(), TapeIoError> {
-        self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
-        let Some(required_block_size) = drive.mode_reverification_required else {
+        let Some(required_block_size) = self.mode_reverification_required else {
             return Ok(());
         };
-        let config = drive.read_config_internal(false)?;
-        if config.block_size
-            != (BlockSize::Fixed {
-                size_bytes: required_block_size,
-            })
-        {
-            return Err(crate::TapeIoError::pending(crate::TapeIoErrorKind::OperationFailed(format!(
-                "reset recovery MODE SENSE block-size mismatch: expected {required_block_size}, got {:?}",
-                config.block_size
-            ))));
-        }
-        drive.position()?;
+        self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
+            let config = drive.read_config_internal(false)?;
+            if config.block_size
+                != (BlockSize::Fixed {
+                    size_bytes: required_block_size,
+                })
+            {
+                return Err(crate::TapeIoError::pending(crate::TapeIoErrorKind::OperationFailed(format!(
+                    "reset recovery MODE SENSE block-size mismatch: expected {required_block_size}, got {:?}",
+                    config.block_size
+                ))));
+            }
+            Ok(())
+        })?;
+        self.position()?;
         Ok(())
-        })
     }
 
     /// Write a new block-size + compression configuration via

@@ -3218,5 +3218,7 @@ async fn acknowledged_prefix_property_detects_missing_barriers() {
 
 #[path = "b3b_admission_caller_tests.rs"]
 mod b3b_admission_caller_tests;
+#[path = "rra1_tests.rs"]
+mod rra1_tests;
 #[path = "shutdown_round1_tests.rs"]
 mod shutdown_round1_tests;
