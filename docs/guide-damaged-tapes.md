@@ -96,8 +96,13 @@ when the stripe has lost no more than `m` blocks and shards (its parity blocks
 per stripe), and not when it has lost more (REM-PARITY Sections 13.4 and 13.5).
 Remanence has no command yet that reconstructs a block from parity, so until it
 does, an object that touches a failed block has to be read from another copy.
-A client sees a classified read finding as `remanence-finding: media-damage`
-metadata on the failing `INTERNAL` status from `ReadObjectRange` or `ReadFile`.
+When a client reads such an object with `ReadObjectRange` or `ReadFile` and the
+drive cannot read a block the request covers, the failing `INTERNAL` status
+carries `remanence-finding: media-damage` metadata. A block that reads but holds
+wrong bytes carries no such label: a whole-object read (no `file_id`, no byte
+range) fails with `DATA_LOSS` when the bytes contradict a digest or checksum
+recorded with the object, and a read that names a `file_id` or a byte range
+returns the stored bytes without checking them.
 An epoch whose sidecar metadata is unavailable cannot be checked against a
 checksum, and the other epochs are unaffected; the verification page explains
 this.
