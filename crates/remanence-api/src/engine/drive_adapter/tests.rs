@@ -2750,6 +2750,119 @@ fn standalone_hold_release_allows_suffix_recovery() {
     owner.finish().unwrap();
 }
 
+/// A real standalone append-admission contradiction fences the tape and holds
+/// the drive until acknowledgment permits recovery of the restored suffix.
+#[test]
+fn standalone_contradiction_hold_blocks_tail_recovery_until_released() {
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::new(false);
+    let runtime = state.library_runtime();
+    let mut owner = fixture.owner(state);
+    owner.open_session("default").unwrap();
+    owner.append(fixture.request("one")).unwrap();
+    owner.close_session().unwrap();
+
+    {
+        let mut world = fixture.world.lock().unwrap();
+        let records = &mut world.tapes.get_mut("HAND").unwrap().records;
+        assert!(matches!(records.last(), Some(Record::Filemark)));
+        *records.last_mut().unwrap() = Record::Block(vec![0; BLOCK as usize]);
+    }
+    fixture.commands.lock().unwrap().clear();
+    let error = owner.open_session("default").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("commit cursor predecessor is not exactly a filemark"),
+        "{error}"
+    );
+    assert!(!fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+
+    let fences = fixture.index().list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].tape_uuid, UUID);
+    assert_eq!(fences[0].reason, "session_suffix_contradiction");
+    let holds = runtime.standalone_drive_holds().unwrap();
+    assert_eq!(
+        holds.len(),
+        1,
+        "contradiction must hold the standalone drive"
+    );
+    assert_eq!(holds[0].drive_serial, SERIAL);
+    assert_eq!(holds[0].cause, lib::FenceCause::SessionSuffixContradiction);
+    let hold = holds[0].fence;
+    let raised = runtime.active_fence(hold).expect("active standalone hold");
+    assert_eq!(raised.kind, lib::FenceKind::DriveFault);
+    assert_eq!(
+        raised.scope,
+        lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+            drive_serial: SERIAL.into(),
+        }))
+    );
+    assert_eq!(raised.cause, lib::FenceCause::SessionSuffixContradiction);
+
+    // The operator has checked the drive: the recorded filemark reads correctly
+    // again, leaving the drive hold as the only obstacle to tail recovery.
+    let before = {
+        let mut world = fixture.world.lock().unwrap();
+        let records = &mut world.tapes.get_mut("HAND").unwrap().records;
+        *records.last_mut().unwrap() = Record::Filemark;
+        records.clone()
+    };
+    fixture.commands.lock().unwrap().clear();
+    let error = owner
+        .supersede_tail_confirmed("HAND", |_, _| panic!("held drive reached confirmation"))
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("DriveFenced: drive STEP1-MOUNTED library:{hold}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("rem tape quarantine release library:{hold} --device PATH --allow-device STEP1-MOUNTED --ack TEXT")), "{text}");
+    assert_eq!(
+        fixture.index().list_active_tape_io_fences().unwrap(),
+        fences
+    );
+
+    let released = runtime
+        .release_standalone_drive_hold(
+            &format!("library:{hold}"),
+            "drive checked",
+            remanence_state::AuditActor::local_user(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.cause, lib::FenceCause::SessionSuffixContradiction);
+    let found = owner
+        .supersede_tail_confirmed("HAND", |request, found| {
+            assert_eq!(request, "SUPERSEDE HAND");
+            assert!(found.is_empty(), "{found:?}");
+            Ok(())
+        })
+        .unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    assert!(fixture
+        .index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(runtime.active_fence(hold).is_none());
+    assert!(runtime.standalone_drive_holds().unwrap().is_empty());
+    assert!(!fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+    assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
+    owner.finish().unwrap();
+}
+
 /// DEC-1 and D-N-1-2: an undurable ending retains exactly the append classifier fence.
 #[test]
 fn mounted_append_failure_with_an_undurable_ending_keeps_the_classifier_fence() {
