@@ -2770,6 +2770,10 @@ fn an_unrecordable_standalone_write_fence_is_counted_once_with_its_tape() {
         error.ends_with("; motion is fenced and recovery is required"),
         "{error}"
     );
+    assert!(
+        error.contains("; the drive hold was not recorded: "),
+        "{error}"
+    );
     assert!(mount.unusable);
     assert!(runtime.motion_fenced());
     assert!(runtime.standalone_drive_holds().unwrap().is_empty());

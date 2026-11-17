@@ -277,9 +277,12 @@ Fences can protect a tape or a drive.
   tape admission refuses every read, including `--scan`. Other fence causes leave
   standalone reads available.
 - A **standalone drive hold** (`library:<n>`) records write uncertainty on the
-  drive independently of its cartridge's tape fence. A failed write, finalize
-  or tail replacement that fences its tape for write uncertainty also holds
-  the drive. It refuses writes, initialization and the four catalogue changes
+  drive independently of its cartridge's tape fence. A write, finalize or
+  tail replacement on a standalone drive that ends in a write fence also
+  holds the drive, including when the tape fence itself cannot be recorded
+  and when a read during the write contradicts what was recorded; an
+  append-admission refusal (`append_admission_refused`) fences only the tape.
+  It refuses writes, initialization and the four catalogue changes
   (adopt, drive-form assign-pool, rebind and set-generation), including on other
   cartridges. Reads and `rem tape release` do not consult the hold. The
   standalone quarantine list includes `standalone_holds`; release the hold with

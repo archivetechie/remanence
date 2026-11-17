@@ -441,8 +441,10 @@ Motion and data work stop, and a daemon starting with this condition does not
 start. A drive whose host connection is down does not cause this identity
 refusal.
 
-A failed write, finalize or tail replacement that fences its tape for write
-uncertainty also holds the standalone drive. The hold refuses `put`,
+A write, finalize or tail replacement on a standalone drive that ends in a
+write fence also holds the drive, including when the tape fence itself cannot
+be recorded and when a read during the write contradicts what was recorded.
+The hold refuses `put`,
 `tape finalize`, `tape supersede-tail`, `tape init`, `tape adopt`,
 `tape assign-pool`, `tape rebind` and `tape set-generation` in that drive,
 including on any other cartridge.
@@ -450,7 +452,9 @@ The `assign-pool --tape <UUID>` form opens no drive and does not consult its hol
 On the failed cartridge, put, finalize and the four catalogue commands report
 the tape fence first; init reports `DriveFenced` on any cartridge. Reads and
 `rem tape release` do not consult the hold; their other admission checks still
-apply. An append-admission refusal can fence only the tape.
+apply. An append-admission refusal (`append_admission_refused`) fences only
+the tape; a session-suffix contradiction (`session_suffix_contradiction`)
+found at append admission also holds the standalone drive.
 
 The standalone refusal names the hold and its release command:
 
@@ -474,7 +478,8 @@ never releases a tape fence. Use the library release form for releasable
 tape fences; tape fences requiring physical recovery keep that requirement.
 
 If a daemon answers on the selected configuration's socket, it refuses the hold
-with this text; there is no offline fallback after that refusal:
+with a message containing this text; there is no offline fallback after that
+refusal:
 
 ```text
 fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT` as a standalone command

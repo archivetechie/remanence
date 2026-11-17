@@ -2523,7 +2523,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
 
 /// A standalone uncertainty records one typed drive hold without a legacy append, tape fence or latch.
 #[test]
-fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
+fn standalone_uncertainty_records_one_typed_hold_without_legacy_append() {
     use remanence_state::library_log as lib;
     let (fixture, state) = Fixture::initialized(false);
     let source_bytes = || {
