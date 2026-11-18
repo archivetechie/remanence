@@ -804,6 +804,22 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/plr1_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) LateTransport forwarder to in-memory ModelTransport only; no production dispatch",
+            },
+        ),
+        (
+            "remanence-cli/tests/power_loss_reading.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "CaptureTransport test forwarder to in-memory ModelTransport only; no production dispatch",
+            },
+        ),
+        (
             "remanence-chaos/src/model.rs",
             DispatchPolicy::Exact {
                 execute_out: 12,
