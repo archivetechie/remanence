@@ -1785,6 +1785,14 @@ async fn cancel_audit_records_request_actor() {
         records[1].event,
         lib::OperationEvent::CancelRequested(lib::Unit)
     );
+    let operations = typed
+        .records(|record| record.operation_recorded().map(|value| value.operation))
+        .await;
+    assert_eq!(
+        operations,
+        vec![*operation_id.as_bytes(); 2],
+        "whole-log operation IDs found: {operations:?}"
+    );
 }
 
 /// With a library runtime, a cancel that lands before the operation publishes its first
@@ -1933,6 +1941,14 @@ async fn library_request_audit_records_request_actor() {
         Some("LIB001")
     );
     assert_eq!(accepted.request_fingerprint, fingerprint);
+    let operations = typed
+        .records(|record| record.operation_recorded().map(|value| value.operation))
+        .await;
+    assert_eq!(
+        operations,
+        vec![*operation_id.as_bytes(); 1],
+        "whole-log operation IDs found: {operations:?}"
+    );
 }
 
 fn test_scheme() -> ParityScheme {
@@ -4635,14 +4651,19 @@ fn write_session_selection_respects_the_physical_library_scope() {
     project_eligible_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
     let cfg = pool_config("camera.copy-a");
     let allowed = HashSet::from([SECOND_POOL_WRITE_TAPE_UUID]);
-    let checkpoint_dir = tempfile::tempdir().expect("checkpoint dir");
+    let checkpoint_dir = index
+        .library_runtime()
+        .expect("typed selection runtime")
+        .manifest()
+        .tape_root()
+        .to_path_buf();
 
     let selected = crate::pool_write::select_tape_in_pool_for_write_session_scoped(
         &index,
         &cfg,
         123,
         &crate::pool_write::TapeSelectionHolds::default(),
-        checkpoint_dir.path(),
+        checkpoint_dir.as_path(),
         &allowed,
         &mut crate::pool_write::SelectionSkips::default(),
     )
