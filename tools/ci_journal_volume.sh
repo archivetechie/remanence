@@ -21,11 +21,10 @@ esac
 mount_point=$2
 [[ $mount_point == /* && $mount_point != *[$'\r\n']* ]] ||
     fail 'mount point must be an absolute path without a newline'
-while [[ $mount_point == */ && $mount_point != / ]]; do
-    mount_point=${mount_point%/}
-done
+mount_point=$(realpath -m -- "$mount_point")
 [[ $mount_point != / ]] || fail 'refusing the root mount point'
 image="$mount_point.img"
+[[ $image != "$mount_point"/* ]] || fail "image path inside the mount point: $image"
 loop_device=
 mounted=0
 image_created=0
@@ -41,7 +40,7 @@ finish() {
     fi
     printf 'ci_journal_volume.sh: %s failed (exit %s)\n' "$step" "$status" >&2
     if [[ $mode == up ]]; then
-        if (( mounted )); then
+        if (( mounted )) || { [[ -n $loop_device ]] && findmnt --noheadings --source "$loop_device" --mountpoint "$mount_point" > /dev/null; }; then
             if ! sudo umount -- "$mount_point"; then
                 printf 'cleanup: unmount failed; retaining loop device and image\n' >&2
                 exit "$status"
@@ -65,6 +64,21 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+pending_signal=
+# Hold INT and TERM while a resource is acquired and recorded, then act on them,
+# so the cleanup never sees an acquired resource it has no record of.
+defer_signals() {
+    trap 'pending_signal=130' INT
+    trap 'pending_signal=143' TERM
+}
+resume_signals() {
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ -n $pending_signal ]]; then
+        exit "$pending_signal"
+    fi
+}
+
 case "$mode" in
     up)
         step='check for an existing image'
@@ -76,14 +90,18 @@ case "$mode" in
             fail "refusing existing mount: $mount_point"
         fi
         step='create image exclusively'
+        defer_signals
         (set -o noclobber; : > "$image")
         image_created=1
+        resume_signals
         step='size image'
         truncate -s "$3" -- "$image"
         step='format ext4 image'
         mkfs.ext4 -q -F "$image"
         step='attach loop device'
+        defer_signals
         loop_device=$(sudo losetup --find --show "$image")
+        resume_signals
         [[ $loop_device =~ ^/dev/loop[0-9]+$ ]] || fail "unexpected loop device: $loop_device"
         cache_path="/sys/block/${loop_device##*/}/queue/write_cache"
         fua_path="/sys/block/${loop_device##*/}/queue/fua"
@@ -92,8 +110,10 @@ case "$mode" in
         step='create mount point'
         sudo mkdir -p -- "$mount_point"
         step='mount ext4 volume'
+        defer_signals
         sudo mount -- "$loop_device" "$mount_point"
         mounted=1
+        resume_signals
         step='identify runner uid'
         owner_uid=$(id -u)
         step='identify runner gid'
