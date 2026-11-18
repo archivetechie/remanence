@@ -27,6 +27,9 @@ mod b6b_fix_tests;
 #[path = "host_record_tests.rs"]
 mod host_record_tests;
 
+#[path = "plr1_tests.rs"]
+mod plr1_tests;
+
 use super::*;
 use remanence_chaos::file_model::{FileEvent, FileSnapshot, MemoryDirectory};
 use remanence_library::durable_file::test_support::register;

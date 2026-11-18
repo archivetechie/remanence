@@ -27,8 +27,8 @@ use crate::index_separation::{
     validate_index_separation_pair, IndexSeparationError, IndexSeparationInteriorBlockSource,
 };
 use crate::raw::{
-    read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
-    RawTapeSource,
+    read_fixed_record, tape_error_is_current_medium_damage, tape_error_is_end_of_data_not_found,
+    FixedRecordRead, PhysicalPositionHint, RawTapeSource,
 };
 use crate::scan::{
     validate_scan_reconstruction_with_report, ScanDamageKind, ScanMode, ScanWalkResult,
@@ -189,6 +189,8 @@ pub enum BotStructuralRecoveryReason {
     NoUsableTerminalLayout,
     /// A layout was found, but A, B, and C all failed local validation.
     AllMembersInvalid,
+    /// The primary SPACE completion reports no end-of-data mark.
+    EndOfDataNotFound,
 }
 
 /// Evidence returned instead of treating a missing terminal index as empty.
@@ -546,9 +548,20 @@ where
     source
         .configure_fixed_block_size(block_size)
         .map_err(|error| source_error("configure fixed block size", error))?;
-    let eod = source
-        .locate_end_of_data()
-        .map_err(|error| source_error("SPACE(EOD)", error))?;
+    let eod = match source.locate_end_of_data() {
+        Ok(eod) => eod,
+        Err(ParityError::TapeIo(ref error)) if tape_error_is_end_of_data_not_found(error, 0x11) => {
+            return Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(
+                Box::new(BotStructuralRecoveryRequired {
+                    reason: BotStructuralRecoveryReason::EndOfDataNotFound,
+                    replicas: missing_evidence(
+                        "drive reports no end-of-data mark; terminal members not inspected",
+                    ),
+                }),
+            ));
+        }
+        Err(error) => return Err(source_error("SPACE(EOD)", error)),
+    };
     if eod.partition != 0 {
         return Err(TerminalInventoryReadError::Source {
             operation: "SPACE(EOD)",
@@ -993,6 +1006,14 @@ fn verify_terminal_index_after_damage<V: ProtectedPass>(
     };
     let selection = match inventory {
         TerminalInventoryOutcome::Inventory(selection) => selection,
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery)
+            if recovery.reason == BotStructuralRecoveryReason::EndOfDataNotFound =>
+        {
+            return Err(TerminalIndexVerificationError::Source {
+                operation: "SPACE(EOD)",
+                message: MISSING_END_OF_DATA_DIAGNOSTIC.to_string(),
+            });
+        }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
             return terminal_recovery_required::<V>(
                 source,
@@ -1495,7 +1516,7 @@ fn scan_verification_prefix(
         })) => Err(TerminalIndexVerificationError::Cancelled),
         Err(error) => Err(attach_prefix_findings(
             TerminalIndexVerificationError::PrefixWalk {
-                message: error.to_string(),
+                message: verification_error_detail(&error),
             },
             findings,
         )),
@@ -2786,6 +2807,20 @@ fn source_error(operation: &'static str, error: ParityError) -> TerminalInventor
     }
 }
 
+const MISSING_END_OF_DATA_DIAGNOSTIC: &str =
+    "drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list";
+
+/// Preserve the source detail while naming only a matching primary SPACE signature.
+fn verification_error_detail(error: &ParityError) -> String {
+    let mut detail = error.to_string();
+    if matches!(error, ParityError::TapeIo(error) if tape_error_is_end_of_data_not_found(error, 0x11))
+    {
+        detail.push_str("; ");
+        detail.push_str(MISSING_END_OF_DATA_DIAGNOSTIC);
+    }
+    detail
+}
+
 fn verification_source_error(
     operation: &'static str,
     error: ParityError,
@@ -2801,7 +2836,7 @@ fn verification_source_error(
     }
     TerminalIndexVerificationError::Source {
         operation,
-        message: error.to_string(),
+        message: verification_error_detail(&error),
     }
 }
 
@@ -2853,6 +2888,7 @@ pub fn verify_terminal_index_step1_for_test(
 #[cfg(test)]
 mod tests {
     mod one_pass_tests;
+    mod power_loss_reading;
     use super::*;
     use crate::raw::RawReadOutcome;
     use crate::tape_index_replica::{
@@ -3222,7 +3258,10 @@ mod tests {
         );
         let (success, rejection) = match result {
             Ok(_) => (true, None),
-            Err(super::one_pass::AttemptError::Rejected(reason)) => (false, Some(reason)),
+            Err(
+                super::one_pass::AttemptError::Rejected(reason)
+                | super::one_pass::AttemptError::RejectedWithSource { reason, .. },
+            ) => (false, Some(reason)),
             Err(super::one_pass::AttemptError::Fatal(_)) => (false, Some("cancelled")),
         };
         assert_eq!(rejection, expected_reason, "attempt rejection reason");

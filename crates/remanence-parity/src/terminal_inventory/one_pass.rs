@@ -50,24 +50,48 @@ pub fn verify_terminal_index_full_with_route(
         fell_back: false,
         fallback_reason: None,
     });
+    let mut first_context = None;
     if route == VerificationRoute::OnePass {
         let _verification = source.verification_context().verification();
-        match verify_one_pass(source, tape_uuid, block_size, mode, 64 * 1024 * 1024) {
-            Ok(complete) => return Ok(complete_outcome(complete)),
-            Err(AttemptError::Fatal(error)) => return Err(error),
-            Err(AttemptError::Rejected(reason)) => report(VerificationRouteStatus {
-                route: VerificationRoute::Walk,
-                fell_back: reason != "no_parity",
-                fallback_reason: Some(reason),
-            }),
-        }
+        let (reason, context) =
+            match verify_one_pass(source, tape_uuid, block_size, mode, 64 * 1024 * 1024) {
+                Ok(complete) => return Ok(complete_outcome(complete)),
+                Err(AttemptError::Fatal(error)) => return Err(error),
+                Err(AttemptError::Rejected(reason)) => (reason, None),
+                Err(AttemptError::RejectedWithSource { reason, context }) => {
+                    (reason, Some(context))
+                }
+            };
+        first_context = context;
+        report(VerificationRouteStatus {
+            route: VerificationRoute::Walk,
+            fell_back: reason != "no_parity",
+            fallback_reason: Some(reason),
+        });
     }
-    verify_terminal_index_full_inner::<Forward>(source, tape_uuid, block_size, &mut authority, mode)
+    let mut result = verify_terminal_index_full_inner::<Forward>(
+        source,
+        tape_uuid,
+        block_size,
+        &mut authority,
+        mode,
+    );
+    if let (Some(context), Err(TerminalIndexVerificationError::Source { message, .. })) =
+        (first_context, &mut result)
+    {
+        message.push_str("; one-pass attempt: ");
+        message.push_str(&context);
+    }
+    result
 }
 
 /// Only cancellation can end an attempt without running the walk.
 pub(super) enum AttemptError {
     Rejected(&'static str),
+    RejectedWithSource {
+        reason: &'static str,
+        context: String,
+    },
     Fatal(TerminalIndexVerificationError),
 }
 
@@ -76,7 +100,12 @@ impl From<TerminalIndexVerificationError> for AttemptError {
         use TerminalIndexVerificationError::*;
         let reason = match error {
             Cancelled => return Self::Fatal(error),
-            Source { .. } => "source",
+            Source { .. } => {
+                return Self::RejectedWithSource {
+                    reason: "source",
+                    context: error.to_string(),
+                }
+            }
             BlockSize(_) => "block_size",
             NoCompleteLayout { .. } => "no_complete_layout",
             ConflictingLayouts { .. } => "conflicting_layouts",
@@ -103,6 +132,14 @@ fn prefix_error(error: ParityError) -> AttemptError {
             kind: remanence_library::TapeIoErrorKind::Cancelled,
             ..
         }) => AttemptError::Fatal(TerminalIndexVerificationError::Cancelled),
+        ParityError::TapeIo(ref tape_error)
+            if tape_error_is_end_of_data_not_found(tape_error, 0x11) =>
+        {
+            AttemptError::RejectedWithSource {
+                reason: "tape_io",
+                context: verification_error_detail(&error),
+            }
+        }
         ParityError::TapeIo(_) => AttemptError::Rejected("tape_io"),
         ParityError::FilemarkMapReconstruct(_) => AttemptError::Rejected("prefix_map"),
         _ => AttemptError::Rejected("prefix_check"),
@@ -262,8 +299,10 @@ pub fn verify_terminal_index_one_pass_budget_for_test(
     match verify_one_pass(source, uuid, size, ScanMode::Standard, budget) {
         Ok(complete) => Ok(complete_outcome(complete)),
         Err(AttemptError::Fatal(error)) => Err(error),
-        Err(AttemptError::Rejected(_)) => Err(TerminalIndexVerificationError::PrefixWalk {
-            message: "provisional pass rejected".into(),
-        }),
+        Err(AttemptError::Rejected(_) | AttemptError::RejectedWithSource { .. }) => {
+            Err(TerminalIndexVerificationError::PrefixWalk {
+                message: "provisional pass rejected".into(),
+            })
+        }
     }
 }

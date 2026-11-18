@@ -1850,7 +1850,7 @@ where
         Command::Tape { command } => {
             match command {
                 Tape::Identify => {
-                    let mut facts = terminal_summary(&mut mounted.drive, false)?;
+                    let mut facts = terminal_summary(&mut mounted.drive, false, errors)?;
                     facts["uuid"] = json!(Uuid::from_bytes(uuid));
                     facts["tape_uuid"] = json!(Uuid::from_bytes(uuid));
                     facts["label"] = json!(mounted.label.as_ref().map(|p| &p.0));
@@ -1913,7 +1913,7 @@ where
                         attach_verification_io(&mut facts, io.finish(), cli.json, output.out)?;
                         Ok(facts)
                     } else {
-                        terminal_summary(&mut mounted.drive, true)
+                        terminal_summary(&mut mounted.drive, true, errors)
                     }
                 }
                 Tape::Restore {
@@ -2512,7 +2512,11 @@ fn complete_init(
     }
     Ok(result)
 }
-fn terminal_summary(drive: &mut DriveHandle, verifying: bool) -> Result<Value, String> {
+fn terminal_summary(
+    drive: &mut DriveHandle,
+    verifying: bool,
+    errors: &mut dyn Write,
+) -> Result<Value, String> {
     let bootstrap = remanence_parity::bootstrap::discover_bootstrap(
         &mut remanence_parity::DriveHandleRawSource::new(drive),
         None,
@@ -2543,6 +2547,11 @@ fn terminal_summary(drive: &mut DriveHandle, verifying: bool) -> Result<Value, S
         },
     )
     .map_err(err)?;
+    if !verifying
+        && matches!(&result, remanence_parity::TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) if recovery.reason == remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound)
+    {
+        writeln!(errors, "warning: drive reports no end-of-data mark; power loss during writing can cause this; committed files remain readable; rem tape restore --scan --list inspects recoverable files, not the actual end").map_err(err)?;
+    }
     let mut summary = summarize_terminal(result, verifying)?;
     summary["bytes"] = if summary["finalized"] == true {
         json!(bytes)
@@ -2560,6 +2569,7 @@ fn terminal_recovery_status(
         remanence_parity::BotStructuralRecoveryReason::AllMembersInvalid => {
             "terminal_index_unusable"
         }
+        remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound => "end_of_data_not_found",
     }
 }
 fn summarize_terminal(
@@ -2575,11 +2585,15 @@ fn summarize_terminal(
                 terminal_recovery_status(&recovery.reason)
             ))
         }
-        remanence_parity::TerminalInventoryOutcome::Inventory(inventory) => Ok(
-            json!({"finalized": true, "object_count": inventory.payload.object_row_count, "replica": inventory.selected_replica_ordinal, "edition_digest": crate::bytes_to_hex(&inventory.edition.edition_digest), "status": if verifying { "verified" } else { "identified" }}),
-        ),
+        remanence_parity::TerminalInventoryOutcome::Inventory(inventory) => {
+            let mut summary = json!({"finalized": true, "object_count": inventory.payload.object_row_count, "replica": inventory.selected_replica_ordinal, "edition_digest": crate::bytes_to_hex(&inventory.edition.edition_digest), "status": if verifying { "verified" } else { "identified" }});
+            if !verifying {
+                summary["end_of_data_mark"] = json!("present");
+            }
+            Ok(summary)
+        }
         remanence_parity::TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => Ok(
-            json!({"finalized": false, "object_count": null, "status": terminal_recovery_status(&recovery.reason)}),
+            json!({"finalized": false, "object_count": null, "status": terminal_recovery_status(&recovery.reason), "end_of_data_mark": if recovery.reason == remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound { "not_found" } else { "present" }}),
         ),
     }
 }
@@ -4152,6 +4166,7 @@ mod tests {
         for reason in [
             BotStructuralRecoveryReason::NoUsableTerminalLayout,
             BotStructuralRecoveryReason::AllMembersInvalid,
+            BotStructuralRecoveryReason::EndOfDataNotFound,
         ] {
             let outcome = TerminalInventoryOutcome::BotStructuralRecoveryRequired(Box::new(
                 BotStructuralRecoveryRequired {

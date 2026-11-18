@@ -371,6 +371,12 @@ fn build_recovery_report(
                 truncation: None,
             }
         }
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery)
+            if recovery.reason
+                == remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound =>
+        {
+            return Err("read terminal tape index: SPACE(EOD): drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list".to_string());
+        }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(_) => {
             let scan = scan_reconstruct_filemark_map_with_report_mode(
                 source, &tape_uuid, block_size, mode,
@@ -2651,5 +2657,77 @@ mod tests {
         assert!(String::from_utf8(stderr)
             .expect("error is UTF-8")
             .contains("write human recovery report"));
+    }
+    /// A missing-mark hand-off cannot turn the debug report into a successful BOT walk.
+    #[test]
+    fn missing_mark_debug_report_refuses_before_bot_walk() {
+        use remanence_chaos::model::{
+            DeviceRole, ModelTransport, Record, VirtualTape, VirtualWorld,
+        };
+        use remanence_library::{DriveHandle, StaticAllowlist};
+        use std::sync::{Arc, Mutex};
+        for empty in [true, false] {
+            let files = plaintext_image(false);
+            let mut tape = VirtualTape::empty(1 << 30, BLOCK_SIZE);
+            tape.records = files[0]
+                .chunks_exact(BLOCK_SIZE as usize)
+                .map(|b| Record::Block(b.to_vec()))
+                .collect();
+            tape.records.push(Record::Filemark);
+            tape.records.push(if empty {
+                Record::Filemark
+            } else {
+                Record::Block(vec![0x35; BLOCK_SIZE as usize])
+            });
+            let keep = tape.records.len();
+            let mut world =
+                VirtualWorld::single_drive("PLR-DEBUG-LIB", 0x100, "PLR-DEBUG", 0x400, 1);
+            world.put_tape_in_drive(0x100, "PLR001L9", Some(0x400), tape);
+            world.power_cut_during_write(0x100, keep).unwrap();
+            let world = Arc::new(Mutex::new(world));
+            let mut drive = DriveHandle::open_standalone_with_transport(
+                Path::new("/virtual/plr-debug"),
+                Box::new(ModelTransport::new(
+                    world.clone(),
+                    DeviceRole::Drive { bay: 0x100 },
+                )),
+                &StaticAllowlist::new(["PLR-DEBUG"]),
+            )
+            .unwrap();
+            assert!(drive.test_unit_ready().is_err());
+            drive.test_unit_ready().unwrap();
+            drive.locate(0).unwrap();
+            world.lock().unwrap().command_log.clear();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_raw_recovery_report(
+                &mut remanence_parity::DriveHandleRawSource::new(&mut drive),
+                &[BLOCK_SIZE],
+                None,
+                true,
+                &mut out,
+                &mut err,
+            );
+            let err = String::from_utf8(err).unwrap();
+            assert_eq!(
+                code,
+                ExitCode::from(1),
+                "empty-file debug report refuses (empty={empty}): {err}"
+            );
+            assert!(out.is_empty());
+            let world = world.lock().unwrap();
+            let commands = &world.command_log;
+            let space = commands
+                .iter()
+                .position(|c| c.opcode == 0x11)
+                .expect("SPACE(EOD) attempted");
+            assert!(
+                !commands[space + 1..]
+                    .iter()
+                    .any(|c| matches!(c.opcode, 0x92 | 0x2b | 0x08 | 0x11)),
+                "no BOT walk starts: {commands:?}"
+            );
+            assert!(err.contains("read terminal tape index: SPACE(EOD): drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list"),"debug diagnostic names missing mark: {err}");
+        }
     }
 }

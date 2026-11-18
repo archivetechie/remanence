@@ -1188,6 +1188,8 @@ fn bot_recovered_summary_reports_present_zero_counts_and_no_terminal_selection()
     let projected = bot_structural_recovery_to_proto(
         RANGE_TAPE_UUID,
         BotStructuralRecoverySummary {
+            end_of_data_mark: remanence_parity::EndOfDataMark::Present,
+            unresolved_from: None,
             bootstrap_recovery_hints: None,
             structural_entry_count: 3,
             complete_object_count: 1,
@@ -1350,6 +1352,8 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
     let recovery = remanence_parity::TerminalIndexRecoveryRequired {
         measured_eod: PhysicalPositionHint::new(9),
         bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+            end_of_data_mark: remanence_parity::EndOfDataMark::Present,
+            unresolved_from: None,
             bootstrap_recovery_hints: None,
             structural_entry_count: 3,
             complete_object_count: 1,
@@ -1471,6 +1475,8 @@ fn recovery_required_verification_projects_measured_bot_evidence() {
             remanence_parity::TerminalIndexRecoveryRequired {
                 measured_eod: remanence_parity::PhysicalPositionHint::new(123),
                 bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+                    end_of_data_mark: remanence_parity::EndOfDataMark::NotReached,
+                    unresolved_from: None,
                     bootstrap_recovery_hints: None,
                     structural_entry_count: 7,
                     complete_object_count: 4,
@@ -1551,6 +1557,8 @@ fn recovery_outcome_with(
         remanence_parity::TerminalIndexRecoveryRequired {
             measured_eod: remanence_parity::PhysicalPositionHint::new(123),
             bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+                end_of_data_mark: remanence_parity::EndOfDataMark::NotReached,
+                unresolved_from: None,
                 bootstrap_recovery_hints: None,
                 structural_entry_count: 7,
                 complete_object_count: 4,
@@ -10350,6 +10358,29 @@ fn terminal_inventory_stream_proto_preserves_complete_book_rows() {
 
 #[test]
 fn bot_recovery_control_events_preserve_start_and_boundary_evidence() {
+    use prost::Message;
+    for (reason, raw) in [
+        (BotStructuralRecoveryReason::NoUsableTerminalLayout, 1),
+        (BotStructuralRecoveryReason::AllMembersInvalid, 2),
+        (BotStructuralRecoveryReason::EndOfDataNotFound, 3),
+    ] {
+        let item = bot_recovery_control_event_to_proto(
+            &BotStructuralRecoveryEvent::Started,
+            RANGE_TAPE_UUID,
+            256 * 1024,
+            reason,
+        );
+        let decoded = pb::TapeInventoryStreamItem::decode(item.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(item, decoded, "wire round trip retains the recovery reason");
+        let Some(pb::tape_inventory_stream_item::Item::BotRecoveryStarted(start)) = decoded.item
+        else {
+            panic!("typed start")
+        };
+        assert_eq!(start.reason, raw, "all three declared wire values");
+        assert_eq!(start.tape_uuid, RANGE_TAPE_UUID);
+        assert_eq!(start.block_size, 256 * 1024);
+    }
+
     let started = bot_recovery_control_event_to_proto(
         &BotStructuralRecoveryEvent::Started,
         RANGE_TAPE_UUID,

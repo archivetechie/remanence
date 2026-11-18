@@ -510,6 +510,9 @@ pub(crate) fn bot_recovery_control_event_to_proto(
                     BotStructuralRecoveryReason::AllMembersInvalid => {
                         pb::TapeInventoryBotRecoveryReason::AllMembersInvalid as i32
                     }
+                    BotStructuralRecoveryReason::EndOfDataNotFound => {
+                        pb::TapeInventoryBotRecoveryReason::EndOfDataNotFound as i32
+                    }
                 },
             })
         }
@@ -577,6 +580,9 @@ pub(crate) fn bot_recovery_reason_detail(reason: BotStructuralRecoveryReason) ->
         }
         BotStructuralRecoveryReason::AllMembersInvalid => {
             "terminal replicas A, B, and C are invalid; structural recovery from BOT is required"
+        }
+        BotStructuralRecoveryReason::EndOfDataNotFound => {
+            "end_of_data_not_found; structural recovery from BOT is required"
         }
     }
 }
@@ -988,6 +994,14 @@ pub(crate) fn bot_structural_recovery_to_proto(
     } else {
         ""
     };
+    let unresolved = if summary.end_of_data_mark == remanence_parity::EndOfDataMark::NotFound {
+        let position = summary
+            .unresolved_from
+            .expect("missing end-of-data mark requires an unresolved position");
+        format!("; end_of_data_mark=not_found; unresolved_from partition={} lba={}; remaining tape unresolved", position.partition, position.lba)
+    } else {
+        String::new()
+    };
     pb::TapeInventory {
         tape_uuid: tape_uuid.to_vec(),
         outcome: pb::TapeInventoryOutcome::BotStructuralRecovered as i32,
@@ -1007,7 +1021,7 @@ pub(crate) fn bot_structural_recovery_to_proto(
         canonical_map_digest: Some(summary.canonical_map_digest.to_vec()),
         inventory_basis: "bot_structural_recovery".to_string(),
         detail: format!(
-            "terminal index unavailable; BOT recovery classified {} recovered, {} unknown, and {} incomplete Object candidates{provenance}",
+            "terminal index unavailable; BOT recovery classified {} recovered, {} unknown, and {} incomplete Object candidates{provenance}{unresolved}",
             summary.recovered_object_count,
             summary.unknown_object_count,
             summary.incomplete_object_count

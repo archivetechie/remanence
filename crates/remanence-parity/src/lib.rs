@@ -76,12 +76,14 @@ pub use bootstrap::{
 pub use bot_recovery::{
     recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_controlled,
     recover_terminal_inventory_from_bot_controlled_mode,
+    recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule,
     recover_terminal_inventory_from_bot_with_authority,
     recover_terminal_inventory_from_bot_with_authority_controlled,
-    recover_terminal_inventory_from_bot_with_authority_controlled_mode, BotObjectRecoveryAuthority,
-    BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, BotRecoveredObject,
-    BotRecoveredObjectState, BotStructuralRecoveryError, BotStructuralRecoveryEvent,
-    BotStructuralRecoverySummary,
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode,
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule,
+    BotObjectRecoveryAuthority, BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope,
+    BotRecoveredObject, BotRecoveredObjectState, BotStructuralRecoveryError,
+    BotStructuralRecoveryEvent, BotStructuralRecoverySummary,
 };
 pub use capacity::{
     CapacityReserveCause, CapacityReserveRemedy, TerminalTripleCloseInput,
