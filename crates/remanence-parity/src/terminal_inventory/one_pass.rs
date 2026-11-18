@@ -100,12 +100,7 @@ impl From<TerminalIndexVerificationError> for AttemptError {
         use TerminalIndexVerificationError::*;
         let reason = match error {
             Cancelled => return Self::Fatal(error),
-            Source { .. } => {
-                return Self::RejectedWithSource {
-                    reason: "source",
-                    context: error.to_string(),
-                }
-            }
+            Source { .. } => "source",
             BlockSize(_) => "block_size",
             NoCompleteLayout { .. } => "no_complete_layout",
             ConflictingLayouts { .. } => "conflicting_layouts",
@@ -160,7 +155,16 @@ pub(super) fn verify_one_pass(
         measured_eod,
         layout,
         no_parity,
-    } = plan_terminal_verification(source, tape_uuid, block_size)?;
+    } = plan_terminal_verification(source, tape_uuid, block_size).map_err(|failure| {
+        if failure.missing_end_of_data {
+            AttemptError::RejectedWithSource {
+                reason: "source",
+                context: failure.error.to_string(),
+            }
+        } else {
+            AttemptError::from(failure.error)
+        }
+    })?;
     // A validated footer's zero protected bound selects the walk without more I/O.
     // This hint never establishes a verdict: the walk checks contradictory payloads too.
     if no_parity {

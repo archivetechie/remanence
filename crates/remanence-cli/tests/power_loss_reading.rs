@@ -617,6 +617,8 @@ fn new_put_finalize_and_supersede_refuse_missing_mark() {
             "admission {action}: missing_reads={} output={} stderr={}",
             output.trace.missing_reads, output.out, output.err
         );
+        // Put and supersede-tail are refusal-only evidence: identity invalidation
+        // refuses first. Finalize reaches the append-suffix guard.
         if action == "put" {
             assert!(
                 output
@@ -626,6 +628,38 @@ fn new_put_finalize_and_supersede_refuse_missing_mark() {
                     .any(|c| c.first() == Some(&0x08)),
                 "read admission reached media"
             );
+            assert!(
+                output.trace.missing_reads >= 1,
+                "put reads the missing mark"
+            );
+            let summary = output
+                .out
+                .lines()
+                .filter(|line| line.starts_with('{'))
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|item| item["event"] == "summary")
+                .expect("put emits its failed-item summary");
+            let error = summary["failed"]["error"]
+                .as_str()
+                .expect("failed put item names its error");
+            assert!(
+                error.contains("tape identity invalidated"),
+                "put refused by identity invalidation: {error}"
+            );
+        } else {
+            let envelope = envelope(&output);
+            let error = envelope["error"].as_str().unwrap();
+            if action == "finalize" {
+                assert!(
+                    error.contains("append suffix"),
+                    "finalize refused by append suffix: {error}"
+                );
+            } else {
+                assert!(
+                    error.contains("tape identity invalidated"),
+                    "supersede-tail refused by identity invalidation: {error}"
+                );
+            }
         }
     }
 }
@@ -673,6 +707,12 @@ fn standalone_verification_initial_and_post_damage_refuse() {
                 error.contains("drive reports no end-of-data mark"),
                 "diagnostic names missing mark: {error}"
             );
+            if after_damage {
+                assert!(
+                    error.contains("sense=[70, 00, 03, 00, 00, 00, 00, 18, 00, 00, 00, 00, 14, 00"),
+                    "post-damage refusal preserves drive sense: {error}"
+                );
+            }
         } else {
             assert_eq!(
                 error,

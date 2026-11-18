@@ -164,6 +164,17 @@ fn initial(route: VerificationRoute) {
                 vec!["eod", "eod"]
             }
         );
+        if route == VerificationRoute::OnePass {
+            assert_eq!(
+                statuses.last(),
+                Some(&VerificationRouteStatus {
+                    route: VerificationRoute::Walk,
+                    fell_back: true,
+                    fallback_reason: Some("source"),
+                }),
+                "initial missing mark falls back for a source failure"
+            );
+        }
         println!(
             "{route:?} calls={:?} error={error} statuses={statuses:?}",
             source.calls

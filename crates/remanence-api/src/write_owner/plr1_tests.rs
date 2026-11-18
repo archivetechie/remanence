@@ -106,17 +106,6 @@ fn with_cut_io<R>(
         },
     )
     .unwrap();
-    // Opening replay authority cleans stale temporary spools from the crash image.
-    // Establish that ready-host state before comparing durable files around the handler.
-    drop(
-        remanence_state::authority::BotRecoveryAuthority::try_open(
-            &cfg.checkpoint_journal_dir,
-            &cfg.index_path,
-            TAPE,
-            BLOCK,
-        )
-        .unwrap(),
-    );
     test(&mut index, &mut cfg, &mut drive, &world, temp.path())
 }
 use pb::tape_inventory_stream_item::Item;
@@ -171,19 +160,47 @@ fn summary(items: &[pb::TapeInventoryStreamItem]) -> &pb::TapeInventory {
         })
         .unwrap()
 }
+/// Permit only this tape's disposable journal temporaries to disappear.
+#[track_caller]
 fn unchanged(
     root: &Path,
     before: BTreeMap<PathBuf, Vec<u8>>,
     index: &CatalogIndex,
     fences: String,
-) {
+) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
     let after = disk_image(root);
+    let tape_id = uuid::Uuid::from_bytes(TAPE).simple().to_string();
+    let eligible: BTreeSet<_> = before
+        .keys()
+        .filter(|path| {
+            path.parent() == Some(Path::new("native/tapes"))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        ["spool", "initial", "replacement", "repair-record"]
+                            .iter()
+                            .any(|purpose| name.starts_with(&format!(".{purpose}-{tape_id}-")))
+                    })
+        })
+        .cloned()
+        .collect();
+    let deleted: BTreeSet<_> = eligible
+        .iter()
+        .filter(|path| !after.contains_key(*path))
+        .cloned()
+        .collect();
+    println!(
+        "cleanup window at {}: deleted={deleted:?} eligible={eligible:?}",
+        std::panic::Location::caller()
+    );
     let changed: Vec<_> = before
         .keys()
         .chain(after.keys())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter(|path| before.get(*path) != after.get(*path))
+        .filter(|path| !eligible.contains(*path) || after.contains_key(*path))
         .collect();
     assert!(
         changed.is_empty(),
@@ -194,6 +211,7 @@ fn unchanged(
         fences,
         "handler preserves fences"
     );
+    (deleted, eligible)
 }
 fn scan(drive: &mut DriveHandle) -> remanence_parity::ScanWalkResult {
     let result = remanence_parity::scan_reconstruct_filemark_map_with_end_of_data_rule(
@@ -220,10 +238,10 @@ async fn missing_mark_inventory_handler_returns_ok() {
     let end = cut.records.len() as u64;
     assert_eq!(end, 24);
     for authority in [false, true] {
-        let streams:[Vec<_>;2]=[false,true].map(|missing|with_cut(&root,cut,missing,authority,|index,cfg,drive,_,root|{
+        let runs = [false,true].map(|missing|with_cut(&root,cut,missing,authority,|index,cfg,drive,_,root|{
             let before=disk_image(root);let fences=format!("{:?}",index.list_active_tape_io_fences().unwrap());
             let(result,items)=inventory(index,cfg,drive);assert!(result.is_ok(),"inventory handler returns Ok: {result:?}");
-            unchanged(root,before,index,fences);
+            let cleanup = unchanged(root,before,index,fences);
             let s=summary(&items);assert_eq!(s.outcome,pb::TapeInventoryOutcome::BotStructuralRecovered as i32);
             assert_eq!(s.structural_entry_count,Some(6));assert_eq!(s.object_row_count,Some(3));
             assert_eq!(s.recovered_object_count,Some(if authority{3}else{0}));assert_eq!(s.unknown_object_count,Some(if authority{0}else{3}));
@@ -232,8 +250,26 @@ async fn missing_mark_inventory_handler_returns_ok() {
             assert_eq!(started.reason,if missing{3}else{1});
             if missing {assert!(s.detail.ends_with(&format!("; end_of_data_mark=not_found; unresolved_from partition=0 lba={end}; remaining tape unresolved")),"{}",s.detail)}
             else{assert!(!s.detail.contains("end_of_data_mark"));}
-            println!("authority={authority} missing={missing} items={items:?}");items
+            println!("authority={authority} missing={missing} items={items:?}");(items, cleanup)
         }));
+        for (_, (deleted, eligible)) in &runs {
+            if authority {
+                assert_eq!(
+                    deleted, eligible,
+                    "authority removes exactly the eligible temporaries"
+                );
+            } else {
+                assert!(deleted.is_empty(), "absent journal removes no temporaries");
+            }
+        }
+        assert_eq!(
+            runs[0].1, runs[1].1,
+            "marked and missing cleanup agree within one authority setting"
+        );
+        if authority {
+            assert!(!runs[0].1 .1.is_empty(), "authority cleanup is not vacuous");
+        }
+        let streams = runs.map(|(items, _)| items);
         let mut marked = streams[0].clone();
         let mut missing = streams[1].clone();
         for item in &mut marked {
@@ -332,7 +368,11 @@ async fn authority_scope_refuses_shorter_map_after_all_rows_validate() {
         assert!(!items
             .iter()
             .any(|i| matches!(i.item, Some(Item::BotObject(_) | Item::Summary(_)))));
-        unchanged(root, before, index, fences);
+        let (deleted, _) = unchanged(root, before, index, fences);
+        assert!(
+            deleted.is_empty(),
+            "shorter-map setup already cleaned temporaries"
+        );
     });
 }
 #[tokio::test]
@@ -378,14 +418,22 @@ async fn daemon_initial_and_post_damage_verification_refuse() {
                 .expect_err("no successful verdict or EOD_MEASURED");
                 assert_eq!(error.code(), tonic::Code::Unavailable);
                 assert!(error.message().contains("SPACE(EOD)"), "{error}");
+                if route == VerificationRoute::OnePass && !post {
+                    assert!(error.message().contains("one-pass attempt:"), "{error}");
+                }
                 assert!(
                     error
                         .message()
                         .contains("drive reports no end-of-data mark"),
                     "diagnostic names missing mark: {error}"
                 );
-                if route == VerificationRoute::OnePass && !post {
-                    assert!(error.message().contains("one-pass attempt:"), "{error}");
+                if post {
+                    assert!(
+                        error.message().contains(
+                            "sense=[70, 00, 03, 00, 00, 00, 00, 18, 00, 00, 00, 00, 14, 00"
+                        ),
+                        "post-damage refusal preserves drive sense: {error}"
+                    );
                 }
                 let ops = world
                     .lock()
@@ -402,7 +450,11 @@ async fn daemon_initial_and_post_damage_verification_refuse() {
                     "no further positioning after refusal: {ops:?}"
                 );
                 println!("route={route:?} post={post} error={error} ops={ops:?}");
-                unchanged(root, before, index, fences);
+                let (deleted, eligible) = unchanged(root, before, index, fences);
+                assert_eq!(
+                    deleted, eligible,
+                    "verification authority cleans exactly its eligible temporaries"
+                );
             });
         }
     }
@@ -784,7 +836,11 @@ async fn daemon_walk_and_one_pass_late_prefix_keep_missing_signature() {
                     t.commands
                 );
                 drop(t);
-                unchanged(root, before, index, fences);
+                let (deleted, eligible) = unchanged(root, before, index, fences);
+                assert_eq!(
+                    deleted, eligible,
+                    "verification authority cleans exactly its eligible temporaries"
+                );
             },
         );
     }

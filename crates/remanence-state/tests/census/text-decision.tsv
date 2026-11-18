@@ -308,6 +308,7 @@ crates/remanence-parity/src/sink.rs::validate_bounded_resume_prefix::text-find	1
 crates/remanence-parity/src/tape_index.rs::decode_tape_index_payload_object_row_slot::text-equality	1
 crates/remanence-parity/src/tape_index.rs::decode_tape_index_payload_object_row_slot::text-match	2
 crates/remanence-parity/src/terminal_inventory.rs::verify_terminal_index_after_damage::text-equality	1
+crates/remanence-parity/src/terminal_inventory.rs::verify_terminal_index_after_damage::text-strip_prefix	1
 crates/remanence-parity/src/terminal_inventory/one_pass.rs::verify_terminal_index_full_with_route::text-equality	1
 crates/remanence-parity/src/verify_protected.rs::verify_sidecar_observed::text-equality	1
 crates/remanence-parity/src/verify_protected/forward.rs::with_crc::text-match	1

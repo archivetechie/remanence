@@ -554,9 +554,9 @@ where
             return Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(
                 Box::new(BotStructuralRecoveryRequired {
                     reason: BotStructuralRecoveryReason::EndOfDataNotFound,
-                    replicas: missing_evidence(
-                        "drive reports no end-of-data mark; terminal members not inspected",
-                    ),
+                    replicas: missing_evidence(&format!(
+                        "{MISSING_END_OF_DATA_DETAIL_PREFIX}{error}"
+                    )),
                 }),
             ));
         }
@@ -1009,9 +1009,19 @@ fn verify_terminal_index_after_damage<V: ProtectedPass>(
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery)
             if recovery.reason == BotStructuralRecoveryReason::EndOfDataNotFound =>
         {
+            let mut message = MISSING_END_OF_DATA_DIAGNOSTIC.to_string();
+            if let Some(detail) = recovery.replicas.first().and_then(|replica| match replica {
+                TerminalReplicaEvidence::Invalid(failure) => failure
+                    .detail
+                    .strip_prefix(MISSING_END_OF_DATA_DETAIL_PREFIX),
+                _ => None,
+            }) {
+                message.push_str("; ");
+                message.push_str(detail);
+            }
             return Err(TerminalIndexVerificationError::Source {
                 operation: "SPACE(EOD)",
-                message: MISSING_END_OF_DATA_DIAGNOSTIC.to_string(),
+                message,
             });
         }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
@@ -1749,24 +1759,54 @@ struct TerminalVerificationPlan {
     no_parity: bool,
 }
 
+/// Preserve only the initial typed missing-mark failure for a one-pass fallback.
+struct TerminalVerificationPlanError {
+    error: TerminalIndexVerificationError,
+    missing_end_of_data: bool,
+}
+
+impl From<TerminalIndexVerificationError> for TerminalVerificationPlanError {
+    fn from(error: TerminalIndexVerificationError) -> Self {
+        Self {
+            error,
+            missing_end_of_data: false,
+        }
+    }
+}
+
+impl From<TerminalVerificationPlanError> for TerminalIndexVerificationError {
+    fn from(error: TerminalVerificationPlanError) -> Self {
+        error.error
+    }
+}
+
 /// Configure the source, measure EOD and select its unique complete terminal layout.
 fn plan_terminal_verification(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
-) -> Result<TerminalVerificationPlan, TerminalIndexVerificationError> {
-    validate_terminal_index_block_size_hint(block_size)?;
+) -> Result<TerminalVerificationPlan, TerminalVerificationPlanError> {
+    validate_terminal_index_block_size_hint(block_size)
+        .map_err(TerminalIndexVerificationError::from)?;
     source
         .configure_fixed_block_size(block_size)
         .map_err(|error| verification_source_error("configure fixed block size", error))?;
-    let measured_eod = source
-        .locate_end_of_data()
-        .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
+    let measured_eod =
+        source
+            .locate_end_of_data()
+            .map_err(|error| TerminalVerificationPlanError {
+                missing_end_of_data: matches!(
+                    &error,
+                    ParityError::TapeIo(error) if tape_error_is_end_of_data_not_found(error, 0x11)
+                ),
+                error: verification_source_error("SPACE(EOD)", error),
+            })?;
     if measured_eod.partition != 0 {
         return Err(TerminalIndexVerificationError::Source {
             operation: "SPACE(EOD)",
             message: format!("returned unsupported partition {}", measured_eod.partition),
-        });
+        }
+        .into());
     }
 
     let mut no_parity_layouts = Vec::new();
@@ -1792,13 +1832,15 @@ fn plan_terminal_verification(
         [] => {
             return Err(TerminalIndexVerificationError::NoCompleteLayout {
                 measured_eod_lba: measured_eod.lba,
-            })
+            }
+            .into())
         }
         [layout] => *layout,
         _ => {
             return Err(TerminalIndexVerificationError::ConflictingLayouts {
                 count: layouts.len(),
-            })
+            }
+            .into())
         }
     };
 
@@ -2807,7 +2849,14 @@ fn source_error(operation: &'static str, error: ParityError) -> TerminalInventor
     }
 }
 
-const MISSING_END_OF_DATA_DIAGNOSTIC: &str =
+const MISSING_END_OF_DATA_DETAIL_PREFIX: &str =
+    "drive reports no end-of-data mark; terminal members not inspected; SPACE(EOD): ";
+
+/// Missing-mark statement for a recovery that the operator has already attempted.
+pub const MISSING_END_OF_DATA_STATEMENT: &str = "drive reports no end-of-data mark";
+
+/// Missing-mark diagnostic with advice for callers that refuse recovery.
+pub const MISSING_END_OF_DATA_DIAGNOSTIC: &str =
     "drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list";
 
 /// Preserve the source detail while naming only a matching primary SPACE signature.

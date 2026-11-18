@@ -375,7 +375,10 @@ fn build_recovery_report(
             if recovery.reason
                 == remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound =>
         {
-            return Err("read terminal tape index: SPACE(EOD): drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list".to_string());
+            return Err(format!(
+                "read terminal tape index: SPACE(EOD): {}",
+                remanence_parity::MISSING_END_OF_DATA_DIAGNOSTIC
+            ));
         }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(_) => {
             let scan = scan_reconstruct_filemark_map_with_report_mode(

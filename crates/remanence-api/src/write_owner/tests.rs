@@ -1224,6 +1224,30 @@ fn bot_recovered_summary_reports_present_zero_counts_and_no_terminal_selection()
     assert_eq!(projected.payload_digest, None);
 }
 
+/// A synthetic missing-mark summary must remain renderable without a position.
+#[test]
+fn bot_recovered_missing_mark_without_unresolved_position_reports_unavailable() {
+    let projected = bot_structural_recovery_to_proto(
+        RANGE_TAPE_UUID,
+        BotStructuralRecoverySummary {
+            end_of_data_mark: remanence_parity::EndOfDataMark::NotFound,
+            unresolved_from: None,
+            bootstrap_recovery_hints: None,
+            structural_entry_count: 3,
+            complete_object_count: 1,
+            recovered_object_count: 1,
+            unknown_object_count: 0,
+            incomplete_object_count: 0,
+            canonical_map_digest: [0x44; 32],
+            damaged_region_count: 0,
+        },
+    );
+    assert_eq!(
+        projected.detail,
+        "terminal index unavailable; BOT recovery classified 1 recovered, 0 unknown, and 0 incomplete Object candidates; end_of_data_mark=not_found; unresolved_from unavailable; remaining tape unresolved"
+    );
+}
+
 #[test]
 fn separation_health_keeps_a_two_record_zero_and_omits_an_invalid_count() {
     let rows = terminal_separation_health(&[

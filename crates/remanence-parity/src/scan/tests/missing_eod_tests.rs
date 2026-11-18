@@ -415,6 +415,48 @@ fn confirmation_refuses() {
     }
 }
 
+/// A refused opted-in recovery names the mark without recommending the same recovery.
+#[test]
+fn bot_recovery_advice_respects_end_of_data_rule() {
+    for rule in [EndOfDataRule::StopWhenConfirmed, EndOfDataRule::Refuse] {
+        let mut fixture = Fixture::new(records(BLOCK_SIZE, true), BLOCK_SIZE, Some(MISSING));
+        let mut source = fixture.source();
+        source.locate_fault = Some(LocateFault::Fail);
+        let error =
+            crate::recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule(
+                &mut source,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                ScanMode::Standard,
+                rule,
+                |_| ScanWalkControl::Continue,
+                |_| Ok(()),
+            )
+            .expect_err("missing mark cannot be confirmed");
+        let crate::BotStructuralRecoveryError::Scan { message } = error else {
+            panic!("expected Scan refusal: {error:?}");
+        };
+        assert!(
+            message.contains("drive reports no end-of-data mark"),
+            "{message}"
+        );
+        if rule == EndOfDataRule::StopWhenConfirmed {
+            assert!(
+                !message.contains("use rem tape"),
+                "no circular recovery advice: {message}"
+            );
+        } else {
+            assert!(
+                message.contains(concat!(
+                    "drive reports no end-of-data mark; ",
+                    "use rem tape identify or rem tape restore --scan --list"
+                )),
+                "Refuse retains full diagnostic: {message}"
+            );
+        }
+    }
+}
+
 /// T7. A missing-mark READ in the middle of a marked tape follows damaged-head recovery.
 #[test]
 fn middle_read_preserves_later_files() {

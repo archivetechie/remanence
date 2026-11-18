@@ -208,7 +208,7 @@ pub use terminal_inventory::{
     TerminalInventoryOutcome, TerminalInventoryReadError, TerminalInventorySelection,
     TerminalInventoryStreamEvent, TerminalReplicaEvidence, TerminalReplicaFailure,
     TerminalReplicaFailureKind, TerminalSeparationEvidence, VerificationRoute,
-    VerificationRouteStatus,
+    VerificationRouteStatus, MISSING_END_OF_DATA_DIAGNOSTIC, MISSING_END_OF_DATA_STATEMENT,
 };
 pub use terminal_tail::{
     validate_terminal_index_block_size, TerminalTailComponentKind, TerminalTailComponentPlan,

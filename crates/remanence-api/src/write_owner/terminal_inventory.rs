@@ -995,10 +995,10 @@ pub(crate) fn bot_structural_recovery_to_proto(
         ""
     };
     let unresolved = if summary.end_of_data_mark == remanence_parity::EndOfDataMark::NotFound {
-        let position = summary
-            .unresolved_from
-            .expect("missing end-of-data mark requires an unresolved position");
-        format!("; end_of_data_mark=not_found; unresolved_from partition={} lba={}; remaining tape unresolved", position.partition, position.lba)
+        match summary.unresolved_from {
+            Some(position) => format!("; end_of_data_mark=not_found; unresolved_from partition={} lba={}; remaining tape unresolved", position.partition, position.lba),
+            None => "; end_of_data_mark=not_found; unresolved_from unavailable; remaining tape unresolved".to_string(),
+        }
     } else {
         String::new()
     };

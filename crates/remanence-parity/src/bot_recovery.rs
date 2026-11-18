@@ -428,7 +428,11 @@ where
         error => {
             let mut message = error.to_string();
             if matches!(&error, ParityError::TapeIo(error) if tape_error_is_end_of_data_not_found(error, 0x11)) {
-                message.push_str("; drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list");
+                message.push_str("; ");
+                message.push_str(match rule {
+                    EndOfDataRule::Refuse => crate::MISSING_END_OF_DATA_DIAGNOSTIC,
+                    EndOfDataRule::StopWhenConfirmed => crate::MISSING_END_OF_DATA_STATEMENT,
+                });
             }
             BotStructuralRecoveryError::Scan { message }
         },
