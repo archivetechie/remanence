@@ -34,15 +34,14 @@ async fn caller_matrix(caller: &str) {
         ("suffix", true),
         ("structural", true),
     ] {
-        let (mut typed, root) = typed_root();
-        let mut index = typed.catalog().write_handle();
-        // setup supplies only the virtual world; its legacy catalog is never read.
-        let world = setup(&root);
+        let root = DurabilityRoot::new(BARCODE, caller != "terminal");
+        let mut index = root.state.write_handle();
+        let world = model_world(BARCODE, caller != "terminal");
         if caller != "terminal" {
-            typed_due_tape(&typed, &root, world.clone()).await;
+            typed_due_tape(&root, world.clone()).await;
         }
         let mut library = open_model_library(world.clone());
-        let cfg = typed_config(&typed, &library);
+        let cfg = root.config(&library);
         let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
         let mut selection = selected();
         // Terminal admission refuses before writing any component; initialize its plan authority.
@@ -319,6 +318,8 @@ async fn caller_matrix(caller: &str) {
             .map(|v| v.to_str().unwrap().to_owned());
         let library_uuid = cfg.authority.runtime().unwrap().manifest().library_uuid();
         drop((index, cfg, drive, library, connection));
+        drop(root.state);
+        let mut typed = root.typed;
         let raised = typed
             .records(|record| (record.tag() == lib::Tag::FenceRaised).then_some(()))
             .await;

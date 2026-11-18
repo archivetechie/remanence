@@ -77,12 +77,12 @@ async fn rra1_reset_position_hardware_error_is_media() {
 /// Each sense case owns a fresh tape, authority, model world, and reset-invalidated handle.
 #[cfg(target_os = "linux")]
 async fn reset_position_failure_is_media(sense: (u8, u8, u8)) {
-    let (typed, root) = typed_root();
-    let mut index = typed.catalog().write_handle();
-    let world = setup(&root);
-    typed_due_tape(&typed, &root, world.clone()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let mut index = root.state.write_handle();
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     let mut library = open_model_library(world.clone());
-    let cfg = typed_config(&typed, &library);
+    let cfg = root.config(&library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let start = arm_reset(&mut drive, &world);
     world
@@ -102,12 +102,12 @@ async fn reset_position_failure_is_media(sense: (u8, u8, u8)) {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn rra1_reset_block_size_mismatch_remains_transient() {
-    let (typed, root) = typed_root();
-    let mut index = typed.catalog().write_handle();
-    let world = setup(&root);
-    typed_due_tape(&typed, &root, world.clone()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let mut index = root.state.write_handle();
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     let mut library = open_model_library(world.clone());
-    let cfg = typed_config(&typed, &library);
+    let cfg = root.config(&library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     arm_reset(&mut drive, &world);
     world
@@ -139,10 +139,10 @@ async fn rra1_reset_block_size_mismatch_remains_transient() {
 #[cfg(target_os = "linux")]
 #[test]
 fn rra1_unarmed_write_preparation_starts_with_rewind() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let mut library = open_model_library(world.clone());
-    let cfg = config(root.path(), &library);
+    let cfg = root.config(&library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let start = world.lock().unwrap().command_log.len();
     let result = prepare_drive_for_write(

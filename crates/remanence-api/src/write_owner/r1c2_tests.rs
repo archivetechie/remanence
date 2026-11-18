@@ -264,14 +264,11 @@ fn mounted_admission_refuses_the_endpoints_own_unresolved_motion() {
     let policy = remanence_library::StaticAllowlist::new([SERIAL]);
     let drive = library.open_drive(BAY_A, &policy).unwrap();
     let index = t.root.catalog().write_handle();
-    let mut cfg = test_write_owner_config(
-        t.root.paths().sqlite_path.clone(),
-        t.root.paths().audit_dir.clone(),
+    let mut cfg = test_typed_write_owner_config(
+        &t.root,
         &library,
         library_snapshot_cell(library_state.clone()),
     );
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(t.runtime.clone());
-    cfg.catalog = t.root.catalog();
     cfg.placement =
         crate::write_owner::ActorPlacement::Mounted(crate::write_owner::MountedDriveContext {
             endpoint: drive.endpoint().durable_key().unwrap().clone(),
@@ -458,15 +455,13 @@ fn load_drive_no_wait_leaves_no_readiness_row_and_the_restart_starts() {
         let state = root.open();
         let mut index = state.write_handle();
         let mut library = open_model_library(world.clone());
-        let mut cfg = test_write_owner_config(
-            root.paths.sqlite_path.clone(),
-            root.paths.audit_dir.clone(),
+        let cfg = test_state_write_owner_config(
+            &state,
             &library,
             library_snapshot_cell(library.library().clone()),
         );
-        cfg.catalog = state.projection_client();
-        cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
-        let api = crate::ApiState::new(state.projection_client());
+        let mut api = crate::ApiState::new(state.projection_client());
+        api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
         let operation = api
             .accept_owner_request(
                 AuditActor::User("loader".into()),
@@ -742,15 +737,13 @@ fn waited_load(
         &HashSet::from([SERIAL.to_string()]),
     )
     .unwrap();
-    let mut cfg = test_write_owner_config(
-        root.paths.sqlite_path.clone(),
-        root.paths.audit_dir.clone(),
+    let cfg = test_state_write_owner_config(
+        &state,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.catalog = state.projection_client();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
-    let api = crate::ApiState::new(state.projection_client());
+    let mut api = crate::ApiState::new(state.projection_client());
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     let operation = api
         .accept_owner_request(
             AuditActor::User("loader".into()),
@@ -1379,15 +1372,13 @@ fn failed_waited_load(
         &HashSet::from([SERIAL.to_string()]),
     )
     .unwrap();
-    let mut cfg = test_write_owner_config(
-        root.paths.sqlite_path.clone(),
-        root.paths.audit_dir.clone(),
+    let cfg = test_state_write_owner_config(
+        &state,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.catalog = state.projection_client();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
-    let api = crate::ApiState::new(state.projection_client());
+    let mut api = crate::ApiState::new(state.projection_client());
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     let operation = api
         .accept_owner_request(
             AuditActor::User("loader".into()),
@@ -1890,7 +1881,6 @@ fn readiness_owner_shutdown_keeps_initializing_load_budget_spent() {
 
 /// Exercise a refused waited load through the typed owner and persist its Failed outcome.
 fn fx1_refused_waited_load(
-    root: &Root,
     state: &remanence_state::StateHandle,
     library: &mut remanence_library::LibraryHandle,
     observe_drive: bool,
@@ -1904,15 +1894,13 @@ fn fx1_refused_waited_load(
         )
         .unwrap();
     }
-    let mut cfg = test_write_owner_config(
-        root.paths.sqlite_path.clone(),
-        root.paths.audit_dir.clone(),
+    let cfg = test_state_write_owner_config(
+        state,
         library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.catalog = state.projection_client();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
-    let api = crate::ApiState::new(state.projection_client());
+    let mut api = crate::ApiState::new(state.projection_client());
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     let operation = api
         .accept_owner_request(
             AuditActor::User("loader".into()),
@@ -1954,7 +1942,7 @@ fn fx1_waited_empty_slot_leaves_no_readiness_row_across_restart() {
     {
         let state = root.open();
         let mut library = open_model_library(world.clone());
-        fx1_refused_waited_load(&root, &state, &mut library, true);
+        fx1_refused_waited_load(&state, &mut library, true);
         no_active_readiness_rows(&state);
     }
     let (state, api, runtime) = start_daemon(&root, &world, plain)
@@ -2067,7 +2055,7 @@ fn fx1_waited_move_check_condition_leaves_no_readiness_row() {
             }
         })
         .unwrap();
-    fx1_refused_waited_load(&root, &state, &mut library, true);
+    fx1_refused_waited_load(&state, &mut library, true);
     assert_eq!(attempts.load(Ordering::SeqCst), 1, "MOVE CDB attempted");
     no_active_readiness_rows(&state);
 }
@@ -2090,7 +2078,7 @@ fn fx1_waited_unopenable_drive_leaves_no_readiness_row_across_restart() {
                 }
             })
             .unwrap();
-        fx1_refused_waited_load(&root, &state, &mut library, true);
+        fx1_refused_waited_load(&state, &mut library, true);
         assert_eq!(drive_load_commands_on(&world, BAY_A), 0, "no LOAD CDB");
         assert_eq!(
             world.lock().unwrap().loaded_barcode(BAY_A),
@@ -2122,7 +2110,7 @@ fn fx1_waited_begin_refusal_leaves_moved_cartridge_without_readiness_row() {
     let world = waited_world();
     let state = root.open();
     let mut library = open_model_library(world.clone());
-    fx1_refused_waited_load(&root, &state, &mut library, false);
+    fx1_refused_waited_load(&state, &mut library, false);
     assert!(
         world
             .lock()
@@ -2160,15 +2148,13 @@ fn fx1_measure_startup_after_move_done_and_begin_without_load_intent() {
             &HashSet::from([SERIAL.to_string()]),
         )
         .unwrap();
-        let mut cfg = test_write_owner_config(
-            root.paths.sqlite_path.clone(),
-            root.paths.audit_dir.clone(),
+        let cfg = test_state_write_owner_config(
+            &state,
             &library,
             library_snapshot_cell(library.library().clone()),
         );
-        cfg.catalog = state.projection_client();
-        cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
-        let api = crate::ApiState::new(state.projection_client());
+        let mut api = crate::ApiState::new(state.projection_client());
+        api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
         operation = api
             .accept_owner_request(
                 AuditActor::User("loader".into()),
@@ -2260,15 +2246,13 @@ fn startup_slow_first_load_is_abandoned_and_reconciled() {
             &HashSet::from([SERIAL.to_string()]),
         )
         .unwrap();
-        let mut cfg = test_write_owner_config(
-            root.paths.sqlite_path.clone(),
-            root.paths.audit_dir.clone(),
+        let cfg = test_state_write_owner_config(
+            &state,
             &library,
             library_snapshot_cell(library.library().clone()),
         );
-        cfg.catalog = state.projection_client();
-        cfg.authority = crate::write_owner::TerminalAuthority::Typed(state.library_runtime());
-        let api = crate::ApiState::new(state.projection_client());
+        let mut api = crate::ApiState::new(state.projection_client());
+        api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
         operation = api
             .accept_owner_request(
                 AuditActor::User("loader".into()),

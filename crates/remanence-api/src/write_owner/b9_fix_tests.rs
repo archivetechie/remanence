@@ -1,16 +1,16 @@
 //! B9 review regressions through real actors, admission, and model-only media.
-use super::b6b_fix_tests::{native_records, selection};
+use super::b6b_fix_tests::{native_records_in, selection};
 use super::*;
 use remanence_state::tape_log::Record as NativeRecord;
 
 /// Open through the dispatch loop so actor ownership participates in every assertion.
-async fn live_actor(root: &Path) -> (crate::ApiState, DrivePool, Uuid) {
-    let world = setup(root);
+async fn live_actor(root: &DurabilityRoot) -> (crate::ApiState, DrivePool, Uuid) {
+    let world = model_world(BARCODE, true);
     let mut library = open_model_library(world);
     let lifecycle = DrivePoolLifecycle::default();
     let key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
-    let mut cfg = config(root, &library);
+    let mut cfg = root.config(&library);
     cfg.lifecycle = Some(lifecycle.clone());
     cfg.reservations = reservations.clone();
     let drive = library.open_drive(BAY, &cfg.policy).unwrap();
@@ -22,7 +22,7 @@ async fn live_actor(root: &Path) -> (crate::ApiState, DrivePool, Uuid) {
         reservations,
         lifecycle,
     );
-    let mut state = super::b7_tests::state(root);
+    let mut state = root.api_state();
     state.library_snapshot = Some(library_snapshot_cell(library.library().clone()));
     state.drive_pool = Some(pool.clone());
     let (reply, received) = oneshot::channel();
@@ -69,8 +69,8 @@ fn mounted() -> MountedSession {
 /// A late registration must reach Checkpoint/Close instead of waiting on the live actor.
 #[tokio::test]
 async fn b9_fix_shutdown_hands_off_session_after_snapshot() {
-    let root = tempfile::tempdir().unwrap();
-    let (state, pool, id) = live_actor(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let (state, pool, id) = live_actor(&root).await;
     assert!(pool.sessions_by_drive().is_empty());
     let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
     tokio::time::timeout(StdDuration::from_secs(2), async {
@@ -89,7 +89,7 @@ async fn b9_fix_shutdown_hands_off_session_after_snapshot() {
         .unwrap()
         .unwrap();
     assert!(pool.sessions_by_drive().is_empty());
-    assert!(native_records(root.path()).iter().any(|r| matches!(r,
+    assert!(native_records_in(&root.tape_dir()).iter().any(|r| matches!(r,
         NativeRecord::SessionEnded(e) if e.reason == remanence_state::tape_log::SessionEndReason::GracefulShutdown)));
 }
 
@@ -97,8 +97,8 @@ async fn b9_fix_shutdown_hands_off_session_after_snapshot() {
 #[tokio::test]
 async fn b9_fix_live_session_refuses_robotics_and_health_promptly() {
     use crate::pb::library_service_server::LibraryService;
-    let root = tempfile::tempdir().unwrap();
-    let (state, pool, id) = live_actor(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let (state, pool, id) = live_actor(&root).await;
     pool.record_session(id, mounted());
     let error = tokio::time::timeout(
         StdDuration::from_secs(1),
@@ -426,15 +426,19 @@ async fn b4b2c_shutdown_before_manual_reconciliation_preserves_native_log() {
 /// Reopening an exact clean ending adds only SessionOpened, never a redundant refinement.
 #[tokio::test]
 async fn b9_fix_clean_reopen_does_not_refine_session_ended() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    let selected = selection(root.path(), &world, false);
-    let (tx, opened, thread) = open_writer_with_selection(
-        root.path(),
-        open_model_library(world.clone()),
-        selected.clone(),
-    )
-    .await;
+    let root = DurabilityRoot::new(BARCODE, false);
+    let world = model_world(BARCODE, false);
+    let selected = SelectedTape {
+        parity_config: ParityConfig::None,
+        ..selected()
+    };
+    let (tx, opened, thread) = root
+        .writer(
+            open_model_library(world.clone()),
+            selected.clone(),
+            |_, _| {},
+        )
+        .await;
     let id = opened.unwrap();
     append_actor_test_file(
         &tx,
@@ -450,7 +454,7 @@ async fn b9_fix_clean_reopen_does_not_refine_session_ended() {
     // A later SessionOpened is itself a legitimate sequence change.
     {
         let mut library = open_model_library(world.clone());
-        let cfg = config(root.path(), &library);
+        let cfg = root.config(&library);
         let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
         prepare_drive_for_write(
             &mut drive,
@@ -486,10 +490,11 @@ async fn b9_fix_clean_reopen_does_not_refine_session_ended() {
         );
         assert!(admission.ended_tail_eod.is_none());
     }
-    let before = native_records(root.path());
-    let (tx, opened, thread) =
-        open_writer_with_selection(root.path(), open_model_library(world), selected).await;
-    let after = native_records(root.path());
+    let before = native_records_in(&root.tape_dir());
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected, |_, _| {})
+        .await;
+    let after = native_records_in(&root.tape_dir());
     assert_eq!(
         after.len(),
         before.len() + 1,
@@ -512,11 +517,11 @@ async fn b9_fix_clean_reopen_does_not_refine_session_ended() {
 /// A slow consumer remains valid beyond the removed deadline; shutdown interrupts both sends.
 #[test]
 fn b9_fix_read_and_inventory_backpressure_wait_only_for_shutdown() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let library = open_model_library(world);
     let lifecycle = DrivePoolLifecycle::default();
-    let mut cfg = config(root.path(), &library);
+    let mut cfg = root.config(&library);
     cfg.lifecycle = Some(lifecycle.clone());
     let (read_tx, _read_rx) =
         crate::read_core::read_stream_channel(crate::read_core::READ_STREAM_CHANNEL_BYTE_BUDGET);

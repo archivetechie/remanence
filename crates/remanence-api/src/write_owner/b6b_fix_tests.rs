@@ -4,13 +4,8 @@ use remanence_state::tape_log::{
     codec::Decoder, store::Header, Record as NativeRecord, SessionEndReason,
 };
 
-/// Read every native record, including endings later superseded by ClosedOut.
-pub(super) fn native_records(root: &Path) -> Vec<NativeRecord> {
-    native_records_in(&root.join("journals/tapes"))
-}
-
 /// Read native records from a fixture's explicit tape-log directory.
-fn native_records_in(directory: &Path) -> Vec<NativeRecord> {
+pub(super) fn native_records_in(directory: &Path) -> Vec<NativeRecord> {
     let bytes =
         std::fs::read(directory.join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple())))
             .unwrap();
@@ -67,19 +62,26 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
     use crate::write_session_ingress::WriteSessionApi;
     for parity in [false, true] {
         for abort_shutdown in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let world = setup(root.path());
-            let selected = selection(root.path(), &world, parity);
-            let lifecycle = DrivePoolLifecycle::default();
-            let (tx, opened, thread) = open_writer_configured(
-                root.path(),
-                open_model_library(world.clone()),
-                selected.clone(),
-                |cfg, _| {
-                    cfg.lifecycle = Some(lifecycle.clone());
+            let root = DurabilityRoot::new(BARCODE, parity);
+            let world = model_world(BARCODE, parity);
+            let selected = SelectedTape {
+                parity_config: if parity {
+                    ParityConfig::Scheme(scheme())
+                } else {
+                    ParityConfig::None
                 },
-            )
-            .await;
+                ..selected()
+            };
+            let lifecycle = DrivePoolLifecycle::default();
+            let (tx, opened, thread) = root
+                .writer(
+                    open_model_library(world.clone()),
+                    selected.clone(),
+                    |cfg, _| {
+                        cfg.lifecycle = Some(lifecycle.clone());
+                    },
+                )
+                .await;
             let id = opened.unwrap();
             // A committed short prefix makes the parity rebuild observable.
             append_actor_test_file(
@@ -144,9 +146,7 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
                         drive_uuid: None,
                     },
                 );
-                let mut state = crate::ApiState::new(
-                    remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-                );
+                let mut state = root.api_state();
                 let spool = root.path().join("spool");
                 std::fs::create_dir(&spool).unwrap();
                 state.spool_dir = Some(Arc::new(spool));
@@ -183,7 +183,7 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
                 assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
             }
             thread.join().unwrap();
-            let records = native_records(root.path());
+            let records = native_records_in(&root.tape_dir());
             let end_pos = records
                 .iter()
                 .position(|r| matches!(r, NativeRecord::SessionEnded(_)))
@@ -207,16 +207,11 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
                     .any(|r| matches!(r, NativeRecord::ClosedOut(_))),
                 parity
             );
-            let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
+            let index = root.state.write_handle();
             assert!(index.list_active_tape_io_fences().unwrap().is_empty());
-            let (tx, opened, thread) = open_writer_with_selection(
-                root.path(),
-                open_model_library(world.clone()),
-                selected,
-            )
-            .await;
+            let (tx, opened, thread) = root
+                .writer(open_model_library(world.clone()), selected, |_, _| {})
+                .await;
             close_writer(
                 &tx,
                 opened.expect("named tail re-proves without supersede"),
@@ -232,9 +227,11 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
 #[tokio::test]
 async fn stale_idle_and_wrong_abort_do_not_change_end_reason() {
     for stale_idle in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
-        let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |_, _| {})
+            .await;
         let id = opened.unwrap();
         if stale_idle {
             tx.send(DriveCommand::TimerIdleClose {
@@ -258,7 +255,7 @@ async fn stale_idle_and_wrong_abort_do_not_change_end_reason() {
             );
         }
         close_writer(&tx, id, thread).await;
-        assert!(native_records(root.path()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::CleanClose)));
+        assert!(native_records_in(&root.tape_dir()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::CleanClose)));
     }
 }
 
@@ -266,19 +263,27 @@ async fn stale_idle_and_wrong_abort_do_not_change_end_reason() {
 #[tokio::test]
 async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row() {
     for fail_end in [false, true] {
-        let (mut typed, root) = typed_root();
-        let world = setup(&root);
-        let tape_dir = typed.paths().journal_dir.join("tapes");
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
+        let tape_dir = root.typed.paths().journal_dir.join("tapes");
         let files = MemoryDirectory::default();
+        seed_typed_crash_files(&root.tape_dir(), &files);
         let _registration = register(tape_dir.clone(), Arc::new(files.clone()));
-        let (tx, opened, thread) =
-            open_typed_writer_configured(&typed, open_model_library(world), selected(), |_, _| {})
-                .await;
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |_, _| {})
+            .await;
         let id = opened.unwrap();
-        let object =
-            append_actor_test_file(&tx, id, root.join("object"), "object", "object", b"saved")
-                .await;
-        let authority = TapeAuthority::open(&tape_dir, TAPE, &typed.paths().sqlite_path).unwrap();
+        let object = append_actor_test_file(
+            &tx,
+            id,
+            root.path().join("object"),
+            "object",
+            "object",
+            b"saved",
+        )
+        .await;
+        let authority =
+            TapeAuthority::open(&tape_dir, TAPE, &root.typed.paths().sqlite_path).unwrap();
         let target = remanence_state::authority::fixtures::publication_target(&authority);
         let backend = files.clone();
         let syncs = Arc::new(AtomicU64::new(0));
@@ -311,7 +316,7 @@ async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row(
         );
         thread.join().unwrap();
         files.observe(None);
-        let index = typed.catalog().write_handle();
+        let index = root.state.write_handle();
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1, "syncs={}", syncs.load(Ordering::SeqCst));
         assert_eq!(fences[0].reason, "authority_ambiguous");
@@ -324,7 +329,7 @@ async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row(
         // Release every runtime and native holder before the file registration drops.
         drop(authority);
         drop(index);
-        typed.release();
+        drop(root.state);
         // A lost fsync is modelled as losing its dirty bytes on restart.
         let mut snapshot = files.snapshot();
         snapshot.crash(&BTreeMap::new(), false).unwrap();
@@ -347,18 +352,14 @@ async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row(
 /// The API's automatic mid-session seal publishes its decision before the short sidecar.
 #[tokio::test]
 async fn automatic_mid_session_terminal_prefix_has_final_partial_epoch() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world),
-        selected(),
-        |cfg, pool| {
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |cfg, pool| {
             cfg.checkpoint_max_objects = 1;
             pool.watermark_low = 0.000_000_000_001;
-        },
-    )
-    .await;
+        })
+        .await;
     let id = opened.unwrap();
     let result = append_actor_test_file(
         &tx,
@@ -374,7 +375,7 @@ async fn automatic_mid_session_terminal_prefix_has_final_partial_epoch() {
         Some(true)
     );
     thread.join().unwrap();
-    let records = native_records(root.path());
+    let records = native_records_in(&root.tape_dir());
     let decision = records
         .iter()
         .position(|r| matches!(r, NativeRecord::FinalizationDecided(_)))
@@ -384,12 +385,8 @@ async fn automatic_mid_session_terminal_prefix_has_final_partial_epoch() {
         .position(|r| matches!(r, NativeRecord::TerminalPrefix { .. }))
         .unwrap();
     assert!(decision < prefix);
-    let authority = TapeAuthority::open(
-        root.path().join("journals/tapes"),
-        TAPE,
-        &root.path().join("state.sqlite"),
-    )
-    .unwrap();
+    let authority =
+        TapeAuthority::open(root.tape_dir(), TAPE, &root.state.paths().sqlite_path).unwrap();
     let plan = authority
         .latest_commit()
         .unwrap()
@@ -413,12 +410,9 @@ async fn automatic_mid_session_terminal_prefix_has_final_partial_epoch() {
 #[tokio::test]
 async fn closeout_rpc_rejects_nil_reused_key_and_wrong_pool_with_debt() {
     use crate::pb::catalog_server::Catalog;
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    let mut state = crate::ApiState::new(
-        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-    );
-    state.checkpoint_journal_dir = Arc::new(root.path().join("journals/tapes"));
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    let state = root.api_state();
     std::fs::create_dir_all(state.checkpoint_journal_dir.as_ref()).unwrap();
     let service = state.catalog_service();
     let request = |key: Uuid, pool: Option<&str>| pb::CloseoutTapeRequest {
@@ -447,7 +441,9 @@ async fn closeout_rpc_rejects_nil_reused_key_and_wrong_pool_with_debt() {
     assert!(error.message().contains("different request"));
     // Wait for the no-op operation before starting the writer's native lease.
     tokio::task::yield_now().await;
-    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world.clone())).await;
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world.clone()), selected(), |_, _| {})
+        .await;
     let id = opened.unwrap();
     append_actor_test_file(
         &tx,
@@ -515,8 +511,8 @@ impl SgTransport for FinalBarrierFailure {
 /// The shutdown error reply is not completion: the named end must finish fsync first.
 #[tokio::test]
 async fn failed_shutdown_barrier_waits_for_durable_named_end() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let armed = Arc::new(AtomicBool::new(false));
     let model = world.lock().unwrap().library_snapshot();
     let w = world.clone();
@@ -539,9 +535,10 @@ async fn failed_shutdown_barrier_waits_for_durable_named_end() {
     let key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
     let files = MemoryDirectory::default();
-    let _registration = register(root.path().join("journals/tapes"), Arc::new(files.clone()));
-    let (tx, opened, thread) =
-        open_writer_configured(root.path(), library, selected(), |cfg, _| {
+    seed_typed_crash_files(&root.tape_dir(), &files);
+    let _registration = register(root.tape_dir(), Arc::new(files.clone()));
+    let (tx, opened, thread) = root
+        .writer(library, selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
             cfg.reservations = reservations.clone();
         })
@@ -574,16 +571,10 @@ async fn failed_shutdown_barrier_waits_for_durable_named_end() {
             drive_uuid: None,
         },
     );
-    let mut state = crate::ApiState::new(
-        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-    );
+    let mut state = root.api_state();
     state.drive_pool = Some(pool.clone());
-    let authority = TapeAuthority::open(
-        root.path().join("journals/tapes"),
-        TAPE,
-        &root.path().join("state.sqlite"),
-    )
-    .unwrap();
+    let authority =
+        TapeAuthority::open(root.tape_dir(), TAPE, &root.state.paths().sqlite_path).unwrap();
     let target = remanence_state::authority::fixtures::publication_target(&authority);
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let wait_gate = gate.clone();
@@ -638,7 +629,9 @@ async fn failed_shutdown_barrier_waits_for_durable_named_end() {
     assert_eq!(end.reason, SessionEndReason::DriveError);
     assert_eq!(end.tail_file_count, 1);
     assert!(!pool.drive_is_closing(&key));
-    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |_, _| {})
+        .await;
     close_writer(
         &tx,
         opened.expect("ended tail requires no crash acknowledgement"),
@@ -651,24 +644,20 @@ async fn failed_shutdown_barrier_waits_for_durable_named_end() {
 #[tokio::test]
 async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
     for action in [12, 13] {
-        let (typed, root) = typed_root();
-        let world = setup(&root);
-        let (tx, opened, thread) = open_typed_writer_configured(
-            &typed,
-            open_model_library(world),
-            selected(),
-            |cfg, _| {
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |cfg, _| {
                 cfg.io_memory
                     .epoch_test_action
                     .store(action, Ordering::Relaxed);
-            },
-        )
-        .await;
+            })
+            .await;
         let id = opened.unwrap();
         let object = append_actor_test_file(
             &tx,
             id,
-            root.join("object"),
+            root.path().join("object"),
             "object",
             "object",
             b"durable before host failure",
@@ -691,14 +680,14 @@ async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
             object.record.object_id
         );
         thread.join().unwrap();
-        let records = native_records_in(&typed.paths().journal_dir.join("tapes"));
+        let records = native_records_in(&root.typed.paths().journal_dir.join("tapes"));
         assert!(records
             .iter()
             .any(|r| matches!(r, NativeRecord::Committed(_))));
         assert!(!records
             .iter()
             .any(|r| matches!(r, NativeRecord::SessionEnded(_))));
-        let index = typed.catalog().write_handle();
+        let index = root.state.write_handle();
         let fences = index.list_active_tape_io_fences().unwrap();
         println!(
             "R3 action={action} fences={} reasons={:?}",
@@ -713,21 +702,17 @@ async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
 #[tokio::test]
 async fn failed_close_after_stale_timer_or_stray_abort_ends_failed_append_during_shutdown() {
     for (stale_idle, hook) in [(false, 9), (true, 9), (false, 10)] {
-        let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
         let lifecycle = DrivePoolLifecycle::default();
-        let (tx, opened, thread) = open_writer_configured(
-            root.path(),
-            open_model_library(world),
-            selected(),
-            |cfg, _| {
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |cfg, _| {
                 cfg.lifecycle = Some(lifecycle.clone());
                 cfg.io_memory
                     .epoch_test_action
                     .store(hook, Ordering::Relaxed);
-            },
-        )
-        .await;
+            })
+            .await;
         let id = opened.unwrap();
         if stale_idle {
             tx.send(DriveCommand::TimerIdleClose {
@@ -786,6 +771,6 @@ async fn failed_close_after_stale_timer_or_stray_abort_ends_failed_append_during
                 .len(),
             1
         );
-        assert!(native_records(root.path()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::FailedAppend)));
+        assert!(native_records_in(&root.tape_dir()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::FailedAppend)));
     }
 }

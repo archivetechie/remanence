@@ -14,10 +14,6 @@ fn automatic_terminal_plan_preserves_non_operator_seal_reasons() {
         Trigger::PoolCloseOut,
         Trigger::NoPendingObjectFits,
     ] {
-        let temp = tempfile::tempdir().unwrap();
-        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
         let selected = SelectedTape {
             standalone_endpoint: None,
             pool_id: "automatic-reasons".into(),
@@ -25,15 +21,8 @@ fn automatic_terminal_plan_preserves_non_operator_seal_reasons() {
             block_size: 256 * 1024,
             parity_config: ParityConfig::None,
         };
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: selected.tape_uuid,
-                voltag: "REASONL9".into(),
-                block_size: selected.block_size,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
+        let root = crate::tests::TypedRoot::open_with_tapes(&[(selected.tape_uuid, "REASONL9")]);
+        let index = root.catalog().write_handle();
         let pool = TapePoolConfig {
             id: selected.pool_id.clone(),
             display_name: None,
@@ -47,10 +36,9 @@ fn automatic_terminal_plan_preserves_non_operator_seal_reasons() {
             capacity_cap_bytes: None,
             min_object_size_bytes: 0,
         };
-        std::fs::create_dir_all(temp.path().join("tapes")).unwrap();
-        let authority =
-            TapeAuthority::open(temp.path().join("tapes"), selected.tape_uuid, index.path())
-                .unwrap();
+        let tape_dir = root.paths().journal_dir.join("tapes");
+        std::fs::create_dir_all(&tape_dir).unwrap();
+        let authority = TapeAuthority::open(tape_dir, selected.tape_uuid, index.path()).unwrap();
         let mut writer = authority.acquire_exclusive().unwrap();
         writer
             .publish_initialized(

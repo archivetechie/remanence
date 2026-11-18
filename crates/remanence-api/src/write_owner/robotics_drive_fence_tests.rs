@@ -3,13 +3,10 @@ use super::*;
 use crate::write_owner::WriteAdmissionCoordinator;
 use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
 use remanence_library::{DiscoveryReport, Library};
-use remanence_state::{library_runtime::LibraryRuntime, StateLockGuard, StatePaths};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
     sync::Mutex,
 };
-use uuid::Uuid;
 
 fn open_model_library(
     world: std::sync::Arc<std::sync::Mutex<VirtualWorld>>,
@@ -31,24 +28,17 @@ fn open_model_library(
         .expect("open model library")
 }
 
-fn test_write_owner_config(
-    index_path: PathBuf,
-    audit_dir: PathBuf,
+fn typed_config(
+    root: &crate::tests::TypedRoot,
     library: &remanence_library::LibraryHandle,
     library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
 ) -> WriteOwnerConfig {
     let serial = library.library().serial.clone();
-    let checkpoint_journal_dir = index_path.parent().unwrap().join("tapes");
-    std::fs::create_dir_all(&checkpoint_journal_dir).unwrap();
+    let catalog = root.catalog();
     WriteOwnerConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            &audit_dir,
-            false,
-            &Arc::new(std::sync::Mutex::new(())),
-        ),
-        catalog: remanence_state::projector::open(&(index_path)).unwrap(),
-        index_path,
+        authority: crate::write_owner::TerminalAuthority::Typed(catalog.library_runtime().unwrap()),
+        catalog,
+        index_path: root.paths().sqlite_path.clone(),
         report: DiscoveryReport {
             unattached_drives: Vec::new(),
             complete: true,
@@ -76,7 +66,7 @@ fn test_write_owner_config(
         )
         .expect("test I/O memory manager"),
         write_admissions: WriteAdmissionCoordinator::default(),
-        checkpoint_journal_dir,
+        checkpoint_journal_dir: root.paths().journal_dir.join("tapes"),
         checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
         checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -84,7 +74,7 @@ fn test_write_owner_config(
         lifecycle: Some(crate::drive_pool::DrivePoolLifecycle::default()),
         changer_ready_wait: remanence_library::ChangerReadyWait::default(),
         calibration_store: remanence_state::CalibrationControlStore::open(
-            std::env::temp_dir().join(format!("rem-calibration-tests-{}", Uuid::new_v4())),
+            &root.paths().calibration_dir,
         )
         .expect("open test calibration store"),
     }
@@ -106,22 +96,10 @@ fn library_snapshot_cell(library: Library) -> Arc<RwLock<Arc<crate::LibrarySnaps
 /// A drive fence refuses at the typed motion gate, before the executor can send MOVE MEDIUM.
 #[test]
 fn robotics_move_to_drive_fenced_bay_records_one_refusal_without_move() {
-    let root = tempfile::tempdir().unwrap();
-    let root = root.path();
-    let paths = StatePaths {
-        config_path: root.join("config"),
-        state_dir: root.join("state"),
-        audit_dir: root.join("library"),
-        journal_dir: root.join("native"),
-        sqlite_path: root.join("catalog.sqlite"),
-        tape_cache_dir: root.join("cache"),
-        calibration_dir: root.join("calibration"),
-    };
-    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
-    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
-    let catalog = remanence_state::projector::open(&paths.sqlite_path)
-        .unwrap()
-        .with_library_runtime(runtime.clone());
+    let mut root = crate::tests::TypedRoot::open();
+    let paths = root.paths().clone();
+    let catalog = root.catalog();
+    let runtime = catalog.library_runtime().unwrap();
     let mut index = catalog.write_handle();
     let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 1);
     model.put_tape_in_slot(
@@ -141,16 +119,14 @@ fn robotics_move_to_drive_fenced_bay_records_one_refusal_without_move() {
         &HashSet::from(["LIB-CLEAN".into()]),
     )
     .unwrap();
-    let mut cfg = test_write_owner_config(
-        paths.sqlite_path.clone(),
-        paths.audit_dir.clone(),
+    let mut cfg = typed_config(
+        &root,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.catalog = catalog.clone();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
     cfg.cleaning.min_cycle_duration = "0s".into();
-    let api = crate::ApiState::new(catalog.clone());
+    let mut api = root.api_state();
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     let action = RoboticsAction::Move {
         src: 0x400,
         dst: 0x100,
@@ -217,6 +193,7 @@ fn robotics_move_to_drive_fenced_bay_records_one_refusal_without_move() {
     drop(index);
     drop(catalog);
     drop(runtime);
+    root.release();
     let view = lib::native_view::NativeTapeView::probe(
         &paths.journal_dir.join("tapes"),
         &paths.sqlite_path,
@@ -281,22 +258,10 @@ fn full_pass_failed_robotics_records_history_passes() {
         return;
     }
     use remanence_state::full_pass::{self as passes, PassKind};
-    let root = tempfile::tempdir().unwrap();
-    let root = root.path();
-    let paths = StatePaths {
-        config_path: root.join("config"),
-        state_dir: root.join("state"),
-        audit_dir: root.join("library"),
-        journal_dir: root.join("native"),
-        sqlite_path: root.join("catalog.sqlite"),
-        tape_cache_dir: root.join("cache"),
-        calibration_dir: root.join("calibration"),
-    };
-    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
-    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
-    let catalog = remanence_state::projector::open(&paths.sqlite_path)
-        .unwrap()
-        .with_library_runtime(runtime.clone());
+    let mut root = crate::tests::TypedRoot::open();
+    let paths = root.paths().clone();
+    let catalog = root.catalog();
+    let runtime = catalog.library_runtime().unwrap();
     let mut index = catalog.write_handle();
     let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 1);
     model.put_tape_in_slot(
@@ -316,16 +281,14 @@ fn full_pass_failed_robotics_records_history_passes() {
         &HashSet::from(["LIB-CLEAN".into()]),
     )
     .unwrap();
-    let mut cfg = test_write_owner_config(
-        paths.sqlite_path.clone(),
-        paths.audit_dir.clone(),
+    let mut cfg = typed_config(
+        &root,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.catalog = catalog.clone();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
     cfg.cleaning.min_cycle_duration = "0s".into();
-    let api = crate::ApiState::new(catalog.clone());
+    let mut api = root.api_state();
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     let action = RoboticsAction::Move {
         src: 0x400,
         dst: 0x100,
@@ -436,6 +399,7 @@ fn full_pass_failed_robotics_records_history_passes() {
     drop(index);
     drop(catalog);
     drop(runtime);
+    root.release();
     let view = lib::native_view::NativeTapeView::probe(
         &paths.journal_dir.join("tapes"),
         &paths.sqlite_path,
@@ -482,22 +446,10 @@ fn full_pass_failed_robotics_records_history_passes() {
 /// T1: a waited LOAD refused by a drive fence leaves no readiness row or robotics gate.
 #[test]
 fn fx1_waited_load_drive_fence_leaves_no_readiness_row_or_robotics_gate() {
-    let root = tempfile::tempdir().unwrap();
-    let root = root.path();
-    let paths = StatePaths {
-        config_path: root.join("config"),
-        state_dir: root.join("state"),
-        audit_dir: root.join("library"),
-        journal_dir: root.join("native"),
-        sqlite_path: root.join("catalog.sqlite"),
-        tape_cache_dir: root.join("cache"),
-        calibration_dir: root.join("calibration"),
-    };
-    let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
-    let runtime = LibraryRuntime::open(&paths, true, lease.clone()).unwrap();
-    let catalog = remanence_state::projector::open(&paths.sqlite_path)
-        .unwrap()
-        .with_library_runtime(runtime.clone());
+    let mut root = crate::tests::TypedRoot::open();
+    let paths = root.paths().clone();
+    let catalog = root.catalog();
+    let runtime = catalog.library_runtime().unwrap();
     let mut index = catalog.write_handle();
     let mut model = VirtualWorld::single_drive("LIB-CLEAN", 0x100, "DRV-CLEAN", 0x400, 1);
     model.put_tape_in_slot(
@@ -517,16 +469,14 @@ fn fx1_waited_load_drive_fence_leaves_no_readiness_row_or_robotics_gate() {
         &HashSet::from(["LIB-CLEAN".into()]),
     )
     .unwrap();
-    let mut cfg = test_write_owner_config(
-        paths.sqlite_path.clone(),
-        paths.audit_dir.clone(),
+    let mut cfg = typed_config(
+        &root,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.catalog = catalog.clone();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
     cfg.cleaning.min_cycle_duration = "0s".into();
-    let api = crate::ApiState::new(catalog.clone());
+    let mut api = root.api_state();
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     let action = RoboticsAction::Load {
         slot: 0x400,
         bay: 0x100,
@@ -605,6 +555,7 @@ fn fx1_waited_load_drive_fence_leaves_no_readiness_row_or_robotics_gate() {
     drop(index);
     drop(catalog);
     drop(runtime);
+    root.release();
     let view = lib::native_view::NativeTapeView::probe(
         &paths.journal_dir.join("tapes"),
         &paths.sqlite_path,

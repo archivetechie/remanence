@@ -1,5 +1,5 @@
 //! B9 receipt and accepted-tail regressions through the production actor and model transport.
-use super::b6b_fix_tests::{native_records, selection};
+use super::b6b_fix_tests::native_records_in;
 use super::*;
 use remanence_state::tape_log::{Record as NativeRecord, SessionEndReason};
 use std::sync::atomic::Ordering;
@@ -12,21 +12,17 @@ async fn b9_durable_checkpoint_receipts_survive_projection_failure() {
         CheckpointTrigger::Timer,
         CheckpointTrigger::Shutdown,
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
         let lifecycle = DrivePoolLifecycle::default();
-        let (tx, opened, thread) = open_writer_configured(
-            root.path(),
-            open_model_library(world),
-            selected(),
-            |cfg, _| {
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |cfg, _| {
                 cfg.lifecycle = Some(lifecycle.clone());
                 // Hook 10: a competing SQLite writer holds the database across the
                 // projection, after the native Committed has been fsynced.
                 cfg.io_memory.epoch_test_action.store(10, Ordering::Relaxed);
-            },
-        )
-        .await;
+            })
+            .await;
         let id = opened.unwrap();
         let append = append_actor_test_file(
             &tx,
@@ -48,7 +44,7 @@ async fn b9_durable_checkpoint_receipts_survive_projection_failure() {
         .unwrap();
         let outcome = received.await.unwrap();
         // The native log already holds the Committed group naming the object.
-        let committed = native_records(root.path())
+        let committed = native_records_in(&root.tape_dir())
             .iter()
             .filter(|r| matches!(r, NativeRecord::Committed(c) if c.object_count == 1))
             .count();
@@ -61,7 +57,7 @@ async fn b9_durable_checkpoint_receipts_survive_projection_failure() {
         panic!(
             "durable commit reported as an error: {status}; ended session carries {} receipts; end reason {:?}",
             ended.checkpointed_objects.len(),
-            native_records(root.path()).iter().find_map(|r| match r {
+            native_records_in(&root.tape_dir()).iter().find_map(|r| match r {
                 NativeRecord::SessionEnded(e) => Some(e.reason),
                 _ => None,
             })
@@ -77,21 +73,25 @@ async fn b9_durable_checkpoint_receipts_survive_projection_failure() {
         );
         assert_eq!(ended.objects_committed, 1);
         assert!(append.durable_receipt.lock().unwrap().is_some());
-        assert!(native_records(root.path()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::FailedAppend)));
+        assert!(native_records_in(&root.tape_dir()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::FailedAppend)));
     }
 }
 
 #[tokio::test]
 async fn b9_buffered_tail_loss_reopens_without_supersede() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    let selected = selection(root.path(), &world, false);
-    let (tx, opened, thread) = open_writer_with_selection(
-        root.path(),
-        open_model_library(world.clone()),
-        selected.clone(),
-    )
-    .await;
+    let root = DurabilityRoot::new(BARCODE, false);
+    let world = model_world(BARCODE, false);
+    let selected = SelectedTape {
+        parity_config: ParityConfig::None,
+        ..selected()
+    };
+    let (tx, opened, thread) = root
+        .writer(
+            open_model_library(world.clone()),
+            selected.clone(),
+            |_, _| {},
+        )
+        .await;
     let id = opened.unwrap();
     let pending = append_actor_test_file(
         &tx,
@@ -116,7 +116,7 @@ async fn b9_buffered_tail_loss_reopens_without_supersede() {
     .unwrap();
     received.await.unwrap().unwrap();
     thread.join().unwrap();
-    let records = native_records(root.path());
+    let records = native_records_in(&root.tape_dir());
     let end = records
         .iter()
         .find_map(|r| match r {
@@ -142,18 +142,17 @@ async fn b9_buffered_tail_loss_reopens_without_supersede() {
     );
     world.lock().unwrap().power_cut(BAY, frontier).unwrap();
 
-    let (tx, opened, thread) =
-        open_writer_with_selection(root.path(), open_model_library(world.clone()), selected).await;
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world.clone()), selected, |_, _| {})
+        .await;
     close_writer(&tx, opened.expect("lost buffered tail must reopen"), thread).await;
-    assert!(
-        remanence_state::projector::open(root.path().join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .unwrap()
-            .list_active_tape_io_fences()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(native_records(root.path()).iter().any(
+    assert!(root
+        .state
+        .write_handle()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(native_records_in(&root.tape_dir()).iter().any(
         |r| matches!(r, NativeRecord::SessionEnded(e) if e.proved_eod == Some(frontier as u64))
     ));
 }
@@ -161,20 +160,16 @@ async fn b9_buffered_tail_loss_reopens_without_supersede() {
 /// A threshold checkpoint is the append reply, so durable failure must return that object's receipt.
 #[tokio::test]
 async fn b9_threshold_append_returns_durable_receipt() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let lifecycle = DrivePoolLifecycle::default();
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world),
-        selected(),
-        |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
             cfg.checkpoint_max_objects = 1;
             cfg.io_memory.epoch_test_action.store(10, Ordering::Relaxed);
-        },
-    )
-    .await;
+        })
+        .await;
     let id = opened.unwrap();
     let receipt = append_actor_test_file(
         &tx,
@@ -193,7 +188,7 @@ async fn b9_threshold_append_returns_durable_receipt() {
     let ended = &lifecycle.ended_writes.lock().unwrap()[&id].0;
     assert_eq!(ended.objects_committed, 1);
     assert_eq!(ended.checkpointed_objects.len(), 1);
-    assert!(native_records(root.path()).iter().any(
+    assert!(native_records_in(&root.tape_dir()).iter().any(
         |r| matches!(r, NativeRecord::SessionEnded(e) if e.reason == SessionEndReason::FailedAppend)
     ));
 }
@@ -202,9 +197,9 @@ async fn b9_threshold_append_returns_durable_receipt() {
 #[tokio::test]
 async fn b9_closeout_authorizes_operation_control_roles() {
     use crate::pb::catalog_server::Catalog;
-    let root = tempfile::tempdir().unwrap();
-    setup(root.path());
-    let state = super::b7_tests::state(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+
+    let state = root.api_state();
     for (role, allowed) in [
         ("operator", true),
         ("admin", true),
@@ -287,9 +282,10 @@ async fn b9_cold_observation_lock_does_not_block_runtime() {
 /// Shutdown refuses both worker reservation and host operation publication.
 #[tokio::test]
 async fn b9_shutdown_refuses_maintenance_before_publication() {
-    let root = tempfile::tempdir().unwrap();
-    super::b7_tests::due_tape(root.path()).await;
-    let mut state = super::b7_tests::state(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    let mut state = root.api_state();
     let (changer, _rx) = mpsc::channel(1);
     let pool =
         DrivePool::new_for_library(LIBRARY, changer, HashMap::new(), Arc::new(HashMap::new()));
@@ -344,11 +340,13 @@ async fn b9_fresh_actor_shutdown_waits_for_maintenance_settlement() {
 
 async fn fresh_maintenance_settlement(kind: &str) {
     use super::b6c_tests::{CommandGate, GatedTransport};
-    let root = tempfile::tempdir().unwrap();
-    let world = super::b7_tests::due_tape(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     if kind == "finalize" {
-        let (tx, opened, thread) =
-            open_writer(root.path(), open_model_library(world.clone())).await;
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world.clone()), selected(), |_, _| {})
+            .await;
         close_writer(&tx, opened.unwrap(), thread).await;
     }
     let (entered, reached) = oneshot::channel();
@@ -378,7 +376,7 @@ async fn fresh_maintenance_settlement(kind: &str) {
         )
         .unwrap();
     let lifecycle = DrivePoolLifecycle::default();
-    let mut cfg = config(root.path(), &library);
+    let mut cfg = root.config(&library);
     cfg.lifecycle = Some(lifecycle.clone());
     let memory = cfg.io_memory.clone();
     let drive = library
@@ -394,7 +392,7 @@ async fn fresh_maintenance_settlement(kind: &str) {
         reservations.clone(),
         lifecycle.clone(),
     );
-    let mut state = super::b7_tests::state(root.path());
+    let mut state = root.api_state();
     state.drive_pool = Some(pool);
     gate.armed.store(true, Ordering::SeqCst);
     let (reply, mut received) = oneshot::channel();
@@ -437,8 +435,12 @@ async fn fresh_maintenance_settlement(kind: &str) {
                     &actor_fingerprint,
                     b"b9 settlement",
                 );
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
             let (_, mut request) = crate::mount::prepare_manual_finalize_request(
-                &state.index().unwrap(),
+                &index,
                 crate::mount::ManualFinalizeTapeAdmission {
                     candidate_operation_id: Uuid::new_v4(),
                     actor: AuditActor::System,
@@ -453,20 +455,9 @@ async fn fresh_maintenance_settlement(kind: &str) {
             )
             .unwrap();
             assert!(super::super::preflight_manual_finalize_cancellable(
-                &mut {
-                    let mut index = state.catalog.write_handle();
-                    if let Some(pool) = &state.drive_pool {
-                        index.set_readiness_observer(pool.readiness_wake.clone());
-                    }
-                    index
-                },
+                &mut index,
                 super::super::ManualFinalizePreflightConfig {
-                    authority: crate::write_owner::TerminalAuthority::fixture(
-                        None,
-                        state.audit_dir.as_path(),
-                        state.audit_fsync,
-                        &state.audit_append_lock
-                    ),
+                    authority: TerminalAuthority::from_api(&state).unwrap(),
                     mounted_endpoint: None,
                     checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
                 },
@@ -542,19 +533,15 @@ async fn fresh_maintenance_settlement(kind: &str) {
 #[tokio::test]
 async fn b9_no_reply_timer_and_close_preserve_durable_projection_failure() {
     for close in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
         let lifecycle = DrivePoolLifecycle::default();
-        let (tx, opened, thread) = open_writer_configured(
-            root.path(),
-            open_model_library(world),
-            selected(),
-            |cfg, _| {
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |cfg, _| {
                 cfg.lifecycle = Some(lifecycle.clone());
                 cfg.io_memory.epoch_test_action.store(10, Ordering::Relaxed);
-            },
-        )
-        .await;
+            })
+            .await;
         let id = opened.unwrap();
         append_actor_test_file(
             &tx,
@@ -590,7 +577,7 @@ async fn b9_no_reply_timer_and_close_preserve_durable_projection_failure() {
         let ended = &lifecycle.ended_writes.lock().unwrap()[&id].0;
         assert_eq!(ended.checkpointed_objects.len(), 1);
         assert_eq!(ended.objects_committed, 1);
-        assert!(native_records(root.path()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(e) if e.reason == SessionEndReason::FailedAppend)));
+        assert!(native_records_in(&root.tape_dir()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(e) if e.reason == SessionEndReason::FailedAppend)));
     }
 }
 
@@ -637,7 +624,7 @@ async fn b9_queued_health_work_outlives_cancelled_requester() {
 async fn b9_overdue_timer_checkpoint_logs_code_without_sql_alarm() {
     use super::b6c_tests::{CommandGate, GatedTransport};
     use crate::write_owner::write_session::CHECKPOINT_BARRIER_ALARM_UNRECORDED;
-    let root = tempfile::tempdir().unwrap();
+    let root = DurabilityRoot::new(BARCODE, true);
     let log_path = root.path().join("actor.log");
     let log = std::fs::File::create(&log_path).unwrap();
     let _logging = tracing::subscriber::set_default(
@@ -647,7 +634,7 @@ async fn b9_overdue_timer_checkpoint_logs_code_without_sql_alarm() {
             .with_writer(move || log.try_clone().unwrap())
             .finish(),
     );
-    let world = setup(root.path());
+    let world = model_world(BARCODE, true);
     let (entered, reached) = oneshot::channel();
     let gate = Arc::new(CommandGate {
         armed: AtomicBool::new(false),
@@ -674,8 +661,8 @@ async fn b9_overdue_timer_checkpoint_logs_code_without_sql_alarm() {
             },
         )
         .unwrap();
-    let (tx, opened, thread) =
-        open_writer_configured(root.path(), library, selected(), |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(library, selected(), |cfg, _| {
             cfg.checkpoint_max_age_seconds = 1;
         })
         .await;
@@ -706,9 +693,7 @@ async fn b9_overdue_timer_checkpoint_logs_code_without_sql_alarm() {
     second.await.unwrap();
     close_writer(&tx, id, thread).await;
 
-    let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let index = root.state.write_handle();
     let alarms = index.list_alarms(true).unwrap();
     assert!(
         !alarms.iter().any(|alarm| alarm

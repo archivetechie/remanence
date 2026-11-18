@@ -251,15 +251,20 @@ fn setup_with_barcode(root: &Path, barcode: &str) -> Arc<Mutex<VirtualWorld>> {
             },
         )
         .unwrap();
+    model_world(barcode, true)
+}
+
+/// Model the physical cartridge with the geometry selected at provisioning.
+fn model_world(barcode: &str, parity: bool) -> Arc<Mutex<VirtualWorld>> {
     let bootstrap = BootstrapPayload {
-        scheme: Some(ParitySchemeRecord {
+        scheme: parity.then(|| ParitySchemeRecord {
             id: scheme().id.as_str().into(),
             data_blocks_per_stripe: 4,
             parity_blocks_per_stripe: 1,
             stripes_per_neighborhood: 1,
             no_parity_flag: false,
         }),
-        no_parity_flag: false,
+        no_parity_flag: !parity,
         filemark_map_digest: Some(sole_bot_filemark_map_digest().unwrap()),
         tape_uuid: TAPE,
         written_by_version: "test".into(),
@@ -294,6 +299,139 @@ fn config(root: &Path, library: &remanence_library::LibraryHandle) -> WriteOwner
     cfg.checkpoint_max_age_seconds = 3600;
     cfg.fixture_audit_mut().audit_fsync = true;
     cfg
+}
+
+/// One pool assignment owner for the test's catalog, native journals, actors and API clients.
+struct DurabilityRoot {
+    state: remanence_state::StateHandle,
+    typed: crate::tests::TypedRoot,
+}
+
+impl DurabilityRoot {
+    fn new(barcode: &str, parity: bool) -> Self {
+        Self::with_tapes(&[(TAPE, barcode)], &[TAPE], parity)
+    }
+
+    fn with_tapes(tapes: &[(TapeUuid, &str)], assigned: &[TapeUuid], parity: bool) -> Self {
+        let mut typed =
+            crate::tests::TypedRoot::open_with_tape_inputs(tapes.iter().map(|&(id, label)| {
+                (
+                    ProvisionTapeInput {
+                        tape_uuid: id,
+                        voltag: label.into(),
+                        block_size: BLOCK,
+                        parity: if parity {
+                            ParityConfig::Scheme(scheme())
+                        } else {
+                            ParityConfig::None
+                        },
+                        force: false,
+                    },
+                    remanence_state::LabelProvenance::Operator,
+                    Some(MediaObservation {
+                        generation: LtoGen::Lto9,
+                        source: GenerationSource::Operator,
+                    }),
+                )
+            }));
+        let paths = typed.paths().clone();
+        let mut config = typed.config();
+        config.tape_pools.push(pool());
+        typed.release();
+        let mut state = remanence_state::StateHandle::open_with_config(paths, config).unwrap();
+        for &id in assigned {
+            let generation = state
+                .library_runtime()
+                .tape_state(id)
+                .unwrap()
+                .assignment_generation;
+            state.assign_tape_pool(id, generation, Some(POOL)).unwrap();
+        }
+        Self { state, typed }
+    }
+
+    fn path(&self) -> &Path {
+        self.typed.paths().sqlite_path.parent().unwrap()
+    }
+
+    fn tape_dir(&self) -> PathBuf {
+        self.state.paths().journal_dir.join("tapes")
+    }
+
+    fn api_state(&self) -> crate::ApiState {
+        let mut state =
+            crate::ApiState::new_with_pool_configs(self.state.projection_client(), [pool()]);
+        state.checkpoint_journal_dir = Arc::new(self.tape_dir());
+        state.audit_dir = Arc::new(self.state.paths().audit_dir.clone());
+        state.drive_idle_unload_seconds = 0;
+        state
+    }
+
+    fn config(&self, library: &remanence_library::LibraryHandle) -> WriteOwnerConfig {
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut self.state.write_handle(),
+            [library.library()],
+            &HashSet::from([LIBRARY.to_owned()]),
+        )
+        .unwrap();
+        let mut cfg = test_state_write_owner_config(
+            &self.state,
+            library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        cfg.calibration_store =
+            CalibrationControlStore::open(&self.state.paths().calibration_dir).unwrap();
+        cfg.checkpoint_max_objects = 100;
+        cfg.checkpoint_max_age_seconds = 3600;
+        cfg
+    }
+
+    async fn writer(
+        &self,
+        mut library: remanence_library::LibraryHandle,
+        selection: SelectedTape,
+        configure: impl FnOnce(&mut WriteOwnerConfig, &mut TapePoolConfig),
+    ) -> (
+        mpsc::Sender<DriveCommand>,
+        Result<Uuid, Status>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let mut cfg = self.config(&library);
+        let mut index = self.state.write_handle();
+        let mut pool_cfg = pool();
+        configure(&mut cfg, &mut pool_cfg);
+        let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let actor_tx = tx.clone();
+        let (reply, received) = oneshot::channel();
+        let request = super::super::actor_runtime::OpenWriteActorRequest {
+            actor: AuditActor::System,
+            pool_cfg,
+            selected: selection,
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: false,
+            library_serial: Some(LIBRARY.into()),
+            barcode: index.get_tape(&TAPE).unwrap().unwrap().voltag,
+            source_slot: None,
+            drive_uuid: None,
+            drive_serial: Some(DRIVE.into()),
+            reply,
+        };
+        // The actor's log lines reach the caller's subscriber, when it has one.
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        let thread = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                handle_drive_open_write(
+                    BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
+                );
+            });
+        });
+        let opened = received
+            .await
+            .expect("writer replies without panic")
+            .map(|session| Uuid::from_slice(&session.session_id).unwrap());
+        (tx, opened, thread)
+    }
 }
 
 /// Provision the durability tape before opening its typed runtime, then attach its pool.
@@ -395,19 +533,23 @@ async fn open_typed_writer_configured(
 }
 
 /// Leave real typed pool-session debt by checkpointing a file and aborting at the shutdown deadline.
-async fn typed_due_tape(
-    typed: &crate::tests::TypedRoot,
-    root: &Path,
-    world: Arc<Mutex<VirtualWorld>>,
-) {
+async fn typed_due_tape(root: &DurabilityRoot, world: Arc<Mutex<VirtualWorld>>) {
     let lifecycle = DrivePoolLifecycle::default();
-    let (tx, opened, thread) =
-        open_typed_writer_configured(typed, open_model_library(world), selected(), |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone())
         })
         .await;
     let id = opened.unwrap();
-    append_actor_test_file(&tx, id, root.join("saved"), "saved", "saved", b"committed").await;
+    append_actor_test_file(
+        &tx,
+        id,
+        root.path().join("saved"),
+        "saved",
+        "saved",
+        b"committed",
+    )
+    .await;
     let (reply, received) = oneshot::channel();
     tx.send(DriveCommand::Checkpoint {
         session_id: id,
@@ -418,9 +560,7 @@ async fn typed_due_tape(
     .await
     .unwrap();
     received.await.unwrap().unwrap();
-    let mut state = crate::ApiState::new_with_pool_configs(typed.catalog(), vec![pool()]);
-    state.checkpoint_journal_dir = Arc::new(typed.paths().journal_dir.join("tapes"));
-    state.drive_idle_unload_seconds = 0;
+    let state = root.api_state();
     crate::closeout_obligation::scan(&state).unwrap();
     assert!(
         state.closeout_work.contains((TAPE, 1)),
@@ -454,10 +594,10 @@ async fn typed_due_tape(
 /// the drive; it cannot leave an anonymous epoch for the next session.
 #[test]
 fn lost_open_reply_ends_the_durable_session() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let mut library = open_model_library(world);
-    let cfg = config(root.path(), &library);
+    let cfg = root.config(&library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let (actor_tx, mut rx) = mpsc::channel(16);
     let (reply, received) = oneshot::channel();
@@ -475,9 +615,7 @@ fn lost_open_reply_ends_the_durable_session() {
         drive_serial: Some(DRIVE.into()),
         reply,
     };
-    let mut index = remanence_state::projector::open(&cfg.index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let mut index = root.state.write_handle();
     handle_drive_open_write(
         BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
     );
@@ -498,9 +636,11 @@ fn lost_open_reply_ends_the_durable_session() {
 /// Its explicit disconnect command ends the already-open owner without a mark.
 #[tokio::test]
 async fn disconnected_open_task_ends_the_session_and_releases_authority() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world.clone())).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world.clone()), selected(), |_, _| {})
+        .await;
     let id = opened.unwrap();
     let before = world.lock().unwrap().tapes[BARCODE].records.clone();
     let (reply, ended) = oneshot::channel();
@@ -512,11 +652,8 @@ async fn disconnected_open_task_ends_the_session_and_releases_authority() {
     .unwrap();
     ended.await.unwrap().unwrap();
     thread.join().unwrap();
-    let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    let authority =
-        TapeAuthority::open(root.path().join("journals/tapes"), TAPE, index.path()).unwrap();
+    let index = root.state.write_handle();
+    let authority = TapeAuthority::open(root.tape_dir(), TAPE, index.path()).unwrap();
     let lease = authority.acquire_exclusive().unwrap();
     let snapshot = lease.freeze().unwrap();
     let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
@@ -537,8 +674,8 @@ async fn disconnected_open_task_ends_the_session_and_releases_authority() {
 /// returns, so the test does the same on a pool that shares the actor's lifecycle.
 #[tokio::test]
 async fn write_close_release_empties_the_pools_session_map() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let lifecycle = DrivePoolLifecycle::default();
     let drive_key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(drive_key.clone(), AtomicBool::new(true))]));
@@ -548,16 +685,12 @@ async fn write_close_release_empties_the_pools_session_map() {
         Arc::clone(&reservations),
         lifecycle.clone(),
     );
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world),
-        selected(),
-        |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle);
             cfg.reservations = Arc::clone(&reservations);
-        },
-    )
-    .await;
+        })
+        .await;
     let id = opened.unwrap();
     pool.record_session(
         id,
@@ -681,9 +814,8 @@ async fn close_writer(
     thread.join().expect("write-session engine does not panic");
 }
 
-/// Read exact member bytes through the normal read-session engine after restart.
-async fn read_receipts(
-    root: &Path,
+async fn read_pool_receipts(
+    root: &DurabilityRoot,
     world: Arc<Mutex<VirtualWorld>>,
     receipts: &[Receipt],
 ) -> Result<(), String> {
@@ -691,7 +823,7 @@ async fn read_receipts(
         return Ok(());
     }
     let mut library = open_model_library(world);
-    let cfg = config(root, &library);
+    let cfg = root.config(&library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let (tx, mut rx) = mpsc::channel(16);
     let (reply, received) = oneshot::channel();
@@ -707,10 +839,8 @@ async fn read_receipts(
         daemon_epoch: 2,
         reply,
     };
+    let mut index = root.state.write_handle();
     let thread = std::thread::spawn(move || {
-        let mut index = remanence_state::projector::open(&cfg.index_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
         handle_drive_open_read(
             BAY, &mut index, &cfg, &mut rx, &mut drive, &mut 0, None, request,
         );
@@ -723,9 +853,7 @@ async fn read_receipts(
             return Err(format!("read open refuses acknowledged object: {status}"));
         }
     };
-    let index = remanence_state::projector::open(root.join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let index = root.state.write_handle();
     let mut outcome = Ok(());
     for receipt in receipts {
         let member = &index.list_native_object_files(&receipt.id).unwrap()[0];
@@ -762,67 +890,6 @@ async fn read_receipts(
     received.await.unwrap().unwrap();
     thread.join().expect("read-session engine does not panic");
     outcome
-}
-
-/// Use the operator's preview/confirmation route to discard only an uncommitted tail.
-fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), Status> {
-    use super::super::terminal_types::TerminalConfig;
-    let mut library = open_model_library(world.clone());
-    let cfg = config(root, &library);
-    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
-    let mut index = remanence_state::projector::open(root.join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    prepare_drive_for_write(
-        &mut drive,
-        &TAPE,
-        BLOCK,
-        Uuid::new_v4(),
-        WriteMediaPolicy::RewritableObject,
-    )
-    .unwrap();
-    let generation = drive.identity_generation();
-    let before = world.lock().unwrap().tapes[BARCODE].records.clone();
-    let mut preview = None;
-    let refusal = crate::write_owner::supersede_mounted_tail(
-        &mut index,
-        &cfg.terminal_config(),
-        &mut drive,
-        TAPE,
-        generation,
-        BARCODE,
-        AuditActor::System,
-        |required, found, sequence| {
-            preview = Some((required.to_owned(), found.to_vec(), sequence));
-            Err("confirmation required".into())
-        },
-    )
-    .unwrap_err();
-    assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        world.lock().unwrap().tapes[BARCODE].records,
-        before,
-        "preview does not change tape"
-    );
-    let Some((confirmation, found, sequence)) = preview else {
-        return Err(refusal);
-    };
-    crate::write_owner::supersede_mounted_tail(
-        &mut index,
-        &cfg.terminal_config(),
-        &mut drive,
-        TAPE,
-        generation,
-        BARCODE,
-        AuditActor::System,
-        |required, current, current_sequence| {
-            assert_eq!(current_sequence, sequence);
-            assert_eq!(required, confirmation);
-            assert_eq!(current, found);
-            Ok(())
-        },
-    )
-    .map(|_| ())
 }
 
 fn record_refusal(
@@ -908,237 +975,6 @@ struct Coverage {
     unnamed_refusals: BTreeMap<String, usize>,
     refused: BTreeMap<String, usize>,
     refusal_examples: BTreeMap<String, String>,
-}
-
-async fn check_crash(
-    source: &Path,
-    cut: &Cut,
-    keep: usize,
-    tails: BTreeMap<PathBuf, usize>,
-    keep_entries: bool,
-    coverage: &mut Coverage,
-) -> Result<(), String> {
-    coverage.crashes += 1;
-    // Include the crash choice, not only its boundary, in citable diagnostics.
-    let cut = &Cut {
-        boundary: format!(
-            "C{:03} {}; keep_entries={keep_entries}; tails={:?}",
-            cut.number,
-            cut.boundary,
-            tails
-                .iter()
-                .map(|(path, bytes)| (path.strip_prefix(source).unwrap(), bytes))
-                .collect::<Vec<_>>(),
-        ),
-        ..cut.clone()
-    };
-    let temp = tempfile::tempdir().unwrap();
-    restore_disk(temp.path(), &cut.disk);
-    let mut files = cut.files.clone();
-    files.crash(&tails, keep_entries).unwrap();
-    files.materialize(source, temp.path()).unwrap();
-    let mut world = cut.world.clone();
-    world.tapes.get_mut(BARCODE).unwrap().records = cut.records.as_ref().clone();
-    world.power_cut(BAY, keep).unwrap();
-    // Even an operator refusal cannot excuse losing an acknowledged record.
-    for receipt in &cut.receipts {
-        if world.tapes[BARCODE]
-            .records
-            .get(receipt.start..receipt.start + receipt.records.len())
-            != Some(receipt.records.as_slice())
-        {
-            return Err(format!(
-                "{}: acknowledged object {} loses tape bytes at keep={keep}",
-                cut.boundary, receipt.id
-            ));
-        }
-    }
-    let world = Arc::new(Mutex::new(world));
-    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    let replay = crate::startup_checkpoint::replay_checkpoint_journal_projections(
-        &mut index,
-        &temp.path().join("journals/tapes"),
-    );
-    if let Err(status) = replay {
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
-        assert!(
-            status
-                .message()
-                .contains(&Uuid::from_bytes(TAPE).to_string()),
-            "refusal names the tape: {status}"
-        );
-        assert!(
-            status.message().contains("torn trailing frame"),
-            "unexpected startup refusal: {status}"
-        );
-        for receipt in &cut.receipts {
-            assert!(
-                index.get_native_object(&receipt.id).unwrap().is_some(),
-                "startup refusal preserves acknowledged object"
-            );
-        }
-        *coverage
-            .refused
-            .entry("startup: torn checkpoint frame".into())
-            .or_default() += 1;
-        coverage
-            .refusal_examples
-            .entry("startup: torn checkpoint frame".into())
-            .or_insert_with(|| {
-                format!(
-                    "{}; keep={keep}; receipts={}",
-                    cut.boundary,
-                    cut.receipts.len()
-                )
-            });
-        return read_receipts(temp.path(), world, &cut.receipts).await;
-    }
-    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        temp.path().join("journals/tapes"),
-        TAPE,
-    )
-    .build()
-    .unwrap()
-    .replay()
-    .unwrap();
-    let committed = authority
-        .last()
-        .map_or(0, |record| record.committed_object_count);
-    let listed = index.list_native_objects().unwrap();
-    assert_eq!(
-        listed.len() as u64,
-        committed,
-        "catalog agrees with durable prefix at {}",
-        cut.boundary
-    );
-    for receipt in &cut.receipts {
-        assert!(
-            listed.iter().any(|object| object.object_id == receipt.id),
-            "acknowledged object is listed at {}",
-            cut.boundary
-        );
-        let members = index.list_native_object_files(&receipt.id).unwrap();
-        assert_eq!(members[0].size_bytes, receipt.payload.len() as u64);
-    }
-    drop(index);
-    for attempt in 0..2 {
-        let (tx, opened, thread) =
-            open_writer(temp.path(), open_model_library(world.clone())).await;
-        match opened {
-            Ok(id) => {
-                coverage.completed += 1;
-                let protected_start = authority.last().map_or(2, |record| record.eod_lba);
-                // Admission closes any prior session's debt before opening the next epoch.
-                let expected_start =
-                    remanence_state::projector::open(temp.path().join("state.sqlite"))
-                        .map(|catalog| catalog.write_handle())
-                        .unwrap()
-                        .get_tape(&TAPE)
-                        .unwrap()
-                        .unwrap()
-                        .written_extent_lba
-                        .unwrap();
-                let before = world.lock().unwrap().tapes[BARCODE]
-                    .records
-                    .get(..protected_start as usize)
-                    .map(<[Record]>::to_vec);
-                let Some(before) = before else {
-                    close_writer(&tx, id, thread).await;
-                    return Err(format!(
-                        "{}: recovery admits an append beyond surviving tape",
-                        cut.boundary
-                    ));
-                };
-                append_actor_test_file(
-                    &tx,
-                    id,
-                    temp.path().join("next-input"),
-                    "next-file",
-                    "next-caller",
-                    b"next append",
-                )
-                .await;
-                let (reply, received) = oneshot::channel();
-                tx.send(DriveCommand::Checkpoint {
-                    session_id: id,
-                    trigger: CheckpointTrigger::Explicit,
-                    expected_batch_id: None,
-                    reply: Some(reply),
-                })
-                .await
-                .unwrap();
-                let response = received.await.unwrap().unwrap();
-                let next_id = Uuid::from_slice(&response.committed_objects[0].object_id)
-                    .unwrap()
-                    .to_string();
-                let index = remanence_state::projector::open(temp.path().join("state.sqlite"))
-                    .map(|catalog| catalog.write_handle())
-                    .unwrap();
-                let next = index.find_native_object_instances(&next_id).unwrap();
-                assert_eq!(
-                    next[0].global_start_block,
-                    Some(expected_start),
-                    "next append immediately follows the committed prefix at {}",
-                    cut.boundary
-                );
-                assert_eq!(
-                    &world.lock().unwrap().tapes[BARCODE].records[..before.len()],
-                    before.as_slice()
-                );
-                close_writer(&tx, id, thread).await;
-                break;
-            }
-            Err(status) => {
-                thread.join().expect("recovery never panics");
-                let needs_ack = record_refusal(coverage, &status, cut, keep)?;
-                if needs_ack && attempt == 0 {
-                    match acknowledge_tail(temp.path(), world.clone()) {
-                        Ok(()) => {
-                            coverage.acknowledged_tails += 1;
-                        }
-                        Err(status) => {
-                            record_refusal(coverage, &status, cut, keep)?;
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    for fence in index.list_active_tape_io_fences().unwrap() {
-        assert_eq!(fence.tape_uuid, TAPE);
-        assert_eq!(fence.reason, "supersede_tail_failed");
-        let status = session_open_reject_tape_io_fences(
-            &index,
-            &TAPE,
-            Some(BARCODE),
-            "open read session",
-            true,
-        )
-        .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert!(status
-            .message()
-            .contains(&Uuid::from_bytes(TAPE).to_string()));
-        index
-            .release_tape_io_fence(
-                &fence.quarantine_id,
-                "verified acknowledged records after failed tail discard",
-            )
-            .unwrap()
-            .unwrap();
-        coverage.released_fences += 1;
-    }
-    drop(index);
-    read_receipts(temp.path(), world, &cut.receipts).await?;
-    Ok(())
 }
 
 /// One independent restart. The default always includes the minimum-survival
@@ -1251,47 +1087,6 @@ fn crash_cases(cuts: &[Cut], full: bool) -> Vec<CrashCase> {
         "every cut has the minimum-survival crash",
     );
     cases
-}
-
-#[allow(dead_code)] // Retained legacy entry point; property now uses the typed engine.
-async fn run_case(source: &Path, cuts: &[Cut], case: &CrashCase) -> Result<Coverage, String> {
-    let cut = &cuts[case.cut];
-    let mut coverage = Coverage::default();
-    let failed_cut;
-    let cut = if case.fail_sync {
-        use remanence_library::durable_file::DurableDirectory;
-        let path = cut.before_sync.as_ref().unwrap();
-        let failed = MemoryDirectory::from_snapshot(cut.files.clone());
-        failed.fail_next_sync(path).unwrap();
-        let mut file = failed.open(path).unwrap();
-        assert!(file.sync().is_err());
-        // A later successful sync does not restore bytes lost by the error.
-        file.sync().unwrap();
-        coverage.failed_syncs = 1;
-        failed_cut = Cut {
-            boundary: format!(
-                "failed sync {}",
-                path.strip_prefix(source).unwrap().display()
-            ),
-            before_sync: None,
-            files: failed.snapshot(),
-            ..cut.clone()
-        };
-        &failed_cut
-    } else {
-        cut
-    };
-    coverage.torn_tails = usize::from(!case.tails.is_empty());
-    check_crash(
-        source,
-        cut,
-        case.keep,
-        case.tails.clone(),
-        case.keep_entries,
-        &mut coverage,
-    )
-    .await?;
-    Ok(coverage)
 }
 
 impl Coverage {

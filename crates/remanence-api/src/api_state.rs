@@ -1390,39 +1390,6 @@ impl ApiState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_request_received(
-        &self,
-        actor: AuditActor,
-        operation_id: Uuid,
-        operation_kind: &str,
-        tape_uuid: &[u8; 16],
-        idempotency_key: Option<Uuid>,
-    ) -> Result<(), Status> {
-        let mut index = self.catalog.write_handle();
-        let mut detail = BTreeMap::new();
-        detail.insert(
-            "tape_uuid".to_string(),
-            CborValue::Bytes(tape_uuid.to_vec()),
-        );
-        append_operation_audit(
-            &mut index,
-            self.audit_dir.as_ref(),
-            self.audit_fsync,
-            &self.audit_append_lock,
-            OperationAuditInput {
-                actor,
-                operation_id,
-                operation_kind,
-                event: AuditEvent::RequestReceived,
-                subject_kind: "tape",
-                subject_id: Some(Uuid::from_bytes(*tape_uuid).to_string()),
-                idempotency_key,
-                detail,
-            },
-        )
-    }
-
     pub(crate) fn record_cancel_requested(
         &self,
         actor: AuditActor,

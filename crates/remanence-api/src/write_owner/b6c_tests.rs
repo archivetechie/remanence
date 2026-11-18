@@ -79,7 +79,7 @@ impl SgTransport for GatedTransport {
 async fn mr_b_running_unload_is_not_reconciled() {
     use remanence_state::library_log as lib;
     const BAY_B: u16 = 0x101;
-    let (mut typed, _root) = typed_root();
+    let mut typed = crate::tests::TypedRoot::open_with_tapes(&[(TAPE, BARCODE)]);
     let runtime = typed.catalog().library_runtime().unwrap();
     let mut model = VirtualWorld::single_drive(LIBRARY, BAY_B, DRIVE, 0x400, 2);
     model.put_tape_in_drive(BAY_B, BARCODE, Some(0x401), VirtualTape::default());
@@ -221,8 +221,8 @@ async fn mr_b_running_unload_is_not_reconciled() {
 
 /// Expire while a command is issued, then settle it without dispatching another.
 async fn interrupted_session(sidecar: bool, lost: bool) {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let (entered, reached) = oneshot::channel();
     let gate = Arc::new(CommandGate {
         armed: AtomicBool::new(false),
@@ -252,8 +252,8 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
     let lifecycle = DrivePoolLifecycle::default();
     let key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
-    let (tx, opened, thread) =
-        open_writer_configured(root.path(), library, selected(), |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(library, selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
             cfg.reservations = reservations.clone();
         })
@@ -316,9 +316,7 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
             drive_uuid: None,
         },
     );
-    let mut state = crate::ApiState::new(
-        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-    );
+    let mut state = root.api_state();
     state.drive_pool = Some(pool);
     let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
     tokio::time::sleep(StdDuration::from_millis(60)).await;
@@ -340,17 +338,11 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
         before + usize::from(!lost),
         "only the already issued command may reach the model"
     );
-    let authority = TapeAuthority::open(
-        root.path().join("journals/tapes"),
-        TAPE,
-        &root.path().join("state.sqlite"),
-    )
-    .unwrap();
+    let authority =
+        TapeAuthority::open(root.tape_dir(), TAPE, &root.state.paths().sqlite_path).unwrap();
     let snapshot = authority.freeze().unwrap();
     let summary = snapshot.tape_summary();
-    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let index = root.state.write_handle();
     if lost {
         assert!(
             summary.open_session.is_some(),
@@ -358,11 +350,19 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
         );
         assert!(summary.last_session_end.is_none());
         for fence in index.list_active_tape_io_fences().unwrap() {
-            index
-                .release_tape_io_fence(&fence.quarantine_id, "test transport restored")
+            root.state
+                .library_runtime()
+                .release_tape_fence(
+                    &fence.quarantine_id,
+                    "test transport restored",
+                    false,
+                    remanence_state::library_log::AuditActor::System,
+                )
                 .unwrap();
         }
-        let (_tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+        let (_tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |_, _| {})
+            .await;
         let error = opened.unwrap_err();
         assert!(error.message().contains("TailBeyondKnownState"), "{error}");
         thread.join().unwrap();
@@ -398,11 +398,13 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
             assert!(summary.closeout_due());
         }
         drop(snapshot);
-        let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+        let (tx, opened, thread) = root
+            .writer(open_model_library(world), selected(), |_, _| {})
+            .await;
         let id = opened.expect("recorded live tail must reopen without acknowledgement");
         if sidecar {
             assert!(
-                super::b6b_fix_tests::native_records(root.path())
+                super::b6b_fix_tests::native_records_in(&root.tape_dir())
                     .iter()
                     .any(|record| matches!(
                         record,
@@ -417,8 +419,8 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
 
 /// Exercise unknown completion with the shared runtime and release its tape fences by source ID.
 async fn typed_lost_interrupted_session() {
-    let (typed, root) = typed_root();
-    let world = setup(root.as_path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let (entered, reached) = oneshot::channel();
     let gate = Arc::new(CommandGate {
         armed: AtomicBool::new(false),
@@ -446,7 +448,7 @@ async fn typed_lost_interrupted_session() {
         )
         .unwrap();
     crate::drive_collection::observe_drive_catalog_from_libraries(
-        &mut typed.catalog().write_handle(),
+        &mut root.state.write_handle(),
         [library.library()],
         &HashSet::from([LIBRARY.to_string()]),
     )
@@ -454,8 +456,8 @@ async fn typed_lost_interrupted_session() {
     let lifecycle = DrivePoolLifecycle::default();
     let key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
-    let (tx, opened, thread) =
-        open_typed_writer_configured(&typed, library, selected(), |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(library, selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
             cfg.reservations = reservations.clone();
         })
@@ -464,7 +466,7 @@ async fn typed_lost_interrupted_session() {
     append_actor_test_file(
         &tx,
         id,
-        root.as_path().join("pending"),
+        root.path().join("pending"),
         "pending",
         "pending",
         b"deadline object",
@@ -506,8 +508,7 @@ async fn typed_lost_interrupted_session() {
             drive_uuid: None,
         },
     );
-    let mut state = crate::ApiState::new_with_pool_configs(typed.catalog(), vec![super::pool()]);
-    state.checkpoint_journal_dir = Arc::new(typed.paths().journal_dir.join("tapes"));
+    let mut state = root.api_state();
     state.drive_idle_unload_seconds = 0;
     state.drive_pool = Some(pool);
     let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
@@ -531,20 +532,20 @@ async fn typed_lost_interrupted_session() {
         "only the already issued command may reach the model"
     );
     let authority = TapeAuthority::open(
-        typed.paths().journal_dir.join("tapes"),
+        root.typed.paths().journal_dir.join("tapes"),
         TAPE,
-        &typed.paths().sqlite_path,
+        &root.typed.paths().sqlite_path,
     )
     .unwrap();
     let snapshot = authority.freeze().unwrap();
     let summary = snapshot.tape_summary();
-    let index = typed.catalog().write_handle();
+    let index = root.state.write_handle();
     assert!(
         summary.open_session.is_some(),
         "unknown completion keeps the crash row"
     );
     assert!(summary.last_session_end.is_none());
-    let runtime = typed.catalog().library_runtime().unwrap();
+    let runtime = root.state.library_runtime();
     for fence in index.list_active_tape_io_fences().unwrap() {
         runtime
             .release_tape_fence(
@@ -555,9 +556,9 @@ async fn typed_lost_interrupted_session() {
             )
             .unwrap();
     }
-    let (_tx, opened, thread) =
-        open_typed_writer_configured(&typed, open_model_library(world), selected(), |_, _| {})
-            .await;
+    let (_tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |_, _| {})
+        .await;
     let error = opened.unwrap_err();
     assert!(error.message().contains("TailBeyondKnownState"), "{error}");
     thread.join().unwrap();
@@ -580,8 +581,8 @@ async fn lost_transport_at_settle_bound_leaves_crash_row() {
 /// would deadlock this test. Both workers observe the very same absolute cutoff.
 #[tokio::test]
 async fn shutdown_sessions_share_one_deadline_and_end_in_parallel() {
-    let root = tempfile::tempdir().unwrap();
-    setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+
     let lifecycle = DrivePoolLifecycle::default();
     let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
     let mut drives = HashMap::new();
@@ -627,9 +628,7 @@ async fn shutdown_sessions_share_one_deadline_and_end_in_parallel() {
     for (id, mounted) in sessions {
         pool.record_session(id, mounted);
     }
-    let mut state = crate::ApiState::new(
-        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-    );
+    let mut state = root.api_state();
     state.shutdown_close_deadline_secs = 1;
     state.drive_pool = Some(pool);
     let started = std::time::Instant::now();
@@ -654,21 +653,17 @@ async fn shutdown_sessions_share_one_deadline_and_end_in_parallel() {
 async fn shutdown_deadline_wakes_stalled_overlap_ingress_and_ends_actor() {
     use super::ingress_deadline_media_tests::StalledBody;
     use crate::write_session_ingress::WriteSessionApi;
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let lifecycle = DrivePoolLifecycle::default();
     let key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world.clone()),
-        selected(),
-        |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world.clone()), selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
             cfg.reservations = reservations.clone();
-        },
-    )
-    .await;
+        })
+        .await;
     let id = opened.unwrap();
     let before = world.lock().unwrap().tapes[BARCODE].records.len();
     let (changer, _rx) = mpsc::channel(1);
@@ -689,9 +684,7 @@ async fn shutdown_deadline_wakes_stalled_overlap_ingress_and_ends_actor() {
             drive_uuid: None,
         },
     );
-    let mut state = crate::ApiState::new(
-        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-    );
+    let mut state = root.api_state();
     let spool = root.path().join("spool");
     std::fs::create_dir(&spool).unwrap();
     state.spool_dir = Some(Arc::new(spool));
@@ -758,12 +751,8 @@ async fn shutdown_deadline_wakes_stalled_overlap_ingress_and_ends_actor() {
     assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     assert!(error.message().contains("ShutdownCloseDeadline"));
     thread.join().unwrap();
-    let authority = TapeAuthority::open(
-        root.path().join("journals/tapes"),
-        TAPE,
-        &root.path().join("state.sqlite"),
-    )
-    .unwrap();
+    let authority =
+        TapeAuthority::open(root.tape_dir(), TAPE, &root.state.paths().sqlite_path).unwrap();
     let snapshot = authority.freeze().unwrap();
     let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
     assert_eq!(end.reason, SessionEndReason::FailedAppend);
@@ -774,20 +763,17 @@ async fn shutdown_deadline_wakes_stalled_overlap_ingress_and_ends_actor() {
 /// neither the deadline nor skipped closeout can revoke its receipt.
 #[tokio::test]
 async fn commit_sync_crossing_deadline_returns_receipts_and_leaves_closeout_due() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let files = MemoryDirectory::default();
-    let _registration = register(root.path().join("journals/tapes"), Arc::new(files.clone()));
+    seed_typed_crash_files(&root.tape_dir(), &files);
+    let _registration = register(root.tape_dir(), Arc::new(files.clone()));
     let lifecycle = DrivePoolLifecycle::default();
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world.clone()),
-        selected(),
-        |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world.clone()), selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
-        },
-    )
-    .await;
+        })
+        .await;
     let id = opened.unwrap();
     append_actor_test_file(
         &tx,
@@ -798,12 +784,8 @@ async fn commit_sync_crossing_deadline_returns_receipts_and_leaves_closeout_due(
         b"durable despite deadline",
     )
     .await;
-    let authority = TapeAuthority::open(
-        root.path().join("journals/tapes"),
-        TAPE,
-        &root.path().join("state.sqlite"),
-    )
-    .unwrap();
+    let authority =
+        TapeAuthority::open(root.tape_dir(), TAPE, &root.state.paths().sqlite_path).unwrap();
     let target = remanence_state::authority::fixtures::publication_target(&authority);
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let wait_gate = gate.clone();
@@ -876,21 +858,17 @@ async fn commit_sync_crossing_deadline_returns_receipts_and_leaves_closeout_due(
 /// An actor-open reply racing the pool's initial snapshot must still be ended.
 #[tokio::test]
 async fn shutdown_ends_session_registered_after_initial_snapshot() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let lifecycle = DrivePoolLifecycle::default();
     let key = DriveKey::new(LIBRARY, BAY);
     let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world),
-        selected(),
-        |cfg, _| {
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |cfg, _| {
             cfg.lifecycle = Some(lifecycle.clone());
             cfg.reservations = reservations.clone();
-        },
-    )
-    .await;
+        })
+        .await;
     let id = opened.unwrap();
     let (changer, _rx) = mpsc::channel(1);
     let pool = DrivePool::new_with_lifecycle(
@@ -899,9 +877,7 @@ async fn shutdown_ends_session_registered_after_initial_snapshot() {
         reservations,
         lifecycle,
     );
-    let mut state = crate::ApiState::new(
-        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-    );
+    let mut state = root.api_state();
     state.drive_pool = Some(pool.clone());
     let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
     tokio::time::timeout(StdDuration::from_secs(2), async {
@@ -930,12 +906,8 @@ async fn shutdown_ends_session_registered_after_initial_snapshot() {
         .unwrap()
         .unwrap();
     thread.join().unwrap();
-    let authority = TapeAuthority::open(
-        root.path().join("journals/tapes"),
-        TAPE,
-        &root.path().join("state.sqlite"),
-    )
-    .unwrap();
+    let authority =
+        TapeAuthority::open(root.tape_dir(), TAPE, &root.state.paths().sqlite_path).unwrap();
     let snapshot = authority.freeze().unwrap();
     assert!(snapshot.tape_summary().open_session.is_none());
     assert_eq!(

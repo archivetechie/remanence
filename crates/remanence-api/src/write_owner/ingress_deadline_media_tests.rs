@@ -41,44 +41,17 @@ async fn client_disconnect_preserves_committed_receipt_and_names_tail() {
 async fn check_ingress_ending(disconnect: bool) {
     for overlap in [false, true] {
         for mid_object in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let world = setup(root.path());
+            let root = DurabilityRoot::new(BARCODE, false);
+            let world = model_world(BARCODE, false);
             // Use the no-parity writer to inspect the committed archive's
             // physical blocks as well as reading it through the session engine.
-            let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
-            index
-                .provision_tape(ProvisionTapeInput {
-                    tape_uuid: TAPE,
-                    voltag: BARCODE.into(),
-                    block_size: BLOCK,
-                    parity: ParityConfig::None,
-                    force: false,
-                })
-                .unwrap();
-            index.project_tape_pool_membership(TAPE, POOL).unwrap();
-            {
-                let mut model = world.lock().unwrap();
-                let Record::Block(block) = &mut model.tapes.get_mut(BARCODE).unwrap().records[0]
-                else {
-                    panic!("bootstrap block");
-                };
-                let mut bootstrap = parse_bootstrap_block(block).unwrap();
-                bootstrap.scheme = None;
-                bootstrap.no_parity_flag = true;
-                write_bootstrap_block(&bootstrap, block).unwrap();
-            }
             let selection = SelectedTape {
                 parity_config: ParityConfig::None,
                 ..selected()
             };
-            let (tx, opened, thread) = open_writer_with_selection(
-                root.path(),
-                open_model_library(world.clone()),
-                selection,
-            )
-            .await;
+            let (tx, opened, thread) = root
+                .writer(open_model_library(world.clone()), selection, |_, _| {})
+                .await;
             let id = opened.unwrap();
             let payload = b"checkpointed before a later client stall".to_vec();
             append_actor_test_file(
@@ -106,9 +79,7 @@ async fn check_ingress_ending(disconnect: bool) {
                 pb::AppendDurability::Checkpointed as i32
             );
             let object_id = Uuid::from_slice(&receipt.object_id).unwrap().to_string();
-            let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-                .map(|catalog| catalog.write_handle())
-                .unwrap();
+            let index = root.state.write_handle();
             let saved = index.get_native_object(&object_id).unwrap().unwrap();
             let copies = index.find_native_object_instances(&object_id).unwrap();
             let before = world.lock().unwrap().tapes[BARCODE].records.clone();
@@ -130,9 +101,7 @@ async fn check_ingress_ending(disconnect: bool) {
                     drive_uuid: None,
                 },
             );
-            let mut state = crate::ApiState::new(
-                remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-            );
+            let mut state = root.api_state();
             let spool = root.path().join("spool");
             std::fs::create_dir_all(&spool).unwrap();
             state.spool_dir = Some(Arc::new(spool.clone()));
@@ -243,9 +212,7 @@ async fn check_ingress_ending(disconnect: bool) {
             assert_eq!(index.list_native_objects().unwrap().len(), 1);
             // A failed append definitively ends its owner; wait for its durable named end.
             thread.join().expect("failed append owner exits");
-            let authority =
-                TapeAuthority::open(root.path().join("journals/tapes"), TAPE, index.path())
-                    .unwrap();
+            let authority = TapeAuthority::open(root.tape_dir(), TAPE, index.path()).unwrap();
             let snapshot = authority.freeze().unwrap();
             let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
             assert_eq!(
@@ -297,8 +264,8 @@ async fn check_ingress_ending(disconnect: bool) {
                 index.list_active_tape_io_fences().unwrap().is_empty(),
                 "a durable live end keeps reads available"
             );
-            read_receipts(
-                root.path(),
+            read_pool_receipts(
+                &root,
                 world,
                 &[Receipt {
                     id: object_id,
