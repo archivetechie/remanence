@@ -70,13 +70,16 @@ jobs:
             fi
           done
 
+      - name: Trusted journal volume for tests
+        run: tools/ci_journal_volume.sh up "$RUNNER_TEMP/journal-volume" 4G
+
       # Read-only. Shows the write-cache mode the journal trust check will
       # consult for the test temp directories, so a rejection can be told
       # apart from a runner disk that is "write back" without FUA.
       - name: Report journal-volume write cache
         run: |
           (
-            for dir in "${RUNNER_TEMP:-/tmp}" /tmp; do
+            for dir in "${TMPDIR:-/tmp}" "${RUNNER_TEMP:-/tmp}" /tmp; do
               echo "== $dir ($(findmnt -no SOURCE,FSTYPE -T "$dir"))"
               dev=$(stat -c '%d' "$dir")
               major=$(( ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff) ))
@@ -316,6 +319,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libarchive-tools attr
           cargo install cargo-llvm-cov --locked
+      - name: Trusted journal volume for tests
+        run: tools/ci_journal_volume.sh up "$RUNNER_TEMP/journal-volume" 4G
+
       - name: Measure workspace coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage data
