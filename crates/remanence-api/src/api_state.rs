@@ -1423,38 +1423,6 @@ impl ApiState {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_library_request_received(
-        &self,
-        actor: AuditActor,
-        operation_id: Uuid,
-        operation_kind: &str,
-        library_serial: &str,
-        mut detail: BTreeMap<String, CborValue>,
-    ) -> Result<(), Status> {
-        let mut index = self.catalog.write_handle();
-        detail.insert(
-            "library_serial".to_string(),
-            CborValue::Text(library_serial.to_string()),
-        );
-        append_operation_audit(
-            &mut index,
-            self.audit_dir.as_ref(),
-            self.audit_fsync,
-            &self.audit_append_lock,
-            OperationAuditInput {
-                actor,
-                operation_id,
-                operation_kind,
-                event: AuditEvent::RequestReceived,
-                subject_kind: "library",
-                subject_id: Some(library_serial.to_string()),
-                idempotency_key: None,
-                detail,
-            },
-        )
-    }
-
     pub(crate) fn record_cancel_requested(
         &self,
         actor: AuditActor,

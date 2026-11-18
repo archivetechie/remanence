@@ -711,6 +711,38 @@ fn test_index() -> CatalogIndex {
         .expect("open test index")
 }
 
+/// Keep the authority root alive alongside its attached projection writer.
+fn typed_index() -> (TypedRoot, CatalogIndex) {
+    let typed = TypedRoot::open();
+    let index = typed.catalog().write_handle();
+    (typed, index)
+}
+
+/// Service fixtures retain the owner and use the runtime's native tape directory.
+fn typed_state(typed: TypedRoot) -> (TypedRoot, ApiState) {
+    let mut state = typed.api_state();
+    state.checkpoint_journal_dir = Arc::new(
+        state
+            .catalog
+            .library_runtime()
+            .expect("typed fixture runtime")
+            .manifest()
+            .tape_root()
+            .to_path_buf(),
+    );
+    (typed, state)
+}
+
+/// The spool stays separate from authority storage, including missing-path fixtures.
+fn typed_state_with_spool(spool_dir: PathBuf, budget_bytes: u64) -> (TypedRoot, ApiState) {
+    let (typed, mut state) = typed_state(TypedRoot::open());
+    state.spool_dir = Some(Arc::new(spool_dir));
+    state.spool_budget_bytes = Some(budget_bytes);
+    state.io_memory =
+        crate::io_memory::IoMemoryReservation::new(budget_bytes).expect("test I/O memory ceiling");
+    (typed, state)
+}
+
 fn temp_dir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -1234,8 +1266,8 @@ fn append_object_spool_create_failure_returns_cause_and_logs_path() {
         .tempdir()
         .expect("tempdir");
     let spool_dir = temp.path().join("missing").join("spool");
-    let service =
-        state_with_spool(spool_dir.clone(), APPEND_SPOOL_MAX_BYTES).write_session_service();
+    let (_typed, state) = typed_state_with_spool(spool_dir.clone(), APPEND_SPOOL_MAX_BYTES);
+    let service = state.write_session_service();
     let session_id = Uuid::new_v4();
     let stream = tokio_stream::iter([Ok(append_start_message(session_id, 1))]);
 
@@ -1284,7 +1316,8 @@ fn append_object_refuses_request_beyond_effective_tmpfs_budget() {
     let spool_dir = temp.path().join("spool");
     std::fs::create_dir_all(&spool_dir).expect("spool dir");
     let budget = 1024 * 1024;
-    let service = state_with_spool(spool_dir.clone(), budget).write_session_service();
+    let (_typed, state) = typed_state_with_spool(spool_dir.clone(), budget);
+    let service = state.write_session_service();
     let session_id = Uuid::new_v4();
     let stream = tokio_stream::iter([Ok(append_start_message(session_id, budget + 1))]);
 
@@ -1611,13 +1644,8 @@ fn authorization_matrix_covers_drive_stewardship_mutations() {
 
 #[tokio::test]
 async fn write_session_rejects_readonly_role_before_validation() {
-    let service = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
-    .write_session_service();
+    let (_typed, state) = typed_state(TypedRoot::open());
+    let service = state.write_session_service();
     let mut request = Request::new(pb::OpenWriteSessionRequest {
         target: None,
         body_format: None,
@@ -1659,13 +1687,8 @@ fn unimplemented_idempotency_rejects_only_non_empty_keys() {
 
 #[tokio::test]
 async fn write_session_rejects_idempotency_key_before_validation() {
-    let service = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
-    .write_session_service();
+    let (_typed, state) = typed_state(TypedRoot::open());
+    let service = state.write_session_service();
     let err = pb::write_session_service_server::WriteSessionService::open_write_session(
         &service,
         Request::new(pb::OpenWriteSessionRequest {
@@ -1687,13 +1710,8 @@ async fn write_session_rejects_idempotency_key_before_validation() {
 /// these were the same request on the wire.
 #[tokio::test]
 async fn write_session_separates_absent_body_format_from_a_blank_one() {
-    let service = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
-    .write_session_service();
+    let (_typed, state) = typed_state(TypedRoot::open());
+    let service = state.write_session_service();
     let open = |body_format| {
         pb::write_session_service_server::WriteSessionService::open_write_session(
             &service,
@@ -1729,25 +1747,44 @@ async fn write_session_separates_absent_body_format_from_a_blank_one() {
     );
 }
 
-#[test]
-fn cancel_audit_records_request_actor() {
-    let state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
-    let operation_id = Uuid::new_v4();
+#[tokio::test]
+async fn cancel_audit_records_request_actor() {
+    use remanence_state::library_log as lib;
+    let (mut typed, state) = typed_state(TypedRoot::open());
+    let tape = [0x5A; 16];
+    let fingerprint = {
+        let mut hash = Sha256::new();
+        hash.update(b"tape_verification\0");
+        hash.update(tape);
+        hash.finalize().into()
+    };
+    let operation_id = state
+        .accept_owner_request(
+            AuditActor::Service("submitter".into()),
+            "tape_verification",
+            "tape",
+            Uuid::from_bytes(tape).to_string(),
+            fingerprint,
+        )
+        .expect("accept tape verification fixture");
     let actor = AuditActor::Service("operator-a".to_string());
-
     state
         .record_cancel_requested(actor.clone(), operation_id, "tape_verification")
         .expect("record cancel");
-
-    let records = FileAuditLog::replay(state.audit_dir.as_ref()).expect("replay audit");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].actor, actor);
-    assert_eq!(records[0].event, AuditEvent::CancelRequested);
+    assert_no_legacy_audit_records(&state);
+    drop(state);
+    let records = typed.operation_chain(operation_id).await;
+    assert_eq!(records.len(), 2);
+    assert!(records
+        .iter()
+        .all(|r| r.kind == lib::OperationKind::TapeVerification));
+    assert!(matches!(records[0].event, lib::OperationEvent::Accepted(_)));
+    assert_eq!(records[0].actor, AuditActor::Service("submitter".into()));
+    assert_eq!(records[1].actor, actor);
+    assert_eq!(
+        records[1].event,
+        lib::OperationEvent::CancelRequested(lib::Unit)
+    );
 }
 
 /// With a library runtime, a cancel that lands before the operation publishes its first
@@ -1864,33 +1901,38 @@ async fn reconcile_tape_typed_is_deferred_before_any_load() {
     );
 }
 
-#[test]
-fn library_request_audit_records_request_actor() {
-    let state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
-    let operation_id = Uuid::new_v4();
+#[tokio::test]
+async fn library_request_audit_records_request_actor() {
+    use remanence_state::library_log as lib;
+    let (mut typed, state) = typed_state(TypedRoot::open());
     let actor = AuditActor::Service("operator-a".to_string());
-
-    state
-        .record_library_request_received(
+    let fingerprint = crate::operation_source::robotics_fingerprint(
+        "LIB001",
+        &crate::write_owner::RoboticsAction::Refresh,
+    );
+    let operation_id = state
+        .accept_owner_request(
             actor.clone(),
-            operation_id,
             "refresh_inventory",
-            "LIB001",
-            BTreeMap::new(),
+            "library",
+            "LIB001".into(),
+            fingerprint,
         )
-        .expect("record library request");
-
-    let records = FileAuditLog::replay(state.audit_dir.as_ref()).expect("replay audit");
+        .expect("accept library request");
+    assert_no_legacy_audit_records(&state);
+    drop(state);
+    let records = typed.operation_chain(operation_id).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].actor, actor);
-    assert_eq!(records[0].event, AuditEvent::RequestReceived);
-    assert_eq!(records[0].subject.kind, "library");
-    assert_eq!(records[0].subject.id.as_deref(), Some("LIB001"));
+    assert_eq!(records[0].kind, lib::OperationKind::RefreshInventory);
+    let lib::OperationEvent::Accepted(accepted) = &records[0].event else {
+        panic!("expected RefreshInventory acceptance: {records:?}");
+    };
+    assert_eq!(
+        accepted.subject.as_ref().map(|subject| subject.as_str()),
+        Some("LIB001")
+    );
+    assert_eq!(accepted.request_fingerprint, fingerprint);
 }
 
 fn test_scheme() -> ParityScheme {
@@ -2041,210 +2083,6 @@ fn project_no_parity_tape_usage(
             },
         )
         .expect("project no-parity tape usage");
-}
-
-#[test]
-fn sealed_manual_completion_audit_repair_is_exactly_once() {
-    const BLOCK_SIZE: u32 = 256 * 1024;
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-terminal-finish-audit-repair")
-        .tempdir()
-        .expect("tempdir");
-    let audit_dir = temp.path().join("audit");
-    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
-    let tape_uuid = [0xa1; 16];
-    let operation_id = Uuid::from_u128(0xa101);
-    let idempotency_key = Uuid::from_u128(0xa102);
-    let request_fingerprint = [0xa3; 32];
-    let actor_fingerprint = "sha256:terminal-audit-repair";
-    index
-        .register_idempotency_request(
-            actor_fingerprint,
-            FINALIZE_TAPE_OPERATION_KIND,
-            idempotency_key,
-            request_fingerprint,
-            operation_id,
-            Some("2026-08-09T00:00:00Z"),
-        )
-        .expect("project exact request binding");
-    let layout = remanence_parity::TerminalTailLayout::new(
-        0,
-        BLOCK_SIZE,
-        2,
-        10,
-        3,
-        remanence_parity::index_separation_records(
-            BLOCK_SIZE,
-            remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
-        )
-        .expect("separation records"),
-    )
-    .expect("terminal layout");
-    let completion = remanence_state::TerminalFinalizationIntent {
-        tape_uuid,
-        trigger: remanence_state::TerminalFinalizationTrigger::OperatorCloseOut,
-        manual: Some(remanence_state::ManualTerminalFinalizationIdentity {
-            operation_id: *operation_id.as_bytes(),
-            operation_kind: FINALIZE_TAPE_OPERATION_KIND.to_string(),
-            actor_fingerprint: actor_fingerprint.to_string(),
-            idempotency_key: *idempotency_key.as_bytes(),
-            request_fingerprint,
-            assigned_pool_id: Some("audit-repair".to_string()),
-            expected_pool_id: Some("audit-repair".to_string()),
-            assignment_generation: 1,
-            reason: "repair final audit after host-only crash".to_string(),
-        }),
-        progress: remanence_state::TerminalFinalizationProgress::AfterReplicaC,
-        recovery_required: false,
-        edition_id: [0xa4; 16],
-        edition_sequence: 1,
-        edition_digest: [0xa5; 32],
-        writer_version: "audit-repair-test".to_string(),
-        write_timestamp: "2026-08-09T00:00:00Z".to_string(),
-        terminal_prefix: None,
-        layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
-            .expect("persisted layout"),
-    };
-    let lock = Arc::new(std::sync::Mutex::new(()));
-
-    for _ in 0..2 {
-        ensure_manual_finalize_finished_audit(
-            &mut index,
-            &audit_dir,
-            &lock,
-            tape_uuid,
-            &(&completion).into(),
-        )
-        .expect("ensure exact operation-finished evidence");
-    }
-
-    let records = FileAuditLog::replay(&audit_dir).expect("replay repaired audit");
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| {
-                record.event == AuditEvent::TapeSealed
-                    && audit_subject_matches_tape(record, tape_uuid)
-            })
-            .count(),
-        0
-    );
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| {
-                record.event == AuditEvent::OperationFinished
-                    && record.operation_id == Some(operation_id)
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        index
-            .idempotency_scope_record(
-                actor_fingerprint,
-                FINALIZE_TAPE_OPERATION_KIND,
-                idempotency_key,
-            )
-            .expect("read repaired scope")
-            .expect("scope exists")
-            .terminal_state
-            .as_deref(),
-        Some("finished")
-    );
-
-    append_and_project_audit(
-        &mut index,
-        &audit_dir,
-        false,
-        &lock,
-        ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: Some(operation_id),
-            session_id: None,
-            idempotency_key: Some(idempotency_key),
-            event: AuditEvent::OperationFinished,
-            subject_kind: "tape",
-            subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
-            detail: BTreeMap::from([
-                (
-                    "tape_uuid".to_string(),
-                    CborValue::Bytes(tape_uuid.to_vec()),
-                ),
-                (
-                    "actor_fingerprint".to_string(),
-                    CborValue::Text(actor_fingerprint.to_string()),
-                ),
-                (
-                    "finalization_progress".to_string(),
-                    CborValue::Text("after_replica_c".to_string()),
-                ),
-                (
-                    "operation_kind".to_string(),
-                    CborValue::Text(FINALIZE_TAPE_OPERATION_KIND.to_string()),
-                ),
-            ]),
-        },
-    )
-    .expect("append hostile duplicate operation-finished evidence");
-    let duplicate_finish = ensure_manual_finalize_finished_audit(
-        &mut index,
-        &audit_dir,
-        &lock,
-        tape_uuid,
-        &(&completion).into(),
-    )
-    .expect_err("duplicate operation-finished evidence must fail closed");
-    assert_eq!(duplicate_finish.code(), tonic::Code::FailedPrecondition);
-    assert!(duplicate_finish
-        .message()
-        .contains("2 durable OperationFinished"));
-
-    append_and_project_audit(
-        &mut index,
-        &audit_dir,
-        false,
-        &lock,
-        ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: Some(operation_id),
-            session_id: None,
-            idempotency_key: Some(idempotency_key),
-            event: AuditEvent::OperationFailed,
-            subject_kind: "tape",
-            subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
-            detail: BTreeMap::from([
-                (
-                    "actor_fingerprint".to_string(),
-                    CborValue::Text(actor_fingerprint.to_string()),
-                ),
-                (
-                    "operation_kind".to_string(),
-                    CborValue::Text(FINALIZE_TAPE_OPERATION_KIND.to_string()),
-                ),
-            ]),
-        },
-    )
-    .expect("append hostile incompatible terminal evidence");
-    let incompatible_terminal = ensure_manual_finalize_finished_audit(
-        &mut index,
-        &audit_dir,
-        &lock,
-        tape_uuid,
-        &(&completion).into(),
-    )
-    .expect_err("incompatible terminal evidence must fail closed");
-    assert_eq!(
-        incompatible_terminal.code(),
-        tonic::Code::FailedPrecondition
-    );
-    assert!(incompatible_terminal
-        .message()
-        .contains("incompatible durable terminal audit"));
 }
 
 fn project_no_parity_tape(index: &mut CatalogIndex, pool_id: &str, tape_uuid: [u8; 16]) {
@@ -3379,8 +3217,8 @@ fn operation_uuid() -> Uuid {
     Uuid::parse_str(OPERATION_ID_TEXT).expect("valid operation uuid")
 }
 
-fn populated_state() -> ApiState {
-    let mut index = test_index();
+fn populated_state() -> (TypedRoot, ApiState) {
+    let (typed, mut index) = typed_index();
     let scheme = ParityScheme {
         id: SchemeId::new_static("rs-test"),
         data_blocks_per_stripe: 2,
@@ -3504,25 +3342,18 @@ fn populated_state() -> ApiState {
             }],
         )
         .expect("populate object");
-    ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
+    typed_state(typed)
 }
 
-fn populated_state_with_file_catalog() -> ApiState {
-    let state = populated_state();
+fn populated_state_with_file_catalog() -> (TypedRoot, ApiState) {
+    let (typed, state) = populated_state();
     let scheme = ParityScheme {
         id: SchemeId::new_static("rs-test"),
         data_blocks_per_stripe: 2,
         parity_blocks_per_stripe: 1,
         stripes_per_neighborhood: 3,
     };
-    let mut index = remanence_state::projector::open(state.index_path.as_ref())
-        .map(|catalog| catalog.write_handle())
-        .expect("open test index");
+    let mut index = state.catalog.write_handle();
     index
         .project_native_object_and_committed_tape_file_bundle(
             NativeObjectProjectionInput {
@@ -3587,15 +3418,15 @@ fn populated_state_with_file_catalog() -> ApiState {
                 .unwrap(),
         )
         .expect("populate object file rows");
-    state
+    (typed, state)
 }
 
-fn empty_pool_state() -> ApiState {
+fn empty_pool_state() -> (TypedRoot, ApiState) {
     pool_state_with_tapes(&[TAPE_UUID])
 }
 
-fn state_with_library_snapshot(serial: &str) -> ApiState {
-    let mut state = empty_pool_state();
+fn state_with_library_snapshot(serial: &str) -> (TypedRoot, ApiState) {
+    let (typed, mut state) = empty_pool_state();
     state.default_library_serial = Some(Arc::new(serial.to_string()));
     state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
         report: DiscoveryReport {
@@ -3607,7 +3438,7 @@ fn state_with_library_snapshot(serial: &str) -> ApiState {
         },
         captured_at: OffsetDateTime::UNIX_EPOCH,
     }))));
-    state
+    (typed, state)
 }
 
 fn test_library(serial: &str) -> Library {
@@ -3669,47 +3500,6 @@ fn test_library(serial: &str) -> Library {
             import_enabled: true,
             export_enabled: true,
         }],
-    }
-}
-
-fn foreign_drive_library(serial: &str, bays: &[(u16, &str, Option<&str>)]) -> Library {
-    let mut library = test_library(serial);
-    library.layout.drive_start = bays
-        .iter()
-        .map(|(element_address, _, _)| *element_address)
-        .min()
-        .unwrap_or(0);
-    library.layout.drive_count = u16::try_from(bays.len()).expect("test bay count fits u16");
-    library.drive_bays = bays
-        .iter()
-        .map(|(element_address, drive_serial, sg_path)| DriveBay {
-            element_address: *element_address,
-            accessible: true,
-            exception: None,
-            installed: Some(InstalledDrive {
-                serial: (*drive_serial).to_string(),
-                identity_source: IdentitySource::DvcidAndInquiry,
-                vendor: Some("IBM".to_string()),
-                product: Some("ULT3580".to_string()),
-                revision: Some("A1".to_string()),
-                sg_path: sg_path.map(PathBuf::from),
-                sysfs_path: None,
-            }),
-            loaded: false,
-            loaded_tape: None,
-            source_slot: None,
-        })
-        .collect();
-    library
-}
-
-fn foreign_counter_snapshot(tape_alert_flags: Option<&str>) -> ForeignDriveSnapshot {
-    ForeignDriveSnapshot {
-        tape_alert_flags: tape_alert_flags.map(str::to_string),
-        write_errors_corrected: Some(11),
-        write_errors_uncorrected: Some(1),
-        read_errors_corrected: Some(7),
-        read_errors_uncorrected: Some(0),
     }
 }
 
@@ -3841,186 +3631,8 @@ fn drive_collection_workers_exit_on_shutdown_and_release_the_state_lock() {
         .expect("a new runtime opens over the same state root");
 }
 
-#[test]
-fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-api-foreign-collision")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let report = DiscoveryReport {
-        unattached_drives: Vec::new(),
-        complete: true,
-        incomplete_evidence: Vec::new(),
-        libraries: vec![foreign_drive_library(
-            "d2lib",
-            &[
-                (0x0100, "DUPSER", Some("/dev/sg10")),
-                (0x0101, "DUPSER", Some("/dev/sg11")),
-            ],
-        )],
-        warnings: Vec::new(),
-    };
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
-    observe_drive_catalog_from_libraries(&mut index, report.libraries.iter(), &HashSet::new())
-        .expect("observe duplicate serial foreign rows");
-    let collision_rows = index.list_drives(true, false).expect("list drives");
-    assert_eq!(collision_rows.len(), 2);
-    assert!(
-        collision_rows.iter().all(|drive| !drive.actionable),
-        "duplicate serial rows must be non-actionable: {collision_rows:?}"
-    );
-    drop(index);
-
-    let drives_cfg = remanence_state::DrivesConfig {
-        foreign_tapealert: true,
-        ..remanence_state::DrivesConfig::default()
-    };
-    let audit = AuditAppendContext {
-        dir: temp.path().join("audit"),
-        fsync: false,
-        lock: Arc::new(std::sync::Mutex::new(())),
-    };
-    let mut reads = Vec::new();
-    poll_foreign_drive_counters_once_with_reader(
-        &remanence_state::projector::open(&index_path).unwrap(),
-        &report,
-        &drives_cfg,
-        &HashSet::new(),
-        &audit,
-        |path, _foreign_tapealert| {
-            reads.push(path.to_path_buf());
-            Ok(foreign_counter_snapshot(Some("[20]")))
-        },
-    )
-    .expect("poll foreign counters");
-
-    assert!(
-        reads.is_empty(),
-        "ambiguous duplicate serial bays must not be polled or attributed: {reads:?}"
-    );
-    let index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("reopen catalog");
-    for drive in collision_rows {
-        assert!(
-            index
-                .list_drive_health_snapshots(&drive.drive_uuid)
-                .expect("list snapshots")
-                .is_empty(),
-            "collision row received a snapshot: {drive:?}"
-        );
-    }
-    let active_alarms = index.list_alarms(false).expect("list active alarms");
-    assert!(
-        active_alarms
-            .iter()
-            .all(|alarm| alarm.kind != "foreign-drive-wants-cleaning"),
-        "collision rows must not receive foreign cleaning advisories: {active_alarms:?}"
-    );
-}
-
-#[test]
-fn foreign_poll_attributes_unambiguous_row_by_library_and_element_address() {
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-api-foreign-unambiguous")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let report = DiscoveryReport {
-        unattached_drives: Vec::new(),
-        complete: true,
-        incomplete_evidence: Vec::new(),
-        libraries: vec![foreign_drive_library(
-            "d2lib",
-            &[
-                (0x0100, "FOREIGN_A", None),
-                (0x0101, "FOREIGN_B", Some("/dev/sg-target")),
-            ],
-        )],
-        warnings: Vec::new(),
-    };
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
-    observe_drive_catalog_from_libraries(&mut index, report.libraries.iter(), &HashSet::new())
-        .expect("observe foreign rows");
-    let other_drive = index
-        .get_actionable_drive_at("d2lib", 0x0100)
-        .expect("lookup other bay")
-        .expect("other bay drive");
-    let target_drive = index
-        .get_actionable_drive_at("d2lib", 0x0101)
-        .expect("lookup target bay")
-        .expect("target bay drive");
-    assert_eq!(other_drive.serial.as_deref(), Some("FOREIGN_A"));
-    assert_eq!(target_drive.serial.as_deref(), Some("FOREIGN_B"));
-    drop(index);
-
-    let drives_cfg = remanence_state::DrivesConfig {
-        foreign_tapealert: true,
-        ..remanence_state::DrivesConfig::default()
-    };
-    let audit = AuditAppendContext {
-        dir: temp.path().join("audit"),
-        fsync: false,
-        lock: Arc::new(std::sync::Mutex::new(())),
-    };
-    let mut reads = Vec::new();
-    poll_foreign_drive_counters_once_with_reader(
-        &remanence_state::projector::open(&index_path).unwrap(),
-        &report,
-        &drives_cfg,
-        &HashSet::new(),
-        &audit,
-        |path, foreign_tapealert| {
-            assert!(foreign_tapealert, "test config must request TapeAlert");
-            reads.push(path.to_path_buf());
-            Ok(foreign_counter_snapshot(Some("[20]")))
-        },
-    )
-    .expect("poll foreign counters");
-
-    assert_eq!(reads, vec![PathBuf::from("/dev/sg-target")]);
-    let index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("reopen catalog");
-    assert!(
-        index
-            .list_drive_health_snapshots(&other_drive.drive_uuid)
-            .expect("other snapshots")
-            .is_empty(),
-        "non-polled bay must not receive target snapshot"
-    );
-    let target_snapshots = index
-        .list_drive_health_snapshots(&target_drive.drive_uuid)
-        .expect("target snapshots");
-    assert_eq!(target_snapshots.len(), 1);
-    assert_eq!(target_snapshots[0].trigger, "foreign-counter");
-    assert_eq!(target_snapshots[0].write_errors_corrected, Some(11));
-    let audit_records = FileAuditLog::replay(audit.dir.as_path()).expect("replay poll audit");
-    assert!(audit_records
-        .iter()
-        .any(|record| record.event == AuditEvent::DriveHealthObserved));
-    assert!(audit_records
-        .iter()
-        .any(|record| record.event == AuditEvent::AlarmRaised));
-    let advisory = index
-        .list_alarms(false)
-        .expect("list active alarms")
-        .into_iter()
-        .find(|alarm| alarm.kind == "foreign-drive-wants-cleaning")
-        .expect("foreign advisory alarm");
-    assert!(advisory
-        .detail
-        .as_deref()
-        .is_some_and(|detail| { detail.contains("d2lib") && detail.contains("FOREIGN_B") }));
-}
-
-fn pool_state_with_tapes(tape_uuids: &[[u8; 16]]) -> ApiState {
-    let mut index = test_index();
+fn pool_state_with_tapes(tape_uuids: &[[u8; 16]]) -> (TypedRoot, ApiState) {
+    let (typed, mut index) = typed_index();
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: "camera.copy-a".to_string(),
@@ -4033,19 +3645,14 @@ fn pool_state_with_tapes(tape_uuids: &[[u8; 16]]) -> ApiState {
     for tape_uuid in tape_uuids {
         project_eligible_tape(&mut index, "camera.copy-a", *tape_uuid);
     }
-    ApiState::new_with_pool_configs(
-        {
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        },
-        vec![pool_config("camera.copy-a")],
-    )
+    let (typed, mut state) = typed_state(typed);
+    let config = pool_config("camera.copy-a");
+    state.pool_configs = Arc::new(HashMap::from([(config.id.clone(), config)]));
+    (typed, state)
 }
 
-fn state_with_operation() -> ApiState {
-    let mut index = test_index();
+fn state_with_operation() -> (TypedRoot, ApiState) {
+    let (typed, mut index) = typed_index();
     let operation_id = operation_uuid();
     let session_id = Uuid::from_u128(0x33);
     for record in [
@@ -4071,16 +3678,11 @@ fn state_with_operation() -> ApiState {
             .project_audit_record(&record)
             .expect("project operation audit record");
     }
-    ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
+    typed_state(typed)
 }
 
-fn state_with_queued_operation() -> ApiState {
-    let mut index = test_index();
+fn state_with_queued_operation() -> (TypedRoot, ApiState) {
+    let (typed, mut index) = typed_index();
     let operation_id = operation_uuid();
     let record = audit_record(
         1,
@@ -4098,16 +3700,11 @@ fn state_with_queued_operation() -> ApiState {
     index
         .project_audit_record(&record)
         .expect("project queued operation");
-    ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
+    typed_state(typed)
 }
 
-fn state_with_failed_operation() -> ApiState {
-    let mut index = test_index();
+fn state_with_failed_operation() -> (TypedRoot, ApiState) {
+    let (typed, mut index) = typed_index();
     let operation_id = operation_uuid();
     let record = audit_record(
         1,
@@ -4125,12 +3722,7 @@ fn state_with_failed_operation() -> ApiState {
     index
         .project_audit_record(&record)
         .expect("project failed operation");
-    ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
+    typed_state(typed)
 }
 
 #[derive(Debug)]
@@ -4596,7 +4188,7 @@ fn assert_no_pool_write_catalog_reference(
 
 #[test]
 fn select_tape_in_pool_returns_unique_eligible_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
 
@@ -4614,7 +4206,7 @@ fn select_tape_in_pool_returns_unique_eligible_tape() {
 
 #[test]
 fn select_tape_in_pool_accepts_no_parity_tape_geometry() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
 
@@ -4629,7 +4221,7 @@ fn select_tape_in_pool_accepts_no_parity_tape_geometry() {
 
 #[test]
 fn tape_io_fence_refuses_pool_selection_until_operator_release() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     let fence = index
@@ -4672,7 +4264,7 @@ fn tape_io_fence_refuses_pool_selection_until_operator_release() {
 
 #[test]
 fn startup_accepts_scoped_tape_io_fence_until_operator_release() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     let fence = index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
             tape_uuid: POOL_WRITE_TAPE_UUID,
@@ -4693,7 +4285,7 @@ fn startup_accepts_scoped_tape_io_fence_until_operator_release() {
 
 #[test]
 fn select_tape_in_pool_prefers_appendable_written_no_parity_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
@@ -4711,12 +4303,17 @@ fn select_tape_in_pool_prefers_appendable_written_no_parity_tape() {
 
 #[test]
 fn checkpoint_selection_skips_journal_less_legacy_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
     project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 7);
-    let checkpoint_dir = temp_dir("remanence-batched-selection-mixed");
+    let checkpoint_dir = index
+        .library_runtime()
+        .expect("typed selection runtime")
+        .manifest()
+        .tape_root()
+        .to_path_buf();
     let cfg = pool_config("camera.copy-a");
 
     let batched = crate::pool_write::select_tape_in_pool_for_write_session(
@@ -4732,11 +4329,27 @@ fn checkpoint_selection_skips_journal_less_legacy_tape() {
 
 #[test]
 fn batched_selection_accepts_non_fresh_tape_with_checkpoint_journal() {
-    let mut index = test_index();
+    let _index_typed = TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: POOL_WRITE_TAPE_UUID,
+            voltag: "RMN004L9".into(),
+            block_size: API_SESSION_BLOCK_SIZE,
+            parity: ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        remanence_state::MediaObservation::label_hint("RMN004L9"),
+    )]);
+    let mut index = _index_typed.catalog().write_handle();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 3);
-    let checkpoint_dir = temp_dir("remanence-batched-selection-journaled");
+    let checkpoint_dir = index
+        .library_runtime()
+        .expect("typed selection runtime")
+        .manifest()
+        .tape_root()
+        .to_path_buf();
     append_checkpoint_record(checkpoint_dir.as_path(), POOL_WRITE_TAPE_UUID);
 
     let selected = crate::pool_write::select_tape_in_pool_for_write_session(
@@ -4753,13 +4366,18 @@ fn batched_selection_accepts_non_fresh_tape_with_checkpoint_journal() {
 
 #[test]
 fn checkpoint_selection_reports_every_accept_sealed_legacy_candidate() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
     project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 3);
     project_no_parity_tape_usage(&mut index, SECOND_POOL_WRITE_TAPE_UUID, 5);
-    let checkpoint_dir = temp_dir("remanence-batched-selection-ineligible");
+    let checkpoint_dir = index
+        .library_runtime()
+        .expect("typed selection runtime")
+        .manifest()
+        .tape_root()
+        .to_path_buf();
 
     let error = crate::pool_write::select_tape_in_pool_for_write_session(
         &index,
@@ -4804,7 +4422,7 @@ fn capture_debug_logs<F: FnOnce() -> T, T>(f: F) -> (T, String) {
 
 #[test]
 fn selection_logs_fenced_skips_at_debug_when_another_tape_is_selected() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
@@ -4863,7 +4481,7 @@ fn selection_logs_fenced_skips_at_debug_when_another_tape_is_selected() {
 
 #[test]
 fn selection_ranks_unlabelled_rows_after_every_labelled_row() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     // The unlabelled row has the lower UUID, so neither the voltag nor the
     // UUID tie-break may put it first.
@@ -4903,12 +4521,28 @@ fn selection_ranks_unlabelled_rows_after_every_labelled_row() {
 
 #[test]
 fn checkpoint_selection_skips_reserved_tape_before_peeking_its_log() {
-    let mut index = test_index();
+    let _index_typed = TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: POOL_WRITE_TAPE_UUID,
+            voltag: "RMN004L9".into(),
+            block_size: API_SESSION_BLOCK_SIZE,
+            parity: ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        remanence_state::MediaObservation::label_hint("RMN004L9"),
+    )]);
+    let mut index = _index_typed.catalog().write_handle();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
     project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 3);
-    let checkpoint_dir = temp_dir("remanence-selection-reserved-lease");
+    let checkpoint_dir = index
+        .library_runtime()
+        .expect("typed selection runtime")
+        .manifest()
+        .tape_root()
+        .to_path_buf();
     append_checkpoint_record(checkpoint_dir.as_path(), POOL_WRITE_TAPE_UUID);
     // The live owner of the reserved tape holds its exclusive tape-log lease.
     let owner = remanence_state::TapeAuthority::open(
@@ -4954,7 +4588,7 @@ fn checkpoint_selection_skips_reserved_tape_before_peeking_its_log() {
 
 #[test]
 fn select_tape_in_pool_reports_unknown_pool() {
-    let index = test_index();
+    let (_index_typed, index) = typed_index();
 
     let cfg = pool_config("missing.pool");
     let err = select_tape_in_pool(&index, &cfg, 123, &HashSet::new()).expect_err("unknown pool");
@@ -4967,7 +4601,7 @@ fn select_tape_in_pool_reports_unknown_pool() {
 
 #[test]
 fn select_tape_in_pool_reports_empty_pool() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
 
     let cfg = pool_config("camera.copy-a");
@@ -4981,7 +4615,7 @@ fn select_tape_in_pool_reports_empty_pool() {
 
 #[test]
 fn select_tape_in_pool_uses_policy_for_multiple_eligible_tapes() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_eligible_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
@@ -4995,7 +4629,7 @@ fn select_tape_in_pool_uses_policy_for_multiple_eligible_tapes() {
 
 #[test]
 fn write_session_selection_respects_the_physical_library_scope() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_eligible_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
@@ -5019,7 +4653,7 @@ fn write_session_selection_respects_the_physical_library_scope() {
 
 #[test]
 fn select_tape_in_pool_excludes_reserved_preferred_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     project_eligible_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
@@ -5035,7 +4669,7 @@ fn select_tape_in_pool_excludes_reserved_preferred_tape() {
 
 #[test]
 fn select_tape_in_pool_errors_when_only_eligible_tape_is_reserved() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     let reserved = [POOL_WRITE_TAPE_UUID].into_iter().collect();
@@ -5055,7 +4689,7 @@ fn select_tape_in_pool_errors_when_only_eligible_tape_is_reserved() {
 
 #[test]
 fn select_tape_in_pool_uses_partially_written_no_parity_tape_to_complete() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape_with_block_size(
         &mut index,
@@ -5088,7 +4722,7 @@ fn select_tape_in_pool_uses_partially_written_no_parity_tape_to_complete() {
 
 #[test]
 fn select_tape_in_pool_reuses_appendable_no_parity_tape_before_fresh_empty_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape_with_block_size(
         &mut index,
@@ -5117,7 +4751,7 @@ fn select_tape_in_pool_reuses_appendable_no_parity_tape_before_fresh_empty_tape(
 
 #[test]
 fn select_tape_in_pool_enforces_capacity_invariant_against_lto_capacity() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape_with_voltag(
         &mut index,
@@ -5203,7 +4837,7 @@ fn seal_decision_honors_force_seal_valve_below_low() {
 #[test]
 fn write_object_to_pool_returns_locator_commits_catalog_and_round_trips_payload() {
     const BLOCK_SIZE: u32 = 256 * 1024;
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_eligible_tape_with_block_size(
         &mut index,
@@ -5320,7 +4954,7 @@ fn write_object_to_pool_returns_locator_commits_catalog_and_round_trips_payload(
 
 #[test]
 fn no_parity_write_round_trips_payload_and_commits_without_parity_geometry() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-no-parity-src");
@@ -5412,7 +5046,7 @@ fn fresh_tape_first_object_span_excludes_bootstrap_prefix_and_trailing_filemark(
     // precedes the first object's start and is excluded at capture, so
     // the object's span is [2, 2 + block_count) — exclusive — with the
     // trailing filemark at 2 + block_count outside the span.
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-fresh-span-src");
@@ -5490,7 +5124,7 @@ fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
     std::fs::write(&source_path, &payload).expect("write source payload");
     let cfg = pool_config("scenario-a");
 
-    let mut batched_index = test_index();
+    let (_batched_index_typed, mut batched_index) = typed_index();
     project_pool(&mut batched_index, "scenario-a");
     project_no_parity_tape(&mut batched_index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let mut batched_sink = BatchedVecSink::new(4);
@@ -5534,7 +5168,7 @@ fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
         payload.as_slice()
     );
 
-    let mut serial_index = test_index();
+    let (_serial_index_typed, mut serial_index) = typed_index();
     project_pool(&mut serial_index, "scenario-a");
     project_no_parity_tape(&mut serial_index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let mut serial_sink = VecBlockSink::new();
@@ -5590,7 +5224,7 @@ fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
 
 #[test]
 fn partial_batched_no_parity_write_is_uncommittable_without_automatic_fence() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-partial-batch-src");
@@ -5639,7 +5273,7 @@ fn partial_batched_no_parity_write_is_uncommittable_without_automatic_fence() {
 
 #[test]
 fn encrypted_no_parity_short_byte_batch_is_uncommittable_without_automatic_fence() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-short-byte-encrypted-src");
@@ -5695,7 +5329,7 @@ fn encrypted_no_parity_short_byte_batch_is_uncommittable_without_automatic_fence
 
 #[test]
 fn position_drift_during_batched_write_is_uncommittable_without_automatic_fence() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-position-drift-src");
@@ -5740,7 +5374,7 @@ fn position_drift_during_batched_write_is_uncommittable_without_automatic_fence(
 
 #[test]
 fn encrypted_no_parity_write_round_trips_payload_and_commits_envelope_fields() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-encrypted-no-parity-src");
@@ -5899,7 +5533,7 @@ fn encrypted_no_parity_write_round_trips_payload_and_commits_envelope_fields() {
 
 #[test]
 fn pool_write_rejects_pool_tape_block_size_mismatch_before_tape_io() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-block-mismatch-src");
@@ -5992,7 +5626,7 @@ fn pool_write_rejects_pool_tape_block_size_mismatch_before_tape_io() {
 fn pool_write_uses_selected_tape_block_size_as_rem_object_chunk_size() {
     const CUSTOM_BLOCK_SIZE: u32 = 8192;
 
-    let mut plaintext_index = test_index();
+    let (_plaintext_index_typed, mut plaintext_index) = typed_index();
     project_pool(&mut plaintext_index, "custom-plain");
     project_no_parity_tape_with_block_size(
         &mut plaintext_index,
@@ -6072,7 +5706,7 @@ fn pool_write_uses_selected_tape_block_size_as_rem_object_chunk_size() {
         plaintext_payload
     );
 
-    let mut encrypted_index = test_index();
+    let (_encrypted_index_typed, mut encrypted_index) = typed_index();
     project_pool(&mut encrypted_index, "custom-encrypted");
     project_no_parity_tape_with_block_size(
         &mut encrypted_index,
@@ -6163,7 +5797,7 @@ fn pool_write_uses_selected_tape_block_size_as_rem_object_chunk_size() {
 
 #[test]
 fn encrypted_write_transfer_failure_leaves_no_durable_catalog_reference() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-encrypted-transfer-fail-src");
@@ -6221,7 +5855,7 @@ fn encrypted_write_transfer_failure_leaves_no_durable_catalog_reference() {
 
 #[test]
 fn plaintext_write_transfer_failure_leaves_no_durable_catalog_reference() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-plaintext-transfer-fail-src");
@@ -6447,7 +6081,7 @@ fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
 
 #[test]
 fn no_parity_pool_write_appends_second_object_to_same_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-no-parity-reuse-src");
@@ -6562,7 +6196,7 @@ fn no_parity_pool_write_appends_second_object_to_same_tape() {
 
 #[test]
 fn pool_write_replays_same_pool_caller_object_id_without_tape_io() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-caller-replay-src");
@@ -6702,7 +6336,7 @@ fn pool_write_replays_same_pool_caller_object_id_without_tape_io() {
 
 #[test]
 fn canonical_uuid_collision_is_rejected_before_tape_motion() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-canonical-uuid-collision");
@@ -6752,7 +6386,7 @@ fn canonical_uuid_collision_is_rejected_before_tape_motion() {
 
 #[test]
 fn committed_replay_rejects_input_kind_change_before_tape_motion() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-input-kind-replay");
@@ -6805,7 +6439,7 @@ fn committed_replay_rejects_input_kind_change_before_tape_motion() {
 
 #[test]
 fn pool_write_conflicts_same_pool_caller_object_id_with_different_content() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-caller-conflict-src");
@@ -6888,7 +6522,7 @@ fn pool_write_conflicts_same_pool_caller_object_id_with_different_content() {
 
 #[test]
 fn streamed_caller_id_digest_conflict_rejects_before_any_tape_motion() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-streamed-caller-conflict");
@@ -6952,7 +6586,7 @@ fn streamed_caller_id_digest_conflict_rejects_before_any_tape_motion() {
 
 #[test]
 fn pool_write_rejects_empty_caller_object_id_without_tape_io() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-empty-caller-src");
@@ -6993,7 +6627,7 @@ fn pool_write_rejects_empty_caller_object_id_without_tape_io() {
 #[test]
 fn write_to_selected_tape_rejects_second_parity_object_before_tape_io() {
     const BLOCK_SIZE: u32 = 256 * 1024;
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_eligible_tape_with_block_size(
         &mut index,
@@ -7066,7 +6700,7 @@ fn write_to_selected_tape_rejects_second_parity_object_before_tape_io() {
 
 #[test]
 fn write_rejects_expected_content_sha256_mismatch_before_writing() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
     let source_dir = temp_dir("remanence-api-hash-mismatch-src");
@@ -7108,7 +6742,7 @@ fn write_rejects_expected_content_sha256_mismatch_before_writing() {
 
 #[test]
 fn write_object_to_pool_seals_after_crossing_low_and_excludes_tape() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "seal.pool");
     project_no_parity_tape(&mut index, "seal.pool", POOL_WRITE_TAPE_UUID);
     project_no_parity_tape(&mut index, "seal.pool", SECOND_POOL_WRITE_TAPE_UUID);
@@ -7169,7 +6803,7 @@ fn verify_tape_identity_accepts_match_and_rejects_mismatch_or_absent_bootstrap()
 
 #[test]
 fn write_object_to_pool_rejects_non_regular_source_as_invalid_argument() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
     let mut tape_sink = VecBlockSink::new();
@@ -7204,7 +6838,8 @@ fn write_object_to_pool_rejects_non_regular_source_as_invalid_argument() {
 
 #[tokio::test]
 async fn daemon_health_and_version_are_wired() {
-    let service = populated_state().daemon_service();
+    let (_typed, state) = populated_state();
+    let service = state.daemon_service();
 
     let health = pb::daemon_server::Daemon::health(&service, Request::new(()))
         .await
@@ -7215,7 +6850,20 @@ async fn daemon_health_and_version_are_wired() {
         health.components.get("sqlite_index").map(String::as_str),
         Some("ok")
     );
-    assert_eq!(health.component_health.len(), 1);
+    assert_eq!(health.component_health.len(), 2);
+    assert_eq!(
+        health
+            .components
+            .get("library_authority")
+            .map(String::as_str),
+        Some("healthy")
+    );
+    assert_eq!(health.component_health[1].component, "library_authority");
+    assert_eq!(
+        health.component_health[1].status,
+        pb::component_health::Status::Healthy as i32
+    );
+    assert!(health.component_health[1].other_status.is_empty());
     assert_eq!(health.component_health[0].component, "sqlite_index");
     assert_eq!(
         health.component_health[0].status,
@@ -7246,10 +6894,11 @@ fn drive_target_test_state(
     loaded_tape: Option<&str>,
     busy: bool,
 ) -> (
+    TypedRoot,
     ApiState,
     tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
 ) {
-    let mut state = populated_state();
+    let (typed, mut state) = populated_state();
     let serial = "LIB-DRIVE-TARGET";
     let mut library = test_library(serial);
     library.drive_bays[0].loaded = loaded;
@@ -7274,7 +6923,7 @@ fn drive_target_test_state(
         HashMap::from([(1, drive_tx)]),
         Arc::new(HashMap::from([(1, AtomicBool::new(busy))])),
     ));
-    (state, drive_rx)
+    (typed, state, drive_rx)
 }
 
 fn drive_target_request(required_pool_id: &str) -> pb::OpenReadSessionRequest {
@@ -7293,7 +6942,7 @@ fn drive_target_request(required_pool_id: &str) -> pb::OpenReadSessionRequest {
 
 #[tokio::test]
 async fn drive_target_read_open_uses_loaded_drive_and_reports_it() {
-    let (state, mut drive_rx) = drive_target_test_state(true, Some("ACM003L9"), false);
+    let (_typed, state, mut drive_rx) = drive_target_test_state(true, Some("ACM003L9"), false);
     let session_id = Uuid::new_v4();
     let actor = tokio::spawn(async move {
         match drive_rx.recv().await.expect("read-open command") {
@@ -7346,15 +6995,22 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
     const BAY: u16 = 1;
     const SLOT: u16 = 0x03e9;
 
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-api-drive-target-actor")
-        .tempdir()
-        .expect("temp dir");
-    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .expect("open test catalog");
+    let typed = TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: TAPE_UUID,
+            voltag: "RMN003L9".into(),
+            block_size: API_SESSION_BLOCK_SIZE,
+            parity: ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        remanence_state::MediaObservation::label_hint("RMN003L9"),
+    )]);
+    let mut index = typed.catalog().write_handle();
     project_pool(&mut index, "camera.copy-a");
-    project_no_parity_tape(&mut index, "camera.copy-a", TAPE_UUID);
+    index
+        .project_tape_pool_membership(TAPE_UUID, "camera.copy-a")
+        .expect("project read pool membership");
 
     let barcode = format!("RMN{:03}L9", TAPE_UUID[0]);
     let bootstrap = no_parity_bootstrap_block(TAPE_UUID);
@@ -7373,6 +7029,12 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         libraries: vec![discovered_library.clone()],
         warnings: Vec::new(),
     };
+    observe_drive_catalog_from_libraries(
+        &mut index,
+        report.libraries.iter(),
+        &HashSet::from([LIBRARY_SERIAL.to_string()]),
+    )
+    .expect("observe real read drive");
     let policy = remanence_library::StaticAllowlist::new([LIBRARY_SERIAL]);
     let actor_world = Arc::clone(&world);
     let mut library = discovered_library
@@ -7401,20 +7063,16 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         AtomicBool::new(false),
     )]));
 
-    let mut state = ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    drop(index);
+    let (mut typed, mut state) = typed_state(typed);
     let owner_config = crate::write_owner::WriteOwnerConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            state.catalog.library_runtime(),
-            state.audit_dir.as_ref().clone(),
-            false,
-            &(Arc::clone(&state.audit_append_lock)),
+        authority: crate::write_owner::TerminalAuthority::Typed(
+            state
+                .catalog
+                .library_runtime()
+                .expect("typed read authority"),
         ),
-        catalog: remanence_state::projector::open(state.index_path.as_ref()).unwrap(),
+        catalog: state.catalog.clone(),
         index_path: state.index_path.as_ref().clone(),
         report,
         policy,
@@ -7437,11 +7095,7 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         )
         .expect("test I/O memory manager"),
         write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
-        checkpoint_journal_dir: {
-            let p = temp.path().join("tapes");
-            std::fs::create_dir_all(&p).unwrap();
-            p
-        },
+        checkpoint_journal_dir: state.checkpoint_journal_dir.as_ref().clone(),
         checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
         checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -7506,35 +7160,39 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         closed.state,
         pb::read_session::State::ReadSessionStateClosed as i32
     );
+    // Actor senders have no join handle; wait for their runtime clones to retire.
+    drop(state);
+    let _ = typed.records(|_| None::<()>).await;
 }
 
 #[test]
 fn drive_target_read_errors_are_precise_and_pool_guard_is_enforced() {
-    let (empty, _rx) = drive_target_test_state(false, None, false);
+    let (_empty_typed, empty, _rx) = drive_target_test_state(false, None, false);
     let error = select_read_target(&empty, drive_target_request("").target)
         .expect_err("empty drive must fail");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(error.message(), "drive bay 0x0001 is empty");
 
-    let (busy, _rx) = drive_target_test_state(true, Some("ACM003L9"), true);
+    let (_busy_typed, busy, _rx) = drive_target_test_state(true, Some("ACM003L9"), true);
     let error = select_read_target(&busy, drive_target_request("").target)
         .expect_err("busy drive must fail");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(error.message(), "drive bay 0x0001 is busy");
 
-    let (unproven, _rx) = drive_target_test_state(true, None, false);
+    let (_unproven_typed, unproven, _rx) = drive_target_test_state(true, None, false);
     let error = select_read_target(&unproven, drive_target_request("").target)
         .expect_err("unproven identity must fail");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("identity cannot be proven"));
 
-    let (wrong_pool, _rx) = drive_target_test_state(true, Some("ACM003L9"), false);
+    let (_wrong_pool_typed, wrong_pool, _rx) =
+        drive_target_test_state(true, Some("ACM003L9"), false);
     let error = select_read_target(&wrong_pool, drive_target_request("camera.copy-b").target)
         .expect_err("pool guard mismatch must fail");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(error.message(), "tape is not assigned to the required pool");
 
-    let (mut foreign, _rx) = drive_target_test_state(true, Some("ACM003L9"), false);
+    let (_foreign_typed, mut foreign, _rx) = drive_target_test_state(true, Some("ACM003L9"), false);
     let mut second_library = test_library("LIB-D2");
     second_library.drive_bays[0].loaded = true;
     second_library.drive_bays[0].loaded_tape = Some("ACM003L9".to_string());
@@ -7880,7 +7538,8 @@ async fn audit_service_without_runtime_refuses() {
 
 #[tokio::test]
 async fn daemon_operations_are_projected() {
-    let service = state_with_operation().daemon_service();
+    let (_typed, state) = state_with_operation();
+    let service = state.daemon_service();
     let operation_id = operation_uuid();
 
     let status = pb::daemon_server::Daemon::get_operation(
@@ -7932,7 +7591,8 @@ async fn daemon_operations_are_projected() {
 
 #[tokio::test]
 async fn daemon_reports_queued_operation() {
-    let service = state_with_queued_operation().daemon_service();
+    let (_typed, state) = state_with_queued_operation();
+    let service = state.daemon_service();
     let operation_id = operation_uuid();
 
     let status = pb::daemon_server::Daemon::get_operation(
@@ -7956,7 +7616,8 @@ async fn daemon_reports_queued_operation() {
 
 #[tokio::test]
 async fn daemon_reports_durable_operation_failure_detail() {
-    let service = state_with_failed_operation().daemon_service();
+    let (_typed, state) = state_with_failed_operation();
+    let service = state.daemon_service();
 
     let status = pb::daemon_server::Daemon::get_operation(
         &service,
@@ -7978,13 +7639,17 @@ async fn daemon_reports_durable_operation_failure_detail() {
 
 #[tokio::test]
 async fn watch_streams_until_terminal_and_cancel_flips_token() {
-    let state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
-    let operation_id = Uuid::from_u128(7);
+    use remanence_state::library_log as lib;
+    let (mut typed, state) = typed_state(TypedRoot::open());
+    let operation_id = state
+        .accept_owner_request(
+            AuditActor::Service("submitter".into()),
+            "reconcile_tape",
+            "tape",
+            Uuid::from_bytes([0x5A; 16]).to_string(),
+            [0x44; 32],
+        )
+        .expect("accept reconcile fixture");
     let handle = state.operations.register(operation_id, "reconcile_tape");
     let daemon = state.daemon_service();
 
@@ -8018,11 +7683,25 @@ async fn watch_streams_until_terminal_and_cancel_flips_token() {
     let first = stream.next().await.unwrap().unwrap();
     assert_eq!(first.state, pb::OperationState::Cancelled as i32);
     assert!(stream.next().await.is_none());
+    assert_no_legacy_audit_records(&state);
+    drop((stream, daemon, handle, state));
+    let records = typed.operation_chain(operation_id).await;
+    assert_eq!(records.len(), 2);
+    assert!(records
+        .iter()
+        .all(|r| r.kind == lib::OperationKind::ReconcileTape));
+    assert!(matches!(records[0].event, lib::OperationEvent::Accepted(_)));
+    assert_eq!(records[0].actor, AuditActor::Service("submitter".into()));
+    assert_eq!(
+        records[1].event,
+        lib::OperationEvent::CancelRequested(lib::Unit)
+    );
+    assert_eq!(records[1].actor, AuditActor::System);
 }
 
 #[tokio::test]
 async fn cancel_terminal_live_operation_does_not_regress_durable_state() {
-    let state = state_with_operation();
+    let (_typed, state) = state_with_operation();
     let operation_id = operation_uuid();
     let handle = state.operations.register(operation_id, "write_object");
     handle.publish(crate::operations::status(
@@ -8287,12 +7966,7 @@ fn drive_pool_close_parks_cartridge_and_follow_on_session_claims_it() {
 
 #[tokio::test]
 async fn drive_byte_accounting_uses_session_drive_uuid_for_shared_bay() {
-    let state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let (_typed, state) = typed_state(TypedRoot::open());
     let shared_bay = 0x0101;
     let session_a = crate::write_owner::MountedSession {
         bay: shared_bay,
@@ -8366,16 +8040,7 @@ async fn append_finish_does_not_double_count() {
         .prefix("remanence-append-finish-live-counter")
         .tempdir()
         .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
-    let mut state = ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let (_typed, mut state) = typed_state(TypedRoot::open());
     let session_id = Uuid::new_v4();
     let bay = 0x0101;
     let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
@@ -8481,12 +8146,7 @@ async fn append_finish_does_not_double_count() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_consumer_failure_survives_ring_cancellation() {
-    let mut state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let (_typed, mut state) = typed_state(TypedRoot::open());
     let session_id = Uuid::new_v4();
     let bay = 0x0102;
     let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -8586,12 +8246,7 @@ async fn overlap_consumer_failure_survives_ring_cancellation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_record() {
-    let mut state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let (_typed, mut state) = typed_state(TypedRoot::open());
     let session_id = Uuid::new_v4();
     let bay = 0x0102;
     let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -8690,12 +8345,7 @@ async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_reco
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_success_response_waits_for_checkpointed_receipt() {
-    let mut state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let (_typed, mut state) = typed_state(TypedRoot::open());
     let session_id = Uuid::new_v4();
     let bay = 0x0103;
     let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -8839,12 +8489,7 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
 
 #[test]
 fn drive_byte_accounting_skips_unresolvable_drive_and_warns() {
-    let state = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    let (_typed, state) = typed_state(TypedRoot::open());
     let warnings = capture_warnings(|| {
         state.record_drive_read_bytes(None, 512);
         state.record_drive_write_bytes(Some(&[]), 1024);
@@ -8883,7 +8528,8 @@ fn drive_pool_tracks_pending_tape_reservations_for_selection_exclusion() {
 
 #[tokio::test]
 async fn catalog_missing_authority_refuses_tapes_but_lists_projected_files() {
-    let service = populated_state().catalog_service();
+    let (_typed, state) = populated_state();
+    let service = state.catalog_service();
 
     let tapes = pb::catalog_server::Catalog::list_tapes(
         &service,
@@ -8992,7 +8638,8 @@ async fn catalog_missing_authority_refuses_tapes_but_lists_projected_files() {
 
 #[tokio::test]
 async fn terminal_inventory_rpcs_require_an_exact_tape_uuid_before_mounting() {
-    let service = populated_state().catalog_service();
+    let (_typed, state) = populated_state();
+    let service = state.catalog_service();
     let inventory = pb::catalog_server::Catalog::get_tape_inventory(
         &service,
         Request::new(pb::TapeInventoryRequest {
@@ -9017,7 +8664,8 @@ async fn terminal_inventory_rpcs_require_an_exact_tape_uuid_before_mounting() {
 
 #[tokio::test]
 async fn catalog_lists_and_fetches_files_in_native_object() {
-    let service = populated_state_with_file_catalog().catalog_service();
+    let (_typed, state) = populated_state_with_file_catalog();
+    let service = state.catalog_service();
 
     let files = pb::catalog_server::Catalog::list_files_in_object(
         &service,
@@ -9079,7 +8727,8 @@ async fn catalog_lists_and_fetches_files_in_native_object() {
 
 #[tokio::test]
 async fn catalog_enumerates_and_fetches_native_objects() {
-    let service = populated_state().catalog_service();
+    let (_typed, state) = populated_state();
+    let service = state.catalog_service();
     let mut stream = pb::catalog_server::Catalog::enumerate_objects(
         &service,
         Request::new(pb::EnumerateObjectsRequest {
@@ -9172,11 +8821,9 @@ async fn catalog_enumerates_and_fetches_native_objects() {
 
 #[test]
 fn content_digest_lookup_rejects_ambiguous_or_malformed_keys() {
-    let state = populated_state();
+    let (_typed, state) = populated_state();
     let second_object_id = Uuid::from_u128(0x2222).to_string();
-    let mut index = remanence_state::projector::open(state.index_path.as_ref())
-        .map(|catalog| catalog.write_handle())
-        .expect("open test index");
+    let mut index = state.catalog.write_handle();
     index
         .upsert_native_object_projection(
             NativeObjectProjectionInput {
@@ -9228,7 +8875,8 @@ async fn write_session_tape_target_is_wired_and_shape_validated() {
     // validation runs before any catalog or hardware access, so a
     // mount_if_needed=false request fails with InvalidArgument even on a
     // state with no drive pool.
-    let service = empty_pool_state().write_session_service();
+    let (_typed, state) = empty_pool_state();
+    let service = state.write_session_service();
     let err = pb::write_session_service_server::WriteSessionService::open_write_session(
         &service,
         Request::new(pb::OpenWriteSessionRequest {
@@ -9253,7 +8901,8 @@ async fn write_session_tape_target_is_wired_and_shape_validated() {
 
 #[tokio::test]
 async fn write_session_drive_target_stays_unimplemented() {
-    let service = empty_pool_state().write_session_service();
+    let (_typed, state) = empty_pool_state();
+    let service = state.write_session_service();
     let err = pb::write_session_service_server::WriteSessionService::open_write_session(
         &service,
         Request::new(pb::OpenWriteSessionRequest {
@@ -9276,7 +8925,8 @@ async fn write_session_drive_target_stays_unimplemented() {
 
 #[test]
 fn pool_target_library_uuid_resolves_snapshot_uuid() {
-    let service = state_with_library_snapshot("LIB001").write_session_service();
+    let (_typed, state) = state_with_library_snapshot("LIB001");
+    let service = state.write_session_service();
     let target = pb::TapePoolTarget {
         pool_id: "camera.copy-a".to_string(),
         library_uuid: crate::library::library_uuid("LIB001").to_vec(),
@@ -9292,7 +8942,8 @@ fn pool_target_library_uuid_resolves_snapshot_uuid() {
 
 #[test]
 fn pool_target_library_uuid_rejects_legacy_raw_serial_bytes() {
-    let service = state_with_library_snapshot("LIB001").write_session_service();
+    let (_typed, state) = state_with_library_snapshot("LIB001");
+    let service = state.write_session_service();
     let target = pb::TapePoolTarget {
         pool_id: "camera.copy-a".to_string(),
         library_uuid: b"LIB001".to_vec(),
@@ -9308,7 +8959,8 @@ fn pool_target_library_uuid_rejects_legacy_raw_serial_bytes() {
 
 #[tokio::test]
 async fn write_session_pool_target_rejects_legacy_raw_library_serial() {
-    let service = empty_pool_state().write_session_service();
+    let (_typed, state) = empty_pool_state();
+    let service = state.write_session_service();
     let err = pb::write_session_service_server::WriteSessionService::open_write_session(
         &service,
         Request::new(pb::OpenWriteSessionRequest {
@@ -9331,7 +8983,8 @@ async fn write_session_pool_target_rejects_legacy_raw_library_serial() {
 
 #[tokio::test]
 async fn read_session_read_only_state_returns_unavailable_for_tape_open() {
-    let service = populated_state().read_session_service();
+    let (_typed, state) = populated_state();
+    let service = state.read_session_service();
     let err = pb::read_session_service_server::ReadSessionService::open_read_session(
         &service,
         Request::new(pb::OpenReadSessionRequest {
@@ -9375,7 +9028,7 @@ async fn read_object_range_dispatches_empty_file_id_range_to_drive_actor() {
             drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
         },
     );
-    let mut state = populated_state();
+    let (_typed, mut state) = populated_state();
     state.drive_pool = Some(pool);
     let service = state.read_session_service();
 
@@ -9465,7 +9118,7 @@ async fn read_object_range_empty_file_id_zero_zero_uses_whole_payload_path() {
             drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
         },
     );
-    let mut state = populated_state();
+    let (_typed, mut state) = populated_state();
     state.drive_pool = Some(pool);
     let service = state.read_session_service();
 
@@ -9551,7 +9204,7 @@ async fn read_object_range_dispatches_file_scoped_range_to_drive_actor() {
             drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
         },
     );
-    let mut state = populated_state();
+    let (_typed, mut state) = populated_state();
     state.drive_pool = Some(pool);
     let service = state.read_session_service();
 
@@ -9641,7 +9294,7 @@ async fn read_file_dispatches_file_id_as_whole_file_range() {
             drive_uuid: Some(Uuid::new_v4().as_bytes().to_vec()),
         },
     );
-    let mut state = populated_state();
+    let (_typed, mut state) = populated_state();
     state.drive_pool = Some(pool);
     let service = state.read_session_service();
 
@@ -9689,7 +9342,8 @@ async fn read_file_dispatches_file_id_as_whole_file_range() {
 
 #[tokio::test]
 async fn catalog_units_are_exposed_as_parallel_surface() {
-    let service = populated_state().catalog_service();
+    let (_typed, state) = populated_state();
+    let service = state.catalog_service();
     let mut stream = pb::catalog_server::Catalog::enumerate_units(
         &service,
         Request::new(pb::EnumerateUnitsRequest {
@@ -9794,13 +9448,8 @@ use crate::auth::{authorize_request, AuthPermission};
 /// Malformed timestamps are rejected at ingress, before spool or mount admission.
 #[tokio::test]
 async fn append_rejects_invalid_mtime_before_io() {
-    let service = ApiState::new({
-        let index = test_index();
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    })
-    .write_session_service();
+    let (_typed, state) = typed_state(TypedRoot::open());
+    let service = state.write_session_service();
     for invalid in ["", "-1", "1.", "1.2.3", "tomorrow"] {
         let mut start = append_start_message(Uuid::new_v4(), 4);
         let Some(pb::append_object_message::Payload::Start(ref mut fields)) = start.payload else {
@@ -9821,7 +9470,7 @@ async fn append_rejects_invalid_mtime_before_io() {
 async fn reconcile_operation_get_and_list_preserve_stored_status() {
     use pb::daemon_server::Daemon;
     use prost::Message;
-    let mut index = test_index();
+    let (typed, mut index) = typed_index();
     let id = Uuid::new_v4();
     index
         .project_audit_record(&audit_record(
@@ -9836,12 +9485,8 @@ async fn reconcile_operation_get_and_list_preserve_stored_status() {
         index.get_operation(&id.to_string()).unwrap().unwrap(),
     )
     .unwrap();
-    let state = ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    drop(index);
+    let (_typed, state) = typed_state(typed);
     let handle = state.operations.register(id, "reconcile_tape");
     assert!(expected.progress.is_empty());
     let service = state.daemon_service();
@@ -9886,7 +9531,7 @@ async fn reconcile_operation_get_and_list_preserve_stored_status() {
 #[tokio::test]
 async fn verification_operation_progress_timestamps_and_terminal_filters() {
     use pb::daemon_server::Daemon;
-    let mut index = test_index();
+    let (typed, mut index) = typed_index();
     let id = Uuid::new_v4();
     index
         .project_audit_record(&audit_record(
@@ -9900,12 +9545,8 @@ async fn verification_operation_progress_timestamps_and_terminal_filters() {
             )]),
         ))
         .unwrap();
-    let state = ApiState::new({
-        let index = index;
-        let catalog = remanence_state::projector::open(index.path()).unwrap();
-        drop(index);
-        catalog
-    });
+    drop(index);
+    let (_typed, state) = typed_state(typed);
     let handle = state.operations.register(id, "tape_verification");
     let service = state.daemon_service();
     let mut created = None;
@@ -9962,7 +9603,7 @@ async fn default_overlap_stream_fallbacks_reach_completed_spool() {
         "below_overlap_min",
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = state_with_spool(temp.path().to_path_buf(), 1024 * 1024);
+        let (_typed, mut state) = typed_state_with_spool(temp.path().to_path_buf(), 1024 * 1024);
         assert_eq!(
             state.append_staging_mode,
             remanence_state::AppendStagingMode::Overlap
@@ -10084,7 +9725,7 @@ async fn default_overlap_stream_fallbacks_reach_completed_spool() {
 async fn spool_digest_mismatch_and_manifest_refuse_before_dispatch() {
     for reason in ["manifest", "start_mismatch", "finish_mismatch"] {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = state_with_spool(temp.path().to_path_buf(), 1024);
+        let (_typed, mut state) = typed_state_with_spool(temp.path().to_path_buf(), 1024);
         if reason != "manifest" {
             state.append_staging_mode = remanence_state::AppendStagingMode::Serial;
         }
@@ -10125,7 +9766,7 @@ async fn spool_digest_mismatch_and_manifest_refuse_before_dispatch() {
 async fn overlap_reservation_refuses_before_payload_receive() {
     let temp = tempfile::tempdir().unwrap();
     let slab = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
-    let mut state = state_with_spool(temp.path().to_path_buf(), 4 * slab);
+    let (_typed, mut state) = typed_state_with_spool(temp.path().to_path_buf(), 4 * slab);
     state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
     state.append_ring_bytes = 8 * slab;
     state.append_overlap_min_bytes = slab;
@@ -10163,7 +9804,7 @@ async fn overlap_reservation_refuses_before_payload_receive() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn b9_overlap_checkpoint_claim_survives_catalog_and_later_checkpoint_failure() {
     for destination in ["catalog", "session", "catalog_error", "checkpoint_error"] {
-        let mut state = populated_state();
+        let (_typed, mut state) = populated_state();
         let session_id = Uuid::new_v4();
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(2);
@@ -10322,7 +9963,7 @@ async fn b9_overlap_checkpoint_claim_survives_catalog_and_later_checkpoint_failu
 /// Scoped startup preserves fencing; absent scope retains the original refusal.
 #[test]
 fn startup_fence_scope_and_readiness_recovery() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     let endpoint = remanence_state::DriveKey::new("LIB-A", 1);
     let fence = index
         .record_tape_io_fence_at_endpoint(
@@ -10354,14 +9995,29 @@ fn startup_fence_scope_and_readiness_recovery() {
             .len(),
         before.len()
     );
-    assert!(
-        ensure_media_readiness_admitted(&index, None, "open", "LIB-A", Some(1), None, false)
-            .is_err()
-    );
+    assert!(ensure_media_readiness_admitted(
+        &index,
+        index.library_runtime().as_ref(),
+        "open",
+        "LIB-A",
+        Some(1),
+        None,
+        false
+    )
+    .is_err());
     index
         .release_tape_io_fence(&fence.quarantine_id, "checked")
         .unwrap();
-    ensure_media_readiness_admitted(&index, None, "open", "LIB-A", Some(1), None, false).unwrap();
+    ensure_media_readiness_admitted(
+        &index,
+        index.library_runtime().as_ref(),
+        "open",
+        "LIB-A",
+        Some(1),
+        None,
+        false,
+    )
+    .unwrap();
     let unscoped = index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
             tape_uuid: [0; 16],
@@ -10856,7 +10512,7 @@ async fn release_fence_rpc_names_a_standalone_hold() {
 /// Startup logs one warning per scoped fence and rejects malformed endpoint evidence.
 #[test]
 fn startup_reports_each_fence_and_refuses_malformed_scope() {
-    let mut index = test_index();
+    let (_index_typed, mut index) = typed_index();
     for (tape, barcode, endpoint) in [
         ([1; 16], None, None),
         ([0; 16], Some("LABEL".to_string()), None),
@@ -10892,11 +10548,9 @@ fn startup_reports_each_fence_and_refuses_malformed_scope() {
 /// Caller ids resolve within a pool and never select the oldest cross-pool match.
 #[tokio::test]
 async fn catalog_caller_id_requires_pool_when_two_pools_hold_it() {
-    let state = populated_state();
+    let (_typed, state) = populated_state();
     let service = state.catalog_service();
-    let mut index = remanence_state::projector::open(state.index_path.as_ref())
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let mut index = state.catalog.write_handle();
     index
         .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
             pool_id: "copy-b".into(),
