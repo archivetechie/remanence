@@ -73,7 +73,7 @@ pub enum HistoryEnd {
     Damaged {
         /// Segment basename at the first failure.
         segment: String,
-        /// Header offset zero or the start of the failed frame.
+        /// 0 for a file-open, header or segment-chain fault; the failed frame's start for a frame fault; for an early end, an empty or interior-torn segment or a decoder I/O error, the end of the last verified frame (the header's end when none was verified).
         offset: u64,
         /// Replay fault or I/O error text.
         fault: String,
@@ -389,7 +389,24 @@ fn event_kind(body: &Body) -> String {
         Body::WrapMapCached(v) => v.action.variant_name(),
         Body::RecoveryRecorded(v) => v.action.variant_name(),
         Body::Diagnostic(v) => v.event.variant_name(),
-        _ => None,
+        Body::AssignPool(_)
+        | Body::Label(_)
+        | Body::Retire(_)
+        | Body::Reprovision(_)
+        | Body::MediumSpecSet(_)
+        | Body::SupersedeTail(_)
+        | Body::AcceptUnprotectedFinalization(_)
+        | Body::FenceRaised(_)
+        | Body::FenceReleased(_)
+        | Body::MotionOutcome(_)
+        | Body::InventoryReconciled(_)
+        | Body::VerificationProgress(_)
+        | Body::VerificationVerdict(_)
+        | Body::ManualFinalizationAccepted(_)
+        | Body::ConfigurationAccepted(_)
+        | Body::ReadinessObserved(_)
+        | Body::DriveObserved(_)
+        | Body::DriveHealthObserved(_) => None,
     };
     match variant {
         Some(variant) => format!("{kind}.{variant}"),
@@ -1101,6 +1118,114 @@ mod tests {
         assert_eq!(
             Walker::default().subject(&release, 1000),
             subject("fence", "999")
+        );
+    }
+
+    /// S7: subject rows absent from the corpus resolve through one history walker.
+    #[test]
+    fn s7_subject_rows_without_corpus_cover() {
+        let mut walker = Walker::default();
+        let raise = Body::FenceRaised(FenceRaised {
+            kind: FenceKind::DriveFault,
+            scope: FenceScope::Model {
+                model: "ULT3580-TD9".into(),
+                firmware: "Q3F7".into(),
+            },
+            cause: FenceCause::Cleaning,
+            evidence: None,
+            at: None,
+            operation: None,
+            detail: Bounded(vec![]),
+        });
+        assert_eq!(
+            walker.subject(&raise, 40),
+            ("model".into(), Some("ULT3580-TD9/Q3F7".into())),
+            "model fence raise"
+        );
+        let release = Body::FenceReleased(FenceReleased {
+            fence: 40,
+            evidence: "settled".into(),
+            forced: false,
+            detail: Bounded(vec![]),
+        });
+        assert_eq!(
+            walker.subject(&release, 41),
+            ("model".into(), Some("ULT3580-TD9/Q3F7".into())),
+            "model fence release"
+        );
+
+        let bay = DriveKey::Bay(Bay {
+            library_serial: "LIB-1".into(),
+            bay: 3,
+        });
+        let standalone = Standalone {
+            drive_serial: "SN-9".into(),
+        };
+        let mut ready = ReadinessObserved {
+            operation: [77; 16],
+            endpoint: bay.clone(),
+            tape: None,
+            barcode: None,
+            phase: ReadinessPhase::StartupReconcile,
+            state: ReadinessState::AbortedUnknown,
+            previous: None,
+            started_unix_ns: 1,
+            limit_ms: Some(1000),
+            evidence: None,
+            load_intent: None,
+            ready_generation: 1,
+            result: ReadinessResult::AbortedUnknown,
+            scope: ReadinessScope::Library,
+            media: None,
+            source_slot: None,
+            run: None,
+            cancel_source: None,
+        };
+        assert_eq!(
+            walker.subject(&Body::ReadinessObserved(ready.clone()), 42),
+            ("library".into(), Some("LIB-1".into())),
+            "library readiness at a bay"
+        );
+        ready.endpoint = DriveKey::Standalone(standalone.clone());
+        assert_eq!(
+            walker.subject(&Body::ReadinessObserved(ready.clone()), 43),
+            ("endpoint".into(), Some("standalone:SN-9".into())),
+            "library readiness at a standalone drive"
+        );
+        ready.scope = ReadinessScope::Endpoint;
+        ready.endpoint = bay;
+        assert_eq!(
+            walker.subject(&Body::ReadinessObserved(ready), 44),
+            ("endpoint".into(), Some("bay:LIB-1:0x0003".into())),
+            "endpoint readiness at a bay"
+        );
+
+        let inventory = Body::InventoryReconciled(InventoryReconciled {
+            subject: InventorySubject::Standalone(standalone),
+            observation_generation: 1,
+            resolves: Bounded(vec![]),
+            complete: true,
+            elements: Bounded(vec![]),
+        });
+        assert_eq!(
+            walker.subject(&inventory, 45),
+            ("endpoint".into(), Some("standalone:SN-9".into())),
+            "standalone inventory"
+        );
+
+        let outcome = Body::MotionOutcome(MotionOutcome {
+            intent: DecisionRef {
+                sequence: 998,
+                record_uuid: [98; 16],
+            },
+            result: MotionResult::Unknown,
+            evidence: fixture::evidence(),
+            confirmation: None,
+        });
+        assert_eq!(
+            walker.subject(&outcome, 46),
+            ("motion".into(), Some("998".into())),
+            "motion outcome without its intent"
         );
     }
 
