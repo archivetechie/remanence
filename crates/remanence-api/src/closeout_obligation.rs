@@ -1030,13 +1030,18 @@ mod tests {
     }
     #[test]
     fn b7_alarm_once_per_age_and_again_after_restart_even_without_drive() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("audit")).unwrap();
+        let typed = crate::tests::TypedRoot::open();
+        let tape_root = typed
+            .catalog()
+            .library_runtime()
+            .unwrap()
+            .manifest()
+            .tape_root()
+            .to_path_buf();
+        // Each process has independent alarm deduplication over the same typed authority.
         let make = || {
-            let mut state = ApiState::new(
-                remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-            );
-            state.audit_dir = std::sync::Arc::new(root.path().join("audit"));
+            let mut state = typed.api_state();
+            state.checkpoint_journal_dir = std::sync::Arc::new(tape_root.clone());
             state
         };
         let state = make();

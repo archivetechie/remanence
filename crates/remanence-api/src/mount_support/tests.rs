@@ -2340,20 +2340,50 @@ fn bootstrap_without_filemark_can_be_explicitly_superseded() {
     drop(reopen_state());
 }
 
+/// Check durable absence over every received tag, including unapplied library records.
+/// Call only after releasing the test's state, configuration and mount owners.
+fn assert_no_received_fence_or_recovery(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+) {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+    let mut tags = Vec::new();
+    let replay = store::replay_observed_with_received(
+        &paths.audit_dir,
+        library_uuid,
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, _receipt| {
+            tags.push(record.tag());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        replay.refusal.is_none(),
+        "typed library replay refused: {:?}",
+        replay.refusal
+    );
+    assert!(replay.fold.pending.is_empty());
+    assert!(
+        tags.iter()
+            .all(|tag| !matches!(tag, Tag::FenceRaised | Tag::RecoveryRecorded)),
+        "unexpected durable fence or recovery: {tags:?}"
+    );
+}
+
 #[test]
 fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
+    let runtime = state.library_runtime();
+    let checkpoint_journal_dir = runtime.manifest().tape_root().to_path_buf();
     let cfg = crate::write_owner::TerminalWriteConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            state.paths().audit_dir.clone(),
-            true,
-            &(Arc::new(Mutex::new(()))),
-        ),
+        authority: crate::write_owner::TerminalAuthority::Typed(runtime),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
+        checkpoint_journal_dir,
     };
     let error = crate::append_admission::AdmissionError::new(
         crate::append_admission::AdmissionErrorKind::Io(remanence_library::TapeIoError::new(
@@ -2379,15 +2409,11 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    assert!(remanence_state::FileAuditLog::replay(
-        &cfg.authority
-            .historical_fixture()
-            .expect("historical audit fixture")
-            .audit_dir
-    )
-    .unwrap()
-    .iter()
-    .all(|r| r.event != AuditEvent::RecoveryEvent));
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    drop(cfg);
+    drop(state);
+    assert_no_received_fence_or_recovery(&paths, library_uuid);
 }
 
 /// Structural refusals quarantine only the tape, and retain the authenticated actor.
@@ -3041,12 +3067,11 @@ fn b3b_fix2_init_r6_definite_rejection() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    assert!(
-        !remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir)
-            .unwrap()
-            .iter()
-            .any(|e| e.event == AuditEvent::TapeIoFenceRaised)
-    );
+    let paths = mount.state.paths().clone();
+    let library_uuid = mount.state.library_runtime().manifest().library_uuid();
+    drop(mount);
+    drop(state);
+    assert_no_received_fence_or_recovery(&paths, library_uuid);
 }
 
 /// The real operator constructor installs the shared typed runtime on its actual

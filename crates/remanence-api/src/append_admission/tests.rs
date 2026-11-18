@@ -1321,17 +1321,16 @@ fn native_session_suffix_rows_and_unknown_command_frontiers() {
         for survivors in 0..=3 {
             for mark in [false, true] {
                 let mut f = fixture_with_size(NATIVE_SIZE);
-                let root = tempfile::tempdir().unwrap();
-                let index = remanence_state::projector::open(root.path().join("state.sqlite"))
-                    .map(|catalog| catalog.write_handle())
-                    .unwrap();
-                std::fs::create_dir(root.path().join("tapes")).unwrap();
-                let authority = remanence_state::TapeAuthority::open(
-                    root.path().join("tapes"),
-                    UUID,
-                    index.path(),
-                )
-                .unwrap();
+                let typed = crate::tests::TypedRoot::open();
+                let index = typed.catalog().write_handle();
+                let tape_root = index
+                    .library_runtime()
+                    .unwrap()
+                    .manifest()
+                    .tape_root()
+                    .to_path_buf();
+                let authority =
+                    remanence_state::TapeAuthority::open(&tape_root, UUID, index.path()).unwrap();
                 let mut lease = authority.acquire_exclusive().unwrap();
                 lease
                     .publish_initialized(
@@ -1454,14 +1453,15 @@ fn x22_closed_tail_row(row: &str) {
     let named = matches!(row, "named" | "proved_eod");
     let conflicting_eod = row == "proved_eod";
     let mut f = fixture_with_size(NATIVE_SIZE);
-    let root = tempfile::tempdir().unwrap();
-    let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+    let typed = crate::tests::TypedRoot::open();
+    let index = typed.catalog().write_handle();
+    let tape_root = index
+        .library_runtime()
         .unwrap()
-        .write_handle();
-    std::fs::create_dir(root.path().join("tapes")).unwrap();
-    let authority =
-        remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
-            .unwrap();
+        .manifest()
+        .tape_root()
+        .to_path_buf();
+    let authority = remanence_state::TapeAuthority::open(&tape_root, UUID, index.path()).unwrap();
     let mut lease = authority.acquire_exclusive().unwrap();
     lease
         .publish_initialized(
@@ -1861,20 +1861,15 @@ fn b3b_admission_carrier_and_renderer_census() {
     assert_eq!(outcome.evidence.opcode, Some(8));
     assert_eq!(outcome.evidence.current_sense().unwrap().key, 4);
     assert_ne!(f.drive.last_command_outcome().unwrap(), &outcome);
-    let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
+    let typed = crate::tests::TypedRoot::open();
+    let mut index = typed.catalog().write_handle();
+    let runtime = index.library_runtime().unwrap();
+    let tape_root = runtime.manifest().tape_root().to_path_buf();
     let cfg = crate::write_owner::TerminalWriteConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            root.path().join("audit"),
-            true,
-            &(Arc::new(Mutex::new(()))),
-        ),
+        authority: crate::write_owner::TerminalAuthority::Typed(runtime),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: root.path().join("tapes"),
+        checkpoint_journal_dir: tape_root,
     };
     let before = (census::total(), census::normalizations());
     assert_eq!(admission_error_outcome(&error), outcome);

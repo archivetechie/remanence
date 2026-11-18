@@ -96,26 +96,50 @@ fn placed_library_keeps_actual_endpoint_guards_and_source() {
         .unwrap()
         .iter()
         .any(|c| matches!(c[0], 0x1b | 0xa5)));
-    let records = FileAuditLog::replay(&fixture.config.audit.dir).unwrap();
-    for record in records.iter().filter(|r| {
-        matches!(
-            r.event,
-            AuditEvent::SessionOpened | AuditEvent::SessionClosed
-        )
-    }) {
-        assert_eq!(
-            record.detail["endpoint_key"],
-            ciborium::Value::Text(remanence_library::DriveKey::new(LIBRARY, BAY).encode())
-        );
-        assert_eq!(
-            record.detail["library_serial"],
-            ciborium::Value::Text(LIBRARY.into())
-        );
-        assert_eq!(
-            record.detail["drive_bay"],
-            ciborium::Value::Integer(u64::from(BAY).into())
-        );
+    // The actor has joined; require the actual native opening and its later clean ending.
+    use remanence_state::tape_log::{Record as Native, SessionEndReason};
+    let path =
+        remanence_state::TapeAuthority::list_entries(fixture.config.journal.dir.join("tapes"))
+            .unwrap()
+            .pop()
+            .expect("native session log");
+    let mut file = std::fs::File::open(path).unwrap();
+    remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+    let mut decoder = remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+    let mut records = Vec::new();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        records.push(frame.record);
     }
+    let session_id = *Uuid::from_slice(&session.session_id).unwrap().as_bytes();
+    let (opened_at, opened) = records
+        .iter()
+        .enumerate()
+        .find_map(|(at, record)| match record {
+            Native::SessionOpened(open) if open.session_id == session_id => Some((at, open)),
+            _ => None,
+        })
+        .expect("returned session ID has a native opening");
+    assert_eq!(
+        opened.drive.endpoint,
+        remanence_state::library_log::DriveKey::Bay(remanence_state::library_log::Bay {
+            library_serial: LIBRARY.into(),
+            bay: BAY,
+        })
+    );
+    let ended = records
+        .iter()
+        .skip(opened_at + 1)
+        .find_map(|record| match record {
+            Native::SessionEnded(end)
+                if end.session_id == session_id && end.incarnation == opened.incarnation =>
+            {
+                Some(end)
+            }
+            _ => None,
+        })
+        .expect("same native session and incarnation ended after opening");
+    assert_eq!(ended.reason, SessionEndReason::CleanClose);
 }
 
 #[test]
@@ -533,16 +557,13 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
     .unwrap();
     let (_library, mut drive, _policy) = library_parts(&fixture);
     for mounted in [true, false] {
+        let runtime = state.library_runtime();
+        let checkpoint_journal_dir = runtime.manifest().tape_root().to_path_buf();
         let cfg = write_owner::TerminalWriteConfig {
-            authority: crate::write_owner::TerminalAuthority::fixture(
-                None,
-                fixture.config.audit.dir.clone(),
-                true,
-                &(Arc::new(Mutex::new(()))),
-            ),
+            authority: crate::write_owner::TerminalAuthority::Typed(runtime),
             io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
             mounted_endpoint: mounted.then(|| remanence_library::DriveKey::new(LIBRARY, BAY)),
-            checkpoint_journal_dir: fixture.config.journal.dir.join("tapes"),
+            checkpoint_journal_dir,
         };
         let status = write_owner::finalize_mounted_tape(
             &mut state.write_handle(),
