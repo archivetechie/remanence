@@ -52,6 +52,7 @@ use crate::write_session_ingress::WriteSessionApi;
 pub struct ApiState {
     pub(crate) catalog: remanence_state::ProjectionClient,
     pub(crate) index_path: Arc<PathBuf>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) audit_dir: Arc<PathBuf>,
     // Read only by the legacy audit funnel, now test-only; deleted with the funnel at L3.
     #[cfg_attr(not(test), allow(dead_code))]

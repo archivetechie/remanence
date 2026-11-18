@@ -15,7 +15,7 @@ Commands:
   daemon                         Query daemon process health and version over Layer 5 gRPC
   op                             Query daemon operation status
   catalog                        Query the daemon catalog
-  audit                          Query earlier-version audit segments; this version records no operation history there
+  audit                          Query the operation history recorded in the library log
   drive                          Query and mutate daemon drive stewardship state
   alarms                         List standing alarms; CLI acknowledgement is refused for active unacknowledged alarms
   top                            Live top view over daemon state

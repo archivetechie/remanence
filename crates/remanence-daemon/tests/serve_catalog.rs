@@ -3,11 +3,7 @@
 //! LibraryService.list_libraries through it.
 
 use remanence_api::{pb, ApiState};
-use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, FileAuditLog, SourceLayer,
-    TapePoolProjectionInput,
-};
-use std::collections::BTreeMap;
+use remanence_state::TapePoolProjectionInput;
 use std::os::unix::fs::PermissionsExt;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
@@ -31,23 +27,6 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
             created_at_utc: None,
         })
         .expect("seed pool");
-    let session_id = uuid::Uuid::new_v4();
-    FileAuditLog::open(dir.path().join("audit"), false)
-        .expect("open audit")
-        .append_and_return_record(AuditEventRecord {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: None,
-            session_id: Some(session_id),
-            idempotency_key: None,
-            event: AuditEvent::OperationFailed,
-            subject: AuditSubject {
-                kind: "session".to_string(),
-                id: Some(session_id.to_string()),
-            },
-            detail: BTreeMap::new(),
-        })
-        .expect("seed audit");
     let state = ApiState::new({
         let index = index;
         let catalog = remanence_state::projector::open(index.path()).unwrap();
@@ -105,7 +84,7 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
         .await
         .expect("reconnect unix audit");
     let mut audit = pb::audit_client::AuditClient::new(channel);
-    let mut entries = audit
+    let error = audit
         .query_audit(pb::QueryAuditRequest {
             since: Some(prost_types::Timestamp {
                 seconds: 0,
@@ -115,27 +94,14 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
                 seconds: 4_102_444_800,
                 nanos: 0,
             }),
-            filter: [("session_id".to_string(), session_id.to_string())]
-                .into_iter()
-                .collect(),
+            filter: Default::default(),
         })
         .await
-        .expect("query audit over unix transport")
-        .into_inner();
-    let entry = entries
-        .message()
-        .await
-        .expect("read audit entry")
-        .expect("filtered audit entry");
-    assert_eq!(entry.session_id, session_id.as_bytes());
-    assert_eq!(entry.event_kind, "OperationFailed");
-    assert!(
-        entries
-            .message()
-            .await
-            .expect("finish audit stream")
-            .is_none(),
-        "audit filter must return exactly one entry"
+        .expect_err("query audit without library authority over unix transport");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "audit history reads the library log, and this service has no library authority"
     );
 
     let _ = shutdown_tx.send(());
@@ -156,23 +122,6 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
     let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
         .map(|catalog| catalog.write_handle())
         .expect("open index");
-    let session_id = uuid::Uuid::new_v4();
-    FileAuditLog::open(dir.path().join("audit"), false)
-        .expect("open audit")
-        .append_and_return_record(AuditEventRecord {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer5,
-            operation_id: None,
-            session_id: Some(session_id),
-            idempotency_key: None,
-            event: AuditEvent::OperationFailed,
-            subject: AuditSubject {
-                kind: "session".to_string(),
-                id: Some(session_id.to_string()),
-            },
-            detail: BTreeMap::new(),
-        })
-        .expect("seed audit");
     let reserved_tcp = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("loopback TCP must be available for the mTLS transport test");
     let tcp_addr = reserved_tcp.local_addr().expect("reserved TCP address");
@@ -229,7 +178,7 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
         .await
         .expect("connect mTLS transport");
     let mut audit = pb::audit_client::AuditClient::new(channel);
-    let mut entries = audit
+    let error = audit
         .query_audit(pb::QueryAuditRequest {
             since: Some(prost_types::Timestamp {
                 seconds: 0,
@@ -239,27 +188,14 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
                 seconds: 4_102_444_800,
                 nanos: 0,
             }),
-            filter: [("event_kind".to_string(), "OperationFailed".to_string())]
-                .into_iter()
-                .collect(),
+            filter: Default::default(),
         })
         .await
-        .expect("query audit over mTLS transport")
-        .into_inner();
-    let entry = entries
-        .message()
-        .await
-        .expect("read mTLS audit entry")
-        .expect("filtered mTLS audit entry");
-    assert_eq!(entry.session_id, session_id.as_bytes());
-    assert_eq!(entry.event_kind, "OperationFailed");
-    assert!(
-        entries
-            .message()
-            .await
-            .expect("finish mTLS audit stream")
-            .is_none(),
-        "mTLS audit filter must return exactly one entry"
+        .expect_err("query audit without library authority over mTLS transport");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "audit history reads the library log, and this service has no library authority"
     );
 
     let _ = shutdown_tx.send(());

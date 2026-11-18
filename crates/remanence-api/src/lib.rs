@@ -23,9 +23,9 @@ use std::time::Instant;
 
 #[cfg(test)]
 use remanence_state::{
-    AuditEventRecord, CatalogIndex, FileAuditLog, MediaReadinessOperationRecord,
-    NativeObjectFileRecord, NativeObjectInstanceRecord, NativeObjectRecord, StateError,
-    StateHandle, TapePoolConfig, TapeRecord,
+    CatalogIndex, FileAuditLog, MediaReadinessOperationRecord, NativeObjectFileRecord,
+    NativeObjectInstanceRecord, NativeObjectRecord, StateError, StateHandle, TapePoolConfig,
+    TapeRecord,
 };
 #[cfg(test)]
 use time::OffsetDateTime;

@@ -259,6 +259,7 @@ tape_catalog_dir = "{path}/cache"
                     state.catalog_service(),
                 ))
                 .add_service(pb::daemon_server::DaemonServer::new(state.daemon_service()))
+                .add_service(pb::audit_server::AuditServer::new(state.audit_service()))
                 .add_service(pb::library_service_server::LibraryServiceServer::new(
                     state.library_service(),
                 ))
@@ -2554,6 +2555,9 @@ async fn session_epochs_end_at_close_and_full_epoch_ignores_checkpoint_boundarie
 
 #[path = "characterisation/b10_pool.rs"]
 mod b10_pool;
+
+#[path = "characterisation/cu1a_history.rs"]
+mod cu1a_history;
 
 #[path = "characterisation/full_pass.rs"]
 mod full_pass;

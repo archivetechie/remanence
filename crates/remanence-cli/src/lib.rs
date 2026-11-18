@@ -576,7 +576,7 @@ enum RemCommand {
         command: CatalogClientCommand,
     },
 
-    /// Query earlier-version audit segments; this version records no operation history there.
+    /// Query the operation history recorded in the library log
     Audit {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -1269,7 +1269,7 @@ enum Command {
         command: CatalogClientCommand,
     },
 
-    /// Query earlier-version audit segments; this version records no operation history there.
+    /// Query the operation history recorded in the library log
     #[command(name = "audit", hide = true)]
     AuditClient {
         /// Daemon gRPC endpoint URI.
@@ -1797,8 +1797,7 @@ struct DriveUnloadArgs {
 
 #[derive(Subcommand, Debug)]
 enum AuditClientCommand {
-    /// Stream earlier-version audit segments in the half-open interval [since, until).
-    /// Shows no history of this version's operations and does not read the library log.
+    /// Stream the library log's records in the half-open interval [since, until), one entry per record
     Query {
         /// Inclusive RFC3339 lower bound.
         #[arg(long, value_name = "RFC3339")]
@@ -1806,7 +1805,7 @@ enum AuditClientCommand {
         /// Exclusive RFC3339 upper bound.
         #[arg(long, value_name = "RFC3339")]
         until: String,
-        /// Exact-match filter in k=v form; repeat for multiple fields.
+        /// Filter in k=v form; repeat for multiple fields. Dotless event values also match that record family.
         #[arg(long = "filter", value_name = "K=V")]
         filters: Vec<String>,
     },
@@ -6052,12 +6051,23 @@ fn print_audit_entry(
         write_json_with_capabilities(&mut *out, &value).map_err(|error| error.to_string())?;
         writeln!(out).map_err(|error| error.to_string())
     } else {
+        let subject = value["detail"]["subject"]
+            .as_object()
+            .map(|subject| {
+                format!(
+                    "{}:{}",
+                    subject.get("kind").and_then(Value::as_str).unwrap_or("-"),
+                    subject.get("id").and_then(Value::as_str).unwrap_or("-"),
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
         writeln!(
             out,
-            "{} {} {} {} build={}",
+            "{} {} {} {} {} build={}",
             entry.sequence,
             timestamp_text(entry.timestamp.as_ref()).unwrap_or_else(|| "-".to_string()),
             entry.event_kind,
+            subject,
             entry.actor,
             entry.software_build.as_deref().unwrap_or("legacy-unknown"),
         )
@@ -19949,6 +19959,42 @@ mod tests {
             "0x0102",
         ])
         .is_err());
+    }
+
+    /// Library-history text includes the subject, including absent identities and old detail.
+    #[test]
+    fn audit_entry_text_includes_subject() {
+        for (detail, subject) in [
+            (
+                r#"{"subject":{"kind":"tape","id":"550e8400-e29b-41d4-a716-446655440000"}}"#,
+                "tape:550e8400-e29b-41d4-a716-446655440000",
+            ),
+            (r#"{"subject":{"kind":"tape","id":null}}"#, "tape:-"),
+            ("{}", "-"),
+        ] {
+            let mut out = Vec::new();
+            print_audit_entry(
+                pb::AuditEntry {
+                    sequence: 7,
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 0,
+                        nanos: 0,
+                    }),
+                    event_kind: "Retire".into(),
+                    actor: "system".into(),
+                    detail_json: detail.into(),
+                    software_build: Some("recorded-build".into()),
+                    ..Default::default()
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("7 1970-01-01T00:00:00Z Retire {subject} system build=recorded-build\n")
+            );
+        }
     }
 
     #[test]

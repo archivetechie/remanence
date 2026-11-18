@@ -3677,6 +3677,111 @@ fn selected_members_keep_destination_containment() {
     );
 }
 
+/// The real audit CLI reads library records and prints the same tape subject in JSON and text.
+#[test]
+fn audit_history_through_daemon() {
+    let f = VersionFixture::with_parity(false);
+    let tape_uuid = f.ok(&["tape", "identify"])["uuid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = f.root.path().join("daemon.sock");
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let (handle, server) = {
+        let _entered = runtime.enter();
+        let (handle, state) = f.daemon_state(remanence_state::AppendStagingMode::Serial);
+        let probe = std::os::unix::net::UnixListener::bind(&socket)
+            .expect("daemon test requires Unix sockets");
+        drop(probe);
+        std::fs::remove_file(&socket).unwrap();
+        let socket = socket.clone();
+        let server = runtime.spawn(async move {
+            remanence_daemon::serve(state, &socket, None, async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap()
+        });
+        (handle, server)
+    };
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(socket.exists(), "daemon must start");
+    let endpoint = format!("unix:{}", socket.display());
+    let subject_filter = format!("subject_id={tape_uuid}");
+    let run = |json: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rem"));
+        command
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
+            .current_dir(f.root.path())
+            .args([
+                "audit",
+                "query",
+                "--since",
+                "1970-01-01T00:00:00Z",
+                "--until",
+                "2100-01-01T00:00:00Z",
+                "--filter",
+                "event=Reprovision",
+                "--filter",
+                "subject_kind=tape",
+                "--filter",
+                &subject_filter,
+                "--endpoint",
+                &endpoint,
+            ]);
+        if json {
+            command.arg("--json");
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    };
+    let json = run(true);
+    let entries: Vec<serde_json::Value> = json
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!entries.is_empty(), "library history must reach the CLI");
+    let text = run(false);
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), entries.len());
+    for (entry, line) in entries.iter().zip(lines) {
+        assert_eq!(entry["detail"]["subject"]["kind"], "tape");
+        assert_eq!(entry["detail"]["subject"]["id"], tape_uuid);
+        assert_eq!(entry["event_kind"], "Reprovision");
+        assert_eq!(
+            line,
+            format!(
+                "{} {} Reprovision tape:{} {} build={}",
+                entry["sequence"].as_u64().unwrap(),
+                entry["timestamp"].as_str().unwrap(),
+                tape_uuid,
+                entry["actor"].as_str().unwrap(),
+                entry["software_build"].as_str().unwrap(),
+            )
+        );
+    }
+    stop.send(()).unwrap();
+    runtime.block_on(server).unwrap();
+    drop(runtime);
+    drop(handle);
+}
+
 /// Production CLI and daemon services preserve timestamps through both append modes.
 #[test]
 fn daemon_put_get_preserves_mtime() {

@@ -2196,11 +2196,10 @@ message PlanBatchReadResponse {
 }
 
 // =============================================================================
-// AUDIT SERVICE — read-only audit log queries.
+// AUDIT SERVICE — read-only history of the library log's records.
 //
-// The append-only audit log is daemon-authoritative.
-// Layer 5 exposes query-only surface; mutations only happen through the
-// other services.
+// One history entry per library-log record. Layer 5 exposes queries here;
+// mutations only happen through the other services.
 // =============================================================================
 
 service Audit {
@@ -2210,23 +2209,28 @@ service Audit {
 message QueryAuditRequest {
   google.protobuf.Timestamp since = 1;
   google.protobuf.Timestamp until = 2;
-  // Filter by operation_id, session_id, subject, event kind, actor, etc.
+  // Filter by operation_id, session_id, subject_id, subject_kind, event_kind
+  // (aliases: event, kind), actor, or source_layer. A dotless event value also
+  // matches the record family <value>.<Variant>.
   map<string, string> filter      = 3;
 }
 
 message AuditEntry {
-  uint64 sequence              = 1;
+  uint64 sequence              = 1; // Library-log sequence.
   google.protobuf.Timestamp timestamp = 2;
   string actor                 = 3;
-  string source_layer          = 4; // "layer2", "layer3a", "layer3c", "layer5"
+  string source_layer          = 4; // "layer2", "layer3b", "layer3c", "layer4", "layer5"
   bytes  operation_id          = 5;
   bytes  session_id            = 6;
+  // The record kind, or Kind.Variant for kinds that carry their event inside
+  // (see `rem audit query`).
   string event_kind            = 7;
-  // Free-form structured detail; CBOR-encoded in the on-disk log, JSON-ified
-  // here for client convenience.
+  // Structured record detail: record_kind, record_uuid, record_hash, process_id,
+  // idempotency_key, subject {kind, id}, and body. host_id is omitted; large byte
+  // values are summarized and an oversized body is replaced by omitted metadata.
   string detail_json           = 8;
-  // Producing crate version plus build-time git description. Absent only for
-  // audit records written before this field was introduced.
+  // Always present for library-history entries; the build string recorded by
+  // the record's writer.
   optional string software_build = 9;
 }
 

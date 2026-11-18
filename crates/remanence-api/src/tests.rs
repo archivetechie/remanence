@@ -7566,32 +7566,32 @@ fn drive_target_read_errors_are_precise_and_pool_guard_is_enforced() {
     );
 }
 
-fn audit_test_record(
+/// Construct searchable library-envelope values without a renderer or a log reader.
+fn audit_test_head(
     sequence: u64,
     timestamp_utc: &str,
     session_id: Option<Uuid>,
     operation_id: Option<Uuid>,
-    event: AuditEvent,
-) -> AuditRecord {
-    AuditRecord {
-        schema_version: 1,
-        record_uuid: Uuid::new_v4(),
+    event_kind: &str,
+) -> remanence_state::library_runtime::HistoryHead {
+    remanence_state::library_runtime::HistoryHead {
         sequence,
-        timestamp_utc: timestamp_utc.to_string(),
-        host_id: "test-host".to_string(),
-        process_id: 1,
-        software_build: Some("test-build".to_string()),
+        timestamp_unix_ns: OffsetDateTime::parse(
+            timestamp_utc,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+        .unix_timestamp_nanos()
+        .try_into()
+        .unwrap(),
+        software_build: "test-build".into(),
         actor: AuditActor::System,
         source_layer: SourceLayer::Layer5,
-        operation_id,
-        session_id,
-        idempotency_key: None,
-        event,
-        subject: AuditSubject {
-            kind: "session".to_string(),
-            id: session_id.map(|value| value.to_string()),
-        },
-        detail: BTreeMap::new(),
+        operation_id: operation_id.map(|id| *id.as_bytes()),
+        session_id: session_id.map(|id| *id.as_bytes()),
+        event_kind: event_kind.into(),
+        subject_kind: "session".into(),
+        subject_id: session_id.map(|id| id.to_string()),
     }
 }
 
@@ -7605,46 +7605,93 @@ fn audit_query_window_and_filters_select_exact_entries() {
         filter: HashMap::from([
             ("session_id".to_string(), session_id.to_string()),
             ("operation_id".to_string(), operation_id.to_string()),
-            ("event_kind".to_string(), "OperationFailed".to_string()),
+            (
+                "event_kind".to_string(),
+                "OperationRecorded.Failed".to_string(),
+            ),
         ]),
     })
     .expect("valid audit query");
-    let records = [
-        audit_test_record(
+    let heads = [
+        audit_test_head(
             1,
             "2026-07-18T09:59:59Z",
             Some(session_id),
             Some(operation_id),
-            AuditEvent::OperationFailed,
+            "OperationRecorded.Failed",
         ),
-        audit_test_record(
+        audit_test_head(
             2,
-            "2026-07-18T10:30:00Z",
+            "2026-07-18T10:00:00Z",
             Some(session_id),
             Some(operation_id),
-            AuditEvent::OperationFailed,
+            "OperationRecorded.Failed",
         ),
-        audit_test_record(
+        audit_test_head(
             3,
             "2026-07-18T11:00:00Z",
             Some(session_id),
             Some(operation_id),
-            AuditEvent::OperationFailed,
+            "OperationRecorded.Failed",
         ),
-        audit_test_record(
+        audit_test_head(
             4,
             "2026-07-18T10:45:00Z",
             Some(Uuid::new_v4()),
             Some(operation_id),
-            AuditEvent::OperationFailed,
+            "OperationRecorded.Failed",
         ),
     ];
-    let matched = records
+    let matched = heads
         .iter()
-        .filter(|record| audit_record_matches(record, &query).expect("match audit record"))
-        .map(|record| record.sequence)
+        .filter(|head| audit_head_matches(head, &query))
+        .map(|head| head.sequence)
         .collect::<Vec<_>>();
     assert_eq!(matched, vec![2]);
+
+    for alias in ["event", "event_kind", "kind"] {
+        let family = AuditQuery::try_from(pb::QueryAuditRequest {
+            filter: HashMap::from([(alias.into(), "OperationRecorded".into())]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            audit_head_matches(&heads[1], &family),
+            "event=OperationRecorded matches OperationRecorded.Failed"
+        );
+        let mut other = heads[1].clone();
+        other.event_kind = "OperationRecordedX".into();
+        assert!(!audit_head_matches(&other, &family));
+    }
+    let retire = AuditQuery::try_from(pb::QueryAuditRequest {
+        filter: HashMap::from([("event".into(), "Retire".into())]),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut other = heads[1].clone();
+    other.event_kind = "DriveDecision.Retire".into();
+    assert!(!audit_head_matches(&other, &retire));
+    other.event_kind = "Retire".into();
+    assert!(audit_head_matches(&other, &retire));
+    for (key, value) in [
+        ("actor", "system"),
+        ("source_layer", "layer5"),
+        ("subject_kind", "session"),
+    ] {
+        let mut request = pb::QueryAuditRequest {
+            filter: HashMap::from([(key.into(), value.into())]),
+            ..Default::default()
+        };
+        assert!(audit_head_matches(
+            &heads[1],
+            &AuditQuery::try_from(request.clone()).unwrap()
+        ));
+        request.filter.insert(key.into(), "other".into());
+        assert!(!audit_head_matches(
+            &heads[1],
+            &AuditQuery::try_from(request).unwrap()
+        ));
+    }
 }
 
 #[test]
@@ -7671,67 +7718,164 @@ fn audit_query_uuid_filters_canonicalize_uppercase_and_unhyphenated_inputs() {
         ]),
     })
     .expect("non-canonical UUID spellings are valid filters");
-    let record = audit_test_record(
+    let mut head = audit_test_head(
         1,
         "2026-07-18T10:30:00Z",
         Some(session_id),
         Some(operation_id),
-        AuditEvent::OperationFailed,
+        "OperationRecorded.Failed",
     );
+    assert!(audit_head_matches(&head, &query));
+    head.subject_id = Some("550E8400E29B41D4A716446655440000".into());
+    let canonical = AuditQuery::try_from(pb::QueryAuditRequest {
+        filter: HashMap::from([("subject_id".into(), session_id.to_string())]),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        audit_head_matches(&head, &canonical),
+        "noncanonical stored subject matches canonical filter"
+    );
+}
 
-    assert!(audit_record_matches(&record, &query).expect("match canonical UUIDs"));
+/// The actual runtime supplies known UUID envelopes and the recorded timestamp and build.
+#[tokio::test]
+async fn audit_service_streams_filtered_records() {
+    use remanence_state::library_log as lib;
+    use std::ops::ControlFlow;
+
+    let typed = TypedRoot::open();
+    let state = typed.api_state();
+    let runtime = state.catalog.library_runtime().unwrap();
+    let session_id = [0x51; 16];
+    let actor = AuditActor::Service("history-writer".into());
+    let mut operation_id = None;
+    runtime
+        .append(|authority, view| {
+            let (id, receipt) = authority.start_operation(
+                lib::OperationKind::TapeCloseout,
+                actor.clone(),
+                SourceLayer::Layer3b,
+                view,
+            )?;
+            operation_id = Some(id);
+            Ok(receipt)
+        })
+        .unwrap();
+    let operation_id = operation_id.unwrap();
+    runtime
+        .append(|authority, view| {
+            authority.session_observed(
+                lib::SessionObserved {
+                    session_id,
+                    kind: lib::SessionKind::Read,
+                    endpoint: None,
+                    tape: None,
+                    event: lib::SessionEvent::Opened,
+                    previous: None,
+                    reason: None,
+                },
+                actor.clone(),
+                SourceLayer::Layer3b,
+                view,
+            )
+        })
+        .unwrap();
+    for layer in [SourceLayer::Layer3b, SourceLayer::Layer4] {
+        runtime
+            .append(|authority, view| {
+                authority.diagnostic(
+                    lib::Diagnostic {
+                        event: lib::DiagnosticEvent::RequestReceived,
+                        subject_kind: "history-test".into(),
+                        subject_id: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    actor.clone(),
+                    layer,
+                    view,
+                )
+            })
+            .unwrap();
+    }
+    let mut heads = Vec::new();
+    runtime
+        .history(&mut |entry| {
+            heads.push(entry.head().clone());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(heads.len(), 4);
+    let mut stream = pb::audit_server::Audit::query_audit(
+        &state.audit_service(),
+        Request::new(pb::QueryAuditRequest {
+            since: timestamp_from_rfc3339("2020-01-01T00:00:00Z"),
+            until: timestamp_from_rfc3339("2100-01-01T00:00:00Z"),
+            filter: HashMap::from([("source_layer".to_string(), "layer3b".into())]),
+        }),
+    )
+    .await
+    .expect("query audit")
+    .into_inner();
+    let mut entries = Vec::new();
+    for head in &heads[..3] {
+        let entry = stream.next().await.expect("one entry").expect("audit item");
+        assert_eq!(entry.sequence, head.sequence);
+        assert_eq!(entry.actor, "service:history-writer");
+        assert_eq!(entry.source_layer, "layer3b");
+        let timestamp = entry.timestamp.as_ref().unwrap();
+        assert_eq!(
+            timestamp.seconds,
+            (head.timestamp_unix_ns / 1_000_000_000) as i64
+        );
+        assert_eq!(
+            timestamp.nanos,
+            (head.timestamp_unix_ns % 1_000_000_000) as i32
+        );
+        assert_eq!(
+            entry.software_build.as_deref(),
+            Some(head.software_build.as_str())
+        );
+        assert_eq!(
+            entry.software_build.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        entries.push(entry);
+    }
+    assert_eq!(entries[0].operation_id, operation_id);
+    assert!(entries[0].session_id.is_empty());
+    assert_eq!(entries[0].event_kind, "OperationRecorded.Started");
+    assert!(entries[1].operation_id.is_empty());
+    assert_eq!(entries[1].session_id, session_id);
+    assert_eq!(entries[1].event_kind, "SessionObserved.Opened");
+    assert!(entries[2].operation_id.is_empty());
+    assert!(entries[2].session_id.is_empty());
+    assert_eq!(entries[2].event_kind, "Diagnostic.RequestReceived");
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
-async fn audit_service_streams_filtered_records() {
+async fn audit_service_without_runtime_refuses() {
     let state = ApiState::new({
         let index = test_index();
         let catalog = remanence_state::projector::open(index.path()).unwrap();
         drop(index);
         catalog
     });
-    let session_id = Uuid::new_v4();
-    let mut audit = FileAuditLog::open(state.audit_dir.as_ref(), false).expect("open audit");
-    for (current_session, event) in [
-        (session_id, AuditEvent::OperationFailed),
-        (Uuid::new_v4(), AuditEvent::OperationFinished),
-    ] {
-        audit
-            .append_and_return_record(AuditEventRecord {
-                actor: AuditActor::System,
-                source_layer: SourceLayer::Layer5,
-                operation_id: None,
-                session_id: Some(current_session),
-                idempotency_key: None,
-                event,
-                subject: AuditSubject {
-                    kind: "session".to_string(),
-                    id: Some(current_session.to_string()),
-                },
-                detail: BTreeMap::new(),
-            })
-            .expect("append audit record");
-    }
-    drop(audit);
-    let mut stream = pb::audit_server::Audit::query_audit(
+    let result = pb::audit_server::Audit::query_audit(
         &state.audit_service(),
-        Request::new(pb::QueryAuditRequest {
-            since: timestamp_from_rfc3339("2020-01-01T00:00:00Z"),
-            until: timestamp_from_rfc3339("2100-01-01T00:00:00Z"),
-            filter: HashMap::from([("session_id".to_string(), session_id.to_string())]),
-        }),
+        Request::new(pb::QueryAuditRequest::default()),
     )
-    .await
-    .expect("query audit")
-    .into_inner();
-    let entry = stream.next().await.expect("one entry").expect("audit item");
-    assert_eq!(entry.session_id, session_id.as_bytes());
-    assert_eq!(entry.event_kind, "OperationFailed");
+    .await;
+    let error = match result {
+        Ok(_) => panic!("no runtime must refuse"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
-        entry.software_build.as_deref(),
-        Some(remanence_state::audit::software_build())
+        error.message(),
+        "audit history reads the library log, and this service has no library authority"
     );
-    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
