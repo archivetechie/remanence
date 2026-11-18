@@ -50,6 +50,19 @@ pub fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
     }
 }
 
+/// Whether the primary command reported that the end-of-data mark is missing.
+pub fn tape_error_is_end_of_data_not_found(error: &TapeIoError, issued_opcode: u8) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        error.is_end_of_data_not_found(issued_opcode)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (error, issued_opcode);
+        false
+    }
+}
+
 /// A position that a device reports is the device's fact, not the tape's: when
 /// it does not fit in u64, or goes backwards, the device is at fault and the
 /// error is `TapeIo` (REM-PARITY 2.4). Every device-derived position and count

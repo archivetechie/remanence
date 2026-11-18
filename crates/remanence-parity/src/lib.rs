@@ -152,8 +152,9 @@ pub use resume::{
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
     scan_reconstruct_filemark_map_with_control, scan_reconstruct_filemark_map_with_control_mode,
-    scan_reconstruct_filemark_map_with_report, scan_reconstruct_filemark_map_with_report_mode,
-    validate_scan_reconstruction_with_report, CatalogFilemarkMapInput, ControlledScanWalkOutcome,
+    scan_reconstruct_filemark_map_with_end_of_data_rule, scan_reconstruct_filemark_map_with_report,
+    scan_reconstruct_filemark_map_with_report_mode, validate_scan_reconstruction_with_report,
+    CatalogFilemarkMapInput, ControlledScanWalkOutcome, EndOfDataMark, EndOfDataRule,
     FilemarkMapScanResult, RecoveryBootstrap, ScanBootstrapCandidate, ScanDamageKind,
     ScanDamagedRegion, ScanMode, ScanOverlaySource, ScanRecoveryHints, ScanTailTruncation,
     ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl, ScanWalkProgress, ScanWalkResult,

@@ -161,6 +161,12 @@ impl TapeIoError {
         }
     }
 
+    /// Whether the issued READ or SPACE itself reported a missing EOD mark.
+    pub fn is_end_of_data_not_found(&self, issued_opcode: u8) -> bool {
+        self.completion_evidence()
+            .is_end_of_data_not_found(issued_opcode)
+    }
+
     /// Only a current, zero-transfer BLANK CHECK 00/05 proves physical EOD.
     pub fn is_physical_eod(&self) -> bool {
         self.check_condition_transfer().is_some()

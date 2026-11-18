@@ -84,7 +84,7 @@ impl FileObservation {
             #[cfg(any(test, feature = "test-support"))]
             test_support::record_fallback(self.head_position);
             source.locate_physical(self.head_position)?;
-            return measure_current_file(source, self.head_position);
+            return measure_current_file(source, self.head_position, EndOfDataRule::Refuse);
         }
         let report = self.report_after_filemark.ok_or(ParityError::Invariant(
             "file observation has no boundary report",

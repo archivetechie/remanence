@@ -2019,3 +2019,75 @@ fn identity_buffer_configuration_refusal_is_classified_once() {
     assert_eq!(census::total() - counts.0, 1);
     assert_eq!(census::normalizations() - counts.1, 1);
 }
+
+/// T1. Exercise the missing-mark predicate on independently varied primary evidence.
+#[test]
+fn missing_eod_signature() {
+    use crate::outcome::{Completion, CompletionEvidence};
+    let mut raw = sense(3, 0x14, 0, 0, 0);
+    raw[0] = 0x70;
+    let primary = CompletionEvidence::from_sense(&raw);
+    for op in [0x11, 0x08] {
+        let mut e = primary.clone();
+        e.opcode = Some(op);
+        assert!(e.is_end_of_data_not_found(op));
+        e.host_transferred_bytes = Some(0);
+        e.transferred_bytes = Some(0);
+        assert!(e.is_end_of_data_not_found(op));
+    }
+    for (op, issued) in [
+        (Some(0x34), 0x11),
+        (Some(0x34), 0x34),
+        (Some(0x10), 0x11),
+        (None, 0x11),
+        (Some(8), 0x11),
+        (Some(0x11), 8),
+    ] {
+        let mut e = primary.clone();
+        e.opcode = op;
+        assert!(
+            !e.is_end_of_data_not_found(issued),
+            "opcode {op:#x?}, issued {issued:#x}"
+        );
+    }
+    for (rc, flags_key, asc, ascq, expected) in [
+        (0x70, 3, 0x14, 3, true),
+        (0x70, 8, 0x14, 3, false),
+        (0x70, 3, 0x11, 0, false),
+        (0x70, 3, 0x14, 1, false),
+        (0x71, 3, 0x14, 0, false),
+        (0x70, 0x83, 0x14, 0, false),
+        (0x70, 0x43, 0x14, 0, false),
+        (0x70, 0x23, 0x14, 0, false),
+        (0xf0, 3, 0x14, 0, false),
+    ] {
+        let mut sample = raw.clone();
+        sample[0] = rc;
+        sample[2] = flags_key;
+        sample[12..14].copy_from_slice(&[asc, ascq]);
+        let mut e = CompletionEvidence::from_sense(&sample);
+        e.opcode = Some(0x11);
+        assert_eq!(e.is_end_of_data_not_found(0x11), expected, "{sample:x?}");
+    }
+    for (host, accounted, completion) in [
+        (Some(1), Some(0), Completion::Known),
+        (Some(0), Some(1), Completion::Known),
+        (None, None, Completion::Unknown),
+    ] {
+        let mut e = primary.clone();
+        e.opcode = Some(0x11);
+        e.completion = completion;
+        e.host_transferred_bytes = host;
+        e.transferred_bytes = accounted;
+        assert!(!e.is_end_of_data_not_found(0x11));
+    }
+    let mut transport = CompletionEvidence::from_scsi(&ScsiError::TransportError {
+        status: 2,
+        host_status: 3,
+        driver_status: 8,
+        info: 1,
+        sense: raw,
+    });
+    transport.opcode = Some(0x11);
+    assert!(!transport.is_end_of_data_not_found(0x11));
+}
