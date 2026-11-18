@@ -19,7 +19,7 @@ release yet, so you build from source
 
 ## What you need
 
-- A Linux host with `git`, a C compiler and Rust 1.88 or newer.
+- A Linux host with `git`, a C compiler and Rust 1.89 or newer.
   [Installing Remanence](guide-install.md#before-you-start) lists the packages.
 - `bsdtar` (the `libarchive-tools` package on Debian and Ubuntu, `bsdtar` on
   Fedora). The first part uses it to list an object's contents.

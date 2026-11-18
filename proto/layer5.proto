@@ -2212,7 +2212,7 @@ message QueryAuditRequest {
   google.protobuf.Timestamp until = 2;
   // Filter by operation_id, session_id, subject_id, subject_kind, event_kind
   // (aliases: event, kind), actor, or source_layer. A dotless event value also
-  // matches the record family <value>.<Variant>.
+  // matches the record family `<value>.<Variant>`.
   map<string, string> filter      = 3;
 }
 

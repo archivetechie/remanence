@@ -1736,7 +1736,7 @@ impl LibraryHandle {
     /// the bay's `source_slot` (recorded by Layer 2a from RES
     /// SVALID) is used — the cartridge goes back to its natural
     /// home. If both `destination` and `source_slot` are `None`,
-    /// returns [`UnloadError::Move`]`(`[`MoveError::SourceEmpty`]`)`
+    /// returns [`UnloadError::Move`]`(`[`crate::MoveErrorKind::SourceEmpty`]`)`
     /// (and fires a `Refused` audit event with `op = Unload { bay,
     /// dst: None }`).
     ///
@@ -1892,7 +1892,7 @@ impl LibraryHandle {
 impl ChangerHandle {
     /// Composed: changer MOVE MEDIUM from `slot` to the first
     /// available (`!full`) IE port. Returns
-    /// [`MoveError::DestinationFull`] if all IE ports already hold a
+    /// [`crate::MoveErrorKind::DestinationFull`] if all IE ports already hold a
     /// cartridge or the library has none.
     ///
     /// All audit events carry `operation = AuditOp::Export { slot,
@@ -1933,7 +1933,7 @@ impl ChangerHandle {
     }
 
     /// Composed: changer MOVE MEDIUM from the first occupied
-    /// (`full`) IE port to `slot`. Returns [`MoveError::SourceEmpty`]
+    /// (`full`) IE port to `slot`. Returns [`crate::MoveErrorKind::SourceEmpty`]
     /// if no IE port is occupied (or the library has none).
     ///
     /// All audit events carry `operation = AuditOp::Import { ie,

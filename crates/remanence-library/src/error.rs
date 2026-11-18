@@ -731,7 +731,7 @@ pub enum RescanWarning {
 ///   whole public op, with no `Started` / `Finished`. The exception is a
 ///   MOVE MEDIUM that waited out a not-ready changer: each issued attempt
 ///   has its `Started` / `Finished(sense)` pair, and a refusal after the
-///   wait (changed inventory, or [`MoveError::NotReady`]) closes the op
+///   wait (changed inventory, or [`crate::MoveErrorKind::NotReady`]) closes the op
 ///   with `Refused` and no further CDB, for example `Started`,
 ///   `Finished(02/3B/12)`, `Refused`.
 /// - [`AuditEvent::Warning`] — a non-fatal observation produced by

@@ -14,7 +14,7 @@ You need:
 - a Linux host;
 - `git` and a C compiler (`build-essential` on Debian and Ubuntu, `gcc` on
   Fedora), which the bundled SQLite library and the TLS library need;
-- Rust 1.88 or newer, installed with [rustup](https://rustup.rs).
+- Rust 1.89 or newer, installed with [rustup](https://rustup.rs).
 
 The protobuf definitions of the daemon's API are compiled in-process during
 the build, so `protoc` is not needed. The build needs no other system packages

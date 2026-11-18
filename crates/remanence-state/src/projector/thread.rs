@@ -199,13 +199,13 @@ impl ProjectionClient {
                 reply,
             })
             .map_err(|_| StateError::IndexCorrupt("projector worker stopped".into()));
-        if let Err(error) = sent {
-            #[cfg(any(test, feature = "fixtures"))]
+        #[cfg(any(test, feature = "fixtures"))]
+        if sent.is_err() {
             self.measurement
                 .queued
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(error);
         }
+        sent?;
         let result = answer.recv().map_err(|_| {
             StateError::IndexCorrupt("projector worker stopped before response".into())
         });

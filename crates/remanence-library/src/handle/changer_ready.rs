@@ -54,7 +54,7 @@
 //! [`ChangerReadyWait::max_retries`], and the MOVE after it is classified as a
 //! retry, so a unit attention on it is waited out too. If the pre-move wait
 //! is stopped or reaches its deadline, no MOVE is issued and the move fails
-//! with [`crate::MoveError::NotReady`] after a refresh. If it ends because a
+//! with [`crate::MoveErrorKind::NotReady`] after a refresh. If it ends because a
 //! poll answered with something waiting does not clear, the endpoints are
 //! re-read and compared as after a successful wait before the one MOVE that
 //! follows. A stop signal already set on entry spends no time, and the MOVE

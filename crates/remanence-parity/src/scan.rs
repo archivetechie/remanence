@@ -135,7 +135,7 @@ impl ScanRecoveryHints {
 
     /// Judge the measured length of a first-record read that did not fill its
     /// read size exactly: a short read's `bytes`, or the `actual` of
-    /// [`remanence_library::TapeIoError::ReadBufferTooSmall`]. The comparison is always with the
+    /// [`remanence_library::TapeIoErrorKind::ReadBufferTooSmall`]. The comparison is always with the
     /// supplied block size (REM-PARITY 8.4), so at a candidate read size other
     /// than the supplied one, a record of the supplied length passes and only
     /// that candidate is ruled out by the caller. A read that fills its read

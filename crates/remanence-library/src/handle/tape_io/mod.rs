@@ -871,8 +871,8 @@ impl TapeIoError {
 /// Convert a low-level [`ScsiError`] into a Layer 3a [`TapeIoError`].
 /// Sense bytes are decoded to surface `NoMedium` / `WriteProtected` /
 /// `DataProtect` as their own variants — everything else falls
-/// through to [`TapeIoError::CheckCondition`],
-/// [`TapeIoError::UnexpectedStatus`], or [`TapeIoError::Transport`].
+/// through to [`crate::TapeIoErrorKind::CheckCondition`],
+/// [`crate::TapeIoErrorKind::UnexpectedStatus`], or [`crate::TapeIoErrorKind::Transport`].
 pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
     match err {
         ScsiError::Cancelled => crate::TapeIoError::pending(crate::TapeIoErrorKind::Cancelled),
@@ -1434,7 +1434,7 @@ impl super::DriveHandle {
     /// after the head reaches BOT. Transport errors mark the parent
     /// `LibraryHandle` dirty with cause
     /// [`DirtyCause::CompletionUnknown`]; CHECK CONDITION (including
-    /// the [`TapeIoError::NoMedium`] mapping) leaves the snapshot
+    /// the [`crate::TapeIoErrorKind::NoMedium`] mapping) leaves the snapshot
     /// clean because the physical state is known.
     pub fn rewind(&mut self) -> Result<(), TapeIoError> {
         self.with_command_outcome(crate::outcome::CommandClass::Position, |drive| {
@@ -1518,7 +1518,7 @@ impl super::DriveHandle {
     /// Query the drive's current TapeAlert flags via LOG SENSE page 0x2E.
     ///
     /// This is a read-only status command. Malformed LOG SENSE payloads surface
-    /// as [`TapeIoError::MalformedResponse`] so callers can distinguish a
+    /// as [`crate::TapeIoErrorKind::MalformedResponse`] so callers can distinguish a
     /// successful CDB with unusable medium-sourced bytes from CHECK CONDITION or
     /// transport failure.
     pub fn read_tape_alerts(&mut self) -> Result<TapeAlerts, TapeIoError> {
@@ -1589,10 +1589,10 @@ impl super::DriveHandle {
     /// nothing about them.
     ///
     /// Error mapping, load-bearing for the §6.5 transitions:
-    /// - [`TapeIoError::CheckCondition`] — the drive rejected the
+    /// - [`crate::TapeIoErrorKind::CheckCondition`] — the drive rejected the
     ///   command (the runtime unsupported-format path);
-    /// - [`TapeIoError::Transport`] — completion unknown;
-    /// - [`TapeIoError::MalformedResponse`] — the CDB succeeded but the
+    /// - [`crate::TapeIoErrorKind::Transport`] — completion unknown;
+    /// - [`crate::TapeIoErrorKind::MalformedResponse`] — the CDB succeeded but the
     ///   response bytes failed wire validation.
     ///
     /// The latter two are the "transport or parse failure" arm: the
@@ -3127,7 +3127,7 @@ impl super::DriveHandle {
     ///   short read. Returns `Ok(actual)` using the transferred-byte rule above.
     /// - INFORMATION < 0 (block larger than buffer): the drive
     ///   consumed the block (the head advanced past it). Returns
-    ///   [`TapeIoError::ReadBufferTooSmall { actual, provided }`]
+    ///   [`TapeIoErrorKind::ReadBufferTooSmall { actual, provided }`](crate::TapeIoErrorKind::ReadBufferTooSmall)
     ///   where `actual = (requested as i64) - signed_information`.
     ///   The caller MUST `space(-1, Blocks)` to back up before
     ///   retrying with a larger buffer.
@@ -3971,7 +3971,7 @@ impl super::DriveHandle {
     ///    comes from the page's DCE bit.
     ///
     /// Malformed block-limit or compression responses surface as
-    /// [`TapeIoError::MalformedModeResponse`] (a CDB-succeeded /
+    /// [`crate::TapeIoErrorKind::MalformedModeResponse`] (a CDB-succeeded /
     /// payload-wrong condition, distinct from CHECK CONDITION).
     pub fn read_config(&mut self) -> Result<TapeConfig, TapeIoError> {
         self.read_config_internal(false)

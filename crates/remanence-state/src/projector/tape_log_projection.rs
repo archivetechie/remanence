@@ -1161,10 +1161,14 @@ mod tests {
             .unwrap();
         index
             .with_core(|core| {
-                core.conn.trace_v2(
-                    rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-                    Some(|_| SQL_COUNT.set(SQL_COUNT.get() + 1)),
-                );
+                core.conn
+                    .trace_v2(
+                        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                        Some(|_: rusqlite::trace::TraceEvent<'_>| {
+                            SQL_COUNT.set(SQL_COUNT.get() + 1)
+                        }),
+                    )
+                    .expect("register SQL statement trace");
                 Ok(())
             })
             .unwrap();

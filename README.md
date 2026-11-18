@@ -79,7 +79,7 @@ verify real material on your own equipment before you rely on it.
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 625f7044 -->
 ## Try it without a tape
 
-You need Linux, `git`, a C compiler, Rust 1.88 or newer, and `bsdtar`. Build
+You need Linux, `git`, a C compiler, Rust 1.89 or newer, and `bsdtar`. Build
 Remanence and archive one file into an object on local disk:
 
 ```sh
@@ -113,7 +113,7 @@ is the shortest path to a first physical tape.
 <!-- code-anchor: Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/Cargo.toml @ 625f7044 -->
 ## Build
 
-Building needs Linux, Rust 1.88 or newer, and a C compiler (`build-essential`
+Building needs Linux, Rust 1.89 or newer, and a C compiler (`build-essential`
 on Debian and Ubuntu, `gcc` on Fedora). The protobuf definitions are compiled
 in-process, so `protoc` is not required.
 
