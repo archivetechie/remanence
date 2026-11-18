@@ -13842,12 +13842,20 @@ pub(crate) async fn run_readiness_test_command(state: &crate::ApiState, command:
         })
         .unwrap();
     let snapshot = library_snapshot_cell(library.library().clone());
-    let cfg = test_write_owner_config(
+    let mut cfg = test_write_owner_config(
         state.index_path.as_ref().clone(),
         state.audit_dir.as_ref().clone(),
         &library,
         snapshot,
     );
+    cfg.authority = crate::write_owner::TerminalAuthority::Typed(
+        state
+            .catalog
+            .library_runtime()
+            .expect("readiness test has a runtime"),
+    );
+    cfg.catalog = state.catalog.clone();
+    cfg.checkpoint_journal_dir = state.checkpoint_journal_dir.as_ref().clone();
     let drive = library.open_drive(1, &policy).unwrap();
     let tx = spawn_drive_actor(1, drive, cfg);
     tx.send(command).await.unwrap();
