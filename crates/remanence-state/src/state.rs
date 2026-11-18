@@ -1266,6 +1266,9 @@ impl StateHandle {
             }
             return Err(StateError::JournalReplayFailed(message));
         }
+        lib::store::sync_published_tail(manifest.library_root(), &replay).map_err(|e| {
+            StateError::JournalReplayFailed(format!("sync library log before rebuild: {e}"))
+        })?;
         let no_witness = crate::rebuild_sources::rebuild_sources_complete(
             index,
             &received,

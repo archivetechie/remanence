@@ -6,6 +6,10 @@ use crate::tape_log::{authority::AuthoritySnapshot, CommitCursor, SessionEndReas
 use lib::DiagnosticValue::{Bytes, Text, Unsigned};
 use std::collections::BTreeSet;
 
+#[path = "../../tests/support/library_fault.rs"]
+#[allow(dead_code, clippy::duplicate_mod)]
+mod durability;
+
 const T: lib::Id = [0x51; 16];
 const B: lib::Id = [0x52; 16];
 const TIME: &str = "2026-11-11T00:00:00Z";
@@ -1460,6 +1464,7 @@ fn k94_t13_in_process_older_library_refuses() {
     let mut f = Fixture::new();
     f.provision(T);
     f.native(T, false);
+    let old_end = f.rt().0.authority.with_fold(|fold| fold.received_through);
     f.close();
     let old = files(&f.paths.audit_dir);
     f.reopen();
@@ -1482,13 +1487,35 @@ fn k94_t13_in_process_older_library_refuses() {
         })
         .unwrap();
     f.close();
+    let saved_rows: Vec<_> = rows(&f.paths.sqlite_path)
+        .into_iter()
+        .filter(|row| {
+            let rusqlite::types::Value::Blob(sequence) = &row[0] else {
+                panic!("sequence blob")
+            };
+            u64::from_be_bytes(sequence.as_slice().try_into().unwrap()) > old_end
+        })
+        .collect();
     for p in files(&f.paths.audit_dir).keys() {
         std::fs::remove_file(p).unwrap();
     }
     for (p, b) in &old {
         std::fs::write(p, b).unwrap();
     }
+    f.sql_loss();
     f.reopen();
+    // Reintroduce only the stored suffix witnesses into the already-open catalogue.
+    {
+        let mut conn = rusqlite::Connection::open(&f.paths.sqlite_path).unwrap();
+        let transaction = conn.transaction().unwrap();
+        for row in saved_rows {
+            transaction.execute(
+                "insert into library_projection_records(sequence,record_uuid,source_digest,tag,source_bytes) values(?1,?2,?3,?4,?5)",
+                rusqlite::params_from_iter(row),
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
     let before = files(&f.paths.audit_dir);
     let natives = files(&f.paths.journal_dir);
     let catalog = rows(&f.paths.sqlite_path);
@@ -1640,5 +1667,51 @@ fn direct_write_to_fenced_tape_projects_after_release() {
             tape.last_committed_tape_file
         ),
         before
+    );
+}
+
+/// The offline rebuild makes its complete library input durable before projection.
+#[test]
+fn ca1_t8b_rebuild_syncs_published_tail() {
+    use remanence_library::durable_file::test_support::register;
+    let mut f = Fixture::new();
+    f.close();
+    let cache = durability::PageCache::default();
+    let registration = register(f.paths.audit_dir.clone(), Arc::new(cache.clone()));
+    f.reopen();
+    let append = |f: &Fixture| {
+        f.rt()
+            .append(|a, v| {
+                a.diagnostic(
+                    lib::Diagnostic {
+                        event: lib::DiagnosticEvent::RecoveryEvent,
+                        subject_kind: "tail-sync-test".into(),
+                        subject_id: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let durable_end = append(&f);
+    f.close();
+    drop(registration);
+    // Produce the frame outside registration so the model retains the prior image.
+    f.reopen();
+    let frame_end = append(&f);
+    assert_eq!(frame_end, durable_end + 1);
+    f.close();
+    let registration = register(f.paths.audit_dir.clone(), Arc::new(cache.clone()));
+    crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
+    cache.crash();
+    drop(registration);
+    let inspected = crate::ambiguity_recovery::inspect(&f.paths.config_path).unwrap();
+    assert_eq!(
+        inspected["library_replay"]["last_sequence"].as_u64(),
+        Some(frame_end)
     );
 }

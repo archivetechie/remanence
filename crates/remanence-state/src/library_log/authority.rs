@@ -104,7 +104,7 @@ impl FoldProgress {
 /// Publication receipt plus exactly the applications made by this call, in order.
 #[derive(Clone, Debug)]
 pub struct AuthorityReceipt {
-    /// Durable acknowledgment (diagnostics may be explicitly unsynced).
+    /// Durable acknowledgment for every library record, including Diagnostics.
     pub receipt: Receipt,
     /// Includes older pending entries retried before this append.
     pub applied: Vec<AppliedLibraryRecord>,

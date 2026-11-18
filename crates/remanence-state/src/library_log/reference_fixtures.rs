@@ -5054,7 +5054,7 @@ fn authority_every_typed_method_uses_corpus_rules() {
             let receipt =
                 result.unwrap_or_else(|e| panic!("tag={tag:?} sequence={}: {e}", frame.sequence));
             assert_eq!(receipt.receipt.sequence, frame.sequence);
-            assert_eq!(receipt.receipt.synced, tag != Tag::Diagnostic);
+            assert!(receipt.receipt.synced);
         }
     }
     assert_eq!(tags.len(), 27);

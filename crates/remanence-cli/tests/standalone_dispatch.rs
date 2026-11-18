@@ -6404,10 +6404,29 @@ fn k94_t2_same_length_different_record() {
     k94_fence(&f);
     let rows = k94_rows(&f);
     let sequence = rows.len();
+    // Keep the original catalogue while the replacement log is built against a fresh one.
+    let mut saved = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            k94_config(&f).index.sqlite_path.display()
+        ));
+        if path.exists() {
+            let moved = std::path::PathBuf::from(format!("{}.ca1-saved", path.display()));
+            std::fs::rename(&path, &moved).unwrap();
+            saved.push((path, moved));
+        }
+    }
     k94_restore(&f, &old);
     f.ok(&["pool", "new", "different", "--scheme", "none"]);
-    // Probe M: the next normal open appends the changed configuration before projection refuses it.
-    assert!(remanence_state::StateHandle::open_from_config_file(f.config()).is_err());
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    k94_sql_loss(&f);
+    for (path, moved) in saved {
+        std::fs::rename(moved, path).unwrap();
+    }
+    let error = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap_err();
+    let expected = format!("library sequence {sequence}: the catalog holds a different record for this sequence or record identity than the library log; stop the service and run rem rebuild-catalog-from-journals");
+    assert!(error.to_string().contains(&expected), "{error}");
     let inspected = remanence_state::ambiguity_recovery::inspect(f.config()).unwrap();
     assert_eq!(
         inspected["library_replay"]["last_sequence"].as_u64(),
@@ -6812,10 +6831,8 @@ impl VersionFixture {
         mode: remanence_state::AppendStagingMode,
     ) -> Result<(remanence_state::StateHandle, remanence_api::ApiState), String> {
         let f = self;
-        let handle = remanence_state::StateHandle::open_from_config_file(f.config())
-            .map_err(|e| e.to_string())?;
-        let mut config = handle.config().clone();
         // The daemon owns a real changer slot for mount and shutdown dismount.
+        // Reset the fixture's counters before admission, which can itself refuse.
         {
             let mut world = f.world.lock().unwrap();
             let tape = world.tapes.remove("FIRST").unwrap();
@@ -6828,6 +6845,9 @@ impl VersionFixture {
             );
             world.put_tape_in_drive(0x100, "FIRST", Some(0x400), tape);
         }
+        let handle = remanence_state::StateHandle::open_from_config_file(f.config())
+            .map_err(|e| e.to_string())?;
+        let mut config = handle.config().clone();
         let library = f.world.lock().unwrap().library_snapshot();
         config.libraries = vec![remanence_state::LibraryConfig {
             serial: library.serial.clone(),
@@ -6887,6 +6907,7 @@ fn k94_daemon_refuses(rebuild: bool) {
         k94_refused(&f, "RebuildWouldDropLibraryRecords");
     }
     let rows = k94_rows(&f);
+    let segments = k94_segments(&f);
     let tape_hashes: K94Files = k94_hashes(&f)
         .into_iter()
         .filter(|(p, _)| p.starts_with(&k94_config(&f).journal.dir))
@@ -6899,17 +6920,15 @@ fn k94_daemon_refuses(rebuild: bool) {
             panic!("daemon open unexpectedly succeeded");
         }
     };
-    assert!(
-        error.contains("projection contradiction: library sequence"),
-        "{error}"
-    );
+    assert!(error.contains("CatalogAheadOfLibraryLog:"), "{error}");
     assert_eq!(f.writes(), 0);
     assert_eq!(k94_rows(&f), rows);
     let after: K94Files = k94_hashes(&f)
         .into_iter()
         .filter(|(p, _)| p.starts_with(&k94_config(&f).journal.dir))
         .collect();
-    assert_eq!(after, tape_hashes); // The one attempted library append is explicitly exempt.
+    assert_eq!(after, tape_hashes);
+    assert_eq!(k94_segments(&f), segments);
 }
 #[test]
 fn k94_t11_no_rebuild_daemon_refuses() {
@@ -7023,4 +7042,61 @@ pool_id = "camera.copy-a"
         assigned.pool_source,
         Some(lib::PoolSource::Operator(lib::Unit))
     );
+}
+
+/// An ahead catalogue refuses before any append and names the exact offline rebuild.
+#[test]
+fn ca1_t1_catalog_ahead_refuses_open_names_rebuild() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_append_diagnostic(&f);
+    k94_restore(&f, &old);
+    let inspected = remanence_state::ambiguity_recovery::inspect(f.config()).unwrap();
+    let log_end = inspected["library_replay"]["last_sequence"]
+        .as_u64()
+        .unwrap();
+    let rows = k94_rows(&f);
+    let rusqlite::types::Value::Blob(sequence) = &rows.last().unwrap()[0] else {
+        panic!("sequence blob")
+    };
+    let catalog_end = u64::from_be_bytes(sequence.as_slice().try_into().unwrap());
+    assert_eq!(catalog_end, log_end + 1);
+    let expected = format!("CatalogAheadOfLibraryLog: the catalog holds library records the library log does not (library log ends at record {log_end}, catalog at record {catalog_end}). Stop the service and run rem rebuild-catalog-from-journals --config '{}'; it rebuilds the catalog, or lists what the catalog holds beyond the log and the way on.", f.config().display());
+    let error = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap_err();
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert_eq!(k94_segments(&f), old);
+    assert_eq!(k94_rows(&f), rows);
+    k94_success(&f);
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    k94_append_diagnostic(&f);
+}
+
+/// Recovery clears ambiguity, then reports the ahead catalogue at its runtime reopen.
+#[test]
+fn ca1_t7_recovery_reopen_reports_catalog_ahead() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_append_diagnostic(&f);
+    k94_restore(&f, &old);
+    let marker = k94_config(&f).audit.dir.join("library-log.ambiguous");
+    std::fs::write(&marker, b"").unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem-debug"))
+        .env("REM_TEST_NO_LIVE_SCSI", "1")
+        .args([
+            "library-log",
+            "recover",
+            "--config",
+            f.config().to_str().unwrap(),
+            "--confirm-clear-ambiguity",
+        ])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{error}");
+    assert!(error.contains("reopen after ambiguity recovery"), "{error}");
+    assert!(error.contains("CatalogAheadOfLibraryLog"), "{error}");
+    assert!(!marker.exists());
+    k94_success(&f);
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    k94_append_diagnostic(&f);
 }

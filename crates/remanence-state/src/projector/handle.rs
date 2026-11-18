@@ -1251,6 +1251,10 @@ impl CatalogIndex {
     ) -> Result<RebuildReport, StateError> {
         self.with_core(|core| core.rebuild_tape_log_projection(audit, snapshots))
     }
+    /// Read the library end without loading source record bytes.
+    pub(crate) fn library_catalog_end(&self) -> Result<u64, StateError> {
+        self.with_core(|core| core.library_catalog_end())
+    }
     /// Read the existing library witnesses before any rebuild clears the projection.
     pub(crate) fn library_catalog_evidence(
         &self,

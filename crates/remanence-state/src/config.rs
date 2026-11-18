@@ -542,8 +542,8 @@ pub struct JournalConfig {
 pub struct AuditConfig {
     /// Directory containing `*.remlib` segments and library-log lock/fence markers.
     pub dir: PathBuf,
-    /// Whether library-log Diagnostic appends are synced before returning.
-    /// Other record types always sync; segment rotation also syncs.
+    /// Controls sync for legacy audit appends. Library-log records always sync
+    /// before returning, regardless of this compatibility setting.
     #[serde(default = "default_true")]
     pub fsync: bool,
     /// Accepted and range-validated; production does not read this setting.

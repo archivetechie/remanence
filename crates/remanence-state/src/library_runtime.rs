@@ -392,6 +392,15 @@ impl LibraryRuntime {
         )?;
         let snapshot = authority.snapshot()?;
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
+        let projector = ProjectionClient::open(&paths.sqlite_path)?;
+        let catalog_end = projector.reader()?.library_catalog_end()?;
+        let log_end = authority.with_fold(|fold| fold.received_through);
+        if catalog_end > log_end {
+            let path = crate::ambiguity_recovery::shell_path(&paths.config_path);
+            return Err(StateError::JournalReplayFailed(format!(
+                "CatalogAheadOfLibraryLog: the catalog holds library records the library log does not (library log ends at record {log_end}, catalog at record {catalog_end}). Stop the service and run rem rebuild-catalog-from-journals --config {path}; it rebuilds the catalog, or lists what the catalog holds beyond the log and the way on."
+            )).into());
+        }
         let reconciliation = if lib::store::fence_reconcile_path(manifest.library_root())
             .try_exists()
             .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
@@ -401,7 +410,6 @@ impl LibraryRuntime {
             Vec::new()
         };
         let snapshot = authority.snapshot()?;
-        let projector = ProjectionClient::open(&paths.sqlite_path)?;
         let marks = projector.reader()?.tape_projection_marks()?;
         let raises = authority.with_fold(|fold| {
             native_floor::detect(

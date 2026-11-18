@@ -18,6 +18,14 @@ pub(crate) fn fence_reconcile_path(library_root: &Path) -> PathBuf {
     library_root.join("library-log.fence-reconcile")
 }
 
+/// Make the scanned library tail and its directory durable before projection.
+pub(crate) fn sync_published_tail(dir: &Path, replay: &Replay) -> io::Result<()> {
+    if let Some(last) = replay.segments.last() {
+        File::open(dir.join(&last.name))?.sync_all()?;
+    }
+    File::open(dir)?.sync_all()
+}
+
 /// Origin attribution injected by the eventual authority owner.
 #[derive(Clone, Debug)]
 pub struct Origin {
@@ -38,7 +46,7 @@ pub trait UuidSource: Send + Sync {
     /// UUID for the prospective sequence.
     fn next(&self, sequence: u64) -> Id;
 }
-/// Durable or unsynced append acknowledgment.
+/// Durable append acknowledgment for every library record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     /// Source sequence.
@@ -542,7 +550,6 @@ pub struct LibraryLog {
     origin: Origin,
     clock: Box<dyn Clock>,
     uuids: Box<dyn UuidSource>,
-    diagnostic_fsync: bool,
     _lock: Arc<Flock<fs::File>>,
     _directory_lock: Arc<Flock<fs::File>>,
     state: Replay,
@@ -574,7 +581,7 @@ impl LibraryLog {
         origin: Origin,
         clock: Box<dyn Clock>,
         uuids: Box<dyn UuidSource>,
-        diagnostic_fsync: bool,
+        _diagnostic_fsync: bool,
         view: &dyn TapeView,
     ) -> Result<Self, StoreError> {
         fs::create_dir_all(dir)?;
@@ -605,13 +612,16 @@ impl LibraryLog {
             origin,
             clock,
             uuids,
-            diagnostic_fsync,
             _lock: Arc::new(lease),
             _directory_lock: Arc::new(directory_lease),
             state,
         };
         if owner.state.refusal.is_none() && !publication::has_ambiguity(&owner.identity)? {
             owner.remove_absent_suffix()?;
+        }
+        if let Err(error) = sync_published_tail(&owner.dir, &owner.state) {
+            publication::fence_ambiguity(&owner.dir, &owner.identity);
+            return Err(StoreError::Ambiguous(error));
         }
         Ok(owner)
     }
@@ -952,12 +962,11 @@ impl LibraryLog {
             .segments
             .last()
             .is_none_or(|s| date > s.header.as_ref().unwrap().date);
-        let synced = rotate || self.diagnostic_fsync || !matches!(record.body, Body::Diagnostic(_));
+        let synced = true;
         let mut new_segment = None;
         let result = (|| -> io::Result<()> {
             if rotate {
-                // The new segment's hash chain covers every byte in its predecessor,
-                // including diagnostics whose own receipts did not promise durability.
+                // Preserve the predecessor barrier before publishing its successor's hash chain.
                 if let Some(active) = self.state.segments.last() {
                     File::open(self.dir.join(&active.name))?.sync_all()?;
                 }
@@ -985,9 +994,7 @@ impl LibraryLog {
                 let mut f = File::options().append(true).open(target)?;
                 // Publication helpers fence before the lost tape can be recorded.
                 f.write_all(&bytes)?;
-                if synced {
-                    f.sync_all()?;
-                }
+                f.sync_all()?;
             }
             Ok(())
         })();
