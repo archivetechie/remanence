@@ -7342,7 +7342,7 @@ mod tests {
                 .write_handle();
         rusqlite::Connection::open(&projection_failure_path).unwrap()
             .execute_batch("create trigger fail_native_projection before insert on tape_log_projection begin select raise(abort, 'injected projection failure'); end;").unwrap();
-        crate::write_owner::preflight_automatic_terminal_completion(
+        let status = crate::write_owner::preflight_automatic_terminal_completion(
             &mut projection_failure_index,
             crate::write_owner::ManualFinalizePreflightConfig {
                 authority: crate::write_owner::TerminalAuthority::from_api(&state).unwrap(),
@@ -7353,6 +7353,11 @@ mod tests {
             &pool_config,
         )
         .expect_err("failed sealed projection must not consume retry authority");
+        assert!(
+            status.message().contains("injected projection failure"),
+            "unexpected preflight error: {}",
+            status.message()
+        );
         let pending = stale_journal
             .finalization_status()
             .map(|intent| {
@@ -8460,7 +8465,8 @@ mod tests {
         );
         assert_eq!(polled.detail, summary);
         // A fresh registry uses the durable audit projection for GetOperation.
-        let reopened = ApiState::new(root_handle.projection_client());
+        let mut reopened = ApiState::new(root_handle.projection_client());
+        reopened.checkpoint_journal_dir = state.checkpoint_journal_dir.clone();
         let stored = <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
             &reopened.daemon_service(),
             tonic::Request::new(pb::GetOperationRequest {

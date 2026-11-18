@@ -228,6 +228,13 @@ fn planning_harness(
 async fn manual_finalization_requires_closeout_before_media_or_acceptance() {
     for in_slot in [false, true] {
         let (mut h, admission, _) = planning_harness(in_slot);
+        let publications = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = publications.clone();
+        h.state.operations.before_publish_for_test(move |status| {
+            if status.operation_kind == "finalize_tape" {
+                observed.lock().unwrap().push(status.clone());
+            }
+        });
         let result = manual_finalize_tape(&h.state, admission.clone())
             .await
             .unwrap_err();
@@ -244,5 +251,15 @@ async fn manual_finalization_requires_closeout_before_media_or_acceptance() {
             .operations
             .latest(&admission.candidate_operation_id)
             .is_none());
+        assert!(
+            publications.lock().unwrap().is_empty(),
+            "finalization published before closeout under operation IDs: {:?}",
+            publications
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|status| Uuid::from_slice(&status.operation_id).unwrap())
+                .collect::<Vec<_>>()
+        );
     }
 }
