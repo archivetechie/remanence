@@ -1792,6 +1792,8 @@ mod verdict_tests;
 mod measurements;
 
 #[cfg(test)]
+mod prefix_hash_tests;
+#[cfg(test)]
 mod projection_lag_tests;
 #[cfg(test)]
 mod stamp_tests;

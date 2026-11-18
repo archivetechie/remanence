@@ -116,6 +116,9 @@ impl NativeTapeView {
             }
         };
         if has_header {
+            if let Some(prior) = self.tapes.get(&uuid) {
+                snapshot.carry_projection_prefix_hash(prior);
+            }
             self.tapes.insert(uuid, snapshot);
             self.changed_tape(uuid);
         } else if self.tapes.remove(&uuid).is_some() {
@@ -259,6 +262,9 @@ impl NativeTapeView {
             return Ok(());
         }
         let tape = snapshot.header().tape_uuid;
+        if let Some(prior) = self.tapes.get(&tape) {
+            snapshot.carry_projection_prefix_hash(prior);
+        }
         self.tapes.insert(tape, snapshot);
         self.changed_tape(tape);
         Ok(())

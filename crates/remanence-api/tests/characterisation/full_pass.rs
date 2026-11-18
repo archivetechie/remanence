@@ -293,3 +293,55 @@ async fn manual_finalization_uses_position_index() {
     }
     println!("{COMPLETE}");
 }
+
+/// T5: a warmed production round extends tape hashes and skips its unchanged open.
+#[tokio::test]
+async fn warmed_round_extends_tape_hashes() {
+    const TEST: &str = "full_pass::warmed_round_extends_tape_hashes";
+    const COMPLETE: &str = "LLR1B_SESSION_COMPLETE";
+    if isolated(TEST, COMPLETE) {
+        return;
+    }
+    let mut fixture = Harness::new(false);
+    {
+        let mut world = fixture.world.lock().unwrap();
+        world.drive_bays.insert(BAY, None);
+        let tape = world.tapes[BARCODE].clone();
+        world.put_tape_in_slot(0x400, BARCODE, tape);
+    }
+    fixture.config.daemon.drive_idle_unload_seconds = 1;
+    let client = fixture.start().await;
+    let first = round(&client, &fixture, "prefix-first", b"first round object").await;
+    let skips = || {
+        remanence_state::projector::open(&fixture.config.index.sqlite_path)
+            .unwrap()
+            .write_handle()
+            .fixture_tape_projection_skips()
+            .unwrap()
+    };
+    let before = skips();
+    passes::reset();
+    let second = round(&client, &fixture, "prefix-second", b"second round object").await;
+    // Full-pass measurements precede all test-side source inspection.
+    let observed = passes::counts();
+    println!("LLR1B T5 counts: {observed:?}");
+    let prefix_hashes: u64 = observed
+        .iter()
+        .filter(|(kind, file, _)| {
+            *kind == PassKind::TapePrefixHash && file.ends_with("projector/tape_log_projection.rs")
+        })
+        .map(|(_, _, count)| count)
+        .sum();
+    let after = skips();
+    println!("LLR1B T5 projector_prefix_hashes={prefix_hashes} skips_before={before} skips_after={after}");
+    assert_eq!(prefix_hashes, 0, "T5 zero projector TapePrefixHash");
+    assert!(after > before, "T5 skips rose in round 2");
+    assert_ne!(
+        first.object_id, second.object_id,
+        "rounds publish distinct objects"
+    );
+    client.state.shutdown_drive_pool().await.unwrap();
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    println!("{COMPLETE}");
+}

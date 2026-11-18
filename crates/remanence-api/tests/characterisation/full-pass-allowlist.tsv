@@ -4,5 +4,4 @@
 LibraryReplay	crates/remanence-state/src/library_runtime/drive_observation.rs
 LibraryReplay	crates/remanence-state/src/library_runtime/peer_observations.rs
 LibraryReplay	crates/remanence-state/src/library_runtime/restart.rs
-TapePrefixHash	crates/remanence-state/src/projector/tape_log_projection.rs
 TapeValidate	crates/remanence-state/src/tape_log/authority.rs

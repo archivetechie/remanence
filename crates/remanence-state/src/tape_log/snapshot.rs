@@ -312,6 +312,7 @@ impl Captured {
         Snapshot {
             file: self.file,
             identity: self.identity,
+            prefix_hash: Arc::new(Mutex::new(None)),
             position_index,
             first_sequence: 1,
             start: self.start,
@@ -344,6 +345,7 @@ impl Captured {
         Ok(Snapshot {
             file: self.file,
             identity: self.identity,
+            prefix_hash: Arc::new(Mutex::new(None)),
             position_index,
             first_sequence: 1,
             start: self.start,
@@ -386,9 +388,19 @@ pub struct RecordEvidence {
     pub digest: [u8; 32],
 }
 
+/// SHA-256 continuation for one validated immutable prefix. The cell's lock is
+/// a leaf: copy/install only, never held across I/O or another lock acquisition.
+#[derive(Clone, Debug)]
+struct PrefixHash {
+    end: u64,
+    state: sha2::Sha256,
+    digest: [u8; 32],
+}
+
 /// Fully trust-validated immutable prefix. Provisional rows never escape visitors.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    prefix_hash: Arc<Mutex<Option<PrefixHash>>>,
     pub(super) plan_base: PlanBase,
     pub(super) position_index: PositionIndex,
     first_sequence: u64,
@@ -407,6 +419,10 @@ impl Snapshot {
     /// an explicit authority repair atomically replaces the file.
     pub(crate) fn file_identity(&self) -> Result<Option<(u64, u64)>, StoreError> {
         Ok(self.identity)
+    }
+    /// Keep this snapshot's inode alive for a process-local projection marker.
+    pub(crate) fn projection_file(&self) -> Option<Arc<File>> {
+        self.file.clone()
     }
     /// Measurements of the full validation pass performed outside the lock.
     pub fn replay_metrics(&self) -> ReplayMetrics {
@@ -539,9 +555,84 @@ impl Snapshot {
             "native evidence disappeared from a validated snapshot",
         )))
     }
-    /// Bind a projection checkpoint to exact frozen bytes using bounded memory.
+    /// Carry a continuation only between captures of the same tape/header and
+    /// pinned inode. Copy out before installing, including when cells are shared.
+    pub(crate) fn carry_projection_prefix_hash(&self, prior: &Self) {
+        if self.header() != prior.header()
+            || !matches!((self.file_identity(), prior.file_identity()),
+                (Ok(Some(current)), Ok(Some(previous))) if current == previous)
+        {
+            return;
+        }
+        let kept = prior
+            .prefix_hash
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(kept) = kept {
+            self.install_prefix_hash(kept);
+        }
+    }
+
+    /// Never replace a continuation with one at an earlier or equal end.
+    fn install_prefix_hash(&self, candidate: PrefixHash) {
+        let mut kept = self.prefix_hash.lock().unwrap_or_else(|p| p.into_inner());
+        if kept.as_ref().is_none_or(|old| old.end < candidate.end) {
+            *kept = Some(candidate);
+        }
+    }
+
+    /// Bind a projection checkpoint to frozen bytes, extending a remembered
+    /// SHA-256 state when possible. Older ends still hash from byte zero.
     #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn projection_prefix_digest(&self, end: u64) -> Result<[u8; 32], StoreError> {
+        use sha2::{Digest, Sha256};
+        if end > self.summary.closed_end {
+            return Err(StoreError::Refused(
+                "projection source is shorter than its digest",
+            ));
+        }
+        let kept = self
+            .prefix_hash
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (start, mut state) = match kept {
+            Some(kept) if kept.end == end => return Ok(kept.digest),
+            Some(kept) if kept.end < end => (kept.end, kept.state),
+            _ => (0, Sha256::new()),
+        };
+        if end != 0 {
+            let file = self
+                .file
+                .as_ref()
+                .ok_or(StoreError::Refused("projection source file absent"))?;
+            #[cfg(any(test, feature = "fixtures"))]
+            if start == 0 && end > self.start {
+                crate::full_pass::count(crate::full_pass::PassKind::TapePrefixHash);
+            }
+            let mut reader = PrefixReader {
+                file: file.clone(),
+                position: start,
+                end,
+            };
+            let mut bytes = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut bytes)?;
+                if n == 0 {
+                    break;
+                }
+                state.update(&bytes[..n]);
+            }
+        }
+        let digest = state.clone().finalize().into();
+        self.install_prefix_hash(PrefixHash { end, state, digest });
+        Ok(digest)
+    }
+    /// Original byte-zero hash retained for differential tests.
+    #[cfg(test)]
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
+    pub(crate) fn projection_prefix_digest_oracle(&self, end: u64) -> Result<[u8; 32], StoreError> {
         use sha2::{Digest, Sha256};
         if end > self.summary.closed_end {
             return Err(StoreError::Refused(

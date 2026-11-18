@@ -368,6 +368,7 @@ impl CatalogIndex {
         total_committed_ordinals: u64,
     ) -> Result<TapeJournalIndexReport, StateError> {
         self.with_core(|core| {
+            core.forget_projection_marker(tape_uuid);
             let result = core.reconcile_tape_files_projection(
                 tape_uuid,
                 entries,
@@ -950,6 +951,7 @@ impl CatalogIndex {
         input: TerminalFinalizationProjectionInput,
     ) -> Result<TapeRecord, StateError> {
         self.with_core(|core| {
+            core.forget_projection_marker(input.tape_uuid);
             let tape = input.tape_uuid;
             let result = core.project_terminal_finalization(input);
             if let Some(library) = &self.library {

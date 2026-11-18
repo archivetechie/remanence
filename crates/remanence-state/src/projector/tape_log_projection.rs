@@ -17,6 +17,31 @@ use crate::authority::{CatalogPayload, TapeAuthoritySnapshot};
 use crate::tape_log::store::StoreError;
 use crate::tape_log::{authority::AuthoritySnapshot, Record};
 
+/// Completion proof for one owned final commit. Pinning the file prevents an
+/// inode from being reused while this in-memory marker survives.
+#[derive(Debug)]
+pub(super) struct ProjectedTape {
+    _file: std::sync::Arc<std::fs::File>,
+    identity: (u64, u64),
+    end: u64,
+    digest: [u8; 32],
+}
+
+impl ProjectedTape {
+    /// Source bytes and SQL must still name the exact completed projection.
+    fn matches(
+        &self,
+        snapshot: &crate::tape_log::snapshot::Snapshot,
+        source: Option<&(SqliteU64, Vec<u8>)>,
+    ) -> bool {
+        matches!(snapshot.file_identity(), Ok(Some(identity)) if identity == self.identity)
+            && self.end == snapshot.summary().closed_end
+            && source.is_some_and(|(end, digest)| {
+                end.get() == self.end && digest.as_slice() == self.digest.as_slice()
+            })
+    }
+}
+
 pub(super) const SCHEMA: &str = "create table if not exists tape_log_projection (
  tape_uuid blob primary key check(length(tape_uuid) = 16),
  incarnation integer not null check(incarnation = 1),
@@ -165,6 +190,7 @@ impl CatalogCore {
     /// Schema metadata is infrastructure; no catalog identity is preserved as
     /// fallback authority. Callers validate all source prefixes before this.
     pub(crate) fn clear_typed_projection(&mut self) -> Result<(), StateError> {
+        self.forget_projection_markers();
         let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin typed projection rebuild", e))?;
         tx.execute_batch("pragma defer_foreign_keys=on")
@@ -1486,6 +1512,16 @@ mod tests {
 }
 
 impl CatalogCore {
+    /// A direct catalog writer invalidates completion, but leaves source hashes.
+    pub(in crate::projector) fn forget_projection_marker(&mut self, tape: [u8; 16]) {
+        self.projected_tapes.remove(&tape);
+    }
+
+    /// A rebuild or a new state lease cannot trust earlier process-local commits.
+    pub(in crate::projector) fn forget_projection_markers(&mut self) {
+        self.projected_tapes.clear();
+    }
+
     /// Commit bounded chunks only when this projection owns the outer transaction.
     /// Nested projections leave atomicity to their caller.
     pub(super) fn project_tape_log_bounded(
@@ -1509,7 +1545,35 @@ impl CatalogCore {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
-            .map_err(|e| sqlite_error("read tape source digest", e))?;
+            .map_err(|e| {
+                self.forget_projection_marker(uuid);
+                sqlite_error("read tape source digest", e)
+            })?;
+        let resume:Option<(SqliteU64,SqliteU64)>=self.conn.query_row("select through_sequence,rows_committed from tape_projection_chunks where tape_uuid=?1",[uuid.as_slice()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e| { self.forget_projection_marker(uuid); sqlite_error("read tape chunk resume", e) })?;
+        if resume.is_none()
+            && self
+                .projected_tapes
+                .get(&uuid)
+                .is_some_and(|marker| marker.matches(&snapshot.raw, prior.as_ref()))
+            && projection_mark(&self.conn, uuid)
+                .inspect_err(|_| {
+                    self.forget_projection_marker(uuid);
+                })?
+                .is_some_and(|(sequence, offset)| {
+                    sequence == snapshot.raw.summary().last_closed_sequence
+                        && matches!(
+                            snapshot.raw.projection_decoder(sequence, offset),
+                            Ok(Some(_))
+                        )
+                })
+        {
+            #[cfg(any(test, feature = "fixtures"))]
+            {
+                self.tape_projection_skips += 1;
+            }
+            return Ok(());
+        }
+        self.forget_projection_marker(uuid);
         if let Some((end, digest)) = prior {
             if snapshot.raw.projection_prefix_digest(end.get())?.as_slice() != digest {
                 return Err(StateError::IndexCorrupt(
@@ -1519,6 +1583,89 @@ impl CatalogCore {
         }
         let end = snapshot.raw.summary().closed_end;
         let digest = snapshot.raw.projection_prefix_digest(end)?;
+        let tx = projection_transaction(&mut self.conn)
+            .map_err(|e| sqlite_error("begin bounded tape projection", e))?;
+        let owns_transaction = matches!(tx, ProjectionTransaction::Transaction(_));
+        tx.execute("insert into tape_projection_sources values(?1,?2,?3,?4) on conflict(tape_uuid) do update set received_sequence=excluded.received_sequence,byte_end=excluded.byte_end,source_digest=excluded.source_digest",params![uuid.as_slice(),SqliteU64::new(snapshot.log_reference().0),SqliteU64::new(end),digest.as_slice()]).map_err(|e|sqlite_error("bind tape projection source",e))?;
+        let mut count = 0;
+        let mut last = None;
+        project_snapshot_rows(&tx, snapshot, true, &mut |conn, sequence, row| {
+            if owns_transaction && count == super::apply::TAPE_CHUNK_ROWS {
+                let (sequence, row) = last.expect("nonempty chunk");
+                conn.execute("insert into tape_projection_chunks values(?1,?2,?3) on conflict(tape_uuid) do update set through_sequence=excluded.through_sequence,rows_committed=excluded.rows_committed",params![uuid.as_slice(),SqliteU64::new(sequence),SqliteU64::new(row)]).map_err(|e|sqlite_error("checkpoint tape chunk",e))?;
+                conn.execute_batch("commit; begin immediate")
+                    .map_err(|e| sqlite_error("commit bounded tape chunk", e))?;
+                count = 0;
+            }
+            if resume.is_some_and(|(s, r)| s.get() == sequence && row <= r.get()) {
+                return Ok(true);
+            }
+            count += 1;
+            last = Some((sequence, row));
+            Ok(false)
+        })?;
+        tx.execute(
+            "delete from tape_projection_chunks where tape_uuid=?1",
+            [uuid.as_slice()],
+        )
+        .map_err(|e| sqlite_error("finish tape chunk projection", e))?;
+        tx.commit()
+            .map_err(|e| sqlite_error("commit final tape chunk", e))?;
+        if owns_transaction {
+            if let (Some(file), Ok(Some(identity))) =
+                (snapshot.raw.projection_file(), snapshot.raw.file_identity())
+            {
+                self.projected_tapes.insert(
+                    uuid,
+                    ProjectedTape {
+                        _file: file,
+                        identity,
+                        end,
+                        digest,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+    /// Original full projection, with byte-zero digests and no in-memory marker.
+    #[cfg(test)]
+    pub(in crate::projector) fn project_tape_log_bounded_oracle(
+        &mut self,
+        snapshot: &AuthoritySnapshot,
+    ) -> Result<(), StateError> {
+        // A newly opened native writer has a synthetic spool header offset but
+        // no published authority. It contributes no rows or projection mark.
+        // Published header-only sequence zero still has a real header digest.
+        if snapshot.raw.summary().last_closed_sequence == 0
+            && snapshot.raw.header_digest()?.is_none()
+        {
+            return Ok(());
+        }
+        let uuid = snapshot.raw.header().tape_uuid;
+        let prior: Option<(SqliteU64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "select byte_end,source_digest from tape_projection_sources where tape_uuid=?1",
+                [uuid.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| sqlite_error("read tape source digest", e))?;
+        if let Some((end, digest)) = prior {
+            if snapshot
+                .raw
+                .projection_prefix_digest_oracle(end.get())?
+                .as_slice()
+                != digest
+            {
+                return Err(StateError::IndexCorrupt(
+                    "tape projection source digest changed".into(),
+                ));
+            }
+        }
+        let end = snapshot.raw.summary().closed_end;
+        let digest = snapshot.raw.projection_prefix_digest_oracle(end)?;
         let resume:Option<(SqliteU64,SqliteU64)>=self.conn.query_row("select through_sequence,rows_committed from tape_projection_chunks where tape_uuid=?1",[uuid.as_slice()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|sqlite_error("read tape chunk resume",e))?;
         let tx = projection_transaction(&mut self.conn)
             .map_err(|e| sqlite_error("begin bounded tape projection", e))?;

@@ -138,6 +138,9 @@ pub const OBJECT_INSTANCE_REPRESENTATION_UNKNOWN: &str = "unknown";
 /// Typed owner for the rebuildable SQLite catalog projection.
 #[derive(Debug)]
 pub(super) struct CatalogCore {
+    projected_tapes: std::collections::BTreeMap<[u8; 16], tape_log_projection::ProjectedTape>,
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(in crate::projector) tape_projection_skips: u64,
     #[cfg(any(test, feature = "fixtures"))]
     pub(in crate::projector) apply_counts: [u64; 3],
     conn: Connection,
@@ -1343,6 +1346,9 @@ impl CatalogCore {
             path,
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         })
     }
 
@@ -1362,6 +1368,9 @@ impl CatalogCore {
             path,
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         })
     }
 
@@ -1409,6 +1418,9 @@ impl CatalogCore {
             path,
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         })
     }
 
@@ -13670,6 +13682,9 @@ impl CatalogCore {
             conn,
             path: PathBuf::from(":memory:"),
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         }
     }
 }

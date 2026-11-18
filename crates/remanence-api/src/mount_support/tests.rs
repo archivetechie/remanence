@@ -531,6 +531,11 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
             [UUID.as_slice()],
         )
         .unwrap();
+    remanence_state::projector::open(&sqlite)
+        .unwrap()
+        .write_handle()
+        .fixture_forget_projection_markers()
+        .unwrap();
     runtime.fixture_mark_projection_dirty();
     let before = dispatched_writes(&world);
     // On typed state, catch-up repairs a lost SQLite seal from the logs.

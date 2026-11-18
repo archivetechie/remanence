@@ -81,6 +81,10 @@ impl ProjectionClient {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let path = path.as_ref().to_path_buf();
         let mut writer = super::open(&path)?.write_handle();
+        writer.with_core(|core| {
+            core.forget_projection_markers();
+            Ok(())
+        })?;
         let (requests, queue) = mpsc::sync_channel::<Request>(64);
         #[cfg(any(test, feature = "fixtures"))]
         let measurement = Arc::new(ProjectionMeasurement::default());
@@ -394,6 +398,19 @@ fn project_library_replay(
 
 #[cfg(any(test, feature = "fixtures"))]
 impl CatalogIndex {
+    /// Fixture-only count of unchanged tape projections that returned before SQL writes.
+    pub fn fixture_tape_projection_skips(&self) -> Result<u64, StateError> {
+        self.with_core(|core| Ok(core.tape_projection_skips))
+    }
+
+    /// Model an external catalog edit requiring the next tape projection to run fully.
+    pub fn fixture_forget_projection_markers(&self) -> Result<(), StateError> {
+        self.with_core(|core| {
+            core.forget_projection_markers();
+            Ok(())
+        })
+    }
+
     /// Test hook: live/startup/rebuild entry counts for this shared writer.
     pub fn fixture_apply_counts(&self) -> Result<[u64; 3], StateError> {
         self.with_core(|core| Ok(core.apply_counts))
@@ -402,6 +419,14 @@ impl CatalogIndex {
 
 #[cfg(test)]
 impl CatalogIndex {
+    /// Project through the original bounded path for differential tests.
+    pub(crate) fn project_tape_log_bounded_oracle(
+        &self,
+        snapshot: &crate::tape_log::authority::AuthoritySnapshot,
+    ) -> Result<(), StateError> {
+        self.with_core(|core| core.project_tape_log_bounded_oracle(snapshot))
+    }
+
     pub(crate) fn normalized_authority_dump(
         &self,
     ) -> std::collections::BTreeMap<String, Vec<String>> {
