@@ -207,6 +207,8 @@ struct Inner {
     dispatch: Mutex<()>,
     // A leaf lock under dispatch: only take, install or update; never project under it.
     stamp: Mutex<Option<Stamp>>,
+    // Leaf under the core or dispatch: never take another lock or do I/O while held.
+    dirty_tapes: Mutex<BTreeSet<lib::Id>>,
     // Process-local intent ownership. Lock only under dispatch; transport comes first.
     owned_motion: Mutex<std::collections::BTreeMap<u64, Vec<lib::fold::Scope>>>,
     motion_reconcile_notifier: Mutex<Option<MotionReconcileNotifier>>,
@@ -503,6 +505,7 @@ impl LibraryRuntime {
                 view: Mutex::new(view),
                 dispatch: Mutex::new(()),
                 stamp: Mutex::new(Some(stamp)),
+                dirty_tapes: Mutex::new(BTreeSet::new()),
                 owned_motion: Mutex::new(std::collections::BTreeMap::new()),
                 motion_reconcile_notifier: Mutex::new(None),
                 projector,
@@ -711,6 +714,36 @@ impl LibraryRuntime {
             .keys()
             .copied()
             .collect();
+        let dirty_tapes_empty = self
+            .0
+            .dirty_tapes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if !library_needed && lagging.is_empty() && dirty_tapes_empty {
+            let unchanged = {
+                let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                view.changed_since(merged.view)
+                    .into_iter()
+                    .chain(merged.fenced.iter().copied())
+                    .all(|tape| {
+                        view.snapshot(tape).is_none_or(|native| {
+                            self.0
+                                .authority
+                                .with_fold(|fold| native_floor::fenced(fold, &tape))
+                                || merged.matches(tape, native)
+                        })
+                    })
+            };
+            if unchanged {
+                *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged);
+                return Ok(());
+            }
+        }
+        let drained = {
+            let mut tapes = self.0.dirty_tapes.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *tapes)
+        };
         let to_project = {
             let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
             let mut candidates: BTreeSet<_> = view
@@ -718,21 +751,6 @@ impl LibraryRuntime {
                 .into_iter()
                 .chain(merged.fenced.iter().copied())
                 .collect();
-            if !library_needed
-                && lagging.is_empty()
-                && candidates.iter().all(|&tape| {
-                    view.snapshot(tape).is_none_or(|native| {
-                        self.0
-                            .authority
-                            .with_fold(|fold| native_floor::fenced(fold, &tape))
-                            || merged.matches(tape, native)
-                    })
-                })
-            {
-                drop(view);
-                *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged);
-                return Ok(());
-            }
             if dirty || empty {
                 candidates = view
                     .snapshots()
@@ -741,6 +759,7 @@ impl LibraryRuntime {
             } else {
                 candidates.extend(lagging.iter().copied());
             }
+            candidates.extend(drained.iter().copied());
             merged.view = view.mutations();
             merged.fenced.clear();
             let mut to_project = Vec::new();
@@ -755,7 +774,14 @@ impl LibraryRuntime {
                     .with_fold(|fold| native_floor::fenced(fold, &tape))
                 {
                     merged.fenced.insert(tape);
-                } else if dirty || lagging.contains(&tape) || !merged.matches(tape, native) {
+                    if drained.contains(&tape) {
+                        merged.tapes.remove(&tape);
+                    }
+                } else if dirty
+                    || drained.contains(&tape)
+                    || lagging.contains(&tape)
+                    || !merged.matches(tape, native)
+                {
                     to_project.push(tape);
                 }
             }
@@ -978,6 +1004,15 @@ impl LibraryRuntime {
         }
         self.0.projection_dirty.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// Mark a direct catalogue write for the next catch-up; only insert under the leaf lock.
+    pub(crate) fn mark_tape_dirty(&self, tape: lib::Id) {
+        self.0
+            .dirty_tapes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tape);
     }
 
     /// Fixture hook: models a lost or failed projection.

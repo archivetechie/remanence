@@ -385,6 +385,16 @@ fn selective_catch_up_matches_full_oracle() {
     f.sql("DROP TRIGGER fail_stamp;");
     f.assert_oracle("Y recovered");
     assert!(rt.projection_lag(Y).is_none());
+    f.index()
+        .reconcile_tape_files_projection(X, &[], 7, 9)
+        .unwrap();
+    f.assert_oracle("direct reconcile X");
+    f.index()
+        .project_terminal_finalization(terminal_input(
+            crate::TerminalFinalizationOutcome::InProgress,
+        ))
+        .unwrap();
+    f.assert_oracle("direct terminal X");
 }
 
 /// Removing a lag on source refusal must leave a full catch-up obligation.
@@ -473,5 +483,95 @@ fn nondeferrable_catch_up_leaves_stamp_empty() {
     assert_eq!(
         f.index().projected_through_sequence(X).unwrap(),
         advanced.tape_summary().last_closed_sequence
+    );
+}
+
+/// A closed native prefix makes the summary statements observable on re-projection.
+fn warmed_direct_writer_fixture() -> Fixture {
+    let f = Fixture::new();
+    f.native(X);
+    let advanced = f.advance(X);
+    assert_ne!(advanced.tape_summary().last_closed_sequence, 0);
+    let rt = f.runtime();
+    rt.refresh_native(&advanced).unwrap();
+    rt.catch_up().unwrap();
+    assert_eq!(
+        measured_catch_up(&rt).1,
+        0,
+        "direct writer precondition: zero Apply"
+    );
+    f
+}
+
+/// Read only the three summary counters reasserted from the closed tape prefix.
+fn summary_counters(f: &Fixture) -> (u64, u64, Option<u64>) {
+    let tape = f.index().get_tape(&X).unwrap().unwrap();
+    (
+        tape.highest_protected_ordinal,
+        tape.total_committed_ordinals,
+        tape.last_committed_tape_file,
+    )
+}
+
+/// A reconcile write schedules exactly one re-projection of its unchanged tape.
+#[test]
+fn reconcile_marks_tape_for_one_catch_up() {
+    let f = warmed_direct_writer_fixture();
+    let rt = f.runtime();
+    let counters = summary_counters(&f);
+    f.index()
+        .reconcile_tape_files_projection(X, &[], 7, 9)
+        .unwrap();
+    assert_eq!(
+        measured_catch_up(&rt).1,
+        1,
+        "T1 exactly 1 Apply after reconcile"
+    );
+    assert_eq!(summary_counters(&f), counters);
+    assert_eq!(measured_catch_up(&rt).1, 0, "T1 second catch-up: 0 Apply");
+}
+
+/// Match the catalogue's terminal input precedent, including its manual identity.
+fn terminal_input(
+    outcome: crate::TerminalFinalizationOutcome,
+) -> crate::TerminalFinalizationProjectionInput {
+    crate::TerminalFinalizationProjectionInput {
+        tape_uuid: X,
+        trigger: crate::TerminalFinalizationTrigger::OperatorCloseOut,
+        operation_id: Some(uuid::Uuid::from_u128(0xFA11)),
+        progress: crate::TerminalFinalizationProgress::BeforeReplicaA,
+        edition_digest: [0xED; 32],
+        layout_digest: [0x1A; 32],
+        outcome,
+        updated_at_utc: Some("2026-08-09T00:00:00Z".into()),
+    }
+}
+
+/// Both successful and refused direct terminal writes schedule a tape projection.
+#[test]
+fn terminal_marks_tape_on_success_and_error() {
+    let f = warmed_direct_writer_fixture();
+    let rt = f.runtime();
+    f.index()
+        .project_terminal_finalization(terminal_input(
+            crate::TerminalFinalizationOutcome::InProgress,
+        ))
+        .unwrap();
+    assert_eq!(
+        measured_catch_up(&rt).1,
+        1,
+        "T2 exactly 1 Apply after terminal write"
+    );
+    assert_eq!(measured_catch_up(&rt).1, 0, "T2 second catch-up: 0 Apply");
+    assert_eq!(f.index().get_tape(&X).unwrap().unwrap().state, "finalizing");
+    f.index()
+        .project_terminal_finalization(terminal_input(
+            crate::TerminalFinalizationOutcome::Finalized,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        measured_catch_up(&rt).1,
+        1,
+        "T2 exactly 1 Apply after terminal Err"
     );
 }

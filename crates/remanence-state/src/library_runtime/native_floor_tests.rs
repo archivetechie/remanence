@@ -1506,3 +1506,139 @@ fn k94_t13_in_process_older_library_refuses() {
     assert_eq!(files(&f.paths.journal_dir), natives);
     assert_eq!(rows(&f.paths.sqlite_path), catalog);
 }
+
+/// A direct write drained under a cause-14 fence must be projected after release,
+/// even when native projection previously gave the fenced tape a matching part.
+#[test]
+fn direct_write_to_fenced_tape_projects_after_release() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (short, snapshot) = f.native(T, false);
+    f.rt().native_reference(&snapshot).unwrap();
+    let full = std::fs::read(f.path(T)).unwrap();
+    f.close();
+    std::fs::write(f.path(T), &short).unwrap();
+    let offline =
+        crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap_err();
+    assert!(offline.to_string().contains("RebuildWouldDropMarkEvidence"));
+    f.reopen();
+    let sequence = f.raises(T)[0].0;
+    l1b_assert_refused_once(&mut f, sequence, 1, "live projection mark is above");
+    f.close();
+    std::fs::write(f.path(T), &full).unwrap();
+    f.reopen();
+
+    let counters = || {
+        let tape = f
+            .state
+            .as_ref()
+            .unwrap()
+            .write_handle()
+            .get_tape(&T)
+            .unwrap()
+            .unwrap();
+        (
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals,
+            tape.last_committed_tape_file,
+        )
+    };
+    let before = counters();
+    let rt = f.rt();
+    let native = {
+        let _dispatch = rt.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(rt
+            .0
+            .authority
+            .with_fold(|fold| native_floor::fenced(fold, &T)));
+        rt.0.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(T)
+            .unwrap()
+            .clone()
+    };
+    let part = Part::of(&native).unwrap();
+    let snapshot = AuthoritySnapshot::new(native).unwrap();
+    let result = rt.project_native(
+        &mut f.state.as_ref().unwrap().write_handle(),
+        &snapshot,
+        ApplyPath::Live,
+    );
+    {
+        let _dispatch = rt.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let matches =
+            rt.0.stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|stamp| stamp.tapes.get(&T) == Some(&part));
+        if result.is_ok() && matches {
+            println!("T4 matching part supplied by project_native");
+        } else {
+            assert!(
+                rt.projection_lag(T).is_none(),
+                "T4 fallback requires no projection lag: {result:?}"
+            );
+            rt.0.stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .expect("T4 startup stamp")
+                .tapes
+                .insert(T, part);
+            println!("T4 matching part supplied by permitted fallback: {result:?}");
+        }
+        assert_eq!(
+            rt.0.stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .tapes
+                .get(&T),
+            Some(&part),
+            "T4 matching part before mark"
+        );
+    }
+    f.state
+        .as_ref()
+        .unwrap()
+        .write_handle()
+        .reconcile_tape_files_projection(T, &[], 7, 9)
+        .unwrap();
+    rt.take_projection_measurement();
+    rt.catch_up().unwrap();
+    assert_eq!(
+        rt.take_projection_measurement().1.len(),
+        0,
+        "T4 fenced: 0 Apply"
+    );
+    assert_eq!(
+        l1b_force(&mut f, sequence).unwrap().unwrap().state,
+        "released"
+    );
+    rt.take_projection_measurement();
+    rt.catch_up().unwrap();
+    assert_eq!(
+        rt.take_projection_measurement().1.len(),
+        1,
+        "T4 exactly 1 Apply after release"
+    );
+    let tape = f
+        .state
+        .as_ref()
+        .unwrap()
+        .write_handle()
+        .get_tape(&T)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals,
+            tape.last_committed_tape_file
+        ),
+        before
+    );
+}

@@ -368,12 +368,16 @@ impl CatalogIndex {
         total_committed_ordinals: u64,
     ) -> Result<TapeJournalIndexReport, StateError> {
         self.with_core(|core| {
-            core.reconcile_tape_files_projection(
+            let result = core.reconcile_tape_files_projection(
                 tape_uuid,
                 entries,
                 highest_protected_ordinal,
                 total_committed_ordinals,
-            )
+            );
+            if let Some(library) = &self.library {
+                library.mark_tape_dirty(tape_uuid);
+            }
+            result
         })
     }
     /// Readiness uses recorded media evidence whenever a catalog row exists.
@@ -945,7 +949,14 @@ impl CatalogIndex {
         &mut self,
         input: TerminalFinalizationProjectionInput,
     ) -> Result<TapeRecord, StateError> {
-        self.with_core(|core| core.project_terminal_finalization(input))
+        self.with_core(|core| {
+            let tape = input.tape_uuid;
+            let result = core.project_terminal_finalization(input);
+            if let Some(library) = &self.library {
+                library.mark_tape_dirty(tape);
+            }
+            result
+        })
     }
     /// Atomically accept one guarded operator close-out.
     ///
