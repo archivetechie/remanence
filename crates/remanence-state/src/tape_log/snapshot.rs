@@ -624,6 +624,11 @@ impl Snapshot {
                 }
                 state.update(&bytes[..n]);
             }
+            if reader.position != end {
+                return Err(StoreError::Refused(
+                    "projection source is shorter than its digest",
+                ));
+            }
         }
         let digest = state.clone().finalize().into();
         self.install_prefix_hash(PrefixHash { end, state, digest });

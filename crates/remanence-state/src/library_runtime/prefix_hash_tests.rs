@@ -160,6 +160,26 @@ tape_catalog_dir = "{0}/cache"
 /// T1: cached, carried and older bounded snapshots agree with a byte-zero oracle.
 #[test]
 fn prefix_hash_matches_oracle_at_all_ends() {
+    // Isolate the extension pass's process-wide counts, as T3 does below.
+    const TEST: &str = "library_runtime::prefix_hash_tests::prefix_hash_matches_oracle_at_all_ends";
+    const COMPLETE: &str = "LLR1B_PREFIX_EXTENSION_COMPLETE";
+    if std::env::var("LLR1B_PREFIX_CHILD").as_deref() != Ok(TEST) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env("LLR1B_PREFIX_CHILD", TEST)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "T1 child failed: {}",
+            output.status
+        );
+        assert!(stdout.contains(COMPLETE), "T1 completion marker absent");
+        return;
+    }
     let f = Fixture::new();
     let mut latest = f.native(X);
     let mut ends = vec![latest.raw.summary().closed_end];
@@ -235,6 +255,77 @@ fn prefix_hash_matches_oracle_at_all_ends() {
         "T1 before refuses kept end"
     );
     assert!(older.projection_prefix_digest_oracle(kept_end).is_err());
+
+    // Count only the ascending extension pass, excluding the oracle's reads.
+    let ascending = f.capture(X);
+    let header_end = ascending.raw.before(1).unwrap().summary().closed_end;
+    ends.retain(|&end| end > header_end);
+    ends.sort_unstable();
+    ends.dedup();
+    assert!(ends.len() >= 3, "T1 extension pass has at least three ends");
+    let expected: Vec<_> = ends
+        .iter()
+        .map(|&end| ascending.raw.projection_prefix_digest_oracle(end).unwrap())
+        .collect();
+    let count = || -> u64 {
+        crate::full_pass::counts()
+            .iter()
+            .filter(|(kind, file, _)| {
+                *kind == crate::full_pass::PassKind::TapePrefixHash && *file == file!()
+            })
+            .map(|(_, _, count)| count)
+            .sum()
+    };
+    let before = count();
+    for (&end, digest) in ends.iter().zip(expected) {
+        assert_eq!(
+            ascending.raw.projection_prefix_digest(end).unwrap(),
+            digest,
+            "T1 ascending end {end}"
+        );
+    }
+    let delta = count() - before;
+    println!("LLR1B T1 ascending extension pass: TapePrefixHash={delta}");
+    assert_eq!(delta, 1, "T1 ascending extension pass count");
+    println!("{COMPLETE}");
+}
+
+/// T6: a tape log shortened after capture refuses without keeping a full-end hash.
+#[test]
+fn short_read_refuses_and_keeps_no_state() {
+    let f = Fixture::new();
+    let snapshot = f.native(X);
+    let closed_end = snapshot.raw.summary().closed_end;
+    let shorter_end = closed_end - 1;
+    let store = crate::tape_log::store::Store::open(
+        f.paths.journal_dir.join("tapes"),
+        X,
+        &f.paths.sqlite_path,
+    )
+    .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.path())
+        .unwrap()
+        .set_len(shorter_end)
+        .unwrap();
+
+    assert!(
+        matches!(
+            snapshot.raw.projection_prefix_digest(closed_end),
+            Err(crate::tape_log::store::StoreError::Refused(message))
+                if message.contains("shorter than its digest")
+        ),
+        "T6 short read must refuse with shorter than its digest"
+    );
+    assert_eq!(
+        snapshot.raw.projection_prefix_digest(shorter_end).unwrap(),
+        snapshot
+            .raw
+            .projection_prefix_digest_oracle(shorter_end)
+            .unwrap(),
+        "T6 shorter end matches oracle after refusal"
+    );
 }
 
 impl Fixture {
