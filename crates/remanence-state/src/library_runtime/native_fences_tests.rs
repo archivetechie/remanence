@@ -914,3 +914,40 @@ fn ca1_t6_catalog_creation_and_migration() {
         }
     }
 }
+
+/// S5(e): publication ambiguity preserves readable history and ordinary read refusal.
+#[test]
+fn history_fenced_snapshot_keeps_published_prefix() {
+    use std::ops::ControlFlow;
+    let f = Fixture::new();
+    f.provision(T);
+    let mut before = vec![];
+    assert_eq!(
+        f.rt()
+            .history(&mut |entry| {
+                before.push((entry.head().clone(), entry.detail_json()));
+                ControlFlow::Continue(())
+            })
+            .unwrap(),
+        HistoryEnd::Clean
+    );
+    assert!(!before.is_empty());
+    f.lose(T);
+    assert!(f.paths.audit_dir.join("library-log.ambiguous").exists());
+    let mut after = vec![];
+    let end = f
+        .rt()
+        .history(&mut |entry| {
+            after.push((entry.head().clone(), entry.detail_json()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(end, HistoryEnd::Fenced);
+    assert!(matches!(
+        f.rt().tape_for_label("history-test"),
+        Err(RuntimeError::Authority(AuthorityError::Store(
+            StoreError::Fenced
+        )))
+    ));
+}

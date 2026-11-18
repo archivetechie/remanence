@@ -968,6 +968,13 @@ impl LibrarySnapshot {
     ) -> Result<store::Replay, StoreError> {
         self.source.replay(view, applied)
     }
+    /// Forward byte traversal without acquiring authority or native-view locks.
+    pub(super) fn frames(
+        &self,
+        visit: &mut dyn FnMut(&Record, u64, Hash) -> std::ops::ControlFlow<()>,
+    ) -> Result<super::history::FramesEnd, (String, u64, String)> {
+        self.source.frames(visit)
+    }
 }
 impl LibraryAuthority {
     /// Capture durable references under the append lock, releasing it before
@@ -1025,6 +1032,20 @@ impl LibraryAuthority {
             .unwrap_or_else(|e| e.into_inner())
             .finish_fence_reconciliation()?)
     }
+    /// Capture history limits and standing together, releasing the log lock on return.
+    pub(crate) fn history_snapshot(
+        &self,
+    ) -> Result<(LibrarySnapshot, super::history::HistoryStanding), AuthorityError> {
+        let log = self.log.lock().unwrap_or_else(|error| error.into_inner());
+        let (source, standing) = log.history_source()?;
+        Ok((
+            LibrarySnapshot {
+                source,
+                _state_lock: self._state_lock.clone(),
+            },
+            standing,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1075,6 +1096,39 @@ mod tests {
         let log = authority.log.lock().unwrap();
         assert_eq!(log.state().last_sequence, 2);
         assert_eq!(log.state().fold.pending[0].sequence, receipt.sequence);
+    }
+    /// S5(d'): history carries an exact latched refusal after visiting all live records.
+    #[test]
+    fn history_refused_snapshot_visits_live_prefix() {
+        use super::super::history::{walk, HistoryEnd};
+        use std::ops::ControlFlow;
+        let root = tempfile::tempdir().unwrap();
+        let (mut log, _) = fixture::open(&root.path().join("library"), &fixture::Present);
+        let mut expected = vec![];
+        for _ in 0..3 {
+            let receipt = fixture::put(&mut log, fixture::diagnostic());
+            expected.push(receipt.sequence);
+        }
+        let refusal = log
+            .install_refold(Err(StoreError::Io(std::io::Error::other("history test"))))
+            .unwrap();
+        let authority = LibraryAuthority {
+            log: Mutex::new(log),
+            _state_lock: Arc::new(StateLockGuard::acquire(root.path()).unwrap()),
+        };
+        let (snapshot, standing) = authority.history_snapshot().unwrap();
+        let mut actual = vec![];
+        let end = walk(&snapshot, standing, &mut |entry| {
+            actual.push(entry.head().sequence);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(
+            end,
+            HistoryEnd::Refused {
+                refusal: format!("{refusal:?}")
+            }
+        );
     }
 }
 

@@ -17,7 +17,7 @@ fn body(l: &mut LibraryLog, b: Body) -> Receipt {
     put(l, b)
 }
 /// Every allocated record is published through the real append owner.
-fn all_records(path: &Path) {
+pub(super) fn all_records(path: &Path) {
     let (mut l, _) = open(path, &Present);
     body(&mut l, provision(1, Some("A")));
     body(&mut l, provision(2, Some("B")));

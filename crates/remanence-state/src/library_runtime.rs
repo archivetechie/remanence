@@ -1766,6 +1766,8 @@ impl LibraryRuntime {
     }
 }
 
+mod history;
+pub use lib::{HistoryEnd, HistoryEntry, HistoryHead};
 mod drive_fence;
 pub use drive_fence::{DriveDataRefusal, DriveFenced, StandaloneDriveHold};
 mod motion;

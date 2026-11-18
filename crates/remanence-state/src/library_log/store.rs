@@ -1166,6 +1166,84 @@ impl ReadSnapshot {
     ) -> Result<Replay, StoreError> {
         scan_prefixes(&self.dir, self.uuid, view, applied, &self.files)
     }
+    /// Walk only the captured prefixes, checking bytes without folding records.
+    pub(super) fn frames(
+        &self,
+        visit: &mut dyn FnMut(&Record, u64, Hash) -> std::ops::ControlFlow<()>,
+    ) -> Result<super::history::FramesEnd, (String, u64, String)> {
+        let mut previous = [0; 32];
+        let mut sequence = 0;
+        for (index, (path, limit)) in self.files.iter().enumerate() {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let damage = |offset, fault: String| (name.clone(), offset, fault);
+            let limit = limit.expect("history snapshots carry byte limits");
+            let mut file = fs::File::open(path)
+                .map_err(|error| damage(0, error.to_string()))?
+                .take(limit);
+            let mut bytes = [0; 84];
+            match file.read_exact(&mut bytes) {
+                Ok(()) => (),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(damage(0, Fault::Header.to_string()));
+                }
+                Err(error) => return Err(damage(0, error.to_string())),
+            }
+            let header = Header::decode(&mut bytes.as_slice(), self.uuid)
+                .map_err(|fault| damage(0, fault.to_string()))?;
+            let fault = if header.name() != name {
+                Some(Fault::SegmentName)
+            } else if header.first_sequence != sequence + 1 {
+                Some(Fault::SegmentSequence)
+            } else if header.previous_segment_hash != previous {
+                Some(Fault::PreviousSegmentHash)
+            } else {
+                None
+            };
+            if let Some(fault) = fault {
+                return Err(damage(0, fault.to_string()));
+            }
+            let mut through = HEADER_LEN;
+            let mut decoder = codec::Decoder::at(file, header.first_sequence, HEADER_LEN);
+            loop {
+                match decoder.next_frame() {
+                    Ok(Some(frame)) => {
+                        let hash = codec::verify(&frame, previous)
+                            .map_err(|fault| damage(frame.offset, fault.to_string()))?;
+                        previous = hash;
+                        sequence = frame.sequence;
+                        through = frame.end;
+                        if visit(&frame.record, frame.sequence, hash).is_break() {
+                            return Ok(super::history::FramesEnd::Stopped);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(codec::Error::Io(error)) => {
+                        return Err(damage(through, error.to_string()));
+                    }
+                    Err(codec::Error::Recovery { offset, fault, .. }) => {
+                        return Err(damage(offset, fault.to_string()));
+                    }
+                }
+            }
+            let fault = if through == HEADER_LEN {
+                Some(Fault::EmptySegment)
+            } else if index + 1 < self.files.len() && decoder.tail() != log_frame::Tail::Complete {
+                Some(Fault::InteriorTorn)
+            } else {
+                None
+            };
+            if let Some(fault) = fault {
+                return Err(damage(through, fault.to_string()));
+            }
+            if through != limit || decoder.tail() != log_frame::Tail::Complete {
+                return Err(damage(
+                    through,
+                    "segment ends before its recorded limit".into(),
+                ));
+            }
+        }
+        Ok(super::history::FramesEnd::Complete)
+    }
 }
 impl LibraryLog {
     pub(super) fn lookup_application(
@@ -1280,6 +1358,22 @@ impl LibraryLog {
         };
         self.state.refusal = Some(refusal.clone());
         Some(refusal)
+    }
+    /// Capture readable limits even when authority writes or projections refuse.
+    pub(super) fn history_source(
+        &self,
+    ) -> Result<(ReadSnapshot, super::history::HistoryStanding), StoreError> {
+        use super::history::HistoryStanding;
+        let standing = if publication::has_ambiguity(&self.identity)? {
+            HistoryStanding::Fenced
+        } else if let Some(refusal) = &self.state.refusal {
+            HistoryStanding::Refused {
+                refusal: format!("{refusal:?}"),
+            }
+        } else {
+            HistoryStanding::Clean
+        };
+        Ok((self.bounded_source(), standing))
     }
 }
 
