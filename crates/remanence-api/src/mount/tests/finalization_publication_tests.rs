@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 struct Fixture {
-    _temp: tempfile::TempDir,
+    _typed: crate::tests::TypedRoot,
     state: ApiState,
     pool: crate::write_owner::DrivePool,
     admission: ManualFinalizeTapeAdmission,
@@ -14,25 +14,13 @@ struct Fixture {
     _changer_rx: tokio::sync::mpsc::Receiver<crate::write_owner::ChangerCommand>,
 }
 
+/// Use typed tape identity and pool assignment before installing either native tail fixture.
 fn fixture(automatic: bool) -> Fixture {
     const BLOCK_SIZE: u32 = 256 * 1024;
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-startup-terminal-owner")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("state.sqlite");
-    let checkpoint_dir = temp.path().join("tapes");
     let tape_uuid = *Uuid::new_v4().as_bytes();
     let pool_id = "startup-owner-finalize";
-    let (index, pool_config) = if automatic {
-        let config =
-            seed_automatic_after_replica_c(&index_path, tape_uuid, "OWN001L9", pool_id, BLOCK_SIZE);
-        (
-            remanence_state::projector::open(&index_path)
-                .map(|catalog| catalog.write_handle())
-                .unwrap(),
-            config,
-        )
+    let (typed, handle, pool_config) = if automatic {
+        seed_automatic_after_replica_c(&[(tape_uuid, "OWN001L9")], pool_id, BLOCK_SIZE)
     } else {
         let pool_config = TapePoolConfig {
             scheme: None,
@@ -47,52 +35,16 @@ fn fixture(automatic: bool) -> Fixture {
             block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
-        let mut index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("open catalog");
-        index
-            .upsert_tape_pool_projection(TapePoolProjectionInput {
-                pool_id: pool_id.to_string(),
-                display_name: None,
-                copy_class: None,
-                content_class: None,
-                created_at_utc: None,
-            })
-            .expect("project pool");
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: "OWN001L9".to_string(),
-                block_size: BLOCK_SIZE,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .expect("provision tape");
-        index
-            .project_tape_pool_membership(tape_uuid, pool_id)
-            .expect("assign pool");
-        let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
-        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
-            .build()
-            .expect("open checkpoint journal")
-            .append(&checkpoint)
-            .expect("append checkpoint");
-        index
-            .project_checkpoint_record(&checkpoint)
+        let (typed, handle, _config) =
+            pooled_manual_finalize_root(tape_uuid, "OWN001L9", pool_config.clone());
+        handle
+            .write_handle()
+            .project_checkpoint_record(&manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE))
             .expect("project checkpoint");
-
-        (index, pool_config)
+        (typed, handle, pool_config)
     };
-
-    let mut state = ApiState::new_with_pool_configs(
-        {
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        },
-        [pool_config],
-    );
+    let mut state = ApiState::new_with_pool_configs(handle.projection_client(), [pool_config]);
+    state.checkpoint_journal_dir = Arc::new(handle.paths().journal_dir.join("tapes"));
     state.default_library_serial = Some(Arc::new("LIB001".to_string()));
     let mut loaded = drive_bay(0x0101, true, Some("OWN001L9"));
     loaded.source_slot = None;
@@ -131,7 +83,7 @@ fn fixture(automatic: bool) -> Fixture {
     };
 
     Fixture {
-        _temp: temp,
+        _typed: typed,
         state,
         pool,
         admission,
@@ -191,12 +143,7 @@ fn complete_model_tail(
             index
         },
         crate::write_owner::ManualFinalizePreflightConfig {
-            authority: crate::write_owner::TerminalAuthority::fixture(
-                None,
-                state.audit_dir.as_ref(),
-                true,
-                &state.audit_append_lock,
-            ),
+            authority: crate::write_owner::TerminalAuthority::from_api(state).unwrap(),
             mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_ref(),
         },
@@ -275,12 +222,21 @@ async fn assert_sealed_refusals(f: &Fixture) {
     assert!(error.message().contains("sealed"), "{error}");
 }
 
+/// Return the writer-minted ID used by registry, publication-count and RPC assertions.
+async fn accept_manual(f: &Fixture) -> Uuid {
+    let accepted = manual_finalize_tape(&f.state, f.admission.clone())
+        .await
+        .unwrap();
+    let crate::write_owner::ManualFinalizeTapeResult::Accepted(accepted) = accepted else {
+        panic!("expected accepted manual finalization");
+    };
+    accepted.operation_id
+}
+
 async fn check_publication(worker_owned: bool, succeeds: bool) {
     let mut f = fixture(false);
     let mut recovery = None;
-    manual_finalize_tape(&f.state, f.admission.clone())
-        .await
-        .unwrap();
+    let id = accept_manual(&f).await;
     if worker_owned {
         let crate::write_owner::DriveCommand::FinalizeTape { reply, .. } =
             tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
@@ -343,11 +299,7 @@ async fn check_publication(worker_owned: bool, succeeds: bool) {
         .await
         .unwrap()
         .unwrap();
-    let status = f
-        .state
-        .operations
-        .latest(&f.admission.candidate_operation_id)
-        .unwrap();
+    let status = f.state.operations.latest(&id).unwrap();
     assert_eq!(
         status.state,
         if succeeds {
@@ -531,10 +483,7 @@ async fn assert_verify_admitted(f: &mut Fixture) {
 async fn sealed_request_finalization_is_not_readmitted_by_closeout_worker() {
     let mut f = fixture(false);
     let tape = f.admission.tape_uuid;
-    let id = f.admission.candidate_operation_id;
-    manual_finalize_tape(&f.state, f.admission.clone())
-        .await
-        .unwrap();
+    let id = accept_manual(&f).await;
     let command = tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
         .await
         .unwrap()
@@ -569,7 +518,7 @@ async fn sealed_request_finalization_is_not_readmitted_by_closeout_worker() {
         .unwrap();
     assert!(authority.observe_summary().unwrap().sealed);
     assert!(f.state.closeout_work.contains(key));
-    assert_operation_succeeded(&f).await;
+    assert_operation_succeeded(&f, id).await;
     release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while f.pool.mounted_tape_uuids().contains(&tape) {
@@ -595,7 +544,7 @@ async fn sealed_request_finalization_is_not_readmitted_by_closeout_worker() {
         .check_finalizing(tape)
         .expect("sealed tape has no finalizing marker");
     authority.check_finalizing().unwrap();
-    assert_operation_succeeded(&f).await;
+    assert_operation_succeeded(&f, id).await;
     assert!(
         !f.state.closeout_work.contains(key),
         "stale work-list entry was removed"
@@ -611,15 +560,15 @@ async fn sealed_request_finalization_is_not_readmitted_by_closeout_worker() {
     );
     finish_read_probe(&mut f, read).await;
     assert_verify_admitted(&mut f).await;
-    assert_operation_succeeded(&f).await;
+    assert_operation_succeeded(&f, id).await;
 }
 
 /// Use the RPC implementation, including its durable-history/live-state overlay.
-async fn assert_operation_succeeded(f: &Fixture) {
+async fn assert_operation_succeeded(f: &Fixture, operation_id: Uuid) {
     let operation = <crate::DaemonService as pb::daemon_server::Daemon>::get_operation(
         &f.state.daemon_service(),
         tonic::Request::new(pb::GetOperationRequest {
-            operation_id: f.admission.candidate_operation_id.as_bytes().to_vec(),
+            operation_id: operation_id.as_bytes().to_vec(),
         }),
     )
     .await
@@ -633,9 +582,7 @@ async fn assert_operation_succeeded(f: &Fixture) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_during_terminal_publication_waits_without_busy() {
     let mut f = fixture(false);
-    manual_finalize_tape(&f.state, f.admission.clone())
-        .await
-        .unwrap();
+    let id = accept_manual(&f).await;
     let command = tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
         .await
         .unwrap()
@@ -662,7 +609,7 @@ async fn read_during_terminal_publication_waits_without_busy() {
         None,
     ));
     assert_read_waits_for_cleanup(read.as_mut()).await;
-    assert_operation_succeeded(&f).await;
+    assert_operation_succeeded(&f, id).await;
     release.send(()).unwrap();
     finish_read_probe(&mut f, read).await;
 }
