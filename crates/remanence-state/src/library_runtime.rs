@@ -2053,6 +2053,10 @@ mod identity_refold_tests {
             f.runtime.0.ack_frames_checked.load(Ordering::Relaxed) > before,
             "replacement acknowledgement count grows"
         );
+        assert!(
+            f.runtime.projection_lag(TAPE).is_none(),
+            "the nested catch-up projected TAPE without a deferred failure"
+        );
     }
 
     /// Same identity preserves the mark; identical bytes in a new inode drop it
