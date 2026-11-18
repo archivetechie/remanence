@@ -670,8 +670,11 @@ fn l1a_short_log_basis_skip_and_other_tape_projection() {
                 .unwrap(),
             healthy.log_reference().0
         );
+        f.rt().fixture_mark_projection_dirty();
         f.rt().catch_up().unwrap();
         assert_eq!(f.rt().take_projection_measurement().1.len(), 1);
+        f.rt().catch_up().unwrap();
+        assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
         f.reopen();
         assert_eq!(f.raises(T), raises);
     }
@@ -735,6 +738,9 @@ fn l1a_digest_rewrite_and_short_bytes_skip_projection() {
                 f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T],
                 old
             );
+            f.rt().fixture_mark_projection_dirty();
+            f.rt().catch_up().unwrap();
+            assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
             f.rt().catch_up().unwrap();
             assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
             f.reopen();
@@ -1122,6 +1128,15 @@ fn l1b_release_mark_restore_rebuild_and_lost_twice() {
             l1b_force(&mut f, sequence).unwrap().unwrap().state,
             "released"
         );
+        if !rebuild {
+            f.rt().take_projection_measurement();
+            f.rt().catch_up().unwrap();
+            assert_eq!(
+                f.rt().take_projection_measurement().1.len(),
+                1,
+                "released tape gets one Apply"
+            );
+        }
         let release = l1b_release_record(&f);
         assert!(release.forced && release.detail.0.is_empty());
         f.reopen();

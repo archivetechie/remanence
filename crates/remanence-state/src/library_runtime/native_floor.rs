@@ -9,12 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn fenced_tapes(fold: &lib::LibraryFold) -> BTreeSet<lib::Id> {
     fold.tapes
         .keys()
-        .filter(|id| {
-            fold.active_tape_fences(id)
-                .any(|(_, fence)| fence.cause == lib::FenceCause::NativeLogBehindProjection)
-        })
+        .filter(|id| fenced(fold, id))
         .copied()
         .collect()
+}
+
+/// Whether this tape is currently protected from catch-up by cause-14 evidence.
+pub(super) fn fenced(fold: &lib::LibraryFold, tape: &lib::Id) -> bool {
+    fold.active_tape_fences(tape)
+        .any(|(_, fence)| fence.cause == lib::FenceCause::NativeLogBehindProjection)
 }
 
 /// Cause-14 evidence cannot be acknowledged away without an explicit force request.

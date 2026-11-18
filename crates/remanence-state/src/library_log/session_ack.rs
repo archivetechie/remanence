@@ -74,16 +74,15 @@ pub(crate) fn validate(
     validate_prefixes(view.snapshots().map(|s| (s, None)), replay).map(|_| ())
 }
 
-/// Incremental validation of one changed native prefix. The progress mark is
+/// Incremental validation of changed native prefixes. Each progress mark is
 /// in-memory source validation, never a derived catalog watermark.
 pub(crate) fn validate_new(
-    native: crate::tape_log::snapshot::Snapshot,
-    prior: Option<(u64, u64)>,
+    prefixes: impl IntoIterator<Item = (crate::tape_log::snapshot::Snapshot, Option<(u64, u64)>)>,
     replay: impl FnOnce(
         &mut dyn FnMut(AppliedLibraryRecord) -> Result<(), StoreError>,
     ) -> Result<Replay, StoreError>,
 ) -> Result<usize, StateError> {
-    validate_prefixes(std::iter::once((native, prior)), replay)
+    validate_prefixes(prefixes.into_iter(), replay)
 }
 fn validate_prefixes(
     prefixes: impl Iterator<Item = (crate::tape_log::snapshot::Snapshot, Option<(u64, u64)>)>,

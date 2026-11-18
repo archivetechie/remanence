@@ -507,6 +507,7 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
     let sqlite = state.paths().sqlite_path.clone();
     let world = world();
     let lock = root.path().join("locks");
+    let runtime = state.library_runtime();
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
@@ -530,6 +531,7 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
             [UUID.as_slice()],
         )
         .unwrap();
+    runtime.fixture_mark_projection_dirty();
     let before = dispatched_writes(&world);
     // On typed state, catch-up repairs a lost SQLite seal from the logs.
     let refusal = actor
@@ -542,6 +544,7 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
     );
     assert_eq!(dispatched_writes(&world), before);
     let _ = actor.finish();
+    drop(runtime);
     let state = reopen_state();
     assert_eq!(
         state.catalog().get_tape(&UUID).unwrap().unwrap().state,

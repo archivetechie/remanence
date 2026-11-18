@@ -17,6 +17,7 @@ use crate::{
     },
     StateError, StateLockGuard, StatePaths,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -165,12 +166,47 @@ struct ProjectionLag {
 }
 type MotionReconcileNotifier = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// The contiguous library projection and the native prefixes copied to SQL.
+#[derive(Default)]
+struct Stamp {
+    library: u64,
+    tapes: BTreeMap<lib::Id, Part>,
+    view: u64,
+    fenced: BTreeSet<lib::Id>,
+}
+
+impl Stamp {
+    /// A missing identity result is always a difference, including two errors.
+    fn matches(&self, tape: lib::Id, native: &crate::tape_log::snapshot::Snapshot) -> bool {
+        Part::of(native).is_some_and(|part| self.tapes.get(&tape) == Some(&part))
+    }
+}
+
+/// Identity is captured with the snapshot, so comparing parts performs no I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Part {
+    identity: Option<(u64, u64)>,
+    last_closed_sequence: u64,
+    closed_end: u64,
+}
+impl Part {
+    fn of(snapshot: &crate::tape_log::snapshot::Snapshot) -> Option<Self> {
+        Some(Self {
+            identity: snapshot.file_identity().ok()?,
+            last_closed_sequence: snapshot.summary().last_closed_sequence,
+            closed_end: snapshot.summary().closed_end,
+        })
+    }
+}
+
 struct Inner {
     authority: LibraryAuthority,
     view: Mutex<NativeTapeView>,
     // This dispatch lock orders append receipts and projection submissions; it
     // is not a tape lock or LibraryAuthority's append lock.
     dispatch: Mutex<()>,
+    // A leaf lock under dispatch: only take, install or update; never project under it.
+    stamp: Mutex<Option<Stamp>>,
     // Process-local intent ownership. Lock only under dispatch; transport comes first.
     owned_motion: Mutex<std::collections::BTreeMap<u64, Vec<lib::fold::Scope>>>,
     motion_reconcile_notifier: Mutex<Option<MotionReconcileNotifier>>,
@@ -188,6 +224,8 @@ struct Inner {
     ack_progress: Mutex<std::collections::BTreeMap<lib::Id, (u64, u64)>>,
     #[cfg(test)]
     ack_frames_checked: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    library_passes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     refold_scans: std::sync::atomic::AtomicUsize,
 }
@@ -248,6 +286,21 @@ impl Drop for IdentityReplacement<'_> {
             for (tape, change) in &self.changes {
                 if !matches!(change, AuthoritativeChange::Unchanged) {
                     progress.remove(tape);
+                }
+            }
+        }
+        {
+            let mut stamp = self
+                .runtime
+                .0
+                .stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(stamp) = stamp.as_mut() {
+                for (tape, change) in &self.changes {
+                    if !matches!(change, AuthoritativeChange::Unchanged) {
+                        stamp.tapes.remove(tape);
+                    }
                 }
             }
         }
@@ -372,17 +425,26 @@ impl LibraryRuntime {
             }
             authority.snapshot()?
         };
-        projector.project_library(snapshot, Box::new(view.clone()), ApplyPath::Startup)?;
+        let report =
+            projector.project_library(snapshot, Box::new(view.clone()), ApplyPath::Startup)?;
         // Library identities/assignments precede native sessions and terminal
         // state. Every native prefix was validated before either replay starts.
         let fenced = authority.with_fold(native_floor::fenced_tapes);
         let mut projection_lag = std::collections::BTreeMap::new();
+        let mut stamp = Stamp {
+            library: report.decided,
+            tapes: BTreeMap::new(),
+            view: view.mutations(),
+            fenced: BTreeSet::new(),
+        };
         for native in view.snapshots() {
             if fenced.contains(&native.header().tape_uuid) {
+                stamp.fenced.insert(native.header().tape_uuid);
                 continue;
             }
             let tape = native.header().tape_uuid;
             let last_closed_sequence = native.summary().last_closed_sequence;
+            let part = Part::of(&native);
             let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
             match projector.project(
                 AuthorityRecord::Tape(Box::new(snapshot)),
@@ -404,7 +466,13 @@ impl LibraryRuntime {
                     projection_lag.remove(&tape);
                     return Err(error.into());
                 }
-                _ => {
+                ProjectionResult::Applied(_) => {
+                    projection_lag.remove(&tape);
+                    if let Some(part) = part {
+                        stamp.tapes.insert(tape, part);
+                    }
+                }
+                ProjectionResult::Pending(_) => {
                     projection_lag.remove(&tape);
                 }
             }
@@ -428,10 +496,13 @@ impl LibraryRuntime {
                 #[cfg(test)]
                 ack_frames_checked: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
+                library_passes: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
                 refold_scans: std::sync::atomic::AtomicUsize::new(0),
                 authority,
                 view: Mutex::new(view),
                 dispatch: Mutex::new(()),
+                stamp: Mutex::new(Some(stamp)),
                 owned_motion: Mutex::new(std::collections::BTreeMap::new()),
                 motion_reconcile_notifier: Mutex::new(None),
                 projector,
@@ -488,6 +559,29 @@ impl LibraryRuntime {
             }
             view.clone()
         };
+        // Drop marks before a dirty append's nested catch-up can use the replacement.
+        {
+            let mut progress = self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (tape, change) in &response.changes {
+                if !matches!(change, lib::native_view::AuthoritativeChange::Unchanged) {
+                    progress.remove(tape);
+                }
+            }
+        }
+        {
+            let mut stamp = self.0.stamp.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stamp) = stamp.as_mut() {
+                for (tape, change) in &response.changes {
+                    if !matches!(change, lib::native_view::AuthoritativeChange::Unchanged) {
+                        stamp.tapes.remove(tape);
+                    }
+                }
+            }
+        }
         self.append_locked(|a, v| write(a, v, &NativeIdentityView(view)))
     }
 
@@ -498,10 +592,24 @@ impl LibraryRuntime {
         if self.0.projection_dirty.load(Ordering::Acquire) {
             self.catch_up_locked()?;
         }
+        let before = self.0.authority.with_fold(|fold| {
+            (
+                fold.received_through,
+                fold.non_applications,
+                fold.pending.len(),
+            )
+        });
         let result = {
             let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
             write(&self.0.authority, &*view)
         };
+        let after = self.0.authority.with_fold(|fold| {
+            (
+                fold.received_through,
+                fold.non_applications,
+                fold.pending.len(),
+            )
+        });
         #[cfg(any(test, feature = "fixtures"))]
         let durable_return = std::time::Instant::now();
         if result.as_ref().err().is_some_and(store_failure) {
@@ -512,17 +620,36 @@ impl LibraryRuntime {
             Err(AuthorityError::AppliedBeforeRefusal { applied, .. }) => applied.as_slice(),
             Err(_) => &[],
         };
+        if applied.is_empty() && before == after {
+            if let Ok(receipt) = &result {
+                return Ok(receipt.receipt.clone());
+            }
+        }
         // Dirty before channel submission: any failed or lost response requires
         // replay of the durable prefix before the next producer can append.
         self.0.projection_dirty.store(true, Ordering::Release);
         let projection = (|| -> Result<(), RuntimeError> {
+            let mut all_applied = true;
+            let mut through = before.0;
+            let mut contiguous = true;
             for record in applied {
+                contiguous &= through.checked_add(1) == Some(record.sequence());
+                through = record.sequence();
                 match self.0.projector.project(
                     AuthorityRecord::Library(Box::new(record.clone())),
                     ApplyPath::Live,
                 )? {
-                    ProjectionResult::Applied(_) | ProjectionResult::Pending(_) => (),
+                    ProjectionResult::Applied(_) => (),
+                    ProjectionResult::Pending(_) => all_applied = false,
                     ProjectionResult::Failed { error, .. } => return Err(error.into()),
+                }
+            }
+            if all_applied && contiguous && through == after.0 {
+                let mut stamp = self.0.stamp.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(stamp) = stamp.as_mut() {
+                    if stamp.library == before.0 {
+                        stamp.library = after.0;
+                    }
                 }
             }
             // No application may mean exclusion/contradiction, or resolution
@@ -546,7 +673,9 @@ impl LibraryRuntime {
                 Ok(receipt.receipt)
             }
             (Err(error), Ok(())) => {
-                self.0.projection_dirty.store(false, Ordering::Release);
+                self.0
+                    .projection_dirty
+                    .store(before.0 != after.0, Ordering::Release);
                 Err(error.into())
             }
             (Ok(_), Err(error)) => Err(error),
@@ -557,7 +686,226 @@ impl LibraryRuntime {
         }
     }
 
+    /// Compare copied prefixes under dispatch, leaving no stamp on a failed catch-up.
     fn catch_up_locked(&self) -> Result<(), RuntimeError> {
+        let snapshot = self.0.authority.snapshot()?;
+        let prior = self
+            .0
+            .stamp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let empty = prior.is_none();
+        let mut merged = prior.unwrap_or_default();
+        let dirty = self.0.projection_dirty.load(Ordering::Acquire);
+        let (received, pending) = self
+            .0
+            .authority
+            .with_fold(|fold| (fold.received_through, !fold.pending.is_empty()));
+        let library_needed = dirty || empty || merged.library != received || pending;
+        let lagging: BTreeSet<_> = self
+            .0
+            .projection_lag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let to_project = {
+            let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+            let mut candidates: BTreeSet<_> = view
+                .changed_since(merged.view)
+                .into_iter()
+                .chain(merged.fenced.iter().copied())
+                .collect();
+            if !library_needed
+                && lagging.is_empty()
+                && candidates.iter().all(|&tape| {
+                    view.snapshot(tape).is_none_or(|native| {
+                        self.0
+                            .authority
+                            .with_fold(|fold| native_floor::fenced(fold, &tape))
+                            || merged.matches(tape, native)
+                    })
+                })
+            {
+                drop(view);
+                *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged);
+                return Ok(());
+            }
+            if dirty || empty {
+                candidates = view
+                    .snapshots()
+                    .map(|native| native.header().tape_uuid)
+                    .collect();
+            } else {
+                candidates.extend(lagging.iter().copied());
+            }
+            merged.view = view.mutations();
+            merged.fenced.clear();
+            let mut to_project = Vec::new();
+            for tape in candidates {
+                let Some(native) = view.snapshot(tape) else {
+                    merged.tapes.remove(&tape);
+                    continue;
+                };
+                if self
+                    .0
+                    .authority
+                    .with_fold(|fold| native_floor::fenced(fold, &tape))
+                {
+                    merged.fenced.insert(tape);
+                } else if dirty || lagging.contains(&tape) || !merged.matches(tape, native) {
+                    to_project.push(tape);
+                }
+            }
+            to_project
+        };
+        let natives: Vec<_> = {
+            let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+            to_project
+                .iter()
+                .filter_map(|&tape| view.snapshot(tape).cloned())
+                .collect()
+        };
+        let prefixes: Vec<_> = {
+            let progress = self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            natives
+                .into_iter()
+                .filter_map(|native| {
+                    let prior = progress.get(&native.header().tape_uuid).copied();
+                    if prior.is_some_and(|(through, _)| {
+                        through >= native.summary().last_closed_sequence
+                    }) {
+                        None
+                    } else {
+                        Some((native, prior))
+                    }
+                })
+                .collect()
+        };
+        let checked = lib::session_ack::validate_new(prefixes.iter().cloned(), |applied| {
+            let view = self
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            snapshot.replay(&view, applied)
+        })?;
+        {
+            let mut progress = self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (native, _) in prefixes {
+                progress.insert(
+                    native.header().tape_uuid,
+                    (
+                        native.summary().last_closed_sequence,
+                        native.summary().closed_end,
+                    ),
+                );
+            }
+        }
+        #[cfg(test)]
+        self.0
+            .ack_frames_checked
+            .fetch_add(checked, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = checked;
+        if library_needed {
+            let view = self
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            #[cfg(test)]
+            self.0.library_passes.fetch_add(1, Ordering::Relaxed);
+            merged.library = self
+                .0
+                .projector
+                .project_library(snapshot, Box::new(view), ApplyPath::Live)?
+                .decided;
+        }
+        for tape in to_project {
+            let native = {
+                let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                view.snapshot(tape).cloned()
+            };
+            let Some(native) = native else {
+                merged.tapes.remove(&tape);
+                continue;
+            };
+            let last_closed_sequence = native.summary().last_closed_sequence;
+            let part = Part::of(&native);
+            let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
+            match self
+                .0
+                .projector
+                .project(AuthorityRecord::Tape(Box::new(snapshot)), ApplyPath::Live)?
+            {
+                ProjectionResult::Applied(_) => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    if let Some(part) = part {
+                        merged.tapes.insert(tape, part);
+                    } else {
+                        merged.tapes.remove(&tape);
+                    }
+                }
+                ProjectionResult::Failed {
+                    error: ApplyError::Catalog(error),
+                    ..
+                } if error.is_deferrable_projection_failure() => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            tape,
+                            ProjectionLag {
+                                error: error.to_string(),
+                                last_closed_sequence,
+                            },
+                        );
+                    merged.tapes.remove(&tape);
+                }
+                ProjectionResult::Failed { error, .. } => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    return Err(error.into());
+                }
+                ProjectionResult::Pending(_) => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    merged.tapes.remove(&tape);
+                }
+            }
+        }
+        *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged);
+        self.0.projection_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Full baseline catch-up retained for differential projection checks.
+    #[cfg(test)]
+    fn catch_up_oracle_locked(&self) -> Result<(), RuntimeError> {
         let snapshot = self.0.authority.snapshot()?;
         let view = self
             .0
@@ -632,6 +980,12 @@ impl LibraryRuntime {
         Ok(())
     }
 
+    /// Fixture hook: models a lost or failed projection.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn fixture_mark_projection_dirty(&self) {
+        self.0.projection_dirty.store(true, Ordering::Release);
+    }
+
     /// Recover a failed projection response from authority before admission.
     pub fn catch_up(&self) -> Result<(), RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
@@ -655,6 +1009,7 @@ impl LibraryRuntime {
         index: &mut crate::CatalogIndex,
     ) -> Result<crate::RebuildReport, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let snapshot = self.0.authority.snapshot()?;
         let view = {
             let mut view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -953,12 +1308,6 @@ impl LibraryRuntime {
                     .map_err(|e| ApplyError::Catalog(StateError::from(e)))?;
             }
             before_apply();
-            let view = self
-                .0
-                .view
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
             let source =
                 self.0.authority.snapshot().map_err(|e| {
                     ApplyError::Catalog(StateError::JournalReplayFailed(e.to_string()))
@@ -975,7 +1324,13 @@ impl LibraryRuntime {
             let checked = if already_validated {
                 0
             } else {
-                match lib::session_ack::validate_new(snapshot.raw.clone(), prior, |applied| {
+                match lib::session_ack::validate_new([(snapshot.raw.clone(), prior)], |applied| {
+                    let view = self
+                        .0
+                        .view
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     source.replay(&view, applied)
                 }) {
                     Ok(checked) => checked,
@@ -1013,8 +1368,11 @@ impl LibraryRuntime {
             let current = if prior
                 .is_some_and(|(through, _)| through > snapshot.raw.summary().last_closed_sequence)
             {
-                view.snapshots()
-                    .find(|s| s.header().tape_uuid == snapshot.raw.header().tape_uuid)
+                let native = {
+                    let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                    view.snapshot(tape).cloned()
+                };
+                native
                     .map(crate::tape_log::authority::AuthoritySnapshot::new)
                     .transpose()
                     .map_err(ApplyError::Catalog)?
@@ -1027,16 +1385,30 @@ impl LibraryRuntime {
         let current = match current {
             Ok(current) => current,
             Err(error) => {
-                self.0
+                let removed = self
+                    .0
                     .projection_lag
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(&tape);
+                    .remove(&tape)
+                    .is_some();
+                if removed {
+                    *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 return Err(error);
             }
         };
         let last_closed_sequence = current.raw.summary().last_closed_sequence;
+        let part = Part::of(&current.raw);
         let result = index.apply_frozen(&AuthorityRecord::Tape(Box::new(current)), path);
+        let validated = result.is_ok()
+            && self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&tape)
+                .is_some_and(|(through, _)| *through >= last_closed_sequence);
         {
             let mut lags = self
                 .0
@@ -1065,6 +1437,16 @@ impl LibraryRuntime {
                 }
                 Err(_) => {
                     lags.remove(&tape);
+                }
+            }
+        }
+        {
+            let mut stamp = self.0.stamp.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stamp) = stamp.as_mut() {
+                if let Some(part) = part.filter(|_| validated) {
+                    stamp.tapes.insert(tape, part);
+                } else {
+                    stamp.tapes.remove(&tape);
                 }
             }
         }
@@ -1368,6 +1750,8 @@ mod measurements;
 
 #[cfg(test)]
 mod projection_lag_tests;
+#[cfg(test)]
+mod stamp_tests;
 
 #[cfg(test)]
 mod identity_refold_tests {
@@ -1651,6 +2035,24 @@ mod identity_refold_tests {
             .unwrap();
         f.assert_refolded();
         assert!(!f.runtime.motion_fenced());
+    }
+
+    /// Replacement marks are dropped before the nested dirty catch-up reads them.
+    #[test]
+    fn identity_replacement_dirty_catch_up_checks_new_source() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, true, 262144);
+        let before = f.runtime.0.ack_frames_checked.load(Ordering::Relaxed);
+        f.runtime.fixture_mark_projection_dirty();
+        f.runtime
+            .append_identity(&[&new], |a, v, _| diagnostic(a, v))
+            .unwrap();
+        assert!(
+            f.runtime.0.ack_frames_checked.load(Ordering::Relaxed) > before,
+            "replacement acknowledgement count grows"
+        );
     }
 
     /// Same identity preserves the mark; identical bytes in a new inode drop it

@@ -60,12 +60,8 @@ async fn round(client: &Client, fixture: &Harness, name: &str, bytes: &[u8]) -> 
     object
 }
 
-/// The counted round begins only after every log its everyday steps read exists.
-#[tokio::test]
-async fn everyday_round_counts_history_passes() {
-    if isolated(TEST, COMPLETE) {
-        return;
-    }
+/// Publish the tape log before resetting the counters for the measured round.
+async fn two_rounds() -> (Harness, Client, Instant, pb::ObjectRecord, pb::ObjectRecord) {
     let mut fixture = Harness::new(false);
     {
         let mut world = fixture.world.lock().unwrap();
@@ -85,6 +81,16 @@ async fn everyday_round_counts_history_passes() {
         b"second round object",
     )
     .await;
+    (fixture, client, started, first, second)
+}
+
+/// The counted round begins only after every log its everyday steps read exists.
+#[tokio::test]
+async fn everyday_round_counts_history_passes() {
+    if isolated(TEST, COMPLETE) {
+        return;
+    }
+    let (fixture, client, started, first, second) = two_rounds().await;
     assert_ne!(
         first.object_id, second.object_id,
         "rounds publish distinct objects"
@@ -119,6 +125,50 @@ async fn everyday_round_counts_history_passes() {
             "unallowlisted full pass: {row} (count {count})"
         );
     }
+    client.state.shutdown_drive_pool().await.unwrap();
+    client.shutdown().await;
+    fixture.wait_for_teardown().await;
+    println!("{COMPLETE}");
+}
+
+/// A warmed production round performs no catch-up library replay or first-frame ack walk.
+#[tokio::test]
+async fn warmed_round_skips_catch_up_history() {
+    const TEST: &str = "full_pass::warmed_round_skips_catch_up_history";
+    const COMPLETE: &str = "LLR1A_SESSION_COMPLETE";
+    if isolated(TEST, COMPLETE) {
+        return;
+    }
+    let (fixture, client, _, first, second) = two_rounds().await;
+    // Read first, before any test-side source inspection or teardown.
+    let observed = passes::counts();
+    println!("LLR1A T5 counts: {observed:?}");
+    let library: u64 = observed
+        .iter()
+        .filter(|(kind, file, _)| {
+            *kind == PassKind::LibraryReplay && file.ends_with("projector/thread.rs")
+        })
+        .map(|(_, _, count)| count)
+        .sum();
+    let acknowledgements: u64 = observed
+        .iter()
+        .filter(|(kind, file, _)| {
+            *kind == PassKind::TapeFirstFrame && file.ends_with("library_log/session_ack.rs")
+        })
+        .map(|(_, _, count)| count)
+        .sum();
+    println!(
+        "LLR1A T5 catch_up_library_replays={library} ack_first_frame_walks={acknowledgements}"
+    );
+    assert_eq!(library, 0, "T5 zero catch-up LibraryReplay");
+    assert_eq!(
+        acknowledgements, 0,
+        "T5 zero acknowledgement TapeFirstFrame"
+    );
+    assert_ne!(
+        first.object_id, second.object_id,
+        "rounds publish distinct objects"
+    );
     client.state.shutdown_drive_pool().await.unwrap();
     client.shutdown().await;
     fixture.wait_for_teardown().await;
