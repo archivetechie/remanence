@@ -488,59 +488,68 @@ fn post_transfer_sense_refuses() {
     assert!(source.after_failure().is_empty());
 }
 
-/// T10. Both full verification routes reach the BOT measurement and refuse there.
+/// T10a. The walk verification route reaches the BOT measurement and refuses there.
 #[test]
-fn verification_keeps_refusing() {
-    use crate::VerificationRoute::{OnePass, Walk};
+fn verification_walk_keeps_refusing() {
+    assert_verification_keeps_refusing(crate::VerificationRoute::Walk, 3);
+}
+
+/// T10b. One-pass verification falls back to the BOT walk and refuses there.
+#[test]
+fn verification_one_pass_keeps_refusing() {
+    assert_verification_keeps_refusing(crate::VerificationRoute::OnePass, 4);
+}
+
+/// Keep the measuring error and absence of confirmation pinned for each route.
+fn assert_verification_keeps_refusing(route: crate::VerificationRoute, normal_spaces: usize) {
+    use crate::VerificationRoute::OnePass;
     let size = 256 * 1024;
-    for (route, normal_spaces) in [(Walk, 3), (OnePass, 4)] {
-        let mut fixture = Fixture::new(records(size, true), size, Some(MISSING));
-        fixture
-            .world
-            .lock()
-            .unwrap()
-            .drive_states
-            .get_mut(&BAY)
-            .unwrap()
-            .normal_eod_spaces = normal_spaces;
-        let mut source = fixture.source();
-        let mut statuses = Vec::new();
-        let result = crate::verify_terminal_index_full_with_route(
-            &mut source,
-            &TAPE_UUID,
-            size,
-            None,
-            ScanMode::Standard,
-            route,
-            |s| statuses.push(s),
-        );
-        let (index, primary) = source
-            .failed_space
-            .as_ref()
-            .expect("BOT walk reached its measuring SPACE");
-        assert_sense(primary, MISSING);
-        assert_eq!(primary.opcode, Some(0x11));
-        assert_eq!(
-            source.calls[..*index].iter().filter(|c| **c == Eod).count(),
-            normal_spaces
-        );
-        assert!(source.calls[..*index].ends_with(&[Locate(2), Position, Read, Space(1)]));
-        assert!(
-            source.after_failure().is_empty(),
-            "no confirming LOCATE + SPACE(EOD): {:?}",
-            source.after_failure()
-        );
-        assert!(
-            matches!(
-                result,
-                Err(crate::TerminalIndexVerificationError::PrefixWalk { .. })
-            ),
-            "BOT error: {result:?}"
-        );
-        if route == OnePass {
-            assert!(statuses
-                .iter()
-                .any(|s| s.fell_back && s.fallback_reason == Some("no_complete_layout")));
-        }
+    let mut fixture = Fixture::new(records(size, true), size, Some(MISSING));
+    fixture
+        .world
+        .lock()
+        .unwrap()
+        .drive_states
+        .get_mut(&BAY)
+        .unwrap()
+        .normal_eod_spaces = normal_spaces;
+    let mut source = fixture.source();
+    let mut statuses = Vec::new();
+    let result = crate::verify_terminal_index_full_with_route(
+        &mut source,
+        &TAPE_UUID,
+        size,
+        None,
+        ScanMode::Standard,
+        route,
+        |s| statuses.push(s),
+    );
+    let (index, primary) = source
+        .failed_space
+        .as_ref()
+        .expect("BOT walk reached its measuring SPACE");
+    assert_sense(primary, MISSING);
+    assert_eq!(primary.opcode, Some(0x11));
+    assert_eq!(
+        source.calls[..*index].iter().filter(|c| **c == Eod).count(),
+        normal_spaces
+    );
+    assert!(source.calls[..*index].ends_with(&[Locate(2), Position, Read, Space(1)]));
+    assert!(
+        source.after_failure().is_empty(),
+        "no confirming LOCATE + SPACE(EOD): {:?}",
+        source.after_failure()
+    );
+    assert!(
+        matches!(
+            result,
+            Err(crate::TerminalIndexVerificationError::PrefixWalk { .. })
+        ),
+        "BOT error: {result:?}"
+    );
+    if route == OnePass {
+        assert!(statuses
+            .iter()
+            .any(|s| s.fell_back && s.fallback_reason == Some("no_complete_layout")));
     }
 }
