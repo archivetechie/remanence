@@ -98,11 +98,15 @@ fn placed_library_keeps_actual_endpoint_guards_and_source() {
         .any(|c| matches!(c[0], 0x1b | 0xa5)));
     // The actor has joined; require the actual native opening and its later clean ending.
     use remanence_state::tape_log::{Record as Native, SessionEndReason};
-    let path =
+    let entries =
         remanence_state::TapeAuthority::list_entries(fixture.config.journal.dir.join("tapes"))
-            .unwrap()
-            .pop()
-            .expect("native session log");
+            .unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one native tape log: {entries:?}"
+    );
+    let path = &entries[0];
     let mut file = std::fs::File::open(path).unwrap();
     remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
     let offset = std::io::Seek::stream_position(&mut file).unwrap();
@@ -111,6 +115,25 @@ fn placed_library_keeps_actual_endpoint_guards_and_source() {
     while let Some(frame) = decoder.next_frame().unwrap() {
         records.push(frame.record);
     }
+    let openings: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            Native::SessionOpened(open) => Some((open.session_id, &open.drive.endpoint)),
+            _ => None,
+        })
+        .collect();
+    let expected_endpoint =
+        remanence_state::library_log::DriveKey::Bay(remanence_state::library_log::Bay {
+            library_serial: LIBRARY.into(),
+            bay: BAY,
+        });
+    assert!(
+        !openings.is_empty()
+            && openings
+                .iter()
+                .all(|(_, endpoint)| *endpoint == &expected_endpoint),
+        "every native opening must use the placed library endpoint; found session IDs and endpoints: {openings:?}"
+    );
     let session_id = *Uuid::from_slice(&session.session_id).unwrap().as_bytes();
     let (opened_at, opened) = records
         .iter()
