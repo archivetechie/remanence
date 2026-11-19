@@ -1,10 +1,16 @@
 //! End-to-end: serve() over a temp Unix socket, then a real gRPC client
 //! round-trips Daemon.health, Catalog.list_tape_pools, and
 //! LibraryService.list_libraries through it.
+//! Audit history filtering also round-trips over mTLS and the same server's Unix socket.
 
 use remanence_api::{pb, ApiState};
-use remanence_state::TapePoolProjectionInput;
+use remanence_state::library_log as lib;
+use remanence_state::library_runtime::LibraryRuntime;
+use remanence_state::{
+    AuditActor, SourceLayer, StateLockGuard, StatePaths, TapePoolProjectionInput,
+};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
 #[tokio::test]
@@ -112,6 +118,7 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
     );
 }
 
+/// The daemon streams only the matching library record through each listener.
 #[tokio::test]
 async fn serve_audit_query_roundtrips_over_mtls_transport() {
     let dir = tempfile::Builder::new()
@@ -119,9 +126,60 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
         .tempdir()
         .expect("tempdir");
     let socket_path = dir.path().join("rem.sock");
-    let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .expect("open index");
+    let paths = StatePaths {
+        config_path: dir.path().join("config"),
+        state_dir: dir.path().join("state"),
+        audit_dir: dir.path().join("library"),
+        journal_dir: dir.path().join("native"),
+        sqlite_path: dir.path().join("catalog.sqlite"),
+        tape_cache_dir: dir.path().join("cache"),
+        calibration_dir: dir.path().join("calibration"),
+    };
+    let runtime = LibraryRuntime::open(
+        &paths,
+        true,
+        Arc::new(StateLockGuard::acquire(&paths.state_dir).expect("acquire state lock")),
+    )
+    .expect("open library runtime");
+    let session_id = uuid::Uuid::new_v4();
+    let actor = AuditActor::Service("serve-catalog-test".into());
+    runtime
+        .append(|authority, view| {
+            authority.session_observed(
+                lib::SessionObserved {
+                    session_id: *session_id.as_bytes(),
+                    kind: lib::SessionKind::Read,
+                    endpoint: None,
+                    tape: None,
+                    event: lib::SessionEvent::Opened,
+                    previous: None,
+                    reason: None,
+                },
+                actor.clone(),
+                SourceLayer::Layer5,
+                view,
+            )
+        })
+        .expect("seed session record");
+    runtime
+        .append(|authority, view| {
+            authority.diagnostic(
+                lib::Diagnostic {
+                    event: lib::DiagnosticEvent::RequestReceived,
+                    subject_kind: "serve-catalog-test".into(),
+                    subject_id: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                actor.clone(),
+                SourceLayer::Layer5,
+                view,
+            )
+        })
+        .expect("seed nonmatching diagnostic record");
+    let catalog = remanence_state::projector::open(&paths.sqlite_path)
+        .expect("open catalog")
+        .with_library_runtime(runtime.clone());
+    let state = ApiState::new(catalog);
     let reserved_tcp = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("loopback TCP must be available for the mTLS transport test");
     let tcp_addr = reserved_tcp.local_addr().expect("reserved TCP address");
@@ -139,19 +197,9 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_socket = socket_path.clone();
     let server = tokio::spawn(async move {
-        remanence_daemon::serve(
-            ApiState::new({
-                let index = index;
-                let catalog = remanence_state::projector::open(index.path()).unwrap();
-                drop(index);
-                catalog
-            }),
-            &serve_socket,
-            Some(tls_listener),
-            async {
-                let _ = shutdown_rx.await;
-            },
-        )
+        remanence_daemon::serve(state, &serve_socket, Some(tls_listener), async {
+            let _ = shutdown_rx.await;
+        })
         .await
         .expect("serve");
     });
@@ -178,25 +226,49 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
         .await
         .expect("connect mTLS transport");
     let mut audit = pb::audit_client::AuditClient::new(channel);
-    let error = audit
+    let mut stream = audit
         .query_audit(pb::QueryAuditRequest {
-            since: Some(prost_types::Timestamp {
-                seconds: 0,
-                nanos: 0,
-            }),
-            until: Some(prost_types::Timestamp {
-                seconds: 4_102_444_800,
-                nanos: 0,
-            }),
-            filter: Default::default(),
+            filter: [("event_kind".into(), "SessionObserved".into())].into(),
+            ..Default::default()
         })
         .await
-        .expect_err("query audit without library authority over mTLS transport");
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        .expect("query audit over mTLS transport")
+        .into_inner();
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.message().await.expect("read mTLS audit stream") {
+        entries.push(entry);
+    }
     assert_eq!(
-        error.message(),
-        "audit history reads the library log, and this service has no library authority"
+        entries.len(),
+        1,
+        "mTLS listener must return exactly one entry"
     );
+    assert_eq!(entries[0].session_id, session_id.as_bytes());
+    assert_eq!(entries[0].event_kind, "SessionObserved.Opened");
+
+    let channel = remanence_api::connect_unix(socket_path.clone())
+        .await
+        .expect("connect unix audit");
+    let mut audit = pb::audit_client::AuditClient::new(channel);
+    let mut stream = audit
+        .query_audit(pb::QueryAuditRequest {
+            filter: [("session_id".into(), session_id.to_string())].into(),
+            ..Default::default()
+        })
+        .await
+        .expect("query audit over Unix transport")
+        .into_inner();
+    let mut entries = Vec::new();
+    while let Some(entry) = stream.message().await.expect("read Unix audit stream") {
+        entries.push(entry);
+    }
+    assert_eq!(
+        entries.len(),
+        1,
+        "Unix listener must return exactly one entry"
+    );
+    assert_eq!(entries[0].session_id, session_id.as_bytes());
+    assert_eq!(entries[0].event_kind, "SessionObserved.Opened");
 
     let _ = shutdown_tx.send(());
     server.await.expect("server task");
