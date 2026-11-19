@@ -411,8 +411,8 @@ figures cover different work and are not comparable. An incomplete standalone
 verification exits with status 1 and keeps its facts, its I/O report and
 `active_fences` in `result`, with `error` set to `full verification
 incomplete`. A missing end-of-data mark is not an incomplete verdict:
-`--full` fails with an error that names the missing mark and the operation
-that met it (`SPACE(EOD)` or the physical prefix walk).
+`--full` names the missing mark when `SPACE(EOD)` reports it or when a
+filemark-spacing failure reports it during the physical prefix walk.
 
 `total` covers all commands dispatched from readiness and setup to the end of
 verification. `phases` divides the same work at the existing read boundaries:

@@ -279,8 +279,11 @@ writing, start from a newer copy of the state directory that accounts for
 the data, or withdraw the tape by the [`rem tape
 retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
 this configuration's path with `--config`; parity closeout or a pending
-finalization can block retirement). Otherwise `rem tape supersede-tail
---acknowledge-tape LABEL` can discard the data if its recovery checks pass.
+finalization can block retirement). Otherwise discard can proceed if
+recovery checks pass. In standalone home mode use `rem tape supersede-tail
+--acknowledge-tape LABEL`; for an explicit drive add `--device PATH
+--allow-device SERIAL`. In a library use `rem tape supersede-tail
+--tape-uuid UUID --ack-tape-uuid UUID`.
 Its preview lists the objects and other findings it detected (a trailing
 torn fragment has no separate entry); confirm only after accounting for the
 whole suffix, then rerun an interrupted `put` whose sources still exist. A

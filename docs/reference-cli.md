@@ -366,8 +366,11 @@ writing, start from a newer copy of the state directory that accounts for
 the data, or withdraw the tape by the [`rem tape retire`](#rem-tape-retire)
 procedure (in home mode, pass this configuration's path with `--config`;
 parity closeout or a pending finalization can block retirement). Otherwise
-`rem tape supersede-tail --acknowledge-tape LABEL` can discard the data if
-its recovery checks pass. Its preview lists the objects and other findings
+discard can proceed if recovery checks pass. In standalone home mode use
+`rem tape supersede-tail --acknowledge-tape LABEL`; for an explicit drive
+add `--device PATH --allow-device SERIAL`. In a library use `rem tape
+supersede-tail --tape-uuid UUID
+--ack-tape-uuid UUID`. Its preview lists the objects and other findings
 it detected (a trailing torn fragment has no separate entry); confirm only
 after accounting for the whole suffix, then rerun an interrupted `put` whose
 sources still exist. A UPS, or a disk with power-loss protection, removes
@@ -609,9 +612,9 @@ Without `--full` the command checks the bootstrap and the terminal structure, wh
 takes minutes. With `--full` it walks the whole tape and prints the I/O report: per-phase
 timing in the `io` JSON object, and `io:` and `io phase` lines in text. A
 full verification that returns an incomplete verdict exits non-zero with
-`error: full verification incomplete`; when the drive reports no end-of-data
-mark, `--full` fails instead with an error that names the missing mark and
-the operation that met it (`SPACE(EOD)` or the physical prefix walk).
+`error: full verification incomplete`; `--full` names the missing mark
+when `SPACE(EOD)` reports it or when a filemark-spacing failure reports it
+during the physical prefix walk.
 
 ### rem tape restore
 
@@ -753,8 +756,9 @@ while parity closeout is due. In other cases, discard requires successful
 recovery checks and exact typed confirmation. For an explicit device, add
 `--device <PATH> --allow-device <SERIAL>`.
 
-The decision is recorded as `SupersedeTail` in the library log. Copy files out
-with `rem tape restore --scan` first; discard only data whose objects are known
+The decision is recorded as `SupersedeTail` in the library log. Copy files
+out with `rem tape restore --scan
+--out rescued` first; discard only data whose objects are known
 to be unneeded.
 
 ### rem tape quarantine (standalone)
@@ -1122,7 +1126,8 @@ rem audit query [OPTIONS] --since <RFC3339> --until <RFC3339>
 
 `--json` prints one JSON object per entry.
 
-A library-log ambiguity fence or recorded refusal ends the stream with
+A library-log ambiguity fence or a refusal latched by the library-log
+authority ends the stream with
 `FAILED_PRECONDITION`. Damage encountered during the history walk ends it
 with `DATA_LOSS`. These errors give the last sequence visited, including
 excluded records, or 0 if none was visited. Failure to read the log's

@@ -72,8 +72,11 @@ writing, start from a newer copy of the state directory that accounts for
 the data, or withdraw the tape by the [`rem tape
 retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
 this configuration's path with `--config`; parity closeout or a pending
-finalization can block retirement). Otherwise `rem tape supersede-tail
---acknowledge-tape LABEL` can discard the data if its recovery checks pass.
+finalization can block retirement). Otherwise discard can proceed if
+recovery checks pass. In standalone home mode use `rem tape supersede-tail
+--acknowledge-tape LABEL`; for an explicit drive add `--device PATH
+--allow-device SERIAL`. In a library use `rem tape supersede-tail
+--tape-uuid UUID --ack-tape-uuid UUID`.
 Its preview lists the objects and other findings it detected (a trailing
 torn fragment has no separate entry); confirm only after accounting for the
 whole suffix, then rerun an interrupted `put` whose sources still exist. A
@@ -330,9 +333,9 @@ reports no end-of-data mark; power loss during writing can cause this;
 committed files remain readable; rem tape restore --scan --list inspects
 recoverable files, not the actual end`. A full verification that returns an
 incomplete verdict exits with status 1 and `error: full verification
-incomplete`; when the drive reports no end-of-data mark, `--full` fails
-instead with an error that names the missing mark and the operation that met
-it (`SPACE(EOD)` or the physical prefix walk).
+incomplete`; `--full` names the missing mark when `SPACE(EOD)` reports it
+or when a filemark-spacing failure reports it during the physical prefix
+walk.
 
 Wait for the command to exit before you eject. Use the drive's button, or the
 `mt` command with the drive's non-rewinding tape node, found as in
@@ -675,7 +678,8 @@ restored state does not account for can refuse that write with
 restored state, have at hand a writable tape the state knows and that has
 not been written since the copy. The restored catalog does not list a tape's
 data written since the copy. Copy those files out with
-`rem tape restore --scan`; do not discard the data unless its objects are known
+`rem tape restore --scan
+--out rescued`; do not discard the data unless its objects are known
 to be unneeded. If the restored state
 shows no open session on the tape (its last session closed, or none opened since
 it was initialized here), that data cannot be discarded in this release: keep

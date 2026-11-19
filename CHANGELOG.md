@@ -12,10 +12,12 @@ per-release summaries.
   reason `end_of_data_not_found`; if the walk confirms the missing mark, its
   detail reports `end_of_data_mark=not_found` and `unresolved_from partition=P lba=L`
   (or `unresolved_from unavailable`), followed by `remaining tape unresolved`.
-  Default verification exits 1 with `verification failed: no usable terminal
-  index; end_of_data_not_found`. With `--full`, verification fails with an error
-  naming the missing mark and the operation that met it (`SPACE(EOD)` or the
-  physical prefix walk), rather than an incomplete verdict. Identify warns that
+  When `SPACE(EOD)` reports the missing mark, default verification exits 1
+  and prints `error: verification failed: no usable terminal index;
+  end_of_data_not_found`. `--full` names the missing mark when
+  `SPACE(EOD)` reports it or when a filemark-spacing failure reports it
+  during the physical prefix walk, rather than reporting an incomplete
+  verdict. Identify warns that
   the drive reports no end-of-data mark, that power loss during writing can
   cause this and that committed files remain readable; it points to
   `rem tape restore --scan --list` to inspect recoverable files, not the actual

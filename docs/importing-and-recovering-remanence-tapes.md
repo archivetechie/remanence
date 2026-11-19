@@ -409,10 +409,11 @@ withdrawn or fenced since the copy's date.
 In a library, each tape the restored state knows and a pool has written
 since the copy is checked on the pool's first write to it under the restored
 state, and data there that the restored state does not account for can
-refuse that write. If admission reports `TailBeyondKnownState`, the tape is
-closed for writing; while that refusal's fence is its only fence, read
-sessions are still allowed, and a pool request can try another eligible
-tape. A contradiction with the tape's recorded ending also blocks read
+refuse that write. If admission reports `TailBeyondKnownState`, the tape
+is closed for writing, and a pool request can try another eligible tape.
+The `append_admission_refused` fence itself permits read sessions, but
+contradicted tape admission or another blocking fence prevents
+them. A contradiction with the tape's recorded ending also blocks read
 sessions. Before starting the service on restored state, each pool should
 have a writable tape that the restored state knows and that the pool has not
 written since the copy. The restored catalog does not list a tape's data
