@@ -63,12 +63,21 @@ means fsync can return before data reaches disk.
 Remanence makes its records durable with fsync, as a database does; it cannot
 test whether a disk keeps what it confirms. If a power cut loses the last
 journal records, nothing on tape is lost or overwritten. The next write to
-that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
-with `rem tape restore --scan --out rescued`, then run
-`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
-an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
-`put`. A UPS, or a disk with power-loss protection, removes this power-cut
-exposure.
+that tape can stop with `TailBeyondKnownState`. Recoverable files can be
+copied out with `rem tape restore --scan --out rescued` on a standalone
+drive. After that refusal, if this state shows no open session on the tape
+(its last session closed, or none opened since it was initialized here),
+`supersede-tail` refuses discard in this release: keep the tape closed for
+writing, start from a newer copy of the state directory that accounts for
+the data, or withdraw the tape by the [`rem tape
+retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
+this configuration's path with `--config`; parity closeout or a pending
+finalization can block retirement). Otherwise `rem tape supersede-tail
+--acknowledge-tape LABEL` can discard the data if its recovery checks pass.
+Its preview lists the objects and other findings it detected (a trailing
+torn fragment has no separate entry); confirm only after accounting for the
+whole suffix, then rerun an interrupted `put` whose sources still exist. A
+UPS, or a disk with power-loss protection, removes this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
@@ -314,9 +323,16 @@ Each command prints a JSON summary. A successful finalize reports
 tape's `object_count`, and `--full` reports `"verified_complete": true`. On a
 tape without a usable terminal index, `rem tape verify` exits with status 1 and
 `error: verification failed: no usable terminal index; not_finalized`, or
-`terminal_index_unusable` in place of `not_finalized` when an index exists but
-cannot be used. A full verification that does not complete exits with status 1
-and `error: full verification incomplete`.
+`terminal_index_unusable` in place of `not_finalized` when an index exists
+but cannot be used. When the drive reports no end-of-data mark, the status
+is `end_of_data_not_found`, and `rem tape identify` warns `warning: drive
+reports no end-of-data mark; power loss during writing can cause this;
+committed files remain readable; rem tape restore --scan --list inspects
+recoverable files, not the actual end`. A full verification that returns an
+incomplete verdict exits with status 1 and `error: full verification
+incomplete`; when the drive reports no end-of-data mark, `--full` fails
+instead with an error that names the missing mark and the operation that met
+it (`SPACE(EOD)` or the physical prefix walk).
 
 Wait for the command to exit before you eject. Use the drive's button, or the
 `mt` command with the drive's non-rewinding tape node, found as in
@@ -652,12 +668,15 @@ fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before using restored state, list the tapes used, withdrawn or fenced
 since the copy's date.
 
-Each tape written since the copy is refused on its first write under the
-restored state and closed for writing. Before writing with restored state,
-have a writable tape the state knows and that has not been written since the
-copy. A refused tape stays readable, but its data written since the copy is
-not listed. Copy those files out with `rem tape restore --scan`; do not discard
-the data unless its objects are known to be unneeded. If the restored state
+Each tape the restored state knows that has been written since the copy is
+checked on its first write under the restored state, and data there that the
+restored state does not account for can refuse that write with
+`TailBeyondKnownState` and close the tape for writing. Before writing with
+restored state, have at hand a writable tape the state knows and that has
+not been written since the copy. The restored catalog does not list a tape's
+data written since the copy. Copy those files out with
+`rem tape restore --scan`; do not discard the data unless its objects are known
+to be unneeded. If the restored state
 shows no open session on the tape (its last session closed, or none opened since
 it was initialized here), that data cannot be discarded in this release: keep
 the tape closed for writing, withdraw it with `rem tape retire`

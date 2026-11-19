@@ -270,12 +270,21 @@ it in use.
 Remanence makes its records durable with fsync, as a database does; it cannot
 test whether a disk keeps what it confirms. If a power cut loses the last
 journal records, nothing on tape is lost or overwritten. The next write to
-that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
-with `rem tape restore --scan --out rescued`, then run
-`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
-an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
-`put`. A UPS, or a disk with power-loss protection, removes this power-cut
-exposure.
+that tape can stop with `TailBeyondKnownState`. Recoverable files can be
+copied out with `rem tape restore --scan --out rescued` on a standalone
+drive. After that refusal, if this state shows no open session on the tape
+(its last session closed, or none opened since it was initialized here),
+`supersede-tail` refuses discard in this release: keep the tape closed for
+writing, start from a newer copy of the state directory that accounts for
+the data, or withdraw the tape by the [`rem tape
+retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
+this configuration's path with `--config`; parity closeout or a pending
+finalization can block retirement). Otherwise `rem tape supersede-tail
+--acknowledge-tape LABEL` can discard the data if its recovery checks pass.
+Its preview lists the objects and other findings it detected (a trailing
+torn fragment has no separate entry); confirm only after accounting for the
+whole suffix, then rerun an interrupted `put` whose sources still exist. A
+UPS, or a disk with power-loss protection, removes this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),

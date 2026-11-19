@@ -17,9 +17,9 @@ C, with a spacer tape file called a separation extent between each pair;
 together these five tape files are the terminal suffix. Everything before the
 suffix is the prefix. When the index cannot be used, the tools read the tape
 from the beginning of tape (BOT) instead, tape file by tape file. This is the
-**structural walk**: it measures every tape file and reports each object it
-finds as a candidate, an object-shaped tape file whose identity may not be
-known.
+**structural walk**: it measures the tape files it can resolve and reports
+each object it finds as a candidate, an object-shaped tape file whose identity
+may not be known.
 
 The lines quoted below are the lines the tools print, taken from the code that
 prints them. Where a line has fields that depend on the tape, the field is shown
@@ -96,8 +96,11 @@ when the stripe has lost no more than `m` blocks and shards (its parity blocks
 per stripe), and not when it has lost more (REM-PARITY Sections 13.4 and 13.5).
 Remanence has no command yet that reconstructs a block from parity, so until it
 does, an object that touches a failed block has to be read from another copy.
-When a client reads such an object with `ReadObjectRange` or `ReadFile` and the
-drive cannot read a block the request covers, the failing `INTERNAL` status
+When a client reads such an object with `ReadObjectRange` or `ReadFile` and
+a READ of the object's recorded blocks reports a medium error, an
+unrecovered read error, a recorded entity not found, a blank region or a
+current incorrect-length indication (ILI), as described in [the API
+reference](reference-api.md#errors), the failing `INTERNAL` status
 carries `remanence-finding: media-damage` metadata. A block that reads but holds
 wrong bytes carries no such label: a whole-object read (no `file_id`, no byte
 range) fails with `DATA_LOSS` when the bytes contradict a digest or checksum
@@ -111,17 +114,18 @@ this.
 
 What has happened. A reader finds the terminal index by going to the end of
 data (EOD) and reading back, and the footer of each replica supplies a layout:
-where the suffix's five tape files should be. Three things stop that from
+where the suffix's five tape files should be. Four things stop that from
 working:
 
+- the drive reports no end-of-data mark, which power loss while writing can cause;
 - no replica's footer supplies a layout that a reader can use;
 - a layout is found, and every replica that it plans is invalid;
 - the tape's end of data lies beyond the end the layout planned, because
   something was written after the terminal suffix: a tape file, a second
   suffix, or any other structural artifact after C.
 
-In the third case the replicas themselves can be intact. The exception is a
-later suffix that supplies a layout of its own whose replicas validate; the
+When data follows the planned terminal suffix, the replicas themselves can
+be intact. The exception is a later suffix that supplies a layout of its own whose replicas validate; the
 reader then uses that layout and does not walk (REM-PARITY Sections 8.4 and
 12.6).
 
@@ -132,10 +136,16 @@ beginning of the tape:
 bot_recovery: starting full BOT structural walk (block_size=BYTES, reason=no_usable_terminal_layout)
 ```
 
-The reason is `no_usable_terminal_layout` when no footer supplied a layout the
-reader could trust, and `all_members_invalid` when a layout was found and A, B
-and C all failed validation. Progress follows, one line for each tape file
-crossed:
+The reason is `end_of_data_not_found` when the drive reported no end-of-data
+mark, `no_usable_terminal_layout` when no footer supplied a layout the
+reader could trust, and `all_members_invalid` when a layout was found and A,
+B and C all failed validation. The reason says why the walk started. If the
+walk confirms the missing mark, its detail reports
+`end_of_data_mark=not_found`. When a position is available, `unresolved_from
+partition=P lba=L` is where the unresolved remainder of the tape begins;
+otherwise the detail says `unresolved_from unavailable`. `rem tape
+inventory` exits with status 1 after a structural recovery. Progress
+follows, one line for each tape file crossed:
 
 ```text
 bot_recovery_progress: tape_file=N position=P:LBA candidates=N elapsed_ms=N
@@ -369,9 +379,9 @@ read.
 A tape carries two things that let a stranger read it: a label at the
 beginning, the bootstrap, and a contents list at the end, the terminal index,
 written three times. Damage to either does not make the tape unreadable,
-because the tools can start from the values you know, and can read the whole
-tape from the beginning when the contents list cannot be found. The tools do
-not guess. When the label and what you tell them disagree, or when two copies
+because the tools can start from the values you know, and can read the tape
+from the beginning when the contents list cannot be found, as far as its
+tape files can be resolved. The tools do not guess. When the label and what you tell them disagree, or when two copies
 of the contents list disagree, they stop and say so, because acting on a wrong
 guess could misidentify the tape or its objects. Whether every page can be read
 is a different question, which the [Full

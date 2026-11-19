@@ -344,7 +344,10 @@ a replica is usable, it reads that replica's list of objects and reads no
 object data. It does not walk the tape between the bootstrap and the terminal
 index, so it does not prove that the middle of the tape matches the list. If no
 replica is usable, it reports that explicitly and falls back to a walk from BOT,
-which measures every tape file and reads selected blocks of each object.
+which measures the tape files it can resolve and reads selected blocks of
+each object it measures. If the walk confirms a missing end-of-data mark,
+its reported position, when available, is where the unresolved remainder of
+the tape begins.
 
 A walk can run for hours, so the inventory's event stream
 (`rem.tape.inventory.stream.v1`) announces `bot_recovery_started` before it
@@ -403,13 +406,18 @@ fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,
 withdrawn or fenced since the copy's date.
 
-In a library, each tape a pool has written since the copy is refused once on
-the pool's first write to it and closed for writing. The same request moves on
-to the pool's next tape; a pool may have several tapes in this condition. Before
-starting the service on restored state, each pool needs a writable tape that
-the restored state knows and that the pool has not written since the copy.
-A refused tape stays readable, but its data written since the copy is not
-listed. Do not discard that data unless its objects are known to be unneeded.
+In a library, each tape the restored state knows and a pool has written
+since the copy is checked on the pool's first write to it under the restored
+state, and data there that the restored state does not account for can
+refuse that write. If admission reports `TailBeyondKnownState`, the tape is
+closed for writing; while that refusal's fence is its only fence, read
+sessions are still allowed, and a pool request can try another eligible
+tape. A contradiction with the tape's recorded ending also blocks read
+sessions. Before starting the service on restored state, each pool should
+have a writable tape that the restored state knows and that the pool has not
+written since the copy. The restored catalog does not list a tape's data
+written since the copy. Do not discard that data unless its objects are
+known to be unneeded.
 If the restored state shows no open session on the tape (its last session
 closed, or none opened since it was initialized here), that data cannot be
 discarded in this release: keep the tape closed for writing, withdraw it

@@ -614,7 +614,7 @@ need to replace an uncommitted tail. See [Concepts](concepts.md#7-worm-media).
 ### append admission
 
 Proof that the tape's physical suffix permits a write
-at the tape-log-authorized position. Complete data beyond known state produces
+at the tape-log-authorized position. An unrecorded complete object can cause
 `TailBeyondKnownState`; state rows and fence release do not authorize erasure.
 
 <!-- code-anchor: crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/projector/index.rs @ 625f7044 -->

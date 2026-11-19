@@ -357,12 +357,21 @@ under `fixes`.
 Remanence makes its records durable with fsync, as a database does; it cannot
 test whether a disk keeps what it confirms. If a power cut loses the last
 journal records, nothing on tape is lost or overwritten. The next write to
-that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
-with `rem tape restore --scan --out rescued`, then run
-`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
-an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
-`put`. A UPS, or a disk with power-loss protection, removes this power-cut
-exposure.
+that tape can stop with `TailBeyondKnownState`. Recoverable files can be
+copied out with `rem tape restore --scan --out rescued` on a standalone
+drive. After that refusal, if this state shows no open session on the tape
+(its last session closed, or none opened since it was initialized here),
+`supersede-tail` refuses discard in this release: keep the tape closed for
+writing, start from a newer copy of the state directory that accounts for
+the data, or withdraw the tape by the [`rem tape retire`](#rem-tape-retire)
+procedure (in home mode, pass this configuration's path with `--config`;
+parity closeout or a pending finalization can block retirement). Otherwise
+`rem tape supersede-tail --acknowledge-tape LABEL` can discard the data if
+its recovery checks pass. Its preview lists the objects and other findings
+it detected (a trailing torn fragment has no separate entry); confirm only
+after accounting for the whole suffix, then rerun an interrupted `put` whose
+sources still exist. A UPS, or a disk with power-loss protection, removes
+this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
@@ -598,8 +607,11 @@ rem tape verify [OPTIONS]
 
 Without `--full` the command checks the bootstrap and the terminal structure, which usually
 takes minutes. With `--full` it walks the whole tape and prints the I/O report: per-phase
-timing in the `io` JSON object, and `io:` and `io phase` lines in text. A full verification
-that does not complete exits non-zero with `error: full verification incomplete`.
+timing in the `io` JSON object, and `io:` and `io phase` lines in text. A
+full verification that returns an incomplete verdict exits non-zero with
+`error: full verification incomplete`; when the drive reports no end-of-data
+mark, `--full` fails instead with an error that names the missing mark and
+the operation that met it (`SPACE(EOD)` or the physical prefix walk).
 
 ### rem tape restore
 
@@ -731,13 +743,14 @@ There is no replacement import command.
 rem tape supersede-tail --acknowledge-tape <LABEL|UUID> [--confirm-supersede "SUPERSEDE <LABEL>"]
 ```
 
-List and explicitly discard the suffix beyond local authority, with typed
-confirmation, unless this state shows no open session on the tape (its last
-session closed, or none opened since it was initialized here). That shape
-cannot be discarded in this release: keep the tape closed for writing,
+List and explicitly discard the suffix beyond local authority. If admission
+reports `TailBeyondKnownState` and this state shows no open session on the
+tape (its last session closed, or none opened since it was initialized
+here), discard is refused in this release: keep the tape closed for writing,
 withdraw it with `rem tape retire` (pass `--config` with this configuration's
 path), or start from a newer copy of the state directory. Retirement refuses
-while parity closeout is due. For an explicit device, add
+while parity closeout is due. In other cases, discard requires successful
+recovery checks and exact typed confirmation. For an explicit device, add
 `--device <PATH> --allow-device <SERIAL>`.
 
 The decision is recorded as `SupersedeTail` in the library log. Copy files out
@@ -1109,11 +1122,12 @@ rem audit query [OPTIONS] --since <RFC3339> --until <RFC3339>
 
 `--json` prints one JSON object per entry.
 
-A fence or refused record ends the stream with `FAILED_PRECONDITION`.
-Library-log segment damage ends it with `DATA_LOSS`. Each error gives the
-sequence of the last record visited, including records excluded by the query,
-or 0 if none was visited. A service without library authority refuses the query
-with `FAILED_PRECONDITION` before streaming.
+A library-log ambiguity fence or recorded refusal ends the stream with
+`FAILED_PRECONDITION`. Damage encountered during the history walk ends it
+with `DATA_LOSS`. These errors give the last sequence visited, including
+excluded records, or 0 if none was visited. Failure to read the log's
+standing ends the stream with `INTERNAL`. A service without library authority
+refuses the query with `FAILED_PRECONDITION` before streaming.
 
 To list one day's library-log history:
 

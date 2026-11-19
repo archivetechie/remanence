@@ -469,7 +469,7 @@ minimal config above puts them there.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `journal.dir` | absolute path | required | Directory containing `tapes/<lowercase-simple-uuid>.remtape`, one authority log per tape with or without parity. The authority marker binds this configured root to the state directory. |
-| `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. This controls filesystem types for these state paths only; the journal directory's own check always applies, regardless of this setting or `--allow-untrusted-state-volume`. The journal needs a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on; Remanence checks the mount's options and ZFS flush switches. `rem doctor` reports `journal volume` and, on accepted ZFS volumes, the advisory `journal sync` property check. Remanence makes its records durable with fsync, as a database does; it cannot test whether a disk keeps what it confirms. If a power cut loses the last journal records, nothing on tape is lost or overwritten. The next write to that tape stops with `TailBeyondKnownState` and names the objects. Rescue them with `rem tape restore --scan --out rescued`, then run `rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After an interrupted `put` whose sources still exist, run `supersede-tail` and rerun `put`. A UPS, or a disk with power-loss protection, removes this power-cut exposure. Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`), or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and `zil_nocacheflush` at `0` and the dataset's `sync=standard`. |
+| `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. This controls filesystem types for these state paths only; the journal directory's own check always applies, regardless of this setting or `--allow-untrusted-state-volume`. The journal needs a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on; Remanence checks the mount's options and ZFS flush switches. `rem doctor` reports `journal volume` and, on accepted ZFS volumes, the advisory `journal sync` property check. Remanence makes its records durable with fsync, as a database does; it cannot test whether a disk keeps what it confirms. If a power cut loses the last journal records, nothing on tape is lost or overwritten. The next write to that tape can stop with `TailBeyondKnownState`. Recoverable files can be copied out with `rem tape restore --scan --out rescued` on a standalone drive. After that refusal, if this state shows no open session on the tape (its last session closed, or none opened since it was initialized here), `supersede-tail` refuses discard in this release: keep the tape closed for writing, start from a newer copy of the state directory that accounts for the data, or withdraw the tape by the [`rem tape retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass this configuration's path with `--config`; parity closeout or a pending finalization can block retirement). Otherwise `rem tape supersede-tail --acknowledge-tape LABEL` can discard the data if its recovery checks pass. Its preview lists the objects and other findings it detected (a trailing torn fragment has no separate entry); confirm only after accounting for the whole suffix, then rerun an interrupted `put` whose sources still exist. A UPS, or a disk with power-loss protection, removes this power-cut exposure. Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`), or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and `zil_nocacheflush` at `0` and the dataset's `sync=standard`. |
 | `audit.dir` | absolute path | required | Directory holding the library log's `*.remlib` segments, `library-log.lock`, `library-log.ambiguous` and `library-log.fence-reconcile`. The segments record withdrawals, fences, barcodes and pools. The state directory's `authority-manifest.json` binds the log's root and identity. |
 | `audit.fsync` | bool | `true` | Controls sync for legacy audit appends only. Every library-log record, `Diagnostic` included, syncs before returning regardless of this setting; segment rotation also syncs. |
 | `audit.clock_forward_tolerance_seconds` | integer | `300` | Accepted and range-validated, but has no effect in this version; production does not read it. |
@@ -558,8 +558,9 @@ An ambiguity marker in either log family prevents startup and survives a restart
 After stopping the daemon and fixing the storage problem, use
 `rem-debug library-log inspect --config <PATH>`, followed by
 `rem-debug library-log recover --config <PATH> --confirm-clear-ambiguity`.
-Recovery clears tape markers before the library marker and writes a synced
-recovery diagnostic.
+Recovery clears tape markers before the library marker. It writes a synced
+recovery diagnostic if it clears any marker or finds
+`library-log.fence-reconcile`.
 
 Home mode uses a different generated layout under
 `${XDG_STATE_HOME:-$HOME/.local/state}/rem/`:
@@ -597,13 +598,18 @@ fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,
 withdrawn or fenced since the copy's date.
 
-In a library, each tape a pool has written since the copy is refused once on
-the pool's first write to it and closed for writing. The same request moves on
-to the pool's next tape; a pool may have several tapes in this condition. Before
-starting the service on restored state, each pool needs a writable tape that
-the restored state knows and that the pool has not written since the copy.
-A refused tape stays readable, but its data written since the copy is not
-listed. Do not discard that data unless its objects are known to be unneeded.
+In a library, each tape the restored state knows and a pool has written
+since the copy is checked on the pool's first write to it under the restored
+state, and data there that the restored state does not account for can
+refuse that write. If admission reports `TailBeyondKnownState`, the tape is
+closed for writing; while that refusal's fence is its only fence, read
+sessions are still allowed, and a pool request can try another eligible
+tape. A contradiction with the tape's recorded ending also blocks read
+sessions. Before starting the service on restored state, each pool should
+have a writable tape that the restored state knows and that the pool has not
+written since the copy. The restored catalog does not list a tape's data
+written since the copy. Do not discard that data unless its objects are
+known to be unneeded.
 If the restored state shows no open session on the tape (its last session
 closed, or none opened since it was initialized here), that data cannot be
 discarded in this release: keep the tape closed for writing, withdraw it
@@ -625,8 +631,8 @@ root differs from `authority-format`. Both messages mention reset, but reset
 also refuses this path mismatch and erases nothing. Restore the recorded paths
 or point the configuration at them. Without the authority files, populated logs
 are refused; see [authority-layout refusals](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
-An older backup cannot authorize append over newer tape data:
-`TailBeyondKnownState` refuses that operation. Restore newer state to keep the
+With an older backup, an unrecorded complete object on the tape can refuse
+the write with `TailBeyondKnownState`. Restore newer state to keep the
 data; outside a library, catalogless `tape restore --scan` can rescue files.
 
 Standalone commands that open state acquire the state lock for one invocation

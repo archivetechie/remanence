@@ -225,13 +225,18 @@ fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,
 withdrawn or fenced since the copy's date.
 
-In a library, each tape a pool has written since the copy is refused once on
-the pool's first write to it and closed for writing. The same request moves on
-to the pool's next tape; a pool may have several tapes in this condition. Before
-starting the service on restored state, each pool needs a writable tape that
-the restored state knows and that the pool has not written since the copy.
-A refused tape stays readable, but its data written since the copy is not
-listed. Do not discard that data unless its objects are known to be unneeded.
+In a library, each tape the restored state knows and a pool has written
+since the copy is checked on the pool's first write to it under the restored
+state, and data there that the restored state does not account for can
+refuse that write. If admission reports `TailBeyondKnownState`, the tape is
+closed for writing; while that refusal's fence is its only fence, read
+sessions are still allowed, and a pool request can try another eligible
+tape. A contradiction with the tape's recorded ending also blocks read
+sessions. Before starting the service on restored state, each pool should
+have a writable tape that the restored state knows and that the pool has not
+written since the copy. The restored catalog does not list a tape's data
+written since the copy. Do not discard that data unless its objects are
+known to be unneeded.
 If the restored state shows no open session on the tape (its last session
 closed, or none opened since it was initialized here), that data cannot be
 discarded in this release: keep the tape closed for writing, withdraw it
@@ -315,7 +320,7 @@ standalone refusals are:
 | `unresolved changer bays prohibit device writes` | A reachable changer has a bay whose drive identity cannot be resolved. Fix that mapping; a standalone serial pin does not override it. |
 | `only permitted for read verbs` with `--allow-unserialized-device` | A drive without a readable serial has only an ephemeral identity. Reads can be explicitly allowed; writes cannot. |
 | State volume is untrusted | Put home-mode state on a local persistent filesystem. `--allow-untrusted-state-volume` is an explicit development override, not a normal archive setup. |
-| `journal volume rejected` | Put `journal.dir` on a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on. The detail names a filesystem, mount-option or ZFS flush-switch refusal; if it cannot determine the filesystem, check that `/proc` is mounted. `rem doctor` shows the blocking `journal volume` row and, on accepted ZFS volumes, an advisory `journal sync` row for the dataset's sync property. Neither `--allow-untrusted-state-volume` nor `journal.require_trusted_volume = false` changes the journal check. Remanence makes its records durable with fsync, as a database does; it cannot test whether a disk keeps what it confirms. If a power cut loses the last journal records, nothing on tape is lost or overwritten. The next write to that tape stops with `TailBeyondKnownState` and names the objects. Rescue them with `rem tape restore --scan --out rescued`, then run `rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After an interrupted `put` whose sources still exist, run `supersede-tail` and rerun `put`. A UPS, or a disk with power-loss protection, removes this power-cut exposure. Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`), or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and `zil_nocacheflush` at `0` and the dataset's `sync=standard`. |
+| `journal volume rejected` | Put `journal.dir` on a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on. The detail names a filesystem, mount-option or ZFS flush-switch refusal; if it cannot determine the filesystem, check that `/proc` is mounted. `rem doctor` shows the blocking `journal volume` row and, on accepted ZFS volumes, an advisory `journal sync` row for the dataset's sync property. Neither `--allow-untrusted-state-volume` nor `journal.require_trusted_volume = false` changes the journal check. Remanence makes its records durable with fsync, as a database does; it cannot test whether a disk keeps what it confirms. If a power cut loses the last journal records, nothing on tape is lost or overwritten. The next write to that tape can stop with `TailBeyondKnownState`. Recoverable files can be copied out with `rem tape restore --scan --out rescued` on a standalone drive. After that refusal, if this state shows no open session on the tape (its last session closed, or none opened since it was initialized here), `supersede-tail` refuses discard in this release: keep the tape closed for writing, start from a newer copy of the state directory that accounts for the data, or withdraw the tape by the [`rem tape retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass this configuration's path with `--config`; parity closeout or a pending finalization can block retirement). Otherwise `rem tape supersede-tail --acknowledge-tape LABEL` can discard the data if its recovery checks pass. Its preview lists the objects and other findings it detected (a trailing torn fragment has no separate entry); confirm only after accounting for the whole suffix, then rerun an interrupted `put` whose sources still exist. A UPS, or a disk with power-loss protection, removes this power-cut exposure. Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`), or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and `zil_nocacheflush` at `0` and the dataset's `sync=standard`. |
 | Cannot write `/run/lock/rem`, especially after reboot | Create it with `sudo install -d -o root -g tape -m 0770 /run/lock/rem`. Put `d /run/lock/rem 0770 root tape -` in `/etc/tmpfiles.d/rem.conf` so boot recreates it. |
 | `TailBeyondKnownState` | Tape holds data this state does not record, often after restoring an older copy of the state directory. It stays readable and closed for writing. To keep the data, start from a newer copy of the state directory, or copy files out of this standalone drive with `rem tape restore --scan --out rescued`. Do not delete journals or discard data unless its objects are known to be unneeded. If this state shows no open session on the tape (its last session closed, or none opened since it was initialized here), discard is refused in this release. In other cases, `rem tape supersede-tail --acknowledge-tape <label\|uuid>` (home mode; for an explicit device add `--device <path> --allow-device <serial>`) can discard it if the recovery checks pass and you confirm the preview. |
 | `holds … data at the beginning` | Nonblank media needs `rem tape init --label LABEL --generation <yours> --clobber-data`, then `CLOBBER LABEL`. For non-interactive use, pass `--confirm-clobber "CLOBBER LABEL"`. This also applies after retirement. Clobber also erases a Remanence tape whose files are still in your catalog; run `rem list --tape LABEL` first. It does not bypass write protection, partition, label/identity-swap or cross-pool checks. |
@@ -979,8 +984,8 @@ Rebuild compares the committed range to the original-write check and retries a
 mismatch once after re-proving identity. A second mismatch raises
 `CloseoutCheckMismatch`. Committed extent contradictions raise
 `CloseoutReadContradiction`; a suffix contradicting its named ending raises
-`SessionSuffixContradiction`. Data beyond the known state raises
-`append_admission_refused`, which leaves the tape readable and closed for
+`SessionSuffixContradiction`. `TailBeyondKnownState` raises the
+`append_admission_refused` fence, which leaves the tape readable and closed for
 writing. Neither recovery fence is released by `rem tape quarantine release`.
 Use `rem tape supersede-tail` where the tail can be recovered; it refuses a
 contradicting recorded ending or a state that shows no open session on the tape
