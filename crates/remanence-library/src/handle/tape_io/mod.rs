@@ -46,11 +46,12 @@ pub use media_gate::{
     MediaWriteFenceError, NoCalibrationControl,
 };
 pub use model::{
-    BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
-    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
-    ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
-    TapeConfig, TapePosition, TapePositionReport, WormMediaState, WriteBatchOutcome,
-    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
+    combine_worm_evidence, BlockSize, ComputedPosition, DevicePositionProof,
+    PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome,
+    ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags,
+    SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapePosition, TapePositionReport,
+    WormMediaState, WormVerdict, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    WriteUnpositionedOutcome,
 };
 pub use readiness::{
     classify_media_readiness_error, classify_media_readiness_error_ref,
@@ -158,6 +159,12 @@ impl TapeIoError {
             } => Some((sense, *bytes_transferred)),
             _ => None,
         }
+    }
+
+    /// Whether the issued READ or SPACE itself reported a missing EOD mark.
+    pub fn is_end_of_data_not_found(&self, issued_opcode: u8) -> bool {
+        self.completion_evidence()
+            .is_end_of_data_not_found(issued_opcode)
     }
 
     /// Only a current, zero-transfer BLANK CHECK 00/05 proves physical EOD.
@@ -864,8 +871,8 @@ impl TapeIoError {
 /// Convert a low-level [`ScsiError`] into a Layer 3a [`TapeIoError`].
 /// Sense bytes are decoded to surface `NoMedium` / `WriteProtected` /
 /// `DataProtect` as their own variants — everything else falls
-/// through to [`TapeIoError::CheckCondition`],
-/// [`TapeIoError::UnexpectedStatus`], or [`TapeIoError::Transport`].
+/// through to [`crate::TapeIoErrorKind::CheckCondition`],
+/// [`crate::TapeIoErrorKind::UnexpectedStatus`], or [`crate::TapeIoErrorKind::Transport`].
 pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
     match err {
         ScsiError::Cancelled => crate::TapeIoError::pending(crate::TapeIoErrorKind::Cancelled),
@@ -1427,7 +1434,7 @@ impl super::DriveHandle {
     /// after the head reaches BOT. Transport errors mark the parent
     /// `LibraryHandle` dirty with cause
     /// [`DirtyCause::CompletionUnknown`]; CHECK CONDITION (including
-    /// the [`TapeIoError::NoMedium`] mapping) leaves the snapshot
+    /// the [`crate::TapeIoErrorKind::NoMedium`] mapping) leaves the snapshot
     /// clean because the physical state is known.
     pub fn rewind(&mut self) -> Result<(), TapeIoError> {
         self.with_command_outcome(crate::outcome::CommandClass::Position, |drive| {
@@ -1511,7 +1518,7 @@ impl super::DriveHandle {
     /// Query the drive's current TapeAlert flags via LOG SENSE page 0x2E.
     ///
     /// This is a read-only status command. Malformed LOG SENSE payloads surface
-    /// as [`TapeIoError::MalformedResponse`] so callers can distinguish a
+    /// as [`crate::TapeIoErrorKind::MalformedResponse`] so callers can distinguish a
     /// successful CDB with unusable medium-sourced bytes from CHECK CONDITION or
     /// transport failure.
     pub fn read_tape_alerts(&mut self) -> Result<TapeAlerts, TapeIoError> {
@@ -1582,10 +1589,10 @@ impl super::DriveHandle {
     /// nothing about them.
     ///
     /// Error mapping, load-bearing for the §6.5 transitions:
-    /// - [`TapeIoError::CheckCondition`] — the drive rejected the
+    /// - [`crate::TapeIoErrorKind::CheckCondition`] — the drive rejected the
     ///   command (the runtime unsupported-format path);
-    /// - [`TapeIoError::Transport`] — completion unknown;
-    /// - [`TapeIoError::MalformedResponse`] — the CDB succeeded but the
+    /// - [`crate::TapeIoErrorKind::Transport`] — completion unknown;
+    /// - [`crate::TapeIoErrorKind::MalformedResponse`] — the CDB succeeded but the
     ///   response bytes failed wire validation.
     ///
     /// The latter two are the "transport or parse failure" arm: the
@@ -3120,7 +3127,7 @@ impl super::DriveHandle {
     ///   short read. Returns `Ok(actual)` using the transferred-byte rule above.
     /// - INFORMATION < 0 (block larger than buffer): the drive
     ///   consumed the block (the head advanced past it). Returns
-    ///   [`TapeIoError::ReadBufferTooSmall { actual, provided }`]
+    ///   [`TapeIoErrorKind::ReadBufferTooSmall { actual, provided }`](crate::TapeIoErrorKind::ReadBufferTooSmall)
     ///   where `actual = (requested as i64) - signed_information`.
     ///   The caller MUST `space(-1, Blocks)` to back up before
     ///   retrying with a larger buffer.
@@ -3952,7 +3959,7 @@ impl super::DriveHandle {
 
     /// Read the drive's current block-size + compression
     /// configuration plus its reported maximum block size. Issues
-    /// **two CDBs**, plus a third when the header does not type the cartridge:
+    /// **two CDBs**; WORM evidence comes only from the header:
     ///
     /// 1. READ BLOCK LIMITS (CDB `0x05`) for
     ///    [`TapeConfig::max_block_size_bytes`]. MODE SENSE pages do
@@ -3962,22 +3969,25 @@ impl super::DriveHandle {
     ///    block descriptor — block size comes from the
     ///    descriptor's 3-byte BLOCK LENGTH field; compression
     ///    comes from the page's DCE bit.
-    /// 3. When the header's medium type leaves WORM state unknown,
-    ///    MODE SENSE(6) page `0x1D` (Medium Configuration) supplies
-    ///    the WORM-mode bit. Unsupported or malformed page data
-    ///    leaves WORM state unknown; any other failure of this
-    ///    command (CHECK CONDITION other than a current ILLEGAL
-    ///    REQUEST, or a transport error) fails the call with this
-    ///    command's own outcome.
     ///
     /// Malformed block-limit or compression responses surface as
-    /// [`TapeIoError::MalformedModeResponse`] (a CDB-succeeded /
+    /// [`crate::TapeIoErrorKind::MalformedModeResponse`] (a CDB-succeeded /
     /// payload-wrong condition, distinct from CHECK CONDITION).
     pub fn read_config(&mut self) -> Result<TapeConfig, TapeIoError> {
+        self.read_config_internal(false)
+    }
+
+    /// Read configuration and resolve an inconclusive header's WORM state using
+    /// MODE SENSE(6) page 0x1D (Medium Configuration). Typed headers need no page.
+    /// Unsupported or malformed page data leaves WORM state unknown. Other
+    /// failures return the page command's own outcome, within the same
+    /// `TapeReadConfig` audit pair as the header read.
+    pub fn read_config_resolving_worm(&mut self) -> Result<TapeConfig, TapeIoError> {
         self.read_config_internal(true)
     }
 
-    /// Resolve WORM state only for callers outside the reverify outcome boundary.
+    /// Resolve WORM state only for the write routes' resolving read; the plain read and the reverify
+    /// outcome boundary pass `false` and keep the header's evidence alone.
     fn read_config_internal(&mut self, resolve_worm: bool) -> Result<TapeConfig, TapeIoError> {
         let (op, started, max_block_size_bytes, mut mode) =
             self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
@@ -4063,7 +4073,7 @@ impl super::DriveHandle {
         // The page has its own top-level result boundary so a failure carries
         // its own evidence, not the compression page's successful completion.
         if resolve_worm && mode.worm == WormMediaState::Unknown {
-            mode.worm = self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
+            let page = self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
                 let cdb = remanence_scsi::mode::build_mode_sense6_cdb(
                     remanence_scsi::mode::PageControl::Current,
                     remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION,
@@ -4089,6 +4099,7 @@ impl super::DriveHandle {
                     }
                 }
             })?;
+            mode.worm = combine_worm_evidence(mode.worm, Some(page)).media_state();
         }
 
         self.finish_tape_success(op, started.elapsed());
@@ -4114,24 +4125,25 @@ impl super::DriveHandle {
     /// Re-establish reset-invalidated fixed mode and device position before
     /// any identity probe or data command reuses this daemon-lifetime handle.
     pub fn reverify_invalidated_state(&mut self) -> Result<(), TapeIoError> {
-        self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
-        let Some(required_block_size) = drive.mode_reverification_required else {
+        let Some(required_block_size) = self.mode_reverification_required else {
             return Ok(());
         };
-        let config = drive.read_config_internal(false)?;
-        if config.block_size
-            != (BlockSize::Fixed {
-                size_bytes: required_block_size,
-            })
-        {
-            return Err(crate::TapeIoError::pending(crate::TapeIoErrorKind::OperationFailed(format!(
-                "reset recovery MODE SENSE block-size mismatch: expected {required_block_size}, got {:?}",
-                config.block_size
-            ))));
-        }
-        drive.position()?;
+        self.with_command_outcome(crate::outcome::CommandClass::Mode, |drive| {
+            let config = drive.read_config_internal(false)?;
+            if config.block_size
+                != (BlockSize::Fixed {
+                    size_bytes: required_block_size,
+                })
+            {
+                return Err(crate::TapeIoError::pending(crate::TapeIoErrorKind::OperationFailed(format!(
+                    "reset recovery MODE SENSE block-size mismatch: expected {required_block_size}, got {:?}",
+                    config.block_size
+                ))));
+            }
+            Ok(())
+        })?;
+        self.position()?;
         Ok(())
-        })
     }
 
     /// Write a new block-size + compression configuration via
@@ -4960,7 +4972,7 @@ fn parse_mode_sense_data_compression(buf: &[u8]) -> Result<ModeSenseDataCompress
 
 /// Read WORMM from a MODE SENSE(6) Medium Configuration page. Missing,
 /// truncated or unrelated page data cannot establish that media is rewritable.
-fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
+pub fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
     if response.len() < 4 {
         return WormMediaState::Unknown;
     }
@@ -4972,6 +4984,7 @@ fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
     if response[page_start] & 0x3F != remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION
         || response[page_start] & 0x40 != 0
         || response[page_start + 1] < 1
+        || page_start + 2 + response[page_start + 1] as usize > usable_length
     {
         return WormMediaState::Unknown;
     }
@@ -4982,7 +4995,8 @@ fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
     }
 }
 
-fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {
+/// Decode the cartridge medium-type byte; unlisted codes provide no WORM evidence.
+pub fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {
     match medium_type {
         0x00 => WormMediaState::Unknown,
         0x01 | 0x3C | 0x4C | 0x5C | 0x6C | 0x7C | 0x8C | 0x9C => WormMediaState::Worm,

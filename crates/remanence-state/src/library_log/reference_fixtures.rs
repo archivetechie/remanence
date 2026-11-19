@@ -17,7 +17,7 @@ fn body(l: &mut LibraryLog, b: Body) -> Receipt {
     put(l, b)
 }
 /// Every allocated record is published through the real append owner.
-fn all_records(path: &Path) {
+pub(super) fn all_records(path: &Path) {
     let (mut l, _) = open(path, &Present);
     body(&mut l, provision(1, Some("A")));
     body(&mut l, provision(2, Some("B")));
@@ -5054,7 +5054,7 @@ fn authority_every_typed_method_uses_corpus_rules() {
             let receipt =
                 result.unwrap_or_else(|e| panic!("tag={tag:?} sequence={}: {e}", frame.sequence));
             assert_eq!(receipt.receipt.sequence, frame.sequence);
-            assert_eq!(receipt.receipt.synced, tag != Tag::Diagnostic);
+            assert!(receipt.receipt.synced);
         }
     }
     assert_eq!(tags.len(), 27);

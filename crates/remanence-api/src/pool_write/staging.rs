@@ -870,11 +870,7 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    let mut fence_cfg = super::test_fence_config(state.path().parent().expect("catalog parent"));
-    if let Some(runtime) = state.library_runtime() {
-        fence_cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime);
-    }
-    let fence_cfg = &fence_cfg;
+    let fence_cfg = &super::test_fence_config(state);
     run_ring_staged_transfer(inner, block_size, producer, None, |error| {
         let outcome = staged_failure_outcome(error);
         let error = error.to_string();
@@ -896,11 +892,7 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
-    let mut fence_cfg = super::test_fence_config(state.path().parent().expect("catalog parent"));
-    if let Some(runtime) = state.library_runtime() {
-        fence_cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime);
-    }
-    let fence_cfg = &fence_cfg;
+    let fence_cfg = &super::test_fence_config(state);
     let tape_write_control = overlap_control.as_ref().map(Arc::clone);
     let outcome =
         run_ring_staged_transfer(inner, block_size, producer, tape_write_control, |error| {

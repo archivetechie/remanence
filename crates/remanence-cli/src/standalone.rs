@@ -810,6 +810,25 @@ fn read_only(command: &Command) -> bool {
     )
 }
 
+/// Render an authoritative standalone hold for list and release output.
+fn standalone_hold_json(
+    hold: &remanence_state::library_runtime::StandaloneDriveHold,
+    state: &str,
+) -> Value {
+    let detail: serde_json::Map<String, Value> = hold
+        .detail
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect();
+    json!({
+        "quarantine_id": format!("library:{}", hold.fence),
+        "drive_serial": hold.drive_serial,
+        "cause": format!("{:?}", hold.cause),
+        "detail": detail,
+        "state": state,
+    })
+}
+
 /// Build first-use configuration without persisting operator choices.
 fn default_home_config(root: &Path) -> String {
     let q = |p: PathBuf| toml::Value::String(p.to_string_lossy().into_owned()).to_string();
@@ -1154,9 +1173,22 @@ where
     let mut state = if discovery_only {
         None
     } else {
-        let mut state =
-            StateHandle::open_with_config(StatePaths::from_config(&path, &config), config.clone())
-                .map_err(err)?;
+        let pass = if matches!(
+            cli.command,
+            Command::Tape {
+                command: Tape::AssignPool { .. }
+            }
+        ) {
+            remanence_state::ConfigurationPass::ReportOnly
+        } else {
+            remanence_state::ConfigurationPass::Apply
+        };
+        let mut state = StateHandle::open_with_config_pass(
+            StatePaths::from_config(&path, &config),
+            config.clone(),
+            pass,
+        )
+        .map_err(err)?;
         state.replay_audit_projection().map_err(err)?;
         output.active_fences =
             remanence_api::standalone_fence_policy(state.catalog(), None, None, false)
@@ -1180,19 +1212,42 @@ where
                     .catalog()
                     .list_active_media_readiness_operations(None)
                     .map_err(err)?;
+                let holds = state
+                    .library_runtime()
+                    .standalone_drive_holds()
+                    .map_err(err)?;
                 Ok(
-                    json!({"active_fences":output.active_fences,"media_readiness":ops.iter().map(crate::media_readiness_record_json).collect::<Vec<_>>()}),
+                    json!({"active_fences":output.active_fences,"media_readiness":ops.iter().map(crate::media_readiness_record_json).collect::<Vec<_>>(),"standalone_holds":holds.iter().map(|hold| standalone_hold_json(hold, "active")).collect::<Vec<_>>()}),
                 )
             }
             Quarantine::Release { id, ack } => {
                 if ack.trim().is_empty() {
                     return Err("--ack must be non-empty".into());
                 }
+                if let Some(hold) = state
+                    .library_runtime()
+                    .release_standalone_drive_hold(
+                        id,
+                        ack.trim(),
+                        remanence_state::AuditActor::local_user(),
+                    )
+                    .map_err(err)?
+                {
+                    output.active_fences =
+                        remanence_api::standalone_fence_policy(state.catalog(), None, None, false)
+                            .map_err(err)?
+                            .iter()
+                            .map(crate::tape_io_fence_json)
+                            .collect();
+                    let mut row = standalone_hold_json(&hold, "released");
+                    row["active_fences"] = json!(output.active_fences);
+                    return Ok(row);
+                }
                 let fences = state.catalog().list_active_tape_io_fences().map_err(err)?;
                 if fences.iter().any(|f| {
                     f.quarantine_id == *id && !remanence_api::standalone_fence_releasable(f)
                 }) {
-                    return Err("bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction fence is released by rem tape supersede-tail instead".into());
+                    return Err("bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction or append_admission_refused fence is not released: use rem tape supersede-tail, or withdraw the tape with rem tape retire, passing --config with this configuration's path".into());
                 }
                 let released = state
                     .release_tape_io_fence(id, ack.trim(), false)
@@ -1795,7 +1850,7 @@ where
         Command::Tape { command } => {
             match command {
                 Tape::Identify => {
-                    let mut facts = terminal_summary(&mut mounted.drive, false)?;
+                    let mut facts = terminal_summary(&mut mounted.drive, false, errors)?;
                     facts["uuid"] = json!(Uuid::from_bytes(uuid));
                     facts["tape_uuid"] = json!(Uuid::from_bytes(uuid));
                     facts["label"] = json!(mounted.label.as_ref().map(|p| &p.0));
@@ -1858,7 +1913,7 @@ where
                         attach_verification_io(&mut facts, io.finish(), cli.json, output.out)?;
                         Ok(facts)
                     } else {
-                        terminal_summary(&mut mounted.drive, true)
+                        terminal_summary(&mut mounted.drive, true, errors)
                     }
                 }
                 Tape::Restore {
@@ -2170,10 +2225,14 @@ fn prepare_init(
     drive.prevent_medium_removal().map_err(err)?;
     let proof = drive.identity_generation();
     drive.require_single_partition().map_err(err)?;
-    let mut cfg = drive.read_config().map_err(err)?;
+    let mut cfg = drive.read_config_resolving_worm().map_err(err)?;
     if cfg.write_protected {
         return Err("tape is write protected".into());
     }
+    if let Err(e) = remanence_api::require_rewritable_object_media(cfg) {
+        return Err(format!("tape init refused before any media write: {e}"));
+    }
+
     let hint = generation
         .map(|g| {
             parse_generation(g).map(|generation| MediaObservation {
@@ -2453,7 +2512,11 @@ fn complete_init(
     }
     Ok(result)
 }
-fn terminal_summary(drive: &mut DriveHandle, verifying: bool) -> Result<Value, String> {
+fn terminal_summary(
+    drive: &mut DriveHandle,
+    verifying: bool,
+    errors: &mut dyn Write,
+) -> Result<Value, String> {
     let bootstrap = remanence_parity::bootstrap::discover_bootstrap(
         &mut remanence_parity::DriveHandleRawSource::new(drive),
         None,
@@ -2484,6 +2547,11 @@ fn terminal_summary(drive: &mut DriveHandle, verifying: bool) -> Result<Value, S
         },
     )
     .map_err(err)?;
+    if !verifying
+        && matches!(&result, remanence_parity::TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) if recovery.reason == remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound)
+    {
+        writeln!(errors, "warning: drive reports no end-of-data mark; power loss during writing can cause this; committed files remain readable; rem tape restore --scan --list inspects recoverable files, not the actual end").map_err(err)?;
+    }
     let mut summary = summarize_terminal(result, verifying)?;
     summary["bytes"] = if summary["finalized"] == true {
         json!(bytes)
@@ -2501,6 +2569,7 @@ fn terminal_recovery_status(
         remanence_parity::BotStructuralRecoveryReason::AllMembersInvalid => {
             "terminal_index_unusable"
         }
+        remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound => "end_of_data_not_found",
     }
 }
 fn summarize_terminal(
@@ -2516,11 +2585,15 @@ fn summarize_terminal(
                 terminal_recovery_status(&recovery.reason)
             ))
         }
-        remanence_parity::TerminalInventoryOutcome::Inventory(inventory) => Ok(
-            json!({"finalized": true, "object_count": inventory.payload.object_row_count, "replica": inventory.selected_replica_ordinal, "edition_digest": crate::bytes_to_hex(&inventory.edition.edition_digest), "status": if verifying { "verified" } else { "identified" }}),
-        ),
+        remanence_parity::TerminalInventoryOutcome::Inventory(inventory) => {
+            let mut summary = json!({"finalized": true, "object_count": inventory.payload.object_row_count, "replica": inventory.selected_replica_ordinal, "edition_digest": crate::bytes_to_hex(&inventory.edition.edition_digest), "status": if verifying { "verified" } else { "identified" }});
+            if !verifying {
+                summary["end_of_data_mark"] = json!("present");
+            }
+            Ok(summary)
+        }
         remanence_parity::TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => Ok(
-            json!({"finalized": false, "object_count": null, "status": terminal_recovery_status(&recovery.reason)}),
+            json!({"finalized": false, "object_count": null, "status": terminal_recovery_status(&recovery.reason), "end_of_data_mark": if recovery.reason == remanence_parity::BotStructuralRecoveryReason::EndOfDataNotFound { "not_found" } else { "present" }}),
         ),
     }
 }
@@ -3000,6 +3073,47 @@ fn confirm_setup(
     std::io::stdin().read_line(&mut answer).map_err(err)?;
     Ok(matches!(answer.trim(), "y" | "Y"))
 }
+/// Decode a diagnostic record from the two mode replies using the library's WORM rules.
+fn worm_diagnostic_record(
+    device: &Path,
+    header_reply: Option<&[u8]>,
+    page_reply: Option<&[u8]>,
+) -> Value {
+    use remanence_library::{
+        combine_worm_evidence, worm_state_from_medium_configuration, worm_state_from_medium_type,
+        WormMediaState, WormVerdict,
+    };
+    let medium_type = header_reply.and_then(|reply| reply.get(1)).copied();
+    let header = medium_type
+        .map(worm_state_from_medium_type)
+        .unwrap_or(WormMediaState::Unknown);
+    let page = page_reply.map(worm_state_from_medium_configuration);
+    let state_name = |state| match state {
+        WormMediaState::NotWorm => "not_worm",
+        WormMediaState::Worm => "worm",
+        WormMediaState::Unknown => "unknown",
+    };
+    let wormm = match page {
+        Some(WormMediaState::Worm) => Some(1),
+        Some(WormMediaState::NotWorm) => Some(0),
+        Some(WormMediaState::Unknown) | None => None,
+    };
+    let verdict = match combine_worm_evidence(header, page) {
+        WormVerdict::NotWorm => "not_worm",
+        WormVerdict::Worm => "worm",
+        WormVerdict::Unknown => "unknown",
+        WormVerdict::Conflict { .. } => "conflict",
+    };
+    json!({
+        "device": device,
+        "header_medium_type": medium_type.map(|value| format!("0x{value:02x}")),
+        "header": state_name(header),
+        "wormm": wormm,
+        "medium_configuration": page.map(state_name),
+        "verdict": verdict,
+    })
+}
+
 /// Fixed command allowlist: no READ, SPACE, LOCATE, or data-out commands occur here.
 fn diagnostics<F>(
     cli: &Cli,
@@ -3040,6 +3154,7 @@ where
     }
     let policy = StaticAllowlist::new(cli.allow_device.clone());
     let mut records = vec![];
+    let mut worm = vec![];
     for (i, (path, changer, serial)) in devices.iter().enumerate() {
         if cli.device.is_some() && !policy.allows_device(path, serial.as_deref()) {
             return Err("diagnostic device requires matching --allow-device".into());
@@ -3058,6 +3173,11 @@ where
             ));
         } else {
             commands.push(("mode-sense", vec![0x1a, 0, 0x3f, 0, 255, 0], 255));
+            commands.push((
+                "mode-sense-medium-configuration",
+                vec![0x1a, 0, 0x1d, 0, 255, 0],
+                255,
+            ));
             for (name, page) in [
                 ("log-supported", 0),
                 ("log-write-errors", 2),
@@ -3071,18 +3191,35 @@ where
                 ));
             }
         }
-        for (name, cdb, size) in commands {
+        // These positions follow the three inquiry commands above; changers have no WORM record.
+        let mut header_reply = None;
+        let mut page_reply = None;
+        for (command_index, (name, cdb, size)) in commands.into_iter().enumerate() {
             let mut buf = vec![0; size];
             match transport.execute_in(&cdb, &mut buf) {
                 Ok(result) => {
                     let filename = format!("device-{i}-{name}.bin");
                     let count = (result.bytes_transferred as usize).min(buf.len());
                     fs::write(temp.path().join(&filename), &buf[..count]).map_err(err)?;
+                    if !*changer {
+                        match command_index {
+                            3 => header_reply = Some(buf[..count].to_vec()),
+                            4 => page_reply = Some(buf[..count].to_vec()),
+                            _ => {}
+                        }
+                    }
                     records
                         .push(json!({"device":path,"command":name,"file":filename,"bytes":count}));
                 }
                 Err(e) => records.push(json!({"device":path,"command":name,"error":e.to_string()})),
             }
+        }
+        if !*changer {
+            worm.push(worm_diagnostic_record(
+                path,
+                header_reply.as_deref(),
+                page_reply.as_deref(),
+            ));
         }
     }
     for (name, program, args) in [
@@ -3102,7 +3239,7 @@ where
         };
         fs::write(temp.path().join(name), text).map_err(err)?;
     }
-    fs::write(temp.path().join("manifest.json"),serde_json::to_vec_pretty(&json!({"commands":records,"observed_endpoints":remanence_api::observed_endpoint_json(report),"tape_data_captured":false})).map_err(err)?).map_err(err)?;
+    fs::write(temp.path().join("manifest.json"),serde_json::to_vec_pretty(&json!({"worm":worm,"commands":records,"observed_endpoints":remanence_api::observed_endpoint_json(report),"tape_data_captured":false})).map_err(err)?).map_err(err)?;
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3120,7 +3257,7 @@ where
     if !status.success() {
         return Err(format!("tar failed: {status}"));
     }
-    Ok(json!({"tarball":out,"tape_data_captured":false}))
+    Ok(json!({"tarball":out,"worm":worm,"tape_data_captured":false}))
 }
 
 /// Retry display-only reads once if the database or WAL changed, including a
@@ -3892,6 +4029,72 @@ mod tests {
         );
     }
 
+    /// Explicit device advice selects standalone release regardless of host configuration.
+    #[test]
+    fn quarantine_release_with_device_routes_standalone_on_every_host() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().join("state"),
+            system_config: root.path().join("system.toml"),
+            locks: root.path().join("locks"),
+            test_input: true,
+            euid: 1000,
+            doctor_checks: None,
+        };
+        let path = config_path(&Cli::try_parse_from(["rem", "doctor"]).unwrap(), &env).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        for (system, saved) in [(false, false), (false, true), (true, false), (true, true)] {
+            fs::write(
+                &path,
+                if saved {
+                    format!("{original}\n[home]\ndrive_serial = \"HOLD-1\"\n")
+                } else {
+                    original.clone()
+                },
+            )
+            .unwrap();
+            if system {
+                fs::write(&env.system_config, "").unwrap();
+            } else if env.system_config.exists() {
+                fs::remove_file(&env.system_config).unwrap();
+            }
+            let args = [
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                "library:1",
+                "--device",
+                "PATH",
+                "--allow-device",
+                "HOLD-1",
+                "--ack",
+                "TEXT",
+            ]
+            .map(OsString::from);
+            assert!(
+                selected_in(&args, &env),
+                "explicit device: system={system} saved={saved}"
+            );
+            let args = [
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                "library:1",
+                "--ack",
+                "TEXT",
+            ]
+            .map(OsString::from);
+            assert_eq!(
+                selected_in(&args, &env),
+                saved && !system,
+                "bare: system={system} saved={saved}"
+            );
+        }
+    }
+
     /// Shared quarantine routing follows home-mode configuration, never reason text.
     #[test]
     fn quarantine_routing_requires_home_drive_and_no_library_config() {
@@ -4157,6 +4360,7 @@ mod tests {
         for reason in [
             BotStructuralRecoveryReason::NoUsableTerminalLayout,
             BotStructuralRecoveryReason::AllMembersInvalid,
+            BotStructuralRecoveryReason::EndOfDataNotFound,
         ] {
             let outcome = TerminalInventoryOutcome::BotStructuralRecoveryRequired(Box::new(
                 BotStructuralRecoveryRequired {

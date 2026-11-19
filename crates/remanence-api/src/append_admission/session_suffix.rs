@@ -74,7 +74,7 @@ pub(super) fn named_file(
     uuid: &[u8; 16],
     size: u32,
     file: &TailFile,
-) -> Result<bool, AdmissionError> {
+) -> Result<(bool, u64), AdmissionError> {
     let start = drive.position()?.lba;
     let mut block = vec![0; size as usize];
     let mut first = None;
@@ -151,5 +151,5 @@ pub(super) fn named_file(
         }
         _ => return Err(contradiction("empty named file")),
     }
-    Ok(mark)
+    Ok((mark, end))
 }

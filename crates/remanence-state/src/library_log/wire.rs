@@ -97,6 +97,24 @@ impl Wire for Negative {
 macro_rules! fields {
     ($ty:ident; $($field:ident:$ft:ty),+ $(,)?) => {
         crate::log_frame::cbor::fields!($ty; $($field),+);
+        impl super::history::Render for $ty {
+            fn render(&self, out: &mut dyn Write) -> io::Result<()> {
+                out.write_all(b"{")?;
+                let fields: &[(&str, &dyn super::history::Render)] = &[$((stringify!($field), &self.$field)),+];
+                for (index, (name, value)) in fields.iter().enumerate() {
+                    if index > 0 { out.write_all(b",")?; }
+                    super::history::json_string(out, name)?;
+                    out.write_all(b":")?;
+                    value.render(out)?;
+                }
+                out.write_all(b"}")
+            }
+            #[cfg(test)]
+            fn check_fields(&self) {
+                super::history::check_field_keys(self, Self::FIELDS);
+                $(super::history::Render::check_fields(&self.$field);)+
+            }
+        }
         impl $ty {
             #[cfg(test)]
             pub(super) const FIELDS: &'static [(&'static str,&'static str)] = &[$((stringify!($field),stringify!($ft))),+];
@@ -106,10 +124,35 @@ macro_rules! fields {
 macro_rules! enumeration {
     ($ty:ident; $($n:literal=>$variant:ident),+ $(,)?) => {
         crate::log_frame::cbor::enumeration!($ty;$($n=>$variant),+);
+        impl super::history::Render for $ty {
+            fn render(&self, out: &mut dyn Write) -> io::Result<()> {
+                super::history::json_string(out, self.variant_name().expect("enumeration variant"))
+            }
+            fn variant_name(&self) -> Option<&'static str> {
+                Some(match self { $(Self::$variant => stringify!($variant)),+ })
+            }
+        }
     };
 }
 macro_rules! union {
     ($ty:ident; $($n:literal=>$variant:ident($payload:ty)),+ $(,)?) => {
+
+        impl super::history::Render for $ty {
+            fn render(&self, out: &mut dyn Write) -> io::Result<()> {
+                out.write_all(b"{")?;
+                super::history::json_string(out, self.variant_name().expect("union variant"))?;
+                out.write_all(b":")?;
+                match self { $(Self::$variant(value) => super::history::Render::render(value, out)?),+ }
+                out.write_all(b"}")
+            }
+            fn variant_name(&self) -> Option<&'static str> {
+                Some(match self { $(Self::$variant(_) => stringify!($variant)),+ })
+            }
+            #[cfg(test)]
+            fn check_fields(&self) {
+                match self { $(Self::$variant(value) => super::history::Render::check_fields(value)),+ }
+            }
+        }
         impl Wire for $ty {
             fn put(&self,w:&mut dyn Write)->io::Result<()> {head(w,4,2)?; match self {$(Self::$variant(v)=>{($n as u64).put(w)?;v.put(w)}),+}}
             fn get(r:&mut dyn Read)->io::Result<Self>{if expect(r,4)?!=2{return Err(invalid());}match u64::get(r)? {$($n=>Ok(Self::$variant(<$payload>::get(r)?)),)+_=>Err(invalid())}}

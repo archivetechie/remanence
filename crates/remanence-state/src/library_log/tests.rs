@@ -816,7 +816,7 @@ fn library_log_ambiguous_fsync_never_rolls_back_claim() {
         }
     }
 }
-/// Even an unsynced diagnostic write error fences subsequent authority append.
+/// A diagnostic write error fences subsequent authority append before its sync.
 #[test]
 fn library_log_diagnostic_ambiguity_fences_authority() {
     use remanence_library::durable_file::test_support::register;
@@ -1956,6 +1956,54 @@ fn release_without_fence_uses_absent_history() {
     );
 }
 
+/// Every receipt, including Diagnostics with the setting off, survives a power cut.
+#[test]
+fn ca1_t2_every_record_synced_with_setting_off() {
+    use remanence_library::durable_file::test_support::register;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = durability::PageCache::default();
+    let registration = register(dir.path().into(), Arc::new(cache.clone()));
+    let (mut log, _) = open(dir.path(), &Present);
+    assert!(put(&mut log, provision(1, None)).synced);
+    for _ in 0..3 {
+        assert!(put(&mut log, diagnostic()).synced);
+    }
+    drop(log);
+    cache.crash();
+    drop(registration);
+    let replay = replay(dir.path(), LOG, &Present).unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    assert_eq!(replay.last_sequence, 4);
+}
+
+/// A complete frame left in the host cache becomes durable before open returns.
+#[test]
+fn ca1_t8a_open_syncs_published_tail() {
+    use remanence_library::durable_file::test_support::register;
+    let dir = tempfile::tempdir().unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    let cache = durability::PageCache::default();
+    let registration = register(dir.path().into(), Arc::new(cache.clone()));
+    let (mut log, _) = open(dir.path(), &Present);
+    put(&mut log, provision(1, None));
+    let name = log.state().segments.last().unwrap().name.clone();
+    std::fs::copy(dir.path().join(&name), copy.path().join(&name)).unwrap();
+    let (mut copied, _) = open(copy.path(), &Present);
+    put(&mut copied, diagnostic());
+    drop(copied);
+    let bytes = std::fs::read(copy.path().join(&name)).unwrap();
+    std::fs::write(dir.path().join(&name), bytes).unwrap();
+    drop(log);
+    let (reopened, _) = open(dir.path(), &Present);
+    assert_eq!(reopened.state().last_sequence, 2);
+    drop(reopened);
+    cache.crash();
+    drop(registration);
+    let replay = replay(dir.path(), LOG, &Present).unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    assert_eq!(replay.last_sequence, 2);
+}
+
 /// A power cut after rotation preserves the entire chain of each synced receipt.
 #[test]
 fn rotation_syncs_previous_diagnostics_before_publication() {
@@ -1968,7 +2016,7 @@ fn rotation_syncs_previous_diagnostics_before_publication() {
         let mut receipts = vec![put(&mut l, provision(1, None))];
         for _ in 0..3 {
             let r = put(&mut l, diagnostic());
-            assert!(!r.synced);
+            assert!(r.synced);
             receipts.push(r);
         }
         clock.0.fetch_add(86_400_000_000_000, Ordering::SeqCst);

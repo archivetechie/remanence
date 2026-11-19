@@ -422,24 +422,38 @@ fn run_cleaning_body(
                 CleanPhase::Failed,
                 Some("{\"reason\":\"fast-eject\"}"),
             )?;
+            // DEC-5: GOOD followed by an eject leaves the LOAD Unknown. Observe
+            // the changer through the shared funnel so later motion can proceed.
+            // Record the re-read before the alarm, explaining a failed read
+            // while preserving the failed run and its original refusal.
+            let alarm_reason = match library.reconcile_startup_motion() {
+                Ok(()) => "{\"reason\":\"fast-eject\"}".to_string(),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "remanence_cleaning",
+                        %error,
+                        "reconcile changer after cleaning cartridge fast-eject"
+                    );
+                    let at = OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .expect("current UTC time has an RFC 3339 representation");
+                    let reread = format!(
+                        "at {at} an inventory re-read failed: {error}; robot moves wait for the next re-read"
+                    );
+                    format!(
+                        "{{\"reason\":\"fast-eject\",\"reread\":\"{}\"}}",
+                        crate::startup_media_readiness::json_escape(&reread)
+                    )
+                }
+            };
             raise_alarm_with_evidence(
                 index,
                 cfg,
                 &format!("cln-cart-expired:{voltag}"),
                 "cln-cart-expired",
                 "warning",
-                Some("{\"reason\":\"fast-eject\"}"),
+                Some(&alarm_reason),
             )?;
-            // DEC-5: GOOD followed by an eject leaves the LOAD Unknown. Observe
-            // the changer through the shared funnel so later motion can proceed.
-            // Failure keeps this run Failed, its alarm and the original refusal.
-            if let Err(error) = library.reconcile_startup_motion() {
-                tracing::warn!(
-                    target: "remanence_cleaning",
-                    %error,
-                    "reconcile changer after cleaning cartridge fast-eject"
-                );
-            }
             return Err(Status::failed_precondition(
                 "cleaning cartridge fast-ejected before LOAD admission",
             ));

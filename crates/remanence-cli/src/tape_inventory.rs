@@ -622,6 +622,7 @@ fn bot_recovery_reason_name(reason: i32) -> Result<&'static str, String> {
             Ok("no_usable_terminal_layout")
         }
         Ok(pb::TapeInventoryBotRecoveryReason::AllMembersInvalid) => Ok("all_members_invalid"),
+        Ok(pb::TapeInventoryBotRecoveryReason::EndOfDataNotFound) => Ok("end_of_data_not_found"),
         Ok(pb::TapeInventoryBotRecoveryReason::Unspecified) | Err(_) => {
             Err("unknown BOT recovery reason".to_string())
         }
@@ -2616,6 +2617,62 @@ mod tests {
 
     #[test]
     fn bot_recovery_control_output_is_stable_and_monotone() {
+        for (raw, name) in [
+            (1, "no_usable_terminal_layout"),
+            (2, "all_members_invalid"),
+            (3, "end_of_data_not_found"),
+        ] {
+            let started = pb::TapeInventoryBotRecoveryStarted {
+                tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
+                block_size: 256 * 1024,
+                reason: raw,
+            };
+            accept_bot_recovery_started(
+                &mut BotRecoveryStreamState::default(),
+                &started,
+                *Uuid::from_u128(1).as_bytes(),
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            print_inventory_bot_recovery_started(&started, true, &mut out).unwrap();
+            let value: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["value"]["reason"], name,
+                "wire value 3 renders end_of_data_not_found"
+            );
+        }
+        for raw in [0, -1, 4, i32::MAX] {
+            let started = pb::TapeInventoryBotRecoveryStarted {
+                tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
+                block_size: 256 * 1024,
+                reason: raw,
+            };
+            assert!(
+                accept_bot_recovery_started(
+                    &mut BotRecoveryStreamState::default(),
+                    &started,
+                    *Uuid::from_u128(1).as_bytes()
+                )
+                .is_err(),
+                "unknown reason still refuses"
+            );
+        }
+        let mut recovered = bot_recovered_inventory();
+        recovered.detail.push_str("; end_of_data_mark=not_found; unresolved_from partition=0 lba=24; remaining tape unresolved");
+        let outcome = validate_inventory(&recovered, *Uuid::from_u128(1).as_bytes()).unwrap();
+        assert_eq!(outcome, InventoryOutcome::BotStructuralRecovered);
+        assert!(
+            outcome.requires_operator_recovery(),
+            "recovered missing-mark stream retains exit 1"
+        );
+        let mut out = Vec::new();
+        print_inventory(&recovered, outcome, true, &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["data"]["outcome"], "bot_structural_recovered");
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("remaining tape unresolved"));
+
         let tape_uuid = *Uuid::from_u128(1).as_bytes();
         let started = pb::TapeInventoryBotRecoveryStarted {
             tape_uuid: tape_uuid.to_vec(),

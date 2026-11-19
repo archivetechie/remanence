@@ -78,7 +78,7 @@ use remanence_library::{
     DriveBay, DriveHandle, DriveHandleSource, ElementException, FileBlockSink, FileBlockSource,
     IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, MediaReadinessWaitEvent,
     MediaReadinessWaitOptions, OpenError, Slot, StaticAllowlist, TapeAlerts, TapeConfig,
-    VecBlockSource, WormMediaState, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+    VecBlockSource, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -576,7 +576,7 @@ enum RemCommand {
         command: CatalogClientCommand,
     },
 
-    /// Query earlier-version audit segments; this version records no operation history there.
+    /// Query the operation history recorded in the library log
     Audit {
         /// Daemon gRPC endpoint URI.
         #[arg(
@@ -1269,7 +1269,7 @@ enum Command {
         command: CatalogClientCommand,
     },
 
-    /// Query earlier-version audit segments; this version records no operation history there.
+    /// Query the operation history recorded in the library log
     #[command(name = "audit", hide = true)]
     AuditClient {
         /// Daemon gRPC endpoint URI.
@@ -1797,8 +1797,7 @@ struct DriveUnloadArgs {
 
 #[derive(Subcommand, Debug)]
 enum AuditClientCommand {
-    /// Stream earlier-version audit segments in the half-open interval [since, until).
-    /// Shows no history of this version's operations and does not read the library log.
+    /// Stream the library log's records in the half-open interval [since, until), one entry per record
     Query {
         /// Inclusive RFC3339 lower bound.
         #[arg(long, value_name = "RFC3339")]
@@ -1806,7 +1805,7 @@ enum AuditClientCommand {
         /// Exclusive RFC3339 upper bound.
         #[arg(long, value_name = "RFC3339")]
         until: String,
-        /// Exact-match filter in k=v form; repeat for multiple fields.
+        /// Filter in k=v form; repeat for multiple fields. Dotless event values also match that record family.
         #[arg(long = "filter", value_name = "K=V")]
         filters: Vec<String>,
     },
@@ -6052,12 +6051,23 @@ fn print_audit_entry(
         write_json_with_capabilities(&mut *out, &value).map_err(|error| error.to_string())?;
         writeln!(out).map_err(|error| error.to_string())
     } else {
+        let subject = value["detail"]["subject"]
+            .as_object()
+            .map(|subject| {
+                format!(
+                    "{}:{}",
+                    subject.get("kind").and_then(Value::as_str).unwrap_or("-"),
+                    subject.get("id").and_then(Value::as_str).unwrap_or("-"),
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
         writeln!(
             out,
-            "{} {} {} {} build={}",
+            "{} {} {} {} {} build={}",
             entry.sequence,
             timestamp_text(entry.timestamp.as_ref()).unwrap_or_else(|| "-".to_string()),
             entry.event_kind,
+            subject,
             entry.actor,
             entry.software_build.as_deref().unwrap_or("legacy-unknown"),
         )
@@ -12837,7 +12847,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         "after_read_medium_partitions",
         || signal_guard.requested_signal_name(),
     )?;
-    let drive_config = match drive.read_config() {
+    let drive_config = match drive.read_config_resolving_worm() {
         Ok(config) => config,
         Err(error) => {
             if let Some(signal) = record_media_readiness_signal_or_command_failure(
@@ -12856,6 +12866,9 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     };
     if drive_config.write_protected {
         return Err("media is write-protected according to MODE SENSE".to_string());
+    }
+    if let Err(e) = remanence_api::require_rewritable_object_media(drive_config) {
+        return Err(format!("tape init refused before any media write: {e}"));
     }
 
     record_media_readiness_signal_if_requested(
@@ -12901,18 +12914,6 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         Some(voltag.as_str()),
         remanence_api::bot_classification_uuid(&bot_projection.classification).as_ref(),
     )?;
-    if matches!(drive_config.worm, WormMediaState::Worm)
-        && !matches!(
-            bot_projection.classification,
-            remanence_api::BotClassification::BlankCheckEod
-        )
-    {
-        return Err(
-            "WORM media already contains data/bootstrap; init refuses to append or rewrite it"
-                .to_string(),
-        );
-    }
-
     let catalog_projection = state.project_catalog_inputs(
         voltag.as_str(),
         &bot_projection.classification,
@@ -18088,6 +18089,83 @@ mod tests {
         assert!(release_fence_via_daemon(&config, "tioq-missing", " ", false).is_err());
     }
 
+    /// The offline config route names the standalone hold and refuses before appending.
+    #[test]
+    fn fence_release_config_route_names_a_standalone_hold() {
+        use remanence_state::library_log as lib;
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        let sequence = state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+                            drive_serial: "HOLD-CONFIG".into(),
+                        })),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        drop(state);
+        let rem = |id: &str| {
+            let cli = Cli::try_parse_from([
+                "rem",
+                "tape",
+                "quarantine",
+                "release",
+                id,
+                "--after-settled-inventory",
+                "--ack",
+                "checked",
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .unwrap();
+            let mut out = Vec::new();
+            let mut errors = Vec::new();
+            let code = run(
+                cli,
+                || panic!("quarantine release must not discover devices"),
+                &mut out,
+                &mut errors,
+            );
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(errors).unwrap(),
+            )
+        };
+        assert_eq!(rem("library:999999").0, ExitCode::from(1));
+        let bytes = || -> u64 {
+            fs::read_dir(root.path().join("audit"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+                .map(|path| fs::metadata(path).unwrap().len())
+                .sum()
+        };
+        let before = bytes();
+        let (code, out, errors) = rem(&format!("library:{sequence}"));
+        assert_eq!(code, ExitCode::from(1), "{out}\n{errors}");
+        let expected = format!("fence library:{sequence} holds standalone drive HOLD-CONFIG; stop the daemon and run `rem tape quarantine release library:{sequence} --device PATH --allow-device HOLD-CONFIG --ack TEXT` as a standalone command");
+        assert!(errors.contains(&expected), "{errors}");
+        assert_eq!(bytes(), before);
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert!(state.library_runtime().active_fence(sequence).is_some());
+    }
+
     /// Keep typed daemon ownership and raise a tape fence through its library authority.
     fn fence_release_test_state(config: &Path) -> (remanence_state::StateHandle, String) {
         use remanence_state::library_log as lib;
@@ -19704,7 +19782,7 @@ mod tests {
             compression,
             max_block_size_bytes: 8 * 1024 * 1024,
             write_protected: false,
-            worm: WormMediaState::NotWorm,
+            worm: remanence_library::WormMediaState::NotWorm,
         }
     }
 
@@ -19881,6 +19959,42 @@ mod tests {
             "0x0102",
         ])
         .is_err());
+    }
+
+    /// Library-history text includes the subject, including absent identities and old detail.
+    #[test]
+    fn audit_entry_text_includes_subject() {
+        for (detail, subject) in [
+            (
+                r#"{"subject":{"kind":"tape","id":"550e8400-e29b-41d4-a716-446655440000"}}"#,
+                "tape:550e8400-e29b-41d4-a716-446655440000",
+            ),
+            (r#"{"subject":{"kind":"tape","id":null}}"#, "tape:-"),
+            ("{}", "-"),
+        ] {
+            let mut out = Vec::new();
+            print_audit_entry(
+                pb::AuditEntry {
+                    sequence: 7,
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 0,
+                        nanos: 0,
+                    }),
+                    event_kind: "Retire".into(),
+                    actor: "system".into(),
+                    detail_json: detail.into(),
+                    software_build: Some("recorded-build".into()),
+                    ..Default::default()
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("7 1970-01-01T00:00:00Z Retire {subject} system build=recorded-build\n")
+            );
+        }
     }
 
     #[test]
@@ -23865,6 +23979,22 @@ pool_id = "init-test"
         .expect("seed committed copy");
     }
 
+    /// Blank WORM media must be refused before its otherwise valid bootstrap writes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_blank_worm_refuses_before_writes() {
+        let run = run_tape_init_on_bot_with_medium_type(Some(vec![]), |_, _| {}, &[], "", 0x9c);
+        assert_ne!(run.code, ExitCode::SUCCESS, "{}", run.stderr);
+        assert!(
+            run.stderr
+                .contains("tape init refused before any media write"),
+            "{}",
+            run.stderr
+        );
+        assert!(run.stderr.contains("ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail"), "{}", run.stderr);
+        assert_eq!(run.writes, 0);
+    }
+
     /// Like [`run_tape_init_on_bot`], with `seed(config_path, state_root)`
     /// preparing state before init runs; init may refuse before any device IO.
     #[cfg(target_os = "linux")]
@@ -23873,6 +24003,18 @@ pool_id = "init-test"
         seed: impl FnOnce(&Path, &Path),
         extra: &[&str],
         input_text: &str,
+    ) -> UnknownTapeInitRun {
+        run_tape_init_on_bot_with_medium_type(bot_reads, seed, extra, input_text, 0x98)
+    }
+
+    /// Script the medium-type header independently of blank or used BOT contents.
+    #[cfg(target_os = "linux")]
+    fn run_tape_init_on_bot_with_medium_type(
+        bot_reads: Option<Vec<Option<Vec<u8>>>>,
+        seed: impl FnOnce(&Path, &Path),
+        extra: &[&str],
+        input_text: &str,
+        medium_type: u8,
     ) -> UnknownTapeInitRun {
         let temp = tempfile::tempdir().expect("temp state directory");
         let config_path = write_retire_test_config(temp.path());
@@ -23913,7 +24055,7 @@ pool_id = "init-test"
         }];
         let mut mode_page = vec![0u8; 28];
         mode_page[0] = 27;
-        mode_page[1] = 0x98;
+        mode_page[1] = medium_type;
         mode_page[2] = 0x10;
         mode_page[3] = 8;
         mode_page[12] = 0x0f;
@@ -30489,7 +30631,8 @@ blob Project/Render Files/
         }
     }
 
-    /// Exercise offline wait-ready with the same runtime and drive observation as tape init.
+    /// Exercise offline wait-ready with the drive observation tape init makes. With `crash_left`, the intent
+    /// belongs to a runtime closed before the route, as after a crash; only the route reconciles it.
     #[cfg(target_os = "linux")]
     fn wbr_wait_route(
         keep_initializing: bool,
@@ -30499,13 +30642,13 @@ blob Project/Render Files/
         Result<TapeWaitReadyResult, TapeWaitReadyFailure>,
     ) {
         use remanence_library::motion::{MotionAuthority, MotionCommand, MotionContext};
-        let init = virtual_tape_init(0);
+        let mut init = virtual_tape_init(0);
         let library = {
             let mut world = init.world.lock().unwrap();
             world.leave_cartridge_unthreaded(0x0100);
             world.library_snapshot()
         };
-        if crash_left {
+        let handles = if crash_left {
             let command = MotionCommand::Move {
                 library_serial: "LIB-A".into(),
                 source: 0x0400,
@@ -30519,7 +30662,23 @@ blob Project/Render Files/
                 .state
                 .library_runtime()
                 .requires_reconciliation(&command));
-        }
+            drop(init.drive);
+            drop(init._handle);
+            drop(init.state);
+            init.state = runtime_backed_state(init.temp.path()).1;
+            // Reopening reconciles nothing: the intent is still unresolved and no longer owned.
+            assert!(init
+                .state
+                .library_runtime()
+                .requires_reconciliation(&command));
+            assert!(init
+                .state
+                .library_runtime()
+                .unowned_motion_unresolved("LIB-A"));
+            None
+        } else {
+            Some((init._handle, init.drive))
+        };
         let factory_world = Arc::clone(&init.world);
         TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
             assert!(slot.borrow().is_none());
@@ -30560,6 +30719,37 @@ blob Project/Render Files/
             &mut init.state.write_handle(),
         );
         TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow().is_none()));
+        let (handle, drive) = match handles {
+            Some(handles) => handles,
+            None => {
+                let factory_world = Arc::clone(&init.world);
+                TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(move |path| {
+                        let role = factory_world
+                            .lock()
+                            .unwrap()
+                            .role_for_path(path)
+                            .expect("model path");
+                        Ok(Box::new(remanence_chaos::model::ModelTransport::new(
+                            Arc::clone(&factory_world),
+                            role,
+                        )))
+                    }));
+                });
+                let policy = StaticAllowlist::new(["LIB-A"]);
+                let mut handle =
+                    open_library_handle(&library, &policy).expect("open the model library");
+                handle.set_motion_authority(Arc::new(
+                    init.state.motion_authority().expect("the reopened runtime"),
+                ));
+                let drive = handle.open_drive(0x0100, &policy).expect("open the drive");
+                TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow().is_none()));
+                (handle, drive)
+            }
+        };
+        init._handle = handle;
+        init.drive = drive;
         (init, result)
     }
 

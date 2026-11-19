@@ -677,7 +677,7 @@ pub enum ObjectWriteMediaError {
 
 /// Require positive drive evidence that ordinary Object ingest can replace a
 /// torn, uncommitted tail after restart.
-pub(crate) fn require_rewritable_object_media(
+pub fn require_rewritable_object_media(
     current_cfg: TapeConfig,
 ) -> Result<(), ObjectWriteMediaError> {
     if current_cfg.write_protected {

@@ -750,7 +750,10 @@ fn send_proof_frontier(
         if let Some(terminal) = terminal {
             terminal.record(
                 ReadTerminalPriority::ScsiRoot,
-                Status::internal(format!("read position proof: {error}")),
+                crate::closeout_obligation::attach_outcome_labels(
+                    error.outcome(),
+                    Status::internal(format!("read position proof: {error}")),
+                ),
             );
         }
         SubmitterExit::Fault(error)
@@ -1059,7 +1062,10 @@ fn run_read_pipeline<T: Send>(
                         if let Some(terminal) = &config.terminal {
                             terminal.record(
                                 ReadTerminalPriority::ScsiRoot,
-                                Status::internal(format!("tape read: {error}")),
+                                crate::closeout_obligation::attach_outcome_labels(
+                                    error.outcome(),
+                                    Status::internal(format!("tape read: {error}")),
+                                ),
                             );
                         }
                         match delivery_tx.send(Err(error)) {
@@ -1873,6 +1879,7 @@ mod tests {
             .without_time()
             .with_writer(writer)
             .finish();
+        crate::tests::ensure_log_capture_anchor();
         let result = tracing::subscriber::with_default(subscriber, run);
         let output = String::from_utf8(
             bytes
@@ -3919,6 +3926,14 @@ mod tests {
                     "{case}: returned {err:?}, expected {expected_error:?}"
                 ));
             }
+            assert_eq!(
+                status
+                    .metadata()
+                    .get("remanence-retry")
+                    .map(|value| value.to_str().unwrap()),
+                Some("transient"),
+                "{case}: the winning drive fault retains its retry label"
+            );
             if status.code() != tonic::Code::Internal || status.message() != expected_status {
                 failures.push(format!(
                     "{case}: terminal status {:?} {:?}, expected Internal {expected_status:?}",

@@ -119,7 +119,12 @@ pub trait MotionAuthority: Send + Sync {
     fn requires_reconciliation(&self, _command: &MotionCommand) -> bool {
         false
     }
+    /// Whether this library has unresolved motion with no live owner in this process.
+    fn unowned_motion_unresolved(&self, _library_serial: &str) -> bool {
+        false
+    }
     /// Resolve only this changer's open/Unknown intents after a fresh full RES.
+    /// Intents still owned by this runtime instance are left open.
     fn reconcile_inventory(&self, _observed: &crate::Library) -> Result<(), MotionAuthorityError> {
         Err(MotionAuthorityError {
             message: "startup inventory resolver is unavailable".into(),
@@ -127,6 +132,7 @@ pub trait MotionAuthority: Send + Sync {
         })
     }
     /// Resolve only this standalone endpoint after matching TUR/READ POSITION.
+    /// Intents still owned by this runtime instance are left open.
     fn reconcile_standalone(&self, _endpoint: &DriveKey) -> Result<(), MotionAuthorityError> {
         Err(MotionAuthorityError {
             message: "startup standalone resolver is unavailable".into(),

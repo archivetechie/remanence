@@ -897,7 +897,17 @@ fn medium_configuration_parser_rejects_malformed() {
     short_header_length[14..].fill(1);
     let mut descriptor_past_end = response.clone();
     descriptor_past_end[3] = 255;
-    for malformed in [spf, empty_page, short_header_length, descriptor_past_end] {
+    let declared_past_reply = vec![0x06, 0x00, 0x00, 0x00, 0x1d, 0x1e, 0x00];
+    let mut padded_short_reply = declared_past_reply.clone();
+    padded_short_reply.resize(44, 0);
+    for malformed in [
+        spf,
+        empty_page,
+        short_header_length,
+        descriptor_past_end,
+        declared_past_reply,
+        padded_short_reply,
+    ] {
         assert_eq!(
             worm_state_from_medium_configuration(&malformed),
             WormMediaState::Unknown,
@@ -981,6 +991,50 @@ fn parse_mode_sense_rejects_wrong_page_code() {
             ..
         } => assert!(msg.contains("0x10")),
         other => panic!("expected MalformedModeResponse, got {other:?}"),
+    }
+}
+
+/// Each header/page combination preserves either WORM veto, including both conflicts.
+#[test]
+fn combine_worm_evidence_all_rows() {
+    use WormMediaState::{NotWorm, Unknown, Worm};
+    for (header, page, expected, media) in [
+        (NotWorm, None, WormVerdict::NotWorm, NotWorm),
+        (NotWorm, Some(Unknown), WormVerdict::NotWorm, NotWorm),
+        (NotWorm, Some(NotWorm), WormVerdict::NotWorm, NotWorm),
+        (
+            NotWorm,
+            Some(Worm),
+            WormVerdict::Conflict {
+                header: NotWorm,
+                page: Worm,
+            },
+            Worm,
+        ),
+        (Worm, None, WormVerdict::Worm, Worm),
+        (Worm, Some(Unknown), WormVerdict::Worm, Worm),
+        (Worm, Some(Worm), WormVerdict::Worm, Worm),
+        (
+            Worm,
+            Some(NotWorm),
+            WormVerdict::Conflict {
+                header: Worm,
+                page: NotWorm,
+            },
+            Worm,
+        ),
+        (Unknown, Some(NotWorm), WormVerdict::NotWorm, NotWorm),
+        (Unknown, Some(Worm), WormVerdict::Worm, Worm),
+        (Unknown, None, WormVerdict::Unknown, Unknown),
+        (Unknown, Some(Unknown), WormVerdict::Unknown, Unknown),
+    ] {
+        let verdict = combine_worm_evidence(header, page);
+        assert_eq!(verdict, expected, "header={header:?}, page={page:?}");
+        assert_eq!(
+            verdict.media_state(),
+            media,
+            "header={header:?}, page={page:?}"
+        );
     }
 }
 

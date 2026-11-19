@@ -25,6 +25,8 @@ pub mod codec;
 #[cfg(test)]
 mod differential_tests;
 pub mod fold;
+pub(crate) mod history;
+pub use history::{HistoryEnd, HistoryEntry, HistoryHead};
 mod index;
 pub mod native_view;
 #[cfg(test)]

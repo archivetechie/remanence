@@ -18,22 +18,29 @@ pub(crate) const SESSION_OPEN_CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration
 #[cfg(not(test))]
 pub(crate) const SESSION_OPEN_CONDITIONAL_LOAD_SETTLE: StdDuration = StdDuration::from_secs(1);
 
+/// Tape-fence policy for the shared readiness probe, before any LOAD.
+pub(crate) enum FenceAdmission {
+    Refuse,
+    Read,
+    Recover(crate::TapeUuid),
+}
+
 pub(crate) fn session_open_short_probe_or_load(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
-    session_open_short_probe_or_load_inner(index, drive, ctx, None)
+    session_open_short_probe_or_load_inner(index, drive, ctx, FenceAdmission::Refuse)
 }
 
-/// The supersede alone supplies a recovery identity; all probing stays shared.
+/// Read and recovery admission share the same readiness probing.
 pub(crate) fn session_open_short_probe_or_load_inner(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     ctx: SessionOpenReadinessContext<'_>,
-    recovering_tape: Option<crate::TapeUuid>,
+    admission: FenceAdmission,
 ) -> Result<(), Status> {
-    session_open_reject_admission_conflicts_inner(index, &ctx, recovering_tape)?;
+    session_open_reject_admission_conflicts_inner(index, &ctx, admission)?;
     let family = session_open_media_family(
         index
             .readiness_media_observation(ctx.barcode)
@@ -241,40 +248,42 @@ pub(crate) struct DriveReadinessPoll<'a> {
 /// a second resume) does not repeat a LOAD the operation already sent; a
 /// `ready` observation re-arms it. Only the dispatch gate's durable MotionIntent
 /// consumes the attempt; a pre-intent refusal consumes no budget.
+/// Every non-shutdown exit attempts to record any still-parked LOAD Unknown; the result is unchanged.
 pub(crate) fn poll_drive_media_readiness(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     request: DriveReadinessPoll<'_>,
     handle: &crate::operations::OperationHandle,
 ) -> Result<MediaReadinessPoll, DriveReadinessError> {
-    let DriveReadinessPoll {
-        bay,
-        operation_id,
-        family,
-        options,
-        cartridge_in_drive,
-        phase,
-    } = request;
-    let load_budget = if cartridge_in_drive {
-        crate::startup_media_readiness::media_readiness_initializing_load_budget(
-            index,
+    let result = (|| {
+        let DriveReadinessPoll {
+            bay,
             operation_id,
-        )
-        .map_err(|error| format!("count media readiness LOAD attempts: {error}"))?
-    } else {
-        0
-    };
-    let endpoint = drive
-        .library_serial()
-        .map(|serial| format!("library={serial} drive=0x{bay:04x}"))
-        .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
-    let mut last_logged: Option<LoggedReadiness> = None;
-    let mut interruption = None;
-    let mut load_admission = None;
-    let refused = std::cell::Cell::new(false);
-    #[cfg(test)]
-    let mut attempted_readiness = None;
-    let result = drive.with_readiness_operation(*operation_id.as_bytes(), |drive| drive.wait_for_media_readiness_with_load_admission(
+            family,
+            options,
+            cartridge_in_drive,
+            phase,
+        } = request;
+        let load_budget = if cartridge_in_drive {
+            crate::startup_media_readiness::media_readiness_initializing_load_budget(
+                index,
+                operation_id,
+            )
+            .map_err(|error| format!("count media readiness LOAD attempts: {error}"))?
+        } else {
+            0
+        };
+        let endpoint = drive
+            .library_serial()
+            .map(|serial| format!("library={serial} drive=0x{bay:04x}"))
+            .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
+        let mut last_logged: Option<LoggedReadiness> = None;
+        let mut interruption = None;
+        let mut load_admission = None;
+        let refused = std::cell::Cell::new(false);
+        #[cfg(test)]
+        let mut attempted_readiness = None;
+        let result = drive.with_readiness_operation(*operation_id.as_bytes(), |drive| drive.wait_for_media_readiness_with_load_admission(
         family,
         None,
         options,
@@ -406,20 +415,27 @@ pub(crate) fn poll_drive_media_readiness(
             Ok(())
         },
     ));
-    if refused.get() {
-        #[cfg(test)]
-        if index.library_runtime().is_none() {
-            record_refused_load(
-                index,
-                operation_id,
-                attempted_readiness
-                    .as_ref()
-                    .expect("LOAD write-ahead precedes admission"),
-            )?;
+        if refused.get() {
+            #[cfg(test)]
+            if index.library_runtime().is_none() {
+                record_refused_load(
+                    index,
+                    operation_id,
+                    attempted_readiness
+                        .as_ref()
+                        .expect("LOAD write-ahead precedes admission"),
+                )?;
+            }
+            return Err(DriveReadinessError::Shutdown);
         }
-        return Err(DriveReadinessError::Shutdown);
+        result.map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
+    })();
+    if !matches!(result, Err(DriveReadinessError::Shutdown)) {
+        if let Err(error) = drive.abandon_readiness_loads() {
+            tracing::warn!(operation_id = %handle.op_id_uuid(), %error, "abandon readiness LOADs failed");
+        }
     }
-    result.map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
+    result
 }
 
 /// Append proof that the immediately preceding LOAD write-ahead sent no command.
@@ -452,14 +468,14 @@ pub(crate) fn session_open_reject_admission_conflicts(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
-    session_open_reject_admission_conflicts_inner(index, ctx, None)
+    session_open_reject_admission_conflicts_inner(index, ctx, FenceAdmission::Refuse)
 }
 
-/// Keep drive, readiness and motion admission intact around the suffix exception.
+/// Keep drive, readiness and motion admission intact around the tail-recovery exception.
 pub(crate) fn session_open_reject_admission_conflicts_inner(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
-    recovering_tape: Option<crate::TapeUuid>,
+    admission: FenceAdmission,
 ) -> Result<(), Status> {
     let endpoint = remanence_state::DriveKey::new(ctx.library_serial, ctx.bay);
     if let Some(runtime) = index.library_runtime() {
@@ -471,27 +487,28 @@ pub(crate) fn session_open_reject_admission_conflicts_inner(
             )
             .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
     }
-    if index
-        .tape_io_is_fenced(None, ctx.barcode, Some(&endpoint))
-        .map_err(status_from_state_error)?
-    {
-        // Only the supersede supplies its resolved tape UUID; a mismatch fails closed by scope.
-        let allowed = match recovering_tape {
-            Some(tape) => crate::tape_admission::only_recoverable_suffix_fences(
-                index,
-                index.library_runtime().as_ref(),
-                &tape,
-                ctx.barcode,
-                Some(&endpoint),
-            )
-            .map_err(status_from_state_error)?,
-            None => false,
-        };
-        if !allowed {
-            return Err(Status::failed_precondition(
-                "readiness blocked by active tape-I/O fence",
-            ));
-        }
+    let fences = index
+        .tape_io_matching_fences(None, ctx.barcode, Some(&endpoint))
+        .map_err(status_from_state_error)?;
+    let blocks = match admission {
+        FenceAdmission::Refuse => !fences.is_empty(),
+        FenceAdmission::Read => crate::tape_admission::tape_io_rows_block(
+            &fences,
+            index.library_runtime().as_ref(),
+            None,
+            remanence_state::library_runtime::TapeIoPass::Read,
+        ),
+        FenceAdmission::Recover(tape) => crate::tape_admission::tape_io_rows_block(
+            &fences,
+            index.library_runtime().as_ref(),
+            Some(&tape),
+            remanence_state::library_runtime::TapeIoPass::Motion,
+        ),
+    };
+    if blocks {
+        return Err(Status::failed_precondition(
+            "readiness blocked by active tape-I/O fence",
+        ));
     }
     let conflicts = index
         .media_readiness_admission_conflicts(ctx.library_serial, Some(ctx.bay), ctx.barcode, false)

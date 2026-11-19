@@ -29,8 +29,16 @@ These additions extend `proto/layer5.proto` without changing existing field tags
 `ReleaseTapeIoFence` refuses an empty or whitespace-only acknowledgment with
 `INVALID_ARGUMENT` and `acknowledgment must not be empty`. Release requires a
 `library:` tape-fence id. An id without a typed source identity is refused with
-`FAILED_PRECONDITION` and `fence has no typed library source identity`; a
-drive-scoped source is refused with `fence is not tape-scoped`. For a typed tape
+`FAILED_PRECONDITION` and a message containing
+`fence has no typed library source identity`; a bay-scoped drive fence is
+refused with a message containing `fence is not tape-scoped`. A standalone
+drive hold is refused with `FAILED_PRECONDITION` and a message containing:
+
+```text
+fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT` as a standalone command
+```
+
+The hold refusal appends no release record. For a typed tape
 id with no record, the RPC returns `NOT_FOUND`. A released id returns its
 original record unchanged.
 
@@ -61,5 +69,21 @@ Tape and drive failures can reach clients as gRPC `INTERNAL`,
 `FAILED_PRECONDITION` or `UNAVAILABLE`. Such a status may carry the
 `remanence-retry` metadata label: `transient`, `operator` or `media` describes
 what kind of intervention helps. A status without the label gives no such
-advice; the label is not promised for every failure or RPC. `DATA_LOSS` means
-a digest or checksum failure.
+advice; the label is not promised for every failure or RPC. Among other uses,
+`DATA_LOSS` reports a file-digest, manifest-digest or tar-header checksum
+mismatch on a verified whole-object read. An audit query also ends with
+`DATA_LOSS` if its history walk encounters a damaged library-log segment.
+
+A read-session `ReadObjectRange` or `ReadFile` fails with `INTERNAL` carrying
+`remanence-finding: media-damage` when a READ of the object's recorded blocks
+reports a medium error, an unrecovered read error, a recorded entity not found,
+a blank region, or a record length different from the expected length (a current
+incorrect-length indication, ILI). An error the drive reports, or a mismatch
+the daemon finds, while positioning to the data is not so classified, nor is a
+short transfer reported as good, a filemark, a transport fault, or a hardware
+fault (sense key 4) other than an unrecovered read error or a recorded entity
+not found. The same status carries `remanence-retry`: `media` when the drive
+reports a medium or hardware error, `transient` otherwise (a blank region, or an
+ILI alone); the finding's advice holds either way. It means this copy could
+not be read here: read another copy. It does not by itself prove the medium is
+bad; a dirty head in one drive can give the same answer.

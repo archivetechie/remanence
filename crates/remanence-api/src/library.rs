@@ -1408,7 +1408,7 @@ mod tests {
         DiscoveryReport, DriveBay, ElementException, ElementLayout, IdentitySource, IePort,
         InstalledDrive, Library, Slot,
     };
-    use remanence_state::{DriveObservationInput, FileAuditLog};
+    use remanence_state::DriveObservationInput;
 
     use super::*;
     use crate::pb::library_service_server::LibraryService as _;
@@ -1500,20 +1500,36 @@ mod tests {
         }
     }
 
-    fn test_index() -> CatalogIndex {
-        let dir = std::env::temp_dir().join(format!("remanence-api-lib-{}", Uuid::new_v4()));
-        remanence_state::projector::open(dir.join("state.sqlite"))
-            .map(|catalog| catalog.write_handle())
-            .expect("open test index")
+    /// Keep the typed library log and its temporary directory alive with the service state.
+    struct TestState {
+        state: ApiState,
+        root: crate::tests::TypedRoot,
     }
 
-    fn state_with_snapshot() -> ApiState {
-        let mut state = ApiState::new({
-            let index = test_index();
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        });
+    impl std::ops::Deref for TestState {
+        type Target = ApiState;
+
+        fn deref(&self) -> &Self::Target {
+            &self.state
+        }
+    }
+
+    impl std::ops::DerefMut for TestState {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.state
+        }
+    }
+
+    /// Build the snapshot service over one typed root and its own catalogue path.
+    fn state_with_snapshot() -> TestState {
+        let root = crate::tests::TypedRoot::open();
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
+        TestState { state, root }
+    }
+
+    /// Install the same discovery snapshot for raw and typed test states.
+    fn set_test_snapshot(state: &mut ApiState) {
         state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
@@ -1527,7 +1543,6 @@ mod tests {
                 captured_at: OffsetDateTime::UNIX_EPOCH,
             },
         ))));
-        state
     }
 
     fn observe_test_drive(
@@ -1556,10 +1571,37 @@ mod tests {
                 managed: "rem".to_string(),
                 library_serial: Some(library_serial.to_string()),
                 element_address: Some(bay),
-                observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
+                observed_at_utc: None,
             })
             .expect("observe test drive")
             .drive_uuid
+    }
+
+    /// Retire a just-discovered drive through the typed stewardship authority (generation one).
+    fn retire_observed_drive(root: &crate::tests::TypedRoot, drive_uuid: &[u8], reason: &str) {
+        use remanence_state::library_log as lib;
+        root.catalog()
+            .library_runtime()
+            .unwrap()
+            .append(|authority, view| {
+                authority.drive_decision(
+                    lib::DriveDecision {
+                        drive_uuid: drive_uuid.try_into().unwrap(),
+                        decision: lib::Stewardship::Retire(lib::Reason {
+                            reason: reason.into(),
+                        }),
+                        change: lib::GenerationChange {
+                            expected: 1,
+                            next: 2,
+                        },
+                    },
+                    1,
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    view,
+                )
+            })
+            .expect("retire observed drive");
     }
 
     #[test]
@@ -1772,26 +1814,24 @@ mod tests {
 
     #[tokio::test]
     async fn list_libraries_empty_without_snapshot() {
-        let response = ApiState::new({
-            let index = test_index();
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .list_libraries(Request::new(()))
-        .await
-        .expect("list libraries")
-        .into_inner();
+        let root = crate::tests::TypedRoot::open();
+        let response = root
+            .api_state()
+            .library_service()
+            .list_libraries(Request::new(()))
+            .await
+            .expect("list libraries")
+            .into_inner();
         assert!(response.libraries.is_empty());
     }
 
     #[tokio::test]
     async fn get_library_returns_catalog_enriched_state_for_known_uuid() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "8031BDC7D1", "DvcidInline", 1);
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
         let response = state
             .library_service()
             .get_library(Request::new(pb::GetLibraryRequest {
@@ -1875,7 +1915,8 @@ mod tests {
             .expect("second library drive")
             .serial = "SECOND-DRIVE".to_string();
 
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let first_drive_uuid = observe_test_drive_in_library(
             &mut index,
             "8031BDC7D1",
@@ -1892,12 +1933,7 @@ mod tests {
         );
         assert_ne!(first_drive_uuid, second_drive_uuid);
 
-        let mut state = ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        });
+        let mut state = root.api_state();
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
@@ -1963,14 +1999,12 @@ mod tests {
 
     #[tokio::test]
     async fn get_library_preserves_retired_drive_identity() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "8031BDC7D1", "DvcidInline", 1);
-        index
-            .retire_drive(drive_uuid.as_slice(), "get-library regression")
-            .expect("retire drive")
-            .expect("drive exists");
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        retire_observed_drive(&root, &drive_uuid, "get-library regression");
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
 
         let response = state
             .library_service()
@@ -2014,18 +2048,15 @@ mod tests {
 
     #[tokio::test]
     async fn get_library_missing_snapshot_is_not_found() {
-        let err = ApiState::new({
-            let index = test_index();
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .get_library(Request::new(pb::GetLibraryRequest {
-            library_uuid: vec![0u8; 16],
-        }))
-        .await
-        .expect_err("missing snapshot");
+        let root = crate::tests::TypedRoot::open();
+        let err = root
+            .api_state()
+            .library_service()
+            .get_library(Request::new(pb::GetLibraryRequest {
+                library_uuid: vec![0u8; 16],
+            }))
+            .await
+            .expect_err("missing snapshot");
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
@@ -2254,23 +2285,30 @@ mod tests {
 
     /// Watch admission is currently infallible for a just-registered operation;
     /// exercise its terminal publication helper with the same request audit.
-    #[test]
-    fn b8_watch_admission_failure_has_terminal_audit() {
-        let state = state_with_snapshot();
-        let id = Uuid::new_v4();
-        state
-            .record_library_request_received(
+    #[tokio::test]
+    async fn b8_watch_admission_failure_has_terminal_audit() {
+        use remanence_state::library_log as lib;
+        let TestState { state, mut root } = state_with_snapshot();
+        let fingerprint = crate::operation_source::robotics_fingerprint(
+            "DEC418146K_LL02",
+            &crate::write_owner::RoboticsAction::Unload {
+                bay: 1,
+                destination: None,
+            },
+        );
+        let id = state
+            .accept_owner_request(
                 remanence_state::AuditActor::System,
-                id,
-                "unload",
-                "DEC418146K_LL02",
-                BTreeMap::new(),
+                "unload_drive",
+                "library",
+                "DEC418146K_LL02".into(),
+                fingerprint,
             )
             .unwrap();
-        let handle = state.operations.register(id, "unload");
+        let handle = state.operations.register(id, "unload_drive");
         state.library_service().publish_watch_failure(
             id,
-            "unload",
+            "unload_drive",
             &handle,
             &Status::not_found("watch unavailable"),
         );
@@ -2278,19 +2316,27 @@ mod tests {
             state.operations.latest(&id).unwrap().state,
             pb::OperationState::Failed as i32
         );
-        let rows = FileAuditLog::replay(state.audit_dir.as_ref()).unwrap();
-        let events: Vec<_> = rows
-            .iter()
-            .filter(|r| r.operation_id == Some(id))
-            .map(|r| r.event.clone())
-            .collect();
-        assert_eq!(
-            events,
-            vec![
-                remanence_state::AuditEvent::RequestReceived,
-                remanence_state::AuditEvent::OperationFailed
+        drop((handle, state));
+        let chain = root.operation_chain(id).await;
+        let events: Vec<_> = chain.iter().map(|record| &record.event).collect();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                lib::OperationEvent::Accepted(_),
+                lib::OperationEvent::Failed(_)
             ]
-        );
+        ));
+        assert!(chain
+            .iter()
+            .all(|record| record.kind == lib::OperationKind::UnloadDrive));
+        let lib::OperationEvent::Accepted(accepted) = &chain[0].event else {
+            unreachable!()
+        };
+        assert_eq!(accepted.request_fingerprint, fingerprint);
+        let lib::OperationEvent::Failed(failed) = &chain[1].event else {
+            unreachable!()
+        };
+        assert_eq!(failed.summary.as_str(), "watch unavailable");
     }
 
     #[test]
@@ -2440,7 +2486,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_drive_requires_robotics_permission_before_drive_pool_lookup() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         observe_test_drive(&mut index, "DRV-POLL", "DvcidAndInquiry", 0x0100);
         let mut request = Request::new(pb::PollDriveRequest {
             drive: "DRV-POLL".to_string(),
@@ -2450,37 +2497,30 @@ mod tests {
             .metadata_mut()
             .insert("x-remanence-role", "readonly".parse().unwrap());
 
-        let err = ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .poll_drive(request)
-        .await
-        .expect_err("readonly role must not poll drive health");
+        let err = root
+            .api_state()
+            .library_service()
+            .poll_drive(request)
+            .await
+            .expect_err("readonly role must not poll drive health");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
     async fn poll_drive_rejects_derived_identity_without_opt_in() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         observe_test_drive(&mut index, "DRV-POLL-DERIVED", "Derived", 0x0100);
 
-        let err = ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .poll_drive(Request::new(pb::PollDriveRequest {
-            drive: "DRV-POLL-DERIVED".to_string(),
-            allow_derived_identity: false,
-        }))
-        .await
-        .expect_err("derived identity must reject before drive pool lookup");
+        let err = root
+            .api_state()
+            .library_service()
+            .poll_drive(Request::new(pb::PollDriveRequest {
+                drive: "DRV-POLL-DERIVED".to_string(),
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("derived identity must reject before drive pool lookup");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("Derived"));
     }
@@ -2490,114 +2530,44 @@ mod tests {
     /// reinstatement record cite.
     #[tokio::test]
     async fn retire_drive_rejects_empty_reason_before_lookup() {
-        let err = ApiState::new({
-            let index = test_index();
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .retire_drive(Request::new(pb::RetireDriveRequest {
-            drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
-            reason: "   ".to_string(),
-            allow_derived_identity: false,
-        }))
-        .await
-        .expect_err("an empty reason must reject");
+        let root = crate::tests::TypedRoot::open();
+        let err = root
+            .api_state()
+            .library_service()
+            .retire_drive(Request::new(pb::RetireDriveRequest {
+                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+                reason: "   ".to_string(),
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("an empty reason must reject");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("reason"));
     }
 
     #[tokio::test]
     async fn reinstate_drive_rejects_empty_reason_before_lookup() {
-        let err = ApiState::new({
-            let index = test_index();
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .reinstate_drive(Request::new(pb::ReinstateDriveRequest {
-            drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
-            reason: String::new(),
-            allow_derived_identity: false,
-        }))
-        .await
-        .expect_err("an empty reason must reject");
+        let root = crate::tests::TypedRoot::open();
+        let err = root
+            .api_state()
+            .library_service()
+            .reinstate_drive(Request::new(pb::ReinstateDriveRequest {
+                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+                reason: String::new(),
+                allow_derived_identity: false,
+            }))
+            .await
+            .expect_err("an empty reason must reject");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("reason"));
     }
 
     #[tokio::test]
-    async fn retire_drive_rejects_derived_identity_without_opt_in() {
-        let mut index = test_index();
-        let drive_uuid = observe_test_drive(&mut index, "DRV-DERIVED", "Derived", 0x0100);
-        let err = ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        })
-        .library_service()
-        .retire_drive(Request::new(pb::RetireDriveRequest {
-            drive_uuid,
-            reason: "removed from fleet".to_string(),
-            allow_derived_identity: false,
-        }))
-        .await
-        .expect_err("derived identity must reject without opt-in");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("Derived"));
-    }
-
-    #[tokio::test]
-    async fn retire_drive_rejects_busy_drive_bay() {
-        let mut index = test_index();
-        let drive_uuid = observe_test_drive(&mut index, "DRV-BUSY", "DvcidAndInquiry", 0x0101);
-        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
-        let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
-        let mut state = ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        });
-        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
-            "DEC418146K_LL02",
-            changer_tx,
-            HashMap::new(),
-            reservations,
-        ));
-
-        let err = state
-            .library_service()
-            .retire_drive(Request::new(pb::RetireDriveRequest {
-                drive_uuid,
-                reason: "removed from fleet".to_string(),
-                allow_derived_identity: false,
-            }))
-            .await
-            .expect_err("busy bay must reject retire");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("active session"));
-    }
-
-    #[tokio::test]
     async fn ack_alarm_rejects_cleared_alarm_without_audit_event() {
-        let mut index = test_index();
-        index
-            .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
-            .expect("raise alarm");
-        index
-            .clear_alarm("no-cln-cart:mainlib")
-            .expect("clear alarm")
-            .expect("cleared row");
-        let state = ApiState::new({
-            let index = index;
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        });
+        let mut root = crate::tests::TypedRoot::open();
+        let state = root.api_state();
+        raise_typed_alarm(&state);
+        clear_typed_alarm(&state);
 
         let err = state
             .library_service()
@@ -2608,16 +2578,16 @@ mod tests {
             .await
             .expect_err("cleared alarm must not ack");
         assert_eq!(err.code(), tonic::Code::NotFound);
-        let audit_records = if state.audit_dir.exists() {
-            FileAuditLog::replay(state.audit_dir.as_ref()).expect("replay audit")
-        } else {
-            Vec::new()
-        };
+        drop(state);
+        let audit_records = root
+            .records(|record| record.alarm_changed().map(|value| value.action.clone()))
+            .await;
         assert!(
-            audit_records
-                .iter()
-                .all(|record| record.event != remanence_state::AuditEvent::AlarmAcked),
-            "cleared alarm ack must not append AlarmAcked audit: {audit_records:?}"
+            audit_records.iter().all(|action| !matches!(
+                action,
+                remanence_state::library_log::AlarmAction::Acknowledge(_)
+            )),
+            "cleared alarm ack must not append Acknowledge audit: {audit_records:?}"
         );
     }
 
@@ -3117,7 +3087,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_live_status_projects_drive_states_counters_and_alarms() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "DRV-LIVE", "DvcidAndInquiry", 1);
         index
             .begin_clean_run(&drive_uuid, "DEC418146K_LL02", "manual", None)
@@ -3130,8 +3101,8 @@ mod tests {
                 Some("{}"),
             )
             .expect("raise alarm");
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
         state.record_drive_read_bytes(Some(drive_uuid.as_slice()), 1_024);
         state.record_drive_write_bytes(Some(drive_uuid.as_slice()), 2_048);
         let counters = state.drive_counters(drive_uuid.as_slice());
@@ -3190,10 +3161,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_live_status_projects_advisory_bay_assignment_and_atomic_enforcement() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "DRV-ASSIGN", "DvcidAndInquiry", 1);
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(1, AtomicBool::new(false))]));
         let pool = crate::write_owner::DrivePool::new_for_library(
@@ -3283,7 +3255,7 @@ mod tests {
             Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
         );
         state.drive_pool = Some(pool.clone());
-        let operation_id = Uuid::from_u128(0x5eed);
+        let operation_id = start_test_readiness(&state);
         ({
             let mut index = state.catalog.write_handle();
             if let Some(pool) = &state.drive_pool {
@@ -3302,7 +3274,7 @@ mod tests {
             barcode: Some("S30002L9".to_string()),
             source_slot: Some(0x040a),
             media_generation: Some(9),
-            media_family: None,
+            media_family: Some(remanence_state::LtoGen::Lto9),
             phase: "session_open_short_probe".to_string(),
             state: "becoming_ready".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
@@ -3318,17 +3290,16 @@ mod tests {
             Ok::<_, tonic::Status>(index)
         })
         .expect("open writable catalog")
-        .record_media_readiness_transition(
-            crate::startup_media_readiness::media_readiness_initializing_load_transition(
-                operation_id,
-                &remanence_library::MediaReadiness::new(
-                    remanence_library::MediaReadinessKind::BecomingReady {
-                        ascq: 0x02,
-                        media_initializing: true,
-                    },
-                ),
-            ),
-        )
+        .record_media_readiness_transition({
+            let observed = model_readiness_probe(true);
+            let mut transition =
+                crate::startup_media_readiness::media_readiness_initializing_load_transition(
+                    operation_id,
+                    &observed,
+                );
+            transition.completion_evidence = Some((&observed.outcome().evidence).into());
+            transition
+        })
         .expect("record the fence's last sense");
         let _first_waiter = pool
             .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
@@ -3367,13 +3338,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_live_status_marks_fenced_drives() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "DRV-FENCED", "DvcidAndInquiry", 1);
         index
             .set_drive_fenced(drive_uuid.as_slice(), true)
             .expect("fence drive");
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
 
         let response = state
             .library_service()
@@ -3389,11 +3361,12 @@ mod tests {
 
     #[tokio::test]
     async fn live_status_counter_epoch_changes_across_state_restarts() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "DRV-EPOCH", "DvcidAndInquiry", 1);
 
-        let mut first = state_with_snapshot();
-        first.index_path = Arc::new(index.path().to_path_buf());
+        let mut first = root.api_state();
+        set_test_snapshot(&mut first);
         first.record_drive_read_bytes(Some(drive_uuid.as_slice()), 1);
         let first_epoch = first
             .library_service()
@@ -3405,8 +3378,8 @@ mod tests {
             .drives[0]
             .counter_epoch;
 
-        let mut second = state_with_snapshot();
-        second.index_path = Arc::new(index.path().to_path_buf());
+        let mut second = root.api_state();
+        set_test_snapshot(&mut second);
         let second_epoch = second
             .library_service()
             .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
@@ -3431,15 +3404,13 @@ mod tests {
     /// with no explanation — permanently, since nothing un-retires a drive.
     #[tokio::test]
     async fn live_status_reports_a_retired_drive_with_its_identity() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "DRV-RETIRED", "DvcidAndInquiry", 1);
-        index
-            .retire_drive(drive_uuid.as_slice(), "panel test")
-            .expect("retire")
-            .expect("drive exists");
+        retire_observed_drive(&root, &drive_uuid, "panel test");
 
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
         let response = state
             .library_service()
             .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
@@ -3464,9 +3435,9 @@ mod tests {
     /// uncatalogued, not as a drive whose identity happens to be empty.
     #[tokio::test]
     async fn live_status_marks_an_uncatalogued_bay() {
-        let index = test_index();
-        let mut state = state_with_snapshot();
-        state.index_path = Arc::new(index.path().to_path_buf());
+        let root = crate::tests::TypedRoot::open();
+        let mut state = root.api_state();
+        set_test_snapshot(&mut state);
         let response = state
             .library_service()
             .get_live_status(Request::new(pb::GetLiveStatusRequest {}))
@@ -3486,7 +3457,8 @@ mod tests {
     /// Reinstatement returns a retired drive to service and is auditable.
     #[tokio::test]
     async fn reinstate_returns_a_retired_drive_to_service() {
-        let mut index = test_index();
+        let root = crate::tests::TypedRoot::open();
+        let mut index = root.catalog().write_handle();
         let drive_uuid = observe_test_drive(&mut index, "DRV-BACK", "DvcidAndInquiry", 1);
         index
             .retire_drive(drive_uuid.as_slice(), "retired in error")
@@ -3564,7 +3536,7 @@ mod tests {
             .expect_err("no owner");
         assert_eq!(err.code(), tonic::Code::Unavailable);
     }
-    /// Build a fenced drive with a controlled actor queue and real reservation pool.
+    /// Keep the raw recording-failure fixture solely for the two R4b tests until CU-1b.
     fn auto_resume_fixture(
         state_name: &str,
     ) -> (
@@ -3572,7 +3544,12 @@ mod tests {
         Uuid,
         tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
     ) {
-        let mut state = state_with_snapshot();
+        let dir = std::env::temp_dir().join(format!("remanence-api-lib-{}", Uuid::new_v4()));
+        let mut state = ApiState::new(
+            remanence_state::projector::open(dir.join("state.sqlite"))
+                .expect("open raw test index"),
+        );
+        set_test_snapshot(&mut state);
         let (changer, _) = tokio::sync::mpsc::channel(1);
         let (drive, rx) = tokio::sync::mpsc::channel(4);
         state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
@@ -3610,12 +3587,130 @@ mod tests {
         (state, id, rx)
     }
 
+    /// Discover the drive before opening the typed readiness operation that owns its fence.
+    fn start_test_readiness(state: &ApiState) -> Uuid {
+        state
+            .catalog
+            .write_handle()
+            .observe_drive(DriveObservationInput {
+                serial: "8031BDC7D1".into(),
+                identity_source: "DvcidInline".into(),
+                vendor: Some("HPE".into()),
+                product: Some("Ultrium 9-SCSI".into()),
+                firmware_rev: Some("R1.0".into()),
+                managed: "rem".into(),
+                library_serial: Some("DEC418146K_LL02".into()),
+                element_address: Some(1),
+                observed_at_utc: None,
+            })
+            .unwrap();
+        Uuid::from_bytes(
+            state
+                .catalog
+                .library_runtime()
+                .unwrap()
+                .start_owned_operation(
+                    remanence_state::library_log::OperationKind::MediaReadinessWait,
+                    remanence_state::AuditActor::System,
+                )
+                .unwrap(),
+        )
+    }
+
+    /// Issue TEST UNIT READY on the fixture's model drive, retaining its completion evidence.
+    fn model_readiness_probe(unthreaded: bool) -> remanence_library::MediaReadiness {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use remanence_library::{MediaFamily, SgTransport, StaticAllowlist};
+
+        let mut world = VirtualWorld::single_drive("DEC418146K_LL02", 1, "8031BDC7D1", 0x400, 1);
+        world.put_tape_in_drive(1, "S30002L9", Some(0x040a), VirtualTape::default());
+        if unthreaded {
+            world.leave_cartridge_unthreaded(1);
+        }
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let model = world.lock().unwrap().library_snapshot();
+        let policy = StaticAllowlist::new(["DEC418146K_LL02"]);
+        let mut library = model
+            .open_with(&policy, move |path| {
+                let role = world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(world.clone(), role)) as Box<dyn SgTransport>)
+            })
+            .unwrap();
+        library
+            .open_drive(1, &policy)
+            .unwrap()
+            .probe_media_readiness(MediaFamily::Lto9OrLater)
+    }
+
+    /// Build a fenced drive with a controlled actor queue and real reservation pool.
+    fn typed_auto_resume_fixture(
+        state_name: &str,
+    ) -> (
+        TestState,
+        Uuid,
+        tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
+    ) {
+        let mut state = state_with_snapshot();
+        let (changer, _) = tokio::sync::mpsc::channel(1);
+        let (drive, rx) = tokio::sync::mpsc::channel(4);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer,
+            HashMap::from([(1, drive)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        ));
+        let id = start_test_readiness(&state);
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("8031BDC7D1".into()),
+            barcode: Some("S30002L9".into()),
+            source_slot: Some(0x040a),
+            media_generation: Some(9),
+            media_family: Some(remanence_state::LtoGen::Lto9),
+            phase: "session_open_short_probe".into(),
+            state: if state_name == "ready" {
+                "becoming_ready"
+            } else {
+                state_name
+            }
+            .into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+        if state_name == "ready" {
+            state
+                .catalog
+                .write_handle()
+                .record_media_readiness_transition(
+                    crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                        id,
+                        &model_readiness_probe(false),
+                    ),
+                )
+                .unwrap();
+        }
+        (state, id, rx)
+    }
+
     /// Client-first and daemon-first starts share one command and one reservation.
     #[tokio::test]
     async fn auto_resume_and_client_attach_in_both_orders() {
         use crate::readiness_wait::*;
         for client_first in [false, true] {
-            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
             if client_first {
                 state
                     .start_readiness_wait(
@@ -3674,7 +3769,7 @@ mod tests {
     /// Runtime discovery retries the refusing caller's reservation and admits robotics after READY.
     #[tokio::test]
     async fn auto_resume_waits_for_reservation_release() {
-        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         let held = state
             .drive_pool()
             .unwrap()
@@ -3730,105 +3825,110 @@ mod tests {
     async fn auto_resume_skips_tape_io_fence_until_rpc_release() {
         use remanence_state::library_log as lib;
 
-        let tape_uuid = [0x31; 16];
-        let root = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "S30002L9")]);
-        let mut state = root.api_state();
-        state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
-        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::live_status::LibrarySnapshot {
-                report: DiscoveryReport {
-                    unattached_drives: Vec::new(),
-                    complete: true,
-                    incomplete_evidence: Vec::new(),
-                    libraries: vec![mk_library()],
-                    warnings: Vec::new(),
-                },
-                captured_at: OffsetDateTime::UNIX_EPOCH,
-            },
-        ))));
-        let (changer, _) = tokio::sync::mpsc::channel(1);
-        let (drive, mut rx) = tokio::sync::mpsc::channel(4);
-        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
-            "DEC418146K_LL02",
-            changer,
-            HashMap::from([(1, drive)]),
-            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
-        ));
-        let runtime = root.catalog().library_runtime().unwrap();
-        let id = Uuid::from_bytes(
-            runtime
-                .start_owned_operation(
-                    lib::OperationKind::MediaReadinessWait,
-                    remanence_state::AuditActor::System,
-                )
-                .unwrap(),
-        );
-        {
-            let mut index = state.catalog.write_handle();
-            index
-                .observe_drive(DriveObservationInput {
-                    serial: "8031BDC7D1".to_string(),
-                    identity_source: "DvcidInline".to_string(),
-                    vendor: Some("HPE".to_string()),
-                    product: Some("Ultrium 9-SCSI".to_string()),
-                    firmware_rev: Some("R1.0".to_string()),
-                    managed: "rem".to_string(),
-                    library_serial: Some("DEC418146K_LL02".to_string()),
-                    element_address: Some(1),
-                    observed_at_utc: None,
-                })
-                .unwrap();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        }
-        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-            operation_id: id,
-            run_id: None,
-            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
-            changer_sg: None,
-            drive_sg: None,
-            drive_serial: Some("8031BDC7D1".into()),
-            barcode: Some("S30002L9".into()),
-            source_slot: Some(0x040a),
-            media_generation: Some(9),
-            media_family: Some(remanence_state::LtoGen::Lto9),
-            phase: "session_open_short_probe".into(),
-            state: "becoming_ready".into(),
-            dirty_scope: Some("drive+tape".into()),
-            deadline_at_utc: None,
-            evidence_path: None,
-        })
-        .unwrap();
-        // This RPC releases tape fences; typed drive fences have their own release path.
-        let fence = runtime
-            .append(|a, view| {
-                a.fence_raised(
-                    lib::FenceRaised {
-                        kind: lib::FenceKind::Write,
-                        scope: lib::FenceScope::Tape(lib::TapeRef {
-                            uuid: tape_uuid,
-                            incarnation: 1,
-                        }),
-                        cause: lib::FenceCause::TransferError,
-                        evidence: None,
-                        at: None,
-                        operation: None,
-                        detail: lib::Bounded(vec![]),
+        for cause in [
+            lib::FenceCause::TransferError,
+            lib::FenceCause::AppendAdmissionRefused,
+        ] {
+            let tape_uuid = [0x31; 16];
+            let root = crate::tests::TypedRoot::open_with_tapes(&[(tape_uuid, "S30002L9")]);
+            let mut state = root.api_state();
+            state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
+            state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::live_status::LibrarySnapshot {
+                    report: DiscoveryReport {
+                        unattached_drives: Vec::new(),
+                        complete: true,
+                        incomplete_evidence: Vec::new(),
+                        libraries: vec![mk_library()],
+                        warnings: Vec::new(),
                     },
-                    lib::AuditActor::System,
-                    lib::SourceLayer::Layer4,
-                    view,
-                )
+                    captured_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            ))));
+            let (changer, _) = tokio::sync::mpsc::channel(1);
+            let (drive, mut rx) = tokio::sync::mpsc::channel(4);
+            state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+                "DEC418146K_LL02",
+                changer,
+                HashMap::from([(1, drive)]),
+                Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+            ));
+            let runtime = root.catalog().library_runtime().unwrap();
+            let id = Uuid::from_bytes(
+                runtime
+                    .start_owned_operation(
+                        lib::OperationKind::MediaReadinessWait,
+                        remanence_state::AuditActor::System,
+                    )
+                    .unwrap(),
+            );
+            {
+                let mut index = state.catalog.write_handle();
+                index
+                    .observe_drive(DriveObservationInput {
+                        serial: "8031BDC7D1".to_string(),
+                        identity_source: "DvcidInline".to_string(),
+                        vendor: Some("HPE".to_string()),
+                        product: Some("Ultrium 9-SCSI".to_string()),
+                        firmware_rev: Some("R1.0".to_string()),
+                        managed: "rem".to_string(),
+                        library_serial: Some("DEC418146K_LL02".to_string()),
+                        element_address: Some(1),
+                        observed_at_utc: None,
+                    })
+                    .unwrap();
+                if let Some(pool) = &state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            }
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("8031BDC7D1".into()),
+                barcode: Some("S30002L9".into()),
+                source_slot: Some(0x040a),
+                media_generation: Some(9),
+                media_family: Some(remanence_state::LtoGen::Lto9),
+                phase: "session_open_short_probe".into(),
+                state: "becoming_ready".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
             })
-            .unwrap()
-            .sequence;
-        crate::readiness_wait::spawn_auto_resume(state.clone());
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(rx.try_recv().is_err());
-        assert!(state.operations.latest(&id).is_none());
-        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+            .unwrap();
+            // This RPC releases tape fences; typed drive fences have their own release path.
+            let fence = runtime
+                .append(|a, view| {
+                    a.fence_raised(
+                        lib::FenceRaised {
+                            kind: lib::FenceKind::Write,
+                            scope: lib::FenceScope::Tape(lib::TapeRef {
+                                uuid: tape_uuid,
+                                incarnation: 1,
+                            }),
+                            cause,
+                            evidence: None,
+                            at: None,
+                            operation: None,
+                            detail: lib::Bounded(vec![]),
+                        },
+                        lib::AuditActor::System,
+                        lib::SourceLayer::Layer4,
+                        view,
+                    )
+                })
+                .unwrap()
+                .sequence;
+            crate::readiness_wait::spawn_auto_resume(state.clone());
+            if cause == lib::FenceCause::TransferError {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(rx.try_recv().is_err());
+                assert!(state.operations.latest(&id).is_none());
+                <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &state.library_service(),
             Request::new(pb::ReleaseTapeIoFenceRequest {
                 force: false,
@@ -3838,15 +3938,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            command,
-            crate::write_owner::DriveCommand::WaitReady { .. }
-        ));
-        state.begin_shutdown();
+            }
+            let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                command,
+                crate::write_owner::DriveCommand::WaitReady { .. }
+            ));
+            state.begin_shutdown();
+        }
     }
 
     /// Release-only states and durable operator cancellation never dispatch automatically.
@@ -3860,7 +3962,7 @@ mod tests {
             "reservation_conflict",
             "cancelled",
         ] {
-            let (state, id, mut rx) = auto_resume_fixture(if name == "cancelled" {
+            let (state, id, mut rx) = typed_auto_resume_fixture(if name == "cancelled" {
                 "becoming_ready"
             } else {
                 name
@@ -3906,7 +4008,7 @@ mod tests {
             pb::OperationState::Cancelled,
             pb::OperationState::CompletionUnknown,
         ] {
-            let (state, id, _rx) = auto_resume_fixture("becoming_ready");
+            let (state, id, _rx) = typed_auto_resume_fixture("becoming_ready");
             let readiness = state.operations.register(id, "media_readiness_wait");
             readiness.publish_state(outcome, &[]);
             let owner = state
@@ -3927,7 +4029,7 @@ mod tests {
             assert!(error.message().contains("becoming_ready"));
             assert!(error.message().contains("deadline expired"));
         }
-        let (state, id, _rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, _rx) = typed_auto_resume_fixture("becoming_ready");
         let readiness = state.operations.register(id, "media_readiness_wait");
         readiness.publish_state(pb::OperationState::Running, &[]);
         let owner = state
@@ -4047,7 +4149,7 @@ mod tests {
 
     /// Exercise permanent dispatch failure and fixed-sweep retry through the actor channel.
     async fn assert_permanent_readiness_failure(closed: bool) {
-        let (state, id, rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, rx) = typed_auto_resume_fixture("becoming_ready");
         let actor = if closed {
             drop(rx);
             None
@@ -4140,7 +4242,7 @@ mod tests {
     async fn readiness_resume_attaches_to_live_load_only() {
         use tokio_stream::StreamExt;
         for kind in ["load_drive", "media_readiness_wait", "tape_verification"] {
-            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
             let handle = state.operations.register(id, kind);
             handle.publish_state(pb::OperationState::Running, &[]);
             let response = state
@@ -4184,7 +4286,7 @@ mod tests {
     /// A busy window expires despite repeated wakes; only the sweep retries it.
     #[tokio::test(start_paused = true)]
     async fn auto_resume_retries_after_reservation_window_expires() {
-        let (state, _id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (state, _id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         let pool = state.drive_pool().unwrap();
         let held = pool
             .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
@@ -4214,7 +4316,7 @@ mod tests {
     /// A non-busy refusal gets one attempt per sweep, regardless of wakes.
     #[tokio::test(start_paused = true)]
     async fn auto_resume_refused_start_waits_for_sweep() {
-        let (mut state, _id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (mut state, _id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         state.default_library_serial = Some(Arc::new("OTHER".into()));
         let snapshot = state.library_snapshot.as_ref().unwrap();
         let mut updated = {
@@ -4255,7 +4357,7 @@ mod tests {
     /// A live LoadDrive owns its fence id even before it publishes progress.
     #[tokio::test(start_paused = true)]
     async fn auto_resume_skips_live_load_operation() {
-        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         let load = state.operations.register(id, "load_drive");
         let pool = state.drive_pool().unwrap();
         crate::readiness_wait::spawn_auto_resume(state.clone());
@@ -4288,7 +4390,7 @@ mod tests {
     async fn readiness_observer_waits_through_retry_and_load_release() {
         for kind in ["tape_verification", "finalize_tape"] {
             for ended in [pb::OperationState::Failed, pb::OperationState::Cancelled] {
-                let (state, id, _rx) = auto_resume_fixture("becoming_ready");
+                let (state, id, _rx) = typed_auto_resume_fixture("becoming_ready");
                 let wait = state.operations.register(id, "media_readiness_wait");
                 wait.publish_state(ended, &[("phase", "shutdown")]);
                 let observer = state.operations.register(Uuid::new_v4(), kind);
@@ -4317,9 +4419,7 @@ mod tests {
                 .record_media_readiness_transition(
                     crate::startup_media_readiness::startup_media_readiness_probe_transition(
                         id,
-                        &remanence_library::MediaReadiness::new(
-                            remanence_library::MediaReadinessKind::Ready,
-                        ),
+                        &model_readiness_probe(false),
                     ),
                 )
                 .unwrap();
@@ -4348,7 +4448,7 @@ mod tests {
 
     /// Removing the path prevents reopening while existing connections still read.
     async fn assert_readiness_reuses_catalog(discovery: bool) {
-        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         let pool = state.drive_pool().unwrap();
         let held = pool
             .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
@@ -4391,7 +4491,7 @@ mod tests {
     /// LoadDrive admission attaches the same shutdown signal as standalone waits.
     #[tokio::test]
     async fn load_drive_wait_uses_readiness_shutdown_lifetime() {
-        let (mut state, _id, _rx) = auto_resume_fixture("ready");
+        let (mut state, _id, _rx) = typed_auto_resume_fixture("ready");
         let (changer, mut commands) = tokio::sync::mpsc::channel(1);
         let (drive, _drive_rx) = tokio::sync::mpsc::channel(1);
         state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
@@ -4428,7 +4528,7 @@ mod tests {
     /// Dispatch congestion does not permanently stop automatic admission.
     #[tokio::test]
     async fn auto_resume_retries_after_full_drive_channel() {
-        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         let tx = state
             .drive_pool()
             .unwrap()
@@ -4465,7 +4565,7 @@ mod tests {
     #[tokio::test]
     async fn resume_starts_with_at_least_daemon_timeout() {
         for (requested, expected) in [(1, 9000), (10000, 10000)] {
-            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
             state
                 .library_service()
                 .resume_media_readiness(Request::new(pb::ResumeMediaReadinessRequest {
@@ -4488,7 +4588,7 @@ mod tests {
     /// A LoadDrive failure with the fence id does not stop a readiness observer.
     #[tokio::test]
     async fn readiness_observer_ignores_other_operation_kinds() {
-        let (state, id, _rx) = auto_resume_fixture("ready");
+        let (state, id, _rx) = typed_auto_resume_fixture("ready");
         state
             .operations
             .register(id, "load_drive")
@@ -4510,7 +4610,7 @@ mod tests {
     /// Only the same readiness holder delays an observer of a ready row.
     #[tokio::test]
     async fn ready_fence_waits_only_for_its_own_holder() {
-        let (state, id, _rx) = auto_resume_fixture("ready");
+        let (state, id, _rx) = typed_auto_resume_fixture("ready");
         let pool = state.drive_pool().unwrap();
         let key = remanence_state::DriveKey::new("DEC418146K_LL02", 1);
         let _held = pool.reserve_drive(&key).unwrap();
@@ -4541,18 +4641,14 @@ mod tests {
     /// A daemon without drive actors creates no discovery task or catalog polling.
     #[test]
     fn auto_resume_without_drive_pool_does_not_spawn() {
-        crate::readiness_wait::spawn_auto_resume(ApiState::new({
-            let index = test_index();
-            let catalog = remanence_state::projector::open(index.path()).unwrap();
-            drop(index);
-            catalog
-        }));
+        let root = crate::tests::TypedRoot::open();
+        crate::readiness_wait::spawn_auto_resume(root.api_state());
     }
 
     /// Idle discovery performs no short-interval scans, including after a pending fence clears.
     #[tokio::test]
     async fn auto_resume_sleeps_when_idle_and_after_fence_clears() {
-        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let (state, id, mut rx) = typed_auto_resume_fixture("becoming_ready");
         let pool = state.drive_pool().unwrap();
         let _held = pool
             .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
@@ -4570,9 +4666,7 @@ mod tests {
         .record_media_readiness_transition(
             crate::startup_media_readiness::startup_media_readiness_probe_transition(
                 id,
-                &remanence_library::MediaReadiness::new(
-                    remanence_library::MediaReadinessKind::Ready,
-                ),
+                &model_readiness_probe(false),
             ),
         )
         .unwrap();

@@ -76,12 +76,14 @@ pub use bootstrap::{
 pub use bot_recovery::{
     recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_controlled,
     recover_terminal_inventory_from_bot_controlled_mode,
+    recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule,
     recover_terminal_inventory_from_bot_with_authority,
     recover_terminal_inventory_from_bot_with_authority_controlled,
-    recover_terminal_inventory_from_bot_with_authority_controlled_mode, BotObjectRecoveryAuthority,
-    BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, BotRecoveredObject,
-    BotRecoveredObjectState, BotStructuralRecoveryError, BotStructuralRecoveryEvent,
-    BotStructuralRecoverySummary,
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode,
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule,
+    BotObjectRecoveryAuthority, BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope,
+    BotRecoveredObject, BotRecoveredObjectState, BotStructuralRecoveryError,
+    BotStructuralRecoveryEvent, BotStructuralRecoverySummary,
 };
 pub use capacity::{
     CapacityReserveCause, CapacityReserveRemedy, TerminalTripleCloseInput,
@@ -152,8 +154,9 @@ pub use resume::{
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
     scan_reconstruct_filemark_map_with_control, scan_reconstruct_filemark_map_with_control_mode,
-    scan_reconstruct_filemark_map_with_report, scan_reconstruct_filemark_map_with_report_mode,
-    validate_scan_reconstruction_with_report, CatalogFilemarkMapInput, ControlledScanWalkOutcome,
+    scan_reconstruct_filemark_map_with_end_of_data_rule, scan_reconstruct_filemark_map_with_report,
+    scan_reconstruct_filemark_map_with_report_mode, validate_scan_reconstruction_with_report,
+    CatalogFilemarkMapInput, ControlledScanWalkOutcome, EndOfDataMark, EndOfDataRule,
     FilemarkMapScanResult, RecoveryBootstrap, ScanBootstrapCandidate, ScanDamageKind,
     ScanDamagedRegion, ScanMode, ScanOverlaySource, ScanRecoveryHints, ScanTailTruncation,
     ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl, ScanWalkProgress, ScanWalkResult,
@@ -205,7 +208,7 @@ pub use terminal_inventory::{
     TerminalInventoryOutcome, TerminalInventoryReadError, TerminalInventorySelection,
     TerminalInventoryStreamEvent, TerminalReplicaEvidence, TerminalReplicaFailure,
     TerminalReplicaFailureKind, TerminalSeparationEvidence, VerificationRoute,
-    VerificationRouteStatus,
+    VerificationRouteStatus, MISSING_END_OF_DATA_DIAGNOSTIC, MISSING_END_OF_DATA_STATEMENT,
 };
 pub use terminal_tail::{
     validate_terminal_index_block_size, TerminalTailComponentKind, TerminalTailComponentPlan,

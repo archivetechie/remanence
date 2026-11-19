@@ -179,14 +179,25 @@ tell whether it looked at the same index.
 
 ## 7. WORM media
 
-**WORM** (write once, read many) cartridges cannot be overwritten, by design of the medium.
-Remanence refuses to write ordinary objects to a WORM cartridge, and to a cartridge whose
-WORM state the drive does not report. The reason is crash recovery: after an interrupted
-write, Remanence may need to overwrite the uncommitted tail of the tape at the last commit,
-and a WORM cartridge would refuse that. The drive reports the medium type in the MODE SENSE
-header. If that type is unspecified or unrecognized, Remanence asks the Medium Configuration
-page for its WORM-mode bit. A cartridge is accepted for object writes only when the header
-or that page positively reports it as rewritable.
+**WORM** (write once, read many) cartridges cannot be overwritten.
+Remanence writes objects only to rewritable cartridges. After a write is interrupted it replaces the
+unfinished end of the tape, and a WORM cartridge forbids that. Tapes written elsewhere on WORM
+can still be read. An interrupted write includes a cancelled write or a disconnected client,
+not only a crash. Reading, adoption and restore of supported tape formats on WORM are designed
+for but untested on a physical WORM cartridge.
+
+Buy rewritable cartridges, not WORM. Both library and standalone `tape init` refuse WORM
+and media whose WORM state cannot be established, before any media write, even on a blank
+cartridge. Ordinary object writes also require positive evidence of rewritable media.
+[WORM writing is on the public roadmap](https://github.com/archivetechie/remanence/issues/70).
+
+The drive's MODE SENSE header supplies the cartridge's medium type. Object-write admission,
+tail recovery, finalization and init ask the Medium Configuration page for its WORM-mode bit
+only when that header is unspecified or unrecognized. Plain settings reads used by mounting,
+reading, verification, append re-proof and the all-bays check use the header alone and do not
+request that page. `rem diagnostics capture` reads both signals, even for a typed header,
+and reports a conflict if they disagree. A conflict is treated as WORM; neither signal can
+overrule the other's positive WORM evidence.
 
 ## 8. Libraries, standalone drives and home mode
 
@@ -207,19 +218,30 @@ reference](reference-cli.md#standalone-drives) lists which commands go where.
 When an operation on a tape or drive ends in a state that Remanence cannot prove, for example
 a load whose outcome is unknown, Remanence does not guess. It records
 a **fence**: a durable refusal against that tape or drive, written to the library log and the
-catalog, that survives restarts. Fenced media is refused for writes and initialization, and
-the daemon also refuses read sessions on it, until the cause is resolved. Other tapes and drives stay
-available. Every fence has a **quarantine id**, and the `rem tape quarantine` commands list,
+catalog, that survives restarts. Fenced media is refused for writes and initialization
+until the cause is resolved. Read sessions and motion depend on the cause; other tapes
+and drives stay available. Every fence has a **quarantine id**, and the `rem tape quarantine` commands list,
 show and release fences by that id; in these pages "quarantine" and "fence" name the same
 record. A tape-I/O fence release records the acknowledgement in the library log.
 
-There are two kinds of fence.
+Fences can protect a tape or a drive.
 
 - A **tape-I/O fence** (quarantine id beginning `library:`) records a
   partial batch, a transfer error, an uncertain step of finalization, or a tape log
   that ends before the point the catalog has already projected.
   `rem catalog tapes --json`, `rem top` and `rem daemon health --json` show these fences.
-  An operator investigates, verifies the tape and drive, and uses
+  In a library, a tape fenced only by `append_admission_refused` stays readable
+  and closed for writing; robot motion, eviction and idle unload proceed. A tape fenced only by
+  `session_suffix_contradiction` allows robot motion and eviction, and idle unload
+  once the running service has parked it (a cartridge already seated when the
+  service starts stays until moved), but refuses reads and writing.
+  Neither is released by `rem tape quarantine release`. Use `rem tape supersede-tail`
+  where recovery applies; it refuses a contradicting recorded session ending or a
+  state that shows no open session on the tape (its last session closed, or none
+  opened since it was initialized here). Otherwise withdraw the tape with
+  `rem tape retire` or start from a newer copy of the state directory. Retirement
+  refuses while parity closeout is due. For a releasable cause, an operator
+  investigates, verifies the tape and drive, and uses
   `rem tape quarantine release <ID> --after-settled-inventory --ack <TEXT>`.
   A present, noncontradicted tape log behind the catalog's projection
   (`native_log_behind_projection`) can be restored from an exact copy, or the
@@ -254,11 +276,30 @@ There are two kinds of fence.
   `rem tape verify` and `rem tape restore` refuse on a standalone drive; only
   `rem tape restore --scan` proceeds, walking from the tape's start. Contradicted
   tape admission refuses every read, including `--scan`. Other fence causes leave
-  standalone reads available. A standalone initialization write that fails with
-  an uncertain outcome raises no tape or drive fence. It is refused with
-  `cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-  counted as `StandaloneFenceUnrecorded`, and the command stops all further robot
-  and drive motion until it exits.
+  standalone reads available.
+- A **standalone drive hold** (`library:<n>`) records write uncertainty on the
+  drive independently of its cartridge's tape fence. A write, finalize or
+  tail replacement on a standalone drive that ends in a write fence also
+  holds the drive, including when the tape fence itself cannot be recorded
+  and when a read during the write contradicts what was recorded; an
+  append-admission refusal (`append_admission_refused`) fences only the tape.
+  It refuses writes, initialization and the four catalogue changes
+  (adopt, drive-form assign-pool, rebind and set-generation), including on other
+  cartridges. Reads and `rem tape release` do not consult the hold. The
+  standalone quarantine list includes `standalone_holds`; release the hold with
+  `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT`.
+  Tape fences remain active and keep their own release requirements.
+  The hold is recorded in the library log. If that record fails, the command prints
+  `error: cannot record the hold on standalone drive <serial>: <error>; motion is fenced and recovery is required`
+  and motion stops for the rest of the process. The hold is not on record, so a
+  later command does not find the drive held: check the drive and the tape before
+  using that drive again.
+  An uncertain initialization write holds the drive, returns the write's error
+  and creates no tape fence; its detail names the planned tape UUID. The next
+  init refuses before RESERVE or preparation. If the hold cannot be recorded,
+  the refusal is
+  `cannot durably record standalone write uncertainty for <uuid> at <endpoint> (<reason>): <detail>; the drive hold was not recorded: <error>; motion is fenced and recovery is required`,
+  counted as `StandaloneFenceUnrecorded`; motion stops for the rest of the process.
 - A **media-readiness fence** (quarantine id beginning `mrq-`) records a readiness wait, the
   wait for a drive to become ready after a load, that was interrupted or ended without a clear
   answer. A wait that was still progressing (loading, becoming ready, busy) is resumable: the

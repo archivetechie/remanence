@@ -900,7 +900,7 @@ fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() 
         let fences = fixture.index().list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].tape_uuid, UUID);
-        assert_eq!(fences[0].reason, "session_suffix_contradiction");
+        assert_eq!(fences[0].reason, "append_admission_refused");
         let preview = owner
             .supersede_tail(pb::SupersedeTailRequest {
                 observed_tape_log_sequence: None,
@@ -2060,7 +2060,7 @@ fn gate2b_rejected_tail_remains_ineligible() {
         let fences = fixture.index().list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].tape_uuid, UUID);
-        assert_eq!(fences[0].reason, "session_suffix_contradiction");
+        assert_eq!(fences[0].reason, "append_admission_refused");
         owner.finish().unwrap();
         let selected = crate::pool_write::select_tape_in_pool_for_write_session(
             &fixture.index(),
@@ -2446,6 +2446,7 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
     };
     let ordinary = raise(lib::FenceCause::TransferError);
     let suffix = raise(lib::FenceCause::SessionSuffixContradiction);
+    let admission = raise(lib::FenceCause::AppendAdmissionRefused);
     let service = crate::library::LibraryServiceApi {
         state: crate::ApiState::new(state.projection_client()),
     };
@@ -2453,7 +2454,12 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
         .enable_all()
         .build()
         .unwrap();
-    for sequence in [ordinary.sequence, ordinary.sequence, suffix.sequence] {
+    for sequence in [
+        ordinary.sequence,
+        ordinary.sequence,
+        suffix.sequence,
+        admission.sequence,
+    ] {
         let mut request = tonic::Request::new(crate::pb::ReleaseTapeIoFenceRequest {
             force: false,
             quarantine_id: format!("library:{sequence}"),
@@ -2467,12 +2473,18 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
             assert!(result
                 .unwrap_err()
                 .message()
-                .contains("physical tail recovery"));
+                .contains("a session_suffix_contradiction fence stays until"));
+        } else if sequence == admission.sequence {
+            assert!(result
+                .unwrap_err()
+                .message()
+                .contains("an append_admission_refused fence keeps the tape closed for writing"));
         } else {
             assert_eq!(result.unwrap().into_inner().state, "released");
         }
     }
     assert!(runtime.active_fence(suffix.sequence).is_some());
+    assert!(runtime.active_fence(admission.sequence).is_some());
     let manifest = runtime.manifest().clone();
     drop(service);
     drop(runtime);
@@ -2504,16 +2516,16 @@ fn typed_fence_release_rpc_preserves_actor_and_physical_recovery_policy() {
     let state = fixture.reopen().unwrap();
     assert_eq!(
         state.catalog().list_active_tape_io_fences().unwrap().len(),
-        1
+        2
     );
     assert!(fixture.commands.lock().unwrap().is_empty());
 }
 
-/// The closed fence schema cannot preserve the original coupled tape/endpoint
-/// uncertainty and error text. Refuse without inventing a different source.
+/// A standalone uncertainty records one typed drive hold without a legacy append, tape fence or latch.
 #[test]
-fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
-    let (fixture, mut state) = Fixture::initialized(false);
+fn standalone_uncertainty_records_one_typed_hold_without_legacy_append() {
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::initialized(false);
     let source_bytes = || {
         let mut files: Vec<_> = std::fs::read_dir(&fixture.config.audit.dir)
             .unwrap()
@@ -2529,8 +2541,11 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
     let before = source_bytes();
     let paths = state.paths().clone();
     let library_uuid = state.library_runtime().manifest().library_uuid();
-    let counted = crate::tests::refusal_tests::mark(&fixture.config.index.sqlite_path);
-    let error = crate::mount_support::raise_standalone_fence(
+    let config = state.config().clone();
+    drop(state);
+    let before_records = crate::tests::refusal_tests::read_log(&paths, library_uuid).len();
+    let mut state = remanence_state::StateHandle::open_with_config(paths.clone(), config).unwrap();
+    crate::mount_support::raise_standalone_fence(
         &mut state,
         UUID,
         Some(&remanence_library::DriveKey::Standalone {
@@ -2539,12 +2554,37 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
         "standalone_write_lost_by_restart",
         "unfinished durable write session requires recovery",
     )
-    .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("cannot durably record standalone write uncertainty"));
-    assert!(state.library_runtime().motion_fenced());
-    // The library log only grew, by the one record that counts the refusal.
+    .unwrap();
+    let runtime = state.library_runtime();
+    assert!(!runtime.motion_fenced());
+    let holds = runtime.standalone_drive_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, SERIAL);
+    assert_eq!(
+        holds[0].cause,
+        remanence_state::library_log::FenceCause::StandaloneWriteLostByRestart
+    );
+    let raised = runtime.active_fence(holds[0].fence).unwrap();
+    assert_eq!(raised.kind, lib::FenceKind::DriveFault);
+    assert_eq!(
+        raised.scope,
+        lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+            drive_serial: SERIAL.into(),
+        }))
+    );
+    assert_eq!(raised.cause, holds[0].cause);
+    let evidence = serde_json::json!({
+        "error": "unfinished durable write session requires recovery",
+        "tape_uuid": uuid::Uuid::from_bytes(UUID),
+    })
+    .to_string();
+    assert_eq!(
+        raised.detail,
+        crate::append_admission::tape_fence_detail(None, Some(&evidence))
+    );
+    assert_eq!(holds[0].detail, vec![("evidence_json".into(), evidence)]);
+    drop(runtime);
+    // The library log grows by the independent typed hold.
     let after = source_bytes();
     assert_eq!(after.len(), before.len());
     assert!(
@@ -2554,7 +2594,6 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
             .all(|(now, was)| now.starts_with(was)),
         "the library log is append-only"
     );
-    crate::tests::refusal_tests::assert_grew_by(&fixture.config.index.sqlite_path, &counted, 1);
     assert!(state
         .catalog()
         .list_active_tape_io_fences()
@@ -2563,15 +2602,29 @@ fn standalone_coupled_fence_refuses_without_legacy_authority_append() {
     assert!(fixture.commands.lock().unwrap().is_empty());
     drop(state);
     let log = crate::tests::refusal_tests::read_log(&paths, library_uuid);
+    assert_eq!(log.len(), before_records + 1);
     assert_eq!(
-        crate::tests::refusal_tests::refusals(&log),
-        [crate::tests::refusal_tests::RecordedRefusal::expect(
-            5,
-            "StandaloneFenceUnrecorded",
-            "tape",
-            Some(UUID),
-            remanence_state::AuditActor::local_user(),
-        )]
+        log.last().unwrap().0,
+        remanence_state::library_log::Tag::FenceRaised
+    );
+    assert!(crate::tests::refusal_tests::refusals(&log).is_empty());
+    // Replay the exact new record, following typed_fence_release_rpc's public reader.
+    let view = lib::native_view::NativeTapeView::probe(
+        &paths.journal_dir.join("tapes"),
+        &paths.sqlite_path,
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    lib::store::replay_observed(&paths.audit_dir, library_uuid, &view, &mut |applied| {
+        records.push((applied.sequence(), applied.record().tag()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(records.len(), before_records + 1);
+    // This is the exact sequence whose authoritative body was checked above.
+    assert_eq!(
+        records[before_records],
+        (holds[0].fence, lib::Tag::FenceRaised)
     );
 }
 
@@ -2632,6 +2685,182 @@ fn suffix_fence_release_requires_explicit_physical_recovery_and_replays() {
                 .is_empty());
         }
     }
+}
+
+/// A suffix-caused standalone hold needs acknowledgment before physical tail recovery.
+#[test]
+fn standalone_hold_release_allows_suffix_recovery() {
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::new(false);
+    let runtime = state.library_runtime();
+    let tape = runtime.tape_state(UUID).unwrap().tape;
+    let raise = |scope, kind| {
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
+                        kind,
+                        scope,
+                        cause: lib::FenceCause::SessionSuffixContradiction,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                    },
+                    remanence_state::AuditActor::System,
+                    remanence_state::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let tape_fence = raise(lib::FenceScope::Tape(tape), lib::FenceKind::Write);
+    let hold = raise(
+        lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+            drive_serial: SERIAL.into(),
+        })),
+        lib::FenceKind::DriveFault,
+    );
+    let mut owner = fixture.owner(state);
+    let error = owner
+        .supersede_tail_confirmed("HAND", |_, _| panic!("held drive reached confirmation"))
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("DriveFenced: drive STEP1-MOUNTED library:{hold}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("rem tape quarantine release library:{hold} --device PATH --allow-device STEP1-MOUNTED --ack TEXT")), "{text}");
+    assert!(runtime.active_fence(tape_fence).is_some());
+    let released = runtime
+        .release_standalone_drive_hold(
+            &format!("library:{hold}"),
+            "drive checked",
+            remanence_state::AuditActor::local_user(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.cause, lib::FenceCause::SessionSuffixContradiction);
+    owner
+        .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+        .unwrap();
+    assert!(runtime.active_fence(tape_fence).is_none());
+    assert!(runtime.active_fence(hold).is_none());
+    owner.finish().unwrap();
+}
+
+/// A real standalone append-admission contradiction fences the tape and holds
+/// the drive until acknowledgment permits recovery of the restored suffix.
+#[test]
+fn standalone_contradiction_hold_blocks_tail_recovery_until_released() {
+    use remanence_state::library_log as lib;
+    let (fixture, state) = Fixture::new(false);
+    let runtime = state.library_runtime();
+    let mut owner = fixture.owner(state);
+    owner.open_session("default").unwrap();
+    owner.append(fixture.request("one")).unwrap();
+    owner.close_session().unwrap();
+
+    {
+        let mut world = fixture.world.lock().unwrap();
+        let records = &mut world.tapes.get_mut("HAND").unwrap().records;
+        assert!(matches!(records.last(), Some(Record::Filemark)));
+        *records.last_mut().unwrap() = Record::Block(vec![0; BLOCK as usize]);
+    }
+    fixture.commands.lock().unwrap().clear();
+    let error = owner.open_session("default").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("commit cursor predecessor is not exactly a filemark"),
+        "{error}"
+    );
+    assert!(!fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+
+    let fences = fixture.index().list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].tape_uuid, UUID);
+    assert_eq!(fences[0].reason, "session_suffix_contradiction");
+    let holds = runtime.standalone_drive_holds().unwrap();
+    assert_eq!(
+        holds.len(),
+        1,
+        "contradiction must hold the standalone drive"
+    );
+    assert_eq!(holds[0].drive_serial, SERIAL);
+    assert_eq!(holds[0].cause, lib::FenceCause::SessionSuffixContradiction);
+    let hold = holds[0].fence;
+    let raised = runtime.active_fence(hold).expect("active standalone hold");
+    assert_eq!(raised.kind, lib::FenceKind::DriveFault);
+    assert_eq!(
+        raised.scope,
+        lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+            drive_serial: SERIAL.into(),
+        }))
+    );
+    assert_eq!(raised.cause, lib::FenceCause::SessionSuffixContradiction);
+
+    // The operator has checked the drive: the recorded filemark reads correctly
+    // again, leaving the drive hold as the only obstacle to tail recovery.
+    let before = {
+        let mut world = fixture.world.lock().unwrap();
+        let records = &mut world.tapes.get_mut("HAND").unwrap().records;
+        *records.last_mut().unwrap() = Record::Filemark;
+        records.clone()
+    };
+    fixture.commands.lock().unwrap().clear();
+    let error = owner
+        .supersede_tail_confirmed("HAND", |_, _| panic!("held drive reached confirmation"))
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("DriveFenced: drive STEP1-MOUNTED library:{hold}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("rem tape quarantine release library:{hold} --device PATH --allow-device STEP1-MOUNTED --ack TEXT")), "{text}");
+    assert_eq!(
+        fixture.index().list_active_tape_io_fences().unwrap(),
+        fences
+    );
+
+    let released = runtime
+        .release_standalone_drive_hold(
+            &format!("library:{hold}"),
+            "drive checked",
+            remanence_state::AuditActor::local_user(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.cause, lib::FenceCause::SessionSuffixContradiction);
+    let found = owner
+        .supersede_tail_confirmed("HAND", |request, found| {
+            assert_eq!(request, "SUPERSEDE HAND");
+            assert!(found.is_empty(), "{found:?}");
+            Ok(())
+        })
+        .unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    assert!(fixture
+        .index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(runtime.active_fence(hold).is_none());
+    assert!(runtime.standalone_drive_holds().unwrap().is_empty());
+    assert!(!fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
+    assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
+    owner.finish().unwrap();
 }
 
 /// DEC-1 and D-N-1-2: an undurable ending retains exactly the append classifier fence.

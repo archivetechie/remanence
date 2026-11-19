@@ -1,6 +1,7 @@
 //! Commands and public request/response types for drive and changer actors.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -68,6 +69,11 @@ impl From<StdDuration> for DriveUnloadOutcome {
 }
 
 pub(crate) enum ChangerCommand {
+    /// Re-read inventory for unresolved library motion that has no live owner.
+    ReconcileMotion {
+        /// The actor clears this queued-request flag before it reads inventory.
+        pending: Arc<AtomicBool>,
+    },
     Move {
         src: u16,
         dst: u16,

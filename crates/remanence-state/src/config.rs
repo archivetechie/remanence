@@ -542,8 +542,8 @@ pub struct JournalConfig {
 pub struct AuditConfig {
     /// Directory containing `*.remlib` segments and library-log lock/fence markers.
     pub dir: PathBuf,
-    /// Whether library-log Diagnostic appends are synced before returning.
-    /// Other record types always sync; segment rotation also syncs.
+    /// Controls sync for legacy audit appends. Library-log records always sync
+    /// before returning, regardless of this compatibility setting.
     #[serde(default = "default_true")]
     pub fsync: bool,
     /// Accepted and range-validated; production does not read this setting.
@@ -842,6 +842,14 @@ pub fn derive_tape_pool_from_voltag<'a>(
     voltag: &str,
     rules: &'a [TapePoolRuleConfig],
 ) -> Option<&'a str> {
+    tape_pool_rule_for_voltag(voltag, rules).map(|r| r.pool_id.as_str())
+}
+
+/// Select the longest matching barcode rule with the same normalization as provisioning.
+pub(crate) fn tape_pool_rule_for_voltag<'a>(
+    voltag: &str,
+    rules: &'a [TapePoolRuleConfig],
+) -> Option<&'a TapePoolRuleConfig> {
     let voltag = normalize_rule_match_text(voltag)?;
     rules
         .iter()
@@ -849,10 +857,10 @@ pub fn derive_tape_pool_from_voltag<'a>(
             let prefix = normalize_rule_match_text(&rule.prefix)?;
             voltag
                 .starts_with(prefix.as_str())
-                .then_some((prefix.len(), rule.pool_id.as_str()))
+                .then_some((prefix.len(), rule))
         })
         .max_by_key(|(prefix_len, _)| *prefix_len)
-        .map(|(_, pool_id)| pool_id)
+        .map(|(_, rule)| rule)
 }
 
 /// Validate a configured fixed tape block size.

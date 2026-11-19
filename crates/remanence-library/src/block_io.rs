@@ -1195,7 +1195,7 @@ impl BlockSink for VecBlockSink {
 
 /// In-memory [`BlockSource`] that serves blocks from an internal
 /// `Vec<Vec<u8>>`. LBAs are dense (0..N); seeking past the end
-/// returns a [`TapeIoError::CheckCondition`] modelled on the
+/// returns a [`crate::TapeIoErrorKind::CheckCondition`] modelled on the
 /// drive's "no medium past EOD" behaviour.
 #[derive(Debug)]
 pub struct VecBlockSource {

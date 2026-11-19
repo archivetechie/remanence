@@ -261,6 +261,10 @@ impl CatalogIndex {
     pub fn delete_wrap_map(&mut self, tape_uuid: &[u8; 16]) -> Result<bool, StateError> {
         self.with_core(|core| core.delete_wrap_map(tape_uuid))
     }
+    /// Locate active drive raises for the library runtime's authoritative scope check.
+    pub(crate) fn active_drive_fence_sequences(&self) -> Result<Vec<u64>, StateError> {
+        self.with_core(|core| core.active_drive_fence_sequences())
+    }
     /// List active tape-I/O fences.
     pub fn list_active_tape_io_fences(&self) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         self.with_core(|core| core.list_active_tape_io_fences())
@@ -276,6 +280,15 @@ impl CatalogIndex {
         barcode: Option<&str>,
     ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         self.with_core(|core| core.tape_io_admission_conflicts(tape_uuid, barcode))
+    }
+    /// Return every matching active fence once, including catalogue-resolved identities.
+    pub fn tape_io_matching_fences(
+        &self,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+        self.with_core(|core| core.tape_io_matching_fences(tape_uuid, barcode, endpoint))
     }
     /// Check current tape identity, barcode, and endpoint fences without a cached view.
     pub fn tape_io_is_fenced(
@@ -355,12 +368,17 @@ impl CatalogIndex {
         total_committed_ordinals: u64,
     ) -> Result<TapeJournalIndexReport, StateError> {
         self.with_core(|core| {
-            core.reconcile_tape_files_projection(
+            core.forget_projection_marker(tape_uuid);
+            let result = core.reconcile_tape_files_projection(
                 tape_uuid,
                 entries,
                 highest_protected_ordinal,
                 total_committed_ordinals,
-            )
+            );
+            if let Some(library) = &self.library {
+                library.mark_tape_dirty(tape_uuid);
+            }
+            result
         })
     }
     /// Readiness uses recorded media evidence whenever a catalog row exists.
@@ -932,7 +950,15 @@ impl CatalogIndex {
         &mut self,
         input: TerminalFinalizationProjectionInput,
     ) -> Result<TapeRecord, StateError> {
-        self.with_core(|core| core.project_terminal_finalization(input))
+        self.with_core(|core| {
+            core.forget_projection_marker(input.tape_uuid);
+            let tape = input.tape_uuid;
+            let result = core.project_terminal_finalization(input);
+            if let Some(library) = &self.library {
+                library.mark_tape_dirty(tape);
+            }
+            result
+        })
     }
     /// Atomically accept one guarded operator close-out.
     ///
@@ -1226,6 +1252,10 @@ impl CatalogIndex {
         snapshots: &[AuthoritySnapshot],
     ) -> Result<RebuildReport, StateError> {
         self.with_core(|core| core.rebuild_tape_log_projection(audit, snapshots))
+    }
+    /// Read the library end without loading source record bytes.
+    pub(crate) fn library_catalog_end(&self) -> Result<u64, StateError> {
+        self.with_core(|core| core.library_catalog_end())
     }
     /// Read the existing library witnesses before any rebuild clears the projection.
     pub(crate) fn library_catalog_evidence(

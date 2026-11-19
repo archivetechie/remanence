@@ -466,7 +466,7 @@ pub(super) fn open_parity_actor_session_with_rows(
                 let error = err.to_string();
                 let status = status_from_parity_error(&err, error.clone());
                 if write_attempted {
-                    return Err(fence_failed_parity_raw_write(
+                    let status = fence_failed_parity_raw_write(
                         index,
                         cfg,
                         selected,
@@ -482,7 +482,9 @@ pub(super) fn open_parity_actor_session_with_rows(
                         error.as_str(),
                         status,
                     )
-                    .0);
+                    .0;
+                    drive.mark_media_failure_outcome_applied();
+                    return Err(status);
                 }
                 return Err(status);
             }
@@ -2022,6 +2024,14 @@ pub(crate) fn record_closeout_fence(
         .tape_io_admission_conflicts(&tape_uuid, barcode.as_deref())
         .is_ok_and(|fences| !fences.is_empty())
     {
+        super::write_session::hold_standalone_write_drive(
+            &cfg.terminal_config(),
+            cfg.terminal_config().mounted_endpoint.as_ref(),
+            tape_uuid,
+            reason,
+            barcode.as_deref(),
+            Some(&evidence),
+        );
         return;
     }
     if let Err(error) = raise_tape_io_fence(

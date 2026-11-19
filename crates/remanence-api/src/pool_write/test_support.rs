@@ -21,7 +21,7 @@ pub fn write_object_to_pool(
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
 ) -> Result<PoolWriteResult, PoolWriteError> {
-    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
+    let fence_cfg = &super::test_fence_config(state);
     ensure_request_pool_matches_config(&request, pool_cfg)?;
     if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
         return Ok(result);
@@ -69,7 +69,7 @@ pub(crate) fn write_to_selected_tape_with_live_counter(
     selected: SelectedTape,
     live_write_counter: Option<Arc<crate::DriveByteCounters>>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
-    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
+    let fence_cfg = &super::test_fence_config(state);
     write_to_selected_tape_with_live_counter_impl(
         state,
         fence_cfg,

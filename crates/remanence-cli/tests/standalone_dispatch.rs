@@ -960,9 +960,7 @@ fn diagnostics_accepts_discovered_library_device_serials() {
     }
 }
 
-/// An actual bootstrap uses the requested block-size geometry, and a failed
-/// bootstrap records the ruling-29 stand-in refusal instead of main's endpoint fence.
-/// Each attempt plans a fresh tape identity (D-L2-29-1, D-L2-CLI-1-1).
+/// A bootstrap uses the requested geometry; a failed write holds the drive before another init can prepare.
 #[test]
 fn init_geometry_and_failed_bootstrap_are_guarded() {
     use remanence_chaos::model::{DeviceRole, ModelTransport, VirtualTape, VirtualWorld};
@@ -1043,70 +1041,65 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
             .unwrap();
         if fail {
             use remanence_state::library_log::{DiagnosticEvent, DiagnosticValue};
-            // D-L2-CLI-1-1: use ruling23's public diagnostic reader for code 5.
-            let refusal_ids = |expected| {
-                let records = ruling24_library_records(&root.path().join("state/rem/config.toml"));
-                let refusals: Vec<_> = records
-                    .iter()
-                    .filter_map(|record| record.diagnostic())
-                    .filter(|diagnostic| diagnostic.event == DiagnosticEvent::RefusalRecorded)
-                    .collect();
-                assert_eq!(refusals.len(), expected, "D-L2-CLI-1-1: refusal count");
-                refusals
-                    .iter()
-                    .map(|refusal| {
-                        assert_eq!(refusal.subject_kind.as_str(), "tape");
-                        let id = refusal
-                            .subject_id
-                            .as_ref()
-                            .expect("D-L2-CLI-1-1: tape subject");
-                        assert_eq!(
-                            refusal
-                                .detail
-                                .0
-                                .iter()
-                                .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
-                                .collect::<Vec<_>>(),
-                            [
-                                ("code".to_owned(), DiagnosticValue::Unsigned(5)),
-                                (
-                                    "name".to_owned(),
-                                    DiagnosticValue::Text("StandaloneFenceUnrecorded".into())
-                                ),
-                            ]
-                        );
-                        id.as_str().to_owned()
-                    })
-                    .collect::<Vec<_>>()
-            };
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
             let text = output["error"].as_str().expect("the error is a string");
             assert!(
-                text.starts_with("cannot durably record standalone write uncertainty for "),
-                "{text}"
-            );
-            assert!(
-                text.ends_with("; motion is fenced and recovery is required"),
+                !text.contains("cannot durably record standalone write uncertainty"),
                 "{text}"
             );
             assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 0);
             assert!(index.get_tape_by_voltag("HOMEL9").unwrap().is_none());
             drop(index);
-            let first = refusal_ids(1);
+            let config_path = root.path().join("state/rem/config.toml");
+            let records = ruling24_library_records(&config_path);
+            assert!(!records
+                .iter()
+                .filter_map(|r| r.diagnostic())
+                .any(|d| d.event == DiagnosticEvent::RefusalRecorded));
+            let holds = {
+                let state =
+                    remanence_state::StateHandle::open_from_config_file(&config_path).unwrap();
+                assert!(!state.library_runtime().motion_fenced());
+                state.library_runtime().standalone_drive_holds().unwrap()
+            };
+            assert_eq!(holds.len(), 1);
+            assert_eq!(holds[0].drive_serial, "HOME-DRIVE");
+            assert_eq!(
+                holds[0].cause,
+                remanence_state::library_log::FenceCause::TransferError
+            );
             let (code, output) = run(&init);
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
             let text = output["error"].as_str().expect("the error is a string");
             assert!(
-                text.starts_with("cannot durably record standalone write uncertainty for "),
+                text.starts_with(&format!(
+                    "DriveFenced: drive HOME-DRIVE library:{}",
+                    holds[0].fence
+                )),
                 "{text}"
             );
-            assert!(
-                text.ends_with("; motion is fenced and recovery is required"),
-                "{text}"
+            let records = ruling24_library_records(&config_path);
+            let refusals: Vec<_> = records
+                .iter()
+                .filter_map(|r| r.diagnostic())
+                .filter(|d| d.event == DiagnosticEvent::RefusalRecorded)
+                .collect();
+            assert_eq!(refusals.len(), 1);
+            let refusal = refusals[0];
+            assert_eq!(refusal.subject_kind.as_str(), "tape");
+            assert!(refusal.subject_id.is_none());
+            assert_eq!(
+                refusal
+                    .detail
+                    .0
+                    .iter()
+                    .map(|e| (e.0.as_str(), e.1.clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("code", DiagnosticValue::Unsigned(12)),
+                    ("name", DiagnosticValue::Text("DriveFenced".into())),
+                ]
             );
-            let retried = refusal_ids(2);
-            assert_eq!(retried[0], first[0]);
-            assert_ne!(retried[0], retried[1]);
             let index = remanence_state::projector::open(&config.index.sqlite_path)
                 .map(|catalog| catalog.write_handle())
                 .unwrap();
@@ -1170,6 +1163,7 @@ fn skipped_disk_is_informational_without_any_tape_endpoints() {
 /// Persistent virtual media with fresh production dispatch and state locks per invocation.
 struct VersionFixture {
     interrupt_finalize: bool,
+    fail_writes: bool,
     home_default: bool,
     terminal_input: bool,
     fail_after_path: std::sync::Mutex<Option<String>>,
@@ -1184,6 +1178,7 @@ impl VersionFixture {
     fn with_parity(parity: bool) -> Self {
         let fixture = Self {
             interrupt_finalize: false,
+            fail_writes: false,
             home_default: false,
             terminal_input: false,
             fail_after_path: std::sync::Mutex::new(None),
@@ -1348,7 +1343,7 @@ impl VersionFixture {
                             remanence_chaos::model::DeviceRole::Drive { bay: 0x100 },
                         ),
                         config: self.config(),
-                        fail_writes: false,
+                        fail_writes: self.fail_writes,
                         check_all_writes: !extra.starts_with(&["tape", "finalize"]),
                         writes_observed: 0,
                         world: self.world.clone(),
@@ -2340,45 +2335,271 @@ fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
     );
 }
 
-/// D-L2-CLI-1-1: endpoint release waits for ruling 29; its audit read moves
-/// to the typed FenceReleased when that ruling lands.
+/// A seeded hold blocks put, lists and releases without device work, then permits put.
 #[test]
-#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1, D-L2-CLI-1-1"]
-fn standalone_endpoint_fence_releases_by_ack_with_audit() {
-    let f = VersionFixture::new();
-    let source = f.root.path().join("rescue.txt");
-    std::fs::write(&source, b"rescue bytes").unwrap();
-    f.ok(&["put", source.to_str().unwrap()]);
-    let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
-    let fence = f
-        .index()
-        .record_tape_io_fence_at_endpoint(
-            remanence_state::TapeIoFenceInput {
-                tape_uuid: tape.tape_uuid.try_into().unwrap(),
-                barcode: Some("FIRST".into()),
-                reason: "standalone_test".into(),
-                evidence_json: None,
-            },
-            Some(&remanence_library::DriveKey::Standalone {
-                drive_serial: "HOME-DRIVE".into(),
-            }),
-        )
-        .unwrap();
-    f.ok(&[
+fn standalone_drive_hold_release_frees_the_drive() {
+    use remanence_state::library_log as lib;
+    let mut f = VersionFixture::new();
+    f.home_default = true;
+    let config = std::fs::read_to_string(f.config()).unwrap();
+    std::fs::write(
+        f.config(),
+        format!("{config}\n[home]\ndrive_serial = \"HOME-DRIVE\"\n"),
+    )
+    .unwrap();
+    let source = f.root.path().join("hold.txt");
+    std::fs::write(&source, b"held drive bytes").unwrap();
+    let raise_hold = |state: &remanence_state::StateHandle| {
+        state
+            .library_runtime()
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(lib::DriveKey::Standalone(lib::Standalone {
+                            drive_serial: "HOME-DRIVE".into(),
+                        })),
+                        cause: lib::FenceCause::TransferError,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![lib::DiagnosticEntry(
+                            "barcode".into(),
+                            lib::DiagnosticValue::Text("FIRST".into()),
+                        )]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let sequence = raise_hold(&state);
+    drop(state);
+    let id = format!("library:{sequence}");
+    let before = f.writes();
+    let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert_eq!(f.writes(), before);
+    let text = format!("{out}\n{errors}");
+    let prefix = format!("DriveFenced: drive HOME-DRIVE library:{sequence} TransferError");
+    assert!(text.contains(&prefix), "{text}");
+    let advice = format!("{prefix}; release the hold with `rem tape quarantine release {id} --device PATH --allow-device HOME-DRIVE --ack TEXT`");
+    assert!(text.contains(&advice), "{text}");
+    let commands = f.world.lock().unwrap().command_log.len();
+    let row = serde_json::json!({"quarantine_id":id,"drive_serial":"HOME-DRIVE","cause":"TransferError","detail":{"barcode":"FIRST"},"state":"active"});
+    let listed = f.ok(&["tape", "quarantine", "list"]);
+    assert_eq!(listed["standalone_holds"], serde_json::json!([row]));
+    assert_eq!(listed["active_fences"], serde_json::json!([]));
+    let release_args = [
         "tape",
         "quarantine",
         "release",
-        &fence.quarantine_id,
+        &id,
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
         "--ack",
-        "recovered",
+        "drive checked",
+    ];
+    let (code, out, errors) = f.run(&release_args, true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    let mut released = row.clone();
+    released["state"] = serde_json::json!("released");
+    released["active_fences"] = serde_json::json!([]);
+    assert_eq!(VersionFixture::envelope(&out)["result"], released);
+    assert_eq!(
+        f.ok(&["tape", "quarantine", "list"])["standalone_holds"],
+        serde_json::json!([])
+    );
+    assert_eq!(f.world.lock().unwrap().command_log.len(), commands);
+    f.ok(&["put", source.to_str().unwrap()]);
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    let tape = state
+        .catalog()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap();
+    l1b_raise(
+        &state,
+        tape.tape_uuid.try_into().unwrap(),
+        lib::FenceCause::PartialBatch,
+    );
+    let tape_id = state.catalog().list_active_tape_io_fences().unwrap()[0]
+        .quarantine_id
+        .clone();
+    let second = format!("library:{}", raise_hold(&state));
+    drop(state);
+    let (code, out, errors) = f.run(
+        &[
+            "tape",
+            "quarantine",
+            "release",
+            &second,
+            "--device",
+            "/dev/home-model",
+            "--allow-device",
+            "HOME-DRIVE",
+            "--ack",
+            "drive checked",
+        ],
+        false,
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert!(out.contains(&tape_id), "{out}");
+}
+
+/// A failed first parity bootstrap fences its tape once and holds the drive across cartridges.
+#[test]
+fn standalone_endpoint_fence_releases_by_ack_with_audit() {
+    use remanence_state::library_log as lib;
+    let mut f = VersionFixture::new();
+    f.new_tape("SECOND");
+    f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
+    f.ok(&["pool", "new", "offsite"]);
+    f.world
+        .lock()
+        .unwrap()
+        .drive_bays
+        .insert(0x100, Some("FIRST".into()));
+    let source = f.root.path().join("rescue.txt");
+    std::fs::write(&source, b"rescue bytes").unwrap();
+    f.fail_writes = true;
+    let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    let fences = f.index().list_active_tape_io_fences().unwrap();
+    assert_eq!(
+        fences.len(),
+        1,
+        "fresh parity bootstrap must leave exactly one tape fence"
+    );
+    assert_eq!(fences[0].barcode.as_deref(), Some("FIRST"));
+    assert_eq!(fences[0].reason, "transfer_error");
+    let listed = f.ok(&[
+        "tape",
+        "quarantine",
+        "list",
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
     ]);
-    assert!(f.index().list_active_tape_io_fences().unwrap().is_empty());
-    let cfg = remanence_state::load_config(f.config()).unwrap();
-    let audit = remanence_state::FileAuditLog::replay(cfg.audit.dir).unwrap();
-    assert!(audit.iter().any(
-        |r| r.event == remanence_state::AuditEvent::TapeIoFenceReleased
-            && r.subject.id.as_deref() == Some(&fence.quarantine_id)
-    ));
+    let holds = listed["standalone_holds"].as_array().unwrap();
+    assert_eq!(
+        holds.len(),
+        1,
+        "failed standalone put must list one drive hold"
+    );
+    let hold = &holds[0];
+    assert_eq!(hold["drive_serial"], "HOME-DRIVE");
+    assert_eq!(hold["cause"], "TransferError");
+    assert_eq!(hold["detail"]["barcode"], "FIRST");
+    assert_eq!(hold["state"], "active");
+    let id = hold["quarantine_id"].as_str().unwrap();
+    let sequence: u64 = id.strip_prefix("library:").unwrap().parse().unwrap();
+
+    f.world
+        .lock()
+        .unwrap()
+        .drive_bays
+        .insert(0x100, Some("SECOND".into()));
+    f.fail_writes = false;
+    let before = f.writes();
+    let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert_eq!(f.writes(), before);
+    let prefix = format!("DriveFenced: drive HOME-DRIVE {id} TransferError");
+    let advice = format!("{prefix}; release the hold with `rem tape quarantine release {id} --device PATH --allow-device HOME-DRIVE --ack TEXT`");
+    assert!(
+        format!("{out}\n{errors}").contains(&advice),
+        "{out}\n{errors}"
+    );
+    let pool = f
+        .index()
+        .get_tape_by_voltag("SECOND")
+        .unwrap()
+        .unwrap()
+        .pool_id;
+    let (code, out, errors) = f.run(&["tape", "assign-pool", "--pool", "offsite"], true);
+    assert_ne!(
+        code,
+        ExitCode::SUCCESS,
+        "held drive must refuse assign-pool: {out}\n{errors}"
+    );
+    assert!(
+        format!("{out}\n{errors}").contains(&advice),
+        "{out}\n{errors}"
+    );
+    assert_eq!(
+        f.index()
+            .get_tape_by_voltag("SECOND")
+            .unwrap()
+            .unwrap()
+            .pool_id,
+        pool
+    );
+    assert_eq!(f.writes(), before);
+    f.ok(&["tape", "identify"]);
+
+    let commands = f.world.lock().unwrap().command_log.len();
+    let released = f.ok(&[
+        "tape",
+        "quarantine",
+        "release",
+        id,
+        "--device",
+        "/dev/home-model",
+        "--allow-device",
+        "HOME-DRIVE",
+        "--ack",
+        "drive checked",
+    ]);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["active_fences"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        released["active_fences"][0]["quarantine_id"],
+        fences[0].quarantine_id
+    );
+    assert_eq!(
+        f.world.lock().unwrap().command_log.len(),
+        commands,
+        "acknowledgement opens no device"
+    );
+    f.ok(&["put", source.to_str().unwrap()]);
+    assert!(f.writes() > before);
+    assert_eq!(f.index().list_active_tape_io_fences().unwrap(), fences);
+    let records = ruling24_library_records(&f.config());
+    let releases: Vec<_> = records
+        .iter()
+        .filter(|r| r.tag() == lib::Tag::FenceReleased)
+        .collect();
+    assert_eq!(releases.len(), 1);
+    // Inspect canonical body fields as ruling24_reprovision_predecessor does.
+    let (bytes, _) = lib::codec::encode(1, [0; 32], releases[0]).unwrap();
+    let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let start = remanence_state::log_frame::PREFIX_LEN;
+    let value: ciborium::Value = ciborium::from_reader(&bytes[start..start + size]).unwrap();
+    let field = |value: &ciborium::Value, key: u64| {
+        let ciborium::Value::Map(map) = value else {
+            panic!("canonical map")
+        };
+        map.iter()
+            .find(|(k, _)| *k == ciborium::Value::Integer(key.into()))
+            .unwrap()
+            .1
+            .clone()
+    };
+    let body = field(&value, 1);
+    assert_eq!(field(&body, 0), ciborium::Value::Integer(sequence.into()));
+    assert_eq!(
+        field(&body, 1),
+        ciborium::Value::Text("drive checked".into())
+    );
+    assert_eq!(field(&body, 2), ciborium::Value::Bool(false));
 }
 
 /// The child runs production confirmation on a real terminal, with model media.
@@ -2644,6 +2865,166 @@ fn clobber_catalogued_tape_and_refuse_another_label_owner() {
     f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
 }
 
+/// A blank typed WORM cartridge is refused before bootstrap or filemark writes.
+#[test]
+fn blank_worm_init_refuses_before_writes() {
+    let f = VersionFixture::new();
+    let mut tape = remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144);
+    tape.worm = true;
+    f.world
+        .lock()
+        .unwrap()
+        .put_tape_in_drive(0x100, "WORM", None, tape);
+    let before = f.writes();
+    let (code, out, errors) = f.run(
+        &["tape", "init", "--label", "WORM", "--generation", "L9"],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert!(
+        out.contains("tape init refused before any media write"),
+        "{out}"
+    );
+    assert!(out.contains("ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail"), "{out}");
+    assert_eq!(f.writes(), before);
+}
+
+/// Untyped init requires positive rewritable evidence from the configuration page.
+#[test]
+fn untyped_init_resolves_media_before_writes() {
+    use remanence_chaos::model::{MediumTypeReporting, VirtualTape};
+    for (worm, reporting, refusal) in [
+        (true, MediumTypeReporting::ConfigurationPage, Some("ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail")),
+        (false, MediumTypeReporting::Unsupported, Some("ordinary Object writes require media positively identified as rewritable; the loaded tape's WORM state is unknown")),
+        (false, MediumTypeReporting::ConfigurationPage, None),
+    ] {
+        let f = VersionFixture::new();
+        let mut tape = VirtualTape::empty(256 * 1024 * 1024, 262144);
+        tape.worm = worm;
+        {
+            let mut world = f.world.lock().unwrap();
+            world.put_tape_in_drive(0x100, "UNTYPED", None, tape);
+            world.drive_states.get_mut(&0x100).unwrap().medium_type_reporting = reporting;
+        }
+        let before = f.writes();
+        let (code, out, errors) = f.run(&["tape", "init", "--label", "UNTYPED", "--generation", "L9"], true);
+        if let Some(message) = refusal {
+            assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+            assert!(out.contains("tape init refused before any media write"), "{out}");
+            assert!(out.contains(message), "{out}");
+            assert_eq!(f.writes(), before);
+        } else {
+            assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+            assert!(f.writes() > before);
+        }
+    }
+}
+
+/// Both JSON surfaces preserve the independently decoded header and page evidence.
+#[test]
+fn diagnostics_capture_reports_both_worm_signals() {
+    use remanence_chaos::model::{MediumTypeReporting, VirtualTape};
+    for (worm, reporting, medium_type, header, page, wormm, verdict) in [
+        (
+            false,
+            MediumTypeReporting::Header,
+            "0x98",
+            "not_worm",
+            Some("not_worm"),
+            Some(0),
+            "not_worm",
+        ),
+        (
+            true,
+            MediumTypeReporting::Header,
+            "0x9c",
+            "worm",
+            Some("worm"),
+            Some(1),
+            "worm",
+        ),
+        (
+            true,
+            MediumTypeReporting::ConfigurationPage,
+            "0x00",
+            "unknown",
+            Some("worm"),
+            Some(1),
+            "worm",
+        ),
+        (
+            false,
+            MediumTypeReporting::Unsupported,
+            "0x00",
+            "unknown",
+            None,
+            None,
+            "unknown",
+        ),
+    ] {
+        let f = VersionFixture::new();
+        let mut tape = VirtualTape::empty(256 * 1024 * 1024, 262144);
+        tape.worm = worm;
+        {
+            let mut world = f.world.lock().unwrap();
+            world.put_tape_in_drive(0x100, "DIAG", None, tape);
+            world
+                .drive_states
+                .get_mut(&0x100)
+                .unwrap()
+                .medium_type_reporting = reporting;
+        }
+        let before = f.world.lock().unwrap().command_log.len();
+        let archive = f.root.path().join("worm-diagnostics.tar");
+        let result = f.ok(&["diagnostics", "capture", "--out", archive.to_str().unwrap()]);
+        assert_eq!(
+            result["worm"],
+            serde_json::json!([{
+                "device": "/dev/home-model",
+                "header_medium_type": medium_type,
+                "header": header,
+                "wormm": wormm,
+                "medium_configuration": page,
+                "verdict": verdict,
+            }])
+        );
+        let extracted = std::process::Command::new("tar")
+            .arg("-xOf")
+            .arg(&archive)
+            .arg("./manifest.json")
+            .output()
+            .unwrap();
+        assert!(
+            extracted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&extracted.stderr)
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&extracted.stdout).unwrap();
+        assert_eq!(manifest["worm"], result["worm"]);
+        let command = manifest["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["command"] == "mode-sense-medium-configuration")
+            .expect("page command recorded");
+        if page.is_none() {
+            assert!(command["error"].is_string(), "{command}");
+        } else {
+            let raw = std::process::Command::new("tar")
+                .arg("-xOf")
+                .arg(&archive)
+                .arg(format!("./{}", command["file"].as_str().unwrap()))
+                .output()
+                .unwrap();
+            assert!(raw.status.success());
+            assert_eq!(raw.stdout.len() as u64, command["bytes"].as_u64().unwrap());
+        }
+        assert!(f.world.lock().unwrap().command_log[before..]
+            .iter()
+            .all(|command| matches!(command.opcode, 0x12 | 0x1a | 0x4d)));
+    }
+}
+
 /// Every init checks the partition page, including an explicitly confirmed clobber.
 #[test]
 fn partitioned_init_refuses_before_writes() {
@@ -2731,7 +3112,7 @@ fn standalone_cannot_release_a_library_fence() {
         assert_ne!(code, ExitCode::SUCCESS);
         assert!(
             out.contains(
-                "bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction fence is released by rem tape supersede-tail instead"
+                "bare standalone release cannot release this fence: run rem tape quarantine release ID --after-settled-inventory --ack TEXT (add --force for native_log_behind_projection; put --config PATH after release for another configuration; not with --device); a session_suffix_contradiction or append_admission_refused fence is not released: use rem tape supersede-tail, or withdraw the tape with rem tape retire, passing --config with this configuration's path"
             ),
             "{out}"
         );
@@ -3294,6 +3675,111 @@ fn selected_members_keep_destination_containment() {
         f.run(&["list", "--tape", "UNKNOWN"], true).0,
         ExitCode::SUCCESS
     );
+}
+
+/// The real audit CLI reads library records and prints the same tape subject in JSON and text.
+#[test]
+fn audit_history_through_daemon() {
+    let f = VersionFixture::with_parity(false);
+    let tape_uuid = f.ok(&["tape", "identify"])["uuid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = f.root.path().join("daemon.sock");
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let (handle, server) = {
+        let _entered = runtime.enter();
+        let (handle, state) = f.daemon_state(remanence_state::AppendStagingMode::Serial);
+        let probe = std::os::unix::net::UnixListener::bind(&socket)
+            .expect("daemon test requires Unix sockets");
+        drop(probe);
+        std::fs::remove_file(&socket).unwrap();
+        let socket = socket.clone();
+        let server = runtime.spawn(async move {
+            remanence_daemon::serve(state, &socket, None, async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap()
+        });
+        (handle, server)
+    };
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(socket.exists(), "daemon must start");
+    let endpoint = format!("unix:{}", socket.display());
+    let subject_filter = format!("subject_id={tape_uuid}");
+    let run = |json: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rem"));
+        command
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
+            .current_dir(f.root.path())
+            .args([
+                "audit",
+                "query",
+                "--since",
+                "1970-01-01T00:00:00Z",
+                "--until",
+                "2100-01-01T00:00:00Z",
+                "--filter",
+                "event=Reprovision",
+                "--filter",
+                "subject_kind=tape",
+                "--filter",
+                &subject_filter,
+                "--endpoint",
+                &endpoint,
+            ]);
+        if json {
+            command.arg("--json");
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    };
+    let json = run(true);
+    let entries: Vec<serde_json::Value> = json
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!entries.is_empty(), "library history must reach the CLI");
+    let text = run(false);
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), entries.len());
+    for (entry, line) in entries.iter().zip(lines) {
+        assert_eq!(entry["detail"]["subject"]["kind"], "tape");
+        assert_eq!(entry["detail"]["subject"]["id"], tape_uuid);
+        assert_eq!(entry["event_kind"], "Reprovision");
+        assert_eq!(
+            line,
+            format!(
+                "{} {} Reprovision tape:{} {} build={}",
+                entry["sequence"].as_u64().unwrap(),
+                entry["timestamp"].as_str().unwrap(),
+                tape_uuid,
+                entry["actor"].as_str().unwrap(),
+                entry["software_build"].as_str().unwrap(),
+            )
+        );
+    }
+    stop.send(()).unwrap();
+    runtime.block_on(server).unwrap();
+    drop(runtime);
+    drop(handle);
 }
 
 /// Production CLI and daemon services preserve timestamps through both append modes.
@@ -5214,8 +5700,8 @@ fn ruling24_standalone_init_crash_requires_unknown_identity_confirmation() {
         .all(|r| r.tag() != remanence_state::library_log::Tag::Reprovision));
 }
 
-/// A transport fault after the Bootstrap delimiter publishes no identity;
-/// a new invocation must name that unknown BOT before replacing it.
+/// A transport fault after the Bootstrap delimiter holds the drive without publishing identity;
+/// after acknowledgement, a new invocation must name that unknown BOT before replacing it.
 #[test]
 fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
     use remanence_state::library_log::{ProvisionMode, Tag};
@@ -5224,18 +5710,15 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
     let config = root.path().join("state/rem/config.toml");
     let (code, out, errors) = ruling24_run_init(root.path(), &world, None, true, &[]);
     assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+    assert!(
+        !format!("{out} {errors}").contains("cannot durably record standalone write uncertainty")
+    );
     ruling24_assert_no_init_session(&config);
     let records = ruling24_library_records(&config);
-    // Home-mode configuration predates the attempted media write. The failed init adds no
-    // provisioning, session or fence record. Its one other record counts the refusal to record the
-    // write's uncertainty (`StandaloneFenceUnrecorded`, code 5).
-    let (counted, others): (Vec<_>, Vec<_>) = records
-        .iter()
-        .partition(|record| record.diagnostic().is_some());
-    assert!(others
-        .iter()
-        .all(|record| record.tag() == Tag::ConfigurationAccepted));
-    assert_eq!(counted.len(), 1, "{counted:?}");
+    // Configuration precedes the failed write; its only new source is the drive hold.
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].tag(), Tag::ConfigurationAccepted);
+    assert_eq!(records[1].tag(), Tag::FenceRaised);
     let (unknown, before) = {
         let w = world.lock().unwrap();
         let tape = &w.tapes["FIRST"];
@@ -5253,37 +5736,60 @@ fn ruling23_failed_standalone_init_requires_named_unknown_bot() {
             tape.records.clone(),
         )
     };
-    let refusal = counted[0].diagnostic().unwrap();
-    assert_eq!(
-        refusal.event,
-        remanence_state::library_log::DiagnosticEvent::RefusalRecorded
-    );
-    assert_eq!(refusal.subject_kind.as_str(), "tape");
-    assert_eq!(
-        refusal.subject_id.as_ref().map(|id| id.as_str().to_owned()),
-        Some(uuid::Uuid::from_bytes(unknown).to_string()),
-        "the refusal names the tape whose write was uncertain"
-    );
-    assert_eq!(
-        refusal
+    let holds = {
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert!(state
+            .catalog()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty());
+        state.library_runtime().standalone_drive_holds().unwrap()
+    };
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, "HOME-DRIVE");
+    let evidence: serde_json::Value = serde_json::from_str(
+        &holds[0]
             .detail
-            .0
             .iter()
-            .map(|entry| (entry.0.as_str().to_owned(), entry.1.clone()))
-            .collect::<Vec<_>>(),
-        [
-            (
-                "code".to_owned(),
-                remanence_state::library_log::DiagnosticValue::Unsigned(5)
-            ),
-            (
-                "name".to_owned(),
-                remanence_state::library_log::DiagnosticValue::Text(
-                    "StandaloneFenceUnrecorded".into()
-                )
-            ),
-        ]
+            .find(|(k, _)| k == "evidence_json")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(
+        evidence["tape_uuid"],
+        uuid::Uuid::from_bytes(unknown).to_string()
     );
+    world.lock().unwrap().command_log.clear();
+    let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
+    assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+    assert!(
+        format!("{out} {errors}").contains(&format!(
+            "DriveFenced: drive HOME-DRIVE library:{}",
+            holds[0].fence
+        )),
+        "{out} {errors}"
+    );
+    assert_eq!(world.lock().unwrap().tapes["FIRST"].records, before);
+    assert!(world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19 | 0x16)));
+    {
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert!(state
+            .library_runtime()
+            .release_standalone_drive_hold(
+                &format!("library:{}", holds[0].fence),
+                "drive checked",
+                remanence_state::AuditActor::local_user(),
+            )
+            .unwrap()
+            .is_some());
+    }
+    let records = ruling24_library_records(&config);
     world.lock().unwrap().command_log.clear();
     let (code, out, errors) = ruling24_run_init(root.path(), &world, None, false, &[]);
     assert_ne!(code, ExitCode::SUCCESS, "{out}");
@@ -6003,10 +6509,29 @@ fn k94_t2_same_length_different_record() {
     k94_fence(&f);
     let rows = k94_rows(&f);
     let sequence = rows.len();
+    // Keep the original catalogue while the replacement log is built against a fresh one.
+    let mut saved = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            k94_config(&f).index.sqlite_path.display()
+        ));
+        if path.exists() {
+            let moved = std::path::PathBuf::from(format!("{}.ca1-saved", path.display()));
+            std::fs::rename(&path, &moved).unwrap();
+            saved.push((path, moved));
+        }
+    }
     k94_restore(&f, &old);
     f.ok(&["pool", "new", "different", "--scheme", "none"]);
-    // Probe M: the next normal open appends the changed configuration before projection refuses it.
-    assert!(remanence_state::StateHandle::open_from_config_file(f.config()).is_err());
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    k94_sql_loss(&f);
+    for (path, moved) in saved {
+        std::fs::rename(moved, path).unwrap();
+    }
+    let error = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap_err();
+    let expected = format!("library sequence {sequence}: the catalog holds a different record for this sequence or record identity than the library log; stop the service and run rem rebuild-catalog-from-journals");
+    assert!(error.to_string().contains(&expected), "{error}");
     let inspected = remanence_state::ambiguity_recovery::inspect(f.config()).unwrap();
     assert_eq!(
         inspected["library_replay"]["last_sequence"].as_u64(),
@@ -6411,10 +6936,8 @@ impl VersionFixture {
         mode: remanence_state::AppendStagingMode,
     ) -> Result<(remanence_state::StateHandle, remanence_api::ApiState), String> {
         let f = self;
-        let handle = remanence_state::StateHandle::open_from_config_file(f.config())
-            .map_err(|e| e.to_string())?;
-        let mut config = handle.config().clone();
         // The daemon owns a real changer slot for mount and shutdown dismount.
+        // Reset the fixture's counters before admission, which can itself refuse.
         {
             let mut world = f.world.lock().unwrap();
             let tape = world.tapes.remove("FIRST").unwrap();
@@ -6427,6 +6950,9 @@ impl VersionFixture {
             );
             world.put_tape_in_drive(0x100, "FIRST", Some(0x400), tape);
         }
+        let handle = remanence_state::StateHandle::open_from_config_file(f.config())
+            .map_err(|e| e.to_string())?;
+        let mut config = handle.config().clone();
         let library = f.world.lock().unwrap().library_snapshot();
         config.libraries = vec![remanence_state::LibraryConfig {
             serial: library.serial.clone(),
@@ -6486,6 +7012,7 @@ fn k94_daemon_refuses(rebuild: bool) {
         k94_refused(&f, "RebuildWouldDropLibraryRecords");
     }
     let rows = k94_rows(&f);
+    let segments = k94_segments(&f);
     let tape_hashes: K94Files = k94_hashes(&f)
         .into_iter()
         .filter(|(p, _)| p.starts_with(&k94_config(&f).journal.dir))
@@ -6498,17 +7025,15 @@ fn k94_daemon_refuses(rebuild: bool) {
             panic!("daemon open unexpectedly succeeded");
         }
     };
-    assert!(
-        error.contains("projection contradiction: library sequence"),
-        "{error}"
-    );
+    assert!(error.contains("CatalogAheadOfLibraryLog:"), "{error}");
     assert_eq!(f.writes(), 0);
     assert_eq!(k94_rows(&f), rows);
     let after: K94Files = k94_hashes(&f)
         .into_iter()
         .filter(|(p, _)| p.starts_with(&k94_config(&f).journal.dir))
         .collect();
-    assert_eq!(after, tape_hashes); // The one attempted library append is explicitly exempt.
+    assert_eq!(after, tape_hashes);
+    assert_eq!(k94_segments(&f), segments);
 }
 #[test]
 fn k94_t11_no_rebuild_daemon_refuses() {
@@ -6517,4 +7042,166 @@ fn k94_t11_no_rebuild_daemon_refuses() {
 #[test]
 fn k94_t11_after_refused_rebuild_daemon_refuses() {
     k94_daemon_refuses(true);
+}
+
+/// T8: the production assign-pool dispatcher can pin a tape while a normal open refuses its rules.
+#[test]
+fn assign_pool_pins_a_tape_while_the_rules_refuse() {
+    use remanence_state::{library_log as lib, StateHandle};
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let toml = format!(
+        r#"[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+[audit]
+dir = "{0}/audit"
+fsync = true
+[index]
+sqlite_path = "{0}/index.sqlite"
+[cache]
+tape_catalog_dir = "{0}/cache"
+[[tape_pools]]
+id = "camera.copy-a"
+[[tape_pools]]
+id = "camera.copy-b"
+[[tape_pool_rules]]
+prefix = "ACM"
+pool_id = "camera.copy-a"
+"#,
+        root.path().display()
+    );
+    std::fs::write(&config_path, &toml).unwrap();
+    let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+    let tape = [0x72; 16];
+    state
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: tape,
+            voltag: "ACM001L9".into(),
+            block_size: 262144,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    let paths = state.paths().clone();
+    assert!(!paths
+        .journal_dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(tape).simple()))
+        .exists());
+    drop(state);
+    let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+    conn.execute("insert into object_instances(object_id, tape_uuid, tape_file_number, status) values('seeded-object', ?1, ?2, 'committed')",
+        rusqlite::params![tape.to_vec(), 1u64.to_be_bytes().to_vec()]).unwrap();
+    drop(conn);
+    std::fs::write(
+        &config_path,
+        toml.replace("pool_id = \"camera.copy-a\"", "pool_id = \"camera.copy-b\""),
+    )
+    .unwrap();
+    let tape_text = uuid::Uuid::from_bytes(tape).to_string();
+    let error = StateHandle::open_from_config_file(&config_path)
+        .expect_err("T8(i): normal open must refuse the rule move");
+    assert_eq!(error.to_string(), format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {tape_text} (ACM001L9) recorded camera.copy-a derived camera.copy-b; restore the rule (and its pool, for \"recorded pool not configured\"), or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again"));
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let code = remanence_cli::run_with_standalone_test_io(
+        &[
+            "rem",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--allow-untrusted-state-volume",
+            "--json",
+            "tape",
+            "assign-pool",
+            "--tape",
+            &tape_text,
+            "--pool",
+            "camera.copy-a",
+        ],
+        root.path(),
+        &root.path().join("xdg"),
+        &root.path().join("absent-system.toml"),
+        &root.path().join("locks"),
+        vec![],
+        |_: &Path| panic!("assign-pool by UUID must not open a device"),
+        &mut out,
+        &mut errors,
+    );
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "T8(ii): assign-pool must succeed: {}",
+        String::from_utf8_lossy(&errors)
+    );
+    let state = StateHandle::open_from_config_file(&config_path).unwrap();
+    let assigned = state.library_runtime().tape_state(tape).unwrap();
+    assert_eq!(
+        assigned.pool.as_ref().map(|p| p.as_str()),
+        Some("camera.copy-a")
+    );
+    assert_eq!(
+        assigned.pool_source,
+        Some(lib::PoolSource::Operator(lib::Unit))
+    );
+}
+
+/// An ahead catalogue refuses before any append and names the exact offline rebuild.
+#[test]
+fn ca1_t1_catalog_ahead_refuses_open_names_rebuild() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_append_diagnostic(&f);
+    k94_restore(&f, &old);
+    let inspected = remanence_state::ambiguity_recovery::inspect(f.config()).unwrap();
+    let log_end = inspected["library_replay"]["last_sequence"]
+        .as_u64()
+        .unwrap();
+    let rows = k94_rows(&f);
+    let rusqlite::types::Value::Blob(sequence) = &rows.last().unwrap()[0] else {
+        panic!("sequence blob")
+    };
+    let catalog_end = u64::from_be_bytes(sequence.as_slice().try_into().unwrap());
+    assert_eq!(catalog_end, log_end + 1);
+    let expected = format!("CatalogAheadOfLibraryLog: the catalog holds library records the library log does not (library log ends at record {log_end}, catalog at record {catalog_end}). Stop the service and run rem rebuild-catalog-from-journals --config '{}'; it rebuilds the catalog, or lists what the catalog holds beyond the log and the way on.", f.config().display());
+    let error = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap_err();
+    assert!(error.to_string().contains(&expected), "{error}");
+    assert_eq!(k94_segments(&f), old);
+    assert_eq!(k94_rows(&f), rows);
+    k94_success(&f);
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    k94_append_diagnostic(&f);
+}
+
+/// Recovery clears ambiguity, then reports the ahead catalogue at its runtime reopen.
+#[test]
+fn ca1_t7_recovery_reopen_reports_catalog_ahead() {
+    let f = VersionFixture::with_parity(false);
+    let old = k94_segments(&f);
+    k94_append_diagnostic(&f);
+    k94_restore(&f, &old);
+    let marker = k94_config(&f).audit.dir.join("library-log.ambiguous");
+    std::fs::write(&marker, b"").unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem-debug"))
+        .env("REM_TEST_NO_LIVE_SCSI", "1")
+        .args([
+            "library-log",
+            "recover",
+            "--config",
+            f.config().to_str().unwrap(),
+            "--confirm-clear-ambiguity",
+        ])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{error}");
+    assert!(error.contains("reopen after ambiguity recovery"), "{error}");
+    assert!(error.contains("CatalogAheadOfLibraryLog"), "{error}");
+    assert!(!marker.exists());
+    k94_success(&f);
+    drop(remanence_state::StateHandle::open_from_config_file(f.config()).unwrap());
+    k94_append_diagnostic(&f);
 }

@@ -9,13 +9,13 @@
 //!
 //! The split is deliberate:
 //! - **Snapshot-level preflight** lives here. Address validity, full /
-//!   empty checks, the [`MoveError::DriveBayUnresolved`] check for
+//!   empty checks, the [`crate::MoveErrorKind::DriveBayUnresolved`] check for
 //!   drive bays whose `installed` is `None`. Testable with synthetic
 //!   snapshots and no transport.
-//! - **Policy-level checks** ([`MoveError::DerivedDriveBay`]) live in
+//! - **Policy-level checks** ([`crate::MoveErrorKind::DerivedDriveBay`]) live in
 //!   the handle layer, since they need an [`AccessPolicy`] reference
 //!   the snapshot doesn't have.
-//! - **Device-binding checks** ([`MoveError::DriveBayMissingDevice`])
+//! - **Device-binding checks** ([`crate::MoveErrorKind::DriveBayMissingDevice`])
 //!   live in the composed `load` / `unload` paths, where the drive's
 //!   `/dev/sgN` is actually needed. Plain `move_medium` only talks to
 //!   the changer and doesn't care whether the bay has a bound

@@ -630,6 +630,15 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/motion_reconcile_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 2,
+                execute_none: 2,
+                why: "cfg(test) InitializingDrive and FailReadsAfterMove forwarders \
+                      to in-memory ModelTransport only; no production dispatch",
+            },
+        ),
+        (
             "remanence-api/src/write_owner/r1c2_tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 3,
@@ -792,6 +801,22 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                 execute_out: 1,
                 execute_none: 1,
                 why: "cfg(test) crash-cut forwarder and missing-barrier control use only in-memory ModelTransport",
+            },
+        ),
+        (
+            "remanence-api/src/write_owner/plr1_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) LateTransport forwarder to in-memory ModelTransport only; no production dispatch",
+            },
+        ),
+        (
+            "remanence-cli/tests/power_loss_reading.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "CaptureTransport test forwarder to in-memory ModelTransport only; no production dispatch",
             },
         ),
         (

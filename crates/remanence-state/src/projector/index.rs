@@ -138,6 +138,9 @@ pub const OBJECT_INSTANCE_REPRESENTATION_UNKNOWN: &str = "unknown";
 /// Typed owner for the rebuildable SQLite catalog projection.
 #[derive(Debug)]
 pub(super) struct CatalogCore {
+    projected_tapes: std::collections::BTreeMap<[u8; 16], tape_log_projection::ProjectedTape>,
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(in crate::projector) tape_projection_skips: u64,
     #[cfg(any(test, feature = "fixtures"))]
     pub(in crate::projector) apply_counts: [u64; 3],
     conn: Connection,
@@ -1343,6 +1346,9 @@ impl CatalogCore {
             path,
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         })
     }
 
@@ -1362,6 +1368,9 @@ impl CatalogCore {
             path,
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         })
     }
 
@@ -1409,6 +1418,9 @@ impl CatalogCore {
             path,
             #[cfg(any(test, feature = "fixtures"))]
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         })
     }
 
@@ -1883,6 +1895,21 @@ impl CatalogCore {
         Ok(changed > 0)
     }
 
+    /// Locate active drive raises; the library fold decides their current scope and liveness.
+    pub(crate) fn active_drive_fence_sequences(&self) -> Result<Vec<u64>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select sequence from library_drive_fences where released = 0 order by sequence",
+            )
+            .map_err(|err| sqlite_error("prepare active drive fence sequences", err))?;
+        let rows = stmt
+            .query_map([], |row| Ok(row.get::<_, SqliteU64>(0)?.get()))
+            .map_err(|err| sqlite_error("query active drive fence sequences", err))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read active drive fence sequence", err))
+    }
+
     /// List active tape-I/O fences.
     pub fn list_active_tape_io_fences(&self) -> Result<Vec<TapeIoFenceRecord>, StateError> {
         let mut stmt = self
@@ -1941,6 +1968,54 @@ impl CatalogCore {
             .collect())
     }
 
+    /// Match a projected fence by the supplied tape, barcode, or endpoint identity.
+    fn tape_io_fence_matches(
+        fence: &TapeIoFenceRecord,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> bool {
+        tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
+            || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
+            || barcode.is_some_and(|barcode| {
+                !barcode.trim().is_empty()
+                    && fence
+                        .barcode
+                        .as_deref()
+                        .is_some_and(|b| b.trim().eq_ignore_ascii_case(barcode.trim()))
+            })
+    }
+
+    /// Return every matching active fence once, in active-fence order, including
+    /// catalogue-resolved tape and barcode identities. An empty set needs no lookup.
+    pub fn tape_io_matching_fences(
+        &self,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+        let fences = self.list_active_tape_io_fences()?;
+        if fences.is_empty() {
+            return Ok(fences);
+        }
+        let tape = if let Some(uuid) = tape_uuid {
+            self.get_tape(uuid)?
+        } else if let Some(barcode) = barcode {
+            self.get_tape_by_voltag(barcode)?
+        } else {
+            None
+        };
+        let resolved_uuid = tape
+            .as_ref()
+            .and_then(|t| <[u8; 16]>::try_from(t.tape_uuid.as_slice()).ok());
+        let tape_uuid = tape_uuid.or(resolved_uuid.as_ref());
+        let barcode = barcode.or_else(|| tape.as_ref().and_then(|tape| tape.voltag.as_deref()));
+        Ok(fences
+            .into_iter()
+            .filter(|fence| Self::tape_io_fence_matches(fence, tape_uuid, barcode, endpoint))
+            .collect())
+    }
+
     /// Check current tape identity, barcode, and endpoint fences without a cached view.
     pub fn tape_io_is_fenced(
         &self,
@@ -1952,17 +2027,11 @@ impl CatalogCore {
         if fences.is_empty() {
             return Ok(false);
         }
-        if fences.iter().any(|fence| {
-            tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
-                || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
-                || barcode.is_some_and(|barcode| {
-                    !barcode.trim().is_empty()
-                        && fence
-                            .barcode
-                            .as_deref()
-                            .is_some_and(|b| b.trim().eq_ignore_ascii_case(barcode.trim()))
-                })
-        }) {
+        // Preserve direct matches even if a catalogue identity lookup would fail.
+        if fences
+            .iter()
+            .any(|fence| Self::tape_io_fence_matches(fence, tape_uuid, barcode, endpoint))
+        {
             return Ok(true);
         }
         let tape = if let Some(uuid) = tape_uuid {
@@ -1977,16 +2046,9 @@ impl CatalogCore {
             .and_then(|t| <[u8; 16]>::try_from(t.tape_uuid.as_slice()).ok());
         let tape_uuid = tape_uuid.or(resolved_uuid.as_ref());
         let barcode = barcode.or_else(|| tape.as_ref().and_then(|tape| tape.voltag.as_deref()));
-        Ok(fences.iter().any(|fence| {
-            tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
-                || barcode.filter(|b| !b.trim().is_empty()).is_some_and(|b| {
-                    fence
-                        .barcode
-                        .as_deref()
-                        .is_some_and(|f| f.trim().eq_ignore_ascii_case(b.trim()))
-                })
-                || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
-        }))
+        Ok(fences
+            .iter()
+            .any(|fence| Self::tape_io_fence_matches(fence, tape_uuid, barcode, endpoint)))
     }
 
     /// Release an active tape-I/O fence by quarantine id.
@@ -13620,6 +13682,9 @@ impl CatalogCore {
             conn,
             path: PathBuf::from(":memory:"),
             apply_counts: [0; 3],
+            projected_tapes: std::collections::BTreeMap::new(),
+            #[cfg(any(test, feature = "fixtures"))]
+            tape_projection_skips: 0,
         }
     }
 }

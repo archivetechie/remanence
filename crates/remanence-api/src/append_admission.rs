@@ -107,7 +107,7 @@ impl From<TapeIoError> for AdmissionError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AdmissionErrorKind {
-    #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {found:?}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`).")]
+    #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {}. The tape holds data this state does not record, often after restoring an older copy of the state directory. It stays readable and closed for writing. To keep the data, start from a newer copy of the state directory. If this state shows no open session on the tape (its last session closed, or none opened since it was initialized here), discard is refused in this release. In other cases, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library) or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`) can discard it if the recovery checks pass and you confirm the preview; a drive outside a library can first copy its files out with `rem tape restore --scan`.", capped_found(.found))]
     TailBeyondKnownState {
         tape_uuid: uuid::Uuid,
         expected_eod_lba: u64,
@@ -131,6 +131,16 @@ pub(crate) enum AdmissionErrorKind {
     Io(#[from] TapeIoError),
     #[error("append suffix at LBA {start_lba}: {source}")]
     SuffixIo { start_lba: u64, source: TapeIoError },
+}
+
+/// Bound the diagnostic carried in RPC headers while retaining all scan results in the error.
+fn capped_found(found: &[String]) -> String {
+    let shown = found.len().min(8);
+    let mut text = format!("{:?}", &found[..shown]);
+    if found.len() > shown {
+        text.push_str(&format!(" and {} more", found.len() - shown));
+    }
+    text
 }
 
 impl From<String> for AdmissionError {
@@ -307,13 +317,17 @@ pub(crate) fn admit_append_boundary(
                 if summary.open_session.is_none() {
                     let mut failure = None;
                     let mut reached_eod = false;
+                    let mut named_end = boundary.lba;
                     snapshot
                         .visit_session_tail(&mut |file| {
                             if reached_eod {
                                 return Ok(());
                             }
                             session_suffix::named_file(drive, &ctx.tape_uuid, ctx.block_size, file)
-                                .map(|mark| reached_eod = !mark)
+                                .map(|(mark, lba)| {
+                                    reached_eod = !mark;
+                                    named_end = lba;
+                                })
                                 .map_err(|e| {
                                     failure = Some(e);
                                     remanence_state::StateError::JournalReplayFailed(
@@ -331,7 +345,60 @@ pub(crate) fn admit_append_boundary(
                             })
                         })?;
                     if !reached_eod {
-                        session_suffix::eod(drive, ctx.block_size)?;
+                        match session_suffix::eod(drive, ctx.block_size) {
+                            Err(AdmissionError {
+                                kind: AdmissionErrorKind::Unproved(_),
+                                ..
+                            }) if summary
+                                .last_session_end
+                                .as_ref()
+                                .and_then(|end| end.proved_eod)
+                                .is_none_or(|old| old == named_end) =>
+                            {
+                                // Only bytes beyond the fully proved named suffix are a restore tail.
+                                prove_position(
+                                    drive,
+                                    TapePosition {
+                                        lba: named_end,
+                                        ..boundary
+                                    },
+                                    ctx.block_size,
+                                    generation,
+                                )?;
+                                let suffix = scan_append_suffix_observed(
+                                    drive,
+                                    &ctx.tape_uuid,
+                                    ctx.block_size,
+                                    named_end,
+                                    None,
+                                    ctx.terminal_prefix.as_ref(),
+                                    true,
+                                    None,
+                                )
+                                .map_err(|error| match error {
+                                    AdmissionError {
+                                        kind: AdmissionErrorKind::Io(source),
+                                        ..
+                                    } => AdmissionError::new(AdmissionErrorKind::SuffixIo {
+                                        start_lba: named_end,
+                                        source,
+                                    }),
+                                    other => other,
+                                })?;
+                                let mut found = suffix.objects.clone();
+                                found.extend(suffix.foreign_components);
+                                // A confirmed list or an empty torn fragment cannot authorize this shape.
+                                return Err(AdmissionError::new(
+                                    AdmissionErrorKind::TailBeyondKnownState {
+                                        tape_uuid: uuid::Uuid::from_bytes(ctx.tape_uuid),
+                                        expected_eod_lba: named_end,
+                                        found,
+                                        object_ids: suffix.objects,
+                                    },
+                                ));
+                            }
+                            other => other?,
+                        }
                     }
                     let eod = drive.position()?.lba;
                     if let Some(end) = &summary.last_session_end {
@@ -738,7 +805,7 @@ pub(crate) fn daemon_admission_error(
                 detail: tape_fence_detail(barcode.as_deref(), Some(&evidence)),
                 kind: lib::FenceKind::Write,
                 scope: lib::FenceScope::Tape(tape.tape),
-                cause: lib::FenceCause::SessionSuffixContradiction,
+                cause: lib::FenceCause::AppendAdmissionRefused,
                 evidence: None,
                 at: None,
                 operation: None,

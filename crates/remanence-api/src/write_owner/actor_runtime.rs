@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -133,6 +133,145 @@ pub(crate) fn spawn_changer_actor(
     tx
 }
 
+/// Request reconciliation without blocking a transport owner or retaining the actor channel.
+pub(crate) fn motion_reconcile_notifier(
+    senders: &HashMap<String, mpsc::Sender<ChangerCommand>>,
+) -> impl Fn(&str) + Send + Sync + 'static {
+    let senders: HashMap<_, _> = senders
+        .iter()
+        .map(|(serial, sender)| {
+            (
+                serial.clone(),
+                (sender.downgrade(), Arc::new(AtomicBool::new(false))),
+            )
+        })
+        .collect();
+    move |serial| {
+        let Some((sender, pending)) = senders.get(serial) else {
+            return;
+        };
+        if pending.load(Ordering::SeqCst) {
+            tracing::debug!(
+                library_serial = serial,
+                "motion reconciliation already queued"
+            );
+            return;
+        }
+        let Some(sender) = sender.upgrade() else {
+            tracing::debug!(
+                library_serial = serial,
+                "motion reconciliation actor unavailable"
+            );
+            return;
+        };
+        let permit = match sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::debug!(library_serial = serial, %error, "motion reconciliation request skipped");
+                return;
+            }
+        };
+        if !pending.swap(true, Ordering::SeqCst) {
+            permit.send(ChangerCommand::ReconcileMotion {
+                pending: pending.clone(),
+            });
+        } else {
+            drop(permit);
+            tracing::debug!(
+                library_serial = serial,
+                "motion reconciliation request coalesced"
+            );
+        }
+        drop(sender);
+    }
+}
+
+#[cfg(test)]
+/// Route only to the named actor, and allow shutdown with the notifier still alive.
+#[test]
+fn mr_b_notifier_routes_without_retaining_sender() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let senders = HashMap::from([("L".to_string(), tx)]);
+    let notify = motion_reconcile_notifier(&senders);
+    notify("M");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    notify("L");
+    // A queued request must return immediately to a caller holding a transport.
+    notify("L");
+    let Ok(ChangerCommand::ReconcileMotion { pending }) = rx.try_recv() else {
+        panic!("one reconciliation request");
+    };
+    pending.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    drop(senders);
+    notify("L");
+    assert!(rx.blocking_recv().is_none());
+}
+
+#[cfg(test)]
+/// Coalesce queued reads, re-arm before handling, and preserve a wake-up on a full queue.
+#[test]
+fn mr_b_fr1_notifier_coalesces_and_retries_after_full_queue() {
+    let (tx, mut rx) = mpsc::channel::<ChangerCommand>(16);
+    let senders = HashMap::from([("L".to_string(), tx.clone())]);
+    let notify = motion_reconcile_notifier(&senders);
+    for _ in 0..20 {
+        notify("L");
+    }
+    assert_eq!(tx.capacity(), 15, "exactly one re-check is queued");
+    let Ok(ChangerCommand::ReconcileMotion { pending }) = rx.try_recv() else {
+        panic!("one reconciliation request");
+    };
+    assert!(pending.load(Ordering::SeqCst));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    pending.store(false, Ordering::SeqCst);
+    notify("L");
+    assert_eq!(tx.capacity(), 15);
+    let Ok(ChangerCommand::ReconcileMotion { pending: next }) = rx.try_recv() else {
+        panic!("re-armed reconciliation request");
+    };
+    assert!(Arc::ptr_eq(&pending, &next));
+    next.store(false, Ordering::SeqCst);
+    assert_eq!(tx.capacity(), 16);
+    assert!(!pending.load(Ordering::SeqCst));
+    for _ in 0..16 {
+        assert!(tx
+            .try_send(ChangerCommand::ReconcileMotion {
+                pending: Arc::new(AtomicBool::new(false)),
+            })
+            .is_ok());
+    }
+    notify("L");
+    assert_eq!(tx.capacity(), 0);
+    assert!(
+        !pending.load(Ordering::SeqCst),
+        "a full queue leaves the flag clear"
+    );
+    assert!(rx.try_recv().is_ok());
+    notify("L");
+    assert_eq!(tx.capacity(), 0);
+    let mut queued = 0;
+    let mut flagged = 0;
+    while let Ok(ChangerCommand::ReconcileMotion { pending }) = rx.try_recv() {
+        queued += 1;
+        flagged += usize::from(pending.load(Ordering::SeqCst));
+    }
+    assert_eq!(queued, 16);
+    assert_eq!(
+        flagged, 1,
+        "the notifier retries after a slot becomes available"
+    );
+}
+
 pub(crate) fn spawn_drive_actor(
     bay: u16,
     mut drive: DriveHandle,
@@ -216,6 +355,18 @@ pub(super) fn changer_loop(
     }
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            ChangerCommand::ReconcileMotion { pending } => {
+                pending.store(false, Ordering::SeqCst);
+                if cfg
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.shutting_down.load(Ordering::SeqCst))
+                {
+                    tracing::debug!(library_serial = %cfg.library().serial, "motion reconciliation skipped during shutdown");
+                    continue;
+                }
+                let _ = reconcile_actor_motion(&mut index, &cfg, changer);
+            }
             ChangerCommand::Move {
                 src,
                 dst,
@@ -230,8 +381,18 @@ pub(super) fn changer_loop(
                 } else {
                     cfg.changer_ready_wait_for(caller_gone, "caller gone")
                 });
-                let result =
-                    super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
+                let admission = reconcile_actor_motion(&mut index, &cfg, changer);
+                let admitted = admission.is_ok();
+                let result = admission
+                    .map_err(|err| {
+                        Status::failed_precondition(format!("reconcile library motion: {err}"))
+                    })
+                    .and_then(|_| {
+                        super::robotics::admit_fenced_elements(
+                            &index,
+                            changer.library(),
+                            &[src, dst],
+                        )
                         .and_then(|()| {
                             let mut motion = crate::drive_pool::MotionAdmission::new(
                                 cfg.lifecycle.clone(),
@@ -250,23 +411,38 @@ pub(super) fn changer_loop(
                                         Status::failed_precondition(format!("move medium: {err}"))
                                     })
                                 })
-                        });
+                        })
+                    });
                 changer.set_ready_wait(cfg.changer_ready_wait.clone());
-                {
-                    match observe_refreshed_library(&mut index, &cfg, changer.library()) {
-                        Ok(()) => clear_library_snapshot_persist_alarm(
-                            &mut index,
-                            &cfg,
-                            changer.library().serial.as_str(),
-                        ),
+                if admitted {
+                    match reconcile_actor_motion(&mut index, &cfg, changer) {
+                        Ok(false) => {
+                            match observe_refreshed_library(&mut index, &cfg, changer.library()) {
+                                Ok(()) => clear_library_snapshot_persist_alarm(
+                                    &mut index,
+                                    &cfg,
+                                    changer.library().serial.as_str(),
+                                ),
+                                Err(err) => record_library_observation_failure(
+                                    &mut index,
+                                    &cfg,
+                                    changer.library(),
+                                    err.message(),
+                                ),
+                            }
+                            publish_library_snapshot(
+                                &cfg.library().snapshot,
+                                changer.library().clone(),
+                            );
+                        }
+                        Ok(true) => {}
                         Err(err) => record_library_observation_failure(
                             &mut index,
                             &cfg,
                             changer.library(),
-                            err.message(),
+                            &err,
                         ),
                     }
-                    publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
                 }
                 drop(recovery_guard);
                 drop(dismount_guard);
@@ -289,6 +465,16 @@ pub(super) fn changer_loop(
                     cfg.reservations.clone(),
                     cfg.library().serial.clone(),
                 );
+                if let Err(err) = reconcile_actor_motion(&mut index, &cfg, changer) {
+                    let outcome = super::robotics::RoboticsOutcome::Failed {
+                        message: format!("reconcile library motion: {err}"),
+                        phase: "admission",
+                    };
+                    drop(_exclusive_guard);
+                    outcome.publish(&mut index, &cfg, &handle, &library_serial);
+                    handle.wake_readiness();
+                    continue;
+                }
                 let outcome = handle_robotics(&mut index, &cfg, &library_serial, action, &handle);
                 finish_robotics_and_release(
                     &mut index,
@@ -304,6 +490,35 @@ pub(super) fn changer_loop(
     }
 }
 
+/// Publish only the fresh inventory accepted by the single motion reconciliation funnel.
+fn reconcile_actor_motion(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    changer: &mut ChangerHandle,
+) -> Result<bool, String> {
+    match changer.reconcile_unowned_motion() {
+        Ok(true) => {
+            match observe_refreshed_library(index, cfg, changer.library()) {
+                Ok(()) => clear_library_snapshot_persist_alarm(
+                    index,
+                    cfg,
+                    changer.library().serial.as_str(),
+                ),
+                Err(err) => {
+                    record_library_observation_failure(index, cfg, changer.library(), err.message())
+                }
+            }
+            publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(err) => {
+            tracing::warn!(library_serial = %cfg.library().serial, error = %err, "reconcile library motion failed");
+            Err(err)
+        }
+    }
+}
+
 /// A terminal watcher can retry only after refreshed inventory and released ownership.
 pub(super) fn finish_robotics_and_release(
     index: &mut CatalogIndex,
@@ -314,7 +529,9 @@ pub(super) fn finish_robotics_and_release(
     outcome: super::robotics::RoboticsOutcome,
     guard: ExclusiveGuard,
 ) {
-    refresh_actor_changer(changer, cfg);
+    if matches!(reconcile_actor_motion(index, cfg, changer), Ok(false)) {
+        refresh_actor_changer(changer, cfg);
+    }
     drop(guard);
     outcome.publish(index, cfg, handle, library_serial);
     handle.wake_readiness();
@@ -342,6 +559,7 @@ pub(super) fn drain_failed_changer_commands(
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            ChangerCommand::ReconcileMotion { pending } => pending.store(false, Ordering::SeqCst),
             ChangerCommand::Move { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
@@ -736,7 +954,7 @@ pub(super) fn drive_loop(
                             load_continues_move: needs_drive_load,
                             lifecycle: cfg.lifecycle.as_ref(),
                         },
-                        Some(tape_uuid),
+                        super::readiness::FenceAdmission::Recover(tape_uuid),
                     )?;
                     let tape = index
                         .get_tape(&tape_uuid)
@@ -755,6 +973,15 @@ pub(super) fn drive_loop(
                         super::write_session::WriteMediaPolicy::RewritableObject,
                     )?;
                     let generation = drive.identity_generation();
+                    if needs_drive_load {
+                        super::write_session::run_load_calibration_harvest(
+                            &mut index,
+                            drive,
+                            &cfg,
+                            &tape_uuid,
+                            barcode.as_deref(),
+                        );
+                    }
                     let mut preview = None;
                     let result = crate::write_owner::supersede_mounted_tail(
                         &mut index,

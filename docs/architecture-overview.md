@@ -240,7 +240,7 @@ promise. `rem-daemon` serves seven services:
 | `WriteSessionService` | open (pool and pinned-tape targets — drive targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; checkpoint-batched durability applies to parity and no-parity tapes; write-session restart (`recover_session_id`) is not implemented, and the restart support described under [The read path](#the-read-path) covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target, so a client that lost its session in a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset); see [The read path](#the-read-path) |
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |
-| `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams earlier-version `.remaudit` segments back incrementally paged; it shows no history of this version's operations |
+| `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams one entry per matching library-log record; legacy `.remaudit` segments are not read |
 
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/index.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 Write sessions own parity epochs from open to end. The native log's
@@ -258,7 +258,8 @@ due. No abandonment filemark is written and no accumulator survives its session.
 `Catalog.CloseoutTape`, exposed as `rem tape closeout`, performs the same
 idempotent operation explicitly and succeeds without media work when none is due.
 Manual finalization requires due closeout to complete first. Retirement is an
-offline catalog change and does not check or complete closeout debt.
+offline catalog change and refuses with `CloseoutRequired` while parity
+closeout is due.
 Removal is an exclusion handshake and performs no parity work.
 
 Checkpoint batching defaults to 32 GiB of pending logical bytes, 200 pending

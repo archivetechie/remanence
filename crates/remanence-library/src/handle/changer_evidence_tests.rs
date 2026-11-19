@@ -743,3 +743,422 @@ fn readiness_owned_load_is_handed_to_the_next_drive_handle_of_that_bay() {
     let mut again = handle.open_drive(BAY, &policy()).unwrap();
     assert!(again.take_pending_motion().is_empty());
 }
+
+/// MR-A's funnel and abandonment helpers exercise the real handle paths over fixture CDBs.
+mod mr_a_tests {
+    use super::*;
+    use crate::motion::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct Authority {
+        unresolved: AtomicBool,
+        next: AtomicU64,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        abandoned: Mutex<Vec<MotionTicket>>,
+        refusal: Mutex<Option<MotionAuthorityFailure>>,
+    }
+    impl MotionAuthority for Authority {
+        fn unowned_motion_unresolved(&self, serial: &str) -> bool {
+            assert_eq!(serial, SERIAL);
+            self.unresolved.load(Ordering::SeqCst)
+        }
+        fn reconcile_inventory(&self, observed: &Library) -> Result<(), MotionAuthorityError> {
+            assert_eq!(observed.serial, SERIAL);
+            self.events.lock().unwrap().push("reconcile");
+            Ok(())
+        }
+        fn intent(
+            &self,
+            _: &MotionCommand,
+            _: &MotionContext,
+        ) -> Result<MotionTicket, MotionAuthorityError> {
+            Ok(MotionTicket {
+                sequence: self.next.fetch_add(1, Ordering::SeqCst) + 1,
+                record_uuid: [1; 16],
+            })
+        }
+        fn failed(
+            &self,
+            _: MotionTicket,
+            _: &crate::outcome::CompletionEvidence,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("fixture commands succeed");
+        }
+        fn unconfirmed(&self, pending: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            self.abandoned.lock().unwrap().push(pending.ticket);
+            match *self.refusal.lock().unwrap() {
+                Some(kind) => Err(MotionAuthorityError {
+                    kind,
+                    message: "fixture outcome refusal".into(),
+                }),
+                None => Ok(()),
+            }
+        }
+        fn confirm_inventory(
+            &self,
+            _: &PendingMotion,
+            _: &Library,
+        ) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+        fn confirm_standalone(&self, _: &PendingMotion) -> Result<(), MotionAuthorityError> {
+            panic!("bay fixture");
+        }
+        fn confirm_readiness(
+            &self,
+            _: &PendingMotion,
+            _: &crate::MediaReadiness,
+            _: Duration,
+        ) -> Result<(), MotionAuthorityError> {
+            panic!("abandonment never confirms readiness");
+        }
+        fn ensure_motion_allowed(&self) -> Result<(), MotionAuthorityError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Normal,
+        FullRobot,
+        ShapeMismatch,
+        ReadFailure,
+    }
+    struct ObserveRead {
+        inner: Box<dyn SgTransport>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        reply: Reply,
+    }
+    impl SgTransport for ObserveRead {
+        fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+            let outcome = self.inner.execute_in(cdb, buf)?;
+            if cdb[0] == 0xb8 {
+                // issue_res calls this once for its header probe and once for the full reply.
+                if buf.len() == 8 {
+                    self.events.lock().unwrap().push("probe");
+                    return Ok(outcome);
+                }
+                self.events.lock().unwrap().push("read");
+                match self.reply {
+                    Reply::Normal => (),
+                    Reply::FullRobot => {
+                        // The fixture's first page is a single medium transport descriptor.
+                        assert_eq!(buf[8], 1);
+                        buf[18] |= 1;
+                    }
+                    Reply::ShapeMismatch => {
+                        // Change a storage address while preserving the descriptor/count framing.
+                        let mut page = 8;
+                        loop {
+                            assert!(page + 10 < outcome.bytes_transferred as usize);
+                            if buf[page] == 2 {
+                                buf[page + 9] ^= 0x20;
+                                break;
+                            }
+                            let bytes = u32::from_be_bytes([
+                                0,
+                                buf[page + 5],
+                                buf[page + 6],
+                                buf[page + 7],
+                            ]);
+                            page += 8 + bytes as usize;
+                        }
+                    }
+                    Reply::ReadFailure => return Err(check(sense(4, 0x44, 0))),
+                }
+            }
+            Ok(outcome)
+        }
+        fn execute_none(&mut self, _: &[u8]) -> Result<(), ScsiError> {
+            panic!("inventory reconciliation sends only read commands");
+        }
+        fn execute_out(&mut self, _: &[u8], _: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            panic!("inventory reconciliation sends only read commands");
+        }
+    }
+    fn observe_read(handle: &mut LibraryHandle, authority: &Authority, reply: Reply) {
+        let mut transport = handle.changer.transport.lock().unwrap();
+        let inner = std::mem::replace(&mut *transport, Box::new(FixtureTransport::new()));
+        *transport = Box::new(ObserveRead {
+            inner,
+            events: authority.events.clone(),
+            reply,
+        });
+    }
+    fn unresolved_handle(reply: Reply) -> (LibraryHandle, Arc<Authority>) {
+        let (mut handle, _, _) = open(None, None);
+        let authority = Arc::new(Authority::default());
+        authority.unresolved.store(true, Ordering::SeqCst);
+        handle.set_motion_authority(authority.clone());
+        observe_read(&mut handle, &authority, reply);
+        (handle, authority)
+    }
+
+    #[test]
+    fn l1_funnel_skips_without_unowned_motion_then_reads_before_reconciling() {
+        let (mut handle, log, _) = open(None, None);
+        let before = log.borrow().len();
+        assert!(!handle.changer_mut().reconcile_unowned_motion().unwrap());
+        let authority = Arc::new(Authority::default());
+        handle.set_motion_authority(authority.clone());
+        observe_read(&mut handle, &authority, Reply::Normal);
+        assert!(!handle.changer_mut().reconcile_unowned_motion().unwrap());
+        assert_eq!(log.borrow().len(), before, "no CDB without unowned motion");
+        assert!(authority.events.lock().unwrap().is_empty());
+        authority.unresolved.store(true, Ordering::SeqCst);
+        assert!(handle.changer_mut().reconcile_unowned_motion().unwrap());
+        assert_eq!(
+            *authority.events.lock().unwrap(),
+            vec!["probe", "read", "reconcile"]
+        );
+        assert_eq!(log.borrow().len(), before + 2, "one two-phase RES");
+        assert!(log.borrow()[before..].iter().all(|cdb| cdb[0] == 0xb8));
+        assert_eq!(
+            &log.borrow()[before][7..10],
+            &[0, 0, 8],
+            "header probe allocation"
+        );
+        assert_eq!(log.borrow().last().unwrap()[0], 0xb8);
+        authority.events.lock().unwrap().clear();
+        handle.reconcile_startup_motion().unwrap();
+        assert_eq!(
+            *authority.events.lock().unwrap(),
+            vec!["probe", "read", "reconcile"],
+            "startup delegates to the funnel"
+        );
+        assert_eq!(log.borrow().len(), before + 4);
+    }
+
+    #[test]
+    fn l1_failed_read_records_no_reconciliation() {
+        let (mut handle, authority) = unresolved_handle(Reply::ReadFailure);
+        let result = handle.changer_mut().reconcile_unowned_motion();
+        assert_eq!(
+            *authority.events.lock().unwrap(),
+            vec!["probe", "read"],
+            "reconcile_inventory never called"
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn l2_full_robot_hand_records_no_reconciliation() {
+        let (mut handle, authority) = unresolved_handle(Reply::FullRobot);
+        let result = handle.changer_mut().reconcile_unowned_motion();
+        assert_eq!(
+            *authority.events.lock().unwrap(),
+            vec!["probe", "read"],
+            "L2 reconcile_inventory never called"
+        );
+        assert!(result.is_err());
+        assert!(
+            !handle.is_dirty(),
+            "shape matched; only the full hand refuses"
+        );
+    }
+
+    #[test]
+    fn l3_shape_mismatch_records_no_reconciliation() {
+        let (mut handle, authority) = unresolved_handle(Reply::ShapeMismatch);
+        let before = handle
+            .library()
+            .slots
+            .iter()
+            .map(|s| s.element_address)
+            .collect::<Vec<_>>();
+        let result = handle.changer_mut().reconcile_unowned_motion();
+        assert_eq!(
+            *authority.events.lock().unwrap(),
+            vec!["probe", "read"],
+            "L3 reconcile_inventory never called"
+        );
+        assert!(result.is_err());
+        assert!(handle.is_dirty());
+        assert_eq!(
+            handle
+                .library()
+                .slots
+                .iter()
+                .map(|s| s.element_address)
+                .collect::<Vec<_>>(),
+            before,
+            "refresh kept the old snapshot"
+        );
+    }
+
+    fn parked_load() -> (LibraryHandle, Arc<Authority>, MotionTicket) {
+        let (mut handle, _, _) = open(None, None);
+        let authority = Arc::new(Authority::default());
+        handle.set_motion_authority(authority.clone());
+        handle
+            .with_motion_context(
+                MotionContext {
+                    parent_operation: Some([7; 16]),
+                    load_confirmation: LoadConfirmation::Readiness,
+                    ..Default::default()
+                },
+                |handle| handle.load(SLOT, BAY, &policy()),
+            )
+            .unwrap();
+        let pending = &handle.handed_off_motion[&BAY];
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0].command, MotionCommand::Load(_)));
+        assert_eq!(
+            pending[0].context.load_confirmation,
+            LoadConfirmation::Readiness
+        );
+        let ticket = pending[0].ticket;
+        (handle, authority, ticket)
+    }
+
+    #[test]
+    fn l4_drive_abandonment_removes_closed_loads_and_keeps_failed_appends() {
+        for refusal in [
+            None,
+            Some(MotionAuthorityFailure::SemanticRefusal),
+            Some(MotionAuthorityFailure::StoreFailure),
+        ] {
+            let (mut handle, authority, ticket) = parked_load();
+            let mut drive = handle.open_drive(BAY, &policy()).unwrap();
+            *authority.refusal.lock().unwrap() = refusal;
+            let result = drive.abandon_readiness_loads();
+            assert_eq!(*authority.abandoned.lock().unwrap(), vec![ticket]);
+            if refusal == Some(MotionAuthorityFailure::StoreFailure) {
+                assert_eq!(
+                    result.unwrap_err().kind,
+                    MotionAuthorityFailure::StoreFailure
+                );
+                assert_eq!(drive.pending_motion.len(), 1);
+                assert_eq!(drive.pending_motion[0].ticket, ticket);
+                // A subsequent successful append still has the original ticket to close.
+                *authority.refusal.lock().unwrap() = None;
+                drive.abandon_readiness_loads().unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert!(drive.pending_motion.is_empty());
+            let calls = authority.abandoned.lock().unwrap().clone();
+            drive.abandon_readiness_loads().unwrap();
+            assert_eq!(
+                *authority.abandoned.lock().unwrap(),
+                calls,
+                "second drain does nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn l4_handoff_abandonment_removes_closed_loads_and_keeps_failed_appends() {
+        for refusal in [
+            None,
+            Some(MotionAuthorityFailure::SemanticRefusal),
+            Some(MotionAuthorityFailure::StoreFailure),
+        ] {
+            // load() handed off the pending LOAD before dropping its temporary drive handle.
+            let (mut handle, authority, ticket) = parked_load();
+            *authority.refusal.lock().unwrap() = refusal;
+            handle.abandon_handed_off_loads(BAY + 1).unwrap();
+            assert!(authority.abandoned.lock().unwrap().is_empty());
+            let result = handle.abandon_handed_off_loads(BAY);
+            assert_eq!(*authority.abandoned.lock().unwrap(), vec![ticket]);
+            if refusal == Some(MotionAuthorityFailure::StoreFailure) {
+                assert_eq!(
+                    result.unwrap_err().kind,
+                    MotionAuthorityFailure::StoreFailure
+                );
+                assert_eq!(handle.handed_off_motion[&BAY].len(), 1);
+                assert_eq!(handle.handed_off_motion[&BAY][0].ticket, ticket);
+                *authority.refusal.lock().unwrap() = None;
+                handle.abandon_handed_off_loads(BAY).unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert!(!handle.handed_off_motion.contains_key(&BAY));
+            let calls = authority.abandoned.lock().unwrap().clone();
+            handle.abandon_handed_off_loads(BAY).unwrap();
+            assert_eq!(
+                *authority.abandoned.lock().unwrap(),
+                calls,
+                "second drain does nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn l4_abandonment_filters_readiness_loads_and_stops_at_first_storage_error() {
+        for handed_off in [false, true] {
+            let (mut handle, authority, ticket) = parked_load();
+            let mut drive = handle.open_drive(BAY, &policy()).unwrap();
+            let mut other = drive.pending_motion[0].clone();
+            other.ticket.sequence += 1;
+            other.context.load_confirmation = LoadConfirmation::Inventory;
+            drive.pending_motion.push(other.clone());
+            other.ticket.sequence += 1;
+            other.context.load_confirmation = LoadConfirmation::Readiness;
+            other.command = MotionCommand::Unload(DriveKey::Bay {
+                library_serial: SERIAL.into(),
+                bay: BAY,
+            });
+            drive.pending_motion.push(other.clone());
+            other.ticket.sequence += 1;
+            other.command = MotionCommand::Load(DriveKey::Bay {
+                library_serial: SERIAL.into(),
+                bay: BAY,
+            });
+            drive.pending_motion.push(other);
+            *authority.refusal.lock().unwrap() = Some(MotionAuthorityFailure::StoreFailure);
+            if handed_off {
+                handle
+                    .handed_off_motion
+                    .insert(BAY, drive.take_pending_motion());
+                assert_eq!(
+                    handle.abandon_handed_off_loads(BAY).unwrap_err().kind,
+                    MotionAuthorityFailure::StoreFailure
+                );
+                assert_eq!(handle.handed_off_motion[&BAY].len(), 4);
+            } else {
+                assert_eq!(
+                    drive.abandon_readiness_loads().unwrap_err().kind,
+                    MotionAuthorityFailure::StoreFailure
+                );
+                assert_eq!(drive.pending_motion.len(), 4);
+            }
+            assert_eq!(
+                *authority.abandoned.lock().unwrap(),
+                vec![ticket],
+                "later LOAD stays parked"
+            );
+            *authority.refusal.lock().unwrap() = None;
+            let remaining = if handed_off {
+                handle.abandon_handed_off_loads(BAY).unwrap();
+                &handle.handed_off_motion[&BAY]
+            } else {
+                drive.abandon_readiness_loads().unwrap();
+                &drive.pending_motion
+            };
+            assert_eq!(
+                remaining.len(),
+                2,
+                "inventory LOAD and readiness-context UNLOAD stay parked"
+            );
+            assert_eq!(
+                remaining
+                    .iter()
+                    .map(|p| p.ticket.sequence)
+                    .collect::<Vec<_>>(),
+                vec![ticket.sequence + 1, ticket.sequence + 2]
+            );
+            assert_eq!(
+                authority
+                    .abandoned
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.sequence)
+                    .collect::<Vec<_>>(),
+                vec![ticket.sequence, ticket.sequence, ticket.sequence + 3]
+            );
+        }
+    }
+}

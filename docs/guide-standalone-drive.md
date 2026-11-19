@@ -19,6 +19,8 @@ version 0.2.0.
 ## What you need
 
 - Linux, an LTO drive and a compatible rewritable cartridge.
+  Buy rewritable media, not WORM, because recovery replaces an interrupted write's
+  unfinished tail; see [Concepts §7](concepts.md#7-worm-media).
 - Remanence built and installed as described in
   [Installing Remanence](guide-install.md). There is no binary release yet.
 - The host prepared for tape hardware, as in
@@ -61,12 +63,24 @@ means fsync can return before data reaches disk.
 Remanence makes its records durable with fsync, as a database does; it cannot
 test whether a disk keeps what it confirms. If a power cut loses the last
 journal records, nothing on tape is lost or overwritten. The next write to
-that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
-with `rem tape restore --scan --out rescued`, then run
-`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
-an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
-`put`. A UPS, or a disk with power-loss protection, removes this power-cut
-exposure.
+that tape can stop with `TailBeyondKnownState`. Recoverable files can be
+copied out with `rem tape restore --scan --out rescued` on a standalone
+drive. After that refusal, if this state shows no open session on the tape
+(its last session closed, or none opened since it was initialized here),
+`supersede-tail` refuses discard in this release: keep the tape closed for
+writing, start from a newer copy of the state directory that accounts for
+the data, or withdraw the tape by the [`rem tape
+retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
+this configuration's path with `--config`; parity closeout or a pending
+finalization can block retirement). Otherwise discard can proceed if
+recovery checks pass. In standalone home mode use `rem tape supersede-tail
+--acknowledge-tape LABEL`; for an explicit drive add `--device PATH
+--allow-device SERIAL`. In a library use `rem tape supersede-tail
+--tape-uuid UUID --ack-tape-uuid UUID`.
+Its preview lists the objects and other findings it detected (a trailing
+torn fragment has no separate entry); confirm only after accounting for the
+whole suffix, then rerun an interrupted `put` whose sources still exist. A
+UPS, or a disk with power-loss protection, removes this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
@@ -304,16 +318,24 @@ recovery: the same key is refused with
 `tape provisioning conflict: ClosedOperationRetry: ...`, and a new key with
 `pending terminal finalization belongs to a different exact request`. If that
 ending also raised a tape-I/O fence on the tape, the fence refuses both until it
-is released.
+is released. The standalone drive hold also requires acknowledgement before
+further writes or initialization in that drive, including on another cartridge.
 
 Each command prints a JSON summary. A successful finalize reports
 `"finalized": true`. `rem tape verify` reports `"status": "verified"` with the
 tape's `object_count`, and `--full` reports `"verified_complete": true`. On a
 tape without a usable terminal index, `rem tape verify` exits with status 1 and
 `error: verification failed: no usable terminal index; not_finalized`, or
-`terminal_index_unusable` in place of `not_finalized` when an index exists but
-cannot be used. A full verification that does not complete exits with status 1
-and `error: full verification incomplete`.
+`terminal_index_unusable` in place of `not_finalized` when an index exists
+but cannot be used. When the drive reports no end-of-data mark, the status
+is `end_of_data_not_found`, and `rem tape identify` warns `warning: drive
+reports no end-of-data mark; power loss during writing can cause this;
+committed files remain readable; rem tape restore --scan --list inspects
+recoverable files, not the actual end`. A full verification that returns an
+incomplete verdict exits with status 1 and `error: full verification
+incomplete`; `--full` names the missing mark when `SPACE(EOD)` reports it
+or when a filemark-spacing failure reports it during the physical prefix
+walk.
 
 Wait for the command to exit before you eject. Use the drive's button, or the
 `mt` command with the drive's non-rewinding tape node, found as in
@@ -403,6 +425,32 @@ drive. The session is closed when its tape is next opened, subject to the normal
 tape admission and tail checks. Live drive status lists only sessions open now,
 so it does not show the crash-left session.
 
+A write, finalize or tail replacement on a standalone drive that ends in a
+write fence also holds the drive, including when the tape fence itself cannot
+be recorded and when a read during the write contradicts what was recorded.
+The hold refuses `put`,
+`tape finalize`, `tape supersede-tail`, `tape init`, `tape adopt`,
+`tape assign-pool`, `tape rebind` and `tape set-generation` in that drive,
+including on any other cartridge.
+The `assign-pool --tape <UUID>` form opens no drive and does not consult its hold.
+On the failed cartridge, put, finalize and the four catalogue commands report
+the tape fence first; init reports `DriveFenced` on any cartridge. Reads and
+`rem tape release` do not consult the hold; their other admission checks still
+apply. An append-admission refusal (`append_admission_refused`) fences only
+the tape; a session-suffix contradiction (`session_suffix_contradiction`)
+found at append admission also holds the standalone drive.
+The hold is recorded in the library log. If that record fails, the command prints
+`error: cannot record the hold on standalone drive <serial>: <error>; motion is fenced and recovery is required`
+and motion stops for the rest of the process. The hold is not on record, so a
+later command does not find the drive held: check the drive and the tape before
+using that drive again.
+
+The standalone refusal names the hold and its release command:
+
+```text
+DriveFenced: drive <serial> library:<n> <cause>; release the hold with `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT`
+```
+
 Inspect active fences before reading or writing. With a
 `native_log_behind_projection` fence, `rem get`, `rem tape identify`,
 `rem tape verify` and `rem tape restore` refuse. Only `rem tape restore --scan`
@@ -444,6 +492,29 @@ home host pass
 which uses your home configuration when `/etc/rem/config.toml` is absent. With
 no daemon socket answering, it runs offline under the state lock.
 
+`rem tape quarantine list` on the standalone route includes `standalone_holds`:
+each row has `quarantine_id`, `drive_serial`, `cause`, `detail` and `state`.
+It lists all active standalone holds in the selected state root without opening
+a device. After checking the drive, acknowledge its hold with:
+
+```sh
+rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack "drive checked"
+```
+
+This opens no device and sends no device command. It prints the released hold
+with `state: "released"` and the tape fences still present in `active_fences`.
+The hold and tape fences have separate releases: acknowledgement of the drive
+never releases a tape fence. Use the library release form below for releasable
+tape fences; tape fences requiring physical recovery keep that requirement.
+
+If a daemon answers on the selected configuration's socket, it refuses the hold
+with a message containing this text; there is no offline fallback after that
+refusal:
+
+```text
+fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem tape quarantine release library:<n> --device PATH --allow-device <serial> --ack TEXT` as a standalone command
+```
+
 For other releasable tape fences, after checking the hardware and preserving
 the data, record what you checked without `--force`:
 
@@ -466,20 +537,37 @@ When both configurations exist, list the home state's fence ids with
 configuration. To choose a configuration for library-form release, put
 `--config <PATH>` on the `release` subcommand.
 
-A standalone initialization write that fails with an uncertain outcome raises no
-tape or drive fence. It is refused with
-`cannot durably record standalone write uncertainty for ...; motion is fenced and recovery is required`,
-counted as `StandaloneFenceUnrecorded`, and the command stops all further robot and
-drive motion until it exits. Investigate the write failure before running another
-command; there is no endpoint fence to release for this failure.
+A standalone initialization write with an uncertain outcome holds the drive and
+returns the write's own error. It creates no tape fence; the hold's
+`evidence_json` names the planned tape UUID. The next init refuses with
+`DriveFenced` before RESERVE or preparation, on any cartridge. If the hold
+cannot be recorded, the refusal is:
+
+```text
+cannot durably record standalone write uncertainty for <uuid> at <endpoint> (<reason>): <detail>; the drive hold was not recorded: <error>; motion is fenced and recovery is required
+```
+
+That failure is counted as `StandaloneFenceUnrecorded` and stops further motion
+for the rest of the process.
 
 Release records your acknowledgement; it does not prove that the append point
 is safe. Every append checks the physical tail. `TailBeyondKnownState` means
-complete data exists beyond the position your local state knows. Restore a
+the tape holds data your local state does not record (complete files or only a
+torn fragment) beyond the position it knows. Restore a
 newer state backup, or rescue with `--scan`. Do not delete the tape logs in the
 state directory to make the refusal go away.
 
-If you deliberately discard that suffix after rescuing it, run:
+Tape fences for `append_admission_refused` and `session_suffix_contradiction`
+are not released by `rem tape quarantine release`. Tail recovery refuses a tape that
+contradicts its recorded session ending. If the state shows no open session on
+the tape (its last session closed, or none opened since it was initialized here),
+its unrecorded data cannot be discarded in this release:
+keep the tape closed for writing, withdraw it with `rem tape retire` and
+`--config` with this configuration's path, or start from a newer copy of the
+state directory. Retirement refuses while parity closeout is due.
+
+Otherwise, to deliberately discard that suffix after rescuing it, and only
+when its objects are known to be unneeded, run:
 
 ```sh
 rem tape supersede-tail --acknowledge-tape HOME01
@@ -580,8 +668,30 @@ Restore both logs, both authority files and the configuration together, each
 from its newest copy, to the configured paths. An older copy knows nothing
 decided after it: a tape withdrawn or fenced since then is not withdrawn or
 fenced in the restored state, and a tape first provisioned since then is unknown
-to it. Before starting the service on restored state, list the tapes used,
-withdrawn or fenced since the copy's date.
+to it. Before using restored state, list the tapes used, withdrawn or fenced
+since the copy's date.
+
+Each tape the restored state knows that has been written since the copy is
+checked on its first write under the restored state, and data there that the
+restored state does not account for can refuse that write with
+`TailBeyondKnownState` and close the tape for writing. Before writing with
+restored state, have at hand a writable tape the state knows and that has
+not been written since the copy. The restored catalog does not list a tape's
+data written since the copy. Copy those files out with
+`rem tape restore --scan
+--out rescued`; do not discard the data unless its objects are known
+to be unneeded. If the restored state
+shows no open session on the tape (its last session closed, or none opened since
+it was initialized here), that data cannot be discarded in this release: keep
+the tape closed for writing, withdraw it with `rem tape retire`
+and `--config` with this configuration's path, or start from a newer copy of
+the state directory.
+
+On a parity pool, if the restored tape log still owes closeout, retirement
+refuses with `CloseoutRequired`. Closeout stays refused under either
+`append_admission_refused` or `session_suffix_contradiction`.
+For that tape, use `rem tape supersede-tail` only where discard applies, or
+start from a newer copy of the state directory.
 
 Keep the recorded paths on a replacement server. State, tape-log or library-log
 roots that differ from `authority-manifest.json` refuse daemon startup, rebuild

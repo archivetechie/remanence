@@ -613,6 +613,22 @@ impl CompletionEvidence {
     pub fn current_medium_damage(&self) -> bool {
         self.current_sense().is_some_and(|s| s.key == 3)
     }
+    /// Does this primary READ(6) or SPACE(6) completion report a missing EOD mark?
+    pub fn is_end_of_data_not_found(&self, issued_opcode: u8) -> bool {
+        matches!(issued_opcode, 0x08 | 0x11)
+            && self.opcode == Some(issued_opcode)
+            && self.host_transferred_bytes.unwrap_or(0) == 0
+            && self.transferred_bytes.unwrap_or(0) == 0
+            && !self.residual_valid
+            && self.current_sense().is_some_and(|s| {
+                s.key == 3
+                    && s.asc == 0x14
+                    && matches!(s.ascq, 0 | 3)
+                    && !s.filemark
+                    && !s.eom
+                    && !s.ili
+            })
+    }
     /// A zero-byte refusal with no inconsistent sense-residual claim.
     pub fn definitely_rejected(&self) -> bool {
         self.current_sense().is_some_and(|s| {

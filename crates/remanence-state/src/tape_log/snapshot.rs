@@ -8,19 +8,71 @@ use super::{
     *,
 };
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::FileExt,
-    sync::Arc,
+    os::unix::fs::{FileExt, MetadataExt},
+    sync::{Arc, Mutex},
 };
 
 pub(super) type PlanBase = Option<(u64, Arc<TapeSummary>)>;
-type ValidatedPrefix = (TapeSummary, Tail, ReplayMetrics, PlanBase);
+type ValidatedPrefix = (
+    TapeSummary,
+    Tail,
+    ReplayMetrics,
+    PlanBase,
+    BTreeMap<u64, u64>,
+);
+
+const POSITION_INDEX_INTERVAL: u64 = 1024 * 1024;
+
+#[cfg(any(test, feature = "fixtures"))]
+static POSITION_INDEX_INTERVAL_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(POSITION_INDEX_INTERVAL);
+
+/// Set the process-wide bookmark interval for an isolated fixture. Call before
+/// constructing any snapshots; production builds always use one MiB.
+#[cfg(any(test, feature = "fixtures"))]
+pub fn set_position_index_interval(bytes: u64) {
+    assert!(bytes > 0, "position index interval must be positive");
+    POSITION_INDEX_INTERVAL_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the same interval for bookmark spacing and full-pass accounting.
+fn position_index_interval() -> u64 {
+    #[cfg(any(test, feature = "fixtures"))]
+    {
+        POSITION_INDEX_INTERVAL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(any(test, feature = "fixtures")))]
+    {
+        POSITION_INDEX_INTERVAL
+    }
+}
+
+/// Sparse frame boundaries for one pinned file. This is a leaf lock: copy or
+/// insert only, never hold it across I/O or acquisition of another lock.
+pub(super) type PositionIndex = Arc<Mutex<BTreeMap<u64, u64>>>;
+
+/// Keep the first frame at least one interval beyond the previous bookmark.
+/// The log/decode start is the implicit first bookmark, even in an empty map.
+pub(super) fn seed_position(
+    entries: &mut BTreeMap<u64, u64>,
+    previous: &mut u64,
+    sequence: u64,
+    offset: u64,
+) {
+    if offset.saturating_sub(*previous) >= position_index_interval() {
+        entries.insert(sequence, offset);
+        *previous = offset;
+    }
+}
 
 /// Unvalidated capture, deliberately not an authority token.
 #[derive(Clone)]
 pub(super) struct Captured {
     file: Option<Arc<File>>,
+    identity: Option<(u64, u64)>,
     end: u64,
     start: u64,
     header: Header,
@@ -34,9 +86,9 @@ impl Captured {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let end = file
-            .as_ref()
-            .map_or(Ok(0), |f| f.metadata().map(|m| m.len()))?;
+        let metadata = file.as_ref().map(|f| f.metadata()).transpose()?;
+        let end = metadata.as_ref().map_or(0, |m| m.len());
+        let identity = metadata.as_ref().map(|m| (m.dev(), m.ino()));
         let start = if let Some(file) = &file {
             Header::read(
                 &mut PrefixReader {
@@ -55,6 +107,7 @@ impl Captured {
         };
         Ok(Self {
             file,
+            identity,
             end,
             start,
             header: store.header.clone(),
@@ -70,6 +123,8 @@ impl Captured {
             ..ReplayMetrics::default()
         };
         let mut plan_base = None;
+        let mut positions = BTreeMap::new();
+        let mut previous = self.start;
         if let Some(file) = &self.file {
             let mut decoder = Decoder::at(
                 PrefixReader {
@@ -89,6 +144,7 @@ impl Captured {
                         return Err(StoreError::Header);
                     }
                 }
+                seed_position(&mut positions, &mut previous, frame.sequence, frame.offset);
                 metrics.frames += 1;
                 metrics.structural_bytes += frame.structural.len() as u64;
                 metrics.payload_bytes += frame.payload.len() as u64;
@@ -122,12 +178,24 @@ impl Captured {
             let (summary, tail) = fold
                 .finish(decoder.tail())
                 .map_err(CodecError::EncodeSchema)?;
-            Ok((summary, tail, metrics, plan_base))
+            positions.retain(|_, offset| *offset < summary.closed_end);
+            Ok((summary, tail, metrics, plan_base, positions))
         } else {
-            Ok((fold.summary().clone(), Tail::Complete, metrics, None))
+            Ok((
+                fold.summary().clone(),
+                Tail::Complete,
+                metrics,
+                None,
+                positions,
+            ))
         }
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn inspect_tail(&self) -> Result<super::store::TailInspection, StoreError> {
+        #[cfg(any(test, feature = "fixtures"))]
+        if self.end > self.start {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeValidate);
+        }
         let file = self
             .file
             .as_ref()
@@ -181,6 +249,7 @@ impl Captured {
             damage,
         })
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn validate_through(&self, through: u64) -> Result<(TapeSummary, u64), StoreError> {
         if through == 0 {
             return Err(StoreError::Refused(
@@ -233,9 +302,18 @@ impl Captured {
     }
     /// The exclusive owner has already fully validated and incrementally folded
     /// these bytes. Reuse that proof without a catalog scan under its lock.
-    pub(super) fn trusted(self, summary: TapeSummary, tail: Tail, plan_base: PlanBase) -> Snapshot {
+    pub(super) fn trusted(
+        self,
+        summary: TapeSummary,
+        tail: Tail,
+        plan_base: PlanBase,
+        position_index: PositionIndex,
+    ) -> Snapshot {
         Snapshot {
             file: self.file,
+            identity: self.identity,
+            prefix_hash: Arc::new(Mutex::new(None)),
+            position_index,
             first_sequence: 1,
             start: self.start,
             captured_end: self.end,
@@ -247,8 +325,14 @@ impl Captured {
             plan_base,
         }
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(super) fn validate(self) -> Result<Snapshot, StoreError> {
-        let (summary, tail, metrics, plan_base) = self.fold()?;
+        #[cfg(any(test, feature = "fixtures"))]
+        if self.end > self.start {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeValidate);
+        }
+        let (summary, tail, metrics, plan_base, positions) = self.fold()?;
+        let position_index = Arc::new(Mutex::new(positions));
         if self.file.is_some()
             && summary.is_fresh()
             && tail == Tail::Complete
@@ -260,6 +344,9 @@ impl Captured {
         }
         Ok(Snapshot {
             file: self.file,
+            identity: self.identity,
+            prefix_hash: Arc::new(Mutex::new(None)),
+            position_index,
             first_sequence: 1,
             start: self.start,
             captured_end: self.end,
@@ -301,12 +388,24 @@ pub struct RecordEvidence {
     pub digest: [u8; 32],
 }
 
+/// SHA-256 continuation for one validated immutable prefix. The cell's lock is
+/// a leaf: copy/install only, never held across I/O or another lock acquisition.
+#[derive(Clone, Debug)]
+struct PrefixHash {
+    end: u64,
+    state: sha2::Sha256,
+    digest: [u8; 32],
+}
+
 /// Fully trust-validated immutable prefix. Provisional rows never escape visitors.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    prefix_hash: Arc<Mutex<Option<PrefixHash>>>,
     pub(super) plan_base: PlanBase,
+    pub(super) position_index: PositionIndex,
     first_sequence: u64,
     file: Option<Arc<File>>,
+    identity: Option<(u64, u64)>,
     start: u64,
     captured_end: u64,
     pub(super) summary: TapeSummary,
@@ -319,15 +418,11 @@ impl Snapshot {
     /// Identity of the pinned native source, used to reject an old inode after
     /// an explicit authority repair atomically replaces the file.
     pub(crate) fn file_identity(&self) -> Result<Option<(u64, u64)>, StoreError> {
-        use std::os::unix::fs::MetadataExt;
-        self.file
-            .as_ref()
-            .map(|file| {
-                file.metadata()
-                    .map(|m| (m.dev(), m.ino()))
-                    .map_err(StoreError::from)
-            })
-            .transpose()
+        Ok(self.identity)
+    }
+    /// Keep this snapshot's inode alive for a process-local projection marker.
+    pub(crate) fn projection_file(&self) -> Option<Arc<File>> {
+        self.file.clone()
     }
     /// Measurements of the full validation pass performed outside the lock.
     pub fn replay_metrics(&self) -> ReplayMetrics {
@@ -368,7 +463,74 @@ impl Snapshot {
     /// corruption remain errors, never absence. Acquiring a snapshot does not
     /// replace the writer's obligation to finish a successful native sync before
     /// appending a dependent decision; ambiguous leases cannot yield snapshots.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn record_evidence(&self, sequence: u64) -> Result<Option<RecordEvidence>, StoreError> {
+        if sequence == 0 || sequence > self.summary.last_closed_sequence {
+            return Ok(None);
+        }
+        let (first, start) = {
+            let positions = self
+                .position_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            positions
+                .range(..=sequence)
+                .rev()
+                .find(|(_, offset)| **offset >= self.start && **offset < self.summary.closed_end)
+                .map(|(&sequence, &offset)| (sequence, offset))
+                .unwrap_or((self.first_sequence, self.start))
+        };
+        let mut positions = BTreeMap::new();
+        let mut previous = start;
+        let mut answer = Err(StoreError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "native evidence disappeared from a validated snapshot",
+        )));
+        let mut _reached = self.summary.closed_end;
+        if let Some(file) = &self.file {
+            let mut decoder = Decoder::at(
+                PrefixReader {
+                    file: file.clone(),
+                    position: start,
+                    end: self.summary.closed_end,
+                },
+                first,
+                start,
+            );
+            while let Some(frame) = decoder.next_frame()? {
+                seed_position(&mut positions, &mut previous, frame.sequence, frame.offset);
+                if frame.sequence == sequence {
+                    _reached = frame.offset;
+                    answer = Ok(
+                        (!matches!(frame.record, Record::PayloadContinuation(_))).then(|| {
+                            RecordEvidence {
+                                kind: frame.record.tag(),
+                                digest: super::codec::record_digest(&frame),
+                            }
+                        }),
+                    );
+                    break;
+                }
+            }
+        }
+        #[cfg(any(test, feature = "fixtures"))]
+        if _reached.saturating_sub(start) >= position_index_interval() {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeFirstFrame);
+        }
+        if answer.is_ok() {
+            self.position_index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(positions);
+        }
+        answer
+    }
+    /// Original first-frame lookup retained as an independent differential oracle.
+    #[cfg(test)]
+    pub(super) fn record_evidence_oracle(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<RecordEvidence>, StoreError> {
         if sequence == 0 || sequence > self.summary.last_closed_sequence {
             return Ok(None);
         }
@@ -393,8 +555,88 @@ impl Snapshot {
             "native evidence disappeared from a validated snapshot",
         )))
     }
-    /// Bind a projection checkpoint to exact frozen bytes using bounded memory.
+    /// Carry a continuation only between captures of the same tape/header and
+    /// pinned inode. Copy out before installing, including when cells are shared.
+    pub(crate) fn carry_projection_prefix_hash(&self, prior: &Self) {
+        if self.header() != prior.header()
+            || !matches!((self.file_identity(), prior.file_identity()),
+                (Ok(Some(current)), Ok(Some(previous))) if current == previous)
+        {
+            return;
+        }
+        let kept = prior
+            .prefix_hash
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(kept) = kept {
+            self.install_prefix_hash(kept);
+        }
+    }
+
+    /// Never replace a continuation with one at an earlier or equal end.
+    fn install_prefix_hash(&self, candidate: PrefixHash) {
+        let mut kept = self.prefix_hash.lock().unwrap_or_else(|p| p.into_inner());
+        if kept.as_ref().is_none_or(|old| old.end < candidate.end) {
+            *kept = Some(candidate);
+        }
+    }
+
+    /// Bind a projection checkpoint to frozen bytes, extending a remembered
+    /// SHA-256 state when possible. Older ends still hash from byte zero.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn projection_prefix_digest(&self, end: u64) -> Result<[u8; 32], StoreError> {
+        use sha2::{Digest, Sha256};
+        if end > self.summary.closed_end {
+            return Err(StoreError::Refused(
+                "projection source is shorter than its digest",
+            ));
+        }
+        let kept = self
+            .prefix_hash
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (start, mut state) = match kept {
+            Some(kept) if kept.end == end => return Ok(kept.digest),
+            Some(kept) if kept.end < end => (kept.end, kept.state),
+            _ => (0, Sha256::new()),
+        };
+        if end != 0 {
+            let file = self
+                .file
+                .as_ref()
+                .ok_or(StoreError::Refused("projection source file absent"))?;
+            #[cfg(any(test, feature = "fixtures"))]
+            if start == 0 && end > self.start {
+                crate::full_pass::count(crate::full_pass::PassKind::TapePrefixHash);
+            }
+            let mut reader = PrefixReader {
+                file: file.clone(),
+                position: start,
+                end,
+            };
+            let mut bytes = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut bytes)?;
+                if n == 0 {
+                    break;
+                }
+                state.update(&bytes[..n]);
+            }
+            if reader.position != end {
+                return Err(StoreError::Refused(
+                    "projection source is shorter than its digest",
+                ));
+            }
+        }
+        let digest = state.clone().finalize().into();
+        self.install_prefix_hash(PrefixHash { end, state, digest });
+        Ok(digest)
+    }
+    /// Hash pinned bytes from zero without reading or installing remembered prefix state.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
+    pub(crate) fn projection_prefix_digest_oracle(&self, end: u64) -> Result<[u8; 32], StoreError> {
         use sha2::{Digest, Sha256};
         if end > self.summary.closed_end {
             return Err(StoreError::Refused(
@@ -407,6 +649,10 @@ impl Snapshot {
                 .file
                 .as_ref()
                 .ok_or(StoreError::Refused("projection source file absent"))?;
+            #[cfg(any(test, feature = "fixtures"))]
+            if end > self.start {
+                crate::full_pass::count(crate::full_pass::PassKind::TapePrefixHash);
+            }
             let mut reader = PrefixReader {
                 file: file.clone(),
                 position: 0,
@@ -419,6 +665,11 @@ impl Snapshot {
                     break;
                 }
                 digest.update(&bytes[..n]);
+            }
+            if reader.position != end {
+                return Err(StoreError::Refused(
+                    "projection source is shorter than its digest",
+                ));
             }
         }
         Ok(digest.finalize().into())
@@ -480,6 +731,7 @@ impl Snapshot {
     }
     /// Run a structural pass over the already validated closed prefix, skipping
     /// catalog bytes. Directory/prefix planning rows are not durable media rows.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn visit_file_rows(
         &self,
         mut visitor: impl FnMut(&TapeFileEntry) -> Result<(), StoreError>,
@@ -521,6 +773,7 @@ impl Snapshot {
     }
     /// Full validated-frame visitor for payload/metadata adapters. Only closed
     /// groups are included; clients distinguish plan rows from physical rows.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn visit_frames(
         &self,
         mut visitor: impl FnMut(&Frame<'_>) -> Result<(), StoreError>,
@@ -534,6 +787,7 @@ impl Snapshot {
     }
     /// Visit only frames appended after a prefix already validated by the same
     /// process owner. Explicit repair must discard that owner's progress mark.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn visit_frames_after(
         &self,
         through: u64,
@@ -579,6 +833,7 @@ impl Snapshot {
         Ok(())
     }
 
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn before(&self, sequence: u64) -> Result<Self, StoreError> {
         if let Some((first, summary)) = &self.plan_base {
             if *first == sequence {
@@ -616,6 +871,7 @@ impl Snapshot {
     }
     /// Seek directly to the projection's closing frame. Full snapshot validation
     /// already proved the prefix; this checks the mark without replaying it.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn projection_decoder(
         &self,
         sequence: u64,
@@ -663,7 +919,12 @@ impl Snapshot {
         }
         Ok(Some(decoder))
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn decoder(&self) -> Option<Decoder<PrefixReader>> {
+        #[cfg(any(test, feature = "fixtures"))]
+        if self.file.is_some() && self.first_sequence == 1 && self.start < self.summary.closed_end {
+            crate::full_pass::count(crate::full_pass::PassKind::TapeFirstFrame);
+        }
         self.file.as_ref().map(|file| {
             Decoder::at(
                 PrefixReader {
@@ -713,6 +974,7 @@ impl Snapshot {
     /// Stream one catalog item at a time across arbitrary frame boundaries.
     /// Member lists are never materialized. A single variable-length field is
     /// owned by its event consumer; the frame/continuation history is not retained.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn visit_catalog(
         &self,
         mut visitor: impl FnMut(&crate::authority::CatalogPayload) -> Result<(), StoreError>,

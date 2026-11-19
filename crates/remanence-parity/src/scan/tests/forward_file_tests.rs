@@ -206,7 +206,12 @@ fn report_faults_require_spacing_and_spacing_failure_stands() {
         let measured = observation.measure(&mut source).unwrap();
         assert_eq!(
             measured,
-            measure_current_file(&mut make(), PhysicalPositionHint::new(0)).unwrap()
+            measure_current_file(
+                &mut make(),
+                PhysicalPositionHint::new(0),
+                EndOfDataRule::Refuse
+            )
+            .unwrap()
         );
         assert!(source
             .0

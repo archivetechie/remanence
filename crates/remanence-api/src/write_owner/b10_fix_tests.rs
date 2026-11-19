@@ -20,6 +20,10 @@ fn add_tape(root: &Path, world: &Arc<Mutex<VirtualWorld>>, id: [u8; 16], label: 
         })
         .unwrap();
     index.project_tape_pool_membership(id, POOL).unwrap();
+    seat_tape(world, id, label, bay);
+}
+
+fn seat_tape(world: &Arc<Mutex<VirtualWorld>>, id: TapeUuid, label: &str, bay: u16) {
     let bootstrap = crate::build_tape_bootstrap(
         id,
         BLOCK,
@@ -133,7 +137,7 @@ fn typed_actor_state(
     world: Arc<Mutex<VirtualWorld>>,
     policy: PoolSelectionPolicyName,
 ) -> crate::ApiState {
-    let mut library = open_model_library(world.clone());
+    let library = open_model_library(world.clone());
     crate::drive_collection::observe_drive_catalog_from_libraries(
         &mut handle.write_handle(),
         [library.library()],
@@ -144,6 +148,28 @@ fn typed_actor_state(
         crate::ApiState::new_with_pool_configs(handle.projection_client(), vec![pool()]);
     state.checkpoint_journal_dir = Arc::new(handle.paths().journal_dir.join("tapes"));
     state.drive_idle_unload_seconds = 0;
+    let cfg = crash_typed_config(handle.paths(), &handle.projection_client(), &library);
+    start_pool_actors(state, library, cfg, world, policy)
+}
+
+/// Build the API and its actors from the same configured pool owner.
+fn pooled_actor_state(
+    root: &DurabilityRoot,
+    world: Arc<Mutex<VirtualWorld>>,
+    policy: PoolSelectionPolicyName,
+) -> crate::ApiState {
+    let library = open_model_library(world.clone());
+    let cfg = root.config(&library);
+    start_pool_actors(root.api_state(), library, cfg, world, policy)
+}
+
+fn start_pool_actors(
+    mut state: crate::ApiState,
+    mut library: remanence_library::LibraryHandle,
+    mut cfg: WriteOwnerConfig,
+    world: Arc<Mutex<VirtualWorld>>,
+    policy: PoolSelectionPolicyName,
+) -> crate::ApiState {
     let lifecycle = DrivePoolLifecycle::default();
     let bays: Vec<_> = world
         .lock()
@@ -157,7 +183,6 @@ fn typed_actor_state(
             .map(|b| (DriveKey::new(LIBRARY, *b), AtomicBool::new(false)))
             .collect(),
     );
-    let mut cfg = crash_typed_config(handle.paths(), &handle.projection_client(), &library);
     cfg.lifecycle = Some(lifecycle.clone());
     cfg.reservations = reservations.clone();
     let mut policy_cfg = pool();
@@ -380,11 +405,15 @@ async fn write(state: &crate::ApiState, session: &pb::WriteSession, root: &Path,
 /// B was last written, C has an unrelated worker hold: FillOldest still picks A.
 #[tokio::test]
 async fn b10_fix_fill_oldest_ignores_unrelated_worker_recency() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    add_tape(root.path(), &world, OTHER, "AAA001L9", BAY + 1);
-    add_tape(root.path(), &world, THIRD, "ZZZ001L9", BAY + 2);
-    let state = actor_state(root.path(), world, PoolSelectionPolicyName::FillOldest);
+    let root = DurabilityRoot::with_tapes(
+        &[(TAPE, BARCODE), (OTHER, "AAA001L9"), (THIRD, "ZZZ001L9")],
+        &[TAPE, OTHER, THIRD],
+        true,
+    );
+    let world = model_world(BARCODE, true);
+    seat_tape(&world, OTHER, "AAA001L9", BAY + 1);
+    seat_tape(&world, THIRD, "ZZZ001L9", BAY + 2);
+    let state = pooled_actor_state(&root, world, PoolSelectionPolicyName::FillOldest);
     let c = open(&state, Some(THIRD)).await.unwrap();
     close(&state, &c).await;
     let b = open(&state, Some(TAPE)).await.unwrap();
@@ -587,9 +616,9 @@ async fn b10_fix_supersede_tail_wakes_parked_worker() {
 /// Live debt is visible across retry ticks without claiming or recording failures.
 #[tokio::test]
 async fn b10_fix_live_writer_debt_is_not_attempted() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
-    let state = actor_state(root.path(), world, PoolSelectionPolicyName::CompleteOrFill);
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    let state = pooled_actor_state(&root, world, PoolSelectionPolicyName::CompleteOrFill);
     let session = open(&state, None).await.unwrap();
     write(&state, &session, root.path(), "live").await;
     crate::closeout_obligation::spawn(state.clone());
@@ -603,10 +632,15 @@ async fn b10_fix_live_writer_debt_is_not_attempted() {
 /// Finalization can win after recheck but before reserve_tape: reselect B.
 #[tokio::test]
 async fn b10_fix_post_wait_reservation_busy_reselects() {
-    let root = tempfile::tempdir().unwrap();
-    let world = super::b7_tests::due_tape(root.path()).await;
-    add_tape(root.path(), &world, OTHER, "ZZZ002L9", BAY + 1);
-    let state = actor_state(root.path(), world, PoolSelectionPolicyName::CompleteOrFill);
+    let root = DurabilityRoot::with_tapes(
+        &[(TAPE, BARCODE), (OTHER, "ZZZ002L9")],
+        &[TAPE, OTHER],
+        true,
+    );
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    seat_tape(&world, OTHER, "ZZZ002L9", BAY + 1);
+    let state = pooled_actor_state(&root, world, PoolSelectionPolicyName::CompleteOrFill);
     let pool = state.drive_pool().unwrap().clone();
     let guards = Arc::new(Mutex::new(Vec::new()));
     let held = guards.clone();
@@ -643,10 +677,15 @@ async fn b10_fix_post_wait_reservation_busy_reselects() {
 #[tokio::test]
 async fn b10_fix_parked_debt_ranking_preserves_single_candidate() {
     use crate::pool_write::{SelectionSkips, TapeSelectionHold, TapeSelectionHolds};
-    let root = tempfile::tempdir().unwrap();
-    let world = super::b7_tests::due_tape(root.path()).await;
-    add_tape(root.path(), &world, OTHER, "ZZZ002L9", BAY + 1);
-    let state = super::b7_tests::state(root.path());
+    let root = DurabilityRoot::with_tapes(
+        &[(TAPE, BARCODE), (OTHER, "ZZZ002L9")],
+        &[TAPE, OTHER],
+        true,
+    );
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    seat_tape(&world, OTHER, "ZZZ002L9", BAY + 1);
+    let state = root.api_state();
     let holds = TapeSelectionHolds(HashMap::from([(TAPE, TapeSelectionHold::ParkedDebt)]));
     for (scope, expected) in [
         (HashSet::from([TAPE, OTHER]), OTHER),

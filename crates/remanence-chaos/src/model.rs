@@ -109,6 +109,8 @@ pub enum Record {
 pub struct VirtualTape {
     /// Tape records in physical order.
     pub records: Vec<Record>,
+    /// Current fixed sense (key, ASC, ASCQ) at the missing end-of-data mark.
+    pub missing_eod_sense: Option<(u8, u8, u8)>,
     /// Number of leading records proved durable by a synchronizing command.
     pub durable_frontier: usize,
     /// EOM early-warning threshold in bytes.
@@ -147,6 +149,7 @@ impl VirtualTape {
         Self {
             records: Vec::new(),
             durable_frontier: 0,
+            missing_eod_sense: None,
             capacity_bytes,
             written_bytes: 0,
             write_protected: false,
@@ -415,6 +418,14 @@ impl MediumTypeReporting {
 pub struct VirtualDriveState {
     /// How MODE SENSE reports the loaded cartridge's WORM state.
     pub medium_type_reporting: MediumTypeReporting,
+    /// One-shot current fixed sense (key, ASC, ASCQ) for the next READ POSITION; off by default.
+    pub next_read_position_sense: Option<(u8, u8, u8)>,
+    /// One-shot sense on a READ that reaches this record.
+    pub read_sense_at: Option<(u64, (u8, u8, u8))>,
+    /// One-shot sense on a forward SPACE that crosses this record.
+    pub space_sense_at: Option<(u64, (u8, u8, u8))>,
+    /// Number of SPACE(EOD) commands to complete before reporting a missing mark.
+    pub normal_eod_spaces: usize,
     /// This model's single initiator PREVENT survives transport close/reopen.
     pub removal_prevented: bool,
     /// After how many drive ops the drive becomes dirty.
@@ -550,6 +561,20 @@ impl VirtualWorld {
         let state = self.drive_states.entry(bay).or_default();
         state.reset_unit_attention = true;
         state.position_unknown = true;
+        Ok(())
+    }
+
+    /// Cut power mid-write, retaining the chosen prefix and leaving it without an EOD mark.
+    pub fn power_cut_during_write(&mut self, bay: u16, keep: usize) -> Result<(), ScsiError> {
+        self.power_cut(bay, keep)?;
+        let barcode = self
+            .loaded_barcode(bay)
+            .expect("power cut checked tape")
+            .to_owned();
+        self.tapes
+            .get_mut(&barcode)
+            .expect("loaded tape")
+            .missing_eod_sense = Some((3, 0x14, 0));
         Ok(())
     }
 
@@ -898,6 +923,11 @@ impl ModelTransport {
         // INQUIRY does not consume a pending unit attention.
         if opcode != 0x12 && std::mem::take(&mut state.reset_unit_attention) {
             return Err(check_condition(fixed_sense(0x06, 0x29, 0x00, None, 0), 0));
+        }
+        if opcode == 0x34 {
+            if let Some((key, asc, ascq)) = state.next_read_position_sense.take() {
+                return Err(check_condition(fixed_sense(key, asc, ascq, None, 0), 0));
+            }
         }
         if state.position_unknown && matches!(opcode, 0x08 | 0x0a | 0x10 | 0x11 | 0x91) {
             return Err(check_condition(fixed_sense(0x03, 0x15, 0x02, None, 0), 0));
@@ -1257,9 +1287,29 @@ impl ModelTransport {
         let mut world = self.world.lock().expect("virtual world lock");
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
+        let bay = self.drive_bay()?;
+        let mut read_fault = world.drive_states.entry(bay).or_default().read_sense_at;
+        let mut unknown = false;
         let mut success_advance = 0u64;
         let mut error_advance = 0u64;
         let outcome = self.with_loaded_tape(&mut world, |tape| {
+            let mut record_at = |index: usize, bytes: u32, residual: usize| {
+                let lba = position + index;
+                if let Some((at, sense)) = read_fault {
+                    if at == lba as u64 {
+                        read_fault = None;
+                        return Err(current_check_condition(sense, bytes));
+                    }
+                }
+                tape.records.get(lba).ok_or_else(|| {
+                    if let Some(sense) = tape.missing_eod_sense {
+                        unknown = index == 0;
+                        current_check_condition(sense, bytes)
+                    } else {
+                        check_condition(blank_check_eod_sense_with_residual(residual), bytes)
+                    }
+                })
+            };
             if fixed {
                 let block_size = fixed_block_size(tape.block_size)?;
                 let records_requested = usize::try_from(transfer_len)
@@ -1271,14 +1321,12 @@ impl ModelTransport {
                 }
                 let mut bytes_read = 0usize;
                 for record_index in 0..records_requested {
-                    let Some(record) = tape.records.get(position + record_index).cloned() else {
-                        let residual = records_requested - record_index;
-                        error_advance = record_index as u64;
-                        return Err(check_condition(
-                            blank_check_eod_sense_with_residual(residual),
-                            bytes_read as u32,
-                        ));
-                    };
+                    let record = record_at(
+                        record_index,
+                        bytes_read as u32,
+                        records_requested - record_index,
+                    )
+                    .inspect_err(|_| error_advance = record_index as u64)?;
                     match record {
                         Record::Block(block) => {
                             if block.len() != block_size {
@@ -1287,11 +1335,11 @@ impl ModelTransport {
                                 ));
                             }
                             let end = bytes_read + block_size;
-                            buf[bytes_read..end].copy_from_slice(&block);
+                            buf[bytes_read..end].copy_from_slice(block);
                             bytes_read = end;
                         }
                         Record::ZeroBlock(len) => {
-                            if usize::try_from(len).ok() != Some(block_size) {
+                            if usize::try_from(*len).ok() != Some(block_size) {
                                 return Err(ScsiError::InvalidInput(
                                     "fixed READ encountered non-fixed-size sparse zero block",
                                 ));
@@ -1313,12 +1361,7 @@ impl ModelTransport {
                 success_advance = records_requested as u64;
                 Ok(TransferOutcome::clean(bytes_read as u32))
             } else {
-                let Some(record) = tape.records.get(position).cloned() else {
-                    return Err(check_condition(
-                        blank_check_eod_sense_with_residual(transfer_len as usize),
-                        0,
-                    ));
-                };
+                let record = record_at(0, 0, transfer_len as usize)?;
                 match record {
                     Record::Block(block) => {
                         let n = block.len().min(buf.len());
@@ -1327,7 +1370,7 @@ impl ModelTransport {
                         Ok(TransferOutcome::clean(n as u32))
                     }
                     Record::ZeroBlock(len) => {
-                        let n = usize::try_from(len)
+                        let n = usize::try_from(*len)
                             .map_err(|_| {
                                 ScsiError::InvalidInput("sparse zero block exceeds usize")
                             })?
@@ -1346,6 +1389,11 @@ impl ModelTransport {
                 }
             }
         });
+        let state = world.drive_states.entry(bay).or_default();
+        state.read_sense_at = read_fault;
+        if unknown {
+            state.position_unknown = true;
+        }
         let outcome = match outcome {
             Ok(outcome) => {
                 self.position = self.position.saturating_add(success_advance);
@@ -1433,6 +1481,7 @@ impl ModelTransport {
                 }
                 records_written = 1;
             }
+            tape.missing_eod_sense = None;
             tape.written_bytes = tape.written_bytes.saturating_add(buf.len() as u64);
             crossed_eom = tape.written_bytes > tape.capacity_bytes;
             Ok(())
@@ -1458,6 +1507,9 @@ impl ModelTransport {
                 tape.records.truncate(position);
                 tape.durable_frontier = tape.durable_frontier.min(position);
                 recompute_written_bytes(tape);
+            }
+            if count > 0 {
+                tape.missing_eod_sense = None;
             }
             for _ in 0..count {
                 tape.records.push(Record::Filemark);
@@ -1605,11 +1657,20 @@ impl ModelTransport {
             0 => self.space_blocks(count),
             1 => self.space_filemarks(count),
             3 => {
-                let world = self.world.lock().expect("virtual world lock");
+                let mut world = self.world.lock().expect("virtual world lock");
                 let bay = self.drive_bay()?;
-                let barcode = world.drive_bays.get(&bay).and_then(Option::as_ref);
-                if let Some(tape) = barcode.and_then(|barcode| world.tapes.get(barcode)) {
-                    self.position = tape.records.len() as u64;
+                if let Some(tape) = world.loaded_barcode(bay).and_then(|b| world.tapes.get(b)) {
+                    let end = tape.records.len() as u64;
+                    let missing = tape.missing_eod_sense;
+                    let state = world.drive_states.entry(bay).or_default();
+                    if let Some(sense) = missing {
+                        if state.normal_eod_spaces == 0 {
+                            state.position_unknown = true;
+                            return Err(current_check_condition(sense, 0));
+                        }
+                        state.normal_eod_spaces -= 1;
+                    }
+                    self.position = end;
                 }
                 Ok(())
             }
@@ -1618,14 +1679,11 @@ impl ModelTransport {
     }
 
     fn space_blocks(&mut self, count: i64) -> Result<(), ScsiError> {
-        let world = self.world.lock().expect("virtual world lock");
+        let mut world = self.world.lock().expect("virtual world lock");
         let bay = self.drive_bay()?;
-        let end = world
-            .drive_bays
-            .get(&bay)
-            .and_then(Option::as_ref)
-            .and_then(|barcode| world.tapes.get(barcode))
-            .map_or(0, |tape| tape.records.len() as u64);
+        let tape = world.loaded_barcode(bay).and_then(|b| world.tapes.get(b));
+        let end = tape.map_or(0, |t| t.records.len() as u64);
+        let missing = tape.and_then(|t| t.missing_eod_sense);
         let start = self.position;
         let requested_end = if count >= 0 {
             start.saturating_add(count as u64)
@@ -1638,6 +1696,15 @@ impl ModelTransport {
             }
             start - magnitude
         };
+        if count > 0 {
+            let state = world.drive_states.entry(bay).or_default();
+            check_forward_space(
+                state,
+                start,
+                requested_end.saturating_sub(1).min(end),
+                missing.filter(|_| requested_end > end),
+            )?;
+        }
         self.position = requested_end.min(end);
         if requested_end != self.position {
             let residual = residual_after_partial_space(count, start, self.position);
@@ -1650,15 +1717,11 @@ impl ModelTransport {
         if count == 0 {
             return Ok(());
         }
-        let world = self.world.lock().expect("virtual world lock");
+        let mut world = self.world.lock().expect("virtual world lock");
         let bay = self.drive_bay()?;
-        let records = world
-            .drive_bays
-            .get(&bay)
-            .and_then(Option::as_ref)
-            .and_then(|barcode| world.tapes.get(barcode))
-            .map(|tape| tape.records.clone())
-            .unwrap_or_default();
+        let tape = world.loaded_barcode(bay).and_then(|b| world.tapes.get(b));
+        let missing = tape.and_then(|t| t.missing_eod_sense);
+        let records = tape.map(|t| t.records.clone()).unwrap_or_default();
         let start = self.position;
         let mut remaining = count.unsigned_abs();
         if count > 0 {
@@ -1667,6 +1730,12 @@ impl ModelTransport {
                 let mut found = false;
                 while pos < records.len() {
                     if matches!(records[pos], Record::Filemark) {
+                        check_forward_space(
+                            world.drive_states.entry(bay).or_default(),
+                            self.position,
+                            pos as u64,
+                            None,
+                        )?;
                         self.position = (pos + 1) as u64;
                         found = true;
                         break;
@@ -1674,6 +1743,12 @@ impl ModelTransport {
                     pos += 1;
                 }
                 if !found {
+                    check_forward_space(
+                        world.drive_states.entry(bay).or_default(),
+                        self.position,
+                        records.len() as u64,
+                        missing,
+                    )?;
                     self.position = records.len() as u64;
                     let traversed = count.unsigned_abs() - remaining;
                     let residual = count - i64::try_from(traversed).unwrap_or(i64::MAX);
@@ -2112,6 +2187,30 @@ fn is_filemark_check_condition(_err: &ScsiError) -> bool {
     false
 }
 
+/// Check the records attempted by a forward SPACE, including its first absent record.
+fn check_forward_space(
+    state: &mut VirtualDriveState,
+    start: u64,
+    last: u64,
+    missing: Option<(u8, u8, u8)>,
+) -> Result<(), ScsiError> {
+    if let Some((at, sense)) = state.space_sense_at {
+        if (start..=last).contains(&at) {
+            state.space_sense_at = None;
+            return Err(current_check_condition(sense, 0));
+        }
+    }
+    if let Some(sense) = missing {
+        state.position_unknown = true;
+        return Err(current_check_condition(sense, 0));
+    }
+    Ok(())
+}
+
+fn current_check_condition((key, asc, ascq): (u8, u8, u8), bytes: u32) -> ScsiError {
+    check_condition(fixed_sense(key, asc, ascq, None, 0), bytes)
+}
+
 fn fixed_sense(key: u8, asc: u8, ascq: u8, information: Option<i64>, flags: u8) -> Vec<u8> {
     let mut sense = vec![0u8; 32];
     sense[0] = 0x70;
@@ -2174,6 +2273,193 @@ mod tests {
         let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 2);
         world.put_tape_in_slot(0x0400, "TAPE001", VirtualTape::default());
         Arc::new(Mutex::new(world))
+    }
+
+    /// T2. Exercise the cartridge state and independently armed faults through model drives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_eod_model() {
+        use remanence_library::{DriveHandle, SpaceKind, TapeIoError};
+        const BAY: u16 = 0x100;
+        fn open(world: &SharedVirtualWorld) -> DriveHandle {
+            DriveHandle::open_standalone_with_transport(
+                std::path::Path::new("/virtual/missing-eod"),
+                Box::new(ModelTransport::new(
+                    world.clone(),
+                    DeviceRole::Drive { bay: BAY },
+                )),
+                &StaticAllowlist::new(["DRV-MODEL"]),
+            )
+            .unwrap()
+        }
+        fn setup() -> (SharedVirtualWorld, DriveHandle) {
+            let world = world();
+            let mut tape = VirtualTape::empty(1024, 4);
+            tape.records = vec![
+                Record::Block(vec![7; 4]),
+                Record::Filemark,
+                Record::ZeroBlock(4),
+            ];
+            tape.durable_frontier = 2;
+            world
+                .lock()
+                .unwrap()
+                .put_tape_in_drive(BAY, "TAPE001", Some(0x400), tape);
+            let drive = open(&world);
+            {
+                let mut w = world.lock().unwrap();
+                assert!(w.power_cut_during_write(BAY, 1).is_err());
+                assert_eq!(w.tapes["TAPE001"].records.len(), 3);
+                assert!(w.tapes["TAPE001"].missing_eod_sense.is_none());
+                w.power_cut_during_write(BAY, 2).unwrap();
+                assert_eq!(
+                    w.tapes["TAPE001"].records,
+                    [Record::Block(vec![7; 4]), Record::Filemark]
+                );
+                assert_eq!(w.tapes["TAPE001"].durable_frontier, 2);
+            }
+            (world, drive)
+        }
+        fn sense(error: TapeIoError, expected: (u8, u8, u8)) {
+            let evidence = error.completion_evidence();
+            let s = evidence.current_sense().unwrap();
+            assert_eq!((s.key, s.asc, s.ascq), expected);
+            assert_eq!(evidence.host_transferred_bytes, Some(0));
+            assert_eq!(evidence.transferred_bytes, Some(0));
+            assert!(!evidence.residual_valid);
+        }
+        let (world, mut drive) = setup();
+        let missing = (3, 0x14, 0);
+        sense(drive.read_block(&mut [0; 4]).unwrap_err(), (6, 0x29, 0));
+        sense(drive.read_block(&mut [0; 4]).unwrap_err(), (3, 0x15, 2));
+        for op in [0, 1, 2, 3] {
+            assert_eq!(drive.locate(2).unwrap().lba, 2);
+            let error = match op {
+                0 => drive.read_block(&mut [0; 4]).unwrap_err(),
+                1 => drive.space(1, SpaceKind::Filemarks).unwrap_err(),
+                2 => drive.space(1, SpaceKind::Blocks).unwrap_err(),
+                _ => drive.space(0, SpaceKind::EndOfData).unwrap_err(),
+            };
+            sense(error, missing);
+            assert!(world.lock().unwrap().drive_states[&BAY].position_unknown);
+            sense(drive.read_block(&mut [0; 4]).unwrap_err(), (3, 0x15, 2));
+        }
+        for pos in 0..=2 {
+            assert_eq!(drive.locate(pos).unwrap().lba, pos);
+            assert!(!world.lock().unwrap().drive_states[&BAY].position_unknown);
+        }
+        drive.locate(0).unwrap();
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .read_sense_at = Some((0, (3, 0x11, 0)));
+        sense(drive.read_block(&mut [0; 4]).unwrap_err(), (3, 0x11, 0));
+        drive.locate(0).unwrap();
+        assert_eq!(drive.read_block(&mut [0; 4]).unwrap(), 4);
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .space_sense_at = Some((1, (3, 0x11, 0)));
+        sense(
+            drive.space(1, SpaceKind::Filemarks).unwrap_err(),
+            (3, 0x11, 0),
+        );
+        drive.locate(1).unwrap();
+        assert_eq!(
+            drive
+                .space(1, SpaceKind::Filemarks)
+                .unwrap()
+                .position_after
+                .lba,
+            2
+        );
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .next_read_position_sense = Some((3, 0x14, 3));
+        sense(drive.position().unwrap_err(), (3, 0x14, 3));
+        assert_eq!(drive.position().unwrap().lba, 2);
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .normal_eod_spaces = 2;
+        for _ in 0..2 {
+            assert_eq!(
+                drive
+                    .space(0, SpaceKind::EndOfData)
+                    .unwrap()
+                    .position_after
+                    .lba,
+                2
+            );
+        }
+        sense(drive.space(0, SpaceKind::EndOfData).unwrap_err(), missing);
+
+        // Fixed READ retains its complete prefix even when its final sense changes.
+        drive.locate(0).unwrap();
+        let mut raw = ModelTransport::new(world.clone(), DeviceRole::Drive { bay: BAY });
+        world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut("TAPE001")
+            .unwrap()
+            .records[1] = Record::Block(vec![8; 4]);
+        let mut bytes = [0xaa; 12];
+        let error = raw.execute_in(&[8, 1, 0, 0, 3, 0], &mut bytes).unwrap_err();
+        let ScsiError::CheckCondition {
+            sense: s,
+            bytes_transferred,
+        } = error
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!(bytes_transferred, 8);
+        assert_eq!(s, fixed_sense(3, 0x14, 0, None, 0));
+        assert_eq!(bytes, [7, 7, 7, 7, 8, 8, 8, 8, 0xaa, 0xaa, 0xaa, 0xaa]);
+        assert_eq!(raw.position, 2);
+
+        for filemark in [false, true] {
+            let (world, mut drive) = setup();
+            sense(drive.test_unit_ready().unwrap_err(), (6, 0x29, 0));
+            drop(drive);
+            let mut drive = open(&world);
+            drive.locate(2).unwrap();
+            if filemark {
+                drive.write_filemarks(0).unwrap();
+            } else {
+                // The fixed zero-count command has no data buffer.
+                let mut raw = ModelTransport::new(world.clone(), DeviceRole::Drive { bay: BAY });
+                raw.write_6(&[0x0a, 1, 0, 0, 0, 0], &[]).unwrap();
+            }
+            sense(drive.space(0, SpaceKind::EndOfData).unwrap_err(), missing);
+            drive.locate(2).unwrap();
+            if filemark {
+                drive.write_filemarks(1).unwrap();
+            } else {
+                drive.write_block(&[9; 4]).unwrap();
+            }
+            assert_eq!(
+                drive
+                    .space(0, SpaceKind::EndOfData)
+                    .unwrap()
+                    .position_after
+                    .lba,
+                3
+            );
+        }
     }
 
     /// The drive setting controls headers and support; the tape controls WORMM.

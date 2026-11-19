@@ -6,6 +6,10 @@ use crate::tape_log::{authority::AuthoritySnapshot, CommitCursor, SessionEndReas
 use lib::DiagnosticValue::{Bytes, Text, Unsigned};
 use std::collections::BTreeSet;
 
+#[path = "../../tests/support/library_fault.rs"]
+#[allow(dead_code, clippy::duplicate_mod)]
+mod durability;
+
 const T: lib::Id = [0x51; 16];
 const B: lib::Id = [0x52; 16];
 const TIME: &str = "2026-11-11T00:00:00Z";
@@ -670,8 +674,11 @@ fn l1a_short_log_basis_skip_and_other_tape_projection() {
                 .unwrap(),
             healthy.log_reference().0
         );
+        f.rt().fixture_mark_projection_dirty();
         f.rt().catch_up().unwrap();
         assert_eq!(f.rt().take_projection_measurement().1.len(), 1);
+        f.rt().catch_up().unwrap();
+        assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
         f.reopen();
         assert_eq!(f.raises(T), raises);
     }
@@ -735,6 +742,9 @@ fn l1a_digest_rewrite_and_short_bytes_skip_projection() {
                 f.rt().reader().unwrap().tape_projection_marks().unwrap()[&T],
                 old
             );
+            f.rt().fixture_mark_projection_dirty();
+            f.rt().catch_up().unwrap();
+            assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
             f.rt().catch_up().unwrap();
             assert_eq!(f.rt().take_projection_measurement().1.len(), 0);
             f.reopen();
@@ -1093,6 +1103,20 @@ fn l1b_assert_refused_once(f: &mut Fixture, sequence: u64, code: u64, reason: &s
     assert!(f.rt().active_fence(sequence).is_some());
 }
 
+/// Replace fixture bytes through the same inode and extent as the pinned snapshot.
+fn l1b_write_in_place(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let before = file.metadata().unwrap();
+    assert_eq!(before.len(), bytes.len() as u64);
+    file.write_all_at(bytes, 0).unwrap();
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.len()),
+        (after.dev(), after.ino(), after.len())
+    );
+}
+
 /// A mark can only be released after exact restoration or rebuild; a later loss
 /// creates a fresh fence even when the last forced release remembered nothing.
 #[test]
@@ -1118,10 +1142,31 @@ fn l1b_release_mark_restore_rebuild_and_lost_twice() {
             std::fs::write(f.path(T), &full).unwrap();
         }
         f.reopen();
+        if !rebuild {
+            let mut changed = full.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            l1b_write_in_place(&f.path(T), &changed);
+            l1b_assert_refused_once(
+                &mut f,
+                sequence,
+                1,
+                "the projection source digest differs from the tape log",
+            );
+            l1b_write_in_place(&f.path(T), &full);
+        }
         assert_eq!(
             l1b_force(&mut f, sequence).unwrap().unwrap().state,
             "released"
         );
+        if !rebuild {
+            f.rt().take_projection_measurement();
+            f.rt().catch_up().unwrap();
+            assert_eq!(
+                f.rt().take_projection_measurement().1.len(),
+                1,
+                "released tape gets one Apply"
+            );
+        }
         let release = l1b_release_record(&f);
         assert!(release.forced && release.detail.0.is_empty());
         f.reopen();
@@ -1215,7 +1260,12 @@ fn l1b_force_preserves_scope_and_suffix_refusals() {
         (
             lib::FenceScope::Tape(tape(T)),
             lib::FenceCause::SessionSuffixContradiction,
-            "suffix fence requires explicit physical tail recovery",
+            "release refused: a session_suffix_contradiction fence stays until rem tape supersede-tail recovers the tape's tail (it refuses when the tape contradicts its recorded session ending); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory",
+        ),
+        (
+            lib::FenceScope::Tape(tape(T)),
+            lib::FenceCause::AppendAdmissionRefused,
+            "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail, which it refuses when this state shows no open session on the tape (its last session closed, or none opened since it was initialized here); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory",
         ),
     ] {
         let f = Fixture::new();
@@ -1274,6 +1324,50 @@ fn l1b_force_preserves_scope_and_suffix_refusals() {
 /// followed by an empty release clears the latest remembered observation.
 #[test]
 fn l1b_release_floor_memory_content_extent_and_clear() {
+    // A warmed ordinary reader must not supply a forced floor observation.
+    {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (short, snapshot) = f.native(T, false);
+        f.name(6, f.rt().native_reference(&snapshot).unwrap());
+        drop(snapshot);
+        f.close();
+        f.sql_loss();
+        std::fs::write(f.path(T), &short).unwrap();
+        f.reopen();
+        let sequence = f.raises(T)[0].0;
+        let runtime = f.rt();
+        assert!(!runtime
+            .reader()
+            .unwrap()
+            .tape_projection_marks()
+            .unwrap()
+            .contains_key(&T));
+        let snapshot = runtime.0.view.lock().unwrap().snapshot(T).unwrap().clone();
+        let end = snapshot.summary().closed_end;
+        assert_eq!(end, short.len() as u64);
+        let warmed = snapshot.projection_prefix_digest(end).unwrap();
+        let mut changed = short.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        l1b_write_in_place(&f.path(T), &changed);
+        l1b_force(&mut f, sequence).unwrap();
+        let fresh = snapshot.projection_prefix_digest_oracle(end).unwrap();
+        let release = l1b_release_record(&f);
+        l1b_write_in_place(&f.path(T), &short);
+        let observed = &release
+            .detail
+            .0
+            .iter()
+            .find(|entry| entry.0.as_str() == "observed_prefix_digest")
+            .unwrap()
+            .1;
+        assert_eq!(
+            observed,
+            &Bytes(lib::Blob(fresh.to_vec())),
+            "forced floor observation must hash changed bytes afresh"
+        );
+        assert_ne!(fresh, warmed, "changed bytes differ from the warmed digest");
+    }
     for mismatch in [false, true] {
         let mut f = Fixture::new();
         f.provision(T);
@@ -1404,6 +1498,61 @@ fn l1b_release_floor_memory_content_extent_and_clear() {
     assert!(l1b_release_record(&f).detail.0.is_empty());
 }
 
+/// A successful release must neither read nor seed the snapshot's remembered hash.
+#[test]
+fn l1b_release_does_not_seed_prefix_memory() {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (short, snapshot) = f.native(T, false);
+    f.name(6, f.rt().native_reference(&snapshot).unwrap());
+    drop(snapshot);
+    f.close();
+    f.sql_loss();
+    std::fs::write(f.path(T), &short).unwrap();
+    f.reopen();
+    let sequence = f.raises(T)[0].0;
+    let runtime = f.rt();
+    assert!(!runtime
+        .reader()
+        .unwrap()
+        .tape_projection_marks()
+        .unwrap()
+        .contains_key(&T));
+    assert!(runtime
+        .0
+        .authority
+        .with_fold(|fold| !fold.forced_observation.contains_key(&T)));
+    assert!(!runtime.0.projection_dirty.load(Ordering::Acquire));
+    // Clone once: all observations below use this snapshot's shared cache cell.
+    let snapshot = runtime.0.view.lock().unwrap().snapshot(T).unwrap().clone();
+    let original = std::fs::read(f.path(T)).unwrap();
+    let end = snapshot.summary().closed_end as usize;
+    assert_eq!(end, short.len());
+    let mut changed = original.clone();
+    changed[end - 1] ^= 1;
+    let original_digest: [u8; 32] = Sha256::digest(&original[..end]).into();
+    let changed_digest: [u8; 32] = Sha256::digest(&changed[..end]).into();
+    l1b_write_in_place(&f.path(T), &changed);
+    l1b_force(&mut f, sequence).unwrap();
+    let release = l1b_release_record(&f);
+    let observed = &release
+        .detail
+        .0
+        .iter()
+        .find(|entry| entry.0.as_str() == "observed_prefix_digest")
+        .unwrap()
+        .1;
+    assert_eq!(observed, &Bytes(lib::Blob(changed_digest.to_vec())));
+    l1b_write_in_place(&f.path(T), &original);
+    let remembered = snapshot.projection_prefix_digest(end as u64).unwrap();
+    assert_eq!(
+        remembered, original_digest,
+        "release must leave prefix memory cold after byte restoration"
+    );
+    assert_ne!(remembered, changed_digest);
+}
+
 /// In-process rebuild must retain catalog-only library evidence without appending a fence.
 #[test]
 fn k94_t13_in_process_older_library_refuses() {
@@ -1440,6 +1589,7 @@ fn k94_t13_in_process_older_library_refuses() {
     let mut f = Fixture::new();
     f.provision(T);
     f.native(T, false);
+    let old_end = f.rt().0.authority.with_fold(|fold| fold.received_through);
     f.close();
     let old = files(&f.paths.audit_dir);
     f.reopen();
@@ -1462,13 +1612,35 @@ fn k94_t13_in_process_older_library_refuses() {
         })
         .unwrap();
     f.close();
+    let saved_rows: Vec<_> = rows(&f.paths.sqlite_path)
+        .into_iter()
+        .filter(|row| {
+            let rusqlite::types::Value::Blob(sequence) = &row[0] else {
+                panic!("sequence blob")
+            };
+            u64::from_be_bytes(sequence.as_slice().try_into().unwrap()) > old_end
+        })
+        .collect();
     for p in files(&f.paths.audit_dir).keys() {
         std::fs::remove_file(p).unwrap();
     }
     for (p, b) in &old {
         std::fs::write(p, b).unwrap();
     }
+    f.sql_loss();
     f.reopen();
+    // Reintroduce only the stored suffix witnesses into the already-open catalogue.
+    {
+        let mut conn = rusqlite::Connection::open(&f.paths.sqlite_path).unwrap();
+        let transaction = conn.transaction().unwrap();
+        for row in saved_rows {
+            transaction.execute(
+                "insert into library_projection_records(sequence,record_uuid,source_digest,tag,source_bytes) values(?1,?2,?3,?4,?5)",
+                rusqlite::params_from_iter(row),
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
     let before = files(&f.paths.audit_dir);
     let natives = files(&f.paths.journal_dir);
     let catalog = rows(&f.paths.sqlite_path);
@@ -1485,4 +1657,186 @@ fn k94_t13_in_process_older_library_refuses() {
     assert_eq!(files(&f.paths.audit_dir), before);
     assert_eq!(files(&f.paths.journal_dir), natives);
     assert_eq!(rows(&f.paths.sqlite_path), catalog);
+}
+
+/// A direct write drained under a cause-14 fence must be projected after release,
+/// even when native projection previously gave the fenced tape a matching part.
+#[test]
+fn direct_write_to_fenced_tape_projects_after_release() {
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (short, snapshot) = f.native(T, false);
+    f.rt().native_reference(&snapshot).unwrap();
+    let full = std::fs::read(f.path(T)).unwrap();
+    f.close();
+    std::fs::write(f.path(T), &short).unwrap();
+    let offline =
+        crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap_err();
+    assert!(offline.to_string().contains("RebuildWouldDropMarkEvidence"));
+    f.reopen();
+    let sequence = f.raises(T)[0].0;
+    l1b_assert_refused_once(&mut f, sequence, 1, "live projection mark is above");
+    f.close();
+    std::fs::write(f.path(T), &full).unwrap();
+    f.reopen();
+
+    let counters = || {
+        let tape = f
+            .state
+            .as_ref()
+            .unwrap()
+            .write_handle()
+            .get_tape(&T)
+            .unwrap()
+            .unwrap();
+        (
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals,
+            tape.last_committed_tape_file,
+        )
+    };
+    let before = counters();
+    let rt = f.rt();
+    let native = {
+        let _dispatch = rt.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(rt
+            .0
+            .authority
+            .with_fold(|fold| native_floor::fenced(fold, &T)));
+        rt.0.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(T)
+            .unwrap()
+            .clone()
+    };
+    let part = Part::of(&native).unwrap();
+    let snapshot = AuthoritySnapshot::new(native).unwrap();
+    let result = rt.project_native(
+        &mut f.state.as_ref().unwrap().write_handle(),
+        &snapshot,
+        ApplyPath::Live,
+    );
+    {
+        let _dispatch = rt.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let matches =
+            rt.0.stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|stamp| stamp.tapes.get(&T) == Some(&part));
+        if result.is_ok() && matches {
+            println!("T4 matching part supplied by project_native");
+        } else {
+            assert!(
+                rt.projection_lag(T).is_none(),
+                "T4 fallback requires no projection lag: {result:?}"
+            );
+            rt.0.stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .expect("T4 startup stamp")
+                .tapes
+                .insert(T, part);
+            println!("T4 matching part supplied by permitted fallback: {result:?}");
+        }
+        assert_eq!(
+            rt.0.stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .tapes
+                .get(&T),
+            Some(&part),
+            "T4 matching part before mark"
+        );
+    }
+    f.state
+        .as_ref()
+        .unwrap()
+        .write_handle()
+        .reconcile_tape_files_projection(T, &[], 7, 9)
+        .unwrap();
+    rt.take_projection_measurement();
+    rt.catch_up().unwrap();
+    assert_eq!(
+        rt.take_projection_measurement().1.len(),
+        0,
+        "T4 fenced: 0 Apply"
+    );
+    assert_eq!(
+        l1b_force(&mut f, sequence).unwrap().unwrap().state,
+        "released"
+    );
+    rt.take_projection_measurement();
+    rt.catch_up().unwrap();
+    assert_eq!(
+        rt.take_projection_measurement().1.len(),
+        1,
+        "T4 exactly 1 Apply after release"
+    );
+    let tape = f
+        .state
+        .as_ref()
+        .unwrap()
+        .write_handle()
+        .get_tape(&T)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals,
+            tape.last_committed_tape_file
+        ),
+        before
+    );
+}
+
+/// The offline rebuild makes its complete library input durable before projection.
+#[test]
+fn ca1_t8b_rebuild_syncs_published_tail() {
+    use remanence_library::durable_file::test_support::register;
+    let mut f = Fixture::new();
+    f.close();
+    let cache = durability::PageCache::default();
+    let registration = register(f.paths.audit_dir.clone(), Arc::new(cache.clone()));
+    f.reopen();
+    let append = |f: &Fixture| {
+        f.rt()
+            .append(|a, v| {
+                a.diagnostic(
+                    lib::Diagnostic {
+                        event: lib::DiagnosticEvent::RecoveryEvent,
+                        subject_kind: "tail-sync-test".into(),
+                        subject_id: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    };
+    let durable_end = append(&f);
+    f.close();
+    drop(registration);
+    // Produce the frame outside registration so the model retains the prior image.
+    f.reopen();
+    let frame_end = append(&f);
+    assert_eq!(frame_end, durable_end + 1);
+    f.close();
+    let registration = register(f.paths.audit_dir.clone(), Arc::new(cache.clone()));
+    crate::StateHandle::rebuild_projection_from_config_file(&f.paths.config_path).unwrap();
+    cache.crash();
+    drop(registration);
+    let inspected = crate::ambiguity_recovery::inspect(&f.paths.config_path).unwrap();
+    assert_eq!(
+        inspected["library_replay"]["last_sequence"].as_u64(),
+        Some(frame_end)
+    );
 }

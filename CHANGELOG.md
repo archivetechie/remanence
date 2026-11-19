@@ -7,9 +7,37 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Unreleased
 
-- Object writes now work on drives that report medium type `0x00` in the MODE SENSE
-  header, such as some HP LTO-6 drives, when the Medium Configuration page positively
-  reports rewritable media.
+- `rem tape inventory`, `rem tape verify`, `rem tape identify` and scan restore
+  report a missing end-of-data mark. Inventory starts a structural walk with
+  reason `end_of_data_not_found`; if the walk confirms the missing mark, its
+  detail reports `end_of_data_mark=not_found` and `unresolved_from partition=P lba=L`
+  (or `unresolved_from unavailable`), followed by `remaining tape unresolved`.
+  When `SPACE(EOD)` reports the missing mark, default verification exits 1
+  and prints `error: verification failed: no usable terminal index;
+  end_of_data_not_found`. `--full` names the missing mark when
+  `SPACE(EOD)` reports it or when a filemark-spacing failure reports it
+  during the physical prefix walk, rather than reporting an incomplete
+  verdict. Identify warns that
+  the drive reports no end-of-data mark, that power loss during writing can
+  cause this and that committed files remain readable; it points to
+  `rem tape restore --scan --list` to inspect recoverable files, not the actual
+  end. Scan restore reports `end_of_data_mark` (`present`, `not_found` or
+  `not_reached`) and `unresolved_from` (null, or a position with numeric
+  `partition` and decimal-string `lba`).
+
+- `rem audit query` streams the library log's history; it no longer reads legacy
+  `.remaudit` segments.
+
+- Updated the bundled SQLite (rusqlite 0.41.1, libsqlite3-sys 0.39.1) for RUSTSEC-2026-0459; the minimum Rust rises to 1.89, the dependency's floor.
+
+- Object writes work on drives that report medium type `0x00` in the MODE SENSE
+  header when the Medium Configuration page positively reports rewritable media. Only write paths that need WORM state ask that page when
+  the header is inconclusive; plain settings reads use the header alone.
+- Both library and standalone `tape init` refuse WORM and unknown media before any
+  media write, including blank cartridges.
+- `rem diagnostics capture` saves a separate Medium Configuration reply and reports
+  both WORM signals and their combined verdict in the manifest and result JSON.
+  Conflicting signals are treated as WORM.
 
 - Journal volumes now require a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs
   filesystem, with mount lookup following reachable mounts and cross-checked by
@@ -360,12 +388,17 @@ per-release summaries.
   from a crashed restore.
 - Every pool write and every finalization, through the daemon or standalone, is
   admitted against what is physically on the tape before its first block. The
-  tape is read at the recorded end. End of data passes, and a fragment that
-  runs to end of data without its closing filemark is superseded. A complete or
-  unclassifiable object, or a foreign terminal component, refuses the write
-  with `TailBeyondKnownState`, and the daemon puts that tape into the
-  recovery-required state. `rem tape supersede-tail`, standalone or through the
-  daemon, lists what would be discarded, requires a typed confirmation, audits
+  tape is read at the recorded end. Physical end of data passes when it is
+  consistent with the authority being checked. An open session can recover a
+  lone fixed-block fragment that ends at physical end of data without its
+  closing filemark. A closed session can admit a tail that matches its
+  recorded ending. An expected closeout sidecar, or its exact prefix, passes
+  when it ends as the closeout proof permits. Data beyond that proved ending
+  refuses the append, even a fragment or a filemark. An unrecorded complete
+  object can refuse the write with `TailBeyondKnownState`, which closes the
+  tape for writing. A contradiction with the recorded ending refuses with
+  `SessionSuffixContradiction`. `rem tape supersede-tail`, standalone or through
+  the daemon, lists what would be discarded, requires a typed confirmation, audits
   the discarded object ids and rescans before writing. A session that abandons
   its own pending batch writes one filemark at its last checkpoint before it
   releases the drive.

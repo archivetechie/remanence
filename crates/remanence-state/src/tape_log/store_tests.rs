@@ -1514,3 +1514,274 @@ fn empty_prefix_is_durable_and_keeps_its_digest_after_bootstrap() {
         Err(StoreError::AlreadyExists)
     ));
 }
+
+/// Publish roughly one MiB in a real streamed group, with 64 KiB catalog
+/// chunks. The fixed sizes are independent of the position index implementation.
+fn position_group(lease: &mut Lease) -> (u64, u64, u64, u64) {
+    if lease.summary().is_fresh() {
+        let group = lease.prepare().unwrap();
+        lease.stage(group).unwrap().complete(&init(false)).unwrap();
+    }
+    open_fixture_session(lease);
+    let prior = lease.summary().clone();
+    let mut group = lease.prepare().unwrap();
+    let first = group.sequence();
+    let start = prior.closed_end;
+    let row = object(prior.next_file, prior.cursor.lba, None, 3);
+    group
+        .push(
+            &Record::PayloadContinuation(Continuation {
+                group: first,
+                chunk: Chunk::FileRow(row.clone()),
+            }),
+            &[],
+        )
+        .unwrap();
+    let h = header(&row, row.tape_file_number * 3);
+    let mut payload = Vec::new();
+    encode_header(&mut payload, &h).unwrap();
+    let mut item = member();
+    item.path = "p".repeat(1024 * 1024);
+    encode_member(&mut payload, &h, &item).unwrap();
+    let chunks = payload.chunks(64 * 1024);
+    let count = chunks.len();
+    for (ordinal, bytes) in chunks.enumerate() {
+        group
+            .push(
+                &Record::PayloadContinuation(Continuation {
+                    group: first,
+                    chunk: Chunk::Catalog {
+                        tape_file_number: row.tape_file_number,
+                        ordinal: ordinal as u64,
+                        last: ordinal + 1 == count,
+                    },
+                }),
+                bytes,
+            )
+            .unwrap();
+    }
+    let closer = Record::Committed(commit(
+        group.reference(1),
+        row.tape_file_number + 1,
+        prior.cursor.lba + 4,
+        prior.object_count + 1,
+    ));
+    lease.stage(group).unwrap().complete(&closer).unwrap();
+    (
+        first,
+        start,
+        lease.summary().last_closed_sequence,
+        lease.summary().closed_end,
+    )
+}
+
+/// Check fixture geometry and return the largest actual frame span.
+fn position_largest(snapshot: &crate::tape_log::snapshot::Snapshot) -> u64 {
+    let mut largest = 0;
+    let mut start = None;
+    snapshot
+        .visit_frames(|frame| {
+            start.get_or_insert(frame.offset);
+            largest = largest.max(frame.end - frame.offset);
+            Ok(())
+        })
+        .unwrap();
+    assert!(snapshot.summary().closed_end - start.unwrap() >= 4 * 1024 * 1024);
+    assert!(largest < 1024 * 1024 / 2);
+    largest
+}
+
+/// Match evidence and error variants/kinds, without comparing rendered text.
+fn position_compare(snapshot: &crate::tape_log::snapshot::Snapshot, sequence: u64) {
+    let indexed = snapshot.record_evidence(sequence);
+    let replayed = snapshot.record_evidence_oracle(sequence);
+    match (indexed, replayed) {
+        (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "sequence {sequence}"),
+        (Err(StoreError::Io(actual)), Err(StoreError::Io(expected))) => {
+            assert_eq!(actual.kind(), expected.kind(), "sequence {sequence}");
+        }
+        (
+            Err(StoreError::Codec(CodecError::Io(actual))),
+            Err(StoreError::Codec(CodecError::Io(expected))),
+        ) => {
+            assert_eq!(actual.kind(), expected.kind(), "sequence {sequence}");
+        }
+        (actual, expected) => {
+            panic!("sequence {sequence}: indexed {actual:?}, oracle {expected:?}")
+        }
+    }
+}
+
+/// T1: a narrowed group shares bookmarks on both sides of its bounds; neither
+/// side may change the original lookup's answer, including its EOF errors.
+#[test]
+fn position_index_matches_replay_for_frozen_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    let groups: Vec<_> = (0..4).map(|_| position_group(&mut lease)).collect();
+    let captured = lease.snapshot().unwrap();
+    position_largest(&captured);
+    let last = captured.summary().last_closed_sequence;
+    position_compare(&captured, last);
+    drop(lease);
+    let validated = store.snapshot().unwrap();
+    let before = validated.before(groups[2].0).unwrap();
+    let (first, start, end_sequence, end) = groups[2];
+    assert!(start - groups[0].1 >= 2 * 1024 * 1024);
+    assert!(validated.summary().closed_end - end >= 1024 * 1024);
+    let group = validated.group_snapshot(first, start, end);
+    {
+        let positions = group.position_index.lock().unwrap();
+        assert!(positions.values().any(|&offset| offset < start));
+        assert!(positions.values().any(|&offset| offset >= end));
+    }
+    // First group row: M1 must fail here if a bookmark below start is accepted.
+    position_compare(&group, first - 1);
+    for snapshot in [&captured, &validated, &before, &group] {
+        let mut sequences: std::collections::BTreeSet<_> = (0..=last + 1).collect();
+        sequences.extend([1, first - 1, first, end_sequence + 1]);
+        for &entry in snapshot.position_index.lock().unwrap().keys() {
+            sequences.extend([entry - 1, entry]);
+        }
+        assert!(sequences.len() >= 40);
+        for sequence in sequences {
+            position_compare(snapshot, sequence);
+        }
+    }
+}
+
+/// T2(a): validation seeds the very first lookup, independently of warm readers.
+#[test]
+fn position_index_bounds_first_validated_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    for _ in 0..4 {
+        position_group(&mut lease);
+    }
+    let largest = position_largest(&lease.snapshot().unwrap());
+    drop(lease);
+    let snapshot = store.snapshot().unwrap();
+    crate::tape_log::measure::reset();
+    assert!(snapshot
+        .record_evidence(snapshot.summary().last_closed_sequence)
+        .unwrap()
+        .is_some());
+    let bytes = crate::tape_log::measure::counts().full_frame_bytes;
+    assert!(
+        bytes <= 1024 * 1024 + largest,
+        "T2(a) first validated lookup: {bytes} bytes, largest {largest}"
+    );
+}
+
+/// T4: validated and owner captures preserve the captured descriptor's identity
+/// on clones and narrowed prefixes; an absent log has no file identity.
+#[test]
+fn position_index_preserves_captured_file_identity() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    assert_eq!(store.snapshot().unwrap().file_identity().unwrap(), None);
+    let mut lease = store.acquire(true).unwrap();
+    assert_eq!(lease.snapshot().unwrap().file_identity().unwrap(), None);
+    let (first, start, _, end) = position_group(&mut lease);
+    let pinned = std::fs::File::open(store.path()).unwrap();
+    let metadata = pinned.metadata().unwrap();
+    let identity = Some((metadata.dev(), metadata.ino()));
+    let owned = lease.snapshot().unwrap();
+    assert_eq!(
+        owned.file_identity().unwrap(),
+        identity,
+        "T4 lease snapshot"
+    );
+    drop(lease);
+    let validated = store.snapshot().unwrap();
+    assert_eq!(
+        validated.file_identity().unwrap(),
+        identity,
+        "T4 validated snapshot"
+    );
+    for snapshot in [owned, validated] {
+        for narrowed in [
+            snapshot.clone(),
+            snapshot.before(first).unwrap(),
+            snapshot.group_snapshot(first, start, end),
+        ] {
+            assert_eq!(narrowed.file_identity().unwrap(), identity);
+        }
+    }
+}
+
+/// T2(b): a second owner inherits validation bookmarks and extends them while
+/// publishing, so its first lookup of the new end is still bounded.
+#[test]
+fn position_index_bounds_first_grown_lease_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    for _ in 0..4 {
+        position_group(&mut lease);
+    }
+    drop(lease);
+    let mut second = store.acquire(false).unwrap();
+    let previous_end = second.summary().closed_end;
+    for _ in 0..2 {
+        position_group(&mut second);
+    }
+    assert!(second.summary().closed_end - previous_end >= 2 * 1024 * 1024);
+    let snapshot = second.snapshot().unwrap();
+    let largest = position_largest(&snapshot);
+    crate::tape_log::measure::reset();
+    assert!(snapshot
+        .record_evidence(snapshot.summary().last_closed_sequence)
+        .unwrap()
+        .is_some());
+    let bytes = crate::tape_log::measure::counts().full_frame_bytes;
+    assert!(
+        bytes <= 1024 * 1024 + largest,
+        "T2(b) first grown lease lookup: {bytes} bytes, largest {largest}"
+    );
+}
+
+/// T3: replacing a torn suffix resets only the owner's bookmarks. The old
+/// snapshot still pins the old inode; a lookup rebuilds the new file's index.
+#[test]
+fn position_index_resets_after_torn_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    let groups: Vec<_> = (0..4).map(|_| position_group(&mut lease)).collect();
+    let largest = position_largest(&lease.snapshot().unwrap());
+    drop(lease);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.path())
+        .unwrap();
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0)).unwrap();
+    file.write_all(&[0; 100]).unwrap();
+    drop(file);
+    let mut lease = store.acquire(false).unwrap();
+    let old = lease.snapshot().unwrap();
+    position_group(&mut lease);
+    let new = lease.snapshot().unwrap();
+    assert_ne!(old.file_identity().unwrap(), new.file_identity().unwrap());
+    let sequence = groups[2].0;
+    assert!(groups[2].1 - groups[0].1 >= 2 * 1024 * 1024);
+    crate::tape_log::measure::reset();
+    let first = new.record_evidence(sequence).unwrap();
+    let bytes = crate::tape_log::measure::counts().full_frame_bytes;
+    assert!(
+        bytes > 1024 * 1024 + largest,
+        "T3 first lookup more than one interval plus the largest frame: {bytes}, largest {largest}"
+    );
+    crate::tape_log::measure::reset();
+    let second = new.record_evidence(sequence).unwrap();
+    let bytes = crate::tape_log::measure::counts().full_frame_bytes;
+    assert!(
+        bytes <= 1024 * 1024 + largest,
+        "T3 second lookup bounded: {bytes}, largest {largest}"
+    );
+    assert_eq!(first, second);
+    assert_eq!(first, old.record_evidence(sequence).unwrap());
+}

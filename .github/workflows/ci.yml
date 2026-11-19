@@ -70,12 +70,15 @@ jobs:
             fi
           done
 
+      - name: Trusted journal volume for tests
+        run: tools/ci_journal_volume.sh up "$RUNNER_TEMP/journal-volume" 4G
+
       # Read-only. Shows the mount fields and statfs type the journal check reads
       # for the test temp directories.
       - name: Report journal-volume filesystem
         run: |
           (
-            for dir in "${RUNNER_TEMP:-/tmp}" /tmp; do
+            for dir in "${TMPDIR:-/tmp}" "${RUNNER_TEMP:-/tmp}" /tmp; do
               echo "== $dir"
               findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS -T "$dir"
               stat -f -c %t "$dir"
@@ -242,15 +245,15 @@ jobs:
           done
 
   msrv:
-    name: Rust 1.88 minimum-version check
+    name: Rust 1.89 minimum-version check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # 1.88
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # 1.89
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.89.0"
       - name: Check workspace at MSRV
         run: cargo check --workspace --all-targets --locked
 
@@ -297,6 +300,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libarchive-tools attr
           cargo install cargo-llvm-cov --locked
+      - name: Trusted journal volume for tests
+        run: tools/ci_journal_volume.sh up "$RUNNER_TEMP/journal-volume" 4G
+
       - name: Measure workspace coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage data

@@ -34,15 +34,14 @@ async fn caller_matrix(caller: &str) {
         ("suffix", true),
         ("structural", true),
     ] {
-        let (mut typed, root) = typed_root();
-        let mut index = typed.catalog().write_handle();
-        // setup supplies only the virtual world; its legacy catalog is never read.
-        let world = setup(&root);
+        let root = DurabilityRoot::new(BARCODE, caller != "terminal");
+        let mut index = root.state.write_handle();
+        let world = model_world(BARCODE, caller != "terminal");
         if caller != "terminal" {
-            typed_due_tape(&typed, &root, world.clone()).await;
+            typed_due_tape(&root, world.clone()).await;
         }
         let mut library = open_model_library(world.clone());
-        let cfg = typed_config(&typed, &library);
+        let cfg = root.config(&library);
         let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
         let mut selection = selected();
         // Terminal admission refuses before writing any component; initialize its plan authority.
@@ -244,7 +243,14 @@ async fn caller_matrix(caller: &str) {
         );
         if let Some(fence) = fences.first() {
             assert_eq!(fence.tape_uuid, TAPE);
-            assert_eq!(fence.reason, "session_suffix_contradiction");
+            assert_eq!(
+                fence.reason,
+                if kind == "structural" {
+                    "append_admission_refused"
+                } else {
+                    "session_suffix_contradiction"
+                }
+            );
         }
         assert_eq!(
             index.tape_io_is_fenced(Some(&TAPE), None, None).unwrap(),
@@ -312,6 +318,8 @@ async fn caller_matrix(caller: &str) {
             .map(|v| v.to_str().unwrap().to_owned());
         let library_uuid = cfg.authority.runtime().unwrap().manifest().library_uuid();
         drop((index, cfg, drive, library, connection));
+        drop(root.state);
+        let mut typed = root.typed;
         let raised = typed
             .records(|record| (record.tag() == lib::Tag::FenceRaised).then_some(()))
             .await;
@@ -332,7 +340,14 @@ async fn caller_matrix(caller: &str) {
         for (_, fence) in sources {
             assert_eq!(fence.kind, lib::FenceKind::Write);
             assert!(matches!(fence.scope, lib::FenceScope::Tape(tape) if tape.uuid == TAPE));
-            assert_eq!(fence.cause, lib::FenceCause::SessionSuffixContradiction);
+            assert_eq!(
+                fence.cause,
+                if kind == "structural" {
+                    lib::FenceCause::AppendAdmissionRefused
+                } else {
+                    lib::FenceCause::SessionSuffixContradiction
+                }
+            );
         }
         println!("ROW {caller}/{kind}/{fail_projection} code={:?} retry={retry:?} fences={} mutations={mutations:?} FenceRaised={} status={:?}", status.code(), fences.len(), raised.len(), status.message());
     }

@@ -172,7 +172,7 @@ pub(crate) struct SessionOpenReadinessContext<'a> {
 }
 
 mod write_session;
-pub(crate) use write_session::raise_tape_io_fence;
+pub(crate) use write_session::{raise_tape_io_fence, write_fence_cause};
 
 mod terminal_finalize;
 pub(crate) use terminal_finalize::preflight_manual_finalize_with_prefix;

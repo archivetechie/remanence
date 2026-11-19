@@ -141,7 +141,7 @@ pub(crate) fn finalize_mounted_tape(
     finish: impl FnOnce(&mut CatalogIndex, &mut DriveHandle),
 ) -> Result<ManualFinalizeTapeActorReply, Status> {
     validate_manual_finalize_owned_request(index, request)?;
-    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape", false)?;
 
     let checkpoint_journal = remanence_state::TapeAuthority::open(
         cfg.checkpoint_journal_dir.as_path(),
@@ -271,7 +271,7 @@ pub(crate) fn finalize_mounted_tape(
             .map_err(|refusal| Status::failed_precondition(refusal.to_string()))?;
     }
     prepare(index, drive)?;
-    let drive_config = drive.read_config().map_err(|error| {
+    let drive_config = drive.read_config_resolving_worm().map_err(|error| {
         super::restore::attach_outcome_retry(
             error.outcome(),
             Status::unavailable(format!("read finalization drive config: {error}")),
@@ -1049,7 +1049,13 @@ pub(crate) fn preflight_manual_finalize_cancellable(
         }));
     }
     if !had_existing_intent {
-        session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+        session_open_reject_tape_io_fences(
+            index,
+            &request.tape_uuid,
+            barcode,
+            "finalize tape",
+            false,
+        )?;
     }
 
     let new_acceptance = existing_intent.is_none();
@@ -1357,7 +1363,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             projection: result.projection,
         }));
     }
-    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape", false)?;
     Ok(None)
 }
 
@@ -2034,7 +2040,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
             })?;
     }
 
-    let named_tail = if prefix_already_journaled {
+    let named_tail = if prefix_already_journaled || !rewritable {
         None
     } else {
         admit_ended_tail_for_terminal(checkpoint, drive, selected, prefix.start_lba)?
@@ -2380,7 +2386,8 @@ pub(super) fn finish_terminal_tail(
         reconciliation: None,
         durable_projection_pending: false,
     };
-    let mut admission = if prefix_plan.is_none()
+    let mut admission = if rewritable
+        && prefix_plan.is_none()
         && parity_progress_from_state(authority.intent.progress).next_component_index() == Some(0)
     {
         admit_ended_tail_for_terminal(
@@ -3239,7 +3246,9 @@ fn admit_ended_tail_for_terminal(
             Ok(Some(admission))
         }
         Err(crate::append_admission::AdmissionError {
-            kind: crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. },
+            kind:
+                crate::append_admission::AdmissionErrorKind::SessionSuffixContradiction { .. }
+                | crate::append_admission::AdmissionErrorKind::TailBeyondKnownState { .. },
             ..
         }) => Ok(None),
         Err(error) => Err(super::restore::attach_outcome_retry(

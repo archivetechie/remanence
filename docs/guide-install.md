@@ -14,7 +14,7 @@ You need:
 - a Linux host;
 - `git` and a C compiler (`build-essential` on Debian and Ubuntu, `gcc` on
   Fedora), which the bundled SQLite library and the TLS library need;
-- Rust 1.88 or newer, installed with [rustup](https://rustup.rs).
+- Rust 1.89 or newer, installed with [rustup](https://rustup.rs).
 
 The protobuf definitions of the daemon's API are compiled in-process during
 the build, so `protoc` is not needed. The build needs no other system packages
@@ -270,12 +270,24 @@ it in use.
 Remanence makes its records durable with fsync, as a database does; it cannot
 test whether a disk keeps what it confirms. If a power cut loses the last
 journal records, nothing on tape is lost or overwritten. The next write to
-that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
-with `rem tape restore --scan --out rescued`, then run
-`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
-an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
-`put`. A UPS, or a disk with power-loss protection, removes this power-cut
-exposure.
+that tape can stop with `TailBeyondKnownState`. Recoverable files can be
+copied out with `rem tape restore --scan --out rescued` on a standalone
+drive. After that refusal, if this state shows no open session on the tape
+(its last session closed, or none opened since it was initialized here),
+`supersede-tail` refuses discard in this release: keep the tape closed for
+writing, start from a newer copy of the state directory that accounts for
+the data, or withdraw the tape by the [`rem tape
+retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
+this configuration's path with `--config`; parity closeout or a pending
+finalization can block retirement). Otherwise discard can proceed if
+recovery checks pass. In standalone home mode use `rem tape supersede-tail
+--acknowledge-tape LABEL`; for an explicit drive add `--device PATH
+--allow-device SERIAL`. In a library use `rem tape supersede-tail
+--tape-uuid UUID --ack-tape-uuid UUID`.
+Its preview lists the objects and other findings it detected (a trailing
+torn fragment has no separate entry); confirm only after accounting for the
+whole suffix, then rerun an interrupted `put` whose sources still exist. A
+UPS, or a disk with power-loss protection, removes this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),

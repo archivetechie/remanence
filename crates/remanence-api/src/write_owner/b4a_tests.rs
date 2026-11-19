@@ -25,17 +25,42 @@ fn b4a_writable_connections(path: &Path) -> usize {
 #[tokio::test]
 async fn b4a_two_drive_actors_share_one_catalog_connection() {
     const BLOCK: u32 = 256 * 1024;
-    let temp = tempfile::tempdir().unwrap();
-    let index_path = temp.path().join("state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    let audit_dir = temp.path().join("audit");
-    std::fs::create_dir_all(&audit_dir).unwrap();
-    let audit_lock = Arc::new(Mutex::new(()));
+    let pools = [1u8, 2].map(|n| TapePoolConfig {
+        id: format!("copy-{n}"),
+        scheme: None,
+        display_name: None,
+        copy_class: None,
+        content_class: None,
+        selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+        watermark_low: 0.9,
+        watermark_high: 0.95,
+        capacity_cap_bytes: None,
+        block_size_bytes: u64::from(BLOCK),
+        min_object_size_bytes: 0,
+    });
+    let mut root =
+        crate::tests::TypedRoot::open_with_tapes(&[([1; 16], "TP0001L9"), ([2; 16], "TP0002L9")]);
+    let paths = root.paths().clone();
+    let mut config = root.config();
+    config.tape_pools.extend(pools.iter().cloned());
+    root.release();
+    let mut state = StateHandle::open_with_config(paths.clone(), config).unwrap();
+    for (n, pool) in [1u8, 2].into_iter().zip(&pools) {
+        let tape = [n; 16];
+        let generation = state
+            .library_runtime()
+            .tape_state(tape)
+            .unwrap()
+            .assignment_generation;
+        state
+            .assign_tape_pool(tape, generation, Some(&pool.id))
+            .unwrap();
+    }
+    let mut index = state.write_handle();
     let admissions = WriteAdmissionCoordinator::default();
     let mut actors = Vec::new();
-    let api = crate::ApiState::new(remanence_state::projector::open(&index_path).unwrap());
+    let mut api = crate::ApiState::new_with_pool_configs(state.projection_client(), pools.clone());
+    api.checkpoint_journal_dir = Arc::new(paths.journal_dir.join("tapes"));
     let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     let started = std::time::Instant::now();
     let mut world = VirtualWorld::single_drive("LIB-B4A", 0x0100, "DRV1", 0x0400, 2);
@@ -46,49 +71,25 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
     world.drive_states.insert(0x0101, Default::default());
     world.element_layout.drive_count = 2;
     let world = Arc::new(Mutex::new(world));
+    let snapshot = world.lock().unwrap().library_snapshot();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [&snapshot],
+        &HashSet::from([snapshot.serial.clone()]),
+    )
+    .unwrap();
     let mut samples = Vec::new();
-    for n in [1u8, 2] {
-        let pool_id = format!("copy-{n}");
+    for (n, pool_cfg) in [1u8, 2].into_iter().zip(pools) {
         let tape_uuid = [n; 16];
         let barcode = format!("TP000{n}L9");
         let serial = "LIB-B4A".to_string();
         let bay = 0x00ff + u16::from(n);
         let drive_serial = format!("DRV{n}");
-        index
-            .upsert_tape_pool_projection(TapePoolProjectionInput {
-                pool_id: pool_id.clone(),
-                display_name: None,
-                copy_class: None,
-                content_class: None,
-                created_at_utc: None,
-            })
-            .unwrap();
-        index
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid,
-                voltag: barcode.clone(),
-                block_size: BLOCK,
-                parity: ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
-        index
-            .project_tape_pool_membership(tape_uuid, &pool_id)
-            .unwrap();
-        let drive_uuid = index
-            .observe_drive(DriveObservationInput {
-                serial: drive_serial.clone(),
-                identity_source: "DvcidAndInquiry".into(),
-                vendor: None,
-                product: None,
-                firmware_rev: None,
-                managed: "rem".into(),
-                library_serial: Some(serial.clone()),
-                element_address: Some(i64::from(bay)),
-                observed_at_utc: None,
-            })
+        let drive_uuid = state
+            .library_runtime()
+            .active_drive_uuid_for_serial(&drive_serial)
             .unwrap()
-            .drive_uuid;
+            .unwrap();
         let bootstrap = BootstrapPayload {
             scheme: None,
             no_parity_flag: true,
@@ -112,27 +113,12 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
         world.lock().unwrap().leave_cartridge_unthreaded(bay);
         let mut library = open_model_library(world.clone());
         let snapshot = library_snapshot_cell(library.library().clone());
-        let mut cfg =
-            test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
-        cfg.fixture_audit_mut().audit_append_lock = audit_lock.clone();
+        let mut cfg = test_state_write_owner_config(&state, &library, snapshot);
         cfg.write_admissions = admissions.clone();
         cfg.checkpoint_max_objects = 1;
         cfg.lifecycle = Some(lifecycle.clone());
         let drive = library.open_drive(bay, &cfg.policy).unwrap();
         let tx = spawn_drive_actor(bay, drive, cfg);
-        let pool_cfg = TapePoolConfig {
-            id: pool_id,
-            scheme: None,
-            display_name: None,
-            copy_class: None,
-            content_class: None,
-            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
-            watermark_low: 0.9,
-            watermark_high: 0.95,
-            capacity_cap_bytes: None,
-            block_size_bytes: u64::from(BLOCK),
-            min_object_size_bytes: 0,
-        };
         let session = b4a_open_actor_test_write_session(
             &tx,
             &pool_cfg,
@@ -151,7 +137,7 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
         .expect("each actor readiness write wakes the pool");
         actors.push((tx, session));
     }
-    samples.push(b4a_writable_connections(&index_path));
+    samples.push(b4a_writable_connections(&paths.sqlite_path));
     {
         let mut index = api.catalog.write_handle();
         if let Some(pool) = &api.drive_pool {
@@ -167,14 +153,24 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
         created_at_utc: None,
     })
     .unwrap();
-    api.record_request_received(AuditActor::System, Uuid::new_v4(), "b4a", &[1; 16], None)
-        .unwrap();
-    samples.push(b4a_writable_connections(&index_path));
+    let action = RoboticsAction::Move {
+        src: 0x0400,
+        dst: 0x0100,
+    };
+    api.accept_owner_request(
+        AuditActor::System,
+        "move_medium",
+        "library",
+        "LIB-B4A".into(),
+        crate::operation_source::robotics_fingerprint("LIB-B4A", &action),
+    )
+    .unwrap();
+    samples.push(b4a_writable_connections(&paths.sqlite_path));
     let append = |i: usize| {
         append_actor_test_file_result(
             &actors[i].0,
             actors[i].1,
-            temp.path().join(format!("source-{i}")),
+            paths.state_dir.join(format!("source-{i}")),
             "payload",
             "shared-caller",
             b"payload",
@@ -192,7 +188,7 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
             pb::AppendDurability::Checkpointed as i32
         );
     }
-    samples.push(b4a_writable_connections(&index_path));
+    samples.push(b4a_writable_connections(&paths.sqlite_path));
     for (tx, session_id) in actors {
         let (reply, response) = oneshot::channel();
         tx.send(DriveCommand::Close { session_id, reply })
@@ -208,7 +204,7 @@ async fn b4a_two_drive_actors_share_one_catalog_connection() {
         .get_native_object_by_pool_and_caller_object_id("copy-2", "shared-caller")
         .unwrap()
         .is_some());
-    samples.push(b4a_writable_connections(&index_path));
+    samples.push(b4a_writable_connections(&paths.sqlite_path));
     eprintln!(
         "B4a two-drive elapsed={:?}, writable connections={samples:?}",
         started.elapsed()

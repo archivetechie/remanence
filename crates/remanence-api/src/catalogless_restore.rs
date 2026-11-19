@@ -69,6 +69,8 @@ pub fn restore_catalogless_selected(
     let size = bootstrap.block_size_bytes;
     let mut candidates = Vec::new();
     let mut terminal = false;
+    let mut end_of_data_mark = remanence_parity::EndOfDataMark::Present;
+    let mut unresolved_from = None;
     if !scan {
         let outcome = remanence_parity::read_terminal_index_inventory_streamed(
             &mut DriveHandleRawSource::new(drive),
@@ -105,10 +107,13 @@ pub fn restore_catalogless_selected(
     }
     if !terminal {
         candidates.clear();
-        remanence_parity::recover_terminal_inventory_from_bot(
+        let summary = remanence_parity::recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule(
             &mut DriveHandleRawSource::new(drive),
             &bootstrap.tape_uuid,
             size,
+            remanence_parity::ScanMode::Standard,
+            remanence_parity::EndOfDataRule::StopWhenConfirmed,
+            |_| remanence_parity::ScanWalkControl::Continue,
             |candidate| {
                 candidates.push((
                     candidate.tape_file_number,
@@ -120,6 +125,8 @@ pub fn restore_catalogless_selected(
             },
         )
         .map_err(error)?;
+        end_of_data_mark = summary.end_of_data_mark;
+        unresolved_from = summary.unresolved_from;
     }
     let config = drive.read_config().map_err(error)?;
     drive
@@ -133,7 +140,13 @@ pub fn restore_catalogless_selected(
     for (ordinal, (file, count, id, anchor)) in candidates.into_iter().enumerate() {
         let name = format!("candidate-{}", ordinal + 1);
         let result = (|| {
-            let count = count.ok_or_else(|| "incomplete candidate at EOD".to_string())?;
+            let count = count.ok_or_else(|| {
+                if end_of_data_mark == remanence_parity::EndOfDataMark::NotFound {
+                    "incomplete candidate; closing filemark could not be established; remaining tape unresolved"
+                } else {
+                    "incomplete candidate at EOD"
+                }.to_string()
+            })?;
             position_to_object(&mut *drive, BotRelativeTapeFile(file)).map_err(error)?;
             if list {
                 let start = drive
@@ -299,7 +312,19 @@ pub fn restore_catalogless_selected(
             json!(outcomes)
         ));
     }
-    Ok(json!({"terminal_index": terminal, "candidates": outcomes}))
+    let end_of_data_mark = match end_of_data_mark {
+        remanence_parity::EndOfDataMark::Present => "present",
+        remanence_parity::EndOfDataMark::NotFound => "not_found",
+        remanence_parity::EndOfDataMark::NotReached => "not_reached",
+    };
+    let unresolved_from = unresolved_from.map(|position| {
+        json!({
+            "partition": position.partition, "lba": position.lba.to_string()
+        })
+    });
+    Ok(
+        json!({"terminal_index": terminal, "candidates": outcomes, "end_of_data_mark": end_of_data_mark, "unresolved_from": unresolved_from}),
+    )
 }
 
 /// Validate candidates through the same canonical reader used by restoration.

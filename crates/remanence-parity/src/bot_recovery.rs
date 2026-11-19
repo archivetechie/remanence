@@ -10,12 +10,12 @@ use crate::bootstrap::parse_bootstrap_block;
 use crate::error::{BootstrapRefusedField, ParityError};
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::raw::{
-    read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
-    RawTapeSource,
+    read_fixed_record, tape_error_is_current_medium_damage, tape_error_is_end_of_data_not_found,
+    FixedRecordRead, PhysicalPositionHint, RawTapeSource,
 };
 use crate::scan::{
-    scan_reconstruct_filemark_map_with_control_mode, ControlledScanWalkOutcome, ScanMode,
-    ScanRecoveryHints, ScanWalkControl, ScanWalkProgress,
+    scan_reconstruct_filemark_map_with_end_of_data_rule, ControlledScanWalkOutcome, EndOfDataMark,
+    EndOfDataRule, ScanMode, ScanRecoveryHints, ScanWalkControl, ScanWalkProgress,
 };
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -100,6 +100,10 @@ pub enum BotStructuralRecoveryEvent {
 /// Summary of a completed BOT structural recovery pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BotStructuralRecoverySummary {
+    /// End-of-data evidence measured by the BOT walk.
+    pub end_of_data_mark: EndOfDataMark,
+    /// First position from which the remaining tape is unresolved.
+    pub unresolved_from: Option<PhysicalPositionHint>,
     /// Structurally complete tape files reconstructed from BOT.
     pub structural_entry_count: u64,
     /// Structurally complete physical Object candidates.
@@ -254,11 +258,37 @@ where
     C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
     F: FnMut(&BotRecoveredObject) -> Result<(), String>,
 {
-    recover_terminal_inventory_from_bot_with_authority_controlled_mode(
+    recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule(
         source,
         tape_uuid,
         block_size,
         mode,
+        EndOfDataRule::Refuse,
+        visit_control,
+        visit_object,
+    )
+}
+
+/// Run BOT recovery with an explicit policy for a confirmed missing end-of-data mark.
+pub fn recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule<C, F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    rule: EndOfDataRule,
+    visit_control: C,
+    visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        rule,
         &mut NoBotObjectRecoveryAuthority {
             tape_uuid: *tape_uuid,
             block_size,
@@ -326,6 +356,39 @@ pub fn recover_terminal_inventory_from_bot_with_authority_controlled_mode<A, C, 
     block_size: u32,
     mode: ScanMode<'_>,
     authority: &mut A,
+    visit_control: C,
+    visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    A: BotObjectRecoveryAuthority + ?Sized,
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        EndOfDataRule::Refuse,
+        authority,
+        visit_control,
+        visit_object,
+    )
+}
+
+/// Run BOT recovery with an explicit policy for a confirmed missing end-of-data mark.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule<
+    A,
+    C,
+    F,
+>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    rule: EndOfDataRule,
+    authority: &mut A,
     mut visit_control: C,
     mut visit_object: F,
 ) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
@@ -345,11 +408,12 @@ where
     if matches!(mode, ScanMode::Standard) {
         reject_readable_foreign_bot_bootstrap(source, tape_uuid, block_size)?;
     }
-    let walked = scan_reconstruct_filemark_map_with_control_mode(
+    let walked = scan_reconstruct_filemark_map_with_end_of_data_rule(
         source,
         tape_uuid,
         block_size,
         mode,
+        rule,
         |progress| visit_control(&BotStructuralRecoveryEvent::Progress(*progress)),
     )
     .map_err(|error| match error {
@@ -361,8 +425,16 @@ where
             field: BootstrapRefusedField::TapeUuid,
             ..
         } => BotStructuralRecoveryError::TapeIdentityMismatch,
-        error => BotStructuralRecoveryError::Scan {
-            message: error.to_string(),
+        error => {
+            let mut message = error.to_string();
+            if matches!(&error, ParityError::TapeIo(error) if tape_error_is_end_of_data_not_found(error, 0x11)) {
+                message.push_str("; ");
+                message.push_str(match rule {
+                    EndOfDataRule::Refuse => crate::MISSING_END_OF_DATA_DIAGNOSTIC,
+                    EndOfDataRule::StopWhenConfirmed => crate::MISSING_END_OF_DATA_STATEMENT,
+                });
+            }
+            BotStructuralRecoveryError::Scan { message }
         },
     })?;
     let walked = match walked {
@@ -485,6 +557,8 @@ where
     }
 
     Ok(BotStructuralRecoverySummary {
+        end_of_data_mark: walked.end_of_data_mark,
+        unresolved_from: walked.unresolved_from,
         bootstrap_recovery_hints: walked.bootstrap_recovery_hints,
         structural_entry_count: walked.map.tape_file_count(),
         complete_object_count,

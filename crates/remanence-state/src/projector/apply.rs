@@ -138,6 +138,27 @@ impl CatalogCore {
             .map_err(|e| sqlite_error("read library rebuild witnesses", e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| sqlite_error("read library rebuild witness", e))?;
+        let received = self.library_catalog_received()?;
+        Ok(LibraryCatalogEvidence { rows, received })
+    }
+
+    /// Greatest stored or received library sequence, without decoding record bytes.
+    pub(in crate::projector) fn library_catalog_end(&self) -> Result<u64, StateError> {
+        let stored = self
+            .conn
+            .query_row(
+                "select sequence from library_projection_records order by sequence desc limit 1",
+                [],
+                |row| row.get::<_, SqliteU64>(0),
+            )
+            .optional()
+            .map_err(|e| sqlite_error("read library catalog end", e))?
+            .map_or(0, SqliteU64::get);
+        Ok(stored.max(self.library_catalog_received()?))
+    }
+
+    /// Share all three received cursors between open admission and rebuild evidence.
+    fn library_catalog_received(&self) -> Result<u64, StateError> {
         let mut received = 0;
         for sql in [
             "select received from projection_sources where source='library'",
@@ -151,7 +172,7 @@ impl CatalogCore {
                 .map_err(|e| sqlite_error("read library rebuild received position", e))?;
             received = received.max(position.map_or(0, SqliteU64::get));
         }
-        Ok(LibraryCatalogEvidence { rows, received })
+        Ok(received)
     }
 }
 
@@ -228,7 +249,7 @@ impl CatalogCore {
                 if let Some(identity) = identity {
                     if identity != value.log_uuid {
                         return Err(ApplyError::Contradiction(
-                            "library source UUID changed".into(),
+                            "library source UUID changed: the catalog was built from another library log; stop the service and run rem rebuild-catalog-from-journals".into(),
                         ));
                     }
                 } else {
@@ -253,7 +274,7 @@ impl CatalogCore {
                 if let Some(previous) = previous {
                     if previous != digest {
                         return Err(ApplyError::Contradiction(format!(
-                            "library sequence {}",
+                            "library sequence {}: the catalog holds a different record for this sequence or record identity than the library log; stop the service and run rem rebuild-catalog-from-journals",
                             value.sequence
                         )));
                     }
@@ -649,6 +670,32 @@ impl CatalogCore {
                         pool.content_class.as_ref().map(|x| x.0.as_str()),
                         &at,
                     )?;
+                }
+                let configured = v
+                    .definitions
+                    .pools
+                    .0
+                    .iter()
+                    .map(|pool| &pool.id.0)
+                    .collect::<HashSet<_>>();
+                let existing = {
+                    let mut statement = self
+                        .conn
+                        .prepare("select pool_id from tape_pools")
+                        .map_err(|e| sqlite_error("read configured tape pools", e))?;
+                    let pools = statement
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .map_err(|e| sqlite_error("query configured tape pools", e))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| sqlite_error("decode configured tape pools", e))?;
+                    pools
+                };
+                for pool_id in existing {
+                    if !configured.contains(&pool_id) {
+                        self.conn
+                            .execute("delete from tape_pools where pool_id = ?1", [&pool_id])
+                            .map_err(|e| sqlite_error("remove unconfigured tape pool", e))?;
+                    }
                 }
             }
             Body::DriveObserved(v) => {

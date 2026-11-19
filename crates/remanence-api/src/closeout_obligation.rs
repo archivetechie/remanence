@@ -397,6 +397,24 @@ impl RetryCauseExt for RetryCause {
         status
     }
 }
+/// Render the command's existing retry and read-finding decisions without reclassifying.
+pub(crate) fn attach_outcome_labels(
+    outcome: &remanence_library::outcome::ClassifiedOutcome,
+    status: Status,
+) -> Status {
+    let mut status = outcome.retry.attach(status);
+    if matches!(
+        outcome.effect,
+        remanence_library::outcome::Effect::ReadFinding(_)
+    ) {
+        status.metadata_mut().insert(
+            "remanence-finding",
+            "media-damage".parse().expect("fixed finding metadata"),
+        );
+    }
+    status
+}
+
 pub(crate) fn transient(error: &Status) -> bool {
     if crate::readiness_wait::ReadinessFence::from_status(error).is_some()
         || crate::drive_pool::TapeBusy::from_status(error).is_some()
@@ -1012,13 +1030,18 @@ mod tests {
     }
     #[test]
     fn b7_alarm_once_per_age_and_again_after_restart_even_without_drive() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("audit")).unwrap();
+        let typed = crate::tests::TypedRoot::open();
+        let tape_root = typed
+            .catalog()
+            .library_runtime()
+            .unwrap()
+            .manifest()
+            .tape_root()
+            .to_path_buf();
+        // Each process has independent alarm deduplication over the same typed authority.
         let make = || {
-            let mut state = ApiState::new(
-                remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
-            );
-            state.audit_dir = std::sync::Arc::new(root.path().join("audit"));
+            let mut state = typed.api_state();
+            state.checkpoint_journal_dir = std::sync::Arc::new(tape_root.clone());
             state
         };
         let state = make();
@@ -1028,14 +1051,6 @@ mod tests {
             alarm(&state, key, &s).unwrap();
             alarm(&state, key, &s).unwrap();
         });
-        assert_eq!(
-            warnings
-                .iter()
-                .filter(|s| s.contains("CloseoutOverdue"))
-                .count(),
-            1
-        );
-        assert!(state.drive_pool.is_none());
         assert_eq!(
             state
                 .index()
@@ -1047,6 +1062,14 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|s| s.contains("CloseoutOverdue"))
+                .count(),
+            1
+        );
+        assert!(state.drive_pool.is_none());
         alarm(&make(), key, &s).unwrap();
         assert_eq!(
             state

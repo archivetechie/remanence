@@ -752,7 +752,7 @@ impl WriteSessionState<'_> {
                 self.session_id,
                 WriteMediaPolicy::RewritableObject,
             )?;
-            let config = self.drive.read_config().map_err(|e| {
+            let config = self.drive.read_config_resolving_worm().map_err(|e| {
                 super::restore::attach_outcome_retry(
                     e.outcome(),
                     Status::unavailable(e.to_string()),
@@ -2007,6 +2007,7 @@ pub(super) fn handle_drive_open_write(
         &tape_uuid,
         barcode.as_deref(),
         "open write session",
+        false,
     ) {
         let _ = reply.send(Err(status));
         return None;
@@ -2216,7 +2217,7 @@ pub(super) fn handle_drive_open_write(
             ))));
             return None;
         }
-        let drive_config = match drive.read_config() {
+        let drive_config = match drive.read_config_resolving_worm() {
             Ok(config) => config,
             Err(error) => {
                 let _ = reply.send(Err(Status::unavailable(format!(
@@ -2914,26 +2915,10 @@ pub(super) fn handle_drive_open_write(
     })
 }
 
-/// Publish the typed write fence before applying its quarantine effect. The
-/// shared runtime latches a failed publication independently of native endings.
-pub(crate) fn raise_tape_io_fence(
-    index: &mut CatalogIndex,
-    cfg: &impl super::terminal_types::TerminalConfig,
-    input: remanence_state::TapeIoFenceInput,
-    _endpoint: Option<&remanence_library::DriveKey>,
-    completion: Option<&remanence_library::outcome::CompletionEvidence>,
-) -> Result<TapeIoFenceRecord, remanence_state::StateError> {
+/// Map the established write-fence reasons without interpreting diagnostic text.
+pub(crate) fn write_fence_cause(reason: &str) -> Option<remanence_state::library_log::FenceCause> {
     use remanence_state::library_log as lib;
-    let cfg = cfg.terminal_config();
-    let invalid = |message: String| remanence_state::StateError::IndexCorrupt(message);
-    let library = cfg
-        .authority
-        .runtime()
-        .ok_or_else(|| invalid("write fence requires shared LibraryAuthority".into()))?;
-    let tape = library
-        .tape_state(input.tape_uuid)
-        .ok_or_else(|| invalid("write fence requires Reprovision identity".into()))?;
-    let cause = match input.reason.as_str() {
+    Some(match reason {
         "partial_batch" => lib::FenceCause::PartialBatch,
         "transfer_error" => lib::FenceCause::TransferError,
         "closeout_check_mismatch" | "CloseoutCheckMismatch" => {
@@ -2952,50 +2937,111 @@ pub(crate) fn raise_tape_io_fence(
             lib::FenceCause::CloseoutReadContradiction
         }
         "checkpoint_barrier_failed" => lib::FenceCause::CheckpointBarrierFailed,
-        other => return Err(invalid(format!("unrepresented write fence cause: {other}"))),
-    };
-    let evidence = completion.map(|evidence| lib::CompletionEvidence {
-        dispatch: match evidence.dispatch {
-            remanence_library::outcome::Dispatch::Issued => lib::Dispatch::Issued,
-            remanence_library::outcome::Dispatch::NotIssued => lib::Dispatch::NotIssued,
-        },
-        completion: match evidence.completion {
-            remanence_library::outcome::Completion::Known => lib::Completion::Known,
-            remanence_library::outcome::Completion::Unknown => lib::Completion::Unknown,
-        },
-        scsi_status: evidence.scsi_status,
-        host_status: evidence.host_status,
-        driver_status: evidence.driver_status,
-        sense: evidence.sense.clone().map(lib::Blob),
-        residual: evidence.residual,
-    });
-    let at = library
-        .current_native_reference(input.tape_uuid)
-        .map_err(|e| invalid(e.to_string()))?;
-    let receipt = library
-        .append(|authority, view| {
-            authority.fence_raised(
-                lib::FenceRaised {
-                    detail: crate::append_admission::tape_fence_detail(
-                        input.barcode.as_deref(),
-                        input.evidence_json.as_deref(),
-                    ),
-                    kind: lib::FenceKind::Write,
-                    scope: lib::FenceScope::Tape(tape.tape),
-                    cause,
-                    evidence,
-                    at,
-                    operation: None,
-                },
-                lib::AuditActor::System,
-                lib::SourceLayer::Layer5,
-                view,
-            )
-        })
-        .map_err(|e| invalid(e.to_string()))?;
+        _ => return None,
+    })
+}
+
+/// Publish the typed write fence before applying its quarantine effect. The
+/// shared runtime latches a failed publication independently of native endings.
+pub(crate) fn raise_tape_io_fence(
+    index: &mut CatalogIndex,
+    cfg: &impl super::terminal_types::TerminalConfig,
+    input: remanence_state::TapeIoFenceInput,
+    endpoint: Option<&remanence_library::DriveKey>,
+    completion: Option<&remanence_library::outcome::CompletionEvidence>,
+) -> Result<TapeIoFenceRecord, remanence_state::StateError> {
+    use remanence_state::library_log as lib;
+    let cfg = cfg.terminal_config();
+    let invalid = |message: String| remanence_state::StateError::IndexCorrupt(message);
+    let library = cfg
+        .authority
+        .runtime()
+        .ok_or_else(|| invalid("write fence requires shared LibraryAuthority".into()))?;
+    let attempt = (|| {
+        let tape = library
+            .tape_state(input.tape_uuid)
+            .ok_or_else(|| invalid("write fence requires Reprovision identity".into()))?;
+        let cause = write_fence_cause(&input.reason)
+            .ok_or_else(|| invalid(format!("unrepresented write fence cause: {}", input.reason)))?;
+        let evidence = completion.map(|evidence| lib::CompletionEvidence {
+            dispatch: match evidence.dispatch {
+                remanence_library::outcome::Dispatch::Issued => lib::Dispatch::Issued,
+                remanence_library::outcome::Dispatch::NotIssued => lib::Dispatch::NotIssued,
+            },
+            completion: match evidence.completion {
+                remanence_library::outcome::Completion::Known => lib::Completion::Known,
+                remanence_library::outcome::Completion::Unknown => lib::Completion::Unknown,
+            },
+            scsi_status: evidence.scsi_status,
+            host_status: evidence.host_status,
+            driver_status: evidence.driver_status,
+            sense: evidence.sense.clone().map(lib::Blob),
+            residual: evidence.residual,
+        });
+        let at = library
+            .current_native_reference(input.tape_uuid)
+            .map_err(|e| invalid(e.to_string()))?;
+        library
+            .append(|authority, view| {
+                authority.fence_raised(
+                    lib::FenceRaised {
+                        detail: crate::append_admission::tape_fence_detail(
+                            input.barcode.as_deref(),
+                            input.evidence_json.as_deref(),
+                        ),
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(tape.tape),
+                        cause,
+                        evidence,
+                        at,
+                        operation: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer5,
+                    view,
+                )
+            })
+            .map_err(|e| invalid(e.to_string()))
+    })();
+    hold_standalone_write_drive(
+        &cfg,
+        endpoint,
+        input.tape_uuid,
+        &input.reason,
+        input.barcode.as_deref(),
+        input.evidence_json.as_deref(),
+    );
+    let receipt = attempt?;
     index
         .tape_io_fence_by_quarantine_id(&format!("library:{}", receipt.sequence))?
         .ok_or_else(|| invalid("typed fence projection missing after acknowledgement".into()))
+}
+
+/// Publish the independent drive obligation after a tape-fence attempt, preserving its result.
+pub(super) fn hold_standalone_write_drive(
+    cfg: &super::TerminalWriteConfig,
+    endpoint: Option<&remanence_library::DriveKey>,
+    tape: crate::TapeUuid,
+    reason: &str,
+    barcode: Option<&str>,
+    evidence_json: Option<&str>,
+) {
+    let Some(endpoint @ remanence_library::DriveKey::Standalone { drive_serial }) = endpoint else {
+        return;
+    };
+    let (Some(library), Some(cause)) = (cfg.authority.runtime(), super::write_fence_cause(reason))
+    else {
+        return;
+    };
+    if let Err(error) = library.raise_standalone_drive_hold(
+        endpoint,
+        tape,
+        cause,
+        crate::append_admission::tape_fence_detail(barcode, evidence_json),
+    ) {
+        eprintln!("error: cannot record the hold on standalone drive {drive_serial}: {error}; motion is fenced and recovery is required");
+        tracing::error!(%error, %drive_serial, "cannot record standalone drive hold; motion is fenced and recovery is required");
+    }
 }
 
 /// Run the load-time wrap-map harvest for a freshly mounted cartridge
@@ -3147,7 +3193,12 @@ pub(super) fn prepare_drive_for_write_observing_identity(
     })?;
     let rewind_write_elapsed = rewind_write_started.elapsed();
     let read_config_started = Instant::now();
-    let current_cfg = drive.read_config().map_err(|err| {
+    let current_cfg = if media_policy == WriteMediaPolicy::RewritableObject {
+        drive.read_config_resolving_worm()
+    } else {
+        drive.read_config()
+    }
+    .map_err(|err| {
         crate::closeout_obligation::RetryCause::tape_io(&err).attach(Status::internal(format!(
             "read drive config before write: {err}"
         )))

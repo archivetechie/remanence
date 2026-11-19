@@ -99,11 +99,56 @@ fn shutdown_round1_reconcile_reserved_load_and_admitted_completion() {
     }
 }
 
+/// Attach the observed model bay to the same authority that owns this readiness wait.
+fn begin_unthreaded_wait(
+    root: &crate::tests::TypedRoot,
+    library: &mut remanence_library::LibraryHandle,
+) -> (CatalogIndex, Uuid) {
+    let catalog = root.catalog();
+    let runtime = catalog.library_runtime().unwrap();
+    let mut index = catalog.write_handle();
+    library.set_motion_authority(Arc::new(runtime.clone()));
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from([LIBRARY.to_owned()]),
+    )
+    .unwrap();
+    let id = Uuid::from_bytes(
+        runtime
+            .start_owned_operation(
+                remanence_state::library_log::OperationKind::MediaReadinessWait,
+                AuditActor::System,
+            )
+            .unwrap(),
+    );
+    index
+        .record_media_readiness_operation(MediaReadinessOperationInput {
+            operation_id: id,
+            run_id: None,
+            endpoint: DriveKey::new(LIBRARY, BAY),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("DRV-UNTHREADED".into()),
+            barcode: Some("UNT001L9".into()),
+            source_slot: Some(0x400),
+            media_generation: Some(9),
+            media_family: Some(LtoGen::Lto9),
+            phase: "readiness_poll".into(),
+            state: "planned".into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
+    (index, id)
+}
+
 /// Hold the initializing-LOAD callback in the actual operation registry lock.
 /// Shutdown must close admission while publication is blocked, then refuse LOAD.
 #[test]
 fn shutdown_round1_readiness_registry_barrier_refuses_load() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::tests::TypedRoot::open();
     let lifecycle = DrivePoolLifecycle::default();
     let pool = motion_pool(lifecycle);
     let registry = crate::operations::OperationRegistry::default();
@@ -119,17 +164,13 @@ fn shutdown_round1_readiness_registry_barrier_refuses_load() {
             released.recv_timeout(StdDuration::from_secs(10)).unwrap();
         }
     });
-    let id = Uuid::new_v4();
-    let handle = registry
-        .register(id, "readiness")
-        .with_readiness_motion(pool.clone(), DriveKey::new(LIBRARY, BAY));
-    let index_path = root.path().join("state.sqlite");
+    let worker_pool = pool.clone();
     let worker = std::thread::spawn(move || {
         let (world, mut library) = unthreaded_cartridge_world(LIBRARY);
-        let mut index = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .unwrap();
-        record_unthreaded_readiness_operation(&mut index, LIBRARY, id);
+        let (mut index, id) = begin_unthreaded_wait(&root, &mut library);
+        let handle = registry
+            .register(id, "media_readiness_wait")
+            .with_readiness_motion(worker_pool, DriveKey::new(LIBRARY, BAY));
         let mut drive = library
             .open_drive(BAY, &remanence_library::StaticAllowlist::new([LIBRARY]))
             .unwrap();
@@ -146,7 +187,7 @@ fn shutdown_round1_readiness_registry_barrier_refuses_load() {
                     poll_interval: StdDuration::from_millis(1),
                 },
                 cartridge_in_drive: true,
-                phase: "test",
+                phase: "readiness_poll",
             },
             &handle,
         );
@@ -302,8 +343,9 @@ impl SgTransport for StopAtUnloadInventory {
 /// cross the actor callback as typed shutdown and preserve the previous retry.
 #[tokio::test]
 async fn shutdown_round1_debt_eviction_preserves_retry_evidence() {
-    let root = tempfile::tempdir().unwrap();
-    let world = super::b7_tests::due_tape(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     slot_tape(&world);
     {
         let mut world = world.lock().unwrap();
@@ -328,7 +370,7 @@ async fn shutdown_round1_debt_eviction_preserves_retry_evidence() {
         )])),
         lifecycle.clone(),
     );
-    let mut state = super::b7_tests::state(root.path());
+    let mut state = root.api_state();
     let library = open_model_library(world.clone());
     state.library_snapshot = Some(library_snapshot_cell(library.library().clone()));
     state.drive_pool = Some(pool.clone());
@@ -398,30 +440,52 @@ async fn shutdown_round1_debt_eviction_preserves_retry_evidence() {
 /// Operator LOAD has its own inventory and audit waits beyond actor admission.
 #[test]
 fn shutdown_round1_operator_load_rechecks_after_library_preparation() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     slot_tape(&world);
     let mut library = open_model_library(world.clone());
-    let mut cfg = config(root.path(), &library);
+    let mut cfg = root.config(&library);
     let lifecycle = DrivePoolLifecycle::default();
     let pool = motion_pool(lifecycle.clone());
     cfg.lifecycle = Some(lifecycle);
     pool.reserve_library_exclusive(LIBRARY).unwrap();
+    let stopping = pool.clone();
     library.set_audit_hook(move |event| {
         if matches!(event, remanence_library::AuditEvent::Started { cdb, .. } if cdb[0] == 0xa5) {
-            pool.begin_shutdown();
+            stopping.begin_shutdown();
         }
     });
-    let mut index = remanence_state::projector::open(&cfg.index_path)
-        .map(|catalog| catalog.write_handle())
+    let mut index = root.state.write_handle();
+    let action = crate::write_owner::RoboticsAction::Load {
+        slot: 0x400,
+        bay: BAY,
+        wait_ready: false,
+    };
+    let operation = root
+        .api_state()
+        .accept_owner_request(
+            AuditActor::System,
+            "load_drive",
+            "library",
+            LIBRARY.into(),
+            crate::operation_source::robotics_fingerprint(LIBRARY, &action),
+        )
         .unwrap();
     let registry = crate::operations::OperationRegistry::default();
-    let handle = registry.register(Uuid::new_v4(), "load");
+    let handle = registry.register(operation, "load_drive");
+    cfg.configure_operation_library(&mut library, &handle);
     let result = run_load_sequence(&mut index, &cfg, &handle, &mut library, 0x400, BAY, false);
     assert!(
         result.is_err(),
         "operator LOAD must refuse after final preparation"
     );
+    let error = result.unwrap_err();
+    assert!(
+        error.contains("motion admission refused")
+            && error.contains(DaemonShuttingDown::status().message()),
+        "{error}"
+    );
+    assert!(pool.is_shutting_down(), "preparation hook began shutdown");
     assert!(world
         .lock()
         .unwrap()
@@ -434,11 +498,11 @@ fn shutdown_round1_operator_load_rechecks_after_library_preparation() {
 /// even when the queue dispatcher already acquired its motion guard.
 #[tokio::test]
 async fn shutdown_round1_actor_move_rechecks_after_audit_wait() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     slot_tape(&world);
     let mut library = open_model_library(world.clone());
-    let mut cfg = config(root.path(), &library);
+    let mut cfg = root.config(&library);
     let lifecycle = DrivePoolLifecycle::default();
     let pool = motion_pool(lifecycle.clone());
     cfg.lifecycle = Some(lifecycle);
@@ -484,7 +548,7 @@ async fn shutdown_round1_actor_move_rechecks_after_audit_wait() {
 fn shutdown_round1_unload_rechecks_after_audit_and_verification_waits() {
     for verification_wait in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let world = setup(root.path());
+        let world = model_world(BARCODE, true);
         let mut library = open_model_library(world.clone());
         let lifecycle = DrivePoolLifecycle::default();
         let pool = motion_pool(lifecycle.clone());
@@ -562,7 +626,7 @@ impl SgTransport for ShutdownOnLoad {
 }
 
 fn readiness_dispatched_load_finishes() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::tests::TypedRoot::open();
     let lifecycle = DrivePoolLifecycle::default();
     let pool = motion_pool(lifecycle.clone());
     let (world, _) = unthreaded_cartridge_world(LIBRARY);
@@ -579,15 +643,11 @@ fn readiness_dispatched_load_finishes() {
             }))
         })
         .unwrap();
+    let (mut index, id) = begin_unthreaded_wait(&root, &mut library);
     let mut drive = library.open_drive(BAY, &policy).unwrap();
-    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    let id = Uuid::new_v4();
-    record_unthreaded_readiness_operation(&mut index, LIBRARY, id);
     let registry = crate::operations::OperationRegistry::default();
     let handle = registry
-        .register(id, "readiness")
+        .register(id, "media_readiness_wait")
         .with_readiness_motion(pool.clone(), DriveKey::new(LIBRARY, BAY));
     let result = poll_drive_media_readiness(
         &mut index,
@@ -602,7 +662,7 @@ fn readiness_dispatched_load_finishes() {
                 poll_interval: StdDuration::from_millis(1),
             },
             cartridge_in_drive: true,
-            phase: "test",
+            phase: "readiness_poll",
         },
         &handle,
     );
@@ -627,8 +687,9 @@ async fn regate1_dispatched_debt_move_completes_initial_load() {
 
 /// Exercise the debt worker, real changer, and real drive actor with audit barriers.
 async fn debt_conditional_load_cutoff(move_first: bool) {
-    let root = tempfile::tempdir().unwrap();
-    let world = super::b7_tests::due_tape(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     if move_first {
         slot_tape(&world);
     } else {
@@ -660,7 +721,7 @@ async fn debt_conditional_load_cutoff(move_first: bool) {
             cutoff_pool.begin_shutdown();
         }
     });
-    let mut cfg = config(root.path(), &library);
+    let mut cfg = root.config(&library);
     cfg.lifecycle = Some(lifecycle.clone());
     cfg.reservations = Arc::new(HashMap::from([(
         DriveKey::new(LIBRARY, BAY),
@@ -678,7 +739,7 @@ async fn debt_conditional_load_cutoff(move_first: bool) {
         cfg.reservations.clone(),
         lifecycle.clone(),
     );
-    let mut state = super::b7_tests::state(root.path());
+    let mut state = root.api_state();
     state.library_snapshot = Some(library_snapshot_cell(
         world.lock().unwrap().library_snapshot(),
     ));
@@ -904,10 +965,10 @@ fn shutdown_round2_dispatched_and_unknown_loads_still_count_after_restart() {
 /// A queued open cannot dispatch once every external mailbox owner has gone.
 #[tokio::test]
 async fn actor_without_external_sender_refuses_queued_open_and_exits() {
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let mut library = open_model_library(world.clone());
-    let cfg = config(root.path(), &library);
+    let cfg = root.config(&library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let before = world.lock().unwrap().command_log.len();
     let (tx, rx) = mpsc::channel(1);

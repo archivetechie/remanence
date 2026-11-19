@@ -32,9 +32,9 @@ use crate::parity_map::{
     read_final_parity_map, validate_header_matches_footer, DecodedParityMapTapeFile,
 };
 use crate::raw::{
-    classify_fixed_record, device_position_error, read_fixed_record,
-    tape_error_is_current_medium_damage, wrong_record_length, FixedRecordRead,
-    PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    classify_fixed_record, device_position_error, locate_physical_exact, read_fixed_record,
+    tape_error_is_current_medium_damage, tape_error_is_end_of_data_not_found, wrong_record_length,
+    FixedRecordRead, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
 };
 #[cfg(test)]
 use crate::recovery::read_directory_tail_index;
@@ -67,7 +67,7 @@ pub struct CatalogFilemarkMapInput {
 /// Structural signature that terminated a physical tape walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanTailTruncationKind {
-    /// End-of-data was reached before the current file's trailing filemark.
+    /// The walk could not establish the current file's closing filemark.
     MissingTrailingFilemark,
     /// Filemark spacing measured a file containing no data blocks.
     ZeroBlockFile,
@@ -135,7 +135,7 @@ impl ScanRecoveryHints {
 
     /// Judge the measured length of a first-record read that did not fill its
     /// read size exactly: a short read's `bytes`, or the `actual` of
-    /// [`remanence_library::TapeIoError::ReadBufferTooSmall`]. The comparison is always with the
+    /// [`remanence_library::TapeIoErrorKind::ReadBufferTooSmall`]. The comparison is always with the
     /// supplied block size (REM-PARITY 8.4), so at a candidate read size other
     /// than the supplied one, a record of the supplied length passes and only
     /// that candidate is ruled out by the caller. A read that fills its read
@@ -370,6 +370,27 @@ pub enum ScanMode<'a> {
     Recovery(&'a ScanRecoveryHints),
 }
 
+/// How the walk handles a drive that cannot find the end-of-data mark.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndOfDataRule {
+    /// Return the measuring error.
+    #[default]
+    Refuse,
+    /// After a crossed file, stop if SPACE(EOD) independently confirms the report.
+    StopWhenConfirmed,
+}
+
+/// What the ending of a completed walk established about the EOD mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndOfDataMark {
+    /// A head read or file measurement positively reported end of data.
+    Present,
+    /// The measuring SPACE and confirming SPACE(EOD) both reported a missing mark.
+    NotFound,
+    /// The walk ended before establishing the state of the mark.
+    NotReached,
+}
+
 /// Tail-aware result of the single physical filemark-map walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanWalkResult {
@@ -377,9 +398,14 @@ pub struct ScanWalkResult {
     final_parity_map: Option<Box<DecodedParityMapTapeFile>>,
     /// Structurally complete files walked before EOD or truncation.
     pub map: FilemarkMap,
-    /// First incomplete tail file, when one terminated the walk.
+    /// Evidence about the end-of-data mark at the end of this walk.
+    pub end_of_data_mark: EndOfDataMark,
+    /// First unresolved file start after a confirmed missing-mark report.
+    /// Its closing filemark could not be established, even if the file is physically complete.
+    pub unresolved_from: Option<PhysicalPositionHint>,
+    /// First incomplete or unmeasurable tail file, when one terminated the walk.
     pub truncation: Option<ScanTailTruncation>,
-    /// Best structural classification of the torn tail file from its readable
+    /// Best structural classification of the unresolved tail file from its readable
     /// first block. Recognisable terminal control magic is always preserved as
     /// control evidence and never falls through to Object.
     pub truncation_candidate_kind: Option<TapeFileKind>,
@@ -795,16 +821,39 @@ pub fn scan_reconstruct_filemark_map_with_control_mode<F>(
     tape_uuid: &[u8; 16],
     block_size: u32,
     mode: ScanMode<'_>,
+    control: F,
+) -> Result<ControlledScanWalkOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
+    scan_reconstruct_filemark_map_with_end_of_data_rule(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        EndOfDataRule::Refuse,
+        control,
+    )
+}
+
+/// Controlled walk with an explicit policy for a drive reporting a missing EOD mark.
+pub fn scan_reconstruct_filemark_map_with_end_of_data_rule<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    rule: EndOfDataRule,
     mut control: F,
 ) -> Result<ControlledScanWalkOutcome, ParityError>
 where
     F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
 {
-    scan_with_bootstrap_observer(
+    scan_with_rule_and_observer(
         source,
         tape_uuid,
         block_size,
         mode,
+        rule,
         &mut control,
         &mut |_| {},
     )
@@ -822,11 +871,35 @@ pub(crate) fn scan_with_bootstrap_observer<F>(
 where
     F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
 {
+    scan_with_rule_and_observer(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        EndOfDataRule::Refuse,
+        control,
+        bootstrap_observer,
+    )
+}
+
+fn scan_with_rule_and_observer<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    rule: EndOfDataRule,
+    control: &mut F,
+    bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
+) -> Result<ControlledScanWalkOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
     match scan_reconstruct_filemark_map_with_provenance(
         source,
         tape_uuid,
         block_size,
         mode,
+        rule,
         control,
         bootstrap_observer,
     )? {
@@ -840,6 +913,8 @@ where
                 truncation: reconstructed.truncation,
                 truncation_candidate_kind: reconstructed.truncation_candidate_kind,
                 bootstrap_candidates: reconstructed.bootstrap_candidates,
+                end_of_data_mark: reconstructed.end_of_data_mark,
+                unresolved_from: reconstructed.unresolved_from,
                 damaged_regions: reconstructed.damaged_regions,
             }))
         }
@@ -927,6 +1002,8 @@ pub(crate) fn reconcile_measured_sidecars(
 
 #[derive(Debug)]
 struct ScanReconstruction {
+    end_of_data_mark: EndOfDataMark,
+    unresolved_from: Option<PhysicalPositionHint>,
     bootstrap_recovery_hints: Option<ScanRecoveryHints>,
     map: FilemarkMap,
     truncation: Option<ScanTailTruncation>,
@@ -945,6 +1022,7 @@ fn scan_reconstruct_filemark_map_with_provenance<F>(
     tape_uuid: &[u8; 16],
     block_size: u32,
     mode: ScanMode<'_>,
+    rule: EndOfDataRule,
     control: &mut F,
     bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
 ) -> Result<ScanReconstructionOutcome, ParityError>
@@ -961,6 +1039,7 @@ where
         tape_uuid,
         block_size,
         mode,
+        rule,
         control,
         bootstrap_observer,
         None,
@@ -974,6 +1053,7 @@ fn reconstruct_with_reader<F>(
     tape_uuid: &[u8; 16],
     block_size: u32,
     mode: ScanMode<'_>,
+    rule: EndOfDataRule,
     control: &mut F,
     bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
     mut observer: Option<&mut dyn PrefixObserver>,
@@ -1015,7 +1095,7 @@ where
         .transpose()?;
     let mut forward_head = PhysicalPositionHint::new(0);
     let mut provenance = HeadProvenance::Locate;
-    loop {
+    let (end_of_data_mark, unresolved_from) = loop {
         let file_start = if forward {
             forward_head
         } else {
@@ -1026,7 +1106,7 @@ where
                 if file_start.lba != observer.end_lba() {
                     return Err(filemark_scan_error("measured prefix runs past replica A"));
                 }
-                break;
+                break (EndOfDataMark::NotReached, None);
             }
         }
         let file_number = builder.next_tape_file_number()?;
@@ -1100,18 +1180,23 @@ where
             Err(error) => return Err(error),
         };
         provenance = HeadProvenance::DeviceReport;
+        let measurement_rule = if saw_file {
+            rule
+        } else {
+            EndOfDataRule::Refuse
+        };
         match head {
             // A filemark or EOD where the first record should be is an unreadable
             // bootstrap, never a refusal (REM-PARITY 8.4): the walk continues on
             // the supplied values, and ends here with no tape file 0 to map.
-            ScanHeadRead::EndOfData => break,
+            ScanHeadRead::EndOfData => break (EndOfDataMark::Present, None),
             ScanHeadRead::Filemark => {
                 truncation = Some(ScanTailTruncation {
                     tape_file_number: builder.next_tape_file_number()?,
                     position: file_start,
                     kind: ScanTailTruncationKind::EmptyFile,
                 });
-                break;
+                break (EndOfDataMark::NotReached, None);
             }
             ScanHeadRead::Block => {
                 let first_block = buf.clone();
@@ -1130,25 +1215,36 @@ where
                         }
                     }
                 }
-                let measured =
-                    match measure_file_observation(source, file_start, observation.as_ref())? {
-                        MeasureCurrentFileOutcome::Complete(measured) => measured,
-                        MeasureCurrentFileOutcome::EndOfData => break,
-                        MeasureCurrentFileOutcome::Truncated(kind) => {
-                            truncation_candidate_kind = Some(classify_tape_file_head(
-                                &first_block,
-                                tape_uuid,
-                                block_size,
-                                at_bot,
-                            ));
-                            truncation = Some(ScanTailTruncation {
-                                tape_file_number: builder.next_tape_file_number()?,
-                                position: file_start,
-                                kind,
-                            });
-                            break;
-                        }
-                    };
+                let mut truncate = |kind| {
+                    truncation_candidate_kind = Some(classify_tape_file_head(
+                        &first_block,
+                        tape_uuid,
+                        block_size,
+                        at_bot,
+                    ));
+                    truncation = Some(ScanTailTruncation {
+                        tape_file_number: file_number,
+                        position: file_start,
+                        kind,
+                    });
+                };
+                let measured = match measure_file_observation(
+                    source,
+                    file_start,
+                    observation.as_ref(),
+                    measurement_rule,
+                )? {
+                    MeasureCurrentFileOutcome::Complete(measured) => measured,
+                    MeasureCurrentFileOutcome::EndOfData => break (EndOfDataMark::Present, None),
+                    MeasureCurrentFileOutcome::MissingEndOfDataMark => {
+                        truncate(ScanTailTruncationKind::MissingTrailingFilemark);
+                        break (EndOfDataMark::NotFound, Some(file_start));
+                    }
+                    MeasureCurrentFileOutcome::Truncated(kind) => {
+                        truncate(kind);
+                        break (EndOfDataMark::NotReached, None);
+                    }
+                };
                 if invalid_bootstrap {
                     append_from_observation(
                         source,
@@ -1207,19 +1303,26 @@ where
                 if observation.is_none() {
                     source.locate_physical(file_start)?;
                 }
-                let measured =
-                    match measure_file_observation(source, file_start, observation.as_ref())? {
-                        MeasureCurrentFileOutcome::Complete(measured) => measured,
-                        MeasureCurrentFileOutcome::EndOfData => break,
-                        MeasureCurrentFileOutcome::Truncated(kind) => {
-                            truncation = Some(ScanTailTruncation {
-                                tape_file_number: builder.next_tape_file_number()?,
-                                position: file_start,
-                                kind,
-                            });
-                            break;
-                        }
-                    };
+                let measured = match measure_file_observation(
+                    source,
+                    file_start,
+                    observation.as_ref(),
+                    measurement_rule,
+                )? {
+                    MeasureCurrentFileOutcome::Complete(measured) => measured,
+                    MeasureCurrentFileOutcome::EndOfData => break (EndOfDataMark::Present, None),
+                    MeasureCurrentFileOutcome::MissingEndOfDataMark => {
+                        break (EndOfDataMark::NotFound, Some(file_start));
+                    }
+                    MeasureCurrentFileOutcome::Truncated(kind) => {
+                        truncation = Some(ScanTailTruncation {
+                            tape_file_number: builder.next_tape_file_number()?,
+                            position: file_start,
+                            kind,
+                        });
+                        break (EndOfDataMark::NotReached, None);
+                    }
+                };
                 append_from_observation(
                     source,
                     observation.as_ref(),
@@ -1261,13 +1364,15 @@ where
                 provenance = HeadProvenance::Locate;
             }
         }
-    }
+    };
 
     if !saw_file && truncation.is_none() {
         return Err(filemark_scan_error("scan found no tape files"));
     }
 
     Ok(ScanReconstructionOutcome::Complete(ScanReconstruction {
+        end_of_data_mark,
+        unresolved_from,
         bootstrap_recovery_hints,
         map: builder.build()?,
         truncation,
@@ -1314,6 +1419,7 @@ pub(crate) fn scan_observed_prefix(
         tape_uuid,
         block_size,
         mode,
+        EndOfDataRule::Refuse,
         &mut |_| ScanWalkControl::Continue,
         &mut |_| {},
         Some(observer),
@@ -1337,6 +1443,8 @@ pub(crate) fn scan_observed_prefix(
         truncation: reconstructed.truncation,
         truncation_candidate_kind: reconstructed.truncation_candidate_kind,
         bootstrap_candidates: reconstructed.bootstrap_candidates,
+        end_of_data_mark: reconstructed.end_of_data_mark,
+        unresolved_from: reconstructed.unresolved_from,
         damaged_regions: reconstructed.damaged_regions,
     })
 }
@@ -1346,10 +1454,11 @@ fn measure_file_observation(
     source: &mut dyn RawTapeSource,
     start: PhysicalPositionHint,
     observation: Option<&FileObservation>,
+    rule: EndOfDataRule,
 ) -> Result<MeasureCurrentFileOutcome, ParityError> {
     match observation {
         Some(observation) => observation.measure(source),
-        None => measure_current_file(source, start),
+        None => measure_current_file(source, start, rule),
     }
 }
 
@@ -1466,6 +1575,7 @@ pub fn forward_file_scan_for_test(
         tape_uuid,
         block_size,
         mode,
+        EndOfDataRule::Refuse,
         &mut |_| ScanWalkControl::Continue,
         &mut |_| {},
         None,
@@ -1482,6 +1592,8 @@ pub fn forward_file_scan_for_test(
         truncation: reconstructed.truncation,
         truncation_candidate_kind: reconstructed.truncation_candidate_kind,
         bootstrap_candidates: reconstructed.bootstrap_candidates,
+        end_of_data_mark: reconstructed.end_of_data_mark,
+        unresolved_from: reconstructed.unresolved_from,
         damaged_regions: reconstructed.damaged_regions,
     })
 }
@@ -1533,6 +1645,7 @@ struct MeasuredTapeFile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MeasureCurrentFileOutcome {
     EndOfData,
+    MissingEndOfDataMark,
     Complete(MeasuredTapeFile),
     Truncated(ScanTailTruncationKind),
 }
@@ -1567,8 +1680,25 @@ impl From<&SidecarFooter> for SidecarScanClassification {
 fn measure_current_file(
     source: &mut dyn RawTapeSource,
     file_start: PhysicalPositionHint,
+    rule: EndOfDataRule,
 ) -> Result<MeasureCurrentFileOutcome, ParityError> {
-    let outcome = source.space_filemarks(1)?;
+    let missing_mark = |error: &ParityError| match error {
+        ParityError::TapeIo(error) => tape_error_is_end_of_data_not_found(error, 0x11),
+        _ => false,
+    };
+    let outcome = match source.space_filemarks(1) {
+        Err(original) if rule == EndOfDataRule::StopWhenConfirmed && missing_mark(&original) => {
+            if locate_physical_exact(source, file_start).is_ok()
+                && source
+                    .locate_end_of_data()
+                    .is_err_and(|error| missing_mark(&error))
+            {
+                return Ok(MeasureCurrentFileOutcome::MissingEndOfDataMark);
+            }
+            return Err(original);
+        }
+        result => result?,
+    };
     if outcome.filemarks_spaced != 1 {
         return Ok(MeasureCurrentFileOutcome::Truncated(
             ScanTailTruncationKind::MissingTrailingFilemark,
@@ -2190,6 +2320,8 @@ fn bootstrap_refused(field: BootstrapRefusedField, detail: impl Into<String>) ->
 mod tests {
     mod classification_tests;
     mod forward_file_tests;
+    #[cfg(target_os = "linux")]
+    mod missing_eod_tests;
     use forward_file_tests::{
         checked_scan as scan_reconstruct_filemark_map_with_report,
         checked_scan_mode as scan_reconstruct_filemark_map_with_report_mode,
@@ -2677,6 +2809,7 @@ mod tests {
                 &TAPE_UUID,
                 BLOCK_SIZE,
                 ScanMode::Standard,
+                EndOfDataRule::Refuse,
                 &mut |_| ScanWalkControl::Continue,
                 &mut |_| {},
             )
@@ -2690,6 +2823,8 @@ mod tests {
             truncation: walked.truncation,
             truncation_candidate_kind: walked.truncation_candidate_kind,
             bootstrap_candidates: walked.bootstrap_candidates,
+            end_of_data_mark: walked.end_of_data_mark,
+            unresolved_from: walked.unresolved_from,
             damaged_regions: walked.damaged_regions,
             bootstrap_recovery_hints: walked.bootstrap_recovery_hints,
         };
@@ -2868,6 +3003,7 @@ mod tests {
                 &TAPE_UUID,
                 BLOCK_SIZE,
                 ScanMode::Standard,
+                EndOfDataRule::Refuse,
                 &mut |_| ScanWalkControl::Continue,
                 &mut |_| {},
             )
@@ -3406,6 +3542,7 @@ mod tests {
                 &TAPE_UUID,
                 BLOCK_SIZE,
                 ScanMode::Standard,
+                EndOfDataRule::Refuse,
                 &mut { control },
                 &mut |_| {},
             )
@@ -3744,8 +3881,12 @@ mod tests {
     fn walk_measurement_faults_the_device_for_positions_that_go_nowhere() {
         for start in [5, 1] {
             let mut source = RecordingRawSource::new(vec![Record::Filemark]);
-            let error = measure_current_file(&mut source, PhysicalPositionHint::new(start))
-                .expect_err("a delta that does not fit is refused");
+            let error = measure_current_file(
+                &mut source,
+                PhysicalPositionHint::new(start),
+                EndOfDataRule::Refuse,
+            )
+            .expect_err("a delta that does not fit is refused");
             assert!(
                 matches!(error, ParityError::TapeIo(remanence_library::TapeIoError { kind: remanence_library::TapeIoErrorKind::OperationFailed(ref m), .. }) if m.starts_with("device-reported position")),
                 "start {start}: {error:?}"
@@ -3821,8 +3962,12 @@ mod tests {
     fn zero_block_measurement_is_a_tail_truncation_signature() {
         let mut source = RecordingRawSource::new(vec![Record::Filemark]);
 
-        let measured = measure_current_file(&mut source, PhysicalPositionHint::new(0))
-            .expect("zero-block measurement is classified");
+        let measured = measure_current_file(
+            &mut source,
+            PhysicalPositionHint::new(0),
+            EndOfDataRule::Refuse,
+        )
+        .expect("zero-block measurement is classified");
 
         assert_eq!(
             measured,

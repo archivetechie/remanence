@@ -93,9 +93,9 @@ pub fn publish_new(
     File::open(directory)?.sync_all()
 }
 
-/// Append a prevalidated diagnostic frame without establishing durability.
-/// A failed write is ambiguous and fences the logical target exactly as a synced
-/// append does. A subsequent authority append's sync covers these earlier bytes.
+/// Write a prevalidated frame; the caller establishes durability before publication returns.
+/// A failed write is ambiguous and fences the logical target exactly as a failed
+/// sync does. `append_and_publish` follows this write with the durability barrier.
 pub fn append_without_sync(
     output: &mut File,
     bytes: &[u8],

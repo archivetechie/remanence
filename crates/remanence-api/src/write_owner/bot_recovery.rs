@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use remanence_parity::{
-    recover_terminal_inventory_from_bot_controlled_mode,
-    recover_terminal_inventory_from_bot_with_authority_controlled_mode,
+    recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule,
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule,
     verify_terminal_index_full_with_route, BotRecoveredObject, BotStructuralRecoveryError,
     BotStructuralRecoveryEvent, BotStructuralRecoverySummary, RawTapeSource, ScanWalkControl,
     TerminalIndexVerificationError, TerminalIndexVerificationOutcome,
@@ -38,20 +38,24 @@ where
                 message: error.to_string(),
             })?;
     match authority {
-        Some(mut authority) => recover_terminal_inventory_from_bot_with_authority_controlled_mode(
+        Some(mut authority) => {
+            recover_terminal_inventory_from_bot_with_authority_controlled_mode_with_end_of_data_rule(
+                source,
+                tape_uuid,
+                block_size,
+                mode,
+                remanence_parity::EndOfDataRule::StopWhenConfirmed,
+                &mut authority,
+                visit_control,
+                visit_object,
+            )
+        }
+        None => recover_terminal_inventory_from_bot_controlled_mode_with_end_of_data_rule(
             source,
             tape_uuid,
             block_size,
             mode,
-            &mut authority,
-            visit_control,
-            visit_object,
-        ),
-        None => recover_terminal_inventory_from_bot_controlled_mode(
-            source,
-            tape_uuid,
-            block_size,
-            mode,
+            remanence_parity::EndOfDataRule::StopWhenConfirmed,
             visit_control,
             visit_object,
         ),

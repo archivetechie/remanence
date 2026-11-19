@@ -68,20 +68,34 @@ pub(crate) use no_parity::maybe_replay_pool_write;
 #[cfg(test)]
 mod tests;
 
-/// Give each test catalog its own durable audit authority.
+/// Use the catalog's attached authority; retain historical fixtures for raw callers until CU-1b.
 #[cfg(test)]
-fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWriteConfig {
+fn test_fence_config(
+    state: &remanence_state::CatalogIndex,
+) -> crate::write_owner::TerminalWriteConfig {
+    let (authority, checkpoint_journal_dir) = if let Some(runtime) = state.library_runtime() {
+        let tape_root = runtime.manifest().tape_root().to_path_buf();
+        (
+            crate::write_owner::TerminalAuthority::Typed(runtime),
+            tape_root,
+        )
+    } else {
+        let root = state.path().parent().expect("catalog parent");
+        (
+            crate::write_owner::TerminalAuthority::fixture(
+                None,
+                root.join("audit"),
+                true,
+                &(std::sync::Arc::new(std::sync::Mutex::new(()))),
+            ),
+            root.join("tapes"),
+        )
+    };
     crate::write_owner::TerminalWriteConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            root.join("audit"),
-            true,
-            &(std::sync::Arc::new(std::sync::Mutex::new(()))),
-        ),
-
+        authority,
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: root.join("tapes"),
+        checkpoint_journal_dir,
     }
 }
 

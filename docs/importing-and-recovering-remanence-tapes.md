@@ -86,8 +86,9 @@ For a transfer between sites, the destination must support the tape's bootstrap
 and on-tape format versions. Its configuration also needs a pool rule that maps
 the barcode to a configured pool. Adoption does not decrypt or restore objects,
 and encrypted objects still need their private keys. A WORM (write-once)
-cartridge is safe for this read-only identity step, but Remanence does not write
-ordinary objects to WORM media.
+cartridge is supported by the design of this read-only identity step, but adoption
+is untested on a physical WORM cartridge. Remanence does not write ordinary objects
+to WORM media.
 
 <!-- code-anchor: crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state.rs crates/remanence-state/src/config.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Which tapes can be adopted
@@ -343,7 +344,10 @@ a replica is usable, it reads that replica's list of objects and reads no
 object data. It does not walk the tape between the bootstrap and the terminal
 index, so it does not prove that the middle of the tape matches the list. If no
 replica is usable, it reports that explicitly and falls back to a walk from BOT,
-which measures every tape file and reads selected blocks of each object.
+which measures the tape files it can resolve and reads selected blocks of
+each object it measures. If the walk confirms a missing end-of-data mark,
+its reported position, when available, is where the unresolved remainder of
+the tape begins.
 
 A walk can run for hours, so the inventory's event stream
 (`rem.tape.inventory.stream.v1`) announces `bot_recovery_started` before it
@@ -401,6 +405,30 @@ decided after it: a tape withdrawn or fenced since then is not withdrawn or
 fenced in the restored state, and a tape first provisioned since then is unknown
 to it. Before starting the service on restored state, list the tapes used,
 withdrawn or fenced since the copy's date.
+
+In a library, each tape the restored state knows and a pool has written
+since the copy is checked on the pool's first write to it under the restored
+state, and data there that the restored state does not account for can
+refuse that write. If admission reports `TailBeyondKnownState`, the tape
+is closed for writing, and a pool request can try another eligible tape.
+The `append_admission_refused` fence itself permits read sessions, but
+contradicted tape admission or another blocking fence prevents
+them. A contradiction with the tape's recorded ending also blocks read
+sessions. Before starting the service on restored state, each pool should
+have a writable tape that the restored state knows and that the pool has not
+written since the copy. The restored catalog does not list a tape's data
+written since the copy. Do not discard that data unless its objects are
+known to be unneeded.
+If the restored state shows no open session on the tape (its last session
+closed, or none opened since it was initialized here), that data cannot be
+discarded in this release: keep the tape closed for writing, withdraw it
+with `rem tape retire`, or start from a newer copy of the state directory.
+
+On a parity pool, if the restored tape log still owes closeout, retirement
+refuses with `CloseoutRequired`. Closeout stays refused under either
+`append_admission_refused` or `session_suffix_contradiction`.
+For that tape, use `rem tape supersede-tail` only where discard applies, or
+start from a newer copy of the state directory.
 
 Stop the daemon before restoring or rebuilding. Keep the recorded paths on a
 replacement server. Roots that differ from `authority-manifest.json` refuse
@@ -542,8 +570,9 @@ two pieces that need Remanence-specific joining.
 This cannot be done in place on WORM media, where the incomplete tail cannot be
 erased. Remanence admits ordinary object sessions only when the drive reports
 `NotWorm`; `Worm` and `Unknown` are both refused before the drive mode is
-changed. Read-only adoption and recovery are safe on WORM, and terminal-index
-finalization has its own append-only recovery path for WORM. Remanence does not
+changed. Read-only adoption, restore and recovery are designed for WORM, and
+terminal-index finalization has its own append-only recovery path for WORM;
+these paths are untested on a physical WORM cartridge. Remanence does not
 implement WORM object ingest.
 
 The caller keeps the source until `CheckpointSession` reports the object

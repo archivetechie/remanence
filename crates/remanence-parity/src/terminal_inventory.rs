@@ -27,8 +27,8 @@ use crate::index_separation::{
     validate_index_separation_pair, IndexSeparationError, IndexSeparationInteriorBlockSource,
 };
 use crate::raw::{
-    read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
-    RawTapeSource,
+    read_fixed_record, tape_error_is_current_medium_damage, tape_error_is_end_of_data_not_found,
+    FixedRecordRead, PhysicalPositionHint, RawTapeSource,
 };
 use crate::scan::{
     validate_scan_reconstruction_with_report, ScanDamageKind, ScanMode, ScanWalkResult,
@@ -189,6 +189,8 @@ pub enum BotStructuralRecoveryReason {
     NoUsableTerminalLayout,
     /// A layout was found, but A, B, and C all failed local validation.
     AllMembersInvalid,
+    /// The primary SPACE completion reports no end-of-data mark.
+    EndOfDataNotFound,
 }
 
 /// Evidence returned instead of treating a missing terminal index as empty.
@@ -546,9 +548,20 @@ where
     source
         .configure_fixed_block_size(block_size)
         .map_err(|error| source_error("configure fixed block size", error))?;
-    let eod = source
-        .locate_end_of_data()
-        .map_err(|error| source_error("SPACE(EOD)", error))?;
+    let eod = match source.locate_end_of_data() {
+        Ok(eod) => eod,
+        Err(ParityError::TapeIo(ref error)) if tape_error_is_end_of_data_not_found(error, 0x11) => {
+            return Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(
+                Box::new(BotStructuralRecoveryRequired {
+                    reason: BotStructuralRecoveryReason::EndOfDataNotFound,
+                    replicas: missing_evidence(&format!(
+                        "{MISSING_END_OF_DATA_DETAIL_PREFIX}{error}"
+                    )),
+                }),
+            ));
+        }
+        Err(error) => return Err(source_error("SPACE(EOD)", error)),
+    };
     if eod.partition != 0 {
         return Err(TerminalInventoryReadError::Source {
             operation: "SPACE(EOD)",
@@ -993,6 +1006,24 @@ fn verify_terminal_index_after_damage<V: ProtectedPass>(
     };
     let selection = match inventory {
         TerminalInventoryOutcome::Inventory(selection) => selection,
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery)
+            if recovery.reason == BotStructuralRecoveryReason::EndOfDataNotFound =>
+        {
+            let mut message = MISSING_END_OF_DATA_DIAGNOSTIC.to_string();
+            if let Some(detail) = recovery.replicas.first().and_then(|replica| match replica {
+                TerminalReplicaEvidence::Invalid(failure) => failure
+                    .detail
+                    .strip_prefix(MISSING_END_OF_DATA_DETAIL_PREFIX),
+                _ => None,
+            }) {
+                message.push_str("; ");
+                message.push_str(detail);
+            }
+            return Err(TerminalIndexVerificationError::Source {
+                operation: "SPACE(EOD)",
+                message,
+            });
+        }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
             return terminal_recovery_required::<V>(
                 source,
@@ -1495,7 +1526,7 @@ fn scan_verification_prefix(
         })) => Err(TerminalIndexVerificationError::Cancelled),
         Err(error) => Err(attach_prefix_findings(
             TerminalIndexVerificationError::PrefixWalk {
-                message: error.to_string(),
+                message: verification_error_detail(&error),
             },
             findings,
         )),
@@ -1728,24 +1759,54 @@ struct TerminalVerificationPlan {
     no_parity: bool,
 }
 
+/// Preserve only the initial typed missing-mark failure for a one-pass fallback.
+struct TerminalVerificationPlanError {
+    error: TerminalIndexVerificationError,
+    missing_end_of_data: bool,
+}
+
+impl From<TerminalIndexVerificationError> for TerminalVerificationPlanError {
+    fn from(error: TerminalIndexVerificationError) -> Self {
+        Self {
+            error,
+            missing_end_of_data: false,
+        }
+    }
+}
+
+impl From<TerminalVerificationPlanError> for TerminalIndexVerificationError {
+    fn from(error: TerminalVerificationPlanError) -> Self {
+        error.error
+    }
+}
+
 /// Configure the source, measure EOD and select its unique complete terminal layout.
 fn plan_terminal_verification(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
-) -> Result<TerminalVerificationPlan, TerminalIndexVerificationError> {
-    validate_terminal_index_block_size_hint(block_size)?;
+) -> Result<TerminalVerificationPlan, TerminalVerificationPlanError> {
+    validate_terminal_index_block_size_hint(block_size)
+        .map_err(TerminalIndexVerificationError::from)?;
     source
         .configure_fixed_block_size(block_size)
         .map_err(|error| verification_source_error("configure fixed block size", error))?;
-    let measured_eod = source
-        .locate_end_of_data()
-        .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
+    let measured_eod =
+        source
+            .locate_end_of_data()
+            .map_err(|error| TerminalVerificationPlanError {
+                missing_end_of_data: matches!(
+                    &error,
+                    ParityError::TapeIo(error) if tape_error_is_end_of_data_not_found(error, 0x11)
+                ),
+                error: verification_source_error("SPACE(EOD)", error),
+            })?;
     if measured_eod.partition != 0 {
         return Err(TerminalIndexVerificationError::Source {
             operation: "SPACE(EOD)",
             message: format!("returned unsupported partition {}", measured_eod.partition),
-        });
+        }
+        .into());
     }
 
     let mut no_parity_layouts = Vec::new();
@@ -1771,13 +1832,15 @@ fn plan_terminal_verification(
         [] => {
             return Err(TerminalIndexVerificationError::NoCompleteLayout {
                 measured_eod_lba: measured_eod.lba,
-            })
+            }
+            .into())
         }
         [layout] => *layout,
         _ => {
             return Err(TerminalIndexVerificationError::ConflictingLayouts {
                 count: layouts.len(),
-            })
+            }
+            .into())
         }
     };
 
@@ -2786,6 +2849,27 @@ fn source_error(operation: &'static str, error: ParityError) -> TerminalInventor
     }
 }
 
+const MISSING_END_OF_DATA_DETAIL_PREFIX: &str =
+    "drive reports no end-of-data mark; terminal members not inspected; SPACE(EOD): ";
+
+/// Missing-mark statement for a recovery that the operator has already attempted.
+pub const MISSING_END_OF_DATA_STATEMENT: &str = "drive reports no end-of-data mark";
+
+/// Missing-mark diagnostic with advice for callers that refuse recovery.
+pub const MISSING_END_OF_DATA_DIAGNOSTIC: &str =
+    "drive reports no end-of-data mark; use rem tape identify or rem tape restore --scan --list";
+
+/// Preserve the source detail while naming only a matching primary SPACE signature.
+fn verification_error_detail(error: &ParityError) -> String {
+    let mut detail = error.to_string();
+    if matches!(error, ParityError::TapeIo(error) if tape_error_is_end_of_data_not_found(error, 0x11))
+    {
+        detail.push_str("; ");
+        detail.push_str(MISSING_END_OF_DATA_DIAGNOSTIC);
+    }
+    detail
+}
+
 fn verification_source_error(
     operation: &'static str,
     error: ParityError,
@@ -2801,7 +2885,7 @@ fn verification_source_error(
     }
     TerminalIndexVerificationError::Source {
         operation,
-        message: error.to_string(),
+        message: verification_error_detail(&error),
     }
 }
 
@@ -2853,6 +2937,7 @@ pub fn verify_terminal_index_step1_for_test(
 #[cfg(test)]
 mod tests {
     mod one_pass_tests;
+    mod power_loss_reading;
     use super::*;
     use crate::raw::RawReadOutcome;
     use crate::tape_index_replica::{
@@ -3222,7 +3307,10 @@ mod tests {
         );
         let (success, rejection) = match result {
             Ok(_) => (true, None),
-            Err(super::one_pass::AttemptError::Rejected(reason)) => (false, Some(reason)),
+            Err(
+                super::one_pass::AttemptError::Rejected(reason)
+                | super::one_pass::AttemptError::RejectedWithSource { reason, .. },
+            ) => (false, Some(reason)),
             Err(super::one_pass::AttemptError::Fatal(_)) => (false, Some("cancelled")),
         };
         assert_eq!(rejection, expected_reason, "attempt rejection reason");

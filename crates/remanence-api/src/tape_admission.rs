@@ -4,41 +4,15 @@ use remanence_state::{
     library_log as lib, library_runtime::RefusalSubject, CatalogIndex, TapeIoFenceRecord,
 };
 
-/// Recovery may pass only a nonempty set of this tape's live typed suffix fences.
-/// SQL locates tape, barcode and endpoint conflicts; the authority validates each raise.
-pub(crate) fn only_recoverable_suffix_fences(
-    index: &CatalogIndex,
+/// Empty matches admit; nonempty matches require the live authority's pass.
+pub(crate) fn tape_io_rows_block(
+    rows: &[TapeIoFenceRecord],
     runtime: Option<&remanence_state::library_runtime::LibraryRuntime>,
-    tape_uuid: &crate::TapeUuid,
-    barcode: Option<&str>,
-    endpoint: Option<&remanence_state::DriveKey>,
-) -> Result<bool, remanence_state::StateError> {
-    let Some(runtime) = runtime else {
-        return Ok(false);
-    };
-    let Some(identity) = runtime.tape_state(*tape_uuid) else {
-        return Ok(false);
-    };
-    let mut fences = index.tape_io_admission_conflicts(tape_uuid, barcode)?;
-    fences.extend(
-        index
-            .list_active_tape_io_fences()?
-            .into_iter()
-            .filter(|f| endpoint.is_some_and(|endpoint| f.endpoint.as_ref() == Some(endpoint))),
-    );
-    Ok(!fences.is_empty()
-        && fences.into_iter().all(|fence| {
-            fence
-                .quarantine_id
-                .strip_prefix("library:")
-                .and_then(|n| n.parse::<u64>().ok())
-                .and_then(|n| runtime.active_fence(n))
-                .is_some_and(|raise| {
-                    raise.scope == lib::FenceScope::Tape(identity.tape)
-                        && raise.kind == lib::FenceKind::Write
-                        && raise.cause == lib::FenceCause::SessionSuffixContradiction
-                })
-        }))
+    tape: Option<&crate::TapeUuid>,
+    pass: remanence_state::library_runtime::TapeIoPass,
+) -> bool {
+    !rows.is_empty()
+        && !runtime.is_some_and(|runtime| runtime.tape_io_fences_pass(rows, tape, pass))
 }
 
 pub(crate) fn typed_cause(
@@ -51,13 +25,23 @@ pub(crate) fn typed_cause(
         .map(|raise| raise.cause)
 }
 
+/// These recovery fences cannot be released; session refusals name their recovery exits.
+pub(crate) fn release_refused(index: &CatalogIndex, fence: &TapeIoFenceRecord) -> bool {
+    matches!(
+        typed_cause(index, fence),
+        Some(lib::FenceCause::SessionSuffixContradiction | lib::FenceCause::AppendAdmissionRefused)
+    )
+}
+
 /// Stable ordering preserves existing order within each cause rank and in fixtures.
 pub(crate) fn order_conflicts(index: &CatalogIndex, conflicts: &mut [TapeIoFenceRecord]) {
     if index.library_runtime().is_none() {
         return;
     }
     conflicts.sort_by_key(|fence| match typed_cause(index, fence) {
-        Some(lib::FenceCause::SessionSuffixContradiction) => 0,
+        Some(
+            lib::FenceCause::AppendAdmissionRefused | lib::FenceCause::SessionSuffixContradiction,
+        ) => 0,
         Some(lib::FenceCause::NativeLogBehindProjection) => 1,
         _ => 2,
     });
@@ -480,23 +464,178 @@ mod tests {
     use pb::library_service_server::LibraryService;
     use pb::write_session_service_server::WriteSessionService;
     use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::library_runtime::TapeIoPass;
     use tonic::{Code, Request};
 
-    /// Recovery checks every typed cause and fails closed without live identity.
+    /// The row gate distinguishes reads from motion and fails closed without authority.
+    #[test]
+    fn x22_rows_block_matrix() {
+        use lib::FenceCause::{AppendAdmissionRefused, SessionSuffixContradiction, TransferError};
+        for (causes, expected) in [
+            (vec![], (false, false)),
+            (vec![AppendAdmissionRefused], (false, false)),
+            (vec![SessionSuffixContradiction], (true, false)),
+            (vec![AppendAdmissionRefused, TransferError], (true, true)),
+        ] {
+            let fixture = Fixture::new();
+            for cause in causes {
+                fixture.raise(T, cause);
+            }
+            let index = fixture.index();
+            let runtime = index.library_runtime().unwrap();
+            let rows = index.tape_io_matching_fences(Some(&T), None, None).unwrap();
+            for (pass, blocks) in [
+                (TapeIoPass::Read, expected.0),
+                (TapeIoPass::Motion, expected.1),
+            ] {
+                assert_eq!(
+                    super::tape_io_rows_block(&rows, Some(&runtime), Some(&T), pass),
+                    blocks
+                );
+                assert_eq!(
+                    super::tape_io_rows_block(&rows, None, Some(&T), pass),
+                    !rows.is_empty()
+                );
+            }
+        }
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: T,
+                barcode: None,
+                reason: "append_admission_refused".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        let rows = index.tape_io_matching_fences(Some(&T), None, None).unwrap();
+        for pass in [TapeIoPass::Read, TapeIoPass::Motion] {
+            assert!(super::tape_io_rows_block(
+                &rows,
+                index.library_runtime().as_ref(),
+                Some(&T),
+                pass
+            ));
+        }
+        let fixture = Fixture::new();
+        fixture.raise(B, AppendAdmissionRefused);
+        let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+        assert_eq!(conn.execute(
+            "UPDATE tapes SET voltag = 'OTHER', voltag_source = 'operator' WHERE tape_uuid = ?1",
+            [B.as_slice()],
+        ).unwrap(), 1);
+        let index = fixture.index();
+        let rows = index
+            .tape_io_matching_fences(None, Some("OTHER"), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tape_uuid, B);
+        for pass in [TapeIoPass::Read, TapeIoPass::Motion] {
+            assert!(super::tape_io_rows_block(
+                &rows,
+                index.library_runtime().as_ref(),
+                Some(&T),
+                pass
+            ));
+        }
+    }
+
+    /// Rank typed conflicts stably, with legacy rows in the last rank.
+    #[test]
+    fn x22_order_conflicts_stable_ranks() {
+        use lib::FenceCause::*;
+        let fixture = Fixture::new();
+        let mut index = fixture.index();
+        // ContainerQuarantine is reserved and cannot be raised by the live authority.
+        let causes = [
+            TransferError,
+            AppendAdmissionRefused,
+            NativeLogBehindProjection,
+            PartialBatch,
+            SessionSuffixContradiction,
+            CloseoutCheckMismatch,
+            SupersedeTailFailed,
+            StandaloneWriteLostByRestart,
+            ResetUnitAttention,
+            PositionDrift,
+            AuthorityAmbiguous,
+            CloseoutReadContradiction,
+            Cleaning,
+            CheckpointBarrierFailed,
+            AppendAdmissionRefused,
+            NativeLogBehindProjection,
+            SessionSuffixContradiction,
+        ];
+        let mut rows = Vec::new();
+        for cause in causes {
+            let sequence = fixture.raise(T, cause);
+            rows.push(
+                index
+                    .tape_io_matching_fences(Some(&T), None, None)
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.quarantine_id == format!("library:{sequence}"))
+                    .unwrap(),
+            );
+        }
+        let legacy = index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: T,
+                barcode: None,
+                reason: "append_admission_refused".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        rows.insert(6, legacy);
+        let expected_indices = [1, 4, 15, 17, 2, 16, 0, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        let expected: Vec<_> = expected_indices
+            .into_iter()
+            .map(|i| rows[i].quarantine_id.clone())
+            .collect();
+        let mut without_runtime = rows.clone();
+        let reader =
+            remanence_state::CatalogReader::open(&fixture.root.paths().sqlite_path).unwrap();
+        super::order_conflicts(&reader, &mut without_runtime);
+        assert_eq!(
+            without_runtime
+                .iter()
+                .map(|r| &r.quarantine_id)
+                .collect::<Vec<_>>(),
+            rows.iter().map(|r| &r.quarantine_id).collect::<Vec<_>>()
+        );
+        super::order_conflicts(&index, &mut rows);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.quarantine_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    /// Recovery and read passes check every typed cause and fail closed on another tape.
     #[test]
     fn c0b3c_suffix_predicate_cause_matrix() {
         use lib::FenceCause::{
-            NativeLogBehindProjection, SessionSuffixContradiction, TransferError,
+            AppendAdmissionRefused, NativeLogBehindProjection, SessionSuffixContradiction,
+            TransferError,
         };
         let cases = [
-            vec![],
-            vec![SessionSuffixContradiction],
-            vec![SessionSuffixContradiction, TransferError],
-            vec![TransferError],
-            vec![NativeLogBehindProjection],
+            (vec![], (false, false)),
+            (vec![SessionSuffixContradiction], (true, false)),
+            (
+                vec![SessionSuffixContradiction, TransferError],
+                (false, false),
+            ),
+            (vec![TransferError], (false, false)),
+            (vec![NativeLogBehindProjection], (false, false)),
+            (vec![AppendAdmissionRefused], (true, true)),
+            (
+                vec![AppendAdmissionRefused, SessionSuffixContradiction],
+                (true, false),
+            ),
+            (vec![AppendAdmissionRefused, TransferError], (false, false)),
         ];
-        let mut actual = Vec::new();
-        for causes in cases {
+        for (causes, expected) in cases {
             let fixture = Fixture::new();
             let runtime = fixture.state.as_ref().unwrap().library_runtime();
             for cause in causes {
@@ -504,43 +643,34 @@ mod tests {
             }
             let index = fixture.index();
             let endpoint = remanence_state::DriveKey::new("SUFFIX", 0x100);
-            actual.push(
-                super::only_recoverable_suffix_fences(
-                    &index,
-                    Some(&runtime),
-                    &T,
-                    None,
-                    Some(&endpoint),
-                )
-                .unwrap(),
+            let fences = index
+                .tape_io_matching_fences(Some(&T), None, Some(&endpoint))
+                .unwrap();
+            assert_eq!(
+                (
+                    runtime.tape_io_fences_pass(&fences, Some(&T), TapeIoPass::Motion),
+                    runtime.tape_io_fences_pass(&fences, Some(&T), TapeIoPass::Read),
+                ),
+                expected
             );
-            assert!(!super::only_recoverable_suffix_fences(
-                &index,
-                None,
-                &T,
-                None,
-                Some(&endpoint)
-            )
-            .unwrap());
-            assert!(!super::only_recoverable_suffix_fences(
-                &index,
-                Some(&runtime),
-                &[0xff; 16],
-                None,
-                Some(&endpoint)
-            )
-            .unwrap());
+            for (pass, allowed) in [
+                (TapeIoPass::Motion, expected.0),
+                (TapeIoPass::Read, expected.1),
+            ] {
+                assert_eq!(runtime.tape_io_fences_pass(&fences, None, pass), allowed);
+                assert!(!runtime.tape_io_fences_pass(&fences, Some(&B), pass));
+                assert!(!runtime.tape_io_fences_pass(&fences, Some(&[0xff; 16]), pass));
+            }
         }
-        assert_eq!(actual, [false, true, false, false, false]);
     }
 
     /// Endpoint conflicts participate even when their tape and barcode do not match.
     #[test]
     fn c0b3c_suffix_predicate_includes_other_tape_endpoint_fences() {
-        let mut actual = Vec::new();
         for cause in [
             lib::FenceCause::TransferError,
             lib::FenceCause::SessionSuffixContradiction,
+            lib::FenceCause::AppendAdmissionRefused,
         ] {
             let fixture = Fixture::new();
             let runtime = fixture.state.as_ref().unwrap().library_runtime();
@@ -559,26 +689,242 @@ mod tests {
                 1
             );
             let index = fixture.index();
-            assert_eq!(
-                index.tape_io_admission_conflicts(&T, None).unwrap().len(),
-                1
-            );
-            assert!(
-                super::only_recoverable_suffix_fences(&index, Some(&runtime), &T, None, None)
-                    .unwrap()
-            );
-            actual.push(
-                super::only_recoverable_suffix_fences(
-                    &index,
-                    Some(&runtime),
-                    &T,
-                    None,
-                    Some(&endpoint),
+            let own = index.tape_io_matching_fences(Some(&T), None, None).unwrap();
+            assert_eq!(own.len(), 1);
+            assert!(runtime.tape_io_fences_pass(&own, Some(&T), TapeIoPass::Motion));
+            assert!(!runtime.tape_io_fences_pass(&own, Some(&T), TapeIoPass::Read));
+            let all = index
+                .tape_io_matching_fences(Some(&T), None, Some(&endpoint))
+                .unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(!runtime.tape_io_fences_pass(&all, Some(&T), TapeIoPass::Motion));
+            assert!(!runtime.tape_io_fences_pass(&all, Some(&T), TapeIoPass::Read));
+        }
+    }
+
+    /// A barcode resolved to B cannot grant T's recovery exception at the startup gate.
+    #[test]
+    fn x22_recovery_refuses_catalogue_resolved_other_tape() {
+        let fixture = Fixture::new();
+        let runtime = fixture.state.as_ref().unwrap().library_runtime();
+        fixture.raise(T, lib::FenceCause::AppendAdmissionRefused);
+        fixture.raise(B, lib::FenceCause::SessionSuffixContradiction);
+        let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE tapes SET voltag = 'X', voltag_source = 'operator' WHERE tape_uuid = ?1",
+                [B.as_slice()]
+            )
+            .unwrap(),
+            1
+        );
+        let index = fixture.index();
+        let fences = index
+            .tape_io_matching_fences(None, Some("X"), None)
+            .unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].tape_uuid, B);
+        assert!(!runtime.tape_io_fences_pass(&fences, Some(&T), TapeIoPass::Motion));
+        let error = crate::startup_media_readiness::ensure_media_readiness_admitted_inner(
+            &index,
+            Some(&runtime),
+            "supersede tape tail",
+            "MATCH",
+            None,
+            Some("X"),
+            false,
+            Some(T),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(error.message(), "supersede tape tail blocked by active tape-I/O fence; inspect rem tape quarantine list");
+    }
+
+    /// Projected rows cannot substitute for their live typed source or its tape identity.
+    #[test]
+    fn x22_fence_pass_requires_live_source_and_matching_row_identity() {
+        let fixture = Fixture::new();
+        let runtime = fixture.state.as_ref().unwrap().library_runtime();
+        let sequence = fixture.raise(T, lib::FenceCause::AppendAdmissionRefused);
+        let index = fixture.index();
+        let rows = index.tape_io_matching_fences(Some(&T), None, None).unwrap();
+        for pass in [TapeIoPass::Motion, TapeIoPass::Read] {
+            assert!(runtime.tape_io_fences_pass(&rows, None, pass));
+            for tape_uuid in [B.to_vec(), vec![0xff; 16], vec![0; 15]] {
+                let mut invalid = rows.clone();
+                invalid[0].tape_uuid = tape_uuid;
+                assert!(!runtime.tape_io_fences_pass(&invalid, None, pass));
+            }
+            let mut invalid = rows.clone();
+            invalid[0].quarantine_id = "legacy:1".into();
+            assert!(!runtime.tape_io_fences_pass(&invalid, None, pass));
+        }
+        runtime
+            .append(|a, v| {
+                a.fence_released(
+                    lib::FenceReleased {
+                        fence: sequence,
+                        evidence: "fixture physical recovery".into(),
+                        forced: false,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
                 )
-                .unwrap(),
+            })
+            .unwrap();
+        for pass in [TapeIoPass::Motion, TapeIoPass::Read] {
+            assert!(!runtime.tape_io_fences_pass(&rows, None, pass));
+        }
+    }
+
+    /// The matcher gathers every direct or resolved row once in catalogue order.
+    #[test]
+    fn x22_matching_fences_collect_direct_and_resolved_identities() {
+        let fixture = Fixture::new();
+        let index = fixture.index();
+        let endpoint = remanence_state::DriveKey::new("MATCH", 0x100);
+        let check = |tape, barcode, endpoint, sequences: &[u64]| {
+            let rows = index
+                .tape_io_matching_fences(tape, barcode, endpoint)
+                .unwrap();
+            let expected: Vec<_> = index
+                .list_active_tape_io_fences()
+                .unwrap()
+                .into_iter()
+                .filter(|row| {
+                    sequences
+                        .iter()
+                        .any(|n| row.quarantine_id == format!("library:{n}"))
+                })
+                .collect();
+            assert_eq!(rows, expected);
+            assert_eq!(
+                index.tape_io_is_fenced(tape, barcode, endpoint).unwrap(),
+                !rows.is_empty()
+            );
+        };
+        check(Some(&T), Some("MATCH-X"), Some(&endpoint), &[]);
+        let by_tape = fixture.raise(T, lib::FenceCause::SessionSuffixContradiction);
+        let by_barcode = fixture.raise(B, lib::FenceCause::TransferError);
+        let by_endpoint = fixture.raise(B, lib::FenceCause::SessionSuffixContradiction);
+        let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE tape_io_fences SET barcode = ' MATCH-X ' WHERE quarantine_id = ?1",
+                [format!("library:{by_barcode}")],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute(
+                "UPDATE tape_io_fences SET endpoint_key = ?1 WHERE quarantine_id = ?2",
+                rusqlite::params![endpoint.encode(), format!("library:{by_endpoint}")],
+            )
+            .unwrap(),
+            1
+        );
+        check(Some(&T), None, None, &[by_tape]);
+        check(None, Some(" match-x "), None, &[by_barcode]);
+        check(None, None, Some(&endpoint), &[by_endpoint]);
+        check(
+            Some(&T),
+            Some("match-x"),
+            Some(&endpoint),
+            &[by_tape, by_barcode, by_endpoint],
+        );
+        // A row that matches all three supplied identities is still returned once.
+        assert_eq!(conn.execute(
+            "UPDATE tape_io_fences SET barcode = 'MATCH-X', endpoint_key = ?1 WHERE quarantine_id = ?2",
+            rusqlite::params![endpoint.encode(), format!("library:{by_tape}")],
+        ).unwrap(), 1);
+        check(
+            Some(&T),
+            Some("match-x"),
+            Some(&endpoint),
+            &[by_tape, by_barcode, by_endpoint],
+        );
+
+        let fixture = Fixture::new();
+        let by_uuid = fixture.raise(B, lib::FenceCause::SessionSuffixContradiction);
+        let by_barcode = fixture.raise(T, lib::FenceCause::TransferError);
+        let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE tapes SET voltag = 'RESOLVED-X', voltag_source = 'operator' WHERE tape_uuid = ?1",
+                [B.as_slice()]
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute(
+                "UPDATE tape_io_fences SET barcode = 'RESOLVED-X' WHERE quarantine_id = ?1",
+                [format!("library:{by_barcode}")],
+            )
+            .unwrap(),
+            1
+        );
+        let index = fixture.index();
+        let all = index.list_active_tape_io_fences().unwrap();
+        assert_eq!(all.len(), 2);
+        for (tape, barcode) in [(None, Some("RESOLVED-X")), (Some(&B), None)] {
+            let rows = index.tape_io_matching_fences(tape, barcode, None).unwrap();
+            assert_eq!(
+                rows, all,
+                "both catalogue resolution directions must collect both rows"
+            );
+            assert_eq!(
+                index.tape_io_is_fenced(tape, barcode, None).unwrap(),
+                !rows.is_empty()
             );
         }
-        assert_eq!(actual, [false, false]);
+        // An explicit barcode is retained even when the UUID resolves a different one.
+        let rows = index
+            .tape_io_matching_fences(Some(&B), Some("OTHER"), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].quarantine_id, format!("library:{by_uuid}"));
+        assert!(index
+            .tape_io_is_fenced(Some(&B), Some("OTHER"), None)
+            .unwrap());
+        assert!(index
+            .tape_io_matching_fences(None, None, None)
+            .unwrap()
+            .is_empty());
+        assert!(!index.tape_io_is_fenced(None, None, None).unwrap());
+    }
+
+    /// Empty sets avoid catalogue reads; only the Boolean API keeps its direct-match fast path.
+    #[test]
+    fn x22_matching_fences_preserve_boolean_fast_path_on_lookup_error() {
+        let fixture = Fixture::new();
+        let index = fixture.index();
+        let conn = rusqlite::Connection::open(&fixture.root.paths().sqlite_path).unwrap();
+        conn.execute_batch("ALTER TABLE objects RENAME TO x22_hidden_objects")
+            .unwrap();
+        for (tape, barcode) in [(Some(&T), None), (None, Some("X"))] {
+            assert!(index
+                .tape_io_matching_fences(tape, barcode, None)
+                .unwrap()
+                .is_empty());
+            assert!(!index.tape_io_is_fenced(tape, barcode, None).unwrap());
+        }
+        conn.execute_batch("ALTER TABLE x22_hidden_objects RENAME TO objects")
+            .unwrap();
+        fixture.raise(T, lib::FenceCause::AppendAdmissionRefused);
+        conn.execute_batch("ALTER TABLE objects RENAME TO x22_hidden_objects")
+            .unwrap();
+        assert!(index.tape_io_is_fenced(Some(&T), None, None).unwrap());
+        assert!(index.tape_io_matching_fences(Some(&T), None, None).is_err());
+        assert!(index.tape_io_is_fenced(Some(&B), None, None).is_err());
+        assert!(index
+            .tape_io_matching_fences(None, Some("X"), None)
+            .is_err());
+        conn.execute_batch("ALTER TABLE x22_hidden_objects RENAME TO objects")
+            .unwrap();
     }
 
     /// Reach admission through the same TapeTarget RPC as a daemon client.

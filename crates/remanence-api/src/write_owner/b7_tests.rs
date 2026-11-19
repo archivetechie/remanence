@@ -181,10 +181,11 @@ async fn current_empty_rebuild_retired_closeout_debt_exclusion_lost() {
 
 #[tokio::test]
 async fn b7_out_of_scope_debt_is_visible_and_never_worked() {
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     for foreign_library in [true, false] {
-        let mut state = state(root.path());
+        let mut state = root.api_state();
         let library = open_model_library(world.clone());
         state.library_snapshot = Some(library_snapshot_cell(library.library().clone()));
         let (changer, mut changer_rx) = mpsc::channel(2);
@@ -221,9 +222,10 @@ async fn b7_out_of_scope_debt_is_visible_and_never_worked() {
 
 #[tokio::test]
 async fn b7_projection_failure_preserves_startup_queue_and_read_errors() {
-    let root = tempfile::tempdir().unwrap();
-    due_tape(root.path()).await;
-    let state = state(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    let state = root.api_state();
     let db = rusqlite::Connection::open(&*state.index_path).unwrap();
     db.execute_batch("CREATE TRIGGER fail_b7_projection BEFORE UPDATE ON tapes BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END;").unwrap();
     crate::startup_checkpoint::replay_checkpoint_journal_projections_with_audit(
@@ -596,8 +598,8 @@ impl SgTransport for HeldBarrier {
 #[tokio::test]
 async fn b7_fix_catalog_and_live_read_last_commit_during_held_checkpoint_barrier() {
     use pb::{catalog_server::Catalog, library_service_server::LibraryService};
-    let root = tempfile::tempdir().unwrap();
-    let world = setup(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
     let armed = Arc::new(AtomicBool::new(false));
     let (entered, arrived) = oneshot::channel();
     let entered = Arc::new(Mutex::new(Some(entered)));
@@ -618,9 +620,9 @@ async fn b7_fix_catalog_and_live_read_last_commit_during_held_checkpoint_barrier
             }
         })
         .unwrap();
-    let (tx, opened, thread) = open_writer(root.path(), library).await;
+    let (tx, opened, thread) = root.writer(library, selected(), |_, _| {}).await;
     let id = opened.unwrap();
-    let mut state = state(root.path());
+    let mut state = root.api_state();
     state.library_snapshot = Some(library_snapshot_cell(model));
     let before = summary(&state, TAPE).unwrap();
     append_actor_test_file(
@@ -695,31 +697,19 @@ async fn b7_fix_catalog_and_live_read_last_commit_during_held_checkpoint_barrier
 #[tokio::test]
 async fn b7_fix_partial_catalog_live_and_positive_native_mapping() {
     use pb::{catalog_server::Catalog, library_service_server::LibraryService};
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
-    let mut state = state(root.path());
+    let bad = [0xb9; 16];
+    let fresh = [0xba; 16];
+    let root = DurabilityRoot::with_tapes(
+        &[(TAPE, BARCODE), (bad, "BAD001L9"), (fresh, "NEW001L9")],
+        &[TAPE],
+        true,
+    );
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    let mut state = root.api_state();
     state.library_snapshot = Some(library_snapshot_cell(
         world.lock().unwrap().library_snapshot(),
     ));
-    let bad = [0xb9; 16];
-    let fresh = [0xba; 16];
-    for (uuid, barcode) in [(bad, "BAD001L9"), (fresh, "NEW001L9")] {
-        {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        }
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: uuid,
-            voltag: barcode.into(),
-            block_size: BLOCK,
-            parity: ParityConfig::Scheme(scheme()),
-            force: false,
-        })
-        .unwrap();
-    }
     std::fs::write(
         state
             .checkpoint_journal_dir
@@ -783,7 +773,18 @@ async fn b7_fix_partial_catalog_live_and_positive_native_mapping() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(filtered.tapes, vec![tape]);
+    let mut expected_list_entry = tape.clone();
+    expected_list_entry.correlation_rollups.clear();
+    assert_eq!(filtered.tapes, vec![expected_list_entry]);
+    assert!(filtered.tapes[0].correlation_rollups.is_empty());
+
+    assert_eq!(tape.correlation_rollups.len(), 1);
+    let rollup = &tape.correlation_rollups[0];
+    assert_eq!(rollup.tape_uuid, TAPE);
+    assert_eq!(rollup.drive_serial, DRIVE);
+    assert_eq!(rollup.drive_uuid.len(), 16);
+    assert_eq!(rollup.session_count, 1);
+    assert_eq!(rollup.snapshot_count, 0);
     let live = state
         .library_service()
         .get_live_status(tonic::Request::new(pb::GetLiveStatusRequest {}))
@@ -802,9 +803,10 @@ async fn b7_fix_partial_catalog_live_and_positive_native_mapping() {
 #[tokio::test]
 async fn b7_fix_pinned_closeout_and_finalize_wait_for_worker() {
     for caller in ["pinned", "closeout", "finalize"] {
-        let root = tempfile::tempdir().unwrap();
-        let world = due_tape(root.path()).await;
-        let mut state = state(root.path());
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
+        typed_due_tape(&root, world.clone()).await;
+        let mut state = root.api_state();
         state.library_snapshot = Some(library_snapshot_cell(
             world.lock().unwrap().library_snapshot(),
         ));
@@ -848,10 +850,10 @@ async fn b7_fix_pinned_closeout_and_finalize_wait_for_worker() {
                             &state,
                             TAPE,
                             None,
-                            crate::closeout_progress::CloseoutProgress::new(
-                                Uuid::new_v4(),
+                            crate::closeout_progress::CloseoutProgress::for_owner(
+                                &TerminalAuthority::from_api(&state).unwrap(),
                                 TAPE,
-                                None,
+                                true,
                             )
                             .unwrap(),
                         )
@@ -924,9 +926,10 @@ async fn b7_fix_pinned_closeout_and_finalize_wait_for_worker() {
 
 #[tokio::test]
 async fn b7_fix_worker_waits_for_drive_without_reserving_memory() {
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
-    let mut state = state(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    let mut state = root.api_state();
     state.library_snapshot = Some(library_snapshot_cell(
         world.lock().unwrap().library_snapshot(),
     ));
@@ -1149,9 +1152,10 @@ async fn b7_fix_pool_skips_excluded_or_failed_preferred_drive_and_never_evicts_e
 #[tokio::test]
 async fn b7_fix2_finalizing_worker_refuses_pinned_read_closeout_and_finalize() {
     use crate::pb::catalog_server::Catalog;
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
-    let mut state = state(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    let mut state = root.api_state();
     state.library_snapshot = Some(library_snapshot_cell(
         world.lock().unwrap().library_snapshot(),
     ));
@@ -1422,9 +1426,10 @@ async fn b7_fix2_retired_debt_skips_unreadable_and_missing_logs() {
 /// attempt runs and after it parks. Neither must create a second dispatch.
 #[tokio::test]
 async fn b7_fix2_worker_motion_does_not_wake_parked_media_failure() {
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
-    let mut state = state(root.path());
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
+    let mut state = root.api_state();
     let loaded = world.lock().unwrap().library_snapshot();
     let mut unloaded = loaded.clone();
     let bay = unloaded
@@ -1602,21 +1607,17 @@ async fn b8_field_failure_is_after_real_model_dispatch() {
         assert!(status.success());
         return;
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = DurabilityRoot::new("AOX032L9", true);
     let gate = root.path().join("gate");
     std::fs::create_dir(&gate).unwrap();
     std::env::set_var("REM_FIELD_GATE_DIR", &gate);
     std::env::set_var("REM_FIELD_TRACE", root.path().join("commands.jsonl"));
     std::env::set_var("REM_FIELD_PROGRESS", root.path().join("progress.jsonl"));
     std::env::set_var("REM_FIELD_ALLOW_FAIL", "1");
-    let world = setup_with_barcode(root.path(), "AOX032L9");
-    let (tx, opened, thread) = open_writer_configured(
-        root.path(),
-        open_model_library(world.clone()),
-        selected(),
-        |_, _| {},
-    )
-    .await;
+    let world = model_world("AOX032L9", true);
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world.clone()), selected(), |_, _| {})
+        .await;
     let id = opened.unwrap();
     append_actor_test_file(
         &tx,
@@ -1637,7 +1638,7 @@ async fn b8_field_failure_is_after_real_model_dispatch() {
     .await
     .unwrap();
     rx.await.unwrap().unwrap();
-    let before = summary(&state(root.path()), TAPE).unwrap();
+    let before = summary(&root.api_state(), TAPE).unwrap();
     assert!(before.protected < before.total);
     std::fs::write(gate.join("arm.json"),serde_json::json!({"schema":"rem.field.arm.v1", "tape_uuid":Uuid::from_bytes(TAPE).to_string(),"barcode":"AOX032L9","action":"fail","nonce":Uuid::new_v4().to_string()}).to_string()).unwrap();
     let release = std::thread::spawn({
@@ -1672,7 +1673,7 @@ async fn b8_field_failure_is_after_real_model_dispatch() {
     release.join().unwrap();
     drop(tx);
     thread.join().unwrap();
-    let after = summary(&state(root.path()), TAPE).unwrap();
+    let after = summary(&root.api_state(), TAPE).unwrap();
     assert_eq!(after.total, before.total);
     assert_eq!(after.object_count, 1);
     assert!(after.last_session_end.unwrap().tail_file_count > 0);
@@ -1680,9 +1681,11 @@ async fn b8_field_failure_is_after_real_model_dispatch() {
         after.protected < after.total,
         "dispatch failure leaves explicit closeout debt"
     );
-    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |_, _| {})
+        .await;
     let id = opened.expect("named failed-append tail must recover without acknowledgement");
-    let recovered = summary(&state(root.path()), TAPE).unwrap();
+    let recovered = summary(&root.api_state(), TAPE).unwrap();
     assert_eq!(recovered.protected, recovered.total);
     assert_eq!(recovered.total, before.total);
     let stages = std::fs::read_to_string(root.path().join("host-stages.jsonl")).unwrap();
@@ -1710,7 +1713,7 @@ async fn b8_field_hold_cancel_and_expiry() {
         }
         return;
     };
-    let root = tempfile::tempdir().unwrap();
+    let root = DurabilityRoot::new("AOX032L9", true);
     let gate = root.path().join("gate");
     std::fs::create_dir(&gate).unwrap();
     std::env::set_var("REM_FIELD_GATE_DIR", &gate);
@@ -1718,8 +1721,10 @@ async fn b8_field_hold_cancel_and_expiry() {
     if mode == "expiry" {
         std::env::set_var("REM_B8_TEST_HOLD_MS", "100");
     }
-    let world = setup_with_barcode(root.path(), "AOX032L9");
-    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+    let world = model_world("AOX032L9", true);
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |_, _| {})
+        .await;
     let id = opened.unwrap();
     append_actor_test_file(
         &tx,
@@ -1740,7 +1745,7 @@ async fn b8_field_hold_cancel_and_expiry() {
     .await
     .unwrap();
     rx.await.unwrap().unwrap();
-    let before = summary(&state(root.path()), TAPE).unwrap();
+    let before = summary(&root.api_state(), TAPE).unwrap();
     let nonce = Uuid::new_v4();
     std::fs::write(
         gate.join("arm.json"),
@@ -1816,7 +1821,7 @@ async fn b8_field_hold_cancel_and_expiry() {
     let trace = std::fs::read(root.path().join("commands.jsonl")).unwrap();
     let offset = proof["trace_offset"].as_u64().unwrap() as usize;
     let subsequent = std::str::from_utf8(&trace[offset..]).unwrap();
-    let state = state(root.path());
+    let state = root.api_state();
     let after = summary(&state, TAPE).unwrap();
     assert_eq!(after.object_count, 1);
     // Closeout clears the summary's latest-ending pointer, so inspect the
@@ -1888,9 +1893,10 @@ async fn b8_field_hold_cancel_and_expiry() {
 #[tokio::test]
 async fn b10_pool_joins_worker_closeout_but_not_its_finalization() {
     for finalizing in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let world = due_tape(root.path()).await;
-        let mut state = state(root.path());
+        let root = DurabilityRoot::new(BARCODE, true);
+        let world = model_world(BARCODE, true);
+        typed_due_tape(&root, world.clone()).await;
+        let mut state = root.api_state();
         state.library_snapshot = Some(library_snapshot_cell(
             world.lock().unwrap().library_snapshot(),
         ));
@@ -1969,8 +1975,9 @@ async fn b10_pool_joins_worker_closeout_but_not_its_finalization() {
 /// A durable debt attempt crosses its early checks, then is paused immediately
 /// before motion admission. The queue variant also waits for changer capacity.
 async fn shutdown_debt_at_motion_admission(queued: bool) {
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
+    let root = DurabilityRoot::new(BARCODE, true);
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     {
         let mut world = world.lock().unwrap();
         let barcode = world.drive_bays.get_mut(&BAY).unwrap().take().unwrap();
@@ -1978,7 +1985,7 @@ async fn shutdown_debt_at_motion_admission(queued: bool) {
         world.slots[0].full = true;
         world.slots[0].barcode = Some(barcode);
     }
-    let mut state = state(root.path());
+    let mut state = root.api_state();
     let mut library = open_model_library(world.clone());
     state.library_snapshot = Some(library_snapshot_cell(library.library().clone()));
     let (changer, mut changer_rx) = mpsc::channel(1);

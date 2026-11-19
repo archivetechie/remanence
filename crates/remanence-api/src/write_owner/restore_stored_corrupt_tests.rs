@@ -6,7 +6,6 @@
 //! model-library and configuration fixtures below stand alone.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use remanence_chaos::model::{DeviceRole, ModelTransport, Record, VirtualTape, VirtualWorld};
@@ -81,15 +80,6 @@ fn two_member_object_with_flipped_member_1() -> (Vec<Vec<u8>>, RemTarObjectLayou
 
 /// Catalog the object as tape file 1 of a provisioned no-parity tape.
 fn project_object(index: &mut CatalogIndex, layout: &RemTarObjectLayout) {
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: TAPE_UUID,
-            voltag: VOLTAG.to_string(),
-            block_size: BLOCK as u32,
-            parity: ParityConfig::None,
-            force: false,
-        })
-        .expect("provision tape");
     let files = layout
         .files
         .iter()
@@ -191,30 +181,22 @@ fn discovery_report(
 /// A library-placed actor configuration; `stream_one_object` reads only its
 /// `tape_io` and `io_memory`.
 fn write_owner_config(
-    root: &Path,
-    index_path: PathBuf,
+    root: &crate::tests::TypedRoot,
     library: &remanence_library::LibraryHandle,
     tape_io: TapeIoConfig,
 ) -> WriteOwnerConfig {
     let serial = library.library().serial.clone();
-    let audit_dir = root.join("audit");
-    let checkpoint_journal_dir = root.join("tapes");
-    std::fs::create_dir_all(&audit_dir).expect("audit dir");
-    std::fs::create_dir_all(&checkpoint_journal_dir).expect("checkpoint dir");
+    let catalog = root.catalog();
     WriteOwnerConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            &audit_dir,
-            false,
-            &Arc::new(Mutex::new(())),
-        ),
-        catalog: remanence_state::projector::open(&index_path).expect("open catalog client"),
-        index_path,
+        authority: crate::write_owner::TerminalAuthority::Typed(catalog.library_runtime().unwrap()),
+        catalog,
+        index_path: root.paths().sqlite_path.clone(),
         report: discovery_report(library),
         policy: remanence_library::StaticAllowlist::new([serial.as_str()]),
         reservations: Arc::new(HashMap::new()),
         placement: crate::write_owner::ActorPlacement::Library(
             crate::write_owner::LibraryActorContext {
+                opener: crate::write_owner::LibraryActorContext::shared_opener(|l, p| l.open(p)),
                 serial: serial.clone(),
                 snapshot: Arc::new(RwLock::new(Arc::new(crate::LibrarySnapshot {
                     report: discovery_report(library),
@@ -231,15 +213,17 @@ fn write_owner_config(
         io_memory: crate::io_memory::IoMemoryReservation::new(64 * 1024 * 1024)
             .expect("I/O memory manager"),
         write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
-        checkpoint_journal_dir,
+        checkpoint_journal_dir: root.paths().journal_dir.join("tapes"),
         checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
         checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
         session_idle_seconds: 1800,
         lifecycle: None,
         changer_ready_wait: remanence_library::ChangerReadyWait::default(),
-        calibration_store: remanence_state::CalibrationControlStore::open(root.join("calibration"))
-            .expect("open calibration store"),
+        calibration_store: remanence_state::CalibrationControlStore::open(
+            &root.paths().calibration_dir,
+        )
+        .expect("open calibration store"),
     }
 }
 
@@ -256,14 +240,21 @@ struct ModelObjectRead {
 /// the minimum reservoir for that batch.
 fn read_corrupt_object_through_model_drive(read_batch_blocks: u32) -> ModelObjectRead {
     let (blocks, layout) = two_member_object_with_flipped_member_1();
-    let temp = tempfile::Builder::new()
-        .prefix("rem-dr-")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog");
+    let root = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: TAPE_UUID,
+            voltag: VOLTAG.into(),
+            block_size: BLOCK as u32,
+            parity: ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Operator,
+        Some(remanence_state::MediaObservation {
+            generation: remanence_state::LtoGen::Lto9,
+            source: remanence_state::GenerationSource::Operator,
+        }),
+    )]);
+    let mut index = root.catalog().write_handle();
     project_object(&mut index, &layout);
 
     let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK as u32);
@@ -284,6 +275,12 @@ fn read_corrupt_object_through_model_drive(read_batch_blocks: u32) -> ModelObjec
     let world = Arc::new(Mutex::new(world));
     let mut library = open_model_library(Arc::clone(&world));
     let serial = library.library().serial.clone();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut index,
+        [library.library()],
+        &HashSet::from([serial.clone()]),
+    )
+    .unwrap();
     let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
     let ring_buffers = 2;
     let mut drive = library
@@ -309,7 +306,7 @@ fn read_corrupt_object_through_model_drive(read_batch_blocks: u32) -> ModelObjec
         read_reservoir_bytes: BLOCK as u64 * u64::from(read_batch_blocks) * u64::from(ring_buffers),
         ..TapeIoConfig::default()
     };
-    let cfg = write_owner_config(temp.path(), index_path, &library, tape_io);
+    let cfg = write_owner_config(&root, &library, tape_io);
     world.lock().expect("world lock").command_log.clear();
 
     let (chunk_tx, _chunk_rx) = crate::read_core::read_stream_channel(0);
@@ -360,6 +357,10 @@ fn assert_stored_corrupt_data_loss(test: &str, read: ModelObjectRead) {
     assert!(
         status.metadata().get("remanence-retry").is_none(),
         "{test}: DATA_LOSS carries no retry metadata"
+    );
+    assert!(
+        status.metadata().get("remanence-finding").is_none(),
+        "{test}: DATA_LOSS carries no finding metadata"
     );
 }
 

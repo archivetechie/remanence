@@ -20,9 +20,9 @@ crates/remanence-state/src/projector/apply.rs::apply_authority::execute	4
 crates/remanence-state/src/projector/apply.rs::apply_authority::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::apply_authority::mutating-sql	4
 # B4b-3, the paused cutover tree salvaged for L1 (3733589c)
-crates/remanence-state/src/projector/apply.rs::apply_library_body::execute	20
+crates/remanence-state/src/projector/apply.rs::apply_library_body::execute	21
 # B4b-3, the paused cutover tree salvaged for L1 (3733589c)
-crates/remanence-state/src/projector/apply.rs::apply_library_body::mutating-sql	20
+crates/remanence-state/src/projector/apply.rs::apply_library_body::mutating-sql	21
 crates/remanence-state/src/projector/apply.rs::commit::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::drop::execute_batch	1
 crates/remanence-state/src/projector/apply.rs::finish_library_replay::execute	2

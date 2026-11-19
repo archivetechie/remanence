@@ -1572,6 +1572,10 @@ fn b3b_mounted_bootstrap_failure_one_fence() {
     let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1, "{fences:?}");
     assert_eq!(fences[0].reason, "partial_batch");
+    let holds = state.library_runtime().standalone_drive_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, SERIAL);
+    assert_eq!(holds[0].cause, lib::FenceCause::PartialBatch);
     let log_uuid = state.library_runtime().manifest().library_uuid();
     let paths = state.paths().clone();
     drop(state);
@@ -1588,7 +1592,7 @@ fn b3b_mounted_bootstrap_failure_one_fence() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(raised, 1);
+    assert_eq!(raised, 2);
 }
 
 /// A later 05/24/00 WRITE has no fence; a new mounted invocation proves C before its next WRITE.

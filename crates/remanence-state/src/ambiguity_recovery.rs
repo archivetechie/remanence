@@ -521,6 +521,6 @@ pub fn startup_hint(paths: &StatePaths) -> Option<String> {
         Some(lines.join("\n"))
     }
 }
-fn shell_path(path: &Path) -> String {
+pub(crate) fn shell_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

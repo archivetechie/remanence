@@ -23,9 +23,9 @@ use std::time::Instant;
 
 #[cfg(test)]
 use remanence_state::{
-    AuditEventRecord, CatalogIndex, FileAuditLog, MediaReadinessOperationRecord,
-    NativeObjectFileRecord, NativeObjectInstanceRecord, NativeObjectRecord, StateError,
-    StateHandle, TapePoolConfig, TapeRecord,
+    CatalogIndex, FileAuditLog, MediaReadinessOperationRecord, NativeObjectFileRecord,
+    NativeObjectInstanceRecord, NativeObjectRecord, StateError, StateHandle, TapePoolConfig,
+    TapeRecord,
 };
 #[cfg(test)]
 use time::OffsetDateTime;
@@ -153,12 +153,12 @@ pub use mount::{load_tape_by_uuid, LoadByUuidError};
 pub use pool_write::{
     can_read, can_write, check_writability_preconditions, lto_generation_from_density,
     lto_generation_from_drive_product, raw_capacity_bytes, replay_committed_pool_write_from_state,
-    seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
-    tape_generation, LtoGen, MediaObservation, ObjectWriteMediaError, PoolWriteError,
-    PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult,
-    SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
-    TapeSealReason, TapeUuid, WritabilityError, WriteObjectInputKind, WriteObjectSource,
-    WriteObjectToPoolRequest,
+    require_rewritable_object_media, seal_decision_after_write, select_tape_in_pool,
+    select_tape_in_pool_for_write_session, tape_generation, LtoGen, MediaObservation,
+    ObjectWriteMediaError, PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord,
+    PoolWriteRepresentation, PoolWriteResult, SelectTapeError, SelectedTape, StreamedWriteSource,
+    TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid, WritabilityError,
+    WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub(crate) use pool_write::{write_object_to_pool, write_to_selected_tape};

@@ -1149,7 +1149,7 @@ fn diagnostic() -> Diagnostic {
         detail: Bounded(vec![]),
     }
 }
-/// fsync failure and an uncertain unsynced Diagnostic both make all later writes unavailable.
+/// A sync failure or an uncertain Diagnostic write makes all later writes unavailable.
 #[test]
 fn authority_publication_faults_are_sticky_for_decisions_and_diagnostics() {
     use remanence_library::durable_file::test_support::register;
@@ -1204,7 +1204,7 @@ fn authority_publication_faults_are_sticky_for_decisions_and_diagnostics() {
         }
     }
 }
-/// Live append receipts distinguish the configured diagnostic policy from decision durability.
+/// Every live receipt is durable before application, even with diagnostic fsync disabled.
 #[test]
 fn authority_fsync_policy_and_fsync_before_apply_restart() {
     let mut f = Fixture::new();
@@ -1213,7 +1213,7 @@ fn authority_fsync_policy_and_fsync_before_apply_restart() {
         .a()
         .diagnostic(diagnostic(), actor(), SourceLayer::Layer4, &View)
         .unwrap();
-    assert!(!diagnostic.receipt.synced);
+    assert!(diagnostic.receipt.synced);
     let r = f
         .a()
         .assign_pool(
@@ -1438,7 +1438,7 @@ fn authority_wrong_counterpart_and_retired_assignment_refused() {
     ));
 }
 
-/// Diagnostics obey the enabled audit.fsync setting too.
+/// Diagnostics remain durable when the compatibility fsync setting is enabled.
 #[test]
 fn authority_diagnostic_fsync_enabled() {
     let root = tempfile::tempdir().unwrap();

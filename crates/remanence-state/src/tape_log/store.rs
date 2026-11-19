@@ -326,6 +326,7 @@ impl Store {
         })
     }
     /// Capture inode/header/end under a short shared lease, then validate unlocked.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn snapshot(&self) -> Result<super::snapshot::Snapshot, StoreError> {
         let lease = self.lock(false)?;
         self.check_ambiguity()?;
@@ -336,14 +337,17 @@ impl Store {
     }
     /// Acquire the only mutation capability. Torn tails are replaced before append.
     /// `fresh` refuses an existing active file even if it contains no closed group.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn acquire(&self, fresh: bool) -> Result<Lease, StoreError> {
         self.acquire_inner(fresh, false)
     }
     /// Recovery-only owner: inspection is allowed, but publication stays fenced
     /// until the caller proves the physical tail under this same lease.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn acquire_for_tail_reconciliation(&self) -> Result<Lease, StoreError> {
         self.acquire_inner(false, true)
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     fn acquire_inner(&self, fresh: bool, recovery: bool) -> Result<Lease, StoreError> {
         let lock = self.lock(true)?;
         self.cleanup_temporary()?;
@@ -382,6 +386,7 @@ impl Store {
             observation: Arc::new(RwLock::new(Ok(snapshot.summary.clone()))),
             fold,
             plan_base: snapshot.plan_base,
+            position_index: snapshot.position_index,
             tail: snapshot.tail,
             fenced: false,
             repair_pending,
@@ -414,10 +419,12 @@ impl Store {
     /// Explicit recovery of uncertain host durability. Revalidate, copy the closed
     /// prefix to a new inode, fsync it and its replacement name, then retire the
     /// ambiguity fence durably. A physical-tail repair fence is never cleared here.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn clear_ambiguity(&self) -> Result<(), StoreError> {
         self.clear_ambiguity_above(0)
     }
     /// Restart reconciliation may not discard an acknowledged projected group.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn clear_ambiguity_above(&self, projected: u64) -> Result<(), StoreError> {
         let _lock = self.lock(true)?;
         self.cleanup_temporary()?;
@@ -477,6 +484,7 @@ impl Store {
     /// Read-only: inspection never creates the lease file. Every owner creates
     /// it before publishing, so a log without one (for example, restored from a
     /// copy) has no live owner and is captured without a shared lease.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn inspect_tail(&self) -> Result<TailInspection, StoreError> {
         let lease = match File::open(self.path.with_extension("lock")) {
             Ok(file) => Some(lock(file, FlockArg::LockSharedNonblock)?),
@@ -503,6 +511,7 @@ impl Store {
     }
     /// Explicit corruption repair, retaining every valid closed group. The
     /// caller must rebuild the tape projection when cutting below its mark.
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub fn repair_tail(&self, through: u64, projected: u64) -> Result<RepairEvidence, StoreError> {
         if through < projected {
             return Err(StoreError::BelowProjection {
@@ -565,6 +574,7 @@ impl Store {
         replace_prefix(self, end)?;
         Ok(record.evidence)
     }
+    #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     fn resume_repair(&self, through: u64) -> Result<RepairEvidence, StoreError> {
         let file = fs::File::open(self.path.with_extension("repair-required"))?;
         let record: RepairRecord = serde_json::from_reader(file.take(16 * 1024))
@@ -654,6 +664,7 @@ pub struct Lease {
     fold: Fold,
     observation: Arc<RwLock<Result<TapeSummary, String>>>,
     plan_base: super::snapshot::PlanBase,
+    position_index: super::snapshot::PositionIndex,
     tail: Tail,
     fenced: bool,
     repair_pending: bool,
@@ -816,6 +827,7 @@ impl Lease {
             self.summary().clone(),
             self.tail,
             self.plan_base.clone(),
+            self.position_index.clone(),
         ))
     }
     /// Create a bounded disk spool at this lease's next sequence and offset.
@@ -887,6 +899,7 @@ impl Lease {
         if self.tail != Tail::Complete {
             self.fenced = true;
             replace_prefix(&self.store, self.summary().closed_end)?;
+            self.position_index = Default::default();
             tracing::warn!(path = %self.store.path.display(), tail = ?self.tail, "replaced torn tape-log suffix");
             self.tail = Tail::Complete;
             self.fenced = false;
@@ -930,6 +943,7 @@ impl Lease {
                     // If rollback itself fails, retain the live owner's guard;
                     // that is a separate cleanup failure, not an ambiguous commit.
                     replace_prefix(&self.store, self.summary().closed_end)?;
+                    self.position_index = Default::default();
                 }
                 self.fenced = false;
                 return Err(StoreError::Io(error));
@@ -1001,6 +1015,7 @@ impl Lease {
             File::open(&self.store.directory)?.sync_all()?;
         } else {
             replace_prefix(&self.store, self.summary().closed_end)?;
+            self.position_index = Default::default();
         }
         self.fenced = false;
         Ok(())
@@ -1150,8 +1165,35 @@ impl Staged<'_> {
             self.group.sequence,
             self.group.offset,
         );
+        // Copy the last bookmark under the leaf lock, then release it before
+        // reading the newly durable frames. An empty map starts at the header,
+        // whose encoded length may have changed before first publication.
+        let previous = self
+            .lease
+            .position_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_key_value()
+            .map(|(_, &offset)| offset);
+        let mut previous = match previous {
+            Some(offset) => offset,
+            None => self
+                .lease
+                .store
+                .header
+                .bytes()
+                .map_err(|e| StoreError::AfterDurable(Box::new(e)))?
+                .len() as u64,
+        };
+        let mut positions = std::collections::BTreeMap::new();
         let folded = (|| -> Result<(), CodecError> {
             while let Some(frame) = decoder.next_frame()? {
+                super::snapshot::seed_position(
+                    &mut positions,
+                    &mut previous,
+                    frame.sequence,
+                    frame.offset,
+                );
                 match &frame.record {
                     Record::FinalizationPrepared(plan) | Record::FinalizationDecided(plan) => {
                         self.lease.plan_base = Some((
@@ -1167,6 +1209,11 @@ impl Staged<'_> {
             Ok(())
         })();
         folded.map_err(|error| StoreError::AfterDurable(Box::new(StoreError::Codec(error))))?;
+        self.lease
+            .position_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(positions);
         self.lease.fenced = false;
         *self
             .lease

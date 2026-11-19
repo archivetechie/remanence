@@ -736,7 +736,7 @@ fn typed_admission_recovery_fence_records_error() {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         let fences = index.tape_io_admission_conflicts(&tape_uuid, None).unwrap();
         assert_eq!(fences.len(), 1);
-        assert_eq!(fences[0].reason, "session_suffix_contradiction");
+        assert_eq!(fences[0].reason, "append_admission_refused");
         assert_eq!(fences[0].evidence_json.as_deref(), Some(expected.as_str()));
         assert_eq!(
             fences[0].barcode.as_deref(),

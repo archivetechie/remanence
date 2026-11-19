@@ -791,3 +791,163 @@ fn s13_ending_found_by_frame_scan_not_last_closed_sequence() {
 
 #[path = "native_ambiguity_tests.rs"]
 mod ambiguity_recovery_tests;
+
+/// Append one harmless library fact through the runtime's production append path.
+fn ca1_diagnostic(runtime: &LibraryRuntime) {
+    runtime
+        .append(|a, v| {
+            a.diagnostic(
+                lib::Diagnostic {
+                    event: lib::DiagnosticEvent::RecoveryEvent,
+                    subject_kind: "catalog-ahead-test".into(),
+                    subject_id: None,
+                    detail: lib::Bounded(vec![]),
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+}
+
+/// Refuse the ahead catalogue before paying an owed fence or consuming its trigger.
+#[test]
+fn ca1_t5_catalog_ahead_preserves_owed_fence() {
+    let (mut f, _) = Fixture::failed();
+    let segments = || -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        std::fs::read_dir(&f.paths.audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "remlib"))
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    };
+    let old = segments();
+    ca1_diagnostic(f.rt());
+    ca1_diagnostic(f.rt());
+    let current = segments();
+    drop(f.runtime.take());
+    for path in current.keys() {
+        std::fs::remove_file(path).unwrap();
+    }
+    for (path, bytes) in &old {
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::write(f.marker(), T).unwrap();
+    let error = f.reopen().unwrap_err();
+    assert!(
+        error.to_string().contains("CatalogAheadOfLibraryLog"),
+        "{error}"
+    );
+    let after: std::collections::BTreeMap<_, _> = std::fs::read_dir(&f.paths.audit_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "remlib"))
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert_eq!(after, old, "refused open changed library segments");
+    assert_eq!(std::fs::read(f.marker()).unwrap(), T);
+}
+
+/// Catalogue creation and supported migrations precede the read-only end query.
+#[test]
+fn ca1_t6_catalog_creation_and_migration() {
+    for schema in [None, Some(0), Some(24), Some(25)] {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        let paths = StatePaths {
+            config_path: p.join("config"),
+            state_dir: p.join("state"),
+            audit_dir: p.join("library"),
+            journal_dir: p.join("native"),
+            sqlite_path: p.join("catalog.sqlite"),
+            tape_cache_dir: p.join("cache"),
+            calibration_dir: p.join("calibration"),
+        };
+        match schema {
+            None => {}
+            Some(0) => std::fs::write(&paths.sqlite_path, []).unwrap(),
+            Some(version) => {
+                let sql = match version {
+                    24 => include_str!("../../tests/fixtures/schema24.sql"),
+                    25 => include_str!("../../tests/fixtures/schema25.sql"),
+                    _ => unreachable!(),
+                };
+                let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+                conn.execute_batch(sql).unwrap();
+            }
+        }
+        let lease = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+        let opened = LibraryRuntime::open(&paths, false, lease);
+        if schema == Some(25) {
+            let error = match opened {
+                Ok(_) => panic!("schema 25's library end must be refused"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("CatalogAheadOfLibraryLog"),
+                "{error}"
+            );
+            assert!(
+                matches!(
+                    &error,
+                    RuntimeError::State(StateError::JournalReplayFailed(_))
+                ),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("library log ends at record 0, catalog at record 5"),
+                "{error}"
+            );
+        } else {
+            let runtime = opened.unwrap_or_else(|error| panic!("schema {schema:?}: {error}"));
+            ca1_diagnostic(&runtime);
+        }
+    }
+}
+
+/// S5(e): publication ambiguity preserves readable history and ordinary read refusal.
+#[test]
+fn history_fenced_snapshot_keeps_published_prefix() {
+    use std::ops::ControlFlow;
+    let f = Fixture::new();
+    f.provision(T);
+    let mut before = vec![];
+    assert_eq!(
+        f.rt()
+            .history(&mut |entry| {
+                before.push((entry.head().clone(), entry.detail_json()));
+                ControlFlow::Continue(())
+            })
+            .unwrap(),
+        HistoryEnd::Clean
+    );
+    assert!(!before.is_empty());
+    f.lose(T);
+    assert!(f.paths.audit_dir.join("library-log.ambiguous").exists());
+    let mut after = vec![];
+    let end = f
+        .rt()
+        .history(&mut |entry| {
+            after.push((entry.head().clone(), entry.detail_json()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(end, HistoryEnd::Fenced);
+    assert!(matches!(
+        f.rt().tape_for_label("history-test"),
+        Err(RuntimeError::Authority(AuthorityError::Store(
+            StoreError::Fenced
+        )))
+    ));
+}

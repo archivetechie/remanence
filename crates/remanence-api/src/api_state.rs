@@ -52,6 +52,7 @@ use crate::write_session_ingress::WriteSessionApi;
 pub struct ApiState {
     pub(crate) catalog: remanence_state::ProjectionClient,
     pub(crate) index_path: Arc<PathBuf>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) audit_dir: Arc<PathBuf>,
     // Read only by the legacy audit funnel, now test-only; deleted with the funnel at L3.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -361,12 +362,15 @@ impl ApiState {
         policy: remanence_library::StaticAllowlist,
         spool_dir: PathBuf,
         spool_budget_bytes: u64,
-        mut open: impl FnMut(
-            &remanence_library::Library,
-            &remanence_library::StaticAllowlist,
-        )
-            -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>,
+        open: impl FnMut(
+                &remanence_library::Library,
+                &remanence_library::StaticAllowlist,
+            )
+                -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>
+            + Send
+            + 'static,
     ) -> Result<Self, Status> {
+        let open = crate::write_owner::LibraryActorContext::shared_opener(open);
         let authority = match catalog.library_runtime() {
             Some(runtime) => crate::write_owner::TerminalAuthority::Typed(runtime),
             #[cfg(test)]
@@ -438,8 +442,10 @@ impl ApiState {
                     "configured library {library_serial} not found in discovery report"
                 ))
             })?;
-            let mut library = open(discovered, &policy)
-                .map_err(|err| Status::internal(format!("open library {library_serial}: {err}")))?;
+            let mut library = open.lock().unwrap_or_else(|e| e.into_inner())(discovered, &policy)
+                .map_err(|err| {
+                Status::internal(format!("open library {library_serial}: {err}"))
+            })?;
             library.set_changer_ready_wait(changer_ready_wait.clone());
             if let Some(runtime) = index.library_runtime() {
                 library.set_motion_authority(Arc::new(runtime));
@@ -479,6 +485,15 @@ impl ApiState {
                 library.library(),
                 &mut opened_drives,
             )?;
+            if index.library_runtime().is_some() {
+                if let Err(error) = library.reconcile_startup_motion() {
+                    tracing::warn!(
+                        library_serial,
+                        %error,
+                        "reconcile library motion after startup readiness"
+                    );
+                }
+            }
             opened_libraries.push((library_serial.to_string(), library, opened_drives));
         }
         replay_checkpoint_journal_projections_with_audit(
@@ -515,6 +530,7 @@ impl ApiState {
                 crate::write_owner::LibraryActorContext {
                     serial: String::new(),
                     snapshot: library_snapshot.clone(),
+                    opener: open.clone(),
                 },
             ),
             snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
@@ -542,6 +558,7 @@ impl ApiState {
                 crate::write_owner::LibraryActorContext {
                     serial: library_serial.clone(),
                     snapshot: library_snapshot.clone(),
+                    opener: open.clone(),
                 },
             );
             for (bay_addr, drive) in opened_drives {
@@ -552,6 +569,11 @@ impl ApiState {
             let changer_tx =
                 crate::write_owner::spawn_changer_actor(library.into_changer(), actor_cfg);
             changer_txs.insert(library_serial, changer_tx);
+        }
+        if let Some(runtime) = base_cfg.authority.runtime() {
+            runtime.set_motion_reconcile_notifier(crate::write_owner::motion_reconcile_notifier(
+                &changer_txs,
+            ));
         }
         let drive_pool = crate::write_owner::DrivePool::new_with_lifecycle(
             changer_txs,
@@ -1366,71 +1388,6 @@ impl ApiState {
                 "operation owner requires shared LibraryAuthority",
             ))
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_request_received(
-        &self,
-        actor: AuditActor,
-        operation_id: Uuid,
-        operation_kind: &str,
-        tape_uuid: &[u8; 16],
-        idempotency_key: Option<Uuid>,
-    ) -> Result<(), Status> {
-        let mut index = self.catalog.write_handle();
-        let mut detail = BTreeMap::new();
-        detail.insert(
-            "tape_uuid".to_string(),
-            CborValue::Bytes(tape_uuid.to_vec()),
-        );
-        append_operation_audit(
-            &mut index,
-            self.audit_dir.as_ref(),
-            self.audit_fsync,
-            &self.audit_append_lock,
-            OperationAuditInput {
-                actor,
-                operation_id,
-                operation_kind,
-                event: AuditEvent::RequestReceived,
-                subject_kind: "tape",
-                subject_id: Some(Uuid::from_bytes(*tape_uuid).to_string()),
-                idempotency_key,
-                detail,
-            },
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_library_request_received(
-        &self,
-        actor: AuditActor,
-        operation_id: Uuid,
-        operation_kind: &str,
-        library_serial: &str,
-        mut detail: BTreeMap<String, CborValue>,
-    ) -> Result<(), Status> {
-        let mut index = self.catalog.write_handle();
-        detail.insert(
-            "library_serial".to_string(),
-            CborValue::Text(library_serial.to_string()),
-        );
-        append_operation_audit(
-            &mut index,
-            self.audit_dir.as_ref(),
-            self.audit_fsync,
-            &self.audit_append_lock,
-            OperationAuditInput {
-                actor,
-                operation_id,
-                operation_kind,
-                event: AuditEvent::RequestReceived,
-                subject_kind: "library",
-                subject_id: Some(library_serial.to_string()),
-                idempotency_key: None,
-                detail,
-            },
-        )
     }
 
     pub(crate) fn record_cancel_requested(

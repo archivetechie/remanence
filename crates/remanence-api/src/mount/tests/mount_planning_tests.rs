@@ -77,7 +77,6 @@ fn planning_harness(
     ManualFinalizeTapeAdmission,
     remanence_parity::TerminalPrefixPlan,
 ) {
-    let mut h = dismount_harness(3600);
     let uuid = [0x91; 16];
     let block_size = 262144;
     let scheme = remanence_parity::ParityScheme {
@@ -86,6 +85,18 @@ fn planning_harness(
         parity_blocks_per_stripe: 4,
         stripes_per_neighborhood: 1,
     };
+    let typed = crate::tests::TypedRoot::open_with_tape_inputs([(
+        ProvisionTapeInput {
+            tape_uuid: uuid,
+            voltag: "OLD001L9".into(),
+            block_size,
+            parity: ParityConfig::Scheme(scheme.clone()),
+            force: false,
+        },
+        remanence_state::LabelProvenance::Changer,
+        remanence_state::MediaObservation::label_hint("OLD001L9"),
+    )]);
+    let mut h = dismount_harness_with_root(3600, typed);
     let mut raw = CounterSink::default();
     let mut bundles = Bundles(Vec::new());
     let identity = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"));
@@ -174,15 +185,6 @@ fn planning_harness(
         }
         index
     };
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: uuid,
-            voltag: "OLD001L9".into(),
-            block_size,
-            parity: ParityConfig::Scheme(scheme.clone()),
-            force: false,
-        })
-        .unwrap();
     use remanence_state::authority::TapeAuthorityView;
     let authority = remanence_state::TapeAuthority::open(
         h.state.checkpoint_journal_dir.as_ref(),
@@ -226,6 +228,13 @@ fn planning_harness(
 async fn manual_finalization_requires_closeout_before_media_or_acceptance() {
     for in_slot in [false, true] {
         let (mut h, admission, _) = planning_harness(in_slot);
+        let publications = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = publications.clone();
+        h.state.operations.before_publish_for_test(move |status| {
+            if status.operation_kind == "finalize_tape" {
+                observed.lock().unwrap().push(status.clone());
+            }
+        });
         let result = manual_finalize_tape(&h.state, admission.clone())
             .await
             .unwrap_err();
@@ -242,5 +251,15 @@ async fn manual_finalization_requires_closeout_before_media_or_acceptance() {
             .operations
             .latest(&admission.candidate_operation_id)
             .is_none());
+        assert!(
+            publications.lock().unwrap().is_empty(),
+            "finalization published before closeout under operation IDs: {:?}",
+            publications
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|status| Uuid::from_slice(&status.operation_id).unwrap())
+                .collect::<Vec<_>>()
+        );
     }
 }

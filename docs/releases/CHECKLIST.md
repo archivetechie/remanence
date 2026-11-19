@@ -80,7 +80,7 @@ The CI run on a push has three jobs, all of which must pass:
   second REM-PARITY implementation's decisions, the field-test client build,
   warning-free API documentation, the REM-OBJECT vectors, the core dependency
   graph guard and the release-evidence tool's tests.
-- `Rust 1.88 minimum-version check`.
+- `Rust 1.89 minimum-version check`.
 - `Static rem-recover artifact`, which builds `rem-recover` for musl and
   checks that it is statically linked.
 

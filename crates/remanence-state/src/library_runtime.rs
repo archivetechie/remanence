@@ -17,6 +17,7 @@ use crate::{
     },
     StateError, StateLockGuard, StatePaths,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -25,6 +26,22 @@ use std::sync::{
 /// Error text of the 32-L1 refusal of a tape-log tail repair. The text starts with the code.
 pub const TAIL_REPAIR_DEFERRED: &str =
     "TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed";
+
+/// Select the earliest active Write fence on this tape without acquiring locks.
+fn first_pool_rule_write_fence(fold: &lib::LibraryFold, uuid: lib::Id) -> Option<u64> {
+    fold.active_tape_fences(&uuid)
+        .find(|(_, raise)| raise.kind == lib::FenceKind::Write)
+        .map(|(sequence, _)| sequence)
+}
+
+/// The operation a set of active tape-I/O fences may permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapeIoPass {
+    /// Motion may pass append-refusal and suffix-contradiction write fences.
+    Motion,
+    /// Reads may pass only append-refusal write fences.
+    Read,
+}
 
 /// Typed errors retain the distinction between semantic refusal and authority
 /// storage failure needed by continuation-LOAD compensation.
@@ -154,12 +171,54 @@ struct ProjectionLag {
     error: String,
     last_closed_sequence: u64,
 }
+type MotionReconcileNotifier = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The contiguous library projection and the native prefixes copied to SQL.
+#[derive(Default)]
+struct Stamp {
+    library: u64,
+    tapes: BTreeMap<lib::Id, Part>,
+    view: u64,
+    fenced: BTreeSet<lib::Id>,
+}
+
+impl Stamp {
+    /// A missing identity result is always a difference, including two errors.
+    fn matches(&self, tape: lib::Id, native: &crate::tape_log::snapshot::Snapshot) -> bool {
+        Part::of(native).is_some_and(|part| self.tapes.get(&tape) == Some(&part))
+    }
+}
+
+/// Identity is captured with the snapshot, so comparing parts performs no I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Part {
+    identity: Option<(u64, u64)>,
+    last_closed_sequence: u64,
+    closed_end: u64,
+}
+impl Part {
+    fn of(snapshot: &crate::tape_log::snapshot::Snapshot) -> Option<Self> {
+        Some(Self {
+            identity: snapshot.file_identity().ok()?,
+            last_closed_sequence: snapshot.summary().last_closed_sequence,
+            closed_end: snapshot.summary().closed_end,
+        })
+    }
+}
+
 struct Inner {
     authority: LibraryAuthority,
     view: Mutex<NativeTapeView>,
     // This dispatch lock orders append receipts and projection submissions; it
     // is not a tape lock or LibraryAuthority's append lock.
     dispatch: Mutex<()>,
+    // A leaf lock under dispatch: only take, install or update; never project under it.
+    stamp: Mutex<Option<Stamp>>,
+    // Leaf under the core or dispatch: never take another lock or do I/O while held.
+    dirty_tapes: Mutex<BTreeSet<lib::Id>>,
+    // Process-local intent ownership. Lock only under dispatch; transport comes first.
+    owned_motion: Mutex<std::collections::BTreeMap<u64, Vec<lib::fold::Scope>>>,
+    motion_reconcile_notifier: Mutex<Option<MotionReconcileNotifier>>,
     projector: ProjectionClient,
     manifest: AuthorityManifest,
     motion_fenced: AtomicBool,
@@ -174,6 +233,10 @@ struct Inner {
     ack_progress: Mutex<std::collections::BTreeMap<lib::Id, (u64, u64)>>,
     #[cfg(test)]
     ack_frames_checked: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    library_passes: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    refold_scans: std::sync::atomic::AtomicUsize,
 }
 impl std::fmt::Debug for LibraryRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,6 +260,81 @@ fn store_failure(error: &AuthorityError) -> bool {
 }
 /// Per owed tape, the reconciliation disposition and its existing skip reason.
 pub(crate) type ReconciliationSummary = Vec<(lib::Id, &'static str)>;
+
+/// Respond to every completed evidence replacement before releasing dispatch,
+/// including an owners-loop error, an append refusal, or unwinding from write.
+struct IdentityReplacement<'a> {
+    runtime: &'a LibraryRuntime,
+    changes: Vec<(lib::Id, lib::native_view::AuthoritativeChange)>,
+}
+impl Drop for IdentityReplacement<'_> {
+    fn drop(&mut self) {
+        use lib::native_view::AuthoritativeChange;
+        let refold = self.changes.iter().any(|(_, change)| {
+            matches!(
+                change,
+                AuthoritativeChange::Removed
+                    | AuthoritativeChange::ShorterPrefix
+                    | AuthoritativeChange::ChangedPrefix
+            )
+        });
+        if refold {
+            // Establish recovery obligations before a refusal check or any scan.
+            self.runtime
+                .0
+                .projection_dirty
+                .store(true, Ordering::Release);
+        }
+        {
+            let mut progress = self
+                .runtime
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (tape, change) in &self.changes {
+                if !matches!(change, AuthoritativeChange::Unchanged) {
+                    progress.remove(tape);
+                }
+            }
+        }
+        {
+            let mut stamp = self
+                .runtime
+                .0
+                .stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(stamp) = stamp.as_mut() {
+                for (tape, change) in &self.changes {
+                    if !matches!(change, AuthoritativeChange::Unchanged) {
+                        stamp.tapes.remove(tape);
+                    }
+                }
+            }
+        }
+        if refold {
+            let view = self
+                .runtime
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let (scanned, refusal) = self.runtime.0.authority.refold_replaced_view(&view);
+            #[cfg(test)]
+            if scanned {
+                self.runtime.0.refold_scans.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(not(test))]
+            let _ = scanned;
+            if let Some(refusal) = refusal {
+                self.runtime.0.motion_fenced.store(true, Ordering::Release);
+                tracing::error!(?refusal, "replacement evidence fenced library motion");
+            }
+        }
+    }
+}
 
 impl LibraryRuntime {
     /// Admit the bound namespaces under an existing state lease, probe every
@@ -261,6 +399,15 @@ impl LibraryRuntime {
         )?;
         let snapshot = authority.snapshot()?;
         lib::session_ack::validate(&view, |applied| snapshot.replay(&view, applied))?;
+        let projector = ProjectionClient::open(&paths.sqlite_path)?;
+        let catalog_end = projector.reader()?.library_catalog_end()?;
+        let log_end = authority.with_fold(|fold| fold.received_through);
+        if catalog_end > log_end {
+            let path = crate::ambiguity_recovery::shell_path(&paths.config_path);
+            return Err(StateError::JournalReplayFailed(format!(
+                "CatalogAheadOfLibraryLog: the catalog holds library records the library log does not (library log ends at record {log_end}, catalog at record {catalog_end}). Stop the service and run rem rebuild-catalog-from-journals --config {path}; it rebuilds the catalog, or lists what the catalog holds beyond the log and the way on."
+            )).into());
+        }
         let reconciliation = if lib::store::fence_reconcile_path(manifest.library_root())
             .try_exists()
             .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?
@@ -270,7 +417,6 @@ impl LibraryRuntime {
             Vec::new()
         };
         let snapshot = authority.snapshot()?;
-        let projector = ProjectionClient::open(&paths.sqlite_path)?;
         let marks = projector.reader()?.tape_projection_marks()?;
         let raises = authority.with_fold(|fold| {
             native_floor::detect(
@@ -296,17 +442,26 @@ impl LibraryRuntime {
             }
             authority.snapshot()?
         };
-        projector.project_library(snapshot, Box::new(view.clone()), ApplyPath::Startup)?;
+        let report =
+            projector.project_library(snapshot, Box::new(view.clone()), ApplyPath::Startup)?;
         // Library identities/assignments precede native sessions and terminal
         // state. Every native prefix was validated before either replay starts.
         let fenced = authority.with_fold(native_floor::fenced_tapes);
         let mut projection_lag = std::collections::BTreeMap::new();
+        let mut stamp = Stamp {
+            library: report.decided,
+            tapes: BTreeMap::new(),
+            view: view.mutations(),
+            fenced: BTreeSet::new(),
+        };
         for native in view.snapshots() {
             if fenced.contains(&native.header().tape_uuid) {
+                stamp.fenced.insert(native.header().tape_uuid);
                 continue;
             }
             let tape = native.header().tape_uuid;
             let last_closed_sequence = native.summary().last_closed_sequence;
+            let part = Part::of(&native);
             let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
             match projector.project(
                 AuthorityRecord::Tape(Box::new(snapshot)),
@@ -328,7 +483,13 @@ impl LibraryRuntime {
                     projection_lag.remove(&tape);
                     return Err(error.into());
                 }
-                _ => {
+                ProjectionResult::Applied(_) => {
+                    projection_lag.remove(&tape);
+                    if let Some(part) = part {
+                        stamp.tapes.insert(tape, part);
+                    }
+                }
+                ProjectionResult::Pending(_) => {
                     projection_lag.remove(&tape);
                 }
             }
@@ -351,9 +512,17 @@ impl LibraryRuntime {
                 ack_progress: Mutex::new(ack_progress),
                 #[cfg(test)]
                 ack_frames_checked: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                library_passes: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                refold_scans: std::sync::atomic::AtomicUsize::new(0),
                 authority,
                 view: Mutex::new(view),
                 dispatch: Mutex::new(()),
+                stamp: Mutex::new(Some(stamp)),
+                dirty_tapes: Mutex::new(BTreeSet::new()),
+                owned_motion: Mutex::new(std::collections::BTreeMap::new()),
+                motion_reconcile_notifier: Mutex::new(None),
                 projector,
                 manifest,
                 motion_fenced: AtomicBool::new(false),
@@ -390,15 +559,47 @@ impl LibraryRuntime {
         ) -> Result<AuthorityReceipt, AuthorityError>,
     ) -> Result<lib::Receipt, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        // Declared after dispatch so every exit responds before dispatch drops.
+        let mut response = IdentityReplacement {
+            runtime: self,
+            changes: Vec::new(),
+        };
         use crate::authority::TapeAuthorityView;
         let view = {
             let mut view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
             for owner in owners {
-                view.replace_authoritative(owner.freeze()?.raw)
+                let snapshot = owner.freeze()?.raw;
+                let tape = snapshot.header().tape_uuid;
+                let change = view
+                    .replace_authoritative(snapshot)
                     .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+                response.changes.push((tape, change));
             }
             view.clone()
         };
+        // Drop marks before a dirty append's nested catch-up can use the replacement.
+        {
+            let mut progress = self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (tape, change) in &response.changes {
+                if !matches!(change, lib::native_view::AuthoritativeChange::Unchanged) {
+                    progress.remove(tape);
+                }
+            }
+        }
+        {
+            let mut stamp = self.0.stamp.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stamp) = stamp.as_mut() {
+                for (tape, change) in &response.changes {
+                    if !matches!(change, lib::native_view::AuthoritativeChange::Unchanged) {
+                        stamp.tapes.remove(tape);
+                    }
+                }
+            }
+        }
         self.append_locked(|a, v| write(a, v, &NativeIdentityView(view)))
     }
 
@@ -409,10 +610,24 @@ impl LibraryRuntime {
         if self.0.projection_dirty.load(Ordering::Acquire) {
             self.catch_up_locked()?;
         }
+        let before = self.0.authority.with_fold(|fold| {
+            (
+                fold.received_through,
+                fold.non_applications,
+                fold.pending.len(),
+            )
+        });
         let result = {
             let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
             write(&self.0.authority, &*view)
         };
+        let after = self.0.authority.with_fold(|fold| {
+            (
+                fold.received_through,
+                fold.non_applications,
+                fold.pending.len(),
+            )
+        });
         #[cfg(any(test, feature = "fixtures"))]
         let durable_return = std::time::Instant::now();
         if result.as_ref().err().is_some_and(store_failure) {
@@ -423,17 +638,36 @@ impl LibraryRuntime {
             Err(AuthorityError::AppliedBeforeRefusal { applied, .. }) => applied.as_slice(),
             Err(_) => &[],
         };
+        if applied.is_empty() && before == after {
+            if let Ok(receipt) = &result {
+                return Ok(receipt.receipt.clone());
+            }
+        }
         // Dirty before channel submission: any failed or lost response requires
         // replay of the durable prefix before the next producer can append.
         self.0.projection_dirty.store(true, Ordering::Release);
         let projection = (|| -> Result<(), RuntimeError> {
+            let mut all_applied = true;
+            let mut through = before.0;
+            let mut contiguous = true;
             for record in applied {
+                contiguous &= through.checked_add(1) == Some(record.sequence());
+                through = record.sequence();
                 match self.0.projector.project(
                     AuthorityRecord::Library(Box::new(record.clone())),
                     ApplyPath::Live,
                 )? {
-                    ProjectionResult::Applied(_) | ProjectionResult::Pending(_) => (),
+                    ProjectionResult::Applied(_) => (),
+                    ProjectionResult::Pending(_) => all_applied = false,
                     ProjectionResult::Failed { error, .. } => return Err(error.into()),
+                }
+            }
+            if all_applied && contiguous && through == after.0 {
+                let mut stamp = self.0.stamp.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(stamp) = stamp.as_mut() {
+                    if stamp.library == before.0 {
+                        stamp.library = after.0;
+                    }
                 }
             }
             // No application may mean exclusion/contradiction, or resolution
@@ -457,7 +691,9 @@ impl LibraryRuntime {
                 Ok(receipt.receipt)
             }
             (Err(error), Ok(())) => {
-                self.0.projection_dirty.store(false, Ordering::Release);
+                self.0
+                    .projection_dirty
+                    .store(before.0 != after.0, Ordering::Release);
                 Err(error.into())
             }
             (Ok(_), Err(error)) => Err(error),
@@ -468,7 +704,249 @@ impl LibraryRuntime {
         }
     }
 
+    /// Compare copied prefixes under dispatch, leaving no stamp on a failed catch-up.
     fn catch_up_locked(&self) -> Result<(), RuntimeError> {
+        let snapshot = self.0.authority.snapshot()?;
+        let prior = self
+            .0
+            .stamp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let empty = prior.is_none();
+        let mut merged = prior.unwrap_or_default();
+        let dirty = self.0.projection_dirty.load(Ordering::Acquire);
+        let (received, pending) = self
+            .0
+            .authority
+            .with_fold(|fold| (fold.received_through, !fold.pending.is_empty()));
+        let library_needed = dirty || empty || merged.library != received || pending;
+        let lagging: BTreeSet<_> = self
+            .0
+            .projection_lag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        let dirty_tapes_empty = self
+            .0
+            .dirty_tapes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if !library_needed && lagging.is_empty() && dirty_tapes_empty {
+            let unchanged = {
+                let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                view.changed_since(merged.view)
+                    .into_iter()
+                    .chain(merged.fenced.iter().copied())
+                    .all(|tape| {
+                        view.snapshot(tape).is_none_or(|native| {
+                            self.0
+                                .authority
+                                .with_fold(|fold| native_floor::fenced(fold, &tape))
+                                || merged.matches(tape, native)
+                        })
+                    })
+            };
+            if unchanged {
+                *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged);
+                return Ok(());
+            }
+        }
+        let drained = {
+            let mut tapes = self.0.dirty_tapes.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *tapes)
+        };
+        let to_project = {
+            let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+            let mut candidates: BTreeSet<_> = view
+                .changed_since(merged.view)
+                .into_iter()
+                .chain(merged.fenced.iter().copied())
+                .collect();
+            if dirty || empty {
+                candidates = view
+                    .snapshots()
+                    .map(|native| native.header().tape_uuid)
+                    .collect();
+            } else {
+                candidates.extend(lagging.iter().copied());
+            }
+            candidates.extend(drained.iter().copied());
+            merged.view = view.mutations();
+            merged.fenced.clear();
+            let mut to_project = Vec::new();
+            for tape in candidates {
+                let Some(native) = view.snapshot(tape) else {
+                    merged.tapes.remove(&tape);
+                    continue;
+                };
+                if self
+                    .0
+                    .authority
+                    .with_fold(|fold| native_floor::fenced(fold, &tape))
+                {
+                    merged.fenced.insert(tape);
+                    if drained.contains(&tape) {
+                        merged.tapes.remove(&tape);
+                    }
+                } else if dirty
+                    || drained.contains(&tape)
+                    || lagging.contains(&tape)
+                    || !merged.matches(tape, native)
+                {
+                    to_project.push(tape);
+                }
+            }
+            to_project
+        };
+        let natives: Vec<_> = {
+            let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+            to_project
+                .iter()
+                .filter_map(|&tape| view.snapshot(tape).cloned())
+                .collect()
+        };
+        let prefixes: Vec<_> = {
+            let progress = self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            natives
+                .into_iter()
+                .filter_map(|native| {
+                    let prior = progress.get(&native.header().tape_uuid).copied();
+                    if prior.is_some_and(|(through, _)| {
+                        through >= native.summary().last_closed_sequence
+                    }) {
+                        None
+                    } else {
+                        Some((native, prior))
+                    }
+                })
+                .collect()
+        };
+        let checked = lib::session_ack::validate_new(prefixes.iter().cloned(), |applied| {
+            let view = self
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            snapshot.replay(&view, applied)
+        })?;
+        {
+            let mut progress = self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (native, _) in prefixes {
+                progress.insert(
+                    native.header().tape_uuid,
+                    (
+                        native.summary().last_closed_sequence,
+                        native.summary().closed_end,
+                    ),
+                );
+            }
+        }
+        #[cfg(test)]
+        self.0
+            .ack_frames_checked
+            .fetch_add(checked, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = checked;
+        if library_needed {
+            let view = self
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            #[cfg(test)]
+            self.0.library_passes.fetch_add(1, Ordering::Relaxed);
+            merged.library = self
+                .0
+                .projector
+                .project_library(snapshot, Box::new(view), ApplyPath::Live)?
+                .decided;
+        }
+        for tape in to_project {
+            let native = {
+                let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                view.snapshot(tape).cloned()
+            };
+            let Some(native) = native else {
+                merged.tapes.remove(&tape);
+                continue;
+            };
+            let last_closed_sequence = native.summary().last_closed_sequence;
+            let part = Part::of(&native);
+            let snapshot = crate::tape_log::authority::AuthoritySnapshot::new(native)?;
+            match self
+                .0
+                .projector
+                .project(AuthorityRecord::Tape(Box::new(snapshot)), ApplyPath::Live)?
+            {
+                ProjectionResult::Applied(_) => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    if let Some(part) = part {
+                        merged.tapes.insert(tape, part);
+                    } else {
+                        merged.tapes.remove(&tape);
+                    }
+                }
+                ProjectionResult::Failed {
+                    error: ApplyError::Catalog(error),
+                    ..
+                } if error.is_deferrable_projection_failure() => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            tape,
+                            ProjectionLag {
+                                error: error.to_string(),
+                                last_closed_sequence,
+                            },
+                        );
+                    merged.tapes.remove(&tape);
+                }
+                ProjectionResult::Failed { error, .. } => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    return Err(error.into());
+                }
+                ProjectionResult::Pending(_) => {
+                    self.0
+                        .projection_lag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&tape);
+                    merged.tapes.remove(&tape);
+                }
+            }
+        }
+        *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(merged);
+        self.0.projection_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Full baseline catch-up retained for differential projection checks.
+    #[cfg(test)]
+    fn catch_up_oracle_locked(&self) -> Result<(), RuntimeError> {
         let snapshot = self.0.authority.snapshot()?;
         let view = self
             .0
@@ -543,6 +1021,21 @@ impl LibraryRuntime {
         Ok(())
     }
 
+    /// Mark a direct catalogue write for the next catch-up; only insert under the leaf lock.
+    pub(crate) fn mark_tape_dirty(&self, tape: lib::Id) {
+        self.0
+            .dirty_tapes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tape);
+    }
+
+    /// Fixture hook: models a lost or failed projection.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn fixture_mark_projection_dirty(&self) {
+        self.0.projection_dirty.store(true, Ordering::Release);
+    }
+
     /// Recover a failed projection response from authority before admission.
     pub fn catch_up(&self) -> Result<(), RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
@@ -566,6 +1059,7 @@ impl LibraryRuntime {
         index: &mut crate::CatalogIndex,
     ) -> Result<crate::RebuildReport, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let snapshot = self.0.authority.snapshot()?;
         let view = {
             let mut view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -677,7 +1171,7 @@ impl LibraryRuntime {
     }
 
     /// Release an operator-addressed tape fence through its source identity.
-    /// Suffix contradictions require the separate physical recovery producer.
+    /// Append refusals and suffix contradictions require physical tail recovery.
     pub fn release_tape_fence(
         &self,
         id: &str,
@@ -698,14 +1192,29 @@ impl LibraryRuntime {
             })?;
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(fence) = self.0.authority.active_fence(sequence) {
+            if let lib::FenceScope::Drive(lib::DriveKey::Standalone(drive)) = &fence.scope {
+                let serial = drive.drive_serial.as_str();
+                return Err(StateError::ConfigInvalid(format!(
+                    "fence library:{sequence} holds standalone drive {serial}; stop the daemon and run `rem tape quarantine release library:{sequence} --device PATH --allow-device {serial} --ack TEXT` as a standalone command"
+                )).into());
+            }
             if !matches!(fence.scope, lib::FenceScope::Tape(_)) {
                 return Err(StateError::ConfigInvalid("fence is not tape-scoped".into()).into());
             }
-            if fence.cause == lib::FenceCause::SessionSuffixContradiction {
-                return Err(StateError::ConfigInvalid(
-                    "suffix fence requires explicit physical tail recovery".into(),
-                )
-                .into());
+            match fence.cause {
+                lib::FenceCause::SessionSuffixContradiction => {
+                    return Err(StateError::ConfigInvalid(
+                        "release refused: a session_suffix_contradiction fence stays until rem tape supersede-tail recovers the tape's tail (it refuses when the tape contradicts its recorded session ending); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory".into(),
+                    )
+                    .into());
+                }
+                lib::FenceCause::AppendAdmissionRefused => {
+                    return Err(StateError::ConfigInvalid(
+                        "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail, which it refuses when this state shows no open session on the tape (its last session closed, or none opened since it was initialized here); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory".into(),
+                    )
+                    .into());
+                }
+                _ => {}
             }
             let forced = fence.cause == lib::FenceCause::NativeLogBehindProjection;
             let detail = if forced {
@@ -849,12 +1358,6 @@ impl LibraryRuntime {
                     .map_err(|e| ApplyError::Catalog(StateError::from(e)))?;
             }
             before_apply();
-            let view = self
-                .0
-                .view
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
             let source =
                 self.0.authority.snapshot().map_err(|e| {
                     ApplyError::Catalog(StateError::JournalReplayFailed(e.to_string()))
@@ -871,7 +1374,13 @@ impl LibraryRuntime {
             let checked = if already_validated {
                 0
             } else {
-                match lib::session_ack::validate_new(snapshot.raw.clone(), prior, |applied| {
+                match lib::session_ack::validate_new([(snapshot.raw.clone(), prior)], |applied| {
+                    let view = self
+                        .0
+                        .view
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     source.replay(&view, applied)
                 }) {
                     Ok(checked) => checked,
@@ -909,8 +1418,11 @@ impl LibraryRuntime {
             let current = if prior
                 .is_some_and(|(through, _)| through > snapshot.raw.summary().last_closed_sequence)
             {
-                view.snapshots()
-                    .find(|s| s.header().tape_uuid == snapshot.raw.header().tape_uuid)
+                let native = {
+                    let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+                    view.snapshot(tape).cloned()
+                };
+                native
                     .map(crate::tape_log::authority::AuthoritySnapshot::new)
                     .transpose()
                     .map_err(ApplyError::Catalog)?
@@ -923,16 +1435,30 @@ impl LibraryRuntime {
         let current = match current {
             Ok(current) => current,
             Err(error) => {
-                self.0
+                let removed = self
+                    .0
                     .projection_lag
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .remove(&tape);
+                    .remove(&tape)
+                    .is_some();
+                if removed {
+                    *self.0.stamp.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 return Err(error);
             }
         };
         let last_closed_sequence = current.raw.summary().last_closed_sequence;
+        let part = Part::of(&current.raw);
         let result = index.apply_frozen(&AuthorityRecord::Tape(Box::new(current)), path);
+        let validated = result.is_ok()
+            && self
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&tape)
+                .is_some_and(|(through, _)| *through >= last_closed_sequence);
         {
             let mut lags = self
                 .0
@@ -961,6 +1487,16 @@ impl LibraryRuntime {
                 }
                 Err(_) => {
                     lags.remove(&tape);
+                }
+            }
+        }
+        {
+            let mut stamp = self.0.stamp.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stamp) = stamp.as_mut() {
+                if let Some(part) = part.filter(|_| validated) {
+                    stamp.tapes.insert(tape, part);
+                } else {
+                    stamp.tapes.remove(&tape);
                 }
             }
         }
@@ -1108,6 +1644,51 @@ impl LibraryRuntime {
     pub fn tape_state(&self, uuid: lib::Id) -> Option<lib::fold::TapeState> {
         self.0.authority.tape_state(uuid)
     }
+    /// Snapshot live data-tape identities and their probed evidence in UUID order.
+    pub(crate) fn pool_rule_tapes(
+        &self,
+    ) -> Vec<(
+        lib::fold::TapeState,
+        Option<crate::tape_log::fold::TapeSummary>,
+        bool,
+        Option<u64>,
+    )> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+        let mut summaries = view
+            .snapshots()
+            .map(|snapshot| (snapshot.header().tape_uuid, snapshot.summary().clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let dropped = view
+            .dropped_logs()
+            .iter()
+            .map(|entry| entry.tape)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.0.authority.with_fold(|fold| {
+            fold.tapes
+                .iter()
+                .filter(|(uuid, tape)| {
+                    !tape.retired && !fold.cleaning_cartridges.contains_key(*uuid)
+                })
+                .map(|(uuid, tape)| {
+                    (
+                        tape.clone(),
+                        summaries.remove(uuid),
+                        dropped.contains(uuid),
+                        first_pool_rule_write_fence(fold, *uuid),
+                    )
+                })
+                .collect()
+        })
+    }
+    /// Re-check one move's Write fence under its retained native owner lease.
+    pub(crate) fn pool_rule_write_fence(&self, uuid: lib::Id) -> Option<u64> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let _view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+        self.0
+            .authority
+            .with_fold(|fold| first_pool_rule_write_fence(fold, uuid))
+    }
     /// Resolve a shell label from current authenticated fold state, never SQL.
     pub fn tape_for_label(&self, label: &str) -> Result<Option<lib::Id>, RuntimeError> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
@@ -1147,6 +1728,41 @@ impl LibraryRuntime {
         })
     }
 
+    /// Permit a nonempty set only when every row names a live write fence for
+    /// its own current tape identity and its cause permits the requested pass.
+    /// When supplied, `tape` also restricts every row to the recovering tape.
+    /// This reads authority state without taking the dispatch lock.
+    pub fn tape_io_fences_pass(
+        &self,
+        fences: &[crate::TapeIoFenceRecord],
+        tape: Option<&lib::Id>,
+        pass: TapeIoPass,
+    ) -> bool {
+        !fences.is_empty()
+            && fences.iter().all(|row| {
+                let Some(raise) = self.fence_for_quarantine_id(&row.quarantine_id) else {
+                    return false;
+                };
+                let Ok(row_tape) = <lib::Id>::try_from(row.tape_uuid.as_slice()) else {
+                    return false;
+                };
+                let Some(identity) = self.tape_state(row_tape) else {
+                    return false;
+                };
+                raise.kind == lib::FenceKind::Write
+                    && raise.scope == lib::FenceScope::Tape(identity.tape)
+                    && tape.is_none_or(|tape| *tape == row_tape)
+                    && match pass {
+                        TapeIoPass::Motion => matches!(
+                            raise.cause,
+                            lib::FenceCause::AppendAdmissionRefused
+                                | lib::FenceCause::SessionSuffixContradiction
+                        ),
+                        TapeIoPass::Read => raise.cause == lib::FenceCause::AppendAdmissionRefused,
+                    }
+            })
+    }
+
     /// Exact source identity and cause of active tape raises.
     pub fn active_fence(&self, sequence: u64) -> Option<lib::FenceRaised> {
         self.0.authority.active_fence(sequence)
@@ -1173,8 +1789,10 @@ impl LibraryRuntime {
     }
 }
 
+mod history;
+pub use lib::{HistoryEnd, HistoryEntry, HistoryHead};
 mod drive_fence;
-pub use drive_fence::{DriveDataRefusal, DriveFenced};
+pub use drive_fence::{DriveDataRefusal, DriveFenced, StandaloneDriveHold};
 mod motion;
 mod native_fences;
 pub(crate) mod native_floor;
@@ -1199,4 +1817,610 @@ mod verdict_tests;
 mod measurements;
 
 #[cfg(test)]
+mod prefix_hash_tests;
+#[cfg(test)]
 mod projection_lag_tests;
+#[cfg(test)]
+mod stamp_tests;
+
+#[cfg(test)]
+mod identity_refold_tests {
+    use super::*;
+    use crate::authority::TapeAuthorityView;
+    use crate::tape_log::{snapshot::Snapshot, CommitCursor};
+    use std::{cell::Cell, fs, path::PathBuf};
+    const TAPE: lib::Id = [0xd3; 16];
+
+    /// Runtime plus an independently held old tape snapshot; no device or service.
+    struct Fixture {
+        runtime: LibraryRuntime,
+        _root: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let paths = StatePaths {
+                config_path: root.path().join("config"),
+                state_dir: root.path().join("state"),
+                audit_dir: root.path().join("library"),
+                journal_dir: root.path().join("native"),
+                sqlite_path: root.path().join("catalog.sqlite"),
+                tape_cache_dir: root.path().join("cache"),
+                calibration_dir: root.path().join("calibration"),
+            };
+            let runtime = LibraryRuntime::open(
+                &paths,
+                true,
+                Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap()),
+            )
+            .unwrap();
+            runtime.append(diagnostic).unwrap();
+            Self {
+                runtime,
+                _root: root,
+            }
+        }
+        fn seed(&self, snapshot: Snapshot) {
+            let _dispatch = self
+                .runtime
+                .0
+                .dispatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let progress = (
+                snapshot.summary().last_closed_sequence,
+                snapshot.summary().closed_end,
+            );
+            self.runtime
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .refresh(snapshot)
+                .unwrap();
+            self.runtime
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(TAPE, progress);
+        }
+        fn scans(&self) -> usize {
+            self.runtime.0.refold_scans.load(Ordering::Relaxed)
+        }
+        fn assert_refolded(&self) {
+            assert_eq!(self.scans(), 1, "replacement must re-fold exactly once");
+            assert!(self.runtime.0.projection_dirty.load(Ordering::Acquire));
+            assert!(!self
+                .runtime
+                .0
+                .ack_progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&TAPE));
+        }
+        fn segment(&self) -> PathBuf {
+            fs::read_dir(self.runtime.manifest().library_root())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+                .unwrap()
+        }
+    }
+
+    /// A native lease can supply an absent, header-only or initialized prefix.
+    fn owner(
+        id: lib::Id,
+        initialized: bool,
+        block_size: u32,
+    ) -> (tempfile::TempDir, crate::TapeAuthorityLease) {
+        let root = tempfile::tempdir().unwrap();
+        let authority = crate::TapeAuthority::open_fixture(root.path(), id).unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        if initialized {
+            owner
+                .publish_initialized(
+                    block_size,
+                    None,
+                    CommitCursor {
+                        partition: 0,
+                        lba: 2,
+                    },
+                )
+                .unwrap();
+        } else {
+            owner.publish_empty_prefix(block_size, None).unwrap();
+        }
+        (root, owner)
+    }
+
+    /// A real writer call with no native dependencies, also used after a latch.
+    fn diagnostic(
+        a: &LibraryAuthority,
+        v: &dyn TapeView,
+    ) -> Result<AuthorityReceipt, AuthorityError> {
+        a.diagnostic(
+            lib::Diagnostic {
+                event: lib::DiagnosticEvent::RequestReceived,
+                subject_kind: "identity-refold".into(),
+                subject_id: None,
+                detail: lib::Bounded(vec![]),
+            },
+            lib::AuditActor::System,
+            lib::SourceLayer::Layer4,
+            v,
+        )
+    }
+
+    /// Check append refusal first, then the health bit; return its exact boundary.
+    fn latched(runtime: &LibraryRuntime) -> lib::store::Refusal {
+        let error = runtime.append(diagnostic).unwrap_err();
+        let RuntimeError::Authority(AuthorityError::Store(StoreError::RecoveryRequired(refusal))) =
+            error
+        else {
+            panic!("next append must refuse RecoveryRequired: {error:?}");
+        };
+        assert!(runtime.motion_fenced(), "re-fold refusal must fence motion");
+        assert!(
+            !runtime
+                .manifest()
+                .library_root()
+                .join("library-log.ambiguous")
+                .exists(),
+            "re-fold refusal is in-memory only"
+        );
+        refusal
+    }
+
+    /// Newly available native evidence must replace the live fold's unresolved flag.
+    #[test]
+    fn identity_refold_clean_scan_installs_fold() {
+        let f = Fixture::new();
+        let (_new_root, new) = owner(TAPE, true, 262144);
+        let snapshot = new.freeze().unwrap().raw;
+        let at = lib::TapeAt {
+            tape: lib::TapeRef {
+                uuid: TAPE,
+                incarnation: 1,
+            },
+            sequence: 1,
+            record_digest: snapshot.record_evidence(1).unwrap().unwrap().digest,
+        };
+        let change = {
+            let mut view = f
+                .runtime
+                .0
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            assert!(view.snapshot(TAPE).is_none());
+            view.replace_authoritative(snapshot).unwrap()
+        };
+        assert_eq!(change, lib::native_view::AuthoritativeChange::ChangedPrefix);
+        // Provision the library identity while its native log remains absent.
+        f.runtime
+            .append(|a, v| {
+                a.reprovision(
+                    lib::Reprovision {
+                        tape: at.tape,
+                        predecessor: None,
+                        mode: lib::ProvisionMode::Initialize,
+                        label: None,
+                        label_provenance: None,
+                        parity_scheme: None,
+                        medium: lib::MediumSpec {
+                            family: lib::MediumFamily::Lto(lib::LtoGen::Lto9),
+                            usable_logical_bytes: 18_000_000_000_000,
+                            record_size: 262144,
+                            rerecord: true,
+                            lifecycle_ops: true,
+                            source: lib::GenerationSource::Operator,
+                        },
+                        pool: None,
+                        endpoint: None,
+                        adoption: None,
+                        pool_source: None,
+                        operation: None,
+                        replaced_bot: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+        let key = crate::DriveKey::Standalone {
+            drive_serial: "LLR2-FR1".into(),
+        };
+        let fence = f
+            .runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(motion::endpoint(&key)),
+                        cause: lib::FenceCause::Cleaning,
+                        evidence: None,
+                        at: Some(at),
+                        operation: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        let before = f
+            .runtime
+            .0
+            .authority
+            .with_fold(|fold| fold.unresolved_fence_evidence.contains(&fence));
+        assert!(before, "absent native evidence must be unresolved");
+        f.runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                assert!(
+                    a.with_fold(|fold| fold.unresolved_fence_evidence.contains(&fence)),
+                    "the append alone must leave the old fold outcome"
+                );
+                Ok(result)
+            })
+            .unwrap();
+        f.assert_refolded();
+        assert!(!f.runtime.motion_fenced());
+        drop(
+            f.runtime
+                .0
+                .authority
+                .snapshot()
+                .expect("no refusal latched after a clean re-fold"),
+        );
+        let after = f
+            .runtime
+            .0
+            .authority
+            .with_fold(|fold| fold.unresolved_fence_evidence.contains(&fence));
+        println!(
+            "report={change:?} refold_scans={} refusal=none unresolved_before={before} unresolved_after={after}",
+            f.scans()
+        );
+        assert!(
+            !after,
+            "clean re-fold must install newly resolved fence evidence"
+        );
+    }
+
+    /// A shortened native prefix invalidates both the fold and acknowledgement mark.
+    #[test]
+    fn identity_refold_shorter_prefix() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        f.runtime
+            .append_identity(&[&new], |a, v, _| diagnostic(a, v))
+            .unwrap();
+        f.assert_refolded();
+        assert!(!f.runtime.motion_fenced());
+    }
+
+    /// Replacement marks are dropped before the nested dirty catch-up reads them.
+    #[test]
+    fn identity_replacement_dirty_catch_up_checks_new_source() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, true, 262144);
+        let before = f.runtime.0.ack_frames_checked.load(Ordering::Relaxed);
+        f.runtime.fixture_mark_projection_dirty();
+        f.runtime
+            .append_identity(&[&new], |a, v, _| diagnostic(a, v))
+            .unwrap();
+        assert!(
+            f.runtime.0.ack_frames_checked.load(Ordering::Relaxed) > before,
+            "replacement acknowledgement count grows"
+        );
+        assert!(
+            f.runtime.projection_lag(TAPE).is_none(),
+            "the nested catch-up projected TAPE without a deferred failure"
+        );
+    }
+
+    /// Same identity preserves the mark; identical bytes in a new inode drop it
+    /// without scanning or dirtying an otherwise successful append.
+    #[test]
+    fn identity_refold_identity_only_and_unchanged() {
+        for identity_only in [false, true] {
+            let f = Fixture::new();
+            let (_old_root, old) = owner(TAPE, true, 262144);
+            f.seed(old.freeze().unwrap().raw);
+            let (_new_root, new) = owner(TAPE, true, 262144);
+            let chosen = if identity_only { &new } else { &old };
+            f.runtime
+                .append_identity(&[chosen], |a, v, _| diagnostic(a, v))
+                .unwrap();
+            assert_eq!(f.scans(), 0);
+            assert!(!f.runtime.0.projection_dirty.load(Ordering::Acquire));
+            assert_eq!(
+                f.runtime
+                    .0
+                    .ack_progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&TAPE),
+                !identity_only
+            );
+        }
+    }
+
+    /// A later owner's freeze error must still respond to the earlier replacement.
+    #[test]
+    fn identity_refold_owners_loop_error() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let (bad_root, bad) = owner([0xd4; 16], false, 262144);
+        fs::write(
+            bad_root.path().join(format!(
+                "{}.remtape",
+                uuid::Uuid::from_bytes([0xd4; 16]).simple()
+            )),
+            b"bad header",
+        )
+        .unwrap();
+        let called = Cell::new(false);
+        assert!(f
+            .runtime
+            .append_identity(&[&new, &bad], |a, v, _| {
+                called.set(true);
+                diagnostic(a, v)
+            })
+            .is_err());
+        assert!(!called.get());
+        f.assert_refolded();
+    }
+
+    /// A real typed append refusal does not suppress the replacement response.
+    #[test]
+    fn identity_refold_append_error() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let error = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                a.fence_released(
+                    lib::FenceReleased {
+                        fence: u64::MAX,
+                        evidence: "invalid forward cause".into(),
+                        forced: true,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Authority(AuthorityError::Store(StoreError::Fold(
+                lib::FoldError::ForwardReference
+            )))
+        ));
+        f.assert_refolded();
+    }
+
+    /// Unwinding poisons the held view mutex; the response recovers it and scans.
+    #[test]
+    fn identity_refold_write_panic() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = f.runtime.append_identity(&[&new], |a, v, _| {
+                diagnostic(a, v).unwrap();
+                panic!("write panic after append");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(f.runtime.0.view.is_poisoned());
+        f.assert_refolded();
+        assert!(f
+            .runtime
+            .0
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(TAPE)
+            .is_some());
+    }
+
+    /// Raise the same source-backed drive fence as the runtime motion tests.
+    fn raise(runtime: &LibraryRuntime, key: &crate::DriveKey) -> u64 {
+        runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        detail: lib::Bounded(vec![]),
+                        kind: lib::FenceKind::DriveFault,
+                        scope: lib::FenceScope::Drive(motion::endpoint(key)),
+                        cause: lib::FenceCause::Cleaning,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence
+    }
+
+    /// Locate a real frame without relying on record sizes or guessed offsets.
+    fn frame_offset(path: &std::path::Path, uuid: lib::Id, sequence: u64) -> u64 {
+        let bytes = fs::read(path).unwrap();
+        let mut input = bytes.as_slice();
+        let header = lib::codec::Header::decode(&mut input, uuid).unwrap();
+        let mut decoder =
+            lib::codec::Decoder::at(input, header.first_sequence, lib::codec::HEADER_LEN);
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            if frame.sequence == sequence {
+                return frame.offset;
+            }
+        }
+        panic!("fixture frame missing");
+    }
+
+    /// A refusing scan may not erase a drive fence from the live fold.
+    #[test]
+    fn identity_refold_scan_refusal_keeps_drive_fence() {
+        let f = Fixture::new();
+        let key = crate::DriveKey::Standalone {
+            drive_serial: "LLR2".into(),
+        };
+        let fence = raise(&f.runtime, &key);
+        assert_eq!(f.runtime.drive_fenced(&key).unwrap().fence, fence);
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let path = f.segment();
+        let offset = frame_offset(&path, f.runtime.manifest().library_uuid(), fence);
+        let receipt = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[offset as usize + crate::log_frame::PREFIX_LEN] ^= 1;
+                fs::write(&path, bytes).unwrap();
+                Ok(result)
+            })
+            .unwrap();
+        let refusal = latched(&f.runtime);
+        assert_eq!(
+            f.runtime.drive_fenced(&key).map(|fence| fence.fence),
+            Some(fence),
+            "refusing scan must retain drive fence"
+        );
+        assert_eq!(refusal.sequence, Some(fence));
+        assert_eq!(refusal.offset, offset);
+        assert!(matches!(refusal.fault, lib::store::RefusalKind::Bytes(_)));
+        assert_eq!(
+            f.runtime
+                .0
+                .authority
+                .with_fold(|fold| fold.received_through),
+            receipt.sequence
+        );
+        f.assert_refolded();
+    }
+
+    /// A scan I/O error latches the live end; a later changed prefix cannot retry.
+    #[test]
+    fn identity_refold_scan_error_latches_live_end() {
+        let f = Fixture::new();
+        let key = crate::DriveKey::Standalone {
+            drive_serial: "LLR2".into(),
+        };
+        let fence = raise(&f.runtime, &key);
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let path = f.segment();
+        let mut live_end = 0;
+        let receipt = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                live_end = fs::metadata(&path).unwrap().len();
+                fs::remove_file(&path).unwrap();
+                Ok(result)
+            })
+            .unwrap();
+        let refusal = latched(&f.runtime);
+        assert_eq!(refusal.sequence, Some(receipt.sequence + 1));
+        assert_eq!(refusal.offset, live_end);
+        assert_eq!(refusal.segment, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            refusal.fault,
+            lib::store::RefusalKind::Fold(lib::FoldError::HistoryUnavailable)
+        );
+        assert_eq!(
+            f.runtime
+                .0
+                .authority
+                .with_fold(|fold| fold.received_through),
+            receipt.sequence
+        );
+        assert_eq!(
+            f.runtime.drive_fenced(&key).map(|fence| fence.fence),
+            Some(fence)
+        );
+        f.assert_refolded();
+        let (_changed_root, changed) = owner(TAPE, true, 524288);
+        f.runtime
+            .0
+            .ack_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(TAPE, (1, 1));
+        assert!(f
+            .runtime
+            .append_identity(&[&changed], |_, _, _| panic!(
+                "latched refusal must precede write"
+            ))
+            .is_err());
+        assert_eq!(latched(&f.runtime), refusal);
+        f.assert_refolded();
+    }
+
+    /// A complete shorter library prefix is a refusal, not a replacement fold;
+    /// its boundary is the scanned through, one sequence before the live end.
+    #[test]
+    fn identity_refold_clean_short_scan_keeps_fold() {
+        let f = Fixture::new();
+        let (_old_root, old) = owner(TAPE, true, 262144);
+        f.seed(old.freeze().unwrap().raw);
+        let (_new_root, new) = owner(TAPE, false, 262144);
+        let path = f.segment();
+        let prior_through = fs::metadata(&path).unwrap().len();
+        let receipt = f
+            .runtime
+            .append_identity(&[&new], |a, v, _| {
+                let result = diagnostic(a, v)?;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(prior_through)
+                    .unwrap();
+                Ok(result)
+            })
+            .unwrap();
+        let refusal = latched(&f.runtime);
+        assert_eq!(
+            f.runtime
+                .0
+                .authority
+                .with_fold(|fold| fold.received_through),
+            receipt.sequence,
+            "clean-short scan must retain live fold"
+        );
+        assert_eq!(refusal.sequence, Some(receipt.sequence));
+        assert_eq!(refusal.offset, prior_through);
+        assert_eq!(refusal.segment, path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            refusal.fault,
+            lib::store::RefusalKind::Fold(lib::FoldError::HistoryUnavailable)
+        );
+        f.assert_refolded();
+    }
+}

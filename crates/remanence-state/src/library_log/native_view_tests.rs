@@ -296,3 +296,62 @@ fn fresh_supersede_uses_existing_header_and_rejects_replaced_identity() {
         crate::library_log::store::replay(&root.path().join("library"), LOG, &replaced).unwrap();
     assert!(replay.fold.contradicted(at.tape));
 }
+
+/// T5: count only actual map mutations, retain removed tapes, and report each
+/// changed tape once without retaining every refresh in the history.
+#[test]
+fn native_view_counts_mutations_and_reports_later_tapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(dir.path());
+    let store = Store::open_fixture(dir.path(), ID).unwrap();
+    let mut view = probe(dir.path()).unwrap();
+    assert_eq!(view.mutations(), 0);
+    assert!(view.changed_since(0).is_empty());
+    let snapshot = store.snapshot().unwrap();
+    let before = snapshot
+        .before(snapshot.summary().last_closed_sequence)
+        .unwrap();
+    view.refresh(snapshot.clone()).unwrap();
+    assert_eq!(view.mutations(), 1, "T5 refresh row");
+    assert_eq!(view.changed_since(0), vec![ID]);
+    let refreshed = view.mutations();
+    view.refresh(before).unwrap();
+    assert_eq!(view.mutations(), refreshed);
+    assert!(view.changed_since(refreshed).is_empty());
+    view.replace_authoritative(snapshot).unwrap();
+    assert_eq!(view.mutations(), 2);
+    assert_eq!(view.changed_since(refreshed), vec![ID]);
+    fs::remove_file(path).unwrap();
+    let absent = store.snapshot().unwrap();
+    view.replace_authoritative(absent.clone()).unwrap();
+    assert_eq!(view.mutations(), 3);
+    assert_eq!(view.changed_since(2), vec![ID]);
+    view.replace_authoritative(absent).unwrap();
+    assert_eq!(view.mutations(), 3);
+    assert!(view.changed_since(3).is_empty());
+    let second = [0xa4; 16];
+    let authority = crate::TapeAuthority::open_fixture(dir.path(), second).unwrap();
+    let mut owner = authority.acquire_exclusive().unwrap();
+    owner
+        .publish_initialized(
+            262144,
+            None,
+            crate::tape_log::CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    drop(owner);
+    let index_path = dir.path().join("index.sqlite");
+    view.discover_missing(dir.path(), &index_path).unwrap();
+    assert_eq!(view.mutations(), 4);
+    assert_eq!(view.changed_since(3), vec![second]);
+    assert_eq!(view.changed_since(0), vec![ID, second]);
+    view.discover_missing(dir.path(), &index_path).unwrap();
+    assert_eq!(view.mutations(), 4);
+    assert!(view.changed_since(4).is_empty());
+    assert!(view.changed_since(u64::MAX).is_empty());
+    assert_eq!(view.changed.len(), 2);
+    assert_eq!(view.changes.len(), 2);
+}

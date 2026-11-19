@@ -138,17 +138,19 @@ async fn l1r3e_finalize_drive_fence_precedes_prepare() {
     world.put_tape_in_drive(0x100, "FINAL001L9", Some(0x400), tape);
     let world = Arc::new(Mutex::new(world));
     let mut library = open_model_library(world.clone());
-    let mut cfg = test_write_owner_config(
-        fixture.root.paths().sqlite_path.clone(),
-        fixture.root.paths().audit_dir.clone(),
+    let state = fixture.state.as_ref().unwrap();
+    let runtime = state.library_runtime();
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut state.write_handle(),
+        [library.library()],
+        &HashSet::from([library.library().serial.clone()]),
+    )
+    .unwrap();
+    let mut cfg = test_state_write_owner_config(
+        state,
         &library,
         library_snapshot_cell(library.library().clone()),
     );
-    let state = fixture.state.as_ref().unwrap();
-    let runtime = state.library_runtime();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
-    cfg.catalog = state.projection_client();
-    cfg.checkpoint_journal_dir = fixture.root.paths().journal_dir.join("tapes");
     cfg.checkpoint_max_objects = 1;
     let actor_drive = library.open_drive(0x100, &cfg.policy).unwrap();
     let tx = spawn_drive_actor(0x100, actor_drive, cfg.clone());
@@ -293,17 +295,15 @@ async fn l1r3e_queued_open_rechecks_drive_fence() {
             }
         })
         .unwrap();
-    let mut cfg = test_write_owner_config(
-        fixture.root.paths().sqlite_path.clone(),
-        fixture.root.paths().audit_dir.clone(),
-        &library,
-        library_snapshot_cell(model),
-    );
     let state = fixture.state.as_ref().unwrap();
     let runtime = state.library_runtime();
-    cfg.authority = crate::write_owner::TerminalAuthority::Typed(runtime.clone());
-    cfg.catalog = state.projection_client();
-    cfg.checkpoint_journal_dir = fixture.root.paths().journal_dir.join("tapes");
+    crate::drive_collection::observe_drive_catalog_from_libraries(
+        &mut state.write_handle(),
+        [library.library()],
+        &HashSet::from([library.library().serial.clone()]),
+    )
+    .unwrap();
+    let cfg = test_state_write_owner_config(state, &library, library_snapshot_cell(model));
     let drive = library.open_drive(0x100, &cfg.policy).unwrap();
     let tx = spawn_drive_actor(0x100, drive, cfg);
     let (entered, waiting) = oneshot::channel();

@@ -50,6 +50,19 @@ pub struct StateHandle {
 /// Non-fatal configuration condition observed while opening state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateConfigWarning {
+    /// A blank tape followed its barcode rule at startup.
+    TapePoolMoved {
+        /// Identity of the tape whose pool changed.
+        tape: uuid::Uuid,
+        /// Barcode used to match the rule.
+        barcode: String,
+        /// Previously recorded pool, or no assignment.
+        from: Option<String>,
+        /// Pool now derived by the rules, or no assignment.
+        to: Option<String>,
+        /// Matched rule prefix, absent when no rule matched.
+        rule: Option<String>,
+    },
     /// Tape pools are configured, but no rules can assign tapes to them.
     TapePoolsWithoutRules {
         /// Number of configured tape pools that will be unreachable by rules.
@@ -410,6 +423,15 @@ impl StateHandle {
 
     /// Open state with already-resolved paths and a parsed config.
     pub fn open_with_config(paths: StatePaths, config: RemConfig) -> Result<Self, StateError> {
+        Self::open_with_config_pass(paths, config, ConfigurationPass::Apply)
+    }
+
+    /// Open state with an explicit configuration pass, allowing operator pins during a refusal.
+    pub fn open_with_config_pass(
+        paths: StatePaths,
+        config: RemConfig,
+        pass: ConfigurationPass,
+    ) -> Result<Self, StateError> {
         crate::authority_manifest::AuthorityManifest::preflight(&paths)?;
         let lock = std::sync::Arc::new(StateLockGuard::acquire(&paths.state_dir)?);
         ensure_no_catalog_reset_fence(&paths)?;
@@ -427,32 +449,12 @@ impl StateHandle {
                     }
                     StateError::ConfigInvalid(message)
                 })?;
-        let mut accepted = authority_reset::configuration_record(&config)?;
-        let prior_configuration = library.configuration();
-        if let Some(prior) = &prior_configuration {
-            accepted.generation = prior.generation;
-        }
-        if prior_configuration.as_ref() != Some(&accepted) {
-            accepted.generation = prior_configuration.map_or(Ok(1), |v| {
-                v.generation.checked_add(1).ok_or_else(|| {
-                    StateError::ConfigInvalid("configuration generation exhausted".into())
-                })
-            })?;
-            library
-                .append(|a, view| {
-                    a.configuration_accepted(
-                        accepted,
-                        AuditActor::System,
-                        SourceLayer::Layer4,
-                        view,
-                    )
-                })
-                .map_err(|e| StateError::ConfigInvalid(e.to_string()))?;
-        }
+        let moved = pool_rules::accept_configuration(&paths, &library, &config, pass)?;
         let catalog =
             crate::projector::open(&paths.sqlite_path)?.with_library_runtime(library.clone());
         let index = catalog.write_handle();
-        let config_warnings = configured_tape_pool_warnings(&config);
+        let mut config_warnings = configured_tape_pool_warnings(&config);
+        config_warnings.extend(moved);
         let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
         Ok(Self {
             paths,
@@ -1264,6 +1266,9 @@ impl StateHandle {
             }
             return Err(StateError::JournalReplayFailed(message));
         }
+        lib::store::sync_published_tail(manifest.library_root(), &replay).map_err(|e| {
+            StateError::JournalReplayFailed(format!("sync library log before rebuild: {e}"))
+        })?;
         let no_witness = crate::rebuild_sources::rebuild_sources_complete(
             index,
             &received,
@@ -1496,7 +1501,8 @@ impl StateHandle {
                 .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
             count += 1;
         }
-        // A native write session has no endpoint or restart-ending vocabulary.
+        // A native write session records its drive but has no restart-ending vocabulary.
+        // Holding that drive after a cut-off write is deferred to rule A.
         // Preserve its unresolved source; never manufacture a read-session row
         // or a classified fence from broad native end reasons (C8-G2). Only ruling 21,
         // at open, derives a fence for a tape whose fence append was lost.
@@ -2705,9 +2711,481 @@ pool_id = "camera.copy-a"
         );
     }
 
-    /// The rules now derive a third pool that neither tape holds. The operator's tape is still not
-    /// the rule's to judge, and the rule's tape no longer matches what its rule derives. The
-    /// state is rebuilt from the typed authority under the changed rule.
+    /// Library byte counts detect accidental appends on a refused configuration.
+    fn pool_rule_library_bytes(paths: &StatePaths) -> u64 {
+        fs::read_dir(&paths.audit_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "remlib"))
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum()
+    }
+
+    /// Match the complete operator-facing refusal, including the recorded-pool remedy.
+    fn pool_rule_conflict_text(tape: [u8; 16], barcode: &str, from: &str, to: &str) -> String {
+        format!("tape pool assignment conflict: the barcode pool rules would move tapes that may hold data: tape {} ({barcode}) recorded {from} derived {to}; restore the rule (and its pool, for \"recorded pool not configured\"), or pin each pinnable tape to its recorded pool with `rem tape assign-pool --tape UUID --pool RECORDED` (`--unassign` for <unassigned>) and start again", Uuid::from_bytes(tape))
+    }
+
+    /// A restart moves only blank rule-assigned tapes and records the current configuration reference.
+    #[test]
+    fn pool_rules_blank_tapes_follow_a_rule_change() {
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let (operator, rule_tape) = operator_and_rule_tapes(temp.path(), &config_path);
+        let other = [0x64; 16];
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: other,
+                voltag: "OTHER01L9".into(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        drop(handle);
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert_eq!(
+            handle.config_warnings(),
+            &[StateConfigWarning::TapePoolMoved {
+                tape: Uuid::from_bytes(rule_tape),
+                barcode: "ACM002L9".into(),
+                from: Some("camera.copy-a".into()),
+                to: Some("camera.copy-c".into()),
+                rule: Some("ACM".into()),
+            }]
+        );
+        assert_eq!(
+            catalog_pool(&handle, rule_tape).as_deref(),
+            Some("camera.copy-c")
+        );
+        assert_eq!(
+            catalog_pool(&handle, operator).as_deref(),
+            Some("camera.copy-b")
+        );
+        assert_eq!(catalog_pool(&handle, other), None);
+        let records = handle.library_runtime().test_source_records();
+        let n = records.len();
+        assert_eq!(records[n - 2].tag(), lib::Tag::ConfigurationAccepted);
+        let lib::BodyView::AssignPool(assignment) = records[n - 1].body_view() else {
+            panic!("last record must be the rule move");
+        };
+        assert_eq!(assignment.tape.uuid, rule_tape);
+        assert_eq!(assignment.source, lib::AssignmentSource::Rule);
+        assert_eq!(
+            assignment.configuration,
+            Some(records[n - 2].reference((n - 1) as u64))
+        );
+        let paths = handle.paths().clone();
+        let bytes = pool_rule_library_bytes(&paths);
+        drop(handle);
+        let handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert!(handle.config_warnings().is_empty());
+        assert_eq!(handle.library_runtime().test_source_records().len(), n);
+        assert_eq!(pool_rule_library_bytes(&paths), bytes);
+        drop(handle);
+        fs::write(&config_path, config_with_pool_but_no_rules(temp.path())).unwrap();
+        let handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert_eq!(
+            handle.config_warnings(),
+            &[
+                StateConfigWarning::TapePoolsWithoutRules { pool_count: 1 },
+                StateConfigWarning::TapePoolMoved {
+                    tape: Uuid::from_bytes(rule_tape),
+                    barcode: "ACM002L9".into(),
+                    from: Some("camera.copy-c".into()),
+                    to: None,
+                    rule: None,
+                },
+            ]
+        );
+        assert_eq!(catalog_pool(&handle, rule_tape), None);
+        assert_eq!(catalog_pool(&handle, other), None);
+        assert_eq!(
+            catalog_pool(&handle, operator).as_deref(),
+            Some("camera.copy-b")
+        );
+        for pool in ["camera.copy-b", "camera.copy-c"] {
+            assert!(handle.catalog().get_tape_pool(pool).unwrap().is_none());
+        }
+    }
+
+    /// A tape's typed write fence refuses startup rule moves before any library append.
+    #[test]
+    fn pool_rules_append_refusal_fence_refuses_a_rule_change() {
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-a"),
+        )
+        .unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let id = [0x67; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "ACM002L9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = handle.paths().clone();
+        assert!(!paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple()))
+            .exists());
+        let row = handle.catalog().get_tape(&id).unwrap().unwrap();
+        assert_eq!(row.state, "ready");
+        assert_eq!(row.pool_id.as_deref(), Some("camera.copy-a"));
+        assert!(handle
+            .catalog()
+            .committed_instance_pool_snapshots(&id)
+            .unwrap()
+            .is_empty());
+        assert!(handle.catalog().non_terminal_sessions().unwrap().is_empty());
+        let runtime = handle.library_runtime();
+        let tape = runtime.tape_state(id).unwrap().tape;
+        let sequence = runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(tape),
+                        cause: lib::FenceCause::AppendAdmissionRefused,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        let before = pool_rule_library_bytes(&paths);
+        drop(runtime);
+        drop(handle);
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let reopened = StateHandle::open_from_config_file(&config_path);
+        assert!(
+            matches!(&reopened, Err(StateError::TapePoolAssignmentConflict(text))
+                if text.contains(&format!("library:{sequence}"))),
+            "expected a typed conflict naming library:{sequence}, got {reopened:?}"
+        );
+        assert_eq!(pool_rule_library_bytes(&paths), before);
+    }
+
+    /// Written tapes refuse before any configuration append, while an operator pin remains available.
+    #[test]
+    fn pool_rules_written_tape_refuses_until_pinned() {
+        use crate::authority::TapeAuthorityWriter;
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-a"),
+        )
+        .unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let id = [0x63; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "ACM002L9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = handle.paths().clone();
+        let authority =
+            crate::TapeAuthority::open(paths.journal_dir.join("tapes"), id, &paths.sqlite_path)
+                .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_report(&(&crate::checkpoint::tests::record(id)).into())
+            .unwrap();
+        owner
+            .end_session(
+                [9; 16],
+                "2026-11-02T00:00:00Z".into(),
+                crate::tape_log::SessionEndReason::CleanClose,
+                None,
+                std::iter::empty(),
+            )
+            .unwrap();
+        handle
+            .index
+            .project_tape_log(&owner.freeze().unwrap())
+            .unwrap();
+        drop(owner);
+        drop(authority);
+        drop(handle);
+        drop(
+            StateHandle::open_from_config_file(&config_path)
+                .expect("T2 premise: written log must reopen under unchanged rules"),
+        );
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let before = pool_rule_library_bytes(&paths);
+        let error = StateHandle::open_from_config_file(&config_path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            pool_rule_conflict_text(id, "ACM002L9", "camera.copy-a", "camera.copy-c")
+        );
+        assert_eq!(pool_rule_library_bytes(&paths), before);
+        let config = load_config(&config_path).unwrap();
+        let mut handle = StateHandle::open_with_config_pass(
+            paths.clone(),
+            config,
+            ConfigurationPass::ReportOnly,
+        )
+        .unwrap();
+        assert!(!handle
+            .config_warnings()
+            .iter()
+            .any(|w| matches!(w, StateConfigWarning::TapePoolMoved { .. })));
+        assert_eq!(pool_rule_library_bytes(&paths), before);
+        let generation = handle
+            .library_runtime()
+            .tape_state(id)
+            .unwrap()
+            .assignment_generation;
+        handle
+            .assign_tape_pool(id, generation, Some("camera.copy-a"))
+            .unwrap();
+        drop(handle);
+        let handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert_eq!(catalog_pool(&handle, id).as_deref(), Some("camera.copy-a"));
+        assert_eq!(
+            handle.library_runtime().tape_state(id).unwrap().pool_source,
+            Some(lib::PoolSource::Operator(lib::Unit))
+        );
+    }
+
+    /// An ended first session with an uncommitted tail refuses a rule move
+    /// without appending library records, even though no object was committed.
+    #[test]
+    fn pool_rules_ended_first_session_with_tail_refuses_a_rule_change() {
+        use crate::tape_log::{
+            SessionDrive, SessionEndReason, TailFile, TailFilemark, TailIdentity,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-a"),
+        )
+        .unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let id = [0x65; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "ACM003L9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = handle.paths().clone();
+        let authority =
+            crate::TapeAuthority::open(paths.journal_dir.join("tapes"), id, &paths.sqlite_path)
+                .unwrap();
+        let mut owner = authority.acquire_exclusive().unwrap();
+        owner
+            .publish_initialized(
+                262144,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        owner
+            .open_session(
+                [9; 16],
+                "2026-11-02T00:00:00Z".into(),
+                SessionDrive {
+                    serial: "pool-rules-test".into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: crate::library_log::DriveKey::Standalone(
+                        crate::library_log::Standalone {
+                            drive_serial: "pool-rules-test".into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
+        owner
+            .end_session(
+                [9; 16],
+                "2026-11-02T00:01:00Z".into(),
+                SessionEndReason::FailedAppend,
+                None,
+                [
+                    Ok(TailFile {
+                        tape_file_number: 1,
+                        identity: TailIdentity::Object("uncommitted-first-object".into()),
+                        known_blocks: 1,
+                        unknown_blocks: 0,
+                        filemark: TailFilemark::Present,
+                        synchronized_blocks: 1,
+                        synchronized_filemark: true,
+                    }),
+                    Ok(TailFile {
+                        tape_file_number: 2,
+                        identity: TailIdentity::Object("failed-second-object".into()),
+                        known_blocks: 0,
+                        unknown_blocks: 2,
+                        filemark: TailFilemark::Absent,
+                        synchronized_blocks: 0,
+                        synchronized_filemark: false,
+                    }),
+                ],
+            )
+            .unwrap();
+        let frozen = owner.freeze().unwrap();
+        let summary = frozen.tape_summary();
+        assert_eq!(summary.object_count, 0);
+        assert!(summary.open_session.is_none());
+        assert_eq!(
+            summary.last_session_end.as_ref().unwrap().tail_file_count,
+            2
+        );
+        handle.index.project_tape_log(&frozen).unwrap();
+        drop(frozen);
+        drop(owner);
+        drop(authority);
+        drop(handle);
+        drop(
+            StateHandle::open_from_config_file(&config_path)
+                .expect("T9 premise: ended session must reopen under unchanged rules"),
+        );
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let before = pool_rule_library_bytes(&paths);
+        let error = StateHandle::open_from_config_file(&config_path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            pool_rule_conflict_text(id, "ACM003L9", "camera.copy-a", "camera.copy-c")
+        );
+        assert_eq!(pool_rule_library_bytes(&paths), before);
+    }
+
+    /// Catalogue copies refuse a logless move, recovery adoption is skipped, and blank adoption moves.
+    #[test]
+    fn pool_rules_unknown_and_recovery_tapes() {
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, two_pool_config(temp.path(), "camera.copy-a")).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let id = [0x63; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "ACM002L9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = handle.paths().clone();
+        assert!(!paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple()))
+            .exists());
+        drop(handle);
+        let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+        conn.execute("insert into object_instances(object_id, tape_uuid, tape_file_number, status) values('seeded-object', ?1, ?2, 'committed')",
+            rusqlite::params![id.to_vec(), 1u64.to_be_bytes().to_vec()]).unwrap();
+        drop(conn);
+        fs::write(&config_path, two_pool_config(temp.path(), "camera.copy-b")).unwrap();
+        let error = StateHandle::open_from_config_file(&config_path)
+            .expect_err("T3(a): catalogue copies must refuse the move");
+        assert_eq!(
+            error.to_string(),
+            pool_rule_conflict_text(id, "ACM002L9", "camera.copy-a", "camera.copy-b")
+        );
+
+        for (tail, recovery) in [
+            (BootstrapAdoptionTailEvidence::DataAfterBootstrap, true),
+            (
+                BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod,
+                false,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, two_pool_config(temp.path(), "camera.copy-a")).unwrap();
+            let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+            let input = adoption_input(Uuid::new_v4());
+            let id = input.tape_uuid;
+            handle
+                .adopt_bootstrap_identity(input, adoption_evidence(tail))
+                .unwrap();
+            let before = handle.library_runtime().test_source_records().len();
+            drop(handle);
+            fs::write(&config_path, two_pool_config(temp.path(), "camera.copy-b")).unwrap();
+            let handle = StateHandle::open_from_config_file(&config_path).unwrap();
+            if recovery {
+                assert!(
+                    !handle
+                        .config_warnings()
+                        .iter()
+                        .any(|w| matches!(w, StateConfigWarning::TapePoolMoved { .. })),
+                    "T3(b): no TapePoolMoved for recovery adoption"
+                );
+                assert_eq!(catalog_pool(&handle, id).as_deref(), Some("camera.copy-a"));
+                assert!(handle.library_runtime().test_source_records()[before..]
+                    .iter()
+                    .all(|r| r.tag() != lib::Tag::AssignPool));
+            } else {
+                assert_eq!(catalog_pool(&handle, id).as_deref(), Some("camera.copy-b"));
+                assert_eq!(
+                    handle.config_warnings(),
+                    &[StateConfigWarning::TapePoolMoved {
+                        tape: Uuid::from_bytes(id),
+                        barcode: "ACM901L9".into(),
+                        from: Some("camera.copy-a".into()),
+                        to: Some("camera.copy-b".into()),
+                        rule: Some("ACM".into()),
+                    }]
+                );
+            }
+        }
+    }
+
+    /// Rebuilding under changed rules moves the blank rule tape to the new pool;
+    /// the operator tape keeps its assignment and both rule checks then succeed.
     #[test]
     fn a_changed_rule_fails_a_rule_pool_and_leaves_an_operator_pool_alone() {
         let temp = tempfile::tempdir().unwrap();
@@ -2721,17 +3199,24 @@ pool_id = "camera.copy-a"
         .unwrap();
         let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
         handle.record_rule_tape_pool_assignment(operator).unwrap();
-        assert!(matches!(
-            handle.record_rule_tape_pool_assignment(rule_tape),
-            Err(StateError::TapePoolAssignmentConflict(_))
-        ));
+        handle.record_rule_tape_pool_assignment(rule_tape).unwrap();
+        assert_eq!(
+            handle.config_warnings(),
+            &[StateConfigWarning::TapePoolMoved {
+                tape: Uuid::from_bytes(rule_tape),
+                barcode: "ACM002L9".into(),
+                from: Some("camera.copy-a".into()),
+                to: Some("camera.copy-c".into()),
+                rule: Some("ACM".into()),
+            }]
+        );
         assert_eq!(
             catalog_pool(&handle, operator).as_deref(),
             Some("camera.copy-b")
         );
         assert_eq!(
             catalog_pool(&handle, rule_tape).as_deref(),
-            Some("camera.copy-a")
+            Some("camera.copy-c")
         );
     }
 
@@ -4235,7 +4720,6 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
-    #[ignore = "D-C3a-S-1 D3 (next landing): the restart pool-rule pass is not in the first landing"]
     fn reopen_reconciles_removed_config_tape_pools() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-handle")
@@ -4248,10 +4732,9 @@ pool_id = "camera.copy-a"
             .as_bytes();
 
         {
-            let handle =
+            let mut handle =
                 StateHandle::open_with_config(paths.clone(), config).expect("open with pool");
             handle
-                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid,
                     voltag: "ACM001L9".to_string(),
@@ -4277,7 +4760,8 @@ pool_id = "camera.copy-a"
         }
 
         let config = parse_config_toml(&config_without_pools(temp.path())).expect("config");
-        let handle = StateHandle::open_with_config(paths, config).expect("reopen without pool");
+        let handle =
+            StateHandle::open_with_config(paths.clone(), config).expect("reopen without pool");
 
         assert!(handle
             .catalog()
@@ -4295,10 +4779,20 @@ pool_id = "camera.copy-a"
             .list_tapes(Some("camera.copy-a"), TapeKindFilter::Data)
             .expect("pool tapes after removal")
             .is_empty());
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_without_pools(temp.path())).expect("write rebuild config");
+        drop(handle);
+        StateHandle::rebuild_projection_from_config_file(&config_path)
+            .expect("rebuild removed pools");
+        let catalog = crate::projector::open(&paths.sqlite_path).expect("fresh projector");
+        assert!(catalog
+            .write_handle()
+            .get_tape_pool("camera.copy-a")
+            .expect("rebuilt pool lookup")
+            .is_none());
     }
 
     #[test]
-    #[ignore = "D-C3a-S-1 D3 (next landing): the restart pool-rule pass is not in the first landing"]
     fn reopen_reconciles_derived_pool_membership_from_rules() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-handle")
@@ -4311,10 +4805,9 @@ pool_id = "camera.copy-a"
             .as_bytes();
 
         {
-            let handle =
+            let mut handle =
                 StateHandle::open_with_config(paths.clone(), config).expect("open with pool");
             handle
-                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid,
                     voltag: "ACM001L9".to_string(),
@@ -6010,6 +6503,9 @@ mod cutover_tests {
         assert_eq!(state.index.projected_through_sequence(id).unwrap(), 5);
     }
 }
+
+mod pool_rules;
+pub use pool_rules::{accept_configuration, ConfigurationPass};
 
 mod initialization;
 pub use initialization::InitializationGuard;

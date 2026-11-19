@@ -301,7 +301,7 @@ the refusal asks for an unused label:
 error: label FIRST belongs to tape 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f; choose a new label
 ```
 
-For a blank cartridge, initialize it under an unused label first. A blank
+For a blank rewritable cartridge, initialize it under an unused label first. A blank
 cartridge has no bootstrap identity for rebind to read. Once the loaded
 cartridge has a catalogued identity, rebind can move `FIRST` to it.
 
@@ -344,7 +344,7 @@ cartridge cannot take a label through rebind.
 
 | Situation | Without retire | With retire |
 | --- | --- | --- |
-| Test setup rebuilt (virtual tape library) | `tape identity mismatch`. A full catalog reset clears the active catalog, library log and tape logs (archiving them). | Retire each affected tape by tape UUID, then run `rem tape init` for blank cartridges and for those still carrying the old tape UUID, then run the workload again. The catalog and library-log history stay intact. Cartridges initialized under an unknown tape UUID need adoption, or a clobber that names that UUID. |
+| Test setup rebuilt (virtual tape library) | `tape identity mismatch`. A full catalog reset clears the active catalog, library log and tape logs (archiving them). | Retire each affected tape by tape UUID, then run `rem tape init` for rewritable cartridges that are blank or still carry the old tape UUID, then run the workload again. The catalog and library-log history stay intact. Cartridges initialized under an unknown tape UUID need adoption, or a clobber that names that UUID. |
 | Recycling tapes between runs | Init is refused: an anomaly if the medium was changed outside Remanence, `refuse-clobber` if it holds written data. | A script calls retire, by the original tape UUID, and then init. A repeated retire of the same tape UUID is a no-op that reports success. |
 | Which objects lost all their copies? | Nothing can answer this. | `rem tape retire --dry-run` lists the objects that would lose their last committed copy. |
 | Mislabeled or foreign cartridge | Refused. | Refused, unchanged. |

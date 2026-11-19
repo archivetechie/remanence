@@ -475,6 +475,18 @@ fn durable_terminal_component_projection_failure_asks_for_replay_and_resumes() {
             .release_tape_io_fence(&fence.quarantine_id, "projection fault removed", false)
             .unwrap();
     }
+    let holds = state.library_runtime().standalone_drive_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].drive_serial, SERIAL);
+    assert!(state
+        .library_runtime()
+        .release_standalone_drive_hold(
+            &format!("library:{}", holds[0].fence),
+            "projection fault removed",
+            AuditActor::local_user(),
+        )
+        .unwrap()
+        .is_some());
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
@@ -495,6 +507,7 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
     let sqlite = state.paths().sqlite_path.clone();
     let world = world();
     let lock = root.path().join("locks");
+    let runtime = state.library_runtime();
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
@@ -518,6 +531,12 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
             [UUID.as_slice()],
         )
         .unwrap();
+    remanence_state::projector::open(&sqlite)
+        .unwrap()
+        .write_handle()
+        .fixture_forget_projection_markers()
+        .unwrap();
+    runtime.fixture_mark_projection_dirty();
     let before = dispatched_writes(&world);
     // On typed state, catch-up repairs a lost SQLite seal from the logs.
     let refusal = actor
@@ -530,6 +549,7 @@ fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
     );
     assert_eq!(dispatched_writes(&world), before);
     let _ = actor.finish();
+    drop(runtime);
     let state = reopen_state();
     assert_eq!(
         state.catalog().get_tape(&UUID).unwrap().unwrap().state,
@@ -1941,16 +1961,11 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                 };
 
                 assert!(
-                    error.contains(if fresh {
-                        "TailBeyondKnownState"
-                    } else {
-                        "SessionSuffixContradiction"
-                    }),
+                    error.contains("TailBeyondKnownState"),
                     "parity={parity_on} fresh={fresh}: {error}"
                 );
                 assert!(
-                    !fresh
-                        || error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
+                    error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
                     "{error}"
                 );
                 assert_eq!(dispatched_writes(&world), before);
@@ -2325,20 +2340,50 @@ fn bootstrap_without_filemark_can_be_explicitly_superseded() {
     drop(reopen_state());
 }
 
+/// Check durable absence over every received tag, including unapplied library records.
+/// Call only after releasing the test's state, configuration and mount owners.
+fn assert_no_received_fence_or_recovery(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+) {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+    let mut tags = Vec::new();
+    let replay = store::replay_observed_with_received(
+        &paths.audit_dir,
+        library_uuid,
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, _receipt| {
+            tags.push(record.tag());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        replay.refusal.is_none(),
+        "typed library replay refused: {:?}",
+        replay.refusal
+    );
+    assert!(replay.fold.pending.is_empty());
+    assert!(
+        tags.iter()
+            .all(|tag| !matches!(tag, Tag::FenceRaised | Tag::RecoveryRecorded)),
+        "unexpected durable fence or recovery: {tags:?}"
+    );
+}
+
 #[test]
 fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let root = tempfile::tempdir().unwrap();
     let state = state(root.path());
+    let runtime = state.library_runtime();
+    let checkpoint_journal_dir = runtime.manifest().tape_root().to_path_buf();
     let cfg = crate::write_owner::TerminalWriteConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            state.paths().audit_dir.clone(),
-            true,
-            &(Arc::new(Mutex::new(()))),
-        ),
+        authority: crate::write_owner::TerminalAuthority::Typed(runtime),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
+        checkpoint_journal_dir,
     };
     let error = crate::append_admission::AdmissionError::new(
         crate::append_admission::AdmissionErrorKind::Io(remanence_library::TapeIoError::new(
@@ -2364,15 +2409,11 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    assert!(remanence_state::FileAuditLog::replay(
-        &cfg.authority
-            .historical_fixture()
-            .expect("historical audit fixture")
-            .audit_dir
-    )
-    .unwrap()
-    .iter()
-    .all(|r| r.event != AuditEvent::RecoveryEvent));
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    drop(cfg);
+    drop(state);
+    assert_no_received_fence_or_recovery(&paths, library_uuid);
 }
 
 /// Structural refusals quarantine only the tape, and retain the authenticated actor.
@@ -2469,137 +2510,6 @@ fn tape_log_lease_contention_is_unavailable_and_other_lock_faults_are_not() {
         crate::status_from_state_error(fault).code(),
         tonic::Code::FailedPrecondition
     );
-}
-
-/// A historical tape identity never acquires today's endpoint; both explicit
-/// identity dimensions independently block mutations, while reads remain usable.
-#[test]
-#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1"]
-fn standalone_fences_match_only_recorded_tape_or_endpoint() {
-    let root = tempfile::tempdir().unwrap();
-    let mut state = state(root.path());
-    let here = remanence_library::DriveKey::Standalone {
-        drive_serial: SERIAL.into(),
-    };
-    let elsewhere = remanence_library::DriveKey::Standalone {
-        drive_serial: "OTHER".into(),
-    };
-    for (tape, endpoint, blocks) in [
-        (UUID, Some(&elsewhere), true),
-        ([9; 16], Some(&here), true),
-        ([9; 16], Some(&elsewhere), false),
-        ([9; 16], None, false),
-        (UUID, None, true),
-    ] {
-        let fence = state
-            .write_handle()
-            .record_tape_io_fence_at_endpoint(
-                remanence_state::TapeIoFenceInput {
-                    tape_uuid: tape,
-                    barcode: None,
-                    reason: "test".into(),
-                    evidence_json: None,
-                },
-                endpoint,
-            )
-            .unwrap();
-        assert_eq!(standalone_fence_releasable(&fence), endpoint.is_some());
-        crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog()).unwrap();
-        if blocks {
-            let refusal = standalone_fence_policy(state.catalog(), Some(UUID), Some(&here), true)
-                .unwrap_err();
-            assert_eq!(
-                refusal.to_string().contains("--after-settled-inventory"),
-                endpoint.is_none()
-            );
-        }
-        assert_eq!(
-            standalone_fence_policy(state.catalog(), Some(UUID), Some(&here), true).is_err(),
-            blocks
-        );
-        assert_eq!(
-            standalone_fence_policy(state.catalog(), Some(UUID), Some(&here), false)
-                .unwrap()
-                .len(),
-            1
-        );
-        state
-            .release_tape_io_fence(&fence.quarantine_id, "checked", false)
-            .unwrap()
-            .unwrap();
-        let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-        let release = audit
-            .iter()
-            .find(|r| {
-                r.event == AuditEvent::TapeIoFenceReleased
-                    && r.subject.id.as_deref() == Some(&fence.quarantine_id)
-            })
-            .unwrap();
-        assert_eq!(
-            release.detail.get("endpoint_key"),
-            endpoint
-                .map(|key| ciborium::Value::Text(key.encode()))
-                .as_ref()
-        );
-    }
-}
-
-/// Both raise and release preserve the endpoint across authoritative rebuilds.
-#[test]
-#[ignore = "ruling 29 (next landing): no production path raises a standalone tape-and-endpoint fence in the first landing; D-L2-29-1"]
-fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
-    let root = tempfile::tempdir().unwrap();
-    let mut state = state(root.path());
-    let endpoint = remanence_library::DriveKey::Standalone {
-        drive_serial: SERIAL.into(),
-    };
-    raise_standalone_fence(
-        &mut state,
-        UUID,
-        Some(&endpoint),
-        "standalone_test",
-        "test evidence",
-    )
-    .unwrap();
-    let fence = state
-        .catalog()
-        .list_active_tape_io_fences()
-        .unwrap()
-        .pop()
-        .unwrap();
-    let paths = state.paths().clone();
-    let config = state.config().clone();
-    let library_uuid = state.library_runtime().manifest().library_uuid();
-    let expected = state.catalog().list_active_tape_io_fences().unwrap();
-    drop(state);
-    crate::tests::assert_fences_survive_empty_rebuild(
-        &paths,
-        config.clone(),
-        library_uuid,
-        &expected,
-    );
-    let mut state = StateHandle::open_with_config(paths, config).unwrap();
-    assert!(standalone_fence_releasable(&fence));
-    crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog()).unwrap();
-    state
-        .release_tape_io_fence(&fence.quarantine_id, "rescued files", false)
-        .unwrap()
-        .unwrap();
-    let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    let mut rebuilt = remanence_state::projector::open(root.path().join("rebuilt-fence.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    rebuilt
-        .rebuild_from_authoritative_sources(&audit, &[])
-        .unwrap();
-    let row = rebuilt
-        .tape_io_fence_by_quarantine_id(&fence.quarantine_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.endpoint, Some(endpoint));
-    assert_eq!(row.release_ack.as_deref(), Some("rescued files"));
-    assert_eq!(row.state, "released");
-    assert!(rebuilt.list_active_tape_io_fences().unwrap().is_empty());
 }
 
 /// A child forked by another thread shares the lock's open file description
@@ -2722,10 +2632,35 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
     crate::tests::assert_fences_survive_empty_rebuild(&paths, config, library_uuid, &fences);
 }
 
-/// A failed standalone WRITE fails closed through the stand-in: motion is latched and counted
-/// once, and it records no fence (ruling 29; D-L2-29-1 D1). Production plans an identity not yet
-/// provisioned (D-L2-29-1 §3); this fixture provisions it, so the pin is the stand-in, not the fold.
-/// Cleanup adds only its CDB, and the spent invocation sends no more commands or refusals.
+/// Inspect the typed hold through L1-1's authoritative list, including initialization's planned tape.
+fn assert_init_hold(
+    runtime: &remanence_state::library_runtime::LibraryRuntime,
+    error: &str,
+) -> u64 {
+    assert!(!runtime.motion_fenced());
+    let holds = runtime.standalone_drive_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    let hold = &holds[0];
+    assert_eq!(hold.drive_serial, SERIAL);
+    assert_eq!(
+        hold.cause,
+        remanence_state::library_log::FenceCause::TransferError
+    );
+    let evidence = hold
+        .detail
+        .iter()
+        .find(|(key, _)| key == "evidence_json")
+        .unwrap();
+    let evidence: serde_json::Value = serde_json::from_str(&evidence.1).unwrap();
+    assert_eq!(
+        evidence["tape_uuid"],
+        uuid::Uuid::from_bytes(UUID).to_string()
+    );
+    assert_eq!(evidence["error"], error);
+    hold.fence
+}
+
+/// A failed initialization holds its drive without latching; the next invocation refuses before RESERVE.
 #[test]
 fn b3b_standalone_init_failure_one_fence_by_cause() {
     use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
@@ -2757,7 +2692,11 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
             Err(error.to_string())
         },
     );
-    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(
+        !error.contains("cannot durably record standalone write uncertainty"),
+        "{error}"
+    );
     assert_eq!(
         census::total(),
         finished.get().0 + 1,
@@ -2765,7 +2704,7 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
     );
     assert_eq!(census::normalizations(), finished.get().1);
     assert!(mount.unusable);
-    assert!(runtime.motion_fenced(), "{result:?}");
+    let hold = assert_init_hold(&runtime, &error);
     let fences = mount.state.catalog().list_active_tape_io_fences().unwrap();
     assert!(fences.is_empty(), "{fences:?}");
     let commands = world.lock().unwrap().command_log.len();
@@ -2779,14 +2718,41 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
     drop((mount, runtime));
     drop(state);
 
-    let log = read_log(&paths, library_uuid);
+    assert!(refusals(&read_log(&paths, library_uuid)).is_empty());
+
+    let mut state = configured_state(root.path(), false);
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    world.lock().unwrap().command_log.clear();
+    let prepared = std::cell::Cell::new(false);
+    let retry: Result<(), _> = mount.initialize(
+        true,
+        |_, _| {
+            prepared.set(true);
+            Err::<(TapeUuid, ()), _>("prepare ran".into())
+        },
+        |_, _, ()| panic!("held drive must not write"),
+    );
+    let error = retry.unwrap_err().to_string();
+    assert!(
+        error.starts_with(&format!("DriveFenced: drive P4-MODEL library:{hold}")),
+        "{error}"
+    );
+    assert!(!prepared.get());
+    assert!(world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .all(|c| c.opcode != 0x16));
+    drop(mount);
+    drop(state);
     assert_eq!(
-        refusals(&log),
+        refusals(&read_log(&paths, library_uuid)),
         [RecordedRefusal::expect(
-            5,
-            "StandaloneFenceUnrecorded",
+            12,
+            "DriveFenced",
             "tape",
-            Some(UUID),
+            None,
             remanence_state::AuditActor::local_user(),
         )]
     );
@@ -2815,6 +2781,7 @@ fn an_unrecordable_standalone_write_fence_is_counted_once_with_its_tape() {
     )
     .unwrap();
     assert!(!runtime.motion_fenced());
+    runtime.fail_next_standalone_hold_for_test();
     let result: Result<(), _> = mount.initialize(
         false,
         |_, _| Ok((UUID, ())),
@@ -2837,8 +2804,13 @@ fn an_unrecordable_standalone_write_fence_is_counted_once_with_its_tape() {
         error.ends_with("; motion is fenced and recovery is required"),
         "{error}"
     );
+    assert!(
+        error.contains("; the drive hold was not recorded: "),
+        "{error}"
+    );
     assert!(mount.unusable);
     assert!(runtime.motion_fenced());
+    assert!(runtime.standalone_drive_holds().unwrap().is_empty());
     drop((mount, runtime));
     drop(state);
 
@@ -2996,11 +2968,9 @@ fn b3b_pipeline_position_consumer(consumer: &str) {
     mount.release(mounted);
 }
 
-/// A post-write adapter failure fails closed through the stand-in: motion is latched and counted
-/// once, and it records no fence (ruling 29; D-L2-29-1 D1). Production plans an identity not yet
-/// provisioned (D-L2-29-1 §3); this fixture provisions it, so the pin is the stand-in, not the fold.
+/// A post-write adapter failure holds the drive while preserving the original failure and no tape fence.
 fn fix2_init_adapter(scenario: &str) {
-    use crate::tests::refusal_tests::{read_log, refusals, RecordedRefusal};
+    use crate::tests::refusal_tests::{read_log, refusals};
     let root = tempfile::tempdir().unwrap();
     let mut state = state_with_audit(root.path(), false);
     let paths = state.paths().clone();
@@ -3023,44 +2993,35 @@ fn fix2_init_adapter(scenario: &str) {
             Err(error.to_string())
         },
     );
-    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(
+        !error.contains("cannot durably record standalone write uncertainty"),
+        "{error}"
+    );
     assert!(mount.unusable, "{scenario}");
-    assert!(runtime.motion_fenced(), "{scenario}: {result:?}");
+    assert_init_hold(&runtime, &error);
     let fences = mount.state.catalog().list_active_tape_io_fences().unwrap();
     assert!(fences.is_empty(), "{scenario}: {fences:?}");
     drop((mount, runtime));
     drop(state);
 
     let log = read_log(&paths, library_uuid);
-    assert_eq!(
-        refusals(&log),
-        [RecordedRefusal::expect(
-            5,
-            "StandaloneFenceUnrecorded",
-            "tape",
-            Some(UUID),
-            remanence_state::AuditActor::local_user(),
-        )],
-        "{scenario}"
-    );
+    assert!(refusals(&log).is_empty(), "{scenario}");
 }
 
-/// An overlap completion failure latches motion and is counted once through the stand-in;
-/// the stand-in records no fence (ruling 29; D-L2-29-1 D1).
+/// An overlap completion failure holds the standalone drive.
 #[test]
 fn b3b_fix2_init_overlap_post_write() {
     fix2_init_adapter("overlap");
 }
 
-/// A post-write parity block-size refusal latches motion and is counted once through the stand-in;
-/// the stand-in records no fence (ruling 29; D-L2-29-1 D1).
+/// A post-write parity block-size refusal holds the standalone drive.
 #[test]
 fn b3b_fix2_init_parity_size_post_write() {
     fix2_init_adapter("parity-size");
 }
 
-/// A post-write poisoned parity sink refusal latches motion and is counted once through the stand-in;
-/// the stand-in records no fence (ruling 29; D-L2-29-1 D1).
+/// A post-write poisoned parity sink refusal holds the standalone drive.
 #[test]
 fn b3b_fix2_init_parity_poisoned_post_write() {
     fix2_init_adapter("parity-poisoned");
@@ -3106,12 +3067,11 @@ fn b3b_fix2_init_r6_definite_rejection() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    assert!(
-        !remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir)
-            .unwrap()
-            .iter()
-            .any(|e| e.event == AuditEvent::TapeIoFenceRaised)
-    );
+    let paths = mount.state.paths().clone();
+    let library_uuid = mount.state.library_runtime().manifest().library_uuid();
+    drop(mount);
+    drop(state);
+    assert_no_received_fence_or_recovery(&paths, library_uuid);
 }
 
 /// The real operator constructor installs the shared typed runtime on its actual

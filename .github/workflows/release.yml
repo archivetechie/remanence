@@ -69,6 +69,9 @@ jobs:
             musl-tools libarchive-tools attr file
           cargo install cargo-about --version 0.9.1 --locked --features cli
 
+      - name: Trusted journal volume for tests
+        run: tools/ci_journal_volume.sh up "$RUNNER_TEMP/journal-volume" 4G
+
       - name: Run release gates
         run: |
           cargo fmt --all --check
