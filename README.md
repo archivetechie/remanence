@@ -222,8 +222,10 @@ seam is format-free.*
 
 ## Contributing and security
 
-Issues and pull requests are welcome; [CONTRIBUTING.md](CONTRIBUTING.md)
-explains how the project works day to day. To report a security issue,
+Issues are welcome, and so are test results from your own hardware; the
+project writes every change itself and does not merge pull requests.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to help and how the project
+works day to day. To report a security issue,
 especially anything affecting the encryption envelope or the integrity
 guarantees, see [SECURITY.md](SECURITY.md), and do not open a public issue for
 a suspected vulnerability. [RELEASING.md](RELEASING.md) describes the

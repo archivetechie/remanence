@@ -259,12 +259,28 @@ whether read buffers can be swapped out, not whether the data is correct.
 On a host with a tape drive, `rem doctor` checks the tape group, the
 capability on the `rem` binary it runs from, the lock directory, the state
 directory, whether the state directory is on a filesystem it trusts for
-durable writes, whether the journal directory is on a local filesystem with a
-block device of its own whose disk writes through or supports FUA, and the
-memory-lock limit. It then looks for drives. Each
-failed check names its fix. The
+durable writes, and the memory-lock limit. Its `journal volume` check requires
+a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write
+barriers on and, on ZFS, flush switches set to `0`. ZFS also gets an advisory
+`journal sync` row warning about `sync=disabled`. It then looks for drives.
+Each failed check names its fix. The
 [standalone-drive guide](guide-standalone-drive.md#1-set-up-the-drive) shows
 it in use.
+
+Remanence makes its records durable with fsync, as a database does; it cannot
+test whether a disk keeps what it confirms. If a power cut loses the last
+journal records, nothing on tape is lost or overwritten. The next write to
+that tape stops with `TailBeyondKnownState` and names the objects. Rescue them
+with `rem tape restore --scan --out rescued`, then run
+`rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After
+an interrupted `put` whose sources still exist, run `supersede-tail` and rerun
+`put`. A UPS, or a disk with power-loss protection, removes this power-cut
+exposure.
+
+Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
+`fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
+or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and
+`zil_nocacheflush` at `0` and the dataset's `sync=standard`.
 
 ## First run
 

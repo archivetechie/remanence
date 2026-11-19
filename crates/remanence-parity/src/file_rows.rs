@@ -448,7 +448,7 @@ pub enum JournalError {
     /// Journal path is on a filesystem class that cannot be trusted as a
     /// crash-recovery commit point.
     #[error(
-        "journal volume rejected: {0} (must be a trusted local volume with honored fsync; §10.6)"
+        "journal volume rejected: {0} (the journal needs a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on)"
     )]
     UntrustedVolume(String),
     /// Replay found a torn or corrupt tail that must be reconciled against the

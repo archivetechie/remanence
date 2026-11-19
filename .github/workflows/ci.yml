@@ -73,34 +73,15 @@ jobs:
       - name: Trusted journal volume for tests
         run: tools/ci_journal_volume.sh up "$RUNNER_TEMP/journal-volume" 4G
 
-      # Read-only. Shows the write-cache mode the journal trust check will
-      # consult for the test temp directories, so a rejection can be told
-      # apart from a runner disk that is "write back" without FUA.
-      - name: Report journal-volume write cache
+      # Read-only. Shows the mount fields and statfs type the journal check reads
+      # for the test temp directories.
+      - name: Report journal-volume filesystem
         run: |
           (
             for dir in "${TMPDIR:-/tmp}" "${RUNNER_TEMP:-/tmp}" /tmp; do
-              echo "== $dir ($(findmnt -no SOURCE,FSTYPE -T "$dir"))"
-              dev=$(stat -c '%d' "$dir")
-              major=$(( ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff) ))
-              minor=$(( (dev & 0xff) | ((dev >> 12) & ~0xff) ))
-              echo "major:minor: $major:$minor"
-              node=$(readlink -e "/sys/dev/block/$major:$minor")
-              if [ -z "$node" ]; then
-                echo "sysfs: no /sys/dev/block/$major:$minor entry (anonymous device)"
-                continue
-              fi
-              echo "sysfs: $node"
-              if [ -f "$node/partition" ]; then
-                echo "partition: yes (number $(cat "$node/partition"))"
-                owner=$(dirname "$node")
-              else
-                echo "partition: no"
-                owner=$node
-              fi
-              echo "consulted: $owner"
-              echo "queue/write_cache: $(cat "$owner/queue/write_cache" 2>&1)"
-              echo "queue/fua: $(cat "$owner/queue/fua" 2>&1)"
+              echo "== $dir"
+              findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS -T "$dir"
+              stat -f -c %t "$dir"
             done
           ) || true
 
