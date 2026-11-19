@@ -1266,7 +1266,7 @@ async fn between_sessions_tail_reads_reselects_and_refuses_discard() {
             let code = preview.as_ref().err().map(tonic::Status::code);
             assert_eq!(code, Some(tonic::Code::FailedPrecondition), "closed-tail preview: {preview:?}");
             let error = preview.unwrap_err();
-            assert_eq!(error.message(), "tape CHAR01L9 holds data written after its last closed session that this state does not record, such as after a restore from an older copy of the state; supersede-tail cannot discard it in this release. The tape stays readable and closed for writing. Keep it so, withdraw it with rem tape retire, or start the service from a newer copy of the state directory.");
+            assert_eq!(error.message(), "tape CHAR01L9 holds data this state does not record, and this state shows no open session on the tape (its last session closed, or none opened since it was initialized here), as happens after a restore from an older copy of the state; supersede-tail cannot discard it in this release. The tape stays readable and closed for writing. Keep it so, withdraw it with rem tape retire, or start the service from a newer copy of the state directory.");
             assert_eq!(x22_fences(&client).await.unwrap(), fences, "preview keeps the same active fence");
             assert_eq!(fixture.world.lock().unwrap().tapes[BARCODE].records, intact,
                 "reads, refused append and refused discard preserve every tape 1 record");

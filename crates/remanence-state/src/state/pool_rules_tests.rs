@@ -194,9 +194,23 @@ fn classification_table() {
         ),
     ] {
         assert_eq!(
-            classify_pool_rule_evidence(summary, dropped, row, terminal, recovery, copies, session),
+            classify_pool_rule_evidence(
+                summary, dropped, row, terminal, recovery, copies, session, false,
+            ),
             expected,
             "{name}"
+        );
+    }
+    // Green table coverage: the fence precedes blank, written and terminal evidence.
+    for (name, summary, terminal) in [
+        ("fenced blank", None, false),
+        ("fenced written", Some(&written), false),
+        ("fenced terminal", Some(&sealed), true),
+    ] {
+        assert_eq!(
+            classify_pool_rule_evidence(summary, false, true, terminal, false, false, false, true),
+            Unknown,
+            "{name}",
         );
     }
 }

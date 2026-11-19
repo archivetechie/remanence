@@ -1103,6 +1103,20 @@ fn l1b_assert_refused_once(f: &mut Fixture, sequence: u64, code: u64, reason: &s
     assert!(f.rt().active_fence(sequence).is_some());
 }
 
+/// Replace fixture bytes through the same inode and extent as the pinned snapshot.
+fn l1b_write_in_place(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let before = file.metadata().unwrap();
+    assert_eq!(before.len(), bytes.len() as u64);
+    file.write_all_at(bytes, 0).unwrap();
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.len()),
+        (after.dev(), after.ino(), after.len())
+    );
+}
+
 /// A mark can only be released after exact restoration or rebuild; a later loss
 /// creates a fresh fence even when the last forced release remembered nothing.
 #[test]
@@ -1128,6 +1142,18 @@ fn l1b_release_mark_restore_rebuild_and_lost_twice() {
             std::fs::write(f.path(T), &full).unwrap();
         }
         f.reopen();
+        if !rebuild {
+            let mut changed = full.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            l1b_write_in_place(&f.path(T), &changed);
+            l1b_assert_refused_once(
+                &mut f,
+                sequence,
+                1,
+                "the projection source digest differs from the tape log",
+            );
+            l1b_write_in_place(&f.path(T), &full);
+        }
         assert_eq!(
             l1b_force(&mut f, sequence).unwrap().unwrap().state,
             "released"
@@ -1239,7 +1265,7 @@ fn l1b_force_preserves_scope_and_suffix_refusals() {
         (
             lib::FenceScope::Tape(tape(T)),
             lib::FenceCause::AppendAdmissionRefused,
-            "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail (it refuses when this state shows the tape's last session closed); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory",
+            "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail, which it refuses when this state shows no open session on the tape (its last session closed, or none opened since it was initialized here); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory",
         ),
     ] {
         let f = Fixture::new();
@@ -1298,6 +1324,50 @@ fn l1b_force_preserves_scope_and_suffix_refusals() {
 /// followed by an empty release clears the latest remembered observation.
 #[test]
 fn l1b_release_floor_memory_content_extent_and_clear() {
+    // A warmed ordinary reader must not supply a forced floor observation.
+    {
+        let mut f = Fixture::new();
+        f.provision(T);
+        let (short, snapshot) = f.native(T, false);
+        f.name(6, f.rt().native_reference(&snapshot).unwrap());
+        drop(snapshot);
+        f.close();
+        f.sql_loss();
+        std::fs::write(f.path(T), &short).unwrap();
+        f.reopen();
+        let sequence = f.raises(T)[0].0;
+        let runtime = f.rt();
+        assert!(!runtime
+            .reader()
+            .unwrap()
+            .tape_projection_marks()
+            .unwrap()
+            .contains_key(&T));
+        let snapshot = runtime.0.view.lock().unwrap().snapshot(T).unwrap().clone();
+        let end = snapshot.summary().closed_end;
+        assert_eq!(end, short.len() as u64);
+        let warmed = snapshot.projection_prefix_digest(end).unwrap();
+        let mut changed = short.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        l1b_write_in_place(&f.path(T), &changed);
+        l1b_force(&mut f, sequence).unwrap();
+        let fresh = snapshot.projection_prefix_digest_oracle(end).unwrap();
+        let release = l1b_release_record(&f);
+        l1b_write_in_place(&f.path(T), &short);
+        let observed = &release
+            .detail
+            .0
+            .iter()
+            .find(|entry| entry.0.as_str() == "observed_prefix_digest")
+            .unwrap()
+            .1;
+        assert_eq!(
+            observed,
+            &Bytes(lib::Blob(fresh.to_vec())),
+            "forced floor observation must hash changed bytes afresh"
+        );
+        assert_ne!(fresh, warmed, "changed bytes differ from the warmed digest");
+    }
     for mismatch in [false, true] {
         let mut f = Fixture::new();
         f.provision(T);
@@ -1426,6 +1496,61 @@ fn l1b_release_floor_memory_content_extent_and_clear() {
     f.reopen();
     l1b_force(&mut f, seq).unwrap();
     assert!(l1b_release_record(&f).detail.0.is_empty());
+}
+
+/// A successful release must neither read nor seed the snapshot's remembered hash.
+#[test]
+fn l1b_release_does_not_seed_prefix_memory() {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    f.provision(T);
+    let (short, snapshot) = f.native(T, false);
+    f.name(6, f.rt().native_reference(&snapshot).unwrap());
+    drop(snapshot);
+    f.close();
+    f.sql_loss();
+    std::fs::write(f.path(T), &short).unwrap();
+    f.reopen();
+    let sequence = f.raises(T)[0].0;
+    let runtime = f.rt();
+    assert!(!runtime
+        .reader()
+        .unwrap()
+        .tape_projection_marks()
+        .unwrap()
+        .contains_key(&T));
+    assert!(runtime
+        .0
+        .authority
+        .with_fold(|fold| !fold.forced_observation.contains_key(&T)));
+    assert!(!runtime.0.projection_dirty.load(Ordering::Acquire));
+    // Clone once: all observations below use this snapshot's shared cache cell.
+    let snapshot = runtime.0.view.lock().unwrap().snapshot(T).unwrap().clone();
+    let original = std::fs::read(f.path(T)).unwrap();
+    let end = snapshot.summary().closed_end as usize;
+    assert_eq!(end, short.len());
+    let mut changed = original.clone();
+    changed[end - 1] ^= 1;
+    let original_digest: [u8; 32] = Sha256::digest(&original[..end]).into();
+    let changed_digest: [u8; 32] = Sha256::digest(&changed[..end]).into();
+    l1b_write_in_place(&f.path(T), &changed);
+    l1b_force(&mut f, sequence).unwrap();
+    let release = l1b_release_record(&f);
+    let observed = &release
+        .detail
+        .0
+        .iter()
+        .find(|entry| entry.0.as_str() == "observed_prefix_digest")
+        .unwrap()
+        .1;
+    assert_eq!(observed, &Bytes(lib::Blob(changed_digest.to_vec())));
+    l1b_write_in_place(&f.path(T), &original);
+    let remembered = snapshot.projection_prefix_digest(end as u64).unwrap();
+    assert_eq!(
+        remembered, original_digest,
+        "release must leave prefix memory cold after byte restoration"
+    );
+    assert_ne!(remembered, changed_digest);
 }
 
 /// In-process rebuild must retain catalog-only library evidence without appending a fence.

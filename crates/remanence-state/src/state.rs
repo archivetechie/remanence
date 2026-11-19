@@ -2816,6 +2816,81 @@ pool_id = "camera.copy-a"
         }
     }
 
+    /// A tape's typed write fence refuses startup rule moves before any library append.
+    #[test]
+    fn pool_rules_append_refusal_fence_refuses_a_rule_change() {
+        use crate::library_log as lib;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-a"),
+        )
+        .unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let id = [0x67; 16];
+        handle
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: id,
+                voltag: "ACM002L9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let paths = handle.paths().clone();
+        assert!(!paths
+            .journal_dir
+            .join("tapes")
+            .join(format!("{}.remtape", Uuid::from_bytes(id).simple()))
+            .exists());
+        let row = handle.catalog().get_tape(&id).unwrap().unwrap();
+        assert_eq!(row.state, "ready");
+        assert_eq!(row.pool_id.as_deref(), Some("camera.copy-a"));
+        assert!(handle
+            .catalog()
+            .committed_instance_pool_snapshots(&id)
+            .unwrap()
+            .is_empty());
+        assert!(handle.catalog().non_terminal_sessions().unwrap().is_empty());
+        let runtime = handle.library_runtime();
+        let tape = runtime.tape_state(id).unwrap().tape;
+        let sequence = runtime
+            .append(|a, v| {
+                a.fence_raised(
+                    lib::FenceRaised {
+                        kind: lib::FenceKind::Write,
+                        scope: lib::FenceScope::Tape(tape),
+                        cause: lib::FenceCause::AppendAdmissionRefused,
+                        evidence: None,
+                        at: None,
+                        operation: None,
+                        detail: lib::Bounded(vec![]),
+                    },
+                    lib::AuditActor::System,
+                    lib::SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap()
+            .sequence;
+        let before = pool_rule_library_bytes(&paths);
+        drop(runtime);
+        drop(handle);
+        fs::write(
+            &config_path,
+            three_pool_config(temp.path(), "camera.copy-c"),
+        )
+        .unwrap();
+        let reopened = StateHandle::open_from_config_file(&config_path);
+        assert!(
+            matches!(&reopened, Err(StateError::TapePoolAssignmentConflict(text))
+                if text.contains(&format!("library:{sequence}"))),
+            "expected a typed conflict naming library:{sequence}, got {reopened:?}"
+        );
+        assert_eq!(pool_rule_library_bytes(&paths), before);
+    }
+
     /// Written tapes refuse before any configuration append, while an operator pin remains available.
     #[test]
     fn pool_rules_written_tape_refuses_until_pinned() {

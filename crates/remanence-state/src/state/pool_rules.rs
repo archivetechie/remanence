@@ -28,8 +28,9 @@ enum PoolRuleEvidence {
     Blank,
 }
 
-/// Keep terminal/recovery exclusions ahead of evidence that would refuse a move.
-/// Any remaining tape log is uncertain, even with no committed objects.
+/// A write fence makes every candidate uncertain, including terminal tapes.
+/// Otherwise keep terminal/recovery exclusions ahead of remaining log evidence.
+#[allow(clippy::too_many_arguments)]
 fn classify_pool_rule_evidence(
     summary: Option<&TapeSummary>,
     dropped: bool,
@@ -38,8 +39,11 @@ fn classify_pool_rule_evidence(
     recovery: bool,
     copies: bool,
     session: bool,
+    fenced: bool,
 ) -> PoolRuleEvidence {
-    if summary.is_some_and(|s| s.sealed || s.seal_due.is_some() || s.finalization.is_some())
+    if fenced {
+        PoolRuleEvidence::Unknown
+    } else if summary.is_some_and(|s| s.sealed || s.seal_due.is_some() || s.finalization.is_some())
         || terminal
         || recovery
     {
@@ -69,7 +73,7 @@ pub fn accept_configuration(
     let sessions = reader.non_terminal_sessions()?;
     let mut moves = Vec::new();
     let mut conflicts = Vec::new();
-    for (tape, summary, dropped) in runtime.pool_rule_tapes() {
+    for (tape, summary, dropped, write_fence) in runtime.pool_rule_tapes() {
         let Some(label) = &tape.label else {
             continue;
         };
@@ -96,6 +100,7 @@ pub fn accept_configuration(
             sessions
                 .iter()
                 .any(|s| s.tape_uuid.as_deref() == Some(uuid.as_slice())),
+            write_fence.is_some(),
         );
         match evidence {
             PoolRuleEvidence::Skip => (),
@@ -119,6 +124,9 @@ pub fn accept_configuration(
                 if let Some(reason) = unpinnable {
                     entry.push_str(", unpinnable: ");
                     entry.push_str(reason);
+                }
+                if let Some(sequence) = write_fence {
+                    entry.push_str(&format!(", active write fence library:{sequence}"));
                 }
                 conflicts.push(entry);
             }
@@ -162,6 +170,12 @@ pub fn accept_configuration(
             TapeAuthority::open(paths.journal_dir.join("tapes"), uuid, &paths.sqlite_path)?;
         let owner = authority.acquire_exclusive()?;
         let frozen = owner.freeze()?;
+        if let Some(sequence) = runtime.pool_rule_write_fence(uuid) {
+            return Err(StateError::TapePoolAssignmentConflict(format!(
+                "tape {} changed before its pool rule move, active write fence library:{sequence}; start again",
+                uuid::Uuid::from_bytes(uuid),
+            )));
+        }
         let current = frozen.tape_summary();
         if current.sealed
             || current.seal_due.is_some()

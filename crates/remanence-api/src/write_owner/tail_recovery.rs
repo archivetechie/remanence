@@ -197,7 +197,7 @@ pub(crate) fn supersede_mounted_tail(
             ..
         }) if last.is_some() && snapshot.tape_summary().open_session.is_none() => {
             return Err(failure(format!(
-                    "tape {label} holds data written after its last closed session that this state does not record, such as after a restore from an older copy of the state; supersede-tail cannot discard it in this release. The tape stays readable and closed for writing. Keep it so, withdraw it with rem tape retire, or start the service from a newer copy of the state directory."
+                    "tape {label} holds data this state does not record, and this state shows no open session on the tape (its last session closed, or none opened since it was initialized here), as happens after a restore from an older copy of the state; supersede-tail cannot discard it in this release. The tape stays readable and closed for writing. Keep it so, withdraw it with rem tape retire, or start the service from a newer copy of the state directory."
                 )));
         }
         Err(crate::append_admission::AdmissionError {

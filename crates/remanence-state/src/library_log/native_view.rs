@@ -335,6 +335,12 @@ impl crate::library_runtime::native_floor::PrefixDigestSource for NativePrefixDi
             .ok_or(StoreError::Refused("native log absent"))?
             .projection_prefix_digest(end)
     }
+    fn fresh_prefix_digest(&self, tape: Id, end: u64) -> Result<super::Hash, StoreError> {
+        self.view
+            .snapshot(tape)
+            .ok_or(StoreError::Refused("native log absent"))?
+            .projection_prefix_digest_oracle(end)
+    }
     fn source_unchanged(&self, tape: Id) -> Result<bool, StoreError> {
         use std::os::unix::fs::MetadataExt;
         let snapshot = self

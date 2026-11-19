@@ -24,6 +24,17 @@ const PLAN_SCHEMA: &str = "rem.tix.terminal-fault-plan.v2";
 const EVIDENCE_SCHEMA: &str = "rem.tix.terminal-fault-evidence.v2";
 const TIX_FAULT_ROOT: &str = "/tmp/system-harness/scenario-tix/terminal-faults";
 
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_OVERWRITE_LOCATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Take and reset logical overwrite requests on the synchronous finalizer's thread.
+#[cfg(test)]
+pub(crate) fn take_terminal_overwrite_locates() -> usize {
+    TERMINAL_OVERWRITE_LOCATES.with(|count| count.replace(0))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalFaultCut {
     BeforeTerminalPrefix,
@@ -649,6 +660,8 @@ impl<S: RawTapeSink + ?Sized> RawTapeSink for TerminalPrefixFaultSink<'_, S> {
         &mut self,
         hint: PhysicalPositionHint,
     ) -> Result<(), remanence_parity::ParityError> {
+        #[cfg(test)]
+        TERMINAL_OVERWRITE_LOCATES.with(|count| count.set(count.get() + 1));
         self.inner.locate_for_overwrite(hint)
     }
 
@@ -821,6 +834,8 @@ impl<S: RawTapeSink + ?Sized> RawTapeSink for TerminalFaultSink<'_, S> {
         &mut self,
         hint: PhysicalPositionHint,
     ) -> Result<(), remanence_parity::ParityError> {
+        #[cfg(test)]
+        TERMINAL_OVERWRITE_LOCATES.with(|count| count.set(count.get() + 1));
         self.inner.locate_for_overwrite(hint)
     }
 

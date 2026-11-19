@@ -2040,7 +2040,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
             })?;
     }
 
-    let named_tail = if prefix_already_journaled {
+    let named_tail = if prefix_already_journaled || !rewritable {
         None
     } else {
         admit_ended_tail_for_terminal(checkpoint, drive, selected, prefix.start_lba)?
@@ -2386,7 +2386,8 @@ pub(super) fn finish_terminal_tail(
         reconciliation: None,
         durable_projection_pending: false,
     };
-    let mut admission = if prefix_plan.is_none()
+    let mut admission = if rewritable
+        && prefix_plan.is_none()
         && parity_progress_from_state(authority.intent.progress).next_component_index() == Some(0)
     {
         admit_ended_tail_for_terminal(

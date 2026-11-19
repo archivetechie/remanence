@@ -4984,6 +4984,7 @@ pub fn worm_state_from_medium_configuration(response: &[u8]) -> WormMediaState {
     if response[page_start] & 0x3F != remanence_scsi::mode::PAGE_MEDIUM_CONFIGURATION
         || response[page_start] & 0x40 != 0
         || response[page_start + 1] < 1
+        || page_start + 2 + response[page_start + 1] as usize > usable_length
     {
         return WormMediaState::Unknown;
     }

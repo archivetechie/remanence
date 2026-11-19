@@ -27,6 +27,13 @@ use std::sync::{
 pub const TAIL_REPAIR_DEFERRED: &str =
     "TailRepairDeferred: repairing a tape-log tail is deferred; nothing was repaired or changed";
 
+/// Select the earliest active Write fence on this tape without acquiring locks.
+fn first_pool_rule_write_fence(fold: &lib::LibraryFold, uuid: lib::Id) -> Option<u64> {
+    fold.active_tape_fences(&uuid)
+        .find(|(_, raise)| raise.kind == lib::FenceKind::Write)
+        .map(|(sequence, _)| sequence)
+}
+
 /// The operation a set of active tape-I/O fences may permit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapeIoPass {
@@ -1203,7 +1210,7 @@ impl LibraryRuntime {
                 }
                 lib::FenceCause::AppendAdmissionRefused => {
                     return Err(StateError::ConfigInvalid(
-                        "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail (it refuses when this state shows the tape's last session closed); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory".into(),
+                        "release refused: an append_admission_refused fence keeps the tape closed for writing, and readable, until rem tape supersede-tail recovers its tail, which it refuses when this state shows no open session on the tape (its last session closed, or none opened since it was initialized here); otherwise withdraw the tape with rem tape retire or start from a newer copy of the state directory".into(),
                     )
                     .into());
                 }
@@ -1644,6 +1651,7 @@ impl LibraryRuntime {
         lib::fold::TapeState,
         Option<crate::tape_log::fold::TapeSummary>,
         bool,
+        Option<u64>,
     )> {
         let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
         let view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -1662,9 +1670,24 @@ impl LibraryRuntime {
                 .filter(|(uuid, tape)| {
                     !tape.retired && !fold.cleaning_cartridges.contains_key(*uuid)
                 })
-                .map(|(uuid, tape)| (tape.clone(), summaries.remove(uuid), dropped.contains(uuid)))
+                .map(|(uuid, tape)| {
+                    (
+                        tape.clone(),
+                        summaries.remove(uuid),
+                        dropped.contains(uuid),
+                        first_pool_rule_write_fence(fold, *uuid),
+                    )
+                })
                 .collect()
         })
+    }
+    /// Re-check one move's Write fence under its retained native owner lease.
+    pub(crate) fn pool_rule_write_fence(&self, uuid: lib::Id) -> Option<u64> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let _view = self.0.view.lock().unwrap_or_else(|e| e.into_inner());
+        self.0
+            .authority
+            .with_fold(|fold| first_pool_rule_write_fence(fold, uuid))
     }
     /// Resolve a shell label from current authenticated fold state, never SQL.
     pub fn tape_for_label(&self, label: &str) -> Result<Option<lib::Id>, RuntimeError> {

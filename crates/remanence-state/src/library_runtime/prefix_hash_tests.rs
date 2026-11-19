@@ -318,6 +318,14 @@ fn short_read_refuses_and_keeps_no_state() {
         ),
         "T6 short read must refuse with shorter than its digest"
     );
+    assert!(
+        matches!(
+            snapshot.raw.projection_prefix_digest_oracle(closed_end),
+            Err(crate::tape_log::store::StoreError::Refused(message))
+                if message == "projection source is shorter than its digest"
+        ),
+        "byte-zero oracle must refuse a short pinned source"
+    );
     assert_eq!(
         snapshot.raw.projection_prefix_digest(shorter_end).unwrap(),
         snapshot

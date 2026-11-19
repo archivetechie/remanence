@@ -634,8 +634,7 @@ impl Snapshot {
         self.install_prefix_hash(PrefixHash { end, state, digest });
         Ok(digest)
     }
-    /// Original byte-zero hash retained for differential tests.
-    #[cfg(test)]
+    /// Hash pinned bytes from zero without reading or installing remembered prefix state.
     #[cfg_attr(any(test, feature = "fixtures"), track_caller)]
     pub(crate) fn projection_prefix_digest_oracle(&self, end: u64) -> Result<[u8; 32], StoreError> {
         use sha2::{Digest, Sha256};
@@ -666,6 +665,11 @@ impl Snapshot {
                     break;
                 }
                 digest.update(&bytes[..n]);
+            }
+            if reader.position != end {
+                return Err(StoreError::Refused(
+                    "projection source is shorter than its digest",
+                ));
             }
         }
         Ok(digest.finalize().into())

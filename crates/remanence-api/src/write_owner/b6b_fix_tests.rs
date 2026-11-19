@@ -4,6 +4,297 @@ use remanence_state::tape_log::{
     codec::Decoder, store::Header, Record as NativeRecord, SessionEndReason,
 };
 
+/// A named Object tail can be overwritten for finalization only with rewritable evidence.
+#[tokio::test]
+async fn finalize_named_tail_on_nonrewritable_media_never_dispatches_overwrite() {
+    use crate::terminal_fault::take_terminal_overwrite_locates;
+    use remanence_chaos::model::MediumTypeReporting;
+    use std::io::Write as _;
+
+    #[derive(Debug)]
+    struct Observation {
+        parity: bool,
+        media: WormMediaState,
+        overwrite_locates: usize,
+        media_writes: u64,
+        result: Result<ManualFinalizeTapeActorReply, Status>,
+        native_recovery: Option<bool>,
+        projected_outcome: Option<TerminalFinalizationOutcome>,
+        sealed: bool,
+        seal_record: bool,
+        successful_final_record: bool,
+        physical_records_unchanged: bool,
+    }
+
+    let mut observations = Vec::new();
+    for parity in [false, true] {
+        for media in [WormMediaState::Worm, WormMediaState::Unknown] {
+            let root = DurabilityRoot::new(BARCODE, parity);
+            let world = model_world(BARCODE, parity);
+            let selected = SelectedTape {
+                parity_config: if parity {
+                    ParityConfig::Scheme(scheme())
+                } else {
+                    ParityConfig::None
+                },
+                ..selected()
+            };
+            // Close a fully committed prefix before opening the session that leaves the tail.
+            let (tx, opened, thread) = root
+                .writer(
+                    open_model_library(world.clone()),
+                    selected.clone(),
+                    |_, _| {},
+                )
+                .await;
+            let id = opened.unwrap();
+            append_actor_test_file(
+                &tx,
+                id,
+                root.path().join("committed"),
+                "committed",
+                "committed",
+                b"saved prefix",
+            )
+            .await;
+            close_writer(&tx, id, thread).await;
+
+            let lifecycle = DrivePoolLifecycle::default();
+            let (tx, opened, thread) = root
+                .writer(
+                    open_model_library(world.clone()),
+                    selected.clone(),
+                    |cfg, _| {
+                        cfg.lifecycle = Some(lifecycle.clone());
+                    },
+                )
+                .await;
+            let id = opened.unwrap();
+            let pending = append_actor_test_file(
+                &tx,
+                id,
+                root.path().join("pending"),
+                "pending",
+                "pending",
+                b"named uncommitted tail",
+            )
+            .await;
+            assert_eq!(
+                pending.record.append_commit_info.unwrap().durability,
+                pb::AppendDurability::Written as i32
+            );
+            lifecycle.shutting_down.store(true, Ordering::SeqCst);
+            let (reply, received) = oneshot::channel();
+            tx.send(DriveCommand::Abort {
+                session_id: id,
+                reason: Some("leave the named tail during shutdown".into()),
+                reply,
+            })
+            .await
+            .unwrap();
+            received.await.unwrap().unwrap();
+            thread.join().unwrap();
+
+            let tape_dir = root.tape_dir();
+            let records = native_records_in(&tape_dir);
+            let end = records
+                .iter()
+                .rev()
+                .find_map(|record| match record {
+                    NativeRecord::SessionEnded(end) => Some(end),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(end.reason, SessionEndReason::Abort);
+            assert!(end.tail_file_count > 0);
+            let authority =
+                TapeAuthority::open(&tape_dir, TAPE, &root.state.paths().sqlite_path).unwrap();
+            let snapshot = authority.freeze().unwrap();
+            let summary = snapshot.tape_summary();
+            let latest = authority.latest_commit().unwrap().unwrap();
+            assert!(summary.open_session.is_none());
+            assert!(
+                !summary.sealed && summary.seal_due.is_none() && summary.finalization.is_none()
+            );
+            assert_eq!(summary.object_count, 1);
+            assert!(summary.total > 0);
+            assert_eq!(summary.protected, if parity { summary.total } else { 0 });
+            let ended_cursor = (end.cursor.partition, end.cursor.lba, end.cursor.next_file);
+            assert_eq!(
+                ended_cursor,
+                (
+                    summary.cursor.partition,
+                    summary.cursor.lba,
+                    summary.next_file
+                )
+            );
+            assert_eq!(
+                ended_cursor,
+                (latest.cursor.partition, latest.cursor.lba, latest.next_file)
+            );
+            let mut index = root.state.write_handle();
+            assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+            let tape = index.get_tape(&TAPE).unwrap().unwrap();
+            assert_eq!(tape.state, "ready");
+            assert_eq!(tape.pool_id.as_deref(), Some(POOL));
+
+            let mut library = open_model_library(world.clone());
+            let cfg = root.config(&library);
+            let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+            let operation = Uuid::new_v4();
+            let mut request = ManualFinalizeTapeActorRequest {
+                candidate_operation_id: operation,
+                actor: AuditActor::System,
+                actor_fingerprint: "sha256:nonrewritable-finalize-test".into(),
+                idempotency_key: Uuid::new_v4(),
+                request_fingerprint: Sha256::digest(operation.as_bytes()).into(),
+                tape_uuid: TAPE,
+                expected_pool_id: Some(POOL.into()),
+                assignment_generation: root
+                    .state
+                    .library_runtime()
+                    .tape_state(TAPE)
+                    .unwrap()
+                    .assignment_generation,
+                reason: "close a partially filled tape with a named tail".into(),
+                block_size: BLOCK,
+                parity_config: selected.parity_config.clone(),
+                pool_config: Some(pool()),
+            };
+            assert!(preflight_manual_finalize_tape(
+                &mut index,
+                ManualFinalizePreflightConfig {
+                    authority: cfg.authority.clone(),
+                    mounted_endpoint: None,
+                    checkpoint_journal_dir: &tape_dir,
+                },
+                Some(BARCODE),
+                &mut request,
+            )
+            .expect("the real preflight must accept the named-tail fixture")
+            .is_none());
+
+            // Object setup used rewritable media; change only the finalizer's observation now.
+            {
+                let mut model = world.lock().unwrap();
+                let tape = model.tapes.get_mut(BARCODE).unwrap();
+                tape.worm = media == WormMediaState::Worm;
+                tape.write_protected = false;
+                model
+                    .drive_states
+                    .get_mut(&BAY)
+                    .unwrap()
+                    .medium_type_reporting = if media == WormMediaState::Worm {
+                    MediumTypeReporting::Header
+                } else {
+                    MediumTypeReporting::Unsupported
+                };
+            }
+            let config = drive.read_config_resolving_worm().unwrap();
+            assert_eq!(config.worm, media);
+            assert!(!config.write_protected);
+            let physical_before = world.lock().unwrap().tapes[BARCODE].records.clone();
+            let writes_before = drive.media_write_dispatch_count();
+            take_terminal_overwrite_locates();
+            let result = handle_drive_finalize_tape(
+                BAY,
+                &mut index,
+                &cfg,
+                &mut drive,
+                &mut 0,
+                ManualFinalizeTapeMountRequest {
+                    request,
+                    needs_drive_load: false,
+                    library_serial: LIBRARY.into(),
+                    barcode: Some(BARCODE.into()),
+                    source_slot: None,
+                    drive_uuid: None,
+                    drive_serial: Some(DRIVE.into()),
+                },
+            );
+            let overwrite_locates = take_terminal_overwrite_locates();
+            let media_writes = drive.media_write_dispatch_count() - writes_before;
+            let after = authority.freeze().unwrap();
+            let native = after.tape_summary();
+            let last = authority.latest_commit().unwrap().unwrap();
+            observations.push(Observation {
+                parity,
+                media,
+                overwrite_locates,
+                media_writes,
+                result,
+                native_recovery: native
+                    .finalization
+                    .as_ref()
+                    .map(|state| state.recovery_required),
+                projected_outcome: index
+                    .terminal_finalization(&TAPE)
+                    .unwrap()
+                    .map(|projection| projection.outcome),
+                sealed: native.sealed,
+                seal_record: native_records_in(&tape_dir)
+                    .iter()
+                    .any(|record| matches!(record, NativeRecord::Sealed { .. })),
+                successful_final_record: last.sealed || last.finalization.is_some(),
+                physical_records_unchanged: world.lock().unwrap().tapes[BARCODE].records
+                    == physical_before,
+            });
+        }
+    }
+    // Direct output preserves every row even when the harness captures passing test prints.
+    for row in &observations {
+        writeln!(
+            std::io::stdout().lock(),
+            "T3 observation parity={} media={:?}: {row:?}",
+            row.parity,
+            row.media
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        observations.iter().map(|row| row.overwrite_locates).collect::<Vec<_>>(),
+        vec![0; 4],
+        "nonrewritable finalization must dispatch no logical overwrite locate; all rows: {observations:#?}"
+    );
+    for row in &observations {
+        if row.parity {
+            let error = row
+                .result
+                .as_ref()
+                .expect_err("parity prefix needs recovery");
+            assert_eq!(error.code(), tonic::Code::Internal, "{row:?}");
+            assert!(
+                error
+                    .message()
+                    .contains("terminal prefix requires recovery: TornWorm"),
+                "{row:?}"
+            );
+        } else {
+            let reply = row
+                .result
+                .as_ref()
+                .expect("no-parity finalization returns its recovery projection");
+            assert_eq!(
+                reply.projection.outcome,
+                TerminalFinalizationOutcome::RecoveryRequired,
+                "{row:?}"
+            );
+        }
+        assert_eq!(row.media_writes, 0, "{row:?}");
+        assert_eq!(row.native_recovery, Some(true), "{row:?}");
+        assert_eq!(
+            row.projected_outcome,
+            Some(TerminalFinalizationOutcome::RecoveryRequired),
+            "{row:?}"
+        );
+        assert!(
+            !row.sealed && !row.seal_record && !row.successful_final_record,
+            "{row:?}"
+        );
+        assert!(row.physical_records_unchanged, "{row:?}");
+    }
+}
+
 /// Read native records from a fixture's explicit tape-log directory.
 pub(super) fn native_records_in(directory: &Path) -> Vec<NativeRecord> {
     let bytes =

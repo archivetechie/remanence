@@ -95,6 +95,8 @@ fn observe_mark(
 /// Fallible prefix bytes and path identity, injectable for release refusal proofs.
 pub(crate) trait PrefixDigestSource {
     fn prefix_digest(&self, tape: lib::Id, end: u64) -> Result<lib::Hash, StoreError>;
+    /// Re-read pinned bytes without consuming or populating prefix memory.
+    fn fresh_prefix_digest(&self, tape: lib::Id, end: u64) -> Result<lib::Hash, StoreError>;
     fn source_unchanged(&self, tape: lib::Id) -> Result<bool, StoreError>;
 }
 
@@ -148,14 +150,13 @@ impl ForceRefusal {
 
 /// Construct the exact seven-value observation used both at release and detection.
 fn forced_observation(
-    tape: lib::Id,
     floor: (u64, lib::Hash, u64),
     native: NativeExtent,
     observed: &str,
-    digests: &dyn PrefixDigestSource,
+    digest: impl FnOnce(u64) -> Result<lib::Hash, StoreError>,
 ) -> Result<lib::Bounded<lib::DiagnosticEntry, 256>, StoreError> {
     use lib::DiagnosticValue::{Bytes, Text, Unsigned};
-    let prefix = digests.prefix_digest(tape, native.closed_end)?;
+    let prefix = digest(native.closed_end)?;
     Ok(lib::Bounded(vec![
         lib::DiagnosticEntry("basis".into(), Text("floor".into())),
         lib::DiagnosticEntry("floor_digest".into(), Bytes(lib::Blob(floor.1.to_vec()))),
@@ -200,7 +201,7 @@ pub(crate) fn force_release_decision(
                 return Err(ForceRefusal::SourceBeyondLog);
             }
             let actual = digests
-                .prefix_digest(tape.uuid, end)
+                .fresh_prefix_digest(tape.uuid, end)
                 .map_err(|_| ForceRefusal::ReadFailed)?;
             if actual != expected {
                 return Err(ForceRefusal::SourceDigestChanged);
@@ -218,8 +219,10 @@ pub(crate) fn force_release_decision(
         if let Some(observed) =
             observe_floor(floor, &reference.floor_digests, Some(native), || Ok(lookup))
         {
-            return forced_observation(tape.uuid, floor, native, observed, digests)
-                .map_err(|_| ForceRefusal::ReadFailed);
+            return forced_observation(floor, native, observed, |end| {
+                digests.fresh_prefix_digest(tape.uuid, end)
+            })
+            .map_err(|_| ForceRefusal::ReadFailed);
         }
     }
     Ok(lib::Bounded(vec![]))
@@ -362,7 +365,10 @@ pub(crate) fn detect(
                     && fold.forced_observation.get(id).is_some_and(|remembered| {
                         native
                             .and_then(|native| {
-                                forced_observation(*id, f, native, observed, prefix_digests).ok()
+                                forced_observation(f, native, observed, |end| {
+                                    prefix_digests.prefix_digest(*id, end)
+                                })
+                                .ok()
                             })
                             .as_ref()
                             == Some(remembered)
@@ -891,6 +897,9 @@ mod force_tests {
                 return Err(StoreError::Refused("fault"));
             }
             Ok([if self.wrong_digest { 9 } else { 8 }; 32])
+        }
+        fn fresh_prefix_digest(&self, tape: lib::Id, end: u64) -> Result<lib::Hash, StoreError> {
+            self.prefix_digest(tape, end)
         }
         fn source_unchanged(&self, _: lib::Id) -> Result<bool, StoreError> {
             if self.stat_error {
