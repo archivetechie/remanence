@@ -1196,6 +1196,7 @@ mod l1b_admission_tests {
                 .with_ansi(false)
                 .with_writer(move || log.try_clone().unwrap())
                 .finish();
+            crate::tests::ensure_log_capture_anchor();
             tracing::subscriber::with_default(subscriber, || {
                 crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap()
             });

@@ -1052,14 +1052,6 @@ mod tests {
             alarm(&state, key, &s).unwrap();
         });
         assert_eq!(
-            warnings
-                .iter()
-                .filter(|s| s.contains("CloseoutOverdue"))
-                .count(),
-            1
-        );
-        assert!(state.drive_pool.is_none());
-        assert_eq!(
             state
                 .index()
                 .unwrap()
@@ -1070,6 +1062,14 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|s| s.contains("CloseoutOverdue"))
+                .count(),
+            1
+        );
+        assert!(state.drive_pool.is_none());
         alarm(&make(), key, &s).unwrap();
         assert_eq!(
             state

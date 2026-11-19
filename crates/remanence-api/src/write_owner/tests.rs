@@ -3609,6 +3609,7 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
         .with_ansi(false)
         .with_writer(move || log.try_clone().unwrap())
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     let drive_tx =
         tracing::subscriber::with_default(subscriber, || spawn_drive_actor(0x0100, drive, cfg));
     let command_start = world.lock().expect("world lock").command_log.len();
@@ -5294,6 +5295,7 @@ async fn readiness_poll_logs_sense_and_publishes_shared_progress_keys() {
         .with_ansi(false)
         .with_writer(move || log.try_clone().expect("clone log writer"))
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     tracing::subscriber::with_default(subscriber, || {
         handle_drive_wait_ready(
             &mut index,
@@ -12151,6 +12153,7 @@ fn verification_walk_cancellation_has_no_verdict_and_can_restart() {
         .with_ansi(false)
         .with_writer(move || file.try_clone().unwrap())
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     let _log = tracing::subscriber::set_default(subscriber);
     with_catalog_recovery_tape_options(
         ParityConfig::None,
@@ -14860,6 +14863,7 @@ fn load_drive_shutdown_logs_at_info() {
         .with_ansi(false)
         .with_writer(move || file.try_clone().unwrap())
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     let _log = tracing::subscriber::set_default(subscriber);
     let path = temp.path().join("state.sqlite");
     let mut index = remanence_state::projector::open(&path)
@@ -16696,6 +16700,7 @@ fn catalog_lock_refusal_logs_write_session_context() {
         .with_ansi(false)
         .with_writer(move || log.try_clone().unwrap())
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     tracing::subscriber::with_default(subscriber, || {
         let _span = tracing::warn_span!(
             "write_session",

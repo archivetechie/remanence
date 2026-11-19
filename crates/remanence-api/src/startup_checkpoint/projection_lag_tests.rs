@@ -186,6 +186,7 @@ fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         .with_ansi(false)
         .with_writer(move || file.try_clone().unwrap())
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     let result = tracing::subscriber::with_default(subscriber, f);
     reader.rewind().unwrap();
     let mut logs = String::new();

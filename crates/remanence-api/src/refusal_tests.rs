@@ -327,6 +327,7 @@ async fn a_refusal_whose_record_cannot_be_projected_still_answers_unchanged() {
         .unwrap();
 
     let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    crate::tests::ensure_log_capture_anchor();
     let guard = tracing::dispatcher::set_default(&tracing::dispatcher::Dispatch::new(
         super::WarningCaptureSubscriber::new(messages.clone()),
     ));

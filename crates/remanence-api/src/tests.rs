@@ -691,17 +691,71 @@ impl Subscriber for WarningCaptureSubscriber {
     }
 }
 
+/// A silent dispatcher that keeps tracing's single-dispatcher shortcut off during captures.
+struct LogCaptureAnchor;
+
+impl Subscriber for LogCaptureAnchor {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, _event: &Event<'_>) {}
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::never()
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::OFF)
+    }
+}
+
+/// Keep a second dispatcher alive for all test captures without installing a default.
+pub(crate) fn ensure_log_capture_anchor() {
+    static ANCHOR: std::sync::OnceLock<Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| Dispatch::new(LogCaptureAnchor));
+}
+
 pub(crate) fn capture_warnings<F>(f: F) -> Vec<String>
 where
     F: FnOnce(),
 {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let subscriber = WarningCaptureSubscriber::new(Arc::clone(&messages));
+    ensure_log_capture_anchor();
     tracing::dispatcher::with_default(&Dispatch::new(subscriber), f);
-    Arc::try_unwrap(messages)
-        .expect("warning capture has one owner")
-        .into_inner()
-        .expect("warning capture mutex not poisoned")
+    let mut captured = messages.lock().expect("warning capture mutex not poisoned");
+    std::mem::take(&mut *captured)
+}
+
+/// A fresh callsite first reached without a subscriber still delivers to its capture.
+#[test]
+fn warning_capture_keeps_event_after_other_thread_registers_callsite() {
+    fn emit_probe_warning() {
+        tracing::warn!("A1b warning capture fresh-callsite probe");
+    }
+
+    let messages = capture_warnings(|| {
+        std::thread::spawn(emit_probe_warning).join().unwrap();
+        emit_probe_warning();
+    });
+    assert_eq!(messages.len(), 1, "capture keeps its own warning");
+    assert_eq!(messages[0], "A1b warning capture fresh-callsite probe");
 }
 
 fn test_index() -> CatalogIndex {
@@ -4429,6 +4483,7 @@ fn capture_debug_logs<F: FnOnce() -> T, T>(f: F) -> (T, String) {
         .with_ansi(false)
         .with_writer(move || log_file.try_clone().expect("clone log writer"))
         .finish();
+    ensure_log_capture_anchor();
     let result = tracing::subscriber::with_default(subscriber, f);
     let mut logs = String::new();
     std::io::Seek::rewind(&mut reader).expect("rewind log capture");

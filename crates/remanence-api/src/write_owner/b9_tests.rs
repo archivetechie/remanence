@@ -627,6 +627,7 @@ async fn b9_overdue_timer_checkpoint_logs_code_without_sql_alarm() {
     let root = DurabilityRoot::new(BARCODE, true);
     let log_path = root.path().join("actor.log");
     let log = std::fs::File::create(&log_path).unwrap();
+    crate::tests::ensure_log_capture_anchor();
     let _logging = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .without_time()

@@ -1261,6 +1261,7 @@ mod route_log_tests {
             .with_ansi(false)
             .with_writer(move || file.try_clone().unwrap())
             .finish();
+        crate::tests::ensure_log_capture_anchor();
         tracing::subscriber::with_default(subscriber, || {
             for (route, fell_back) in [
                 (remanence_parity::VerificationRoute::OnePass, false),

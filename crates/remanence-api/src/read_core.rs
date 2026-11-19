@@ -1879,6 +1879,7 @@ mod tests {
             .without_time()
             .with_writer(writer)
             .finish();
+        crate::tests::ensure_log_capture_anchor();
         let result = tracing::subscriber::with_default(subscriber, run);
         let output = String::from_utf8(
             bytes

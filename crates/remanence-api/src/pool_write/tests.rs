@@ -1924,6 +1924,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         .flatten_event(true)
         .with_writer(move || diagnostic_file.try_clone().unwrap())
         .finish();
+    crate::tests::ensure_log_capture_anchor();
     let _subscriber = tracing::subscriber::set_default(subscriber);
     let temp = tempfile::Builder::new()
         .prefix("remanence-parity-session-retention-")
