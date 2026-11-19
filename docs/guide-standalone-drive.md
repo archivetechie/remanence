@@ -540,8 +540,9 @@ state directory to make the refusal go away.
 
 Tape fences for `append_admission_refused` and `session_suffix_contradiction`
 are not released by `rem tape quarantine release`. Tail recovery refuses a tape that
-contradicts its recorded session ending. If the state shows the tape's last
-session closed, its unrecorded data cannot be discarded in this release:
+contradicts its recorded session ending. If the state shows no open session on
+the tape (its last session closed, or none opened since it was initialized here),
+its unrecorded data cannot be discarded in this release:
 keep the tape closed for writing, withdraw it with `rem tape retire` and
 `--config` with this configuration's path, or start from a newer copy of the
 state directory. Retirement refuses while parity closeout is due.
@@ -657,8 +658,9 @@ have a writable tape the state knows and that has not been written since the
 copy. A refused tape stays readable, but its data written since the copy is
 not listed. Copy those files out with `rem tape restore --scan`; do not discard
 the data unless its objects are known to be unneeded. If the restored state
-shows the tape's last session closed, that data cannot be discarded in this
-release: keep the tape closed for writing, withdraw it with `rem tape retire`
+shows no open session on the tape (its last session closed, or none opened since
+it was initialized here), that data cannot be discarded in this release: keep
+the tape closed for writing, withdraw it with `rem tape retire`
 and `--config` with this configuration's path, or start from a newer copy of
 the state directory.
 

@@ -410,8 +410,9 @@ starting the service on restored state, each pool needs a writable tape that
 the restored state knows and that the pool has not written since the copy.
 A refused tape stays readable, but its data written since the copy is not
 listed. Do not discard that data unless its objects are known to be unneeded.
-If the restored state shows the tape's last session closed, that data cannot
-be discarded in this release: keep the tape closed for writing, withdraw it
+If the restored state shows no open session on the tape (its last session
+closed, or none opened since it was initialized here), that data cannot be
+discarded in this release: keep the tape closed for writing, withdraw it
 with `rem tape retire`, or start from a newer copy of the state directory.
 
 On a parity pool, if the restored tape log still owes closeout, retirement

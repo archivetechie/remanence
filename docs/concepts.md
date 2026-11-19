@@ -237,7 +237,8 @@ Fences can protect a tape or a drive.
   service starts stays until moved), but refuses reads and writing.
   Neither is released by `rem tape quarantine release`. Use `rem tape supersede-tail`
   where recovery applies; it refuses a contradicting recorded session ending or a
-  state that shows the tape's last session closed. Otherwise withdraw the tape with
+  state that shows no open session on the tape (its last session closed, or none
+  opened since it was initialized here). Otherwise withdraw the tape with
   `rem tape retire` or start from a newer copy of the state directory. Retirement
   refuses while parity closeout is due. For a releasable cause, an operator
   investigates, verifies the tape and drive, and uses

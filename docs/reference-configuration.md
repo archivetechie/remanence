@@ -471,7 +471,7 @@ minimal config above puts them there.
 | `journal.dir` | absolute path | required | Directory containing `tapes/<lowercase-simple-uuid>.remtape`, one authority log per tape with or without parity. The authority marker binds this configured root to the state directory. |
 | `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. This controls filesystem types for these state paths only; the journal directory's own check always applies, regardless of this setting or `--allow-untrusted-state-volume`. The journal needs a local ext3, ext4, XFS, btrfs, ZFS, f2fs or bcachefs filesystem with write barriers on; Remanence checks the mount's options and ZFS flush switches. `rem doctor` reports `journal volume` and, on accepted ZFS volumes, the advisory `journal sync` property check. Remanence makes its records durable with fsync, as a database does; it cannot test whether a disk keeps what it confirms. If a power cut loses the last journal records, nothing on tape is lost or overwritten. The next write to that tape stops with `TailBeyondKnownState` and names the objects. Rescue them with `rem tape restore --scan --out rescued`, then run `rem tape supersede-tail --acknowledge-tape LABEL` and write them again. After an interrupted `put` whose sources still exist, run `supersede-tail` and rerun `put`. A UPS, or a disk with power-loss protection, removes this power-cut exposure. Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`), or bcachefs `journal_flush_disabled`. On ZFS keep `zfs_nocacheflush` and `zil_nocacheflush` at `0` and the dataset's `sync=standard`. |
 | `audit.dir` | absolute path | required | Directory holding the library log's `*.remlib` segments, `library-log.lock`, `library-log.ambiguous` and `library-log.fence-reconcile`. The segments record withdrawals, fences, barcodes and pools. The state directory's `authority-manifest.json` binds the log's root and identity. |
-| `audit.fsync` | bool | `true` | Sync each library-log `Diagnostic` append before returning. Other record types sync regardless of this setting; segment rotation also syncs. |
+| `audit.fsync` | bool | `true` | Controls sync for legacy audit appends only. Every library-log record, `Diagnostic` included, syncs before returning regardless of this setting; segment rotation also syncs. |
 | `audit.clock_forward_tolerance_seconds` | integer | `300` | Accepted and range-validated, but has no effect in this version; production does not read it. |
 | `index.sqlite_path` | absolute path | required | The SQLite catalog projection file. The filename is yours to choose; `rem-state.sqlite` is the conventional name. This file is a rebuildable cache — see `rem rebuild-catalog-from-journals`. |
 | `cache.tape_catalog_dir` | absolute path | required | Directory of per-tape catalog cache files. |
@@ -559,7 +559,7 @@ After stopping the daemon and fixing the storage problem, use
 `rem-debug library-log inspect --config <PATH>`, followed by
 `rem-debug library-log recover --config <PATH> --confirm-clear-ambiguity`.
 Recovery clears tape markers before the library marker and writes a synced
-recovery diagnostic even when ordinary diagnostic fsync is disabled.
+recovery diagnostic.
 
 Home mode uses a different generated layout under
 `${XDG_STATE_HOME:-$HOME/.local/state}/rem/`:
@@ -604,8 +604,9 @@ starting the service on restored state, each pool needs a writable tape that
 the restored state knows and that the pool has not written since the copy.
 A refused tape stays readable, but its data written since the copy is not
 listed. Do not discard that data unless its objects are known to be unneeded.
-If the restored state shows the tape's last session closed, that data cannot
-be discarded in this release: keep the tape closed for writing, withdraw it
+If the restored state shows no open session on the tape (its last session
+closed, or none opened since it was initialized here), that data cannot be
+discarded in this release: keep the tape closed for writing, withdraw it
 with `rem tape retire`, or start from a newer copy of the state directory.
 
 On a parity pool, if the restored tape log still owes closeout, retirement

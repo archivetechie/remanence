@@ -732,8 +732,9 @@ rem tape supersede-tail --acknowledge-tape <LABEL|UUID> [--confirm-supersede "SU
 ```
 
 List and explicitly discard the suffix beyond local authority, with typed
-confirmation, unless this state shows the tape's last session closed. That
-shape cannot be discarded in this release: keep the tape closed for writing,
+confirmation, unless this state shows no open session on the tape (its last
+session closed, or none opened since it was initialized here). That shape
+cannot be discarded in this release: keep the tape closed for writing,
 withdraw it with `rem tape retire` (pass `--config` with this configuration's
 path), or start from a newer copy of the state directory. Retirement refuses
 while parity closeout is due. For an explicit device, add
@@ -795,8 +796,9 @@ fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem 
 For releasable tape-fence causes, use the library form below. Tape fences for
 `append_admission_refused` or `session_suffix_contradiction` are not released by
 this command. Use `rem tape supersede-tail` where recovery applies; it refuses
-a contradicting recorded session ending or a state that shows the tape's last
-session closed. Otherwise withdraw the tape with `rem tape retire` (pass
+a contradicting recorded session ending or a state that shows no open session
+on the tape (its last session closed, or none opened since it was initialized
+here). Otherwise withdraw the tape with `rem tape retire` (pass
 `--config` with this configuration's path), or start from a newer copy of the
 state directory. Retirement refuses while parity closeout is due.
 
@@ -1087,9 +1089,8 @@ rem alarms ack [OPTIONS] <CONDITION_KEY>
 
 ### rem audit query
 
-Stream audit segments written by earlier versions for a time interval.
-This command shows no history of this version's operations and is not a query
-of the library log.
+Stream the library log's history for a time interval: one entry per matching
+library-log record. Legacy audit segments (`*.remaudit`) are not read.
 
 ```text
 rem audit query [OPTIONS] --since <RFC3339> --until <RFC3339>
@@ -1097,14 +1098,24 @@ rem audit query [OPTIONS] --since <RFC3339> --until <RFC3339>
 
 - `--since <RFC3339>` is the inclusive lower bound.
 - `--until <RFC3339>` is the exclusive upper bound.
-- `--filter <K=V>` keeps entries whose field `K` equals `V` exactly; repeat it for several
+- `--filter <K=V>` keeps entries matching every filter; repeat it for several
   fields. The keys are `event` (also spelled `event_kind` or `kind`), `actor`,
-  `source_layer`, `subject_kind`, `subject_id`, `session_id` and `operation_id`; any other
-  key is refused.
+  `source_layer`, `subject_kind`, `subject_id`, `session_id` and `operation_id`;
+  any other key is refused. Use each key once, ignoring ASCII case. Values are
+  trimmed; empty values are refused. `session_id` and `operation_id` must parse
+  as UUIDs and match by UUID value. `subject_id` matches as text or an equal
+  UUID. The event keys match the full kind; a value without a dot also matches
+  `<value>.<Variant>`. `actor`, `source_layer` and `subject_kind` match exact text.
 
 `--json` prints one JSON object per entry.
 
-To query surviving earlier-version audit segments for one day:
+A fence or refused record ends the stream with `FAILED_PRECONDITION`.
+Library-log segment damage ends it with `DATA_LOSS`. Each error gives the
+sequence of the last record visited, including records excluded by the query,
+or 0 if none was visited. A service without library authority refuses the query
+with `FAILED_PRECONDITION` before streaming.
+
+To list one day's library-log history:
 
 ```sh
 rem audit query --since 2026-11-02T00:00:00Z --until 2026-11-03T00:00:00Z
@@ -1428,8 +1439,9 @@ fields. The JSON schema of `list` is `rem.tape.quarantine.list.v1`.
 ids; `rem catalog tapes --json`, `rem top` and `rem daemon health --json` list
 those. Neither `append_admission_refused` nor `session_suffix_contradiction`
 is released. Use `rem tape supersede-tail` where recovery applies; it refuses
-a contradicting recorded session ending or a state that shows the tape's last
-session closed. Otherwise withdraw the tape with `rem tape retire` or start
+a contradicting recorded session ending or a state that shows no open session
+on the tape (its last session closed, or none opened since it was initialized
+here). Otherwise withdraw the tape with `rem tape retire` or start
 from a newer copy of the state directory. Retirement refuses while parity
 closeout is due. A releasable tape-I/O fence is released through the configured
 daemon socket after the operator's acknowledgement. Only an absent listener
@@ -1640,7 +1652,8 @@ rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> [--confirm-sup
 
 Through the daemon, list and explicitly discard a suffix beyond checkpoint
 authority using the same append checks. Discard refuses when this state shows
-the tape's last session closed; keep the tape closed for writing, withdraw it
+no open session on the tape (its last session closed, or none opened since it
+was initialized here); keep the tape closed for writing, withdraw it
 with `rem tape retire`, or start from a newer copy of the state directory.
 Retirement refuses while parity closeout is due. To keep the unlisted data,
 start from a newer copy of the state directory; `rem tape restore --scan` is

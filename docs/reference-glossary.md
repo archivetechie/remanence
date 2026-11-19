@@ -324,9 +324,9 @@ commit.
 
 ### audit log
 
-Audit segments (`*.remaudit`) written by earlier versions. `rem audit query`
-reads them; it shows no history of this version's operations. They are not a
-catalog rebuild source.
+Legacy-format audit segments (`*.remaudit`). They are not a catalog rebuild
+source; `rem audit query` does not read them, it streams the library log's
+history.
 
 ### library log
 
@@ -519,7 +519,8 @@ once the running service has parked it (a cartridge already seated when the
 service starts stays until moved), but refuses reads and writing.
 Neither is released by `rem tape quarantine release`. Use `rem tape supersede-tail`
 where recovery applies; it refuses a contradicting recorded session ending or
-a state that shows the tape's last session closed. Otherwise withdraw the tape
+a state that shows no open session on the tape (its last session closed, or none
+opened since it was initialized here). Otherwise withdraw the tape
 with `rem tape retire` or start from a newer copy of the state directory.
 Retirement refuses while parity closeout is due. See [Tape-I/O
 fences](guide-troubleshooting.md#tape-io-fences) for admission details.

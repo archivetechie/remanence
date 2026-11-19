@@ -69,8 +69,10 @@ Tape and drive failures can reach clients as gRPC `INTERNAL`,
 `FAILED_PRECONDITION` or `UNAVAILABLE`. Such a status may carry the
 `remanence-retry` metadata label: `transient`, `operator` or `media` describes
 what kind of intervention helps. A status without the label gives no such
-advice; the label is not promised for every failure or RPC. `DATA_LOSS` means
-a digest or checksum failure.
+advice; the label is not promised for every failure or RPC. Among other uses,
+`DATA_LOSS` reports a file-digest, manifest-digest or tar-header checksum
+mismatch on a verified whole-object read. An audit query also ends with
+`DATA_LOSS` if its history walk encounters a damaged library-log segment.
 
 A read-session `ReadObjectRange` or `ReadFile` fails with `INTERNAL` carrying
 `remanence-finding: media-damage` when a READ of the object's recorded blocks
