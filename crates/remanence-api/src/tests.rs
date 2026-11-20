@@ -824,6 +824,7 @@ fn recipient_pair(first_epoch: u8) -> (RecipientPrivateKey, Vec<RecipientPublicK
     (primary, recipients)
 }
 
+#[allow(dead_code)]
 fn state_with_spool(spool_dir: PathBuf, budget_bytes: u64) -> ApiState {
     let mut state = ApiState::new({
         let index = test_index();
@@ -1480,14 +1481,17 @@ fn manual_finalize_fingerprint_binds_presence_actor_and_exact_reason() {
 
 #[test]
 fn manual_finalize_changed_fields_conflict_after_catalog_restart() {
-    let temp = tempfile::Builder::new()
-        .prefix("remanence-manual-finalize-idempotency-restart")
-        .tempdir()
-        .expect("tempdir");
-    let index_path = temp.path().join("rem-state.sqlite");
+    use remanence_state::library_log::{self as lib, AuthorityError, FoldError};
+    use remanence_state::library_runtime::{LibraryRuntime, RuntimeError};
+
+    let mut typed = TypedRoot::open();
+    let paths = typed.paths().clone();
+    let catalog = typed.catalog();
+    let runtime = catalog.library_runtime().expect("attached catalog");
+    let library_uuid = runtime.manifest().library_uuid();
     let actor_fingerprint = "service:operator-a";
+    let actor = lib::AuditActor::Service("operator-a".into());
     let idempotency_key = Uuid::from_u128(0xf101);
-    let operation_id = Uuid::from_u128(0xf102);
     let tape_uuid = [0x11; 16];
     let baseline = manual_finalize_request_fingerprint(
         tape_uuid,
@@ -1495,19 +1499,44 @@ fn manual_finalize_changed_fields_conflict_after_catalog_restart() {
         actor_fingerprint,
         b"ship copy offsite",
     );
-    remanence_state::projector::open(&index_path)
-        .map(|catalog| catalog.write_handle())
-        .expect("open catalog")
-        .register_idempotency_request(
-            actor_fingerprint,
-            FINALIZE_TAPE_OPERATION_KIND,
-            idempotency_key,
-            baseline,
-            operation_id,
-            Some("2026-08-12T00:00:00Z"),
-        )
+    let accepted = lib::Accepted {
+        actor_fingerprint: actor_fingerprint.into(),
+        idempotency_key: Some(*idempotency_key.as_bytes()),
+        request_fingerprint: baseline,
+        subject: Some(Uuid::from_bytes(tape_uuid).to_string().as_str().into()),
+    };
+    let operation_id = runtime
+        .begin_manual_finalization(accepted.clone(), actor.clone())
         .expect("register baseline request");
-
+    drop(runtime);
+    drop(catalog);
+    typed.release();
+    let before = cu2ft_checked_received(&paths, library_uuid);
+    let original = before
+        .iter()
+        .find_map(|(record, _)| {
+            let operation = record.operation_recorded()?;
+            if operation.operation == operation_id
+                && operation.kind == lib::OperationKind::FinalizeTape
+            {
+                if let lib::OperationEvent::Accepted(value) = &operation.event {
+                    return Some(value);
+                }
+            }
+            None
+        })
+        .expect("the minted operation has its original full Accepted record");
+    assert_eq!(original, &accepted);
+    let reopen = || {
+        let lock = remanence_state::StateLockGuard::acquire(&paths.state_dir)
+            .expect("release prior owners before restart");
+        let runtime = LibraryRuntime::open(&paths, true, Arc::new(lock))
+            .expect("restart authority on the same manifest");
+        let catalog = remanence_state::projector::open(&paths.sqlite_path)
+            .expect("restart catalog")
+            .with_library_runtime(runtime.clone());
+        (runtime, catalog)
+    };
     let changed_fingerprints = [
         manual_finalize_request_fingerprint(
             [0x12; 16],
@@ -1529,20 +1558,38 @@ fn manual_finalize_changed_fields_conflict_after_catalog_restart() {
         ),
     ];
     for changed_fingerprint in changed_fingerprints {
-        let conflict = remanence_state::projector::open(&index_path)
-            .map(|catalog| catalog.write_handle())
-            .expect("restart catalog")
-            .register_idempotency_request(
-                actor_fingerprint,
-                FINALIZE_TAPE_OPERATION_KIND,
-                idempotency_key,
-                changed_fingerprint,
-                Uuid::new_v4(),
-                None,
+        assert_ne!(changed_fingerprint, baseline);
+        let (runtime, catalog) = reopen();
+        // Hold actor, key and original subject fixed: only the digest changes.
+        let conflict = runtime
+            .begin_manual_finalization(
+                lib::Accepted {
+                    request_fingerprint: changed_fingerprint,
+                    ..accepted.clone()
+                },
+                actor.clone(),
             )
             .expect_err("changed request must conflict after restart");
-        assert!(matches!(conflict, StateError::IdempotencyConflict(_)));
+        assert!(matches!(
+            conflict,
+            RuntimeError::Authority(AuthorityError::Store(lib::store::StoreError::Fold(
+                FoldError::ConflictingDuplicate
+            )))
+        ));
+        drop(catalog);
+        drop(runtime);
+        assert_eq!(cu2ft_checked_received(&paths, library_uuid), before);
     }
+    let (runtime, catalog) = reopen();
+    assert_eq!(
+        runtime
+            .begin_manual_finalization(accepted, actor)
+            .expect("exact open retry returns the original operation"),
+        operation_id
+    );
+    drop(catalog);
+    drop(runtime);
+    assert_eq!(cu2ft_checked_received(&paths, library_uuid), before);
 }
 
 #[test]
@@ -11131,4 +11178,57 @@ pub(crate) fn assert_no_legacy_audit_records(state: &ApiState) {
     assert!(FileAuditLog::replay(state.audit_dir.as_ref())
         .expect("replay legacy audit")
         .is_empty());
+}
+
+fn cu2ft_checked_received(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+) -> Vec<(
+    remanence_state::library_log::Record,
+    remanence_state::library_log::Receipt,
+)> {
+    // Read the complete released library source and verify the empty native boundary.
+    use remanence_state::library_log::{native_view::NativeTapeView, store};
+    let native_dir = paths.journal_dir.join("tapes");
+    assert!(native_dir.is_dir(), "the bound native directory must exist");
+    assert!(remanence_state::TapeAuthority::list_entries(&native_dir)
+        .expect("enumerate the readable native directory")
+        .is_empty());
+    let view = NativeTapeView::probe(&native_dir, &paths.sqlite_path).unwrap();
+    let mut received = Vec::new();
+    let replay = store::replay_observed_with_received(
+        &paths.audit_dir,
+        library_uuid,
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, receipt| {
+            received.push((record.clone(), receipt.clone()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    assert!(replay.fold.pending.is_empty());
+    for segment in &replay.segments {
+        assert_eq!(segment.tail, remanence_state::log_frame::Tail::Complete);
+        assert_eq!(
+            segment.through,
+            std::fs::metadata(paths.audit_dir.join(&segment.name))
+                .unwrap()
+                .len()
+        );
+    }
+    for (n, (record, receipt)) in received.iter().enumerate() {
+        assert_eq!(receipt.sequence, n as u64 + 1);
+        assert_eq!(receipt.record_uuid, record.envelope.record_uuid);
+        assert!(receipt.synced);
+    }
+    assert_eq!(replay.last_sequence, received.len() as u64);
+    assert_eq!(
+        replay.terminal_hash,
+        received
+            .last()
+            .map_or([0; 32], |(_, receipt)| receipt.record_hash)
+    );
+    received
 }

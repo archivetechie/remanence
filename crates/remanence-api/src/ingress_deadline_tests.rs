@@ -50,7 +50,7 @@ async fn ingress_deadline_before_start_after_start_and_mid_object() {
         for position in ["before_start", "after_start", "mid_object"] {
             let temp = tempfile::tempdir().unwrap();
             let slab = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
-            let mut state = state_with_spool(temp.path().to_owned(), 2 * slab);
+            let (_typed, mut state) = typed_state_with_spool(temp.path().to_owned(), 2 * slab);
             state.append_staging_mode = mode;
             state.append_ingress_idle_secs = IDLE;
             state.append_ring_bytes = slab;
