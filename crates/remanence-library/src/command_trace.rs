@@ -1,9 +1,9 @@
-//! Opt-in, process-wide command evidence at the Linux SG_IO funnel.
+//! Opt-in, process-wide evidence at the Linux SG_IO funnel.
 //!
-//! Rows contain command metadata and raw errors, never transfer payloads. Only
-//! standard INQUIRY's maker/model/revision fields may leave a response buffer.
-//! Sequential READ(6)/WRITE(6) successes share cumulative runs per device. The
-//! mutex protects rows and run accounting, and is released before every ioctl.
+//! Transfer payloads never enter this recorder. Only standard INQUIRY identity
+//! fields and raw error sense are retained. Rows and cumulative runs share one
+//! caller-thread lock, released before the ioctl. Every transport boundary
+//! contains recorder panics; a caught panic disables tracing for the process.
 
 #![cfg(target_os = "linux")]
 
@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +23,29 @@ use serde_json::{json, Value};
 
 const RUN_INTERVAL_NS: u64 = 10_000_000_000;
 static PROCESS_TRACE: OnceLock<Option<Arc<Recorder>>> = OnceLock::new();
+static DISABLED: AtomicBool = AtomicBool::new(false);
+
+fn diagnostic(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+fn guarded<T>(work: impl FnOnce() -> T) -> Option<T> {
+    if DISABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            // Even a panic payload can have a panicking destructor. Retain it
+            // rather than unwinding from recovery; this happens once per process.
+            std::mem::forget(payload);
+            if !DISABLED.swap(true, Ordering::AcqRel) {
+                diagnostic("rem: command trace disabled: recorder panicked");
+            }
+            None
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Policy<'a> {
@@ -30,38 +55,39 @@ enum Policy<'a> {
 }
 
 fn policy<'a>(trace: Option<&'a OsStr>, field_trace: Option<&OsStr>) -> Policy<'a> {
-    if field_trace.is_some() {
-        Policy::FieldTrace
-    } else {
-        match trace.filter(|value| !value.is_empty()) {
-            Some(value) => Policy::Directory(Path::new(value)),
-            None => Policy::Off,
-        }
+    match trace.filter(|value| !value.is_empty()) {
+        None => Policy::Off,
+        Some(_) if field_trace.is_some() => Policy::FieldTrace,
+        Some(value) => Policy::Directory(Path::new(value)),
     }
 }
 
-/// Resolve the environment once, when the first transport is opened.
-pub(super) fn process_recorder() -> Option<Arc<Recorder>> {
-    PROCESS_TRACE
-        .get_or_init(|| {
-            let trace = std::env::var_os("REM_TRACE");
-            let field_trace = std::env::var_os("REM_FIELD_TRACE");
-            let mut report = |message: &str| eprintln!("{message}");
-            match policy(trace.as_deref(), field_trace.as_deref()) {
-                Policy::Off => None,
-                Policy::FieldTrace => {
-                    report("rem: command trace disabled while the field trace is on");
-                    None
+/// Called only after the device fd is open. Includes setup in the panic boundary.
+pub(super) fn setup() -> (Option<Arc<Recorder>>, u64) {
+    guarded(|| {
+        let trace = PROCESS_TRACE
+            .get_or_init(|| {
+                let trace = std::env::var_os("REM_TRACE");
+                let field = std::env::var_os("REM_FIELD_TRACE");
+                match policy(trace.as_deref(), field.as_deref()) {
+                    Policy::Off => None,
+                    Policy::FieldTrace => {
+                        diagnostic("rem: command trace disabled while the field trace is on");
+                        None
+                    }
+                    Policy::Directory(directory) => open_recorder(
+                        directory,
+                        std::process::id(),
+                        SystemTime::now(),
+                        &mut diagnostic,
+                    ),
                 }
-                Policy::Directory(directory) => open_recorder(
-                    directory,
-                    std::process::id(),
-                    SystemTime::now(),
-                    &mut report,
-                ),
-            }
-        })
-        .clone()
+            })
+            .clone();
+        let dev = trace.as_ref().map_or(0, |recorder| recorder.device());
+        (trace, dev)
+    })
+    .unwrap_or_default()
 }
 
 fn open_recorder(
@@ -80,13 +106,11 @@ fn open_recorder(
         let seconds = wall
             .duration_since(UNIX_EPOCH)
             .map_err(std::io::Error::other)?;
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(directory.join(format!("rem-trace-{pid}-{}.jsonl", seconds.as_secs())))?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(file)
+            .open(directory.join(format!("rem-trace-{pid}-{}.jsonl", seconds.as_secs())))
     })();
     match opened {
         Ok(file) => Some(Arc::new(Recorder::new(file, pid, wall))),
@@ -94,6 +118,21 @@ fn open_recorder(
             report(&format!("rem: command trace disabled: {error}"));
             None
         }
+    }
+}
+
+/// The file and test doubles obey the same write/sync interface.
+trait Writer: Send {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn sync_data(&mut self) -> std::io::Result<()>;
+}
+
+impl Writer for File {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        Write::write_all(self, bytes)
+    }
+    fn sync_data(&mut self) -> std::io::Result<()> {
+        File::sync_data(self)
     }
 }
 
@@ -105,7 +144,9 @@ pub(super) struct Recorder {
 }
 
 struct State {
-    file: File,
+    writer: Box<dyn Writer>,
+    pending_header: Option<Value>,
+    needs_newline: bool,
     devices: HashMap<u64, Device>,
     next_device: u64,
     warned: bool,
@@ -123,7 +164,7 @@ struct Device {
 
 #[derive(PartialEq, Eq)]
 struct Key {
-    cdb: Vec<u8>,
+    cdb: Option<Vec<u8>>,
     requested_bytes: usize,
     timeout_ms: u32,
 }
@@ -142,8 +183,10 @@ struct Run {
 pub(super) struct Command {
     dev: u64,
     key: Key,
+    opcode: Option<u8>,
     dir: Direction,
     start_mono_ns: u64,
+    dispatch_mono_ns: u64,
     matching_run: bool,
 }
 
@@ -153,7 +196,6 @@ pub(super) enum Direction {
     None,
     Out,
 }
-
 impl Direction {
     fn as_str(self) -> &'static str {
         match self {
@@ -165,21 +207,16 @@ impl Direction {
 }
 
 impl Recorder {
-    #[cfg(test)]
-    pub(super) fn for_test(directory: &Path) -> Arc<Self> {
-        open_recorder(directory, 123, UNIX_EPOCH, &mut |reason| panic!("{reason}"))
-            .expect("test trace opens")
-    }
-
-    #[cfg(test)]
-    pub(super) fn sync_count(&self) -> usize {
-        self.lock().sync_count
-    }
-
     fn new(file: File, pid: u32, wall: SystemTime) -> Self {
+        Self::new_writer(Box::new(file), pid, wall)
+    }
+
+    fn new_writer(writer: Box<dyn Writer>, pid: u32, wall: SystemTime) -> Self {
         let recorder = Self {
             state: Mutex::new(State {
-                file,
+                writer,
+                pending_header: None,
+                needs_newline: false,
                 devices: HashMap::new(),
                 next_device: 1,
                 warned: false,
@@ -192,23 +229,25 @@ impl Recorder {
             #[cfg(test)]
             clock: None,
         };
-        recorder.lock().row(
-            json!({"event": "header", "mono_ns": recorder.now(), "schema": 1,
-                "rem_version": env!("CARGO_PKG_VERSION"), "pid": pid,
-                "wall": wall_utc(wall)}),
-            false,
-        );
+        let mut state = recorder.lock();
+        state.pending_header = Some(json!({"event":"header", "mono_ns":recorder.now(),
+            "schema":1, "rem_version":env!("CARGO_PKG_VERSION"), "pid":pid, "wall":wall_utc(wall)}));
+        state.ensure_header();
+        drop(state);
         recorder
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(error) => error.into_inner(),
+        }
     }
 
     fn now(&self) -> u64 {
         #[cfg(test)]
         if let Some(clock) = &self.clock {
-            return clock.load(std::sync::atomic::Ordering::Relaxed);
+            return clock.load(Ordering::Relaxed);
         }
         self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }
@@ -216,7 +255,10 @@ impl Recorder {
     pub(super) fn device(&self) -> u64 {
         let mut state = self.lock();
         let dev = state.next_device;
-        state.next_device += 1;
+        let Some(next) = dev.checked_add(1) else {
+            return 0;
+        };
+        state.next_device = next;
         state.devices.insert(dev, Device::default());
         dev
     }
@@ -228,58 +270,87 @@ impl Recorder {
         dir: Direction,
         requested_bytes: usize,
         timeout_ms: u32,
-    ) -> Command {
+    ) -> Option<Command> {
+        guarded(|| self.begin_inner(dev, cdb, dir, requested_bytes, timeout_ms)).flatten()
+    }
+
+    fn begin_inner(
+        &self,
+        dev: u64,
+        cdb: &[u8],
+        dir: Direction,
+        requested_bytes: usize,
+        timeout_ms: u32,
+    ) -> Option<Command> {
         let start_mono_ns = self.now();
+        // SG_IO rejects longer CDBs. Never allocate or hex-encode that input.
         let key = Key {
-            cdb: cdb.to_vec(),
+            cdb: if cdb.len() <= 16 {
+                Some(cdb.to_vec())
+            } else {
+                None
+            },
             requested_bytes,
             timeout_ms,
         };
         let mut state = self.lock();
-        let matching_run = state.devices[&dev]
-            .run
-            .as_ref()
-            .is_some_and(|run| run.key == key);
+        let device = state.devices.get(&dev)?;
+        let matching_run = device.run.as_ref().is_some_and(|run| run.key == key);
         if !matching_run {
             state.close_run(dev, start_mono_ns);
             state.row(
-                json!({"event": "start", "mono_ns": start_mono_ns, "dev": dev,
-                    "cdb": hex(cdb), "dir": dir.as_str(), "requested_bytes": requested_bytes,
-                    "timeout_ms": timeout_ms}),
+                json!({"event":"start", "mono_ns":start_mono_ns, "dev":dev,
+                "cdb":key.cdb.as_deref().map(hex), "dir":dir.as_str(),
+                "requested_bytes":requested_bytes, "timeout_ms":timeout_ms}),
                 false,
             );
         }
-        Command {
+        drop(state);
+        let dispatch_mono_ns = self.now();
+        Some(Command {
             dev,
             key,
+            opcode: cdb.first().copied(),
             dir,
             start_mono_ns,
+            dispatch_mono_ns,
             matching_run,
-        }
+        })
     }
 
-    /// Observe the raw result before the transport applies `?` or conversions.
+    /// Observe raw SG_IO before the transport propagates or converts its result.
     pub(super) fn complete(
         &self,
-        command: Command,
+        command: Option<Command>,
         result: Result<usize, &ScsiError>,
         response: &[u8],
     ) {
+        let _ = guarded(|| self.complete_inner(command, result, response));
+    }
+
+    fn complete_inner(
+        &self,
+        command: Option<Command>,
+        result: Result<usize, &ScsiError>,
+        response: &[u8],
+    ) {
+        let Some(command) = command else {
+            return;
+        };
         let now = self.now();
-        let duration_ns = now.saturating_sub(command.start_mono_ns);
+        let duration_ns = now.saturating_sub(command.dispatch_mono_ns);
         let full = result.is_ok_and(|n| n == command.key.requested_bytes);
         let mut state = self.lock();
+        let Some(device) = state.devices.get_mut(&command.dev) else {
+            return;
+        };
         if command.matching_run && full {
-            let run = state
-                .devices
-                .get_mut(&command.dev)
-                .unwrap()
-                .run
-                .as_mut()
-                .unwrap();
-            run.count += 1;
-            run.bytes += command.key.requested_bytes as u64;
-            run.total_ns += duration_ns;
+            let Some(run) = device.run.as_mut() else {
+                return;
+            };
+            run.count = run.count.saturating_add(1);
+            run.bytes = run.bytes.saturating_add(command.key.requested_bytes as u64);
+            run.total_ns = run.total_ns.saturating_add(duration_ns);
             run.max_ns = run.max_ns.max(duration_ns);
             run.last_mono_ns = command.start_mono_ns;
             if now.saturating_sub(run.last_row_ns) >= RUN_INTERVAL_NS {
@@ -291,70 +362,114 @@ impl Recorder {
             state.close_run(command.dev, now);
         }
         let (outcome, transferred_bytes, error) = completion_fields(result);
-        let mut row = json!({"event": "done", "mono_ns": now, "dev": command.dev,
-            "opcode": command.key.cdb.first(), "outcome": outcome,
-            "transferred_bytes": transferred_bytes, "duration_ns": duration_ns,
-            "error": error});
+        let mut row = json!({"event":"done", "mono_ns":now, "dev":command.dev,
+            "opcode":command.opcode, "outcome":outcome, "transferred_bytes":transferred_bytes,
+            "duration_ns":duration_ns, "error":error});
         if command.matching_run {
-            row["cdb"] = json!(hex(&command.key.cdb));
-            row["start_mono_ns"] = json!(command.start_mono_ns);
+            if let Some(object) = row.as_object_mut() {
+                object.insert("cdb".into(), json!(command.key.cdb.as_deref().map(hex)));
+                object.insert("start_mono_ns".into(), json!(command.start_mono_ns));
+            }
         }
         state.row(row, result.is_err());
-
+        let unidentified = state
+            .devices
+            .get(&command.dev)
+            .is_some_and(|device| !device.identified);
+        let cdb = command.key.cdb.as_deref();
         if matches!(command.dir, Direction::In)
-            && command.key.cdb.first() == Some(&0x12)
-            && command.key.cdb.get(1).is_some_and(|byte| byte & 1 == 0)
-            && !state.devices[&command.dev].identified
+            && command.opcode == Some(0x12)
+            && cdb
+                .and_then(|bytes| bytes.get(1))
+                .is_some_and(|byte| byte & 1 == 0)
+            && unidentified
         {
             if let Ok(n) = result {
-                // Parse only bytes the raw completion says the device supplied.
                 if let Some(prefix) = response.get(..n) {
                     if let Ok(inquiry) = Inquiry::parse(prefix) {
                         state.row(
-                            json!({"event": "device", "mono_ns": now, "dev": command.dev,
-                                "type": prefix[0] & 0x1f,
-                                "vendor": String::from_utf8_lossy(&inquiry.vendor),
-                                "product": String::from_utf8_lossy(&inquiry.product),
-                                "revision": String::from_utf8_lossy(&inquiry.revision)}),
+                            json!({"event":"device", "mono_ns":now, "dev":command.dev,
+                            "type":prefix.first().map(|byte| byte & 0x1f),
+                            "vendor":String::from_utf8_lossy(&inquiry.vendor),
+                            "product":String::from_utf8_lossy(&inquiry.product),
+                            "revision":String::from_utf8_lossy(&inquiry.revision)}),
                             false,
                         );
-                        state.devices.get_mut(&command.dev).unwrap().identified = true;
+                        if let Some(device) = state.devices.get_mut(&command.dev) {
+                            device.identified = true;
+                        }
                     }
                 }
             }
         }
-        if full && matches!(command.key.cdb.first(), Some(0x08 | 0x0a)) {
-            state.devices.get_mut(&command.dev).unwrap().run = Some(Run {
-                bytes: command.key.requested_bytes as u64,
-                key: command.key,
-                count: 1,
-                total_ns: duration_ns,
-                max_ns: duration_ns,
-                first_mono_ns: command.start_mono_ns,
-                last_mono_ns: command.start_mono_ns,
-                last_row_ns: now,
-            });
+        if full && cdb.is_some() && matches!(command.opcode, Some(0x08 | 0x0a)) {
+            if let Some(device) = state.devices.get_mut(&command.dev) {
+                device.run = Some(Run {
+                    bytes: command.key.requested_bytes as u64,
+                    key: command.key,
+                    count: 1,
+                    total_ns: duration_ns,
+                    max_ns: duration_ns,
+                    first_mono_ns: command.start_mono_ns,
+                    last_mono_ns: command.start_mono_ns,
+                    last_row_ns: now,
+                });
+            }
         }
     }
 
     pub(super) fn close_device(&self, dev: u64) {
-        let mut state = self.lock();
-        state.close_run(dev, self.now());
-        state.devices.remove(&dev);
+        let _ = guarded(|| {
+            let mut state = self.lock();
+            state.close_run(dev, self.now());
+            state.devices.remove(&dev);
+        });
     }
 }
 
 impl State {
+    fn ensure_header(&mut self) -> bool {
+        if let Some(header) = self.pending_header.take() {
+            if !self.write_row(&header) {
+                self.pending_header = Some(header);
+                return false;
+            }
+        }
+        true
+    }
+
     fn row(&mut self, row: Value, failure: bool) {
-        // Values here contain no fallible custom serializer. One write_all sends
-        // the complete line directly to the file, with no userspace buffering.
-        let mut bytes = serde_json::to_vec(&row).expect("trace row is JSON");
-        bytes.push(b'\n');
-        if let Err(error) = self.file.write_all(&bytes) {
-            self.warn_once(&error);
+        if self.ensure_header() {
+            self.write_row(&row);
         }
         if failure {
             self.sync_failure();
+        }
+    }
+
+    fn write_row(&mut self, row: &Value) -> bool {
+        let mut bytes = match serde_json::to_vec(row) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.warn_once(&error);
+                return false;
+            }
+        };
+        if self.needs_newline {
+            bytes.insert(0, b'\n');
+        }
+        bytes.push(b'\n');
+        match self.writer.write_all(&bytes) {
+            Ok(()) => {
+                self.needs_newline = false;
+                true
+            }
+            Err(error) => {
+                // The error gives no count: even a zero-byte failure may need a separator.
+                self.needs_newline = true;
+                self.warn_once(&error);
+                false
+            }
         }
     }
 
@@ -363,29 +478,38 @@ impl State {
         {
             self.sync_count += 1;
         }
-        if let Err(error) = self.file.sync_data() {
+        if let Err(error) = self.writer.sync_data() {
             self.warn_once(&error);
         }
     }
 
-    fn warn_once(&mut self, error: &std::io::Error) {
+    fn warn_once(&mut self, error: &dyn std::fmt::Display) {
         if !self.warned {
             self.warned = true;
             #[cfg(test)]
             {
                 self.warning_count += 1;
             }
-            eprintln!("rem: command trace write/sync failed: {error}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "rem: command trace write/sync failed: {error}"
+            );
         }
     }
 
     fn run_row(&mut self, dev: u64, now: u64) {
-        let run = self.devices.get_mut(&dev).unwrap().run.as_mut().unwrap();
+        let Some(run) = self
+            .devices
+            .get_mut(&dev)
+            .and_then(|device| device.run.as_mut())
+        else {
+            return;
+        };
         run.last_row_ns = now;
-        let row = json!({"event": "run", "mono_ns": now, "dev": dev,
-            "cdb": hex(&run.key.cdb), "count": run.count, "bytes": run.bytes,
-            "total_ns": run.total_ns, "max_ns": run.max_ns,
-            "first_mono_ns": run.first_mono_ns, "last_mono_ns": run.last_mono_ns});
+        let row = json!({"event":"run", "mono_ns":now, "dev":dev,
+            "cdb":run.key.cdb.as_deref().map(hex), "count":run.count, "bytes":run.bytes,
+            "total_ns":run.total_ns, "max_ns":run.max_ns,
+            "first_mono_ns":run.first_mono_ns, "last_mono_ns":run.last_mono_ns});
         self.row(row, false);
     }
 
@@ -396,7 +520,9 @@ impl State {
             .is_some_and(|device| device.run.is_some())
         {
             self.run_row(dev, now);
-            self.devices.get_mut(&dev).unwrap().run = None;
+            if let Some(device) = self.devices.get_mut(&dev) {
+                device.run = None;
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Hermetic recorder proofs: file safety, error fidelity, privacy and run state.
 
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -66,16 +67,17 @@ fn rows(path: &Path) -> Vec<Value> {
 }
 
 #[test]
-fn policy_handles_unset_empty_and_field_trace_even_when_empty() {
+fn policy_only_reports_field_trace_when_command_trace_is_requested() {
     assert_eq!(policy(None, None), Policy::Off);
     assert_eq!(policy(Some(OsStr::new("")), None), Policy::Off);
     assert_eq!(
         policy(Some(OsStr::new("trace")), None),
         Policy::Directory(Path::new("trace"))
     );
-    for trace in [None, Some(OsStr::new("")), Some(OsStr::new("trace"))] {
-        assert_eq!(policy(trace, Some(OsStr::new(""))), Policy::FieldTrace);
-        assert_eq!(policy(trace, Some(OsStr::new("field"))), Policy::FieldTrace);
+    for field in [Some(OsStr::new("")), Some(OsStr::new("field"))] {
+        assert_eq!(policy(None, field), Policy::Off);
+        assert_eq!(policy(Some(OsStr::new("")), field), Policy::Off);
+        assert_eq!(policy(Some(OsStr::new("trace")), field), Policy::FieldTrace);
     }
 }
 
@@ -146,7 +148,7 @@ fn open_creates_private_regular_file_and_header_first() {
     let path = directory.path().join("rem-trace-123-0.jsonl");
     let metadata = path.symlink_metadata().unwrap();
     assert!(metadata.file_type().is_file());
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(metadata.permissions().mode() & 0o177, 0);
     let rows = rows(&path);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["event"], "header");
@@ -264,10 +266,10 @@ fn all_error_variants_keep_every_field_and_unknown_counts_are_null() {
 #[test]
 fn success_counts_are_raw_and_none_is_zero_without_sync() {
     let trace = Trace::new();
-    for (dir, opcode, requested, transferred) in [
-        (Direction::In, 0x12, 96, 36),
-        (Direction::Out, 0x15, 20, 12),
-        (Direction::None, 0x01, 0, 0),
+    for (dir, literal, opcode, requested, transferred) in [
+        (Direction::In, "in", 0x12, 96, 36),
+        (Direction::Out, "out", 0x15, 20, 12),
+        (Direction::None, "none", 0x01, 0, 0),
     ] {
         trace.issue(
             trace.dev,
@@ -280,7 +282,7 @@ fn success_counts_are_raw_and_none_is_zero_without_sync() {
         let rows = trace.rows();
         let start = &rows[rows.len() - 2];
         let done = rows.last().unwrap();
-        assert_eq!(start["dir"], dir.as_str());
+        assert_eq!(start["dir"], literal);
         assert_eq!(start["requested_bytes"], requested);
         assert_eq!(start["timeout_ms"], 5000);
         assert_eq!(done["transferred_bytes"], transferred);
@@ -317,30 +319,31 @@ fn thousand_reads_have_one_pair_and_cumulative_timed_run_rows() {
 }
 
 #[test]
-fn interval_is_checked_at_completion_and_resets_after_each_cumulative_row() {
+fn interval_is_checked_at_completion_across_literal_ten_second_boundary() {
     let trace = Trace::new();
-    trace.read(Ok(4)); // first completion = 107
-    trace.clock.store(RUN_INTERVAL_NS + 106, Ordering::Relaxed);
+    trace.clock.store(0, Ordering::Relaxed);
+    let first = trace
+        .recorder
+        .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
+    trace.recorder.complete(first, Ok(4), &[]);
+    trace.clock.store(9_999_999_999, Ordering::Relaxed);
     let command = trace
         .recorder
         .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
-    assert_eq!(trace.rows().len(), 3, "no timer or begin-time flush");
+    assert_eq!(trace.rows().len(), 3, "no run row before completion");
+    trace.clock.store(10_000_000_000, Ordering::Relaxed);
     trace.recorder.complete(command, Ok(4), &[]);
-    assert_eq!(trace.rows().len(), 3, "one ns short of ten seconds");
-    trace.clock.store(RUN_INTERVAL_NS + 107, Ordering::Relaxed);
+    let rows = trace.rows();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[3]["event"], "run");
+    assert_eq!(rows[3]["count"], 2);
+    assert_eq!(rows[3]["mono_ns"], 10_000_000_000u64);
+    trace.clock.store(19_999_999_999, Ordering::Relaxed);
     let command = trace
         .recorder
         .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
     trace.recorder.complete(command, Ok(4), &[]);
-    assert_eq!(trace.rows().last().unwrap()["count"], 3);
-    trace
-        .clock
-        .store(2 * RUN_INTERVAL_NS + 106, Ordering::Relaxed);
-    let command = trace
-        .recorder
-        .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
-    trace.recorder.complete(command, Ok(4), &[]);
-    assert_eq!(trace.rows().len(), 4);
+    assert_eq!(trace.rows().len(), 4, "the interval resets after a run row");
 }
 
 #[test]
@@ -580,7 +583,7 @@ fn poison_is_recovered_and_write_failures_warn_once_and_recording_continues() {
         let _guard = trace.recorder.state.lock().unwrap();
         panic!("injected poisoned recorder lock");
     }));
-    trace.recorder.lock().file = File::open(&trace.path).unwrap();
+    trace.recorder.lock().writer = Box::new(File::open(&trace.path).unwrap());
     trace.issue(
         trace.dev,
         &[1],
@@ -599,7 +602,312 @@ fn poison_is_recovered_and_write_failures_warn_once_and_recording_continues() {
     );
     assert_eq!(trace.recorder.lock().warning_count, 1);
     assert_eq!(trace.recorder.lock().sync_count, 2);
-    trace.recorder.lock().file = OpenOptions::new().append(true).open(&trace.path).unwrap();
+    trace.recorder.lock().writer =
+        Box::new(OpenOptions::new().append(true).open(&trace.path).unwrap());
     trace.issue(trace.dev, &[1], Direction::None, 0, Ok(0), &[]);
-    assert_eq!(trace.rows().last().unwrap()["outcome"], "good");
+    let text = std::fs::read_to_string(&trace.path).unwrap();
+    let recovered: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(recovered.last().unwrap()["outcome"], "good");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Operation {
+    Write(Vec<u8>),
+    Sync,
+}
+
+#[derive(Default)]
+struct Output {
+    bytes: Vec<u8>,
+    operations: Vec<Operation>,
+    fail_next: Option<usize>,
+    sync_fails: bool,
+    advance_ns: u64,
+}
+
+#[derive(Clone)]
+struct Double {
+    output: Arc<Mutex<Output>>,
+    clock: Arc<AtomicU64>,
+}
+
+impl Double {
+    fn new(clock: Arc<AtomicU64>) -> Self {
+        Self {
+            output: Arc::new(Mutex::new(Output::default())),
+            clock,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Output> {
+        self.output.lock().unwrap()
+    }
+
+    fn rows(&self) -> Vec<Value> {
+        let output = self.lock();
+        std::str::from_utf8(&output.bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+impl Writer for Double {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut output = self.lock();
+        output.operations.push(Operation::Write(bytes.to_vec()));
+        self.clock.fetch_add(output.advance_ns, Ordering::Relaxed);
+        if let Some(prefix) = output.fail_next.take() {
+            output
+                .bytes
+                .extend_from_slice(&bytes[..prefix.min(bytes.len())]);
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        output.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> std::io::Result<()> {
+        let mut output = self.lock();
+        output.operations.push(Operation::Sync);
+        if output.sync_fails {
+            Err(std::io::Error::other("injected sync failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn recorder_double() -> (Recorder, Double, Arc<AtomicU64>, u64) {
+    let clock = Arc::new(AtomicU64::new(100));
+    let double = Double::new(Arc::clone(&clock));
+    let mut recorder = Recorder::new_writer(Box::new(double.clone()), 123, UNIX_EPOCH);
+    recorder.clock = Some(Arc::clone(&clock));
+    let dev = recorder.device();
+    (recorder, double, clock, dev)
+}
+
+#[test]
+fn failure_sync_is_observed_on_writer_after_its_failure_row() {
+    let (recorder, double, clock, dev) = recorder_double();
+    double.lock().operations.clear();
+    let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+    clock.fetch_add(3, Ordering::Relaxed);
+    recorder.complete(command, Err(&ScsiError::InvalidInput("synthetic")), &[]);
+    let output = double.lock();
+    assert_eq!(output.operations.len(), 3);
+    let Operation::Write(start) = &output.operations[0] else {
+        panic!("start write");
+    };
+    let Operation::Write(done) = &output.operations[1] else {
+        panic!("failure write");
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(start).unwrap()["event"],
+        "start"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(done).unwrap()["outcome"],
+        "InvalidInput"
+    );
+    assert_eq!(
+        output.operations[2],
+        Operation::Sync,
+        "actual writer sync, independent of the counter"
+    );
+}
+
+#[test]
+fn sync_errors_are_nonfatal_warn_once_and_recording_continues() {
+    let (recorder, double, _, dev) = recorder_double();
+    double.lock().sync_fails = true;
+    for _ in 0..2 {
+        let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+        recorder.complete(command, Err(&ScsiError::InvalidInput("synthetic")), &[]);
+    }
+    let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+    recorder.complete(command, Ok(0), &[]);
+    assert_eq!(double.rows().last().unwrap()["outcome"], "good");
+    assert_eq!(recorder.lock().warning_count, 1);
+    assert_eq!(
+        double
+            .lock()
+            .operations
+            .iter()
+            .filter(|op| matches!(op, Operation::Sync))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn zero_and_partial_write_recovery_preserves_header_and_isolates_one_fragment() {
+    for header_failure in [true, false] {
+        for prefix in [0, 13] {
+            let clock = Arc::new(AtomicU64::new(100));
+            let double = Double::new(Arc::clone(&clock));
+            if header_failure {
+                double.lock().fail_next = Some(prefix);
+            }
+            let mut recorder = Recorder::new_writer(Box::new(double.clone()), 123, UNIX_EPOCH);
+            recorder.clock = Some(clock);
+            let dev = recorder.device();
+            if !header_failure {
+                double.lock().fail_next = Some(prefix);
+            }
+            let header_length = if header_failure {
+                0
+            } else {
+                double.lock().bytes.len()
+            };
+            let initial_fragment = if header_failure {
+                Some(double.lock().bytes.clone())
+            } else {
+                None
+            };
+            let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+            let fragment =
+                initial_fragment.unwrap_or_else(|| double.lock().bytes[header_length..].to_vec());
+            recorder.complete(command, Ok(0), &[]);
+            let output = double.lock();
+            let mut rows = Vec::new();
+            let mut fragments = Vec::new();
+            for line in output
+                .bytes
+                .strip_suffix(b"\n")
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+            {
+                match serde_json::from_slice::<Value>(line) {
+                    Ok(row) => rows.push(row),
+                    Err(_) => fragments.push(line.to_vec()),
+                }
+            }
+            if prefix == 0 {
+                assert!(
+                    fragments.is_empty() || fragments == [fragment],
+                    "a zero-byte failure may leave one empty separator line"
+                );
+            } else {
+                assert_eq!(
+                    fragments,
+                    [fragment],
+                    "only the exact partial-write fragment is non-JSON"
+                );
+            }
+            assert_eq!(
+                rows[0]["event"], "header",
+                "pending header precedes every successful data row"
+            );
+            let events: Vec<_> = rows
+                .iter()
+                .map(|row| row["event"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                events,
+                if header_failure {
+                    vec!["header", "start", "done"]
+                } else {
+                    vec!["header", "done"]
+                }
+            );
+            assert_eq!(recorder.lock().warning_count, 1);
+        }
+    }
+}
+
+#[test]
+fn command_duration_excludes_start_row_writer_time() {
+    let (recorder, double, clock, dev) = recorder_double();
+    double.lock().advance_ns = 1_000;
+    let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+    assert_eq!(clock.load(Ordering::Relaxed), 1_100);
+    clock.fetch_add(7, Ordering::Relaxed);
+    recorder.complete(command, Ok(0), &[]);
+    let rows = double.rows();
+    assert_eq!(rows[1]["mono_ns"], 100);
+    assert_eq!(rows[2]["mono_ns"], 1_107);
+    assert_eq!(rows[2]["duration_ns"], 7);
+}
+
+#[test]
+fn varied_run_durations_have_exact_total_max_and_last_start() {
+    let (recorder, double, clock, dev) = recorder_double();
+    for (start, duration) in [(100, 3), (140, 11), (170, 5)] {
+        clock.store(start, Ordering::Relaxed);
+        let command = recorder.begin(dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
+        clock.fetch_add(duration, Ordering::Relaxed);
+        recorder.complete(command, Ok(4), &[]);
+    }
+    recorder.close_device(dev);
+    let rows = double.rows();
+    let run = rows.last().unwrap();
+    assert_eq!(run["count"], 3);
+    assert_eq!(run["bytes"], 12);
+    assert_eq!(run["total_ns"], 19);
+    assert_eq!(run["max_ns"], 11);
+    assert_eq!(run["first_mono_ns"], 100);
+    assert_eq!(run["last_mono_ns"], 170);
+}
+
+#[test]
+fn missing_device_entries_skip_without_panicking_or_writing() {
+    let (recorder, double, _, dev) = recorder_double();
+    assert!(recorder
+        .begin(dev + 1, &[1], Direction::None, 0, 5000)
+        .is_none());
+    let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+    recorder.lock().devices.remove(&dev);
+    let before = double.lock().operations.len();
+    recorder.complete(command, Ok(0), &[]);
+    recorder.close_device(dev);
+    assert_eq!(double.lock().operations.len(), before);
+}
+
+// Test-only constructors and injection points, shared by the transport tests.
+impl Recorder {
+    pub(crate) fn for_test(directory: &Path) -> Arc<Self> {
+        open_recorder(directory, 123, UNIX_EPOCH, &mut |reason| panic!("{reason}"))
+            .expect("test trace opens")
+    }
+
+    pub(crate) fn sync_count(&self) -> usize {
+        self.lock().sync_count
+    }
+
+    pub(crate) fn disabled_for_test() -> bool {
+        DISABLED.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn panicking_for_test(directory: &Path, panic_write: usize) -> Arc<Self> {
+        struct PanickingWriter {
+            file: File,
+            writes: usize,
+            panic_write: usize,
+        }
+        impl Writer for PanickingWriter {
+            fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                self.writes += 1;
+                assert_ne!(self.writes, self.panic_write, "injected writer panic");
+                Write::write_all(&mut self.file, bytes)
+            }
+            fn sync_data(&mut self) -> std::io::Result<()> {
+                self.file.sync_data()
+            }
+        }
+        let file = File::create_new(directory.join("panic.jsonl")).unwrap();
+        Arc::new(Self::new_writer(
+            Box::new(PanickingWriter {
+                file,
+                writes: 0,
+                panic_write,
+            }),
+            123,
+            UNIX_EPOCH,
+        ))
+    }
 }

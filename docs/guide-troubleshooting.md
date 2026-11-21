@@ -11,8 +11,9 @@ drive) doing its job.
 Set `REM_TRACE` to an existing directory to record SCSI commands and their
 timing. Repeated full reads and writes are summarised in cumulative runs.
 The trace also records the drive's sense as captured and its maker, model
-and firmware. Sense and device strings come from the drive as sent; sense
-is not decoded. Transfer data, device paths, serial numbers and tape IDs
+and firmware. Device strings are recorded as the drive sends them, with
+invalid bytes replaced. Sense bytes are recorded raw, without decoding,
+and may contain whatever the drive puts there. Transfer data, device paths, serial numbers and tape IDs
 are not recorded.
 
 For a standalone drive, set the variable on the command:
@@ -28,15 +29,19 @@ manager and restart the daemon. Setting the variable only on the client
 does not enable the daemon's trace.
 
 Each process creates one private `rem-trace-<pid>-<unix seconds>.jsonl`
-file, with permissions `0600`. The switch is resolved at the first device
+file, created with mode `0600` (the umask can remove permissions). The switch is resolved at the first successful device
 open; unset or empty means off. Tracing is off while `REM_FIELD_TRACE`
 is set. If the directory or new file cannot be opened, a diagnostic is
 printed and the command continues without tracing. Trace writes run on
-the command's thread and add to its elapsed time.
+the command's thread and add to its elapsed time; `duration_ns` measures
+the command itself, excluding trace I/O. A slow trace directory slows
+every drive's commands while tracing is on, so use a directory on a local disk.
 
 Completed lines survive the process being killed; the last line and a
 run's pending count may not. Host power loss can lose unsynced lines;
 failure rows are synced. Attach the trace files to a bug report.
+A line cut short by a write error (for example a full disk) can appear in
+the file; tools reading the trace should skip lines that do not parse.
 
 ## WORM and unknown-media refusals
 
