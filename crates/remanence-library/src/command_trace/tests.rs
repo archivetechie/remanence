@@ -18,7 +18,7 @@ impl Trace {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("trace.jsonl");
         let clock = Arc::new(AtomicU64::new(100));
-        let mut recorder = Recorder::new(File::create_new(&path).unwrap(), 123, UNIX_EPOCH);
+        let mut recorder = Recorder::new(File::create_new(&path).unwrap(), 123, UNIX_EPOCH, None);
         recorder.clock = Some(Arc::clone(&clock));
         let dev = recorder.device();
         Self {
@@ -57,13 +57,57 @@ fn rows(path: &Path) -> Vec<Value> {
     let text = std::fs::read_to_string(path).unwrap();
     assert!(text.ends_with('\n'));
     text.lines()
-        .map(|line| {
-            let row: Value = serde_json::from_str(line).unwrap();
-            assert!(row["event"].is_string());
-            assert!(row["mono_ns"].is_u64());
-            row
-        })
+        .map(|line| checked_row(serde_json::from_str(line).unwrap()))
         .collect()
+}
+
+fn checked_row(row: Value) -> Value {
+    assert!(row["event"].is_string());
+    assert!(row["mono_ns"].is_u64());
+    row
+}
+
+fn recovered_rows(bytes: &[u8], fragment: &[u8]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut invalid = Vec::new();
+    for line in bytes
+        .strip_suffix(b"\n")
+        .unwrap()
+        .split(|byte| *byte == b'\n')
+    {
+        match serde_json::from_slice(line) {
+            Ok(row) => rows.push(checked_row(row)),
+            Err(_) => invalid.push(line),
+        }
+    }
+    assert!(invalid.len() <= 1, "at most the failed-write fragment");
+    assert!(
+        invalid.iter().all(|line| *line == fragment),
+        "only the exact failed-write fragment"
+    );
+    if !fragment.is_empty() {
+        assert_eq!(invalid, [fragment]);
+    }
+    rows
+}
+
+fn child_output(test: &str, mode: &str) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("CT1_FR2_CHILD", mode)
+        .env("REM_TRACE", "")
+        .env_remove("REM_FIELD_TRACE")
+        .output()
+        .unwrap()
+}
+
+fn assert_child(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[test]
@@ -138,6 +182,17 @@ fn open_requires_existing_directory_and_never_reuses_a_file_or_symlink() {
 
 #[test]
 fn open_creates_private_regular_file_and_header_first() {
+    if std::env::var("CT1_FR2_CHILD").as_deref() != Ok("mode") {
+        assert_child(&child_output(
+            "command_trace::tests::open_creates_private_regular_file_and_header_first",
+            "mode",
+        ));
+        return;
+    }
+    // SAFETY: this subprocess runs this test alone, before creating the file.
+    unsafe {
+        libc::umask(0o022);
+    }
     let directory = tempfile::tempdir().unwrap();
     let mut messages = Vec::new();
     let recorder = open_recorder(directory.path(), 123, UNIX_EPOCH, &mut |message| {
@@ -148,7 +203,7 @@ fn open_creates_private_regular_file_and_header_first() {
     let path = directory.path().join("rem-trace-123-0.jsonl");
     let metadata = path.symlink_metadata().unwrap();
     assert!(metadata.file_type().is_file());
-    assert_eq!(metadata.permissions().mode() & 0o177, 0);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     let rows = rows(&path);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["event"], "header");
@@ -325,20 +380,23 @@ fn interval_is_checked_at_completion_across_literal_ten_second_boundary() {
     let first = trace
         .recorder
         .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
+    trace.clock.store(7, Ordering::Relaxed);
     trace.recorder.complete(first, Ok(4), &[]);
-    trace.clock.store(9_999_999_999, Ordering::Relaxed);
+    assert_eq!(trace.rows()[1]["mono_ns"], 0);
+    assert_eq!(trace.rows()[2]["mono_ns"], 7);
+    trace.clock.store(10_000_000_006, Ordering::Relaxed);
     let command = trace
         .recorder
         .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
     assert_eq!(trace.rows().len(), 3, "no run row before completion");
-    trace.clock.store(10_000_000_000, Ordering::Relaxed);
+    trace.clock.store(10_000_000_007, Ordering::Relaxed);
     trace.recorder.complete(command, Ok(4), &[]);
     let rows = trace.rows();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[3]["event"], "run");
     assert_eq!(rows[3]["count"], 2);
-    assert_eq!(rows[3]["mono_ns"], 10_000_000_000u64);
-    trace.clock.store(19_999_999_999, Ordering::Relaxed);
+    assert_eq!(rows[3]["mono_ns"], 10_000_000_007u64);
+    trace.clock.store(20_000_000_006, Ordering::Relaxed);
     let command = trace
         .recorder
         .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
@@ -605,12 +663,48 @@ fn poison_is_recovered_and_write_failures_warn_once_and_recording_continues() {
     trace.recorder.lock().writer =
         Box::new(OpenOptions::new().append(true).open(&trace.path).unwrap());
     trace.issue(trace.dev, &[1], Direction::None, 0, Ok(0), &[]);
-    let text = std::fs::read_to_string(&trace.path).unwrap();
-    let recovered: Vec<Value> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    let recovered = recovered_rows(&std::fs::read(&trace.path).unwrap(), b"");
     assert_eq!(recovered.last().unwrap()["outcome"], "good");
+}
+
+#[test]
+fn real_file_zero_and_partial_errors_leave_only_the_failed_fragment() {
+    struct PartialFile {
+        file: File,
+        prefix: Option<usize>,
+    }
+    impl Writer for PartialFile {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            if let Some(prefix) = self.prefix.take() {
+                Write::write_all(&mut self.file, &bytes[..prefix])?;
+                return Err(std::io::Error::other("injected partial file write"));
+            }
+            Write::write_all(&mut self.file, bytes)
+        }
+        fn sync_data(&mut self) -> std::io::Result<()> {
+            self.file.sync_data()
+        }
+    }
+    for prefix in [0, 13] {
+        let trace = Trace::new();
+        let header_length = std::fs::read(&trace.path).unwrap().len();
+        trace.recorder.lock().writer = Box::new(PartialFile {
+            file: OpenOptions::new().append(true).open(&trace.path).unwrap(),
+            prefix: Some(prefix),
+        });
+        trace.issue(trace.dev, &[1], Direction::None, 0, Ok(0), &[]);
+        let bytes = std::fs::read(&trace.path).unwrap();
+        let fragment = &bytes[header_length..header_length + prefix];
+        let rows = recovered_rows(&bytes, fragment);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["event"], "header");
+        assert_eq!(rows[1]["event"], "done");
+        trace.issue(trace.dev, &[1], Direction::None, 0, Ok(0), &[]);
+        let rows = recovered_rows(&std::fs::read(&trace.path).unwrap(), fragment);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2]["event"], "start");
+        assert_eq!(rows[3]["event"], "done");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -651,7 +745,7 @@ impl Double {
         std::str::from_utf8(&output.bytes)
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| checked_row(serde_json::from_str(line).unwrap()))
             .collect()
     }
 }
@@ -774,31 +868,7 @@ fn zero_and_partial_write_recovery_preserves_header_and_isolates_one_fragment() 
                 initial_fragment.unwrap_or_else(|| double.lock().bytes[header_length..].to_vec());
             recorder.complete(command, Ok(0), &[]);
             let output = double.lock();
-            let mut rows = Vec::new();
-            let mut fragments = Vec::new();
-            for line in output
-                .bytes
-                .strip_suffix(b"\n")
-                .unwrap()
-                .split(|byte| *byte == b'\n')
-            {
-                match serde_json::from_slice::<Value>(line) {
-                    Ok(row) => rows.push(row),
-                    Err(_) => fragments.push(line.to_vec()),
-                }
-            }
-            if prefix == 0 {
-                assert!(
-                    fragments.is_empty() || fragments == [fragment],
-                    "a zero-byte failure may leave one empty separator line"
-                );
-            } else {
-                assert_eq!(
-                    fragments,
-                    [fragment],
-                    "only the exact partial-write fragment is non-JSON"
-                );
-            }
+            let rows = recovered_rows(&output.bytes, &fragment);
             assert_eq!(
                 rows[0]["event"], "header",
                 "pending header precedes every successful data row"
@@ -866,6 +936,176 @@ fn missing_device_entries_skip_without_panicking_or_writing() {
     recorder.complete(command, Ok(0), &[]);
     recorder.close_device(dev);
     assert_eq!(double.lock().operations.len(), before);
+}
+
+#[test]
+fn waiting_caller_rechecks_disabled_after_the_panicking_writer_unlocks() {
+    if std::env::var("CT1_FR2_CHILD").as_deref() != Ok("race") {
+        assert_child(&child_output("command_trace::tests::waiting_caller_rechecks_disabled_after_the_panicking_writer_unlocks", "race"));
+        return;
+    }
+    struct BarrierWriter {
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+    impl Writer for BarrierWriter {
+        fn write_all(&mut self, _: &[u8]) -> std::io::Result<()> {
+            if self.writes.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.entered.wait();
+                self.release.wait();
+                panic!("injected panic while the second caller waits");
+            }
+            Ok(())
+        }
+        fn sync_data(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let waiting = Arc::new(std::sync::Barrier::new(2));
+    let mut recorder = Recorder::new_writer(
+        Box::new(BarrierWriter {
+            writes: Arc::clone(&writes),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        123,
+        UNIX_EPOCH,
+    );
+    let first_dev = recorder.device();
+    let second_dev = recorder.device();
+    recorder.lock_waiting = Some(Arc::clone(&waiting));
+    let recorder = Arc::new(recorder);
+    let first_recorder = Arc::clone(&recorder);
+    let first =
+        std::thread::spawn(move || first_recorder.begin(first_dev, &[1], Direction::None, 0, 5000));
+    entered.wait();
+    let second_recorder = Arc::clone(&recorder);
+    let second = std::thread::spawn(move || {
+        second_recorder.begin(second_dev, &[1], Direction::None, 0, 5000)
+    });
+    // This barrier is reached only after try_lock observed the held mutex,
+    // inside a caller that already passed guarded()'s disabled check.
+    waiting.wait();
+    release.wait();
+    assert!(first.join().unwrap().is_none());
+    assert!(second.join().unwrap().is_none());
+    assert!(DISABLED.load(Ordering::Acquire));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        2,
+        "the waiting caller must not write"
+    );
+}
+
+#[test]
+fn diagnostics_are_emitted_after_the_recorder_lock_is_released() {
+    let (mut recorder, double, _, dev) = recorder_double();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observations = Arc::clone(&observed);
+    recorder.diagnostic_hook = Some(Arc::new(move |_, free| {
+        observations.lock().unwrap().push(free)
+    }));
+    for _ in 0..2 {
+        double.lock().fail_next = Some(0);
+        let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+        recorder.complete(command, Ok(0), &[]);
+    }
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [true],
+        "one diagnostic with a free recorder lock"
+    );
+    assert_eq!(recorder.lock().warning_count, 1);
+}
+
+#[test]
+fn injected_file_limit_reserves_headroom_before_any_writer_call() {
+    let mode = std::env::var("CT1_FR2_CHILD").unwrap_or_default();
+    if !matches!(
+        mode.as_str(),
+        "limit-header" | "limit-exact" | "limit-partial"
+    ) {
+        for mode in ["limit-header", "limit-exact", "limit-partial"] {
+            let output = child_output("command_trace::tests::injected_file_limit_reserves_headroom_before_any_writer_call", mode);
+            assert_child(&output);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .filter(|line| line
+                        .starts_with("rem: command trace disabled: file-size limit reached"))
+                    .count(),
+                1
+            );
+        }
+        return;
+    }
+    if mode == "limit-header" {
+        let double = Double::new(Arc::new(AtomicU64::new(100)));
+        let _ = Recorder::new_writer_with_limit(
+            Box::new(double.clone()),
+            123,
+            UNIX_EPOCH,
+            Some(65_536),
+        );
+        assert!(
+            double.lock().operations.is_empty(),
+            "no write when the margin consumes the limit"
+        );
+        assert!(DISABLED.load(Ordering::Acquire));
+        return;
+    }
+    let (mut recorder, double, _, dev) = recorder_double();
+    let row = json!({"event":"probe", "mono_ns":123});
+    let row_length = serde_json::to_vec(&row).unwrap().len() as u64 + 1;
+    let initial = double.lock().bytes.len() as u64;
+    recorder.lock().file_limit = Some(65_536 + initial + row_length);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observations = Arc::clone(&observed);
+    recorder.diagnostic_hook = Some(Arc::new(move |_, free| {
+        observations.lock().unwrap().push(free)
+    }));
+    if mode == "limit-partial" {
+        double.lock().fail_next = Some(13);
+    }
+    let _ = recorder.with_state(|state| state.row(row.clone(), false));
+    assert!(
+        !DISABLED.load(Ordering::Acquire),
+        "a write ending exactly at the cap is permitted"
+    );
+    assert_eq!(
+        double.lock().bytes.len() as u64,
+        initial
+            + if mode == "limit-partial" {
+                13
+            } else {
+                row_length
+            }
+    );
+    let bytes = double.lock().bytes.clone();
+    let count = double.lock().operations.len();
+    let _ = recorder.with_state(|state| state.row(row, false));
+    assert!(DISABLED.load(Ordering::Acquire));
+    assert_eq!(
+        double.lock().operations.len(),
+        count,
+        "the over-limit row never reaches the writer"
+    );
+    assert_eq!(double.lock().bytes, bytes);
+    assert!(recorder
+        .begin(dev, &[1], Direction::None, 0, 5000)
+        .is_none());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        if mode == "limit-partial" {
+            vec![true, true]
+        } else {
+            vec![true]
+        }
+    );
 }
 
 // Test-only constructors and injection points, shared by the transport tests.

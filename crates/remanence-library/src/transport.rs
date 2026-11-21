@@ -1016,6 +1016,62 @@ mod tests {
 
         /// Each injection has its own process because disabling is process-wide.
         #[test]
+        fn caller_unwind_flushes_drop_without_disabling_trace() {
+            if std::env::var_os("CT1_CALLER_UNWIND_CHILD").is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "transport::tests::command_trace_fr1::caller_unwind_flushes_drop_without_disabling_trace", "--nocapture"])
+                    .env("CT1_CALLER_UNWIND_CHILD", "1").env("REM_TRACE", "")
+                    .env_remove("REM_FIELD_TRACE").output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let device = tempfile::NamedTempFile::new().unwrap();
+            let recorder = crate::command_trace::Recorder::for_test(directory.path());
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut t = LinuxSgTransport::open_rw(device.path()).unwrap();
+                t.device_index = recorder.device();
+                t.trace = Some(Arc::clone(&recorder));
+                for _ in 0..3 {
+                    let command = recorder.begin(
+                        t.device_index,
+                        &[8, 0, 0, 0, 4, 0],
+                        crate::command_trace::Direction::In,
+                        4,
+                        5000,
+                    );
+                    recorder.complete(command, Ok(4), &[]);
+                }
+                panic!("injected caller panic, not a recorder fault");
+            }));
+            assert!(failed.is_err());
+            assert!(!crate::command_trace::Recorder::disabled_for_test());
+            let dev = recorder.device();
+            let command = recorder.begin(dev, &[1], crate::command_trace::Direction::None, 0, 5000);
+            assert!(
+                command.is_some(),
+                "tracing remains usable after the caller recovers"
+            );
+            recorder.complete(command, Ok(0), &[]);
+            let text =
+                std::fs::read_to_string(directory.path().join("rem-trace-123-0.jsonl")).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 6);
+            assert_eq!(rows[3]["event"], "run");
+            assert_eq!(rows[3]["count"], 3);
+            assert_eq!(rows[5]["outcome"], "good");
+        }
+
+        /// Each injection has its own process because disabling is process-wide.
+        #[test]
         fn panic_child() {
             let Ok(phase) = std::env::var("CT1_PANIC_PHASE") else {
                 return;
@@ -1023,8 +1079,13 @@ mod tests {
             let dir = std::env::var("CT1_PANIC_DIRECTION").unwrap();
             let directory =
                 std::path::PathBuf::from(std::env::var_os("CT1_PANIC_DIRECTORY").unwrap());
+            std::env::set_var("REM_TRACE", &directory);
             let device = tempfile::NamedTempFile::new().unwrap();
             let mut t = LinuxSgTransport::open_rw(device.path()).unwrap();
+            assert!(
+                t.trace.is_some(),
+                "the process recorder is initialized before the injected panic"
+            );
             let panic_write = if phase == "begin" { 2 } else { 3 };
             let recorder =
                 crate::command_trace::Recorder::panicking_for_test(&directory, panic_write);
@@ -1046,13 +1107,32 @@ mod tests {
                 before,
                 "recording stays disabled through Drop"
             );
-            std::env::set_var("REM_TRACE", &directory);
+            let snapshot = || {
+                let mut files: Vec<_> = std::fs::read_dir(&directory)
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (
+                            path.file_name().unwrap().to_owned(),
+                            std::fs::read(&path).unwrap(),
+                        )
+                    })
+                    .collect();
+                files.sort();
+                files
+            };
+            let files_before = snapshot();
             let another = LinuxSgTransport::open_rw(device.path()).unwrap();
             assert!(
                 another.trace.is_none(),
                 "later device opens also skip tracing"
             );
-            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+            assert_eq!(
+                snapshot(),
+                files_before,
+                "later opens create no file and add no row"
+            );
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
         }
 
         #[test]
@@ -1074,6 +1154,10 @@ mod tests {
                         .output()
                         .unwrap();
                     let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        stderr.contains("panicked at"),
+                        "the default Rust panic hook is retained"
+                    );
                     assert!(
                         output.status.success(),
                         "{phase}/{dir}: {stderr}\n{}",

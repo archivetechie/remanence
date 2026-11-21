@@ -24,6 +24,19 @@ use serde_json::{json, Value};
 const RUN_INTERVAL_NS: u64 = 10_000_000_000;
 static PROCESS_TRACE: OnceLock<Option<Arc<Recorder>>> = OnceLock::new();
 static DISABLED: AtomicBool = AtomicBool::new(false);
+static PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
+
+// Declared after the mutex guard, so unwinding disables before unlocking.
+struct DisableOnUnwind {
+    completed: bool,
+}
+impl Drop for DisableOnUnwind {
+    fn drop(&mut self) {
+        if !self.completed {
+            DISABLED.store(true, Ordering::Release);
+        }
+    }
+}
 
 fn diagnostic(message: &str) {
     let _ = writeln!(std::io::stderr(), "{message}");
@@ -39,7 +52,8 @@ fn guarded<T>(work: impl FnOnce() -> T) -> Option<T> {
             // Even a panic payload can have a panicking destructor. Retain it
             // rather than unwinding from recovery; this happens once per process.
             std::mem::forget(payload);
-            if !DISABLED.swap(true, Ordering::AcqRel) {
+            DISABLED.store(true, Ordering::Release);
+            if !PANIC_REPORTED.swap(true, Ordering::AcqRel) {
                 diagnostic("rem: command trace disabled: recorder panicked");
             }
             None
@@ -106,19 +120,32 @@ fn open_recorder(
         let seconds = wall
             .duration_since(UNIX_EPOCH)
             .map_err(std::io::Error::other)?;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(directory.join(format!("rem-trace-{pid}-{}.jsonl", seconds.as_secs())))
+            .open(directory.join(format!("rem-trace-{pid}-{}.jsonl", seconds.as_secs())))?;
+        Ok((file, file_soft_limit()?))
     })();
     match opened {
-        Ok(file) => Some(Arc::new(Recorder::new(file, pid, wall))),
+        Ok((file, limit)) => Some(Arc::new(Recorder::new(file, pid, wall, limit))),
         Err(error) => {
             report(&format!("rem: command trace disabled: {error}"));
             None
         }
     }
+}
+
+fn file_soft_limit() -> std::io::Result<Option<u64>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only to this live rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur))
 }
 
 /// The file and test doubles obey the same write/sync interface.
@@ -136,11 +163,18 @@ impl Writer for File {
     }
 }
 
+#[cfg(test)]
+type DiagnosticHook = Arc<dyn Fn(&str, bool) + Send + Sync>;
+
 pub(super) struct Recorder {
     state: Mutex<State>,
     epoch: Instant,
     #[cfg(test)]
     clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    lock_waiting: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    diagnostic_hook: Option<DiagnosticHook>,
 }
 
 struct State {
@@ -150,6 +184,11 @@ struct State {
     devices: HashMap<u64, Device>,
     next_device: u64,
     warned: bool,
+    pending_diagnostics: Vec<String>,
+    file_limit: Option<u64>,
+    // Reserve the entire attempted write, including on an error: write_all
+    // cannot tell us how many bytes a partial failure left in the file.
+    reserved_bytes: u64,
     #[cfg(test)]
     sync_count: usize,
     #[cfg(test)]
@@ -207,11 +246,21 @@ impl Direction {
 }
 
 impl Recorder {
-    fn new(file: File, pid: u32, wall: SystemTime) -> Self {
-        Self::new_writer(Box::new(file), pid, wall)
+    fn new(file: File, pid: u32, wall: SystemTime, limit: Option<u64>) -> Self {
+        Self::new_writer_with_limit(Box::new(file), pid, wall, limit)
     }
 
+    #[cfg(test)]
     fn new_writer(writer: Box<dyn Writer>, pid: u32, wall: SystemTime) -> Self {
+        Self::new_writer_with_limit(writer, pid, wall, None)
+    }
+
+    fn new_writer_with_limit(
+        writer: Box<dyn Writer>,
+        pid: u32,
+        wall: SystemTime,
+        limit: Option<u64>,
+    ) -> Self {
         let recorder = Self {
             state: Mutex::new(State {
                 writer,
@@ -220,6 +269,9 @@ impl Recorder {
                 devices: HashMap::new(),
                 next_device: 1,
                 warned: false,
+                pending_diagnostics: Vec::new(),
+                file_limit: limit,
+                reserved_bytes: 0,
                 #[cfg(test)]
                 sync_count: 0,
                 #[cfg(test)]
@@ -228,20 +280,64 @@ impl Recorder {
             epoch: Instant::now(),
             #[cfg(test)]
             clock: None,
+            #[cfg(test)]
+            lock_waiting: None,
+            #[cfg(test)]
+            diagnostic_hook: None,
         };
-        let mut state = recorder.lock();
-        state.pending_header = Some(json!({"event":"header", "mono_ns":recorder.now(),
-            "schema":1, "rem_version":env!("CARGO_PKG_VERSION"), "pid":pid, "wall":wall_utc(wall)}));
-        state.ensure_header();
-        drop(state);
+        let header = json!({"event":"header", "mono_ns":recorder.now(),
+            "schema":1, "rem_version":env!("CARGO_PKG_VERSION"), "pid":pid, "wall":wall_utc(wall)});
+        let _ = recorder.with_state(|state| {
+            state.pending_header = Some(header);
+            state.ensure_header();
+        });
         recorder
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
+        #[cfg(test)]
+        if let Some(waiting) = &self.lock_waiting {
+            match self.state.try_lock() {
+                Ok(state) => return state,
+                Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    waiting.wait();
+                }
+            }
+        }
         match self.state.lock() {
             Ok(state) => state,
             Err(error) => error.into_inner(),
         }
+    }
+
+    fn with_state<T>(&self, work: impl FnOnce(&mut State) -> T) -> Option<T> {
+        let mut state = self.lock();
+        if DISABLED.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut unwind = DisableOnUnwind { completed: false };
+        let result = work(&mut state);
+        unwind.completed = true;
+        drop(unwind);
+        let messages = std::mem::take(&mut state.pending_diagnostics);
+        drop(state);
+        for message in messages {
+            self.report(&message);
+        }
+        Some(result)
+    }
+
+    fn report(&self, message: &str) {
+        #[cfg(test)]
+        if let Some(hook) = &self.diagnostic_hook {
+            let free = matches!(
+                self.state.try_lock(),
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_))
+            );
+            hook(message, free);
+        }
+        diagnostic(message);
     }
 
     fn now(&self) -> u64 {
@@ -253,14 +349,16 @@ impl Recorder {
     }
 
     pub(super) fn device(&self) -> u64 {
-        let mut state = self.lock();
-        let dev = state.next_device;
-        let Some(next) = dev.checked_add(1) else {
-            return 0;
-        };
-        state.next_device = next;
-        state.devices.insert(dev, Device::default());
-        dev
+        self.with_state(|state| {
+            let dev = state.next_device;
+            let Some(next) = dev.checked_add(1) else {
+                return 0;
+            };
+            state.next_device = next;
+            state.devices.insert(dev, Device::default());
+            dev
+        })
+        .unwrap_or(0)
     }
 
     pub(super) fn begin(
@@ -293,19 +391,20 @@ impl Recorder {
             requested_bytes,
             timeout_ms,
         };
-        let mut state = self.lock();
-        let device = state.devices.get(&dev)?;
-        let matching_run = device.run.as_ref().is_some_and(|run| run.key == key);
-        if !matching_run {
-            state.close_run(dev, start_mono_ns);
-            state.row(
-                json!({"event":"start", "mono_ns":start_mono_ns, "dev":dev,
+        let matching_run = self.with_state(|state| {
+            let device = state.devices.get(&dev)?;
+            let matching_run = device.run.as_ref().is_some_and(|run| run.key == key);
+            if !matching_run {
+                state.close_run(dev, start_mono_ns);
+                state.row(
+                    json!({"event":"start", "mono_ns":start_mono_ns, "dev":dev,
                 "cdb":key.cdb.as_deref().map(hex), "dir":dir.as_str(),
                 "requested_bytes":requested_bytes, "timeout_ms":timeout_ms}),
-                false,
-            );
-        }
-        drop(state);
+                    false,
+                );
+            }
+            Some(matching_run)
+        })??;
         let dispatch_mono_ns = self.now();
         Some(Command {
             dev,
@@ -340,89 +439,91 @@ impl Recorder {
         let now = self.now();
         let duration_ns = now.saturating_sub(command.dispatch_mono_ns);
         let full = result.is_ok_and(|n| n == command.key.requested_bytes);
-        let mut state = self.lock();
-        let Some(device) = state.devices.get_mut(&command.dev) else {
-            return;
-        };
-        if command.matching_run && full {
-            let Some(run) = device.run.as_mut() else {
+        let _ = self.with_state(|state| {
+            let Some(device) = state.devices.get_mut(&command.dev) else {
                 return;
             };
-            run.count = run.count.saturating_add(1);
-            run.bytes = run.bytes.saturating_add(command.key.requested_bytes as u64);
-            run.total_ns = run.total_ns.saturating_add(duration_ns);
-            run.max_ns = run.max_ns.max(duration_ns);
-            run.last_mono_ns = command.start_mono_ns;
-            if now.saturating_sub(run.last_row_ns) >= RUN_INTERVAL_NS {
-                state.run_row(command.dev, now);
+            if command.matching_run && full {
+                let Some(run) = device.run.as_mut() else {
+                    return;
+                };
+                run.count = run.count.saturating_add(1);
+                run.bytes = run.bytes.saturating_add(command.key.requested_bytes as u64);
+                run.total_ns = run.total_ns.saturating_add(duration_ns);
+                run.max_ns = run.max_ns.max(duration_ns);
+                run.last_mono_ns = command.start_mono_ns;
+                if now.saturating_sub(run.last_row_ns) >= RUN_INTERVAL_NS {
+                    state.run_row(command.dev, now);
+                }
+                return;
             }
-            return;
-        }
-        if command.matching_run {
-            state.close_run(command.dev, now);
-        }
-        let (outcome, transferred_bytes, error) = completion_fields(result);
-        let mut row = json!({"event":"done", "mono_ns":now, "dev":command.dev,
+            if command.matching_run {
+                state.close_run(command.dev, now);
+            }
+            let (outcome, transferred_bytes, error) = completion_fields(result);
+            let mut row = json!({"event":"done", "mono_ns":now, "dev":command.dev,
             "opcode":command.opcode, "outcome":outcome, "transferred_bytes":transferred_bytes,
             "duration_ns":duration_ns, "error":error});
-        if command.matching_run {
-            if let Some(object) = row.as_object_mut() {
-                object.insert("cdb".into(), json!(command.key.cdb.as_deref().map(hex)));
-                object.insert("start_mono_ns".into(), json!(command.start_mono_ns));
+            if command.matching_run {
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("cdb".into(), json!(command.key.cdb.as_deref().map(hex)));
+                    object.insert("start_mono_ns".into(), json!(command.start_mono_ns));
+                }
             }
-        }
-        state.row(row, result.is_err());
-        let unidentified = state
-            .devices
-            .get(&command.dev)
-            .is_some_and(|device| !device.identified);
-        let cdb = command.key.cdb.as_deref();
-        if matches!(command.dir, Direction::In)
-            && command.opcode == Some(0x12)
-            && cdb
-                .and_then(|bytes| bytes.get(1))
-                .is_some_and(|byte| byte & 1 == 0)
-            && unidentified
-        {
-            if let Ok(n) = result {
-                if let Some(prefix) = response.get(..n) {
-                    if let Ok(inquiry) = Inquiry::parse(prefix) {
-                        state.row(
-                            json!({"event":"device", "mono_ns":now, "dev":command.dev,
+            state.row(row, result.is_err());
+            let unidentified = state
+                .devices
+                .get(&command.dev)
+                .is_some_and(|device| !device.identified);
+            let cdb = command.key.cdb.as_deref();
+            if matches!(command.dir, Direction::In)
+                && command.opcode == Some(0x12)
+                && cdb
+                    .and_then(|bytes| bytes.get(1))
+                    .is_some_and(|byte| byte & 1 == 0)
+                && unidentified
+            {
+                if let Ok(n) = result {
+                    if let Some(prefix) = response.get(..n) {
+                        if let Ok(inquiry) = Inquiry::parse(prefix) {
+                            state.row(
+                                json!({"event":"device", "mono_ns":now, "dev":command.dev,
                             "type":prefix.first().map(|byte| byte & 0x1f),
                             "vendor":String::from_utf8_lossy(&inquiry.vendor),
                             "product":String::from_utf8_lossy(&inquiry.product),
                             "revision":String::from_utf8_lossy(&inquiry.revision)}),
-                            false,
-                        );
-                        if let Some(device) = state.devices.get_mut(&command.dev) {
-                            device.identified = true;
+                                false,
+                            );
+                            if let Some(device) = state.devices.get_mut(&command.dev) {
+                                device.identified = true;
+                            }
                         }
                     }
                 }
             }
-        }
-        if full && cdb.is_some() && matches!(command.opcode, Some(0x08 | 0x0a)) {
-            if let Some(device) = state.devices.get_mut(&command.dev) {
-                device.run = Some(Run {
-                    bytes: command.key.requested_bytes as u64,
-                    key: command.key,
-                    count: 1,
-                    total_ns: duration_ns,
-                    max_ns: duration_ns,
-                    first_mono_ns: command.start_mono_ns,
-                    last_mono_ns: command.start_mono_ns,
-                    last_row_ns: now,
-                });
+            if full && cdb.is_some() && matches!(command.opcode, Some(0x08 | 0x0a)) {
+                if let Some(device) = state.devices.get_mut(&command.dev) {
+                    device.run = Some(Run {
+                        bytes: command.key.requested_bytes as u64,
+                        key: command.key,
+                        count: 1,
+                        total_ns: duration_ns,
+                        max_ns: duration_ns,
+                        first_mono_ns: command.start_mono_ns,
+                        last_mono_ns: command.start_mono_ns,
+                        last_row_ns: now,
+                    });
+                }
             }
-        }
+        });
     }
 
     pub(super) fn close_device(&self, dev: u64) {
         let _ = guarded(|| {
-            let mut state = self.lock();
-            state.close_run(dev, self.now());
-            state.devices.remove(&dev);
+            let _ = self.with_state(|state| {
+                state.close_run(dev, self.now());
+                state.devices.remove(&dev);
+            });
         });
     }
 }
@@ -442,7 +543,7 @@ impl State {
         if self.ensure_header() {
             self.write_row(&row);
         }
-        if failure {
+        if failure && !DISABLED.load(Ordering::Acquire) {
             self.sync_failure();
         }
     }
@@ -459,6 +560,18 @@ impl State {
             bytes.insert(0, b'\n');
         }
         bytes.push(b'\n');
+        let next = self.reserved_bytes.checked_add(bytes.len() as u64);
+        if self
+            .file_limit
+            .is_some_and(|limit| next.is_none_or(|length| length > limit.saturating_sub(65_536)))
+        {
+            if !DISABLED.swap(true, Ordering::AcqRel) {
+                self.pending_diagnostics
+                    .push("rem: command trace disabled: file-size limit reached".into());
+            }
+            return false;
+        }
+        self.reserved_bytes = next.unwrap_or(u64::MAX);
         match self.writer.write_all(&bytes) {
             Ok(()) => {
                 self.needs_newline = false;
@@ -490,10 +603,8 @@ impl State {
             {
                 self.warning_count += 1;
             }
-            let _ = writeln!(
-                std::io::stderr(),
-                "rem: command trace write/sync failed: {error}"
-            );
+            self.pending_diagnostics
+                .push(format!("rem: command trace write/sync failed: {error}"));
         }
     }
 
