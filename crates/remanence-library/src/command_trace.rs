@@ -120,12 +120,13 @@ fn open_recorder(
         let seconds = wall
             .duration_since(UNIX_EPOCH)
             .map_err(std::io::Error::other)?;
+        let limit = file_soft_limit()?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(directory.join(format!("rem-trace-{pid}-{}.jsonl", seconds.as_secs())))?;
-        Ok((file, file_soft_limit()?))
+        Ok((file, limit))
     })();
     match opened {
         Ok((file, limit)) => Some(Arc::new(Recorder::new(file, pid, wall, limit))),
@@ -145,7 +146,10 @@ fn file_soft_limit() -> std::io::Result<Option<u64>> {
     if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur))
+    // rlim_t is u32 on some Linux targets and u64 on others.
+    #[allow(clippy::useless_conversion)]
+    let soft_limit = u64::from(limit.rlim_cur);
+    Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(soft_limit))
 }
 
 /// The file and test doubles obey the same write/sync interface.
@@ -549,6 +553,9 @@ impl State {
     }
 
     fn write_row(&mut self, row: &Value) -> bool {
+        if DISABLED.load(Ordering::Acquire) {
+            return false;
+        }
         let mut bytes = match serde_json::to_vec(row) {
             Ok(bytes) => bytes,
             Err(error) => {

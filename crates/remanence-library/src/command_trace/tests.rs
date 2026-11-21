@@ -384,6 +384,17 @@ fn interval_is_checked_at_completion_across_literal_ten_second_boundary() {
     trace.recorder.complete(first, Ok(4), &[]);
     assert_eq!(trace.rows()[1]["mono_ns"], 0);
     assert_eq!(trace.rows()[2]["mono_ns"], 7);
+    trace.clock.store(10_000_000_005, Ordering::Relaxed);
+    let command = trace
+        .recorder
+        .begin(trace.dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
+    trace.clock.store(10_000_000_006, Ordering::Relaxed);
+    trace.recorder.complete(command, Ok(4), &[]);
+    assert_eq!(
+        trace.rows().len(),
+        3,
+        "no row one ns before the first interval boundary"
+    );
     trace.clock.store(10_000_000_006, Ordering::Relaxed);
     let command = trace
         .recorder
@@ -394,7 +405,7 @@ fn interval_is_checked_at_completion_across_literal_ten_second_boundary() {
     let rows = trace.rows();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[3]["event"], "run");
-    assert_eq!(rows[3]["count"], 2);
+    assert_eq!(rows[3]["count"], 3);
     assert_eq!(rows[3]["mono_ns"], 10_000_000_007u64);
     trace.clock.store(20_000_000_006, Ordering::Relaxed);
     let command = trace
@@ -1105,6 +1116,55 @@ fn injected_file_limit_reserves_headroom_before_any_writer_call() {
         } else {
             vec![true]
         }
+    );
+}
+
+#[test]
+fn disabling_on_run_flush_prevents_a_smaller_start_in_the_same_acquisition() {
+    if std::env::var("CT1_FR2_CHILD").as_deref() != Ok("same-acquisition") {
+        assert_child(&child_output("command_trace::tests::disabling_on_run_flush_prevents_a_smaller_start_in_the_same_acquisition", "same-acquisition"));
+        return;
+    }
+    let (recorder, double, clock, dev) = recorder_double();
+    for _ in 0..2 {
+        let command = recorder.begin(dev, &[8, 0, 0, 0, 4, 0], Direction::In, 4, 5000);
+        clock.fetch_add(7, Ordering::Relaxed);
+        recorder.complete(command, Ok(4), &[]);
+    }
+    clock.store(200, Ordering::Relaxed);
+    let start = json!({"event":"start", "mono_ns":200, "dev":dev, "cdb":"01",
+        "dir":"none", "requested_bytes":0, "timeout_ms":5000});
+    let run = json!({"event":"run", "mono_ns":200, "dev":dev, "cdb":"080000000400",
+        "count":2, "bytes":8, "total_ns":14, "max_ns":7,
+        "first_mono_ns":100, "last_mono_ns":107});
+    let start_length = serde_json::to_vec(&start).unwrap().len() as u64 + 1;
+    let run_length = serde_json::to_vec(&run).unwrap().len() as u64 + 1;
+    assert!(
+        run_length > start_length,
+        "the allowance must fit only the smaller row"
+    );
+    let before = double.lock().bytes.clone();
+    let operations = double.lock().operations.clone();
+    recorder.lock().file_limit = Some(65_536 + before.len() as u64 + start_length);
+    let command = recorder.begin(dev, &[1], Direction::None, 0, 5000);
+    assert!(
+        DISABLED.load(Ordering::Acquire),
+        "the pending run exceeds the allowance"
+    );
+    assert_eq!(
+        double.lock().operations,
+        operations,
+        "neither the run nor its following start reaches the writer"
+    );
+    assert_eq!(double.lock().bytes, before);
+    recorder.complete(command, Ok(0), &[]);
+    assert!(recorder
+        .begin(dev, &[1], Direction::None, 0, 5000)
+        .is_none());
+    assert_eq!(
+        double.lock().operations,
+        operations,
+        "later acquisitions also write nothing"
     );
 }
 
