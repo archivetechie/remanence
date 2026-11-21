@@ -684,8 +684,7 @@ stream backpressure separately. Inventory and read sends waiting for consumers
 are interrupted when shutdown begins. There is no startup probe of the service
 manager's configuration. A failed MOVE or forced kill can still leave media
 unthreaded. A walk can issue several SPACE commands; the per-command timeout does
-not bound the whole operation. The field kit's `REMFIELD_STOP_TIMEOUT_SECONDS` is
-a separate process-stop limit and must be sized for the field plan.
+not bound the whole operation.
 
 Graceful shutdown gives every write session the same absolute deadline, starting
 when shutdown begins: `daemon.shutdown_close_deadline_secs` (default 300 seconds,
