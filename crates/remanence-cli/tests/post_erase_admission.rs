@@ -16,7 +16,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+    },
 };
 const DEVICE: &str = "/virtual/plr-t3-drive";
 const SERIAL: &str = "PLR-T3-DRIVE";
@@ -322,8 +325,8 @@ struct Fixture {
 }
 /// Serialize both branches while they restore the same absolute host paths.
 fn repaired_fixture() -> MutexGuard<'static, Fixture> {
-    // Statics are never dropped: the fixture's TempDir remains in TMPDIR until
-    // the test-run harness removes TMPDIR after the process exits.
+    // Statics are never dropped, so the fixture's TempDir is never removed
+    // and stays under TMPDIR after the process exits.
     static FIXTURE: OnceLock<Mutex<Fixture>> = OnceLock::new();
     FIXTURE
         .get_or_init(|| Mutex::new(Fixture::new()))
@@ -332,6 +335,12 @@ fn repaired_fixture() -> MutexGuard<'static, Fixture> {
 }
 impl Fixture {
     fn new() -> Self {
+        static SNAPSHOT_BUILDS: AtomicUsize = AtomicUsize::new(0);
+        assert_eq!(
+            SNAPSHOT_BUILDS.fetch_add(1, Ordering::Relaxed),
+            0,
+            "only one repaired snapshot is built per process"
+        );
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_owned();
         let mut world = VirtualWorld::single_drive("PLR-T3-LIB", BAY, SERIAL, 0x400, 0);
@@ -629,6 +638,22 @@ fn post_erase_read_refusal() {
         0,
         "no WRITE/WFM before refusal"
     );
+    let blank_checks: Vec<_> = output
+        .trace
+        .commands
+        .iter()
+        .filter(|v| {
+            v.cdb[0] == 0x08
+                && v.sense.map(|s| (s.key, s.asc, s.ascq, s.is_deferred()))
+                    == Some((3, 0x14, 0, false))
+        })
+        .collect();
+    assert_eq!(
+        blank_checks.len(),
+        1,
+        "exactly one current blank-check READ"
+    );
+    assert_eq!(blank_checks[0].lba, Some(f.c), "blank-check READ is at C");
     let failed: Vec<_> = output
         .trace
         .commands
@@ -672,6 +697,8 @@ fn post_erase_read_refusal() {
     for (&locate, &read) in predecessor_locates.iter().zip(&predecessor_reads) {
         assert!(previous_end.is_none_or(|end| end < locate));
         assert!(locate < read && read + 1 < at);
+        assert_eq!(read, locate + 2, "adjacent predecessor proof window");
+        assert_eq!(before_read[locate + 1].cdb[0], 0x34);
         assert!(before_read[locate].ok);
         assert!(before_read[read].sense.is_some_and(|s| s.filemark));
         assert_eq!(before_read[read + 1].cdb[0], 0x34);

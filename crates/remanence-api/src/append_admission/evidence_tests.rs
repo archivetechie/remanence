@@ -468,6 +468,7 @@ fn probe_error_precedes_restoration() {
             >= reported + restore.end.duration_since(restore.start).as_millis(),
         "probe elapsed boundary"
     );
+    let mut marker_assertions_ran = false;
     for (reply, expected) in [
         (
             Reply::Host,
@@ -528,8 +529,10 @@ fn probe_error_precedes_restoration() {
             let source = f.drive.read_block(&mut vec![0; SIZE as usize]).unwrap_err();
             assert!(source.to_string().contains("media_readiness_state="));
             assert_eq!(f.script.lock().unwrap().counts[&0x08], 3);
+            marker_assertions_ran = true;
         }
     }
+    assert!(marker_assertions_ran, "Reply::Io marker assertions ran");
     let mut f = fixture();
     hook(&f, 0x08, 2, missing(), 0);
     let (err, _typed) = ended(&mut f);
