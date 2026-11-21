@@ -2872,7 +2872,7 @@ mod tests {
         assert_eq!(&read_buf, batch.as_slice());
     }
 
-    /// Pin per-command classes, including production SPACE dispatch and its status read.
+    /// Pin per-command classes through production SPACE, LOCATE and REWIND dispatch.
     #[test]
     fn model_records_timeout_class_per_command_and_asserts_single_in_flight() {
         let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
@@ -2910,6 +2910,29 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             use remanence_library::{DriveHandle, SpaceKind, TapeIoErrorKind};
+
+            // A fresh loaded fixture resets position and faults between cases.
+            let loaded_drive = || {
+                let mut world =
+                    VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+                let mut tape = VirtualTape::empty(1024, 4);
+                tape.records = vec![Record::Block(b"abcd".to_vec()), Record::Filemark];
+                tape.durable_frontier = tape.records.len();
+                world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), tape);
+                let world = Arc::new(Mutex::new(world));
+                let drive = DriveHandle::open_standalone_with_transport(
+                    std::path::Path::new("/virtual/space-timeout"),
+                    Box::new(ModelTransport::new(
+                        Arc::clone(&world),
+                        DeviceRole::Drive { bay: 0x0100 },
+                    )),
+                    &StaticAllowlist::new(["DRV-MODEL"]),
+                )
+                .expect("allowlisted model drive");
+                // Exclude opener INQUIRY records and release the lock before dispatch.
+                world.lock().expect("world").command_log.clear();
+                (world, drive)
+            };
 
             let mut observed = Vec::new();
             let mut expected = Vec::new();
@@ -2979,25 +3002,7 @@ mod tests {
                     None,
                 ),
             ] {
-                // A fresh loaded fixture resets position and faults between cases.
-                let mut world =
-                    VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
-                let mut tape = VirtualTape::empty(1024, 4);
-                tape.records = vec![Record::Block(b"abcd".to_vec()), Record::Filemark];
-                tape.durable_frontier = tape.records.len();
-                world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), tape);
-                let world = Arc::new(Mutex::new(world));
-                let mut drive = DriveHandle::open_standalone_with_transport(
-                    std::path::Path::new("/virtual/space-timeout"),
-                    Box::new(ModelTransport::new(
-                        Arc::clone(&world),
-                        DeviceRole::Drive { bay: 0x0100 },
-                    )),
-                    &StaticAllowlist::new(["DRV-MODEL"]),
-                )
-                .expect("allowlisted model drive");
-                // Exclude opener INQUIRY records and release the lock before dispatch.
-                world.lock().expect("world").command_log.clear();
+                let (world, mut drive) = loaded_drive();
                 let result = if pipelined {
                     drive.space_pipelined(count, kind)
                 } else {
@@ -3050,7 +3055,41 @@ mod tests {
                     Some(1),
                 ));
             }
-            // One comparison exposes both SPACE encodings if the shared dispatch regresses.
+            for (label, target_lba, commands) in [
+                (
+                    "LOCATE",
+                    Some(1),
+                    vec![
+                        (0x92, TimeoutClass::Positioning),
+                        (0x34, TimeoutClass::TapeStatus),
+                    ],
+                ),
+                ("REWIND", None, vec![(0x01, TimeoutClass::Rewind)]),
+            ] {
+                let (world, mut drive) = loaded_drive();
+                let result = match target_lba {
+                    Some(lba) => drive.locate(lba).map(|_| ()),
+                    None => drive.rewind(),
+                };
+                let world = world.lock().expect("world");
+                // Keep the full log, including LOCATE's inline READ POSITION.
+                let recorded = world
+                    .command_log
+                    .iter()
+                    .map(|record| (record.opcode, record.timeout_class))
+                    .collect::<Vec<_>>();
+                observed.push((
+                    label,
+                    result
+                        .map(|()| false)
+                        .map_err(|error| format!("unexpected error: {error:?}")),
+                    recorded,
+                    vec![],
+                    world.max_drive_commands_in_flight.get(&0x0100).copied(),
+                ));
+                expected.push((label, Ok(false), commands, vec![], Some(1)));
+            }
+            // One comparison exposes every row's command-class regression.
             assert_eq!(observed, expected);
         }
     }
