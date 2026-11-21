@@ -5,8 +5,10 @@ use remanence_chaos::model::{
     VirtualWorld,
 };
 use remanence_library::{
-    transport::TransferOutcome, DeviceAttachment, DriveHandle, ScsiError, SgTransport, SpaceKind,
-    StaticAllowlist, TimeoutClass,
+    scsi::{decode_usable_sense, DecodedSense},
+    transport::TransferOutcome,
+    DeviceAttachment, DriveHandle, ScsiError, SgTransport, SpaceKind, StaticAllowlist,
+    TimeoutClass,
 };
 use remanence_state::tape_log::{Record, SessionEndReason, SessionEnded, TailIdentity};
 use sha2::{Digest, Sha256};
@@ -14,7 +16,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 const DEVICE: &str = "/virtual/plr-t3-drive";
 const SERIAL: &str = "PLR-T3-DRIVE";
@@ -22,10 +24,51 @@ const TAPE: &str = "PLRT03L9";
 const BAY: u16 = 0x100;
 const BLOCK: usize = 262144;
 
+type RepairedIdentity = ([u8; 16], TailIdentity, [u8; 32], u64, [u8; 32]);
+
 #[derive(Clone)]
 struct Snapshot {
     world: VirtualWorld,
     disk: BTreeMap<PathBuf, Vec<u8>>,
+    identity: RepairedIdentity,
+}
+/// Bind the native ending and boundary to a tagged, length-delimited media digest.
+fn repaired_identity(root: &Path, id: [u8; 16], world: &VirtualWorld) -> RepairedIdentity {
+    let state = native(root, id);
+    let ending = state.summary().last_session_end.as_ref().unwrap();
+    let mut tails = Vec::new();
+    state
+        .visit_last_session_tail(|tail| {
+            tails.push(tail.identity.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(tails.len(), 1);
+    assert!(matches!(&tails[0], TailIdentity::Object(_)));
+    let records = &world.tapes[TAPE].records;
+    let mut hash = Sha256::new();
+    hash.update((records.len() as u64).to_be_bytes());
+    for record in records {
+        match record {
+            MediaRecord::Block(bytes) => {
+                hash.update([0]);
+                hash.update((bytes.len() as u64).to_be_bytes());
+                hash.update(bytes);
+            }
+            MediaRecord::ZeroBlock(size) => {
+                hash.update([1]);
+                hash.update(size.to_be_bytes());
+            }
+            MediaRecord::Filemark => hash.update([2]),
+        }
+    }
+    (
+        ending.session_id,
+        tails.remove(0),
+        ending.tail.digest,
+        state.summary().cursor.lba,
+        hash.finalize().into(),
+    )
 }
 fn disk(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
@@ -52,7 +95,7 @@ struct Command {
     cdb: Vec<u8>,
     lba: Option<u64>,
     buffer: usize,
-    sense: Option<(u8, u8, u8)>,
+    sense: Option<DecodedSense>,
     ok: bool,
 }
 #[derive(Clone, Debug, Default)]
@@ -62,11 +105,9 @@ struct Trace {
     data_writes: usize,
     cut_keep: Option<usize>,
 }
-fn sense(error: &ScsiError) -> Option<(u8, u8, u8)> {
+fn sense(error: &ScsiError) -> Option<DecodedSense> {
     match error {
-        ScsiError::CheckCondition { sense, .. } if sense.len() >= 14 && sense[0] & 0x7f == 0x70 => {
-            Some((sense[2] & 15, sense[12], sense[13]))
-        }
+        ScsiError::CheckCondition { sense, .. } => decode_usable_sense(sense),
         _ => None,
     }
 }
@@ -94,7 +135,7 @@ impl SgTransport for CaptureTransport {
             if result.is_ok() && cdb[1] & 1 == 0 {
                 self.position = self.position.map(|p| p + 1);
             } else if let Err(ScsiError::CheckCondition { sense, .. }) = &result {
-                if sense.get(2).is_some_and(|b| b & 0x80 != 0) {
+                if decode_usable_sense(sense).is_some_and(|s| s.filemark) {
                     self.position = self.position.map(|p| p + 1);
                 }
             }
@@ -278,6 +319,16 @@ struct Fixture {
     ending: SessionEnded,
     prefix: Vec<MediaRecord>,
     receipts: Vec<serde_json::Value>,
+}
+/// Serialize both branches while they restore the same absolute host paths.
+fn repaired_fixture() -> MutexGuard<'static, Fixture> {
+    // Statics are never dropped: the fixture's TempDir remains in TMPDIR until
+    // the test-run harness removes TMPDIR after the process exits.
+    static FIXTURE: OnceLock<Mutex<Fixture>> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| Mutex::new(Fixture::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 impl Fixture {
     fn new() -> Self {
@@ -464,8 +515,10 @@ impl Fixture {
         assert_eq!(output.code, ExitCode::SUCCESS, "identify: {output:?}");
         assert_eq!(result(&output)["object_count"], 8);
         get_first(&root, &world);
+        let repaired_world = world.lock().unwrap().clone();
         let repaired = Snapshot {
-            world: world.lock().unwrap().clone(),
+            identity: repaired_identity(&root, id, &repaired_world),
+            world: repaired_world,
             disk: disk(&root),
         };
         println!("fixture: scheme=custom:128,4,1 block={BLOCK} eight_finished=8 C={c} ninth_variable_writes={} keep={} ending={ending:?} tail={tails:?}; SPACE(BOT->EOD)={c}; identify=8; get1=identical",writes.len(),cut_keep);
@@ -494,12 +547,16 @@ impl Fixture {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
         }
-        Arc::new(Mutex::new(self.repaired.world.clone()))
+        let world = Arc::new(Mutex::new(self.repaired.world.clone()));
+        let identity = repaired_identity(&self.root, self.id, &world.lock().unwrap());
+        assert_eq!(identity, self.repaired.identity, "same repaired snapshot");
+        println!("restored repaired snapshot: {identity:?}");
+        world
     }
 }
 #[test]
 fn post_erase_resumes() {
-    let f = Fixture::new();
+    let f = repaired_fixture();
     let world = f.clone_repaired();
     let mut ids: BTreeSet<_> = f
         .receipts
@@ -544,7 +601,7 @@ fn post_erase_resumes() {
 }
 #[test]
 fn post_erase_read_refusal() {
-    let f = Fixture::new();
+    let f = repaired_fixture();
     let world = f.clone_repaired();
     {
         let mut w = world.lock().unwrap();
@@ -577,20 +634,50 @@ fn post_erase_read_refusal() {
         .commands
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.cdb[0] == 0x08 && v.sense == Some((3, 0x14, 0)))
+        .filter(|(_, v)| v.cdb[0] == 0x08 && v.lba == Some(f.c))
         .collect();
     assert_eq!(failed.len(), 1);
     let (at, read) = failed[0];
     assert_eq!(read.lba, Some(f.c));
     assert_eq!(read.buffer, BLOCK);
-    let predecessor_reads = output.trace.commands[..at]
+    assert_eq!(
+        read.sense.map(|s| (s.key, s.asc, s.ascq, s.is_deferred())),
+        Some((3, 0x14, 0, false)),
+        "READ C decoded sense"
+    );
+    let before_read = &output.trace.commands[..at];
+    let predecessor_reads: Vec<_> = before_read
         .iter()
-        .filter(|v| v.cdb[0] == 0x08 && v.lba == Some(f.c - 1))
-        .count();
-    assert!(
-        predecessor_reads >= 3,
+        .enumerate()
+        .filter(|(_, v)| v.cdb[0] == 0x08 && v.lba == Some(f.c - 1))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        predecessor_reads.len(),
+        3,
         "parity reopening and admission predecessor proofs: {output:?}"
     );
+    let predecessor_locates: Vec<_> = before_read
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| {
+            v.cdb[0] == 0x92 && u64::from_be_bytes(v.cdb[4..12].try_into().unwrap()) == f.c - 1
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(predecessor_locates.len(), 3);
+    // The two parity reopening proofs precede admission's session proof. Each
+    // LOCATE also performs its own POSITION before the READ/POSITION pair.
+    let mut previous_end = None;
+    for (&locate, &read) in predecessor_locates.iter().zip(&predecessor_reads) {
+        assert!(previous_end.is_none_or(|end| end < locate));
+        assert!(locate < read && read + 1 < at);
+        assert!(before_read[locate].ok);
+        assert!(before_read[read].sense.is_some_and(|s| s.filemark));
+        assert_eq!(before_read[read + 1].cdb[0], 0x34);
+        assert!(before_read[read + 1].ok);
+        previous_end = Some(read + 1);
+    }
     assert_eq!(
         output.trace.commands[..at]
             .iter()
@@ -602,7 +689,7 @@ fn post_erase_read_refusal() {
     let text = format!("{} {}", output.out, output.err);
     let first="tape identity invalidated: proved generation 0, current generation 1; re-establish media proof before writing";
     assert!(text.contains(first), "unchanged identity refusal: {text}");
-    println!("refusal: C={} predecessor_reads={predecessor_reads} READ_at={at} returned=03/14/00; no writes; records/EOD unchanged; text={text}",f.c);
+    println!("refusal: C={} predecessor_reads={predecessor_reads:?} predecessor_locates={predecessor_locates:?} READ_at={at} returned=03/14/00; no writes; records/EOD unchanged; text={text}",f.c);
     assert!(
         text.contains("opcode=0x08"),
         "refusal names opcode=0x08: {text}"

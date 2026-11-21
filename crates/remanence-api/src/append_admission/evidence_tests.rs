@@ -300,16 +300,19 @@ fn fields(error: &AdmissionError) -> BTreeMap<String, String> {
 }
 fn elapsed(error: &AdmissionError, phase: &str) -> u128 {
     let data = fields(error);
-    data[if phase == "probe" {
-        "proof_elapsed_ms"
+    let (key, label) = if phase == "probe" {
+        ("proof_elapsed_ms", " (probe start to returned error)")
     } else {
-        "restoration_elapsed_ms"
-    }]
-    .split_once(' ')
-    .unwrap()
-    .0
-    .parse()
-    .unwrap()
+        (
+            "restoration_elapsed_ms",
+            " (restoration start to returned error)",
+        )
+    };
+    let value = data[key]
+        .strip_suffix(label)
+        .expect("exact elapsed phase label");
+    assert!(!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()));
+    value.parse().unwrap()
 }
 fn event(f: &Fixture, opcode: u8, nth: usize) -> Event {
     f.script
@@ -412,7 +415,7 @@ fn unavailable(error: &AdmissionError) {
 #[test]
 fn probe_error_precedes_restoration() {
     let mut f = fixture();
-    hook(&f, 0x08, 2, missing(), 0);
+    hook(&f, 0x08, 2, missing(), 10);
     hook(
         &f,
         0x34,
@@ -449,6 +452,13 @@ fn probe_error_precedes_restoration() {
     );
     let restore = event(&f, 0x34, 2);
     let reported = elapsed(&err, "probe");
+    let probe = event(&f, 0x08, 2);
+    let measured = probe.end.duration_since(probe.start).as_millis();
+    assert!(measured >= 10, "probe hook measured delay");
+    assert!(
+        reported >= measured,
+        "probe elapsed includes measured delay"
+    );
     assert!(
         reported <= restore.start.duration_since(start).as_millis(),
         "probe elapsed excludes measured restoration delay: {reported} {restore:?}"
@@ -497,7 +507,7 @@ fn probe_error_precedes_restoration() {
         ),
     ] {
         let mut f = fixture();
-        hook(&f, 0x08, 2, reply, 0);
+        hook(&f, 0x08, 2, reply.clone(), 0);
         let err = fresh(&mut f).unwrap_err();
         common(&err, &f);
         assert_fields(&err, &expected);
@@ -507,17 +517,19 @@ fn probe_error_precedes_restoration() {
                 ("opcode", "0x08"),
                 ("step_target_lba", "1"),
                 ("phase", "probe"),
+                ("kind", "io"),
             ],
         );
+        if matches!(reply, Reply::Io) {
+            // Admission consumed READs #1 (identity) and #2 (bootstrap mark).
+            // Read #3 on this same fixture exposes the source's arbitrary text.
+            assert_eq!(f.script.lock().unwrap().counts[&0x08], 2);
+            hook(&f, 0x08, 3, Reply::Io, 0);
+            let source = f.drive.read_block(&mut vec![0; SIZE as usize]).unwrap_err();
+            assert!(source.to_string().contains("media_readiness_state="));
+            assert_eq!(f.script.lock().unwrap().counts[&0x08], 3);
+        }
     }
-    // Demonstrate the arbitrary source text that the typed clause must exclude.
-    let mut source = fixture();
-    hook(&source, 0x08, 1, Reply::Io, 0);
-    let source = source
-        .drive
-        .read_block(&mut vec![0; SIZE as usize])
-        .unwrap_err();
-    assert!(source.to_string().contains("media_readiness_state="));
     let mut f = fixture();
     hook(&f, 0x08, 2, missing(), 0);
     let (err, _typed) = ended(&mut f);
@@ -733,13 +745,20 @@ fn restoration_error_after_successful_probe() {
     // A successful probe's delay is excluded from restoration's own time origin.
     let mut f = fixture();
     hook(&f, 0x34, 1, Reply::Pass, 25);
-    hook(&f, 0x34, 4, missing(), 0);
+    hook(&f, 0x34, 4, missing(), 10);
     let start = Instant::now();
     let err = checkpoint(&mut f).unwrap_err();
     let end = Instant::now();
     let probe_delay = event(&f, 0x34, 1);
     let probe_last = event(&f, 0x08, 2);
     let reported = elapsed(&err, "restoration");
+    let restore = event(&f, 0x34, 4);
+    let measured = restore.end.duration_since(restore.start).as_millis();
+    assert!(measured >= 10, "restoration hook measured delay");
+    assert!(
+        reported >= measured,
+        "restoration elapsed includes measured delay"
+    );
     assert!(
         reported <= end.duration_since(probe_last.start).as_millis(),
         "restoration uses its own origin"
@@ -763,6 +782,11 @@ fn restoration_error_after_successful_probe() {
             ("phase", "restoration"),
             ("step_target_lba", "0"),
             ("opcode", "0x92"),
+            ("sense", "unavailable"),
+            ("sense_timing", "unavailable"),
+            ("host_status", "unavailable"),
+            ("host_bytes_transferred", "unavailable"),
+            ("bytes_transferred", "unavailable"),
             ("post_transfer.opcode", "0x34"),
             ("post_transfer.sense", "03/14/00"),
             ("post_transfer.sense_timing", "current"),
@@ -771,6 +795,7 @@ fn restoration_error_after_successful_probe() {
             ("post_transfer.bytes_transferred", "0"),
         ],
     );
+    elapsed(&err, "restoration");
     let clause = clause(&err);
     let keys: Vec<_> = clause
         .split("; ")
@@ -832,6 +857,15 @@ fn daemon_identity_refusal_preserves_evidence() {
     hook(&f, 0x08, 2, missing(), 0);
     let (err, typed) = ended(&mut f);
     common(&err, &f);
+    let AdmissionErrorKind::Io(io) = &err.kind else {
+        panic!("outer Io: {err:?}")
+    };
+    let remanence_library::TapeIoErrorKind::IdentityInvalidated { proved, current } = io.kind
+    else {
+        panic!("outer identity: {err:?}")
+    };
+    assert_eq!(proved, 0, "daemon proved generation");
+    assert_eq!(current, 1, "daemon current generation");
     let expected = reference(&err);
     let outcome = admission_error_outcome(&err);
     assert_eq!(outcome, admission_error_outcome(&expected));
