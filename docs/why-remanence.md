@@ -164,7 +164,7 @@ library can take minutes.
 
 Remanence gives each SCSI command a timeout for its class: 5 s for INQUIRY and
 other short status commands, 60 s for READ ELEMENT STATUS, 120 s for MOVE
-MEDIUM, 300 s for positioning, 600 s for LOAD and UNLOAD, INITIALIZE ELEMENT
+MEDIUM, 300 s for LOCATE, 3,600 s for SPACE, 600 s for LOAD and UNLOAD, INITIALIZE ELEMENT
 STATUS and REWIND, and 900 s for tape reads and writes and WRITE FILEMARKS. The
 class is set on the transport before each command is sent. A command that does
 time out is classified as completion-unknown (section 5).

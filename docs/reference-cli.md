@@ -1765,8 +1765,9 @@ tape and drive and records no verdict, and a cancelled verification starts over;
 no pause or resume. The daemon does not pre-empt verification for writes or restores.
 Progress includes tape UUID, drive serial, bay, phase, tape file, bytes read and elapsed
 milliseconds; unknown positions are `unknown`. Phase changes publish immediately; other
-updates publish at most once every five seconds. An in-flight READ can wait for its
-900-second command timeout. The catalog records the verdict state and the terminal edition
+updates publish at most once every five seconds. Cancellation waits for an in-flight
+command to settle: READ can wait for its 900-second command timeout and SPACE for
+its 3,600-second command timeout. The catalog records the verdict state and the terminal edition
 digest when available, and `rem catalog tapes` shows them.
 
 To start a verification of tape `5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f` in the background and
