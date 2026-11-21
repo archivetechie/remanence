@@ -2067,7 +2067,7 @@ impl super::DriveHandle {
 
             drive.fire_tape_started(op, cdb);
 
-            drive.transport.set_timeout_for(TimeoutClass::Positioning);
+            drive.transport.set_timeout_for(TimeoutClass::Space);
             let started = Instant::now();
             let result = drive.transport.execute_none_nonmedia(cdb);
 

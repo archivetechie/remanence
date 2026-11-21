@@ -194,7 +194,8 @@ impl VerificationContext {
     }
 
     /// Check immediately before each CDB, including commands inside raw adapters.
-    /// An in-flight READ has the longest timeout: 900 seconds (TapeIo).
+    /// An in-flight command can wait for its timeout: READ 900 seconds (TapeIo),
+    /// SPACE 3,600 seconds (Space), the longest single-command timeout.
     pub fn check_cancelled(&self) -> Result<(), ScsiError> {
         self.notify();
         if self

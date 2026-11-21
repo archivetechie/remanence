@@ -668,10 +668,21 @@ and closes open sessions, and leaves cartridges seated. A dismount waiting for c
 stops before issuing UNLOAD. Once UNLOAD has been issued, its MOVE home
 continues, and shutdown waits for it without the 600-second reservation deadline.
 That MOVE retains the configured `changer_not_ready_wait_seconds` magazine/door
-wait even during shutdown. Other reservations retain their 600-second bound.
+wait even during shutdown. Shutdown first closes the sessions in its snapshot in
+parallel, then tries to reserve each library bay in turn, skipping standalone
+endpoints. Closeout and drive-actor work (including admitted health polls and
+heartbeats) and admitted changer motion are awaited without a time limit; each
+restarts the ordinary bay wait. A session opened after the snapshot is also
+closed, without restarting that wait. A missing reservation entry or a session
+still recorded on the bay causes an immediate failure for that bay. Other
+reservation holders get 600 seconds of uninterrupted waiting; expiry records a
+failure and moves to the next bay without taking or releasing the reservation.
+After the last bay, shutdown waits without a time limit for remaining changer
+motion and all closeout, drive-actor and finalization workers.
 The service manager's stop timeout (systemd `TimeoutStopSec`, for example) must
-cover `daemon.shutdown_close_deadline_secs` plus command settlement (TapeIo permits
-900 seconds), plus up to 600 seconds per configured drive, since ordinary
+cover `daemon.shutdown_close_deadline_secs` plus settlement of the longest single
+issued command (TapeIo permits 900 seconds and SPACE 3,600 seconds), plus
+600 seconds for each uninterrupted ordinary bay wait, since ordinary
 reservation waits run sequentially. Outstanding changer UNLOAD/MOVE work adds
 its configured readiness waits and command timeouts. These are additive bounds,
 not one global 600-second deadline. Every drive actor uses the shared cutoff from
@@ -680,7 +691,8 @@ waits for actor ownership through issued-command settlement; it interrupts host
 stream backpressure separately. Inventory and read sends waiting for consumers
 are interrupted when shutdown begins. There is no startup probe of the service
 manager's configuration. A failed MOVE or forced kill can still leave media
-unthreaded.
+unthreaded. A walk can issue several SPACE commands; the per-command timeout does
+not bound the whole operation.
 
 Graceful shutdown gives every write session the same absolute deadline, starting
 when shutdown begins: `daemon.shutdown_close_deadline_secs` (default 300 seconds,

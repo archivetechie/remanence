@@ -2872,6 +2872,7 @@ mod tests {
         assert_eq!(&read_buf, batch.as_slice());
     }
 
+    /// Pin per-command classes through production SPACE, LOCATE and REWIND dispatch.
     #[test]
     fn model_records_timeout_class_per_command_and_asserts_single_in_flight() {
         let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
@@ -2904,6 +2905,193 @@ mod tests {
             ]
         );
         assert_eq!(world.max_drive_commands_in_flight.get(&0x0100), Some(&1));
+        drop(world);
+
+        #[cfg(target_os = "linux")]
+        {
+            use remanence_library::{DriveHandle, SpaceKind, TapeIoErrorKind};
+
+            // A fresh loaded fixture resets position and faults between cases.
+            let loaded_drive = || {
+                let mut world =
+                    VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 1);
+                let mut tape = VirtualTape::empty(1024, 4);
+                tape.records = vec![Record::Block(b"abcd".to_vec()), Record::Filemark];
+                tape.durable_frontier = tape.records.len();
+                world.put_tape_in_drive(0x0100, "TAPE001", Some(0x0400), tape);
+                let world = Arc::new(Mutex::new(world));
+                let drive = DriveHandle::open_standalone_with_transport(
+                    std::path::Path::new("/virtual/space-timeout"),
+                    Box::new(ModelTransport::new(
+                        Arc::clone(&world),
+                        DeviceRole::Drive { bay: 0x0100 },
+                    )),
+                    &StaticAllowlist::new(["DRV-MODEL"]),
+                )
+                .expect("allowlisted model drive");
+                // Exclude opener INQUIRY records and release the lock before dispatch.
+                world.lock().expect("world").command_log.clear();
+                (world, drive)
+            };
+
+            let mut observed = Vec::new();
+            let mut expected = Vec::new();
+            for (label, kind, count, pipelined, boundary, opcode) in [
+                (
+                    "blocks small",
+                    SpaceKind::Blocks,
+                    1,
+                    false,
+                    Ok(false),
+                    Some(0x11),
+                ),
+                (
+                    "blocks large",
+                    SpaceKind::Blocks,
+                    9_000_000,
+                    false,
+                    Ok(true),
+                    Some(0x91),
+                ),
+                (
+                    "filemarks small",
+                    SpaceKind::Filemarks,
+                    1,
+                    false,
+                    Ok(false),
+                    Some(0x11),
+                ),
+                (
+                    "filemarks large",
+                    SpaceKind::Filemarks,
+                    9_000_000,
+                    false,
+                    Ok(true),
+                    Some(0x91),
+                ),
+                (
+                    "EOD small",
+                    SpaceKind::EndOfData,
+                    1,
+                    false,
+                    Ok(false),
+                    Some(0x11),
+                ),
+                (
+                    "EOD large",
+                    SpaceKind::EndOfData,
+                    9_000_000,
+                    false,
+                    Ok(false),
+                    Some(0x11),
+                ),
+                (
+                    "EOD pipelined",
+                    SpaceKind::EndOfData,
+                    0,
+                    true,
+                    Ok(false),
+                    Some(0x11),
+                ),
+                (
+                    "sequential refused",
+                    SpaceKind::SequentialFilemarks,
+                    1,
+                    false,
+                    Err("invalid request"),
+                    None,
+                ),
+            ] {
+                let (world, mut drive) = loaded_drive();
+                let result = if pipelined {
+                    drive.space_pipelined(count, kind)
+                } else {
+                    drive.space(count, kind)
+                };
+                // Inspect every dispatch before evaluating its result, including boundaries.
+                let world = world.lock().expect("world");
+                let space_commands = world
+                    .command_log
+                    .iter()
+                    .filter(|record| matches!(record.opcode, 0x11 | 0x91))
+                    .map(|record| (record.opcode, record.timeout_class))
+                    .collect::<Vec<_>>();
+                let status_commands = world
+                    .command_log
+                    .iter()
+                    .filter(|record| record.opcode == 0x34)
+                    .map(|record| (record.opcode, record.timeout_class))
+                    .collect::<Vec<_>>();
+                let outcome = result
+                    .map(|space| space.stopped_at_boundary)
+                    .map_err(|error| {
+                        if matches!(
+                            error.kind,
+                            TapeIoErrorKind::InvalidRequest(ScsiError::InvalidInput(_))
+                        ) {
+                            "invalid request".to_owned()
+                        } else {
+                            format!("unexpected error: {error:?}")
+                        }
+                    });
+                observed.push((
+                    label,
+                    outcome,
+                    space_commands,
+                    status_commands,
+                    world.max_drive_commands_in_flight.get(&0x0100).copied(),
+                ));
+                expected.push((
+                    label,
+                    boundary.map_err(str::to_owned),
+                    opcode
+                        .into_iter()
+                        .map(|op| (op, TimeoutClass::Space))
+                        .collect::<Vec<_>>(),
+                    opcode
+                        .into_iter()
+                        .map(|_| (0x34, TimeoutClass::TapeStatus))
+                        .collect::<Vec<_>>(),
+                    Some(1),
+                ));
+            }
+            for (label, target_lba, commands) in [
+                (
+                    "LOCATE",
+                    Some(1),
+                    vec![
+                        (0x92, TimeoutClass::Positioning),
+                        (0x34, TimeoutClass::TapeStatus),
+                    ],
+                ),
+                ("REWIND", None, vec![(0x01, TimeoutClass::Rewind)]),
+            ] {
+                let (world, mut drive) = loaded_drive();
+                let result = match target_lba {
+                    Some(lba) => drive.locate(lba).map(|_| ()),
+                    None => drive.rewind(),
+                };
+                let world = world.lock().expect("world");
+                // Keep the full log, including LOCATE's inline READ POSITION.
+                let recorded = world
+                    .command_log
+                    .iter()
+                    .map(|record| (record.opcode, record.timeout_class))
+                    .collect::<Vec<_>>();
+                observed.push((
+                    label,
+                    result
+                        .map(|()| false)
+                        .map_err(|error| format!("unexpected error: {error:?}")),
+                    recorded,
+                    vec![],
+                    world.max_drive_commands_in_flight.get(&0x0100).copied(),
+                ));
+                expected.push((label, Ok(false), commands, vec![], Some(1)));
+            }
+            // One comparison exposes every row's command-class regression.
+            assert_eq!(observed, expected);
+        }
     }
 
     #[test]

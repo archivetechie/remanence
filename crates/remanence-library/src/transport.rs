@@ -82,12 +82,15 @@ pub enum TimeoutClass {
     /// WRITE FILEMARKS (forces sync to media unless IMMED is set;
     /// rem doesn't set IMMED). 900 s for drive recovery and destage.
     WriteFilemarks,
-    /// LOCATE / SPACE — anything that moves the heads without
-    /// reading or writing user data. 300 s covers the LTO-9
+    /// LOCATE — moves the heads without reading or writing user
+    /// data. 300 s covers the LTO-9
     /// worst case (~100 s BOT → EOT) plus retries.
     Positioning,
+    /// SPACE — relative motion or a search for end of data. 3,600 s.
+    /// An LTO-6 took about 16 minutes to answer a SPACE that met a lost end-of-data mark.
+    Space,
     /// REWIND — a full-tape return to BOT from arbitrary position.
-    /// 600 s; the most pessimistic case among positioning ops.
+    /// 600 s.
     Rewind,
     /// MODE SELECT / MODE SENSE — config CDBs the drive applies
     /// immediately. 5 s.
@@ -110,6 +113,7 @@ impl TimeoutClass {
             Self::Move => 120_000,
             Self::WriteFilemarks => 900_000,
             Self::Positioning => 300_000,
+            Self::Space => 3_600_000,
             Self::InitElementStatus => 600_000,
             Self::LoadUnload => 600_000,
             Self::Rewind => 600_000,
@@ -723,6 +727,8 @@ mod tests {
         assert_eq!(t.timeout_ms, 600_000);
         t.set_timeout_for(TimeoutClass::PreventAllow);
         assert_eq!(t.timeout_ms, 5_000);
+        t.set_timeout_for(TimeoutClass::Space);
+        assert_eq!(t.timeout_ms, 3_600_000);
     }
 
     #[test]
@@ -833,6 +839,7 @@ mod tests {
         assert_eq!(TimeoutClass::TapeIo.duration_ms(), 900_000);
         assert_eq!(TimeoutClass::WriteFilemarks.duration_ms(), 900_000);
         assert_eq!(TimeoutClass::Positioning.duration_ms(), 300_000);
+        assert_eq!(TimeoutClass::Space.duration_ms(), 3_600_000);
         assert_eq!(TimeoutClass::Rewind.duration_ms(), 600_000);
         assert_eq!(TimeoutClass::ModeConfig.duration_ms(), 5_000);
         assert_eq!(TimeoutClass::TapeStatus.duration_ms(), 5_000);
