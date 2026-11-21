@@ -1,6 +1,6 @@
 //! PLR-1b production CLI probes on cloned model media and matching host state.
 use remanence_chaos::model::{
-    DeviceRole, ModelTransport, SharedVirtualWorld, VirtualTape, VirtualWorld,
+    DeviceRole, DriveProfile, ModelTransport, SharedVirtualWorld, VirtualTape, VirtualWorld,
 };
 use remanence_library::{
     transport::TransferOutcome, DeviceAttachment, DriveHandle, ScsiError, SgTransport,
@@ -50,6 +50,7 @@ fn disk(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 struct IoTrace {
     commands: Vec<Vec<u8>>,
     missing_reads: usize,
+    measured_missing_reads: usize,
     fault_at: Option<u64>,
     eod_succeeded: bool,
     late_armed: bool,
@@ -57,6 +58,11 @@ struct IoTrace {
 fn missing_signature(error: &ScsiError) -> bool {
     matches!(error, ScsiError::CheckCondition { sense, .. }
         if sense.len() >= 14 && sense[0] & 0x7f == 0x70 && sense[2] & 0xf == 3 && sense[12] == 0x14 && matches!(sense[13], 0 | 3))
+}
+/// The measured profile's READ reports 03/11/00 at the lost mark.
+fn measured_missing_signature(error: &ScsiError) -> bool {
+    matches!(error, ScsiError::CheckCondition { sense, .. }
+        if sense.len() >= 14 && sense[0] == 0xf0 && sense[2] == 3 && sense[12] == 0x11 && sense[13] == 0)
 }
 struct CaptureTransport {
     inner: ModelTransport,
@@ -71,6 +77,9 @@ impl SgTransport for CaptureTransport {
         let result = self.inner.execute_in(cdb, buf);
         if cdb.first() == Some(&0x08) && result.as_ref().is_err_and(missing_signature) {
             self.trace.lock().unwrap().missing_reads += 1;
+        }
+        if cdb.first() == Some(&0x08) && result.as_ref().is_err_and(measured_missing_signature) {
+            self.trace.lock().unwrap().measured_missing_reads += 1;
         }
         result
     }
@@ -261,6 +270,22 @@ impl Fixture {
         self.reset_snapshot(if torn { &self.torn } else { &self.committed }, missing)
     }
     fn reset_snapshot(&self, snapshot: &Snapshot, missing: bool) -> SharedVirtualWorld {
+        self.reset_snapshot_profile(snapshot, missing, DriveProfile::Generic)
+    }
+    /// Set the profile before the cut; the measured drive has no reset attention.
+    fn reset_measured(&self, torn: bool) -> SharedVirtualWorld {
+        self.reset_snapshot_profile(
+            if torn { &self.torn } else { &self.committed },
+            true,
+            DriveProfile::MeasuredHpLto6,
+        )
+    }
+    fn reset_snapshot_profile(
+        &self,
+        snapshot: &Snapshot,
+        missing: bool,
+        profile: DriveProfile,
+    ) -> SharedVirtualWorld {
         for entry in std::fs::read_dir(&self.root).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
@@ -275,6 +300,7 @@ impl Fixture {
             std::fs::write(path, data).unwrap();
         }
         let mut world = snapshot.world.clone();
+        world.drive_states.get_mut(&BAY).unwrap().profile = profile;
         let keep = world.tapes[TAPE].records.len();
         assert!(keep >= world.tapes[TAPE].durable_frontier);
         if missing {
@@ -292,9 +318,23 @@ impl Fixture {
             &StaticAllowlist::new([SERIAL]),
         )
         .unwrap();
-        assert!(drive.test_unit_ready().is_err());
+        if profile == DriveProfile::Generic {
+            assert!(drive.test_unit_ready().is_err());
+        }
         drive.test_unit_ready().unwrap();
         drive.locate(0).unwrap();
+        if profile == DriveProfile::MeasuredHpLto6 {
+            let world = world.lock().unwrap();
+            assert_eq!(
+                world.tapes[TAPE].records,
+                snapshot.world.tapes[TAPE].records
+            );
+            assert_eq!(world.tapes[TAPE].durable_frontier, keep);
+            assert_eq!(world.tapes[TAPE].short_erased_end, None);
+            assert_eq!(world.tapes[TAPE].missing_eod_sense, Some((3, 0x14, 0)));
+            assert!(!world.drive_states[&BAY].reset_unit_attention);
+            assert!(!world.drive_states[&BAY].position_unknown);
+        }
         world.lock().unwrap().command_log.clear();
         world
     }
@@ -874,5 +914,272 @@ fn fenced_rescue_keeps_fence_and_write_refusal() {
             format!("{:?}", index(&f.root).list_active_tape_io_fences().unwrap()),
             format!("{before:?}")
         );
+    }
+}
+
+// Profile copies retain the original conclusions and production CLI funnel.
+#[test]
+fn measured_missing_mark_identify_succeeds() {
+    let f = Fixture::new();
+    for torn in [false, true] {
+        let world = f.reset_measured(torn);
+        let output = command(&f.root, &world, &["tape", "identify"]);
+        println!(
+            "measured identify torn={torn}; output={output:?}; command_log={:?}",
+            world.lock().unwrap().command_log
+        );
+        assert_eq!(
+            output.code,
+            ExitCode::SUCCESS,
+            "identify succeeds: {} {}",
+            output.out,
+            output.err
+        );
+        let value = envelope(&output);
+        assert_eq!(value["ok"], true);
+        let result = &value["result"];
+        assert_eq!(result["status"], "end_of_data_not_found");
+        assert_eq!(result["end_of_data_mark"], "not_found");
+        assert_eq!(result["finalized"], false);
+        assert_eq!(result["object_count"], 3);
+        assert_eq!(result["bytes"], 2359296);
+        assert_eq!(result["inventory_source"], "catalog");
+        for warning in [
+            "drive reports no end-of-data mark",
+            "power loss during writing can cause this",
+            "committed files remain readable",
+            "rem tape restore --scan --list",
+            "not the actual end",
+        ] {
+            assert!(output.err.contains(warning), "{output:?}");
+        }
+        let world = f.reset_measured(torn);
+        let human = run(
+            &f.root,
+            &world,
+            &[
+                "rem",
+                "--allow-untrusted-state-volume",
+                "tape",
+                "identify",
+                "--device",
+                DEVICE,
+                "--allow-device",
+                SERIAL,
+            ],
+            Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(human.code, ExitCode::SUCCESS);
+        assert!(human.err.contains("drive reports no end-of-data mark"));
+        assert!(human.out.contains("end_of_data_not_found"));
+    }
+}
+
+#[test]
+fn measured_missing_mark_scan_restore_produces_report() {
+    let f = Fixture::new();
+    for torn in [false, true] {
+        for scan in [false, true] {
+            let world = f.reset_measured(torn);
+            let mut args = vec!["tape", "restore", "--list"];
+            if scan {
+                args.push("--scan");
+            }
+            let output = command(&f.root, &world, &args);
+            println!(
+                "measured command args={args:?}; output={output:?}; command_log={:?}",
+                world.lock().unwrap().command_log
+            );
+            assert_eq!(
+                output.code,
+                ExitCode::SUCCESS,
+                "scan restore produces report: {} {}",
+                output.out,
+                output.err
+            );
+            let report = report(&output);
+            assert_mark(&report, f.fourth_start);
+            assert_eq!(report["terminal_index"], false);
+            let rows = report["candidates"].as_array().unwrap();
+            assert_eq!(rows.len(), 3 + usize::from(torn));
+            for (n, row) in rows.iter().take(3).enumerate() {
+                assert_eq!(row["status"], "listed");
+                assert_eq!(row["manifest"]["rows"][0]["path"], format!("file-{n}.txt"));
+                assert_eq!(row["manifest"]["rows"][0]["size"], 33);
+            }
+            if torn {
+                assert_eq!(rows[3]["status"], "refused");
+                assert_eq!(rows[3]["error"],"incomplete candidate; closing filemark could not be established; remaining tape unresolved");
+            }
+        }
+    }
+}
+
+#[test]
+fn measured_new_put_finalize_and_supersede_refuse_missing_mark() {
+    let f = Fixture::new();
+    for action in ["put", "finalize", "supersede-tail"] {
+        let world = f.reset_measured(false);
+        let catalog = index(&f.root);
+        assert!(catalog.list_active_tape_io_fences().unwrap().is_empty());
+        assert_eq!(
+            catalog
+                .get_tape_by_voltag(TAPE)
+                .unwrap()
+                .unwrap()
+                .pool_id
+                .as_deref(),
+            Some("default")
+        );
+        drop(catalog);
+        assert!(!world.lock().unwrap().tapes[TAPE].write_protected);
+        let new = f.root.join("new-request-distinct-content.txt");
+        std::fs::write(&new, b"PLR fresh content that is not already stored").unwrap();
+        let ack = format!("SUPERSEDE {TAPE}");
+        let args = match action {
+            "put" => vec!["put", new.to_str().unwrap()],
+            "finalize" => vec!["tape", "finalize", "--acknowledge-tape", TAPE],
+            _ => vec![
+                "tape",
+                "supersede-tail",
+                "--acknowledge-tape",
+                TAPE,
+                "--confirm-supersede",
+                &ack,
+            ],
+        };
+        let output = command(&f.root, &world, &args);
+        println!(
+            "measured command args={args:?}; output={output:?}; command_log={:?}",
+            world.lock().unwrap().command_log
+        );
+        assert_eq!(
+            output.code,
+            ExitCode::from(1),
+            "new put refused before WRITE/WFM: {} {}",
+            output.out,
+            output.err
+        );
+        no_write(&output);
+        for line in output.out.lines().filter(|line| line.starts_with('{')) {
+            let item: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_ne!(
+                item["event"], "already_stored",
+                "fresh content cannot take already_stored shortcut"
+            );
+            if item["event"] == "summary" {
+                assert_eq!(item["already_stored"], 0);
+            }
+        }
+        println!(
+            "admission {action}: missing_reads={} output={} stderr={}",
+            output.trace.measured_missing_reads, output.out, output.err
+        );
+        // Put and supersede-tail are refusal-only evidence: identity invalidation
+        // refuses first. Finalize reaches the append-suffix guard.
+        if action == "put" {
+            assert!(
+                output
+                    .trace
+                    .commands
+                    .iter()
+                    .any(|c| c.first() == Some(&0x08)),
+                "read admission reached media"
+            );
+            assert!(
+                output.trace.measured_missing_reads >= 1,
+                "put reads the missing mark"
+            );
+            let summary = output
+                .out
+                .lines()
+                .filter(|line| line.starts_with('{'))
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|item| item["event"] == "summary")
+                .expect("put emits its failed-item summary");
+            let error = summary["failed"]["error"]
+                .as_str()
+                .expect("failed put item names its error");
+            assert!(
+                error.contains("tape identity invalidated"),
+                "put refused by identity invalidation: {error}"
+            );
+        } else {
+            let envelope = envelope(&output);
+            let error = envelope["error"].as_str().unwrap();
+            if action == "finalize" {
+                assert!(
+                    error.contains("append suffix"),
+                    "finalize refused by append suffix: {error}"
+                );
+            } else {
+                assert!(
+                    error.contains("tape identity invalidated"),
+                    "supersede-tail refused by identity invalidation: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn measured_standalone_verification_initial_and_post_damage_refuse() {
+    let f = Fixture::new();
+    for (full, after_damage) in [(false, false), (true, false), (true, true)] {
+        let world = f.reset_measured(false);
+        if after_damage {
+            world
+                .lock()
+                .unwrap()
+                .drive_states
+                .get_mut(&BAY)
+                .unwrap()
+                .normal_eod_spaces = 1;
+        }
+        let mut args = vec!["tape", "verify"];
+        if full {
+            args.push("--full");
+        }
+        let output = command(&f.root, &world, &args);
+        println!(
+            "measured command args={args:?}; output={output:?}; command_log={:?}",
+            world.lock().unwrap().command_log
+        );
+        assert_eq!(output.code, ExitCode::from(1));
+        no_write(&output);
+        let eods: Vec<_> = output
+            .trace
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.first() == Some(&0x11) && c[1] & 7 == 3)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(eods.len(), if after_damage { 2 } else { 1 });
+        assert!(
+            !output.trace.commands[eods.last().unwrap() + 1..]
+                .iter()
+                .any(|c| matches!(c.first(), Some(0x92 | 0x2b | 0x08 | 0x11))),
+            "no positioning after refused SPACE"
+        );
+        let error = envelope(&output)["error"].as_str().unwrap().to_owned();
+        if full {
+            assert!(error.contains("SPACE(EOD)"));
+            assert!(
+                error.contains("drive reports no end-of-data mark"),
+                "diagnostic names missing mark: {error}"
+            );
+            if after_damage {
+                assert!(
+                    error.contains("sense=[70, 00, 03, 00, 00, 00, 00, 18, 00, 00, 00, 00, 14, 00"),
+                    "post-damage refusal preserves drive sense: {error}"
+                );
+            }
+        } else {
+            assert_eq!(
+                error,
+                "verification failed: no usable terminal index; end_of_data_not_found"
+            );
+        }
     }
 }

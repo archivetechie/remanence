@@ -1,8 +1,8 @@
 //! PLR-T3: real standalone sessions prove post-ERASE resume and READ refusal.
 //! The model cut returns to the live actor; all host history is production-written.
 use remanence_chaos::model::{
-    DeviceRole, ModelTransport, Record as MediaRecord, SharedVirtualWorld, VirtualTape,
-    VirtualWorld,
+    DeviceRole, DriveProfile, ModelTransport, Record as MediaRecord, SharedVirtualWorld,
+    VirtualTape, VirtualWorld,
 };
 use remanence_library::{
     scsi::{decode_usable_sense, DecodedSense},
@@ -742,4 +742,173 @@ fn post_erase_read_refusal() {
     let elapsed = ms.parse::<u128>().unwrap();
     assert_eq!(clause,format!("; admission evidence: phase=probe; kind=io; step_target_lba={}; opcode=0x08; sense=03/14/00; sense_timing=current; host_status=unavailable; host_bytes_transferred=0; bytes_transferred=0; proof_elapsed_ms={elapsed} (probe start to returned error)",f.c));
     assert!(!clause.contains("media_readiness_state="));
+}
+
+/// Clone the production-written repair, then opt in to the reporter's drive.
+fn measured_repaired(f: &Fixture) -> SharedVirtualWorld {
+    let world = f.clone_repaired();
+    {
+        let mut world = world.lock().unwrap();
+        world.drive_states.get_mut(&BAY).unwrap().profile = DriveProfile::MeasuredHpLto6;
+        let tape = world.tapes.get_mut(TAPE).unwrap();
+        tape.short_erased_end = Some(f.c as usize);
+        assert_eq!(tape.records, f.prefix);
+        assert_eq!(tape.records.len() as u64, f.c);
+        assert_eq!(tape.durable_frontier as u64, f.c);
+        assert_eq!(tape.missing_eod_sense, None);
+        world.command_log.clear();
+    }
+    world
+}
+
+/// Pin the entire admission clause, with only elapsed milliseconds variable.
+fn assert_measured_clause(output: &Output, c: u64, expires: bool) {
+    let envelope: serde_json::Value = serde_json::from_str(
+        output
+            .out
+            .lines()
+            .rev()
+            .find(|s| s.starts_with('{'))
+            .unwrap(),
+    )
+    .unwrap();
+    let error = envelope["error"].as_str().unwrap();
+    let start = error
+        .find("; admission evidence:")
+        .expect("admission clause");
+    let clause = &error[start..];
+    let ms = clause
+        .split_once("proof_elapsed_ms=")
+        .unwrap()
+        .1
+        .strip_suffix(" (probe start to returned error)")
+        .unwrap();
+    assert!(!ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()));
+    let evidence = if expires {
+        "sense=unavailable; sense_timing=unavailable; host_status=0x0003; host_bytes_transferred=unavailable; bytes_transferred=unavailable"
+    } else {
+        "sense=03/14/00; sense_timing=current; host_status=unavailable; host_bytes_transferred=0; bytes_transferred=0"
+    };
+    assert_eq!(clause, format!("; admission evidence: phase=probe; kind=io; step_target_lba={c}; opcode=0x08; {evidence}; proof_elapsed_ms={ms} (probe start to returned error)"));
+}
+
+/// Refusal must leave the repaired media intact and create neither hold nor fence.
+fn assert_measured_refusal(
+    f: &Fixture,
+    world: &SharedVirtualWorld,
+    output: &Output,
+    expires: bool,
+) {
+    let world = world.lock().unwrap();
+    println!(
+        "measured repaired C={} expires={expires}; state={:?}; command_log={:?}; output={output:?}",
+        f.c, world.drive_states[&BAY], world.command_log
+    );
+    let tape = &world.tapes[TAPE];
+    assert_eq!(tape.records, f.prefix);
+    assert_eq!(tape.durable_frontier as u64, f.c);
+    assert_eq!(tape.short_erased_end, Some(f.c as usize));
+    assert_eq!(tape.missing_eod_sense, None);
+    assert_eq!(
+        world.drive_states[&BAY].profile,
+        DriveProfile::MeasuredHpLto6
+    );
+    assert_ne!(output.code, ExitCode::SUCCESS, "{output:?}");
+    assert!(
+        !output
+            .trace
+            .commands
+            .iter()
+            .any(|c| matches!(c.cdb[0], 0x0a | 0x8a | 0x10 | 0x80 | 0x19)),
+        "no write or ERASE: {output:?}"
+    );
+    assert_eq!(world.command_log.len(), output.trace.commands.len());
+    let reads: Vec<_> = output
+        .trace
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.cdb[0] == 0x08 && c.lba == Some(f.c))
+        .collect();
+    assert_eq!(reads.len(), 1, "one READ at C: {output:?}");
+    let (index, read) = reads[0];
+    assert_eq!(read.cdb, [0x08, 0, 4, 0, 0, 0]);
+    assert_eq!(read.buffer, BLOCK);
+    assert!(!read.ok);
+    assert_eq!(world.command_log[index].opcode, 0x08);
+    assert_eq!(world.command_log[index].timeout_class, TimeoutClass::TapeIo);
+    assert_eq!(
+        read.sense.map(|s| (s.key, s.asc, s.ascq, s.is_deferred())),
+        if expires {
+            None
+        } else {
+            Some((3, 0x14, 0, false))
+        }
+    );
+    drop(world);
+    let cfg = config(&f.root);
+    let index = remanence_state::projector::open(cfg.index.sqlite_path)
+        .unwrap()
+        .write_handle();
+    assert!(
+        index.list_active_tape_io_fences().unwrap().is_empty(),
+        "no fence"
+    );
+    assert!(
+        index
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .is_empty(),
+        "no hold"
+    );
+    assert_measured_clause(output, f.c, expires);
+}
+
+#[test]
+fn measured_post_erase_put_timeout_refuses_twice() {
+    let f = repaired_fixture();
+    let world = measured_repaired(&f);
+    let path = f.root.join("fresh-measured-timeout.bin");
+    std::fs::write(&path, b"fresh measured timeout request\n").unwrap();
+    for _ in 0..2 {
+        world.lock().unwrap().command_log.clear();
+        let output = command(&f.root, &world, &["put", path.to_str().unwrap()], None);
+        assert_measured_refusal(&f, &world, &output, true);
+    }
+}
+
+#[test]
+fn measured_post_erase_put_in_limit_sense_refuses() {
+    let f = repaired_fixture();
+    let world = measured_repaired(&f);
+    world
+        .lock()
+        .unwrap()
+        .drive_states
+        .get_mut(&BAY)
+        .unwrap()
+        .measured_timings
+        .read_at_short_erased_end_ms = 890_000;
+    let path = f.root.join("fresh-measured-in-limit.bin");
+    std::fs::write(&path, b"fresh measured in-limit request\n").unwrap();
+    let output = command(&f.root, &world, &["put", path.to_str().unwrap()], None);
+    assert_measured_refusal(&f, &world, &output, false);
+}
+
+#[test]
+fn measured_post_erase_identify_and_first_file_remain_readable() {
+    let f = repaired_fixture();
+    let world = measured_repaired(&f);
+    let output = command(&f.root, &world, &["tape", "identify"], None);
+    assert_eq!(output.code, ExitCode::SUCCESS, "{output:?}");
+    assert_eq!(result(&output)["object_count"], 8);
+    get_first(&f.root, &world);
+    let world = world.lock().unwrap();
+    assert_eq!(world.tapes[TAPE].records, f.prefix);
+    assert_eq!(world.tapes[TAPE].durable_frontier as u64, f.c);
+    assert_eq!(world.tapes[TAPE].short_erased_end, Some(f.c as usize));
+    assert!(!world
+        .command_log
+        .iter()
+        .any(|c| matches!(c.opcode, 0x0a | 0x8a | 0x10 | 0x80 | 0x19)));
 }
