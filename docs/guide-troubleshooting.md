@@ -6,6 +6,38 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
+## Recording a command trace
+
+Set `REM_TRACE` to an existing directory to record SCSI commands and their
+timing. Repeated full reads and writes are summarised in cumulative runs.
+The trace also records the drive's sense as captured and its maker, model
+and firmware. Sense and device strings come from the drive as sent; sense
+is not decoded. Transfer data, device paths, serial numbers and tape IDs
+are not recorded.
+
+For a standalone drive, set the variable on the command:
+
+```sh
+mkdir -p ~/rem-trace; REM_TRACE=~/rem-trace rem put ...
+```
+
+For library commands, the daemon runs the SCSI commands. Create a directory
+the daemon can write to, add `Environment=REM_TRACE=/absolute/path/rem-trace`
+under `[Service]` in the daemon's unit environment, then reload the service
+manager and restart the daemon. Setting the variable only on the client
+does not enable the daemon's trace.
+
+Each process creates one private `rem-trace-<pid>-<unix seconds>.jsonl`
+file, with permissions `0600`. The switch is resolved at the first device
+open; unset or empty means off. Tracing is off while `REM_FIELD_TRACE`
+is set. If the directory or new file cannot be opened, a diagnostic is
+printed and the command continues without tracing. Trace writes run on
+the command's thread and add to its elapsed time.
+
+Completed lines survive the process being killed; the last line and a
+run's pending count may not. Host power loss can lose unsynced lines;
+failure rows are synced. Attach the trace files to a bug report.
+
 ## WORM and unknown-media refusals
 
 ```text
