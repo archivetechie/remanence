@@ -1365,7 +1365,7 @@ impl ModelTransport {
                         }
                         unknown = index == 0;
                         current_check_condition(sense, bytes)
-                    } else if measured && tape.short_erased_end == Some(lba) {
+                    } else if measured && index == 0 && tape.short_erased_end == Some(lba) {
                         self.timed_failure(
                             timings.read_at_short_erased_end_ms,
                             fixed_sense(3, 0x14, 0, Some(residual as i64), 0),
@@ -1935,6 +1935,9 @@ impl ModelTransport {
         let state = world.drive_states.entry(bay).or_default();
         if state.profile != DriveProfile::MeasuredHpLto6 {
             return Err(ScsiError::InvalidInput("unsupported no-data CDB"));
+        }
+        if cdb.len() < 6 {
+            return Err(ScsiError::InvalidInput("short ERASE(6) CDB"));
         }
         if cdb.get(1).copied().unwrap_or(0) & 1 != 0 {
             return Err(current_check_condition((5, 0x24, 0), 0));
@@ -5959,6 +5962,34 @@ mod measured_profile_tests {
         assert_eq!(model.position, 2);
     }
 
+    /// A partial fixed READ reaches ordinary EOD without the first-record delay.
+    #[test]
+    fn measured_fixed_read_reaching_short_erased_end_keeps_partial_eod() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        {
+            let mut world = world.lock().unwrap();
+            let tape = world.tapes.get_mut(TAPE).unwrap();
+            tape.records = vec![Record::Block(vec![1; 4]), Record::Block(vec![2; 4])];
+            tape.short_erased_end = Some(2);
+        }
+        locate(&mut model, 1);
+        model.set_timeout_for(TimeoutClass::TapeIo);
+        assert_eq!(
+            world.lock().unwrap().drive_states[&BAY].measured_timings,
+            MeasuredTimings::default()
+        );
+        let mut bytes = [0xa5; 8];
+        let err = model
+            .execute_in(&[0x08, 1, 0, 0, 2, 0], &mut bytes)
+            .unwrap_err();
+        assert_sense(err, (8, 0, 5), Some(1), 4);
+        assert_eq!(bytes, [2, 2, 2, 2, 0xa5, 0xa5, 0xa5, 0xa5]);
+        assert_eq!(model.position, 2);
+        let world = world.lock().unwrap();
+        assert!(!world.drive_states[&BAY].position_unknown);
+        assert_eq!(world.tapes[TAPE].short_erased_end, Some(2));
+    }
+
     #[test]
     fn measured_space_eod_sense_expiry_and_false_bop_lifetime() {
         for (class, expires) in [
@@ -6002,8 +6033,10 @@ mod measured_profile_tests {
                 );
                 assert_false_bop(&mut model, 3);
                 none(&mut model, &[0x1b, 0, 0, 0, 0, 0]).unwrap();
+                assert!(world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
                 assert_false_bop(&mut model, 0);
                 none(&mut model, &[0x1b, 0, 0, 0, 1, 0]).unwrap();
+                assert!(world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
                 assert_false_bop(&mut model, 0);
             }
             {
@@ -6012,6 +6045,7 @@ mod measured_profile_tests {
                 assert!(!world.drive_states[&BAY].reset_unit_attention);
             }
             locate(&mut model, 3);
+            assert!(!world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
             let bytes = position(&mut model);
             assert_eq!(bytes[0], 0);
             assert_eq!(u64::from_be_bytes(bytes[8..16].try_into().unwrap()), 3);
@@ -6023,6 +6057,7 @@ mod measured_profile_tests {
                 None,
                 0,
             );
+            assert!(world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
             none(&mut model, &[1, 0, 0, 0, 0, 0]).unwrap();
             assert!(!world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
         }
@@ -6234,6 +6269,41 @@ mod measured_profile_tests {
             None,
             0,
         );
+    }
+
+    /// Malformed ERASE requests must not flush or alter even a repair marker.
+    #[test]
+    fn measured_short_erase_cdb_leaves_media_unchanged() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        {
+            let mut world = world.lock().unwrap();
+            let tape = world.tapes.get_mut(TAPE).unwrap();
+            tape.records = vec![
+                Record::Block(vec![1; 4]),
+                Record::Filemark,
+                Record::Block(vec![2; 4]),
+            ];
+            tape.durable_frontier = 0;
+            tape.short_erased_end = Some(3);
+            recompute_written_bytes(tape);
+        }
+        model.position = 1;
+        for cdb in [&[0x19][..], &[0x19, 0, 0, 0, 0][..]] {
+            let before = world.lock().unwrap().tapes[TAPE].clone();
+            let error = none(&mut model, cdb).unwrap_err();
+            let ScsiError::InvalidInput(message) = error else {
+                panic!("expected malformed ERASE refusal, got {error:?}");
+            };
+            assert_eq!(message.as_bytes(), b"short ERASE(6) CDB");
+            let world = world.lock().unwrap();
+            let after = &world.tapes[TAPE];
+            assert_eq!(after.records, before.records);
+            assert_eq!(after.durable_frontier, before.durable_frontier);
+            assert_eq!(after.short_erased_end, before.short_erased_end);
+            assert_eq!(after.written_bytes, before.written_bytes);
+            assert_eq!(after.missing_eod_sense, before.missing_eod_sense);
+            assert_eq!(model.position, 1);
+        }
     }
 
     #[test]

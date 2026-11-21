@@ -440,17 +440,29 @@ fn assert_mark(report: &serde_json::Value, position: u64) {
         "report preserves independently captured unresolved position"
     );
 }
+/// Reject every media-writing opcode, including ERASE, in refusal evidence.
+fn trace_has_no_writes(trace: &IoTrace) -> bool {
+    !trace
+        .commands
+        .iter()
+        .any(|c| matches!(c.first(), Some(0x0a | 0x8a | 0x10 | 0x80 | 0x19)))
+}
 fn no_write(output: &Output) {
     assert!(
-        !output
-            .trace
-            .commands
-            .iter()
-            .any(|c| matches!(c.first(), Some(0x0a | 0x8a | 0x10 | 0x80))),
-        "new put refused before WRITE/WFM: {} {}",
+        trace_has_no_writes(&output.trace),
+        "new put refused before WRITE/WFM/ERASE: {} {}",
         output.out,
         output.err
     );
+}
+
+#[test]
+fn no_write_predicate_rejects_erase_trace() {
+    let trace = IoTrace {
+        commands: vec![vec![0x19]],
+        ..Default::default()
+    };
+    assert!(!trace_has_no_writes(&trace), "ERASE is a media write");
 }
 fn config(root: &Path) -> PathBuf {
     root.join("xdg-state/rem/config.toml")
