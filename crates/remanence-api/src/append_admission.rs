@@ -56,6 +56,7 @@ pub(crate) struct AppendContext {
 pub(crate) struct AdmissionError {
     pub(crate) kind: AdmissionErrorKind,
     outcome: Option<Box<remanence_library::outcome::ClassifiedOutcome>>,
+    evidence: Option<Box<AdmissionEvidence>>,
 }
 impl std::fmt::Debug for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,7 +65,11 @@ impl std::fmt::Debug for AdmissionError {
 }
 impl std::fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.kind.fmt(f)
+        self.kind.fmt(f)?;
+        if let Some(evidence) = &self.evidence {
+            std::fmt::Display::fmt(evidence, f)?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for AdmissionError {
@@ -78,6 +83,7 @@ impl AdmissionError {
         Self {
             kind,
             outcome: None,
+            evidence: None,
         }
     }
     /// Finish the final public admission error, never an intermediate diagnostic.
@@ -96,6 +102,7 @@ impl AdmissionError {
         Self {
             kind,
             outcome: Some(Box::new(outcome)),
+            evidence: None,
         }
     }
 }
@@ -103,6 +110,121 @@ impl From<TapeIoError> for AdmissionError {
     fn from(error: TapeIoError) -> Self {
         Self::new(AdmissionErrorKind::Io(error))
     }
+}
+
+/// Admission's returned phase error, owned by the existing generation refusal.
+/// This records proof-step context, not the first failed device command.
+enum AdmissionEvidence {
+    Returned {
+        error: AdmissionError,
+        phase: EvidencePhase,
+        step_target: Option<u64>,
+        elapsed: std::time::Duration,
+    },
+    NoReturnedError,
+}
+#[derive(Clone, Copy)]
+enum EvidencePhase {
+    Probe,
+    Restoration,
+}
+impl std::fmt::Display for AdmissionEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self::Returned {
+            error,
+            phase,
+            step_target,
+            elapsed,
+        } = self
+        else {
+            return f.write_str("; admission evidence: no probe or restoration error was returned");
+        };
+        f.write_str("; admission evidence: phase=")?;
+        f.write_str(match phase {
+            EvidencePhase::Probe => "probe",
+            EvidencePhase::Restoration => "restoration",
+        })?;
+        f.write_str("; kind=")?;
+        f.write_str(match &error.kind {
+            AdmissionErrorKind::Io(_) => "io",
+            AdmissionErrorKind::SuffixIo { .. } => "suffix-io",
+            AdmissionErrorKind::Unproved(_) => "unproved",
+            AdmissionErrorKind::MissingBootstrapFilemark => "missing-bootstrap-filemark",
+            AdmissionErrorKind::TailBeyondKnownState { .. } => "tail-beyond-known-state",
+            AdmissionErrorKind::SessionSuffixContradiction { .. } => "session-suffix-contradiction",
+        })?;
+        let target = match &error.kind {
+            AdmissionErrorKind::SuffixIo { start_lba, .. } => Some(*start_lba),
+            _ => *step_target,
+        };
+        f.write_str("; step_target_lba=")?;
+        evidence_decimal(f, target)?;
+        let completion = match &error.kind {
+            AdmissionErrorKind::Io(source) | AdmissionErrorKind::SuffixIo { source, .. } => {
+                Some(source.completion_evidence())
+            }
+            _ => None,
+        };
+        evidence_completion(f, "", completion.as_ref())?;
+        if let Some(post) = completion.as_ref().and_then(|e| e.post_transfer.as_deref()) {
+            evidence_completion(f, "post_transfer.", Some(post))?;
+        }
+        match phase {
+            EvidencePhase::Probe => write!(
+                f,
+                "; proof_elapsed_ms={} (probe start to returned error)",
+                elapsed.as_millis()
+            ),
+            EvidencePhase::Restoration => write!(
+                f,
+                "; restoration_elapsed_ms={} (restoration start to returned error)",
+                elapsed.as_millis()
+            ),
+        }
+    }
+}
+/// Render optional typed integers without converting error-derived text.
+fn evidence_decimal<T: std::fmt::Display>(
+    f: &mut std::fmt::Formatter<'_>,
+    value: Option<T>,
+) -> std::fmt::Result {
+    match value {
+        Some(value) => write!(f, "{value}"),
+        None => f.write_str("unavailable"),
+    }
+}
+/// Format only retained normalized completion fields; no parsing or classification.
+fn evidence_completion(
+    f: &mut std::fmt::Formatter<'_>,
+    prefix: &str,
+    evidence: Option<&remanence_library::outcome::CompletionEvidence>,
+) -> std::fmt::Result {
+    write!(f, "; {prefix}opcode=")?;
+    match evidence.and_then(|e| e.opcode) {
+        Some(opcode) => write!(f, "0x{opcode:02x}")?,
+        None => f.write_str("unavailable")?,
+    }
+    let decoded = evidence.and_then(|e| e.decoded);
+    write!(f, "; {prefix}sense=")?;
+    match decoded {
+        Some(sense) => write!(f, "{:02x}/{:02x}/{:02x}", sense.key, sense.asc, sense.ascq)?,
+        None => f.write_str("unavailable")?,
+    }
+    write!(f, "; {prefix}sense_timing=")?;
+    f.write_str(match decoded {
+        Some(sense) if sense.is_deferred() => "deferred",
+        Some(_) => "current",
+        None => "unavailable",
+    })?;
+    write!(f, "; {prefix}host_status=")?;
+    match evidence.and_then(|e| e.host_status) {
+        Some(status) => write!(f, "0x{status:04x}")?,
+        None => f.write_str("unavailable")?,
+    }
+    write!(f, "; {prefix}host_bytes_transferred=")?;
+    evidence_decimal(f, evidence.and_then(|e| e.host_transferred_bytes))?;
+    write!(f, "; {prefix}bytes_transferred=")?;
+    evidence_decimal(f, evidence.and_then(|e| e.transferred_bytes))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -208,10 +330,14 @@ pub(crate) fn admit_append_boundary(
             _ => None,
         };
         let mut ended_tail_eod = None;
+        let mut probe_target = None;
+        let probe_started = std::time::Instant::now();
         let probe = (|| {
             let boundary = match &authority {
                 AppendAuthority::Fresh => {
+                    probe_target = None;
                     drive.rewind()?;
+                    probe_target = Some(0);
                     crate::verify_tape_identity(&mut DriveHandleSource(drive), &ctx.tape_uuid)
                         .map_err(|e| match e {
                             crate::pool_write::TapeIdentityError::Io(e) => {
@@ -226,6 +352,7 @@ pub(crate) fn admit_append_boundary(
                             ),
                         })?;
                     let mut block = vec![0; ctx.block_size as usize];
+                    probe_target = Some(1);
                     match drive.read_block(&mut block) {
                         Err(remanence_library::TapeIoError {
                             kind: remanence_library::TapeIoErrorKind::FilemarkEncountered,
@@ -252,6 +379,7 @@ pub(crate) fn admit_append_boundary(
                             ))
                         }
                     }
+                    probe_target = None;
                     let position = drive.position()?;
                     if position.partition != 0 {
                         return Err(crate::append_admission::AdmissionError::new(
@@ -263,10 +391,12 @@ pub(crate) fn admit_append_boundary(
                     position
                 }
                 AppendAuthority::Checkpoint { eod } => {
+                    probe_target = Some(eod.lba);
                     prove_position(drive, *eod, ctx.block_size, generation)?;
                     *eod
                 }
                 AppendAuthority::Terminal { .. } | AppendAuthority::Session { .. } => {
+                    probe_target = Some(ctx.boundary.lba);
                     prove_position(drive, ctx.boundary, ctx.block_size, generation)?;
                     ctx.boundary
                 }
@@ -276,6 +406,7 @@ pub(crate) fn admit_append_boundary(
                 // Deterministic own-closeout prefix has priority over the old named
                 // tail. Every attempted proof restores C before trying another row.
                 if let Some(encoded) = closeout {
+                    probe_target = Some(boundary.lba);
                     match session_suffix::own_closeout(drive, &encoded.blocks, ctx.block_size) {
                         Ok((count, mark, digest)) if count > 0 => {
                             if let Some(tail) = &recovered_tail {
@@ -285,6 +416,7 @@ pub(crate) fn admit_append_boundary(
                                 } else {
                                     TailIdentity::TornPrefix(digest)
                                 };
+                                probe_target = None;
                                 tail.observe(
                                     identity,
                                     count,
@@ -309,6 +441,7 @@ pub(crate) fn admit_append_boundary(
                             kind: crate::append_admission::AdmissionErrorKind::Unproved(_),
                             ..
                         }) => {
+                            probe_target = Some(boundary.lba);
                             prove_position(drive, boundary, ctx.block_size, generation)?;
                         }
                         Err(e) => return Err(e),
@@ -323,6 +456,7 @@ pub(crate) fn admit_append_boundary(
                             if reached_eod {
                                 return Ok(());
                             }
+                            probe_target = Some(named_end);
                             session_suffix::named_file(drive, &ctx.tape_uuid, ctx.block_size, file)
                                 .map(|(mark, lba)| {
                                     reached_eod = !mark;
@@ -337,6 +471,7 @@ pub(crate) fn admit_append_boundary(
                         })
                         .map_err(|e| {
                             failure.take().unwrap_or_else(|| {
+                                probe_target = None;
                                 crate::append_admission::AdmissionError::new(
                                     crate::append_admission::AdmissionErrorKind::Unproved(
                                         e.to_string(),
@@ -345,6 +480,7 @@ pub(crate) fn admit_append_boundary(
                             })
                         })?;
                     if !reached_eod {
+                        probe_target = Some(named_end);
                         match session_suffix::eod(drive, ctx.block_size) {
                             Err(AdmissionError {
                                 kind: AdmissionErrorKind::Unproved(_),
@@ -356,6 +492,7 @@ pub(crate) fn admit_append_boundary(
                                 .is_none_or(|old| old == named_end) =>
                             {
                                 // Only bytes beyond the fully proved named suffix are a restore tail.
+                                probe_target = Some(named_end);
                                 prove_position(
                                     drive,
                                     TapePosition {
@@ -365,6 +502,7 @@ pub(crate) fn admit_append_boundary(
                                     ctx.block_size,
                                     generation,
                                 )?;
+                                probe_target = Some(named_end);
                                 let suffix = scan_append_suffix_observed(
                                     drive,
                                     &ctx.tape_uuid,
@@ -400,6 +538,7 @@ pub(crate) fn admit_append_boundary(
                             other => other?,
                         }
                     }
+                    probe_target = None;
                     let eod = drive.position()?.lba;
                     if let Some(end) = &summary.last_session_end {
                         if eod < end.cursor.lba.saturating_add(end.synchronized_tail_blocks)
@@ -421,6 +560,7 @@ pub(crate) fn admit_append_boundary(
                 }
             }
             let mut block = vec![0; ctx.block_size as usize];
+            probe_target = Some(boundary.lba);
             match drive.read_block(&mut block) {
                 Err(e) if e.is_physical_eod() => return Ok(AppendSuffix::default()),
                 Ok(_)
@@ -437,11 +577,13 @@ pub(crate) fn admit_append_boundary(
                     ))
                 }
             };
+            probe_target = Some(boundary.lba);
             prove_position(drive, boundary, ctx.block_size, generation)?;
             let plan = match &authority {
                 AppendAuthority::Terminal { plan } => Some(*plan),
                 _ => None,
             };
+            probe_target = Some(boundary.lba);
             let suffix = scan_append_suffix_observed(
                 drive,
                 &ctx.tape_uuid,
@@ -488,6 +630,7 @@ pub(crate) fn admit_append_boundary(
             }
             Ok(suffix)
         })();
+        let probe_elapsed = probe_started.elapsed();
         let probe = probe.map_err(|error| match (&authority, error) {
             (
                 AppendAuthority::Session { snapshot, .. },
@@ -509,6 +652,8 @@ pub(crate) fn admit_append_boundary(
             }
             (_, error) => error,
         });
+        let restoration_target = Some(ctx.write_position.lba);
+        let restoration_started = std::time::Instant::now();
         let restored = if matches!(authority, AppendAuthority::Fresh) && ctx.write_position.lba == 0
         {
             drive
@@ -532,6 +677,7 @@ pub(crate) fn admit_append_boundary(
         } else {
             prove_position(drive, ctx.write_position, ctx.block_size, generation).map(Some)
         };
+        let restoration_elapsed = restoration_started.elapsed();
         // A suffix read failure refuses admission even when it also invalidates the
         // handle. Preserve its location after attempting cursor restoration.
         if let Err(
@@ -544,7 +690,7 @@ pub(crate) fn admit_append_boundary(
             return Err(error);
         }
         if drive.identity_generation() != generation {
-            return Err(crate::append_admission::AdmissionError::new(
+            let mut refusal = crate::append_admission::AdmissionError::new(
                 crate::append_admission::AdmissionErrorKind::Io(
                     remanence_library::TapeIoError::new(
                         remanence_library::TapeIoErrorKind::IdentityInvalidated {
@@ -553,7 +699,25 @@ pub(crate) fn admit_append_boundary(
                         },
                     ),
                 ),
-            ));
+            );
+            refusal.evidence = Some(Box::new(if let Err(error) = probe {
+                AdmissionEvidence::Returned {
+                    error,
+                    phase: EvidencePhase::Probe,
+                    step_target: probe_target,
+                    elapsed: probe_elapsed,
+                }
+            } else if let Err(error) = restored {
+                AdmissionEvidence::Returned {
+                    error,
+                    phase: EvidencePhase::Restoration,
+                    step_target: restoration_target,
+                    elapsed: restoration_elapsed,
+                }
+            } else {
+                AdmissionEvidence::NoReturnedError
+            }));
+            return Err(refusal);
         }
         let cursor_proof = restored?;
         probe?;
@@ -651,6 +815,9 @@ pub fn admit_initialized_tape(
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod evidence_tests;
 
 /// Admit a durable checkpoint boundary for low-level recovery tools.
 pub fn admit_checkpointed_tape(

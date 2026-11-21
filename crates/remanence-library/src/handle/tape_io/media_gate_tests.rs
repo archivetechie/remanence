@@ -565,6 +565,22 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
 
     let policies: &[(&str, DispatchPolicy)] = &[
         (
+            "remanence-api/src/append_admission/evidence_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "PLR-T3 test forwarder uses only concrete in-memory ModelTransport",
+            },
+        ),
+        (
+            "remanence-cli/tests/post_erase_admission.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "PLR-T3 test forwarder uses only concrete in-memory ModelTransport",
+            },
+        ),
+        (
             "remanence-library/src/handle/tape_io/media_gate.rs",
             DispatchPolicy::Exact {
                 // The gate's data-out dispatch + the test-only
