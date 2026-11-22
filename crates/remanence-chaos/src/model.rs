@@ -4,7 +4,8 @@
 //! immediate WRITE FILEMARKS buffer new records; fixed WRITE contributes one
 //! record per block. Overwrite retracts the frontier to the overwrite position.
 //! `VirtualWorld::power_cut(bay, keep)` retains any prefix from the frontier
-//! through EOD, then queues UNIT ATTENTION `06/29/00` and invalidates position.
+//! through EOD and invalidates position. Generic also queues UNIT ATTENTION
+//! `06/29/00`; the measured profile leaves no attention pending.
 //! INQUIRY leaves that attention pending. READ POSITION sets LONU/MPU until
 //! successful LOAD, REWIND, or LOCATE; relative I/O refuses unknown position.
 //!
@@ -51,6 +52,9 @@
 //! of each file.
 //! Four independent recovery workers keep this suite near one minute. The
 //! missing-barrier control stays in the default suite and stops at its first loss.
+//!
+//! `DriveProfile::MeasuredHpLto6` models the reporter's lost-mark and short-ERASE
+//! answers, including simulated command expiry; `Generic` retains the defaults.
 //!
 //! The ignored full suite explores all buffered record counts through eight
 //! records (otherwise first/middle/last), both namespace outcomes, and journal
@@ -111,6 +115,8 @@ pub struct VirtualTape {
     pub records: Vec<Record>,
     /// Current fixed sense (key, ASC, ASCQ) at the missing end-of-data mark.
     pub missing_eod_sense: Option<(u8, u8, u8)>,
+    /// Record boundary left by a successful short ERASE, if still intact.
+    pub short_erased_end: Option<usize>,
     /// Number of leading records proved durable by a synchronizing command.
     pub durable_frontier: usize,
     /// EOM early-warning threshold in bytes.
@@ -150,6 +156,7 @@ impl VirtualTape {
             records: Vec::new(),
             durable_frontier: 0,
             missing_eod_sense: None,
+            short_erased_end: None,
             capacity_bytes,
             written_bytes: 0,
             write_protected: false,
@@ -413,9 +420,46 @@ impl MediumTypeReporting {
     }
 }
 
+/// Opt-in answers for the reporter's measured drive; Generic keeps the usual model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DriveProfile {
+    /// The original virtual drive answers.
+    #[default]
+    Generic,
+    /// HP LTO-6 answers observed during power-loss recovery.
+    MeasuredHpLto6,
+}
+
+/// Simulated durations for the measured profile's three timed failure answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeasuredTimings {
+    /// M14: READ at the short-erased end, in milliseconds.
+    pub read_at_short_erased_end_ms: u32,
+    /// M8: SPACE(EOD) at a lost mark from BOT, in milliseconds.
+    pub space_eod_missing_mark_ms: u32,
+    /// M8's longest SPACE over filemarks, used for every count, in milliseconds.
+    pub space_filemarks_missing_mark_ms: u32,
+}
+
+impl Default for MeasuredTimings {
+    fn default() -> Self {
+        Self {
+            read_at_short_erased_end_ms: 923_000,
+            space_eod_missing_mark_ms: 310_000,
+            space_filemarks_missing_mark_ms: 956_000,
+        }
+    }
+}
+
 /// Per-drive mechanical, removal-lock and cleaning simulation state.
 #[derive(Clone, Debug, Default)]
 pub struct VirtualDriveState {
+    /// Opt-in drive-specific answers.
+    pub profile: DriveProfile,
+    /// Simulated durations used only by the measured profile.
+    pub measured_timings: MeasuredTimings,
+    /// A returned lost-mark SPACE sense makes position reporting falsely claim BOT.
+    missing_mark_false_bop: bool,
     /// How MODE SENSE reports the loaded cartridge's WORM state.
     pub medium_type_reporting: MediumTypeReporting,
     /// One-shot current fixed sense (key, ASC, ASCQ) for the next READ POSITION; off by default.
@@ -556,10 +600,13 @@ impl VirtualWorld {
             ));
         }
         tape.records.truncate(keep);
+        if tape.short_erased_end != Some(keep) {
+            tape.short_erased_end = None;
+        }
         tape.durable_frontier = keep;
         recompute_written_bytes(tape);
         let state = self.drive_states.entry(bay).or_default();
-        state.reset_unit_attention = true;
+        state.reset_unit_attention = state.profile == DriveProfile::Generic;
         state.position_unknown = true;
         Ok(())
     }
@@ -571,10 +618,9 @@ impl VirtualWorld {
             .loaded_barcode(bay)
             .expect("power cut checked tape")
             .to_owned();
-        self.tapes
-            .get_mut(&barcode)
-            .expect("loaded tape")
-            .missing_eod_sense = Some((3, 0x14, 0));
+        let tape = self.tapes.get_mut(&barcode).expect("loaded tape");
+        tape.missing_eod_sense = Some((3, 0x14, 0));
+        tape.short_erased_end = None;
         Ok(())
     }
 
@@ -1140,6 +1186,11 @@ impl ModelTransport {
         let flags = if self.position == 0 { 0x80 } else { 0x00 };
         let mut response = rp_long_response(flags, 0, self.position);
         let world = self.world.lock().expect("virtual world lock");
+        if world.drive_states.get(&bay).is_some_and(|state| {
+            state.profile == DriveProfile::MeasuredHpLto6 && state.missing_mark_false_bop
+        }) {
+            return copy_response(buf, &rp_long_response(0x80, 0, 0));
+        }
         if world
             .drive_states
             .get(&bay)
@@ -1288,7 +1339,10 @@ impl ModelTransport {
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
         let bay = self.drive_bay()?;
-        let mut read_fault = world.drive_states.entry(bay).or_default().read_sense_at;
+        let state = world.drive_states.entry(bay).or_default();
+        let measured = state.profile == DriveProfile::MeasuredHpLto6;
+        let timings = state.measured_timings;
+        let mut read_fault = state.read_sense_at;
         let mut unknown = false;
         let mut success_advance = 0u64;
         let mut error_advance = 0u64;
@@ -1303,8 +1357,20 @@ impl ModelTransport {
                 }
                 tape.records.get(lba).ok_or_else(|| {
                     if let Some(sense) = tape.missing_eod_sense {
+                        if measured {
+                            return check_condition(
+                                fixed_sense(3, 0x11, 0, (index == 0).then_some(residual as i64), 0),
+                                bytes,
+                            );
+                        }
                         unknown = index == 0;
                         current_check_condition(sense, bytes)
+                    } else if measured && index == 0 && tape.short_erased_end == Some(lba) {
+                        self.timed_failure(
+                            timings.read_at_short_erased_end_ms,
+                            fixed_sense(3, 0x14, 0, Some(residual as i64), 0),
+                            bytes,
+                        )
                     } else {
                         check_condition(blank_check_eod_sense_with_residual(residual), bytes)
                     }
@@ -1418,6 +1484,12 @@ impl ModelTransport {
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
         let mut crossed_eom = false;
         let mut records_written = 0u64;
+        let measured = world
+            .drive_states
+            .entry(self.drive_bay()?)
+            .or_default()
+            .profile
+            == DriveProfile::MeasuredHpLto6;
         self.with_loaded_tape(&mut world, |tape| {
             if tape.write_protected {
                 return Err(ScsiError::InvalidInput("virtual tape is write protected"));
@@ -1438,6 +1510,13 @@ impl ModelTransport {
             }
             if transfer_len == 0 {
                 return Ok(());
+            }
+            if measured
+                && tape
+                    .short_erased_end
+                    .is_some_and(|end| position.min(tape.records.len()) <= end)
+            {
+                tape.short_erased_end = None;
             }
             if position < tape.records.len() {
                 tape.records.truncate(position);
@@ -1502,7 +1581,21 @@ impl ModelTransport {
         let mut world = self.world.lock().expect("virtual world lock");
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
+        let measured = world
+            .drive_states
+            .entry(self.drive_bay()?)
+            .or_default()
+            .profile
+            == DriveProfile::MeasuredHpLto6;
         self.with_loaded_tape(&mut world, |tape| {
+            if measured
+                && count > 0
+                && tape
+                    .short_erased_end
+                    .is_some_and(|end| position.min(tape.records.len()) <= end)
+            {
+                tape.short_erased_end = None;
+            }
             if count > 0 && position < tape.records.len() {
                 tape.records.truncate(position);
                 tape.durable_frontier = tape.durable_frontier.min(position);
@@ -1666,6 +1759,13 @@ impl ModelTransport {
                     if let Some(sense) = missing {
                         if state.normal_eod_spaces == 0 {
                             state.position_unknown = true;
+                            if state.profile == DriveProfile::MeasuredHpLto6 {
+                                return Err(self.missing_mark_space_failure(
+                                    state,
+                                    state.measured_timings.space_eod_missing_mark_ms,
+                                    None,
+                                ));
+                            }
                             return Err(current_check_condition(sense, 0));
                         }
                         state.normal_eod_spaces -= 1;
@@ -1743,6 +1843,16 @@ impl ModelTransport {
                     pos += 1;
                 }
                 if !found {
+                    let state = world.drive_states.entry(bay).or_default();
+                    if state.profile == DriveProfile::MeasuredHpLto6 && missing.is_some() {
+                        check_forward_space(state, self.position, records.len() as u64, None)?;
+                        state.position_unknown = true;
+                        return Err(self.missing_mark_space_failure(
+                            state,
+                            state.measured_timings.space_filemarks_missing_mark_ms,
+                            (count > 1).then_some(count.min(i64::from(u32::MAX))),
+                        ));
+                    }
                     check_forward_space(
                         world.drive_states.entry(bay).or_default(),
                         self.position,
@@ -1786,6 +1896,95 @@ impl ModelTransport {
             }
         }
         Ok(())
+    }
+
+    /// Simulate expiry without waiting or changing command effects already applied.
+    fn timed_failure(&self, duration_ms: u32, sense: Vec<u8>, bytes: u32) -> ScsiError {
+        if duration_ms > self.timeout_class.duration_ms() {
+            ScsiError::TransportError {
+                status: 0,
+                host_status: 0x03,
+                driver_status: 0,
+                info: 1,
+                sense: Vec::new(),
+            }
+        } else {
+            check_condition(sense, bytes)
+        }
+    }
+
+    /// Only a returned measured SPACE sense enables the false BOT report.
+    fn missing_mark_space_failure(
+        &self,
+        state: &mut VirtualDriveState,
+        duration_ms: u32,
+        information: Option<i64>,
+    ) -> ScsiError {
+        if duration_ms <= self.timeout_class.duration_ms() {
+            state.missing_mark_false_bop = true;
+        }
+        self.timed_failure(duration_ms, fixed_sense(3, 0x14, 0, information, 0), 0)
+    }
+
+    /// Short ERASE validates before flushing, then changes the tail under one lock.
+    fn erase_6(&self, cdb: &[u8]) -> Result<(), ScsiError> {
+        let DeviceRole::Drive { bay } = self.role else {
+            return Err(ScsiError::InvalidInput("unsupported no-data CDB"));
+        };
+        let mut world = self.world.lock().expect("virtual world lock");
+        let state = world.drive_states.entry(bay).or_default();
+        if state.profile != DriveProfile::MeasuredHpLto6 {
+            return Err(ScsiError::InvalidInput("unsupported no-data CDB"));
+        }
+        if cdb.len() < 6 {
+            return Err(ScsiError::InvalidInput("short ERASE(6) CDB"));
+        }
+        if cdb.get(1).copied().unwrap_or(0) & 1 != 0 {
+            return Err(current_check_condition((5, 0x24, 0), 0));
+        }
+        if state.position_unknown {
+            return Err(current_check_condition((3, 0x15, 2), 0));
+        }
+        if world.awaits_initializing_command(bay) {
+            return Err(check_condition(initializing_command_required_sense(), 0));
+        }
+        if world.answers_no_medium_until_load(bay) {
+            return Err(check_condition(no_medium_sense(), 0));
+        }
+        match world.drive_bays.get(&bay) {
+            Some(Some(barcode)) if world.tapes.contains_key(barcode) => {}
+            Some(_) => return Err(check_condition(no_medium_sense(), 0)),
+            None => return Err(ScsiError::InvalidInput("unknown drive bay")),
+        }
+        self.with_loaded_tape(&mut world, |tape| {
+            if tape.write_protected {
+                return Err(ScsiError::InvalidInput("virtual tape is write protected"));
+            }
+            if self.position > tape.records.len() as u64 {
+                return Err(current_check_condition((5, 0x24, 0), 0));
+            }
+            let position = self.position as usize;
+            tape.durable_frontier = tape.records.len();
+            tape.records.truncate(position);
+            tape.durable_frontier = position;
+            recompute_written_bytes(tape);
+            tape.missing_eod_sense = None;
+            tape.short_erased_end = Some(position);
+            Ok(())
+        })
+    }
+
+    /// LOCATE and REWIND alone clear the measured false BOT report.
+    fn clear_false_bop(&self) {
+        if let DeviceRole::Drive { bay } = self.role {
+            self.world
+                .lock()
+                .expect("virtual world lock")
+                .drive_states
+                .entry(bay)
+                .or_default()
+                .missing_mark_false_bop = false;
+        }
     }
 
     fn move_medium(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
@@ -1842,10 +2041,12 @@ impl SgTransport for ModelTransport {
                 self.drive_bay()?;
                 self.rewind();
                 self.position_known();
+                self.clear_false_bop();
                 Ok(())
             }
             Some(0x10) => self.write_filemarks(cdb),
             Some(0x11 | 0x91) => self.space(cdb),
+            Some(0x19) => self.erase_6(cdb),
             Some(0x1b) => {
                 self.load_unload(cdb)?;
                 self.position_known();
@@ -1870,6 +2071,7 @@ impl SgTransport for ModelTransport {
                 self.drive_bay()?;
                 self.locate(cdb)?;
                 self.position_known();
+                self.clear_false_bop();
                 Ok(())
             }
             Some(0xa5) => {
@@ -5571,5 +5773,686 @@ struct FixtureAppendProof([u8; 16], u32, u64, u64);
 unsafe impl remanence_library::AppendBoundaryProof for FixtureAppendProof {
     fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
         (self.0, self.1, self.2, self.3)
+    }
+}
+
+/// Raw-CDB witnesses for the measured power-loss model and its Generic control.
+#[cfg(all(test, target_os = "linux"))]
+mod measured_profile_tests {
+    use super::*;
+
+    const BAY: u16 = 0x100;
+    const TAPE: &str = "MEASURED";
+
+    fn drive(profile: DriveProfile) -> (SharedVirtualWorld, ModelTransport) {
+        let mut world = VirtualWorld::single_drive("LIB", BAY, "DRIVE", 0x400, 0);
+        world.put_tape_in_drive(BAY, TAPE, None, VirtualTape::empty(1024, 4));
+        world.drive_states.get_mut(&BAY).unwrap().profile = profile;
+        let world = Arc::new(Mutex::new(world));
+        let mut model = ModelTransport::new(world.clone(), DeviceRole::Drive { bay: BAY });
+        model.set_timeout_for(TimeoutClass::Space);
+        (world, model)
+    }
+
+    fn none(model: &mut ModelTransport, cdb: &[u8]) -> Result<(), ScsiError> {
+        model.execute_none(cdb)
+    }
+
+    fn write(model: &mut ModelTransport, bytes: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        model.execute_out(&[0x0a, 0, 0, 0, bytes.len() as u8, 0], bytes)
+    }
+
+    fn locate(model: &mut ModelTransport, position: u32) {
+        let mut cdb = [0x2b, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        cdb[3..7].copy_from_slice(&position.to_be_bytes());
+        none(model, &cdb).unwrap();
+    }
+
+    fn read(model: &mut ModelTransport, fixed: bool, count: u8) -> ScsiError {
+        let mut buf = [0xa5; 64];
+        let err = model
+            .execute_in(&[0x08, u8::from(fixed), 0, 0, count, 0], &mut buf)
+            .unwrap_err();
+        assert_eq!(
+            buf, [0xa5; 64],
+            "failed first-record READ transfers no bytes"
+        );
+        err
+    }
+
+    fn assert_sense(err: ScsiError, triple: (u8, u8, u8), info: Option<u32>, bytes: u32) {
+        let ScsiError::CheckCondition {
+            sense,
+            bytes_transferred,
+        } = err
+        else {
+            panic!("expected raw sense, got {err:?}");
+        };
+        assert_eq!(sense[0], if info.is_some() { 0xf0 } else { 0x70 });
+        assert_eq!((sense[2], sense[12], sense[13]), triple);
+        assert_eq!(&sense[3..7], &info.unwrap_or(0).to_be_bytes());
+        assert_eq!(bytes_transferred, bytes);
+    }
+
+    fn assert_expiry(err: ScsiError) {
+        let ScsiError::TransportError {
+            status,
+            host_status,
+            driver_status,
+            info,
+            sense,
+        } = err
+        else {
+            panic!("expected simulated expiry, got {err:?}");
+        };
+        assert_eq!((status, host_status, driver_status, info), (0, 0x03, 0, 1));
+        assert!(sense.is_empty());
+    }
+
+    fn position(model: &mut ModelTransport) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        model
+            .execute_in(&[0x34, 6, 0, 0, 0, 0, 0, 0, 32, 0], &mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn assert_false_bop(model: &mut ModelTransport, actual: u64) {
+        let bytes = position(model);
+        assert_eq!(bytes[0], 0x80);
+        assert_eq!(&bytes[8..24], &[0; 16]);
+        assert_eq!(model.position, actual);
+    }
+
+    fn lost_tape(world: &SharedVirtualWorld) {
+        let mut world = world.lock().unwrap();
+        let tape = world.tapes.get_mut(TAPE).unwrap();
+        tape.records = vec![
+            Record::Block(vec![1; 4]),
+            Record::Filemark,
+            Record::Block(vec![2; 4]),
+            Record::Filemark,
+            Record::Block(vec![3; 4]),
+        ];
+        tape.durable_frontier = 0;
+        recompute_written_bytes(tape);
+        world.power_cut_during_write(BAY, 5).unwrap();
+    }
+
+    #[test]
+    fn defaults_and_measured_reset_leave_first_tur_good_and_position_unknown() {
+        assert_eq!(VirtualDriveState::default().profile, DriveProfile::Generic);
+        assert_eq!(
+            MeasuredTimings::default(),
+            MeasuredTimings {
+                read_at_short_erased_end_ms: 923_000,
+                space_eod_missing_mark_ms: 310_000,
+                space_filemarks_missing_mark_ms: 956_000,
+            }
+        );
+        assert_eq!(VirtualTape::default().short_erased_end, None);
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        lost_tape(&world);
+        none(&mut model, &[0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(position(&mut model)[0], 0x0c);
+        assert_sense(read(&mut model, false, 12), (3, 0x15, 2), None, 0);
+        locate(&mut model, 5);
+        assert_sense(read(&mut model, false, 12), (3, 0x11, 0), Some(12), 0);
+        assert_eq!(model.position, 5);
+        assert!(!world.lock().unwrap().drive_states[&BAY].position_unknown);
+        assert_sense(read(&mut model, true, 2), (3, 0x11, 0), Some(2), 0);
+    }
+
+    #[test]
+    fn measured_fixed_read_keeps_transferred_bytes_motion_and_information() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        lost_tape(&world);
+        locate(&mut model, 4);
+        let mut bytes = [0; 12];
+        let err = model
+            .execute_in(&[0x08, 1, 0, 0, 3, 0], &mut bytes)
+            .unwrap_err();
+        assert_sense(err, (3, 0x11, 0), None, 4);
+        assert_eq!(&bytes[..4], &[3; 4]);
+        assert_eq!(&bytes[4..], &[0; 8]);
+        assert_eq!(model.position, 5);
+        assert!(!world.lock().unwrap().drive_states[&BAY].position_unknown);
+    }
+
+    #[test]
+    fn measured_short_erased_end_expiry_and_in_limit() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        {
+            let mut world = world.lock().unwrap();
+            let tape = world.tapes.get_mut(TAPE).unwrap();
+            tape.records = vec![Record::Block(vec![1; 4]), Record::Filemark];
+            tape.short_erased_end = Some(2);
+            tape.durable_frontier = 0;
+        }
+        // READ preparation flushes even when the response expires.
+        model.position = 2;
+        model.set_timeout_for(TimeoutClass::TapeIo);
+        assert_expiry(read(&mut model, false, 12));
+        assert_eq!(model.position, 2);
+        {
+            let world = world.lock().unwrap();
+            assert_eq!(world.tapes[TAPE].durable_frontier, 2);
+            let state = &world.drive_states[&BAY];
+            assert!(
+                !state.reset_unit_attention
+                    && !state.position_unknown
+                    && !state.missing_mark_false_bop
+            );
+        }
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .measured_timings
+            .read_at_short_erased_end_ms = 60_000;
+        for _ in 0..2 {
+            assert_sense(read(&mut model, false, 12), (3, 0x14, 0), Some(12), 0);
+            assert_eq!(model.position, 2);
+        }
+        assert_sense(read(&mut model, true, 3), (3, 0x14, 0), Some(3), 0);
+        assert_eq!(position(&mut model)[0], 0);
+        none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap();
+        assert_eq!(model.position, 2);
+    }
+
+    /// A partial fixed READ reaches ordinary EOD without the first-record delay.
+    #[test]
+    fn measured_fixed_read_reaching_short_erased_end_keeps_partial_eod() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        {
+            let mut world = world.lock().unwrap();
+            let tape = world.tapes.get_mut(TAPE).unwrap();
+            tape.records = vec![Record::Block(vec![1; 4]), Record::Block(vec![2; 4])];
+            tape.short_erased_end = Some(2);
+        }
+        locate(&mut model, 1);
+        model.set_timeout_for(TimeoutClass::TapeIo);
+        assert_eq!(
+            world.lock().unwrap().drive_states[&BAY].measured_timings,
+            MeasuredTimings::default()
+        );
+        let mut bytes = [0xa5; 8];
+        let err = model
+            .execute_in(&[0x08, 1, 0, 0, 2, 0], &mut bytes)
+            .unwrap_err();
+        assert_sense(err, (8, 0, 5), Some(1), 4);
+        assert_eq!(bytes, [2, 2, 2, 2, 0xa5, 0xa5, 0xa5, 0xa5]);
+        assert_eq!(model.position, 2);
+        let world = world.lock().unwrap();
+        assert!(!world.drive_states[&BAY].position_unknown);
+        assert_eq!(world.tapes[TAPE].short_erased_end, Some(2));
+    }
+
+    #[test]
+    fn measured_space_eod_sense_expiry_and_false_bop_lifetime() {
+        for (class, expires) in [
+            (TimeoutClass::Space, false),
+            (TimeoutClass::Positioning, true),
+        ] {
+            let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+            lost_tape(&world);
+            locate(&mut model, 3);
+            world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut(TAPE)
+                .unwrap()
+                .durable_frontier = 0;
+            model.set_timeout_for(class);
+            let err = none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap_err();
+            if expires {
+                assert_expiry(err);
+                assert_eq!(position(&mut model)[0], 0x0c);
+            } else {
+                assert_sense(err, (3, 0x14, 0), None, 0);
+                assert_false_bop(&mut model, 3);
+                assert_sense(read(&mut model, false, 1), (3, 0x15, 2), None, 0);
+                world
+                    .lock()
+                    .unwrap()
+                    .drive_states
+                    .get_mut(&BAY)
+                    .unwrap()
+                    .next_read_position_sense = Some((5, 0x24, 0));
+                let mut buf = [0; 32];
+                assert_sense(
+                    model
+                        .execute_in(&[0x34, 6, 0, 0, 0, 0, 0, 0, 32, 0], &mut buf)
+                        .unwrap_err(),
+                    (5, 0x24, 0),
+                    None,
+                    0,
+                );
+                assert_false_bop(&mut model, 3);
+                none(&mut model, &[0x1b, 0, 0, 0, 0, 0]).unwrap();
+                assert!(world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
+                assert_false_bop(&mut model, 0);
+                none(&mut model, &[0x1b, 0, 0, 0, 1, 0]).unwrap();
+                assert!(world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
+                assert_false_bop(&mut model, 0);
+            }
+            {
+                let world = world.lock().unwrap();
+                assert_eq!(world.tapes[TAPE].durable_frontier, 5);
+                assert!(!world.drive_states[&BAY].reset_unit_attention);
+            }
+            locate(&mut model, 3);
+            assert!(!world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
+            let bytes = position(&mut model);
+            assert_eq!(bytes[0], 0);
+            assert_eq!(u64::from_be_bytes(bytes[8..16].try_into().unwrap()), 3);
+            assert_eq!(u64::from_be_bytes(bytes[16..24].try_into().unwrap()), 1);
+            model.set_timeout_for(TimeoutClass::Space);
+            assert_sense(
+                none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap_err(),
+                (3, 0x14, 0),
+                None,
+                0,
+            );
+            assert!(world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
+            none(&mut model, &[1, 0, 0, 0, 0, 0]).unwrap();
+            assert!(!world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
+        }
+    }
+
+    #[test]
+    fn measured_space_filemarks_count_information_motion_and_expiry() {
+        for (count, class, expires) in [
+            (1u64, TimeoutClass::Space, false),
+            (3, TimeoutClass::Space, false),
+            (u64::MAX >> 1, TimeoutClass::Space, false),
+            (3, TimeoutClass::TapeIo, true),
+        ] {
+            let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+            lost_tape(&world);
+            locate(&mut model, if count == 1 { 4 } else { 0 });
+            world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut(TAPE)
+                .unwrap()
+                .durable_frontier = 0;
+            model.set_timeout_for(class);
+            let mut cdb = [0; 16];
+            cdb[0] = 0x91;
+            cdb[1] = 1;
+            cdb[4..12].copy_from_slice(&count.to_be_bytes());
+            let err = none(&mut model, &cdb).unwrap_err();
+            if expires {
+                assert_expiry(err);
+                assert_eq!(position(&mut model)[0], 0x0c);
+            } else {
+                assert_sense(
+                    err,
+                    (3, 0x14, 0),
+                    (count > 1).then_some(count.min(u64::from(u32::MAX)) as u32),
+                    0,
+                );
+                assert_false_bop(&mut model, 4);
+            }
+            assert_eq!(
+                model.position, 4,
+                "motion over both real marks survives failure"
+            );
+            let world = world.lock().unwrap();
+            assert_eq!(world.tapes[TAPE].durable_frontier, 5);
+            assert!(world.drive_states[&BAY].position_unknown);
+            assert!(!world.drive_states[&BAY].reset_unit_attention);
+        }
+    }
+
+    #[test]
+    fn measured_overrides_keep_precedence() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        lost_tape(&world);
+        locate(&mut model, 5);
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .read_sense_at = Some((5, (5, 0x20, 0)));
+        assert_sense(read(&mut model, false, 12), (5, 0x20, 0), None, 0);
+        assert_sense(read(&mut model, false, 12), (3, 0x11, 0), Some(12), 0);
+        locate(&mut model, 0);
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .space_sense_at = Some((5, (5, 0x24, 0)));
+        assert_sense(
+            none(&mut model, &[0x11, 1, 0, 0, 3, 0]).unwrap_err(),
+            (5, 0x24, 0),
+            None,
+            0,
+        );
+        assert_eq!(model.position, 4);
+        assert!(!world.lock().unwrap().drive_states[&BAY].missing_mark_false_bop);
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .normal_eod_spaces = 1;
+        none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap();
+        assert_eq!(model.position, 5);
+        assert_sense(
+            none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap_err(),
+            (3, 0x14, 0),
+            None,
+            0,
+        );
+    }
+
+    #[test]
+    fn measured_erase_read_write_and_power_cut_marker_lifetime() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        lost_tape(&world);
+        locate(&mut model, 3);
+        world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut(TAPE)
+            .unwrap()
+            .durable_frontier = 0;
+        none(&mut model, &[0x19, 0, 0, 0, 0, 0]).unwrap();
+        {
+            let world = world.lock().unwrap();
+            let tape = &world.tapes[TAPE];
+            assert_eq!(tape.records.len(), 3);
+            assert_eq!(tape.durable_frontier, 3);
+            assert_eq!(tape.written_bytes, 8);
+            assert_eq!(tape.missing_eod_sense, None);
+            assert_eq!(tape.short_erased_end, Some(3));
+        }
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .get_mut(&BAY)
+            .unwrap()
+            .measured_timings
+            .read_at_short_erased_end_ms = 60_000;
+        assert_sense(read(&mut model, false, 12), (3, 0x14, 0), Some(12), 0);
+        world.lock().unwrap().power_cut(BAY, 3).unwrap();
+        assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, Some(3));
+        none(&mut model, &[0, 0, 0, 0, 0, 0]).unwrap();
+        locate(&mut model, 3);
+        assert_sense(read(&mut model, false, 12), (3, 0x14, 0), Some(12), 0);
+        write(&mut model, &[4; 4]).unwrap();
+        assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, None);
+        locate(&mut model, 3);
+        none(&mut model, &[0x19, 0, 0, 0, 0, 0]).unwrap();
+        world
+            .lock()
+            .unwrap()
+            .power_cut_during_write(BAY, 3)
+            .unwrap();
+        assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, None);
+        locate(&mut model, 3);
+        assert_sense(read(&mut model, false, 12), (3, 0x11, 0), Some(12), 0);
+    }
+
+    #[test]
+    fn measured_rejected_erases_do_not_flush_or_change_records() {
+        // Validation order: LONG, unknown, readiness, write protection, range.
+        for refusal in 0..7 {
+            let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+            lost_tape(&world);
+            locate(&mut model, 3);
+            {
+                let mut world = world.lock().unwrap();
+                world.tapes.get_mut(TAPE).unwrap().durable_frontier = 0;
+                let state = world.drive_states.get_mut(&BAY).unwrap();
+                match refusal {
+                    0 => {
+                        state.position_unknown = true;
+                        state.initializing_command_required = true;
+                    }
+                    1 => {
+                        state.position_unknown = true;
+                        state.initializing_command_required = true;
+                    }
+                    2 => state.initializing_command_required = true,
+                    3 => state.no_medium_until_loads = 1,
+                    4 => world.tapes.get_mut(TAPE).unwrap().write_protected = true,
+                    5 => model.position = 6,
+                    6 => state.reset_unit_attention = true,
+                    _ => unreachable!(),
+                }
+            }
+            let before = world.lock().unwrap().tapes[TAPE].clone();
+            let err = none(&mut model, &[0x19, u8::from(refusal == 0), 0, 0, 0, 0]).unwrap_err();
+            match refusal {
+                0 | 5 => assert_sense(err, (5, 0x24, 0), None, 0),
+                1 => assert_sense(err, (3, 0x15, 2), None, 0),
+                2 => assert_sense(err, (2, 4, 2), None, 0),
+                3 => assert_sense(err, (2, 0x3a, 0), None, 0),
+                4 => assert!(matches!(err, ScsiError::InvalidInput(_))),
+                6 => assert_sense(err, (6, 0x29, 0), None, 0),
+                _ => unreachable!(),
+            }
+            let world = world.lock().unwrap();
+            let after = &world.tapes[TAPE];
+            assert_eq!(after.records, before.records);
+            assert_eq!(after.durable_frontier, 0);
+            assert_eq!(after.written_bytes, before.written_bytes);
+            assert_eq!(after.missing_eod_sense, before.missing_eod_sense);
+            assert_eq!(after.short_erased_end, before.short_erased_end);
+        }
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        world.lock().unwrap().tapes.remove(TAPE);
+        assert_sense(
+            none(&mut model, &[0x19, 0, 0, 0, 0, 0]).unwrap_err(),
+            (2, 0x3a, 0),
+            None,
+            0,
+        );
+        world.lock().unwrap().drive_bays.insert(BAY, None);
+        assert_sense(
+            none(&mut model, &[0x19, 0, 0, 0, 0, 0]).unwrap_err(),
+            (2, 0x3a, 0),
+            None,
+            0,
+        );
+    }
+
+    /// Malformed ERASE requests must not flush or alter even a repair marker.
+    #[test]
+    fn measured_short_erase_cdb_leaves_media_unchanged() {
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        {
+            let mut world = world.lock().unwrap();
+            let tape = world.tapes.get_mut(TAPE).unwrap();
+            tape.records = vec![
+                Record::Block(vec![1; 4]),
+                Record::Filemark,
+                Record::Block(vec![2; 4]),
+            ];
+            tape.durable_frontier = 0;
+            tape.short_erased_end = Some(3);
+            recompute_written_bytes(tape);
+        }
+        model.position = 1;
+        for cdb in [&[0x19][..], &[0x19, 0, 0, 0, 0][..]] {
+            let before = world.lock().unwrap().tapes[TAPE].clone();
+            let error = none(&mut model, cdb).unwrap_err();
+            let ScsiError::InvalidInput(message) = error else {
+                panic!("expected malformed ERASE refusal, got {error:?}");
+            };
+            assert_eq!(message.as_bytes(), b"short ERASE(6) CDB");
+            let world = world.lock().unwrap();
+            let after = &world.tapes[TAPE];
+            assert_eq!(after.records, before.records);
+            assert_eq!(after.durable_frontier, before.durable_frontier);
+            assert_eq!(after.short_erased_end, before.short_erased_end);
+            assert_eq!(after.written_bytes, before.written_bytes);
+            assert_eq!(after.missing_eod_sense, before.missing_eod_sense);
+            assert_eq!(model.position, 1);
+        }
+    }
+
+    #[test]
+    fn measured_only_record_changing_writes_clear_the_marker_even_on_eom() {
+        for filemarks in [false, true] {
+            let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+            world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut(TAPE)
+                .unwrap()
+                .short_erased_end = Some(0);
+            write(&mut model, &[]).unwrap();
+            none(&mut model, &[0x10, 1, 0, 0, 0, 0]).unwrap();
+            assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, Some(0));
+            if filemarks {
+                none(&mut model, &[0x10, 1, 0, 0, 1, 0]).unwrap();
+            } else {
+                world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut(TAPE)
+                    .unwrap()
+                    .write_protected = true;
+                assert!(write(&mut model, &[1; 4]).is_err());
+                assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, Some(0));
+                world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut(TAPE)
+                    .unwrap()
+                    .write_protected = false;
+                world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut(TAPE)
+                    .unwrap()
+                    .capacity_bytes = 0;
+                let err = write(&mut model, &[1; 4]).unwrap_err();
+                let ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred,
+                } = err
+                else {
+                    panic!("{err:?}")
+                };
+                assert_eq!(
+                    (sense[0], sense[2], sense[12], sense[13], bytes_transferred),
+                    (0xf0, 0x40, 0, 0, 4)
+                );
+                assert_eq!(&sense[3..7], &[0; 4]);
+            }
+            assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, None);
+        }
+    }
+
+    #[test]
+    fn measured_overwrite_and_shorter_retention_clear_the_marker() {
+        for filemarks in [false, true] {
+            let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+            lost_tape(&world);
+            locate(&mut model, 3);
+            none(&mut model, &[0x19, 0, 0, 0, 0, 0]).unwrap();
+            locate(&mut model, 2);
+            if filemarks {
+                none(&mut model, &[0x10, 1, 0, 0, 1, 0]).unwrap();
+            } else {
+                write(&mut model, &[4; 4]).unwrap();
+            }
+            assert_eq!(world.lock().unwrap().tapes[TAPE].short_erased_end, None);
+        }
+        let (world, mut model) = drive(DriveProfile::MeasuredHpLto6);
+        lost_tape(&world);
+        locate(&mut model, 3);
+        none(&mut model, &[0x19, 0, 0, 0, 0, 0]).unwrap();
+        let mut world = world.lock().unwrap();
+        world.tapes.get_mut(TAPE).unwrap().durable_frontier = 0;
+        world.power_cut(BAY, 2).unwrap();
+        assert_eq!(world.tapes[TAPE].short_erased_end, None);
+    }
+
+    #[test]
+    fn generic_control_keeps_reset_lost_mark_erase_and_untimed_answers() {
+        let (world, mut model) = drive(DriveProfile::Generic);
+        lost_tape(&world);
+        assert_sense(
+            none(&mut model, &[0, 0, 0, 0, 0, 0]).unwrap_err(),
+            (6, 0x29, 0),
+            None,
+            0,
+        );
+        none(&mut model, &[0, 0, 0, 0, 0, 0]).unwrap();
+        locate(&mut model, 5);
+        assert_sense(read(&mut model, false, 12), (3, 0x14, 0), None, 0);
+        assert!(world.lock().unwrap().drive_states[&BAY].position_unknown);
+        locate(&mut model, 4);
+        let mut bytes = [0; 12];
+        let err = model
+            .execute_in(&[0x08, 1, 0, 0, 3, 0], &mut bytes)
+            .unwrap_err();
+        assert_sense(err, (3, 0x14, 0), None, 4);
+        assert_eq!(&bytes[..4], &[3; 4]);
+        assert_eq!(model.position, 5);
+        assert!(!world.lock().unwrap().drive_states[&BAY].position_unknown);
+        locate(&mut model, 0);
+        model.set_timeout_for(TimeoutClass::Positioning);
+        assert_sense(
+            none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap_err(),
+            (3, 0x14, 0),
+            None,
+            0,
+        );
+        assert_eq!(position(&mut model)[0], 0x0c);
+        locate(&mut model, 0);
+        assert_sense(
+            none(&mut model, &[0x11, 1, 0, 0, 3, 0]).unwrap_err(),
+            (3, 0x14, 0),
+            None,
+            0,
+        );
+        assert_eq!(model.position, 4);
+        locate(&mut model, 5);
+        world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut(TAPE)
+            .unwrap()
+            .durable_frontier = 0;
+        assert!(matches!(
+            none(&mut model, &[0x19, 0, 0, 0, 0, 0]),
+            Err(ScsiError::InvalidInput(_))
+        ));
+        {
+            let mut world = world.lock().unwrap();
+            let tape = world.tapes.get_mut(TAPE).unwrap();
+            assert_eq!(tape.records.len(), 5);
+            assert_eq!(tape.durable_frontier, 0);
+            tape.missing_eod_sense = None;
+            tape.short_erased_end = Some(5);
+        }
+        model.set_timeout_for(TimeoutClass::TapeIo);
+        assert_sense(read(&mut model, false, 12), (8, 0, 5), Some(12), 0);
+        none(&mut model, &[0x11, 3, 0, 0, 0, 0]).unwrap();
+        assert_eq!(model.position, 5);
+        write(&mut model, &[1; 4]).unwrap();
     }
 }
