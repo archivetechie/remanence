@@ -1886,6 +1886,84 @@ fn b3b_admission_carrier_and_renderer_census() {
     assert_eq!((census::total(), census::normalizations()), before);
 }
 
+/// Provision the physical TAIL fixture's exact geometry with explicit operator media evidence.
+fn typed_tail_root(block_size: u32) -> crate::tests::TypedRoot {
+    crate::tests::TypedRoot::open_with_tape_inputs([(
+        remanence_state::ProvisionTapeInput {
+            tape_uuid: UUID,
+            voltag: "TAIL".into(),
+            block_size,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        },
+        remanence_state::LabelProvenance::Operator,
+        Some(remanence_state::MediaObservation {
+            generation: remanence_state::LtoGen::Lto9,
+            source: remanence_state::GenerationSource::Operator,
+        }),
+    )])
+}
+
+/// Observe all received authority, including records excluded from application.
+/// Call only after releasing every runtime clone; retain the complete replay and segment bytes.
+fn checked_received_tail(
+    library_dir: &std::path::Path,
+    tape_dir: &std::path::Path,
+    sqlite_path: &std::path::Path,
+    library_uuid: [u8; 16],
+    segments: &mut std::collections::BTreeMap<String, Vec<u8>>,
+) -> (
+    remanence_state::library_log::store::Replay,
+    Vec<(
+        remanence_state::library_log::Record,
+        remanence_state::library_log::store::Receipt,
+    )>,
+) {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+    let view = NativeTapeView::probe(tape_dir, sqlite_path).unwrap();
+    let mut received = Vec::new();
+    let replay = store::replay_observed_with_received(
+        library_dir,
+        library_uuid,
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, receipt| {
+            received.push((record.clone(), receipt.clone()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    assert!(replay.fold.pending.is_empty());
+    assert!(!replay.segments.is_empty());
+    assert!(received.iter().any(|(record, _)| {
+        record.reprovision().is_some_and(|provision| {
+            provision.tape.uuid == UUID
+                && provision.label.as_ref().map(|label| label.as_str()) == Some("TAIL")
+                && provision.medium.record_size == 4096
+                && provision.parity_scheme.is_none()
+        })
+    }));
+    assert!(received
+        .iter()
+        .all(|(record, _)| !matches!(record.tag(), Tag::FenceRaised | Tag::RecoveryRecorded)));
+    assert!(segments.is_empty());
+    *segments = replay
+        .segments
+        .iter()
+        .map(|segment| {
+            assert!(matches!(
+                segment.tail,
+                remanence_state::log_frame::Tail::Complete
+            ));
+            let bytes = std::fs::read(library_dir.join(&segment.name)).unwrap();
+            assert_eq!(segment.through, bytes.len() as u64);
+            (segment.name.clone(), bytes)
+        })
+        .collect();
+    (replay, received)
+}
+
 /// A scoped native-session contradiction adds one fact after all real commands have finished.
 #[test]
 fn b3b_scoped_suffix_contradiction_classifies_once() {
@@ -1896,24 +1974,14 @@ fn b3b_scoped_suffix_contradiction_classifies_once() {
     let observed = vec![0x53; BLOCK as usize];
     let mutation = "mutated";
     let mut f = fixture_with_size(BLOCK);
-    let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    index
-        .provision_tape(remanence_state::ProvisionTapeInput {
-            tape_uuid: UUID,
-            voltag: "TAIL".into(),
-            block_size: BLOCK,
-            parity: remanence_parity::ParityConfig::None,
-            force: false,
-        })
-        .unwrap();
-    std::fs::create_dir(root.path().join("tapes")).unwrap();
-    std::fs::create_dir(root.path().join("audit")).unwrap();
-    let authority =
-        remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
-            .unwrap();
+    let typed = typed_tail_root(BLOCK);
+    let index = typed.catalog().write_handle();
+    let runtime = typed.catalog().library_runtime().unwrap();
+    let tapes = runtime.manifest().tape_root();
+    // Provisioning creates the layout; check those same manifest-owned directories.
+    assert!(tapes.is_dir());
+    assert!(runtime.manifest().library_root().is_dir());
+    let authority = remanence_state::TapeAuthority::open(tapes, UUID, index.path()).unwrap();
     let mut lease = authority.acquire_exclusive().unwrap();
     lease
         .publish_initialized(
@@ -2073,29 +2141,57 @@ fn b3b_fix1_admission_suffix_position_drift_is_transient() {
         outcome.retry,
         remanence_library::outcome::RetryCause::Transient
     );
-    let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    index
-        .provision_tape(remanence_state::ProvisionTapeInput {
-            tape_uuid: UUID,
-            voltag: "TAIL".into(),
-            block_size: SIZE,
-            parity: remanence_parity::ParityConfig::None,
-            force: false,
-        })
-        .unwrap();
+    let mut typed = typed_tail_root(SIZE);
+    let paths = typed.paths().clone();
+    let runtime = typed.catalog().library_runtime().unwrap();
+    let library_uuid = runtime.manifest().library_uuid();
+    let library_dir = runtime.manifest().library_root().to_path_buf();
+    let tape_dir = runtime.manifest().tape_root().to_path_buf();
+    drop(runtime);
+    typed.release();
+    // Include every entry, including the existing lock file, with no exclusions.
+    let directory_bytes = || {
+        std::fs::read_dir(&library_dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(
+                    entry.file_type().unwrap().is_file(),
+                    "unexpected library entry: {:?}",
+                    entry.path()
+                );
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let directory_before = directory_bytes();
+    let mut segments_before = std::collections::BTreeMap::new();
+    let (before_replay, received_before) = checked_received_tail(
+        &library_dir,
+        &tape_dir,
+        &paths.sqlite_path,
+        library_uuid,
+        &mut segments_before,
+    );
+    // The same-root locked reopen is part of the measured no-publication interval.
+    let runtime = remanence_state::library_runtime::LibraryRuntime::open(
+        &paths,
+        true,
+        Arc::new(remanence_state::StateLockGuard::acquire(&paths.state_dir).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(runtime.manifest().library_uuid(), library_uuid);
+    assert_eq!(runtime.manifest().library_root(), library_dir);
+    assert_eq!(runtime.manifest().tape_root(), tape_dir);
+    let mut index = remanence_state::projector::open(&paths.sqlite_path)
+        .unwrap()
+        .with_library_runtime(runtime.clone())
+        .write_handle();
     let cfg = crate::write_owner::TerminalWriteConfig {
-        authority: crate::write_owner::TerminalAuthority::fixture(
-            None,
-            root.path().join("audit"),
-            true,
-            &(Arc::new(Mutex::new(()))),
-        ),
+        checkpoint_journal_dir: runtime.manifest().tape_root().to_path_buf(),
+        authority: crate::write_owner::TerminalAuthority::Typed(runtime),
         io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
         mounted_endpoint: None,
-        checkpoint_journal_dir: root.path().join("tapes"),
     };
     let status = daemon_admission_error(
         remanence_state::AuditActor::System,
@@ -2112,12 +2208,36 @@ fn b3b_fix1_admission_suffix_position_drift_is_transient() {
     );
     assert!(index.list_active_tape_io_fences().unwrap().is_empty());
     assert_eq!(index.get_tape(&UUID).unwrap().unwrap().state, "ready");
-    assert!(!cfg
-        .authority
-        .historical_fixture()
-        .expect("historical audit fixture")
-        .audit_dir
-        .exists());
+    drop(cfg);
+    drop(index);
+    let mut segments_after = std::collections::BTreeMap::new();
+    let (after_replay, received_after) = checked_received_tail(
+        &library_dir,
+        &tape_dir,
+        &paths.sqlite_path,
+        library_uuid,
+        &mut segments_after,
+    );
+    assert_eq!(
+        directory_bytes(),
+        directory_before,
+        "complete library directory names and bytes"
+    );
+    assert_eq!(
+        received_after.len(),
+        received_before.len(),
+        "received delta must be zero"
+    );
+    assert_eq!(
+        received_after, received_before,
+        "complete records and receipts"
+    );
+    assert_eq!(
+        segments_after, segments_before,
+        "library segment names and bytes"
+    );
+    assert_eq!(after_replay.last_sequence, before_replay.last_sequence);
+    assert_eq!(after_replay.terminal_hash, before_replay.terminal_hash);
     assert_eq!(f.drive.media_write_dispatch_count(), 0);
 }
 
@@ -2130,24 +2250,14 @@ fn golden_suffix_contradiction() -> AdmissionError {
     let observed = vec![0x53; BLOCK as usize];
     let mutation = "mutated";
     let mut f = fixture_with_size(BLOCK);
-    let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
-        .map(|catalog| catalog.write_handle())
-        .unwrap();
-    index
-        .provision_tape(remanence_state::ProvisionTapeInput {
-            tape_uuid: UUID,
-            voltag: "TAIL".into(),
-            block_size: BLOCK,
-            parity: remanence_parity::ParityConfig::None,
-            force: false,
-        })
-        .unwrap();
-    std::fs::create_dir(root.path().join("tapes")).unwrap();
-    std::fs::create_dir(root.path().join("audit")).unwrap();
-    let authority =
-        remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
-            .unwrap();
+    let typed = typed_tail_root(BLOCK);
+    let index = typed.catalog().write_handle();
+    let runtime = typed.catalog().library_runtime().unwrap();
+    let tapes = runtime.manifest().tape_root();
+    // Provisioning creates the layout; check those same manifest-owned directories.
+    assert!(tapes.is_dir());
+    assert!(runtime.manifest().library_root().is_dir());
+    let authority = remanence_state::TapeAuthority::open(tapes, UUID, index.path()).unwrap();
     let mut lease = authority.acquire_exclusive().unwrap();
     lease
         .publish_initialized(

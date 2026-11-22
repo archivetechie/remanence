@@ -1117,6 +1117,73 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
         }
     }
 }
+/// Read the complete received library history after all mounted owners have joined.
+/// The manifest paths and positive provisioning/native checks prevent an empty-root proof.
+fn checked_received_pool(
+    library_dir: &Path,
+    tape_dir: &Path,
+    sqlite_path: &Path,
+    library_uuid: [u8; 16],
+    segments: &mut std::collections::BTreeMap<String, Vec<u8>>,
+) -> (
+    remanence_state::library_log::store::Replay,
+    Vec<(
+        remanence_state::library_log::Record,
+        remanence_state::library_log::store::Receipt,
+    )>,
+) {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+    let entries = TapeAuthority::list_entries(tape_dir).unwrap();
+    assert_eq!(
+        entries,
+        vec![tape_dir.join("73737373737373737373737373737373.remtape")]
+    );
+    let mut native = std::fs::File::open(&entries[0]).unwrap();
+    remanence_state::tape_log::store::Header::decode(&mut native, UUID).unwrap();
+    let view = NativeTapeView::probe(tape_dir, sqlite_path).unwrap();
+    let mut received = Vec::new();
+    let replay = store::replay_observed_with_received(
+        library_dir,
+        library_uuid,
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, receipt| {
+            received.push((record.clone(), receipt.clone()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    assert!(replay.fold.pending.is_empty());
+    assert!(!replay.segments.is_empty());
+    assert!(received.iter().any(|(record, _)| {
+        record.reprovision().is_some_and(|provision| {
+            provision.tape.uuid == UUID
+                && provision.label.as_ref().map(|label| label.as_str()) == Some("HAND")
+                && provision.medium.record_size == 262144
+                && provision.parity_scheme.is_none()
+        })
+    }));
+    assert!(received
+        .iter()
+        .all(|(record, _)| record.tag() != Tag::RecoveryRecorded));
+    assert!(segments.is_empty());
+    *segments = replay
+        .segments
+        .iter()
+        .map(|segment| {
+            assert!(matches!(
+                segment.tail,
+                remanence_state::log_frame::Tail::Complete
+            ));
+            let bytes = std::fs::read(library_dir.join(&segment.name)).unwrap();
+            assert_eq!(segment.through, bytes.len() as u64);
+            (segment.name.clone(), bytes)
+        })
+        .collect();
+    (replay, received)
+}
+
 /// Item 5 equivalence: real mounted writes create the facts; deleting SQLite
 /// preserves native session/seal decisions and the physical append refusal.
 #[test]
@@ -1194,6 +1261,14 @@ fn b4b2b_tape_owned_decisions_survive_empty_catalog_rebuild() {
                 },
             )
             .unwrap();
+        let library_uuid = state.library_runtime().manifest().library_uuid();
+        let library_dir = state
+            .library_runtime()
+            .manifest()
+            .library_root()
+            .to_path_buf();
+        let tape_dir = state.library_runtime().manifest().tape_root().to_path_buf();
+        let sqlite_path = state.paths().sqlite_path.clone();
         drop(state);
         if case == "sealed" {
             f.config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
@@ -1279,6 +1354,14 @@ fn b4b2b_tape_owned_decisions_survive_empty_catalog_rebuild() {
                 .unwrap(),
         )
         .unwrap();
+        let mut library_before = std::collections::BTreeMap::new();
+        let (before_replay, received_before) = checked_received_pool(
+            &library_dir,
+            &tape_dir,
+            &sqlite_path,
+            library_uuid,
+            &mut library_before,
+        );
         let audit_before = FileAuditLog::replay(&f.config.audit.dir).unwrap();
         assert!(audit_before
             .iter()
@@ -1312,6 +1395,35 @@ fn b4b2b_tape_owned_decisions_survive_empty_catalog_rebuild() {
         assert_eq!(
             FileAuditLog::replay(&f.config.audit.dir).unwrap(),
             audit_before
+        );
+        let mut library_after = std::collections::BTreeMap::new();
+        let (after_replay, received_after) = checked_received_pool(
+            &library_dir,
+            &tape_dir,
+            &sqlite_path,
+            library_uuid,
+            &mut library_after,
+        );
+        assert_eq!(
+            received_after.len(),
+            received_before.len(),
+            "{case}: received delta must be zero"
+        );
+        assert_eq!(
+            received_after, received_before,
+            "{case}: complete records and receipts"
+        );
+        assert_eq!(
+            library_after, library_before,
+            "{case}: library names and bytes"
+        );
+        assert_eq!(
+            after_replay.last_sequence, before_replay.last_sequence,
+            "{case}"
+        );
+        assert_eq!(
+            after_replay.terminal_hash, before_replay.terminal_hash,
+            "{case}"
         );
         assert_eq!(admission(&f), admitted, "{case}");
         let seals = records(&f)
