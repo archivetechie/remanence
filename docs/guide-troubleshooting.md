@@ -6,6 +6,51 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
+## Recording a command trace
+
+Set `REM_TRACE` to an existing directory to record SCSI commands and their
+timing. Repeated full reads and writes are summarised in cumulative runs.
+The trace also records the drive's sense as captured and its maker, model
+and firmware. Device strings are recorded as the drive sends them, with
+invalid bytes replaced. Sense bytes are recorded raw, without decoding,
+and may contain whatever the drive puts there. Transfer data, device paths,
+serial numbers and tape IDs are not recorded.
+
+For a standalone drive, set the variable on the command:
+
+```sh
+mkdir -p ~/rem-trace; REM_TRACE=~/rem-trace rem put ...
+```
+
+For library commands, the daemon runs the SCSI commands. Create a directory
+the daemon can write to, add `Environment=REM_TRACE=/absolute/path/rem-trace`
+under `[Service]` in the daemon's unit environment, then reload the service
+manager and restart the daemon. Setting the variable only on the client
+does not enable the daemon's trace.
+
+Each process creates one private `rem-trace-<pid>-<unix seconds>.jsonl`
+file, created with mode `0600` (the umask can remove permissions). The switch
+is resolved at the first successful device open; unset or empty means off.
+Tracing is off while `REM_FIELD_TRACE` is set. If the directory or new
+file cannot be opened, a diagnostic is printed and the command continues
+without tracing. Trace writes run on the command's thread and add to its
+elapsed time; `duration_ns` measures the command itself, excluding trace
+I/O. A slow trace directory slows every drive's commands while tracing is
+on, so use a directory on a local disk. The trace holds one file descriptor
+per process. Its diagnostic line goes to stderr like other `rem` messages.
+The process file-size limit is read once, when the trace file is created.
+With a finite limit, tracing stops with at least 64 KiB of headroom below it.
+
+A caught trace panic keeps Rust's default panic hook: it prints a
+`panicked at` line and one `rem: command trace disabled` line on stderr,
+and the command goes on.
+
+Completed lines survive the process being killed; the last line and a
+run's pending count may not. Host power loss can lose unsynced lines;
+failure rows are synced. Attach the trace files to a bug report.
+A line cut short by a write error (for example a full disk) can appear in
+the file; tools reading the trace should skip lines that do not parse.
+
 ## WORM and unknown-media refusals
 
 ```text

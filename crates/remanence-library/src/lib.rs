@@ -20,6 +20,7 @@ pub use remanence_scsi as scsi;
 pub mod field_trace;
 
 pub mod block_io;
+mod command_trace;
 #[doc(hidden)]
 pub mod cursor;
 pub mod discovery;

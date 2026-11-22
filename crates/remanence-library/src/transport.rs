@@ -379,6 +379,8 @@ pub struct LinuxSgTransport {
     /// should call [`SgTransport::set_timeout_for`] before each
     /// slow op (MOVE / INIT / LOAD-UNLOAD).
     timeout_ms: u32,
+    trace: Option<Arc<crate::command_trace::Recorder>>,
+    device_index: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -405,9 +407,12 @@ impl LinuxSgTransport {
             }
             Err(err) => return Err(err),
         };
+        let (trace, device_index) = crate::command_trace::setup();
         Ok(Self {
             file,
             timeout_ms: 5_000,
+            device_index,
+            trace,
         })
     }
 
@@ -429,9 +434,12 @@ impl LinuxSgTransport {
         }
         use std::fs::OpenOptions;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let (trace, device_index) = crate::command_trace::setup();
         Ok(Self {
             file,
             timeout_ms: 5_000,
+            device_index,
+            trace,
         })
     }
 }
@@ -444,7 +452,20 @@ fn should_retry_read_only_open_as_read_write(err: &std::io::Error) -> bool {
 #[cfg(target_os = "linux")]
 impl SgTransport for LinuxSgTransport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
-        let n = remanence_scsi::sg_io::execute_in(&self.file, cdb, buf, self.timeout_ms)?;
+        let command = self.trace.as_ref().and_then(|recorder| {
+            recorder.begin(
+                self.device_index,
+                cdb,
+                crate::command_trace::Direction::In,
+                buf.len(),
+                self.timeout_ms,
+            )
+        });
+        let result = remanence_scsi::sg_io::execute_in(&self.file, cdb, buf, self.timeout_ms);
+        if let (Some(recorder), Some(command)) = (&self.trace, command) {
+            recorder.complete(Some(command), result.as_ref().copied(), buf);
+        }
+        let n = result?;
         // The current sg_io::execute_in surfaces sense bytes only on
         // the error paths (CheckCondition / TransportError). On the
         // happy path the kernel returned status=GOOD with no sense
@@ -455,10 +476,36 @@ impl SgTransport for LinuxSgTransport {
         Ok(TransferOutcome::clean(n as u32))
     }
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
-        remanence_scsi::sg_io::execute_none(&self.file, cdb, self.timeout_ms)
+        let command = self.trace.as_ref().and_then(|recorder| {
+            recorder.begin(
+                self.device_index,
+                cdb,
+                crate::command_trace::Direction::None,
+                0,
+                self.timeout_ms,
+            )
+        });
+        let result = remanence_scsi::sg_io::execute_none(&self.file, cdb, self.timeout_ms);
+        if let (Some(recorder), Some(command)) = (&self.trace, command) {
+            recorder.complete(Some(command), result.as_ref().map(|_| 0), &[]);
+        }
+        result
     }
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
-        let n = remanence_scsi::sg_io::execute_out(&self.file, cdb, buf, self.timeout_ms)?;
+        let command = self.trace.as_ref().and_then(|recorder| {
+            recorder.begin(
+                self.device_index,
+                cdb,
+                crate::command_trace::Direction::Out,
+                buf.len(),
+                self.timeout_ms,
+            )
+        });
+        let result = remanence_scsi::sg_io::execute_out(&self.file, cdb, buf, self.timeout_ms);
+        if let (Some(recorder), Some(command)) = (&self.trace, command) {
+            recorder.complete(Some(command), result.as_ref().copied(), &[]);
+        }
+        let n = result?;
         // execute_out's low-level wrapper returns bytes
         // transferred; Layer 3a's `WriteOutcome` needs the count
         // plus any informational sense. Today the sg_io wrapper
@@ -473,6 +520,15 @@ impl SgTransport for LinuxSgTransport {
 
     fn configure_reserved_buffer(&mut self, requested_bytes: u32) -> Result<u32, ScsiError> {
         remanence_scsi::sg_io::set_reserved_size(&self.file, requested_bytes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxSgTransport {
+    fn drop(&mut self) {
+        if let Some(recorder) = &self.trace {
+            recorder.close_device(self.device_index);
+        }
     }
 }
 
@@ -655,6 +711,525 @@ impl<T: SgTransport> SgTransport for RecordingTransport<T> {
 mod tests {
     use super::*;
 
+    /// Exercise real ioctl failures on regular files, without a live SCSI node.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_trace_all_bodies_preserve_raw_io_and_sync_each_failure_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let device_file = tempfile::NamedTempFile::new().unwrap();
+        let recorder = crate::command_trace::Recorder::for_test(directory.path());
+        let mut transport = LinuxSgTransport::open_rw(device_file.path()).unwrap();
+        transport.device_index = recorder.device();
+        transport.trace = Some(Arc::clone(&recorder));
+        SgTransport::set_timeout_for(&mut transport, TimeoutClass::TapeIo);
+        for (index, dir) in ["in", "none", "out"].into_iter().enumerate() {
+            let cdb = [0x12, 0, 0, 0, 36, 0];
+            let mut buffer = [0u8; 36];
+            let raw = match dir {
+                "in" => remanence_scsi::sg_io::execute_in(
+                    &transport.file,
+                    &cdb,
+                    &mut buffer,
+                    transport.timeout_ms,
+                )
+                .map(|_| ()),
+                "none" => {
+                    remanence_scsi::sg_io::execute_none(&transport.file, &cdb, transport.timeout_ms)
+                }
+                "out" => remanence_scsi::sg_io::execute_out(
+                    &transport.file,
+                    &cdb,
+                    &buffer,
+                    transport.timeout_ms,
+                )
+                .map(|_| ()),
+                _ => unreachable!(),
+            };
+            let result = match dir {
+                "in" => SgTransport::execute_in(&mut transport, &cdb, &mut buffer).map(|_| ()),
+                "none" => SgTransport::execute_none(&mut transport, &cdb),
+                "out" => SgTransport::execute_out(&mut transport, &cdb, &buffer).map(|_| ()),
+                _ => unreachable!(),
+            };
+            let (ScsiError::Io(expected), ScsiError::Io(actual)) =
+                (raw.unwrap_err(), result.unwrap_err())
+            else {
+                panic!("regular file SG_IO must return Io");
+            };
+            assert_eq!(actual.raw_os_error(), Some(libc::ENOTTY));
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+            let text =
+                std::fs::read_to_string(directory.path().join("rem-trace-123-0.jsonl")).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1 + (index + 1) * 2);
+            let start = &rows[1 + index * 2];
+            let done = &rows[2 + index * 2];
+            assert_eq!(start["event"], "start");
+            assert_eq!(done["event"], "done");
+            assert_eq!(start["dev"], transport.device_index);
+            assert_eq!(done["dev"], transport.device_index);
+            assert_eq!(start["dir"], dir);
+            assert_eq!(start["cdb"], "120000002400");
+            assert_eq!(start["requested_bytes"], if dir == "none" { 0 } else { 36 });
+            assert_eq!(start["timeout_ms"], 900_000);
+            assert!(start["mono_ns"].as_u64().unwrap() <= done["mono_ns"].as_u64().unwrap());
+            assert_eq!(done["outcome"], "Io");
+            assert_eq!(done["opcode"], 0x12);
+            assert!(done["transferred_bytes"].is_null());
+            assert_eq!(done["error"]["errno"], libc::ENOTTY);
+            assert_eq!(done["error"]["message"], expected.to_string());
+            assert_eq!(
+                recorder.sync_count(),
+                index + 1,
+                "one sync after each failure row"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_trace_transport_drop_flushes_pending_read_and_write_runs() {
+        for (opcode, dir) in [
+            (0x08, crate::command_trace::Direction::In),
+            (0x0a, crate::command_trace::Direction::Out),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let device_file = tempfile::NamedTempFile::new().unwrap();
+            let recorder = crate::command_trace::Recorder::for_test(directory.path());
+            let mut transport = LinuxSgTransport::open_rw(device_file.path()).unwrap();
+            transport.device_index = recorder.device();
+            transport.trace = Some(Arc::clone(&recorder));
+            for _ in 0..3 {
+                let command = recorder.begin(
+                    transport.device_index,
+                    &[opcode, 0, 0, 0, 4, 0],
+                    dir,
+                    4,
+                    5000,
+                );
+                recorder.complete(command, Ok(4), &[]);
+            }
+            let path = directory.path().join("rem-trace-123-0.jsonl");
+            assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+            drop(transport);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 4, "transport Drop must write the pending run");
+            assert_eq!(rows[3]["event"], "run");
+            assert_eq!(rows[3]["count"], 3);
+            assert_eq!(rows[3]["bytes"], 12);
+            assert_eq!(rows[3]["dev"], 1);
+            assert_eq!(recorder.sync_count(), 0);
+        }
+    }
+
+    /// Environment changes are confined to a subprocess running this test alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_trace_process_child() {
+        let Some(mode) = std::env::var_os("CT1_TRACE_CHILD") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(std::env::var_os("CT1_TRACE_DEVICE").unwrap());
+        let first = LinuxSgTransport::open(&path).unwrap();
+        let enabled = mode == "on";
+        assert_eq!(first.trace.is_some(), enabled);
+        if enabled {
+            std::env::remove_var("REM_TRACE");
+        } else {
+            std::env::set_var("REM_TRACE", std::env::var_os("CT1_TRACE_CHANGED").unwrap());
+        }
+        std::env::remove_var("REM_FIELD_TRACE");
+        let mut second = LinuxSgTransport::open_rw(&path).unwrap();
+        assert_eq!(second.trace.is_some(), enabled, "switch is resolved once");
+        if let (Some(first_recorder), Some(second_recorder)) = (&first.trace, &second.trace) {
+            assert!(Arc::ptr_eq(first_recorder, second_recorder));
+            assert_eq!(first.device_index, 1);
+            assert_eq!(second.device_index, 2);
+        }
+        assert!(matches!(
+            SgTransport::execute_none(&mut second, &[1, 0, 0, 0, 0, 0]),
+            Err(ScsiError::Io(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_trace_process_switch_is_once_and_disabled_diagnostics_are_once() {
+        for mode in [
+            "on",
+            "off",
+            "missing",
+            "field",
+            "field_empty",
+            "field_unset",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let trace_directory = directory.path().join("traces");
+            std::fs::create_dir(&trace_directory).unwrap();
+            let device_file = tempfile::NamedTempFile::new().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "transport::tests::command_trace_process_child",
+                    "--nocapture",
+                ])
+                .env("CT1_TRACE_CHILD", mode)
+                .env("CT1_TRACE_DEVICE", device_file.path())
+                .env("CT1_TRACE_CHANGED", &trace_directory)
+                .env_remove("REM_FIELD_TRACE");
+            match mode {
+                "on" | "field" => {
+                    child.env("REM_TRACE", &trace_directory);
+                }
+                "missing" => {
+                    child.env("REM_TRACE", directory.path().join("missing"));
+                }
+                "off" | "field_empty" => {
+                    child.env("REM_TRACE", "");
+                }
+                "field_unset" => {
+                    child.env_remove("REM_TRACE");
+                }
+                _ => unreachable!(),
+            }
+            if matches!(mode, "field" | "field_empty" | "field_unset") {
+                child.env("REM_FIELD_TRACE", "");
+            }
+            let output = child.output().unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {stderr}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            match mode {
+                "on" | "off" | "field_empty" | "field_unset" => {
+                    assert!(stderr.is_empty(), "{stderr}")
+                }
+                "field" => assert_eq!(
+                    stderr,
+                    "rem: command trace disabled while the field trace is on\n"
+                ),
+                "missing" => {
+                    assert_eq!(stderr.lines().count(), 1);
+                    assert!(stderr.starts_with("rem: command trace disabled: "));
+                }
+                _ => unreachable!(),
+            }
+            let files: Vec<_> = std::fs::read_dir(&trace_directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(files.len(), usize::from(mode == "on"));
+            if mode == "on" {
+                let text = std::fs::read_to_string(files[0].path()).unwrap();
+                let rows: Vec<serde_json::Value> = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0]["event"], "header");
+                assert_eq!(rows[1]["dev"], 2);
+                assert_eq!(rows[2]["dev"], 2);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod command_trace_fr1 {
+        use super::*;
+
+        fn raw_result(t: &LinuxSgTransport, dir: &str, cdb: &[u8]) -> Result<(), ScsiError> {
+            let mut bytes = [0u8; 36];
+            match dir {
+                "in" => remanence_scsi::sg_io::execute_in(&t.file, cdb, &mut bytes, t.timeout_ms)
+                    .map(|_| ()),
+                "none" => remanence_scsi::sg_io::execute_none(&t.file, cdb, t.timeout_ms),
+                "out" => remanence_scsi::sg_io::execute_out(&t.file, cdb, &bytes, t.timeout_ms)
+                    .map(|_| ()),
+                _ => unreachable!(),
+            }
+        }
+
+        fn trait_result(t: &mut LinuxSgTransport, dir: &str, cdb: &[u8]) -> Result<(), ScsiError> {
+            let mut bytes = [0u8; 36];
+            match dir {
+                "in" => SgTransport::execute_in(t, cdb, &mut bytes).map(|_| ()),
+                "none" => SgTransport::execute_none(t, cdb),
+                "out" => SgTransport::execute_out(t, cdb, &bytes).map(|_| ()),
+                _ => unreachable!(),
+            }
+        }
+
+        fn same_error(expected: Result<(), ScsiError>, actual: Result<(), ScsiError>) {
+            match (expected.unwrap_err(), actual.unwrap_err()) {
+                (ScsiError::Io(expected), ScsiError::Io(actual)) => {
+                    assert_eq!(actual.raw_os_error(), Some(libc::ENOTTY));
+                    assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+                    assert_eq!(actual.kind(), expected.kind());
+                    assert_eq!(actual.to_string(), expected.to_string());
+                }
+                (ScsiError::InvalidInput(expected), ScsiError::InvalidInput(actual)) => {
+                    assert_eq!(actual, expected)
+                }
+                pair => panic!("different raw and transport errors: {pair:?}"),
+            }
+        }
+
+        #[test]
+        fn oversized_cdb_is_not_copied_and_returns_raw_invalid_input_for_all_bodies() {
+            let directory = tempfile::tempdir().unwrap();
+            let device = tempfile::NamedTempFile::new().unwrap();
+            let recorder = crate::command_trace::Recorder::for_test(directory.path());
+            let mut t = LinuxSgTransport::open_rw(device.path()).unwrap();
+            t.device_index = recorder.device();
+            t.trace = Some(recorder);
+            let cdb = vec![0x08; 4096];
+            for dir in ["in", "none", "out"] {
+                let expected = raw_result(&t, dir, &cdb);
+                assert!(matches!(expected, Err(ScsiError::InvalidInput(_))));
+                same_error(expected, trait_result(&mut t, dir, &cdb));
+            }
+            let text =
+                std::fs::read_to_string(directory.path().join("rem-trace-123-0.jsonl")).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 7);
+            for start in [&rows[1], &rows[3], &rows[5]] {
+                assert_eq!(start["event"], "start");
+                assert!(start["cdb"].is_null());
+            }
+            assert!(text.len() < 2500, "bounded evidence for the invalid CDB");
+        }
+
+        /// Each injection has its own process because disabling is process-wide.
+        #[test]
+        fn caller_unwind_flushes_drop_without_disabling_trace() {
+            if std::env::var_os("CT1_CALLER_UNWIND_CHILD").is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "transport::tests::command_trace_fr1::caller_unwind_flushes_drop_without_disabling_trace", "--nocapture"])
+                    .env("CT1_CALLER_UNWIND_CHILD", "1").env("REM_TRACE", "")
+                    .env_remove("REM_FIELD_TRACE").output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let device = tempfile::NamedTempFile::new().unwrap();
+            let recorder = crate::command_trace::Recorder::for_test(directory.path());
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut t = LinuxSgTransport::open_rw(device.path()).unwrap();
+                t.device_index = recorder.device();
+                t.trace = Some(Arc::clone(&recorder));
+                for _ in 0..3 {
+                    let command = recorder.begin(
+                        t.device_index,
+                        &[8, 0, 0, 0, 4, 0],
+                        crate::command_trace::Direction::In,
+                        4,
+                        5000,
+                    );
+                    recorder.complete(command, Ok(4), &[]);
+                }
+                panic!("injected caller panic, not a recorder fault");
+            }));
+            assert!(failed.is_err());
+            assert!(!crate::command_trace::Recorder::disabled_for_test());
+            let dev = recorder.device();
+            let command = recorder.begin(dev, &[1], crate::command_trace::Direction::None, 0, 5000);
+            assert!(
+                command.is_some(),
+                "tracing remains usable after the caller recovers"
+            );
+            recorder.complete(command, Ok(0), &[]);
+            let text =
+                std::fs::read_to_string(directory.path().join("rem-trace-123-0.jsonl")).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 6);
+            assert_eq!(rows[3]["event"], "run");
+            assert_eq!(rows[3]["count"], 3);
+            assert_eq!(rows[5]["outcome"], "good");
+        }
+
+        /// Each injection has its own process because disabling is process-wide.
+        #[test]
+        fn panic_child() {
+            let Ok(phase) = std::env::var("CT1_PANIC_PHASE") else {
+                return;
+            };
+            let dir = std::env::var("CT1_PANIC_DIRECTION").unwrap();
+            let directory =
+                std::path::PathBuf::from(std::env::var_os("CT1_PANIC_DIRECTORY").unwrap());
+            std::env::set_var("REM_TRACE", &directory);
+            let device = tempfile::NamedTempFile::new().unwrap();
+            let mut t = LinuxSgTransport::open_rw(device.path()).unwrap();
+            assert!(
+                t.trace.is_some(),
+                "the process recorder is initialized before the injected panic"
+            );
+            let panic_write = if phase == "begin" { 2 } else { 3 };
+            let recorder =
+                crate::command_trace::Recorder::panicking_for_test(&directory, panic_write);
+            t.device_index = recorder.device();
+            t.trace = Some(Arc::clone(&recorder));
+            let cdb = [0x12, 0, 0, 0, 36, 0];
+            let expected = raw_result(&t, &dir, &cdb);
+            same_error(expected, trait_result(&mut t, &dir, &cdb));
+            assert!(crate::command_trace::Recorder::disabled_for_test());
+            let path = directory.join("panic.jsonl");
+            let before = std::fs::read(&path).unwrap();
+            for next in ["in", "none", "out"] {
+                let expected = raw_result(&t, next, &cdb);
+                same_error(expected, trait_result(&mut t, next, &cdb));
+            }
+            drop(t);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "recording stays disabled through Drop"
+            );
+            let snapshot = || {
+                let mut files: Vec<_> = std::fs::read_dir(&directory)
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (
+                            path.file_name().unwrap().to_owned(),
+                            std::fs::read(&path).unwrap(),
+                        )
+                    })
+                    .collect();
+                files.sort();
+                files
+            };
+            let files_before = snapshot();
+            let another = LinuxSgTransport::open_rw(device.path()).unwrap();
+            assert!(
+                another.trace.is_none(),
+                "later device opens also skip tracing"
+            );
+            assert_eq!(
+                snapshot(),
+                files_before,
+                "later opens create no file and add no row"
+            );
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        }
+
+        #[test]
+        fn writer_panics_at_begin_and_completion_preserve_all_transport_results() {
+            for phase in ["begin", "completion"] {
+                for dir in ["in", "none", "out"] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "transport::tests::command_trace_fr1::panic_child",
+                            "--nocapture",
+                        ])
+                        .env("REM_TRACE", "")
+                        .env_remove("REM_FIELD_TRACE")
+                        .env("CT1_PANIC_PHASE", phase)
+                        .env("CT1_PANIC_DIRECTION", dir)
+                        .env("CT1_PANIC_DIRECTORY", directory.path())
+                        .output()
+                        .unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        stderr.contains("panicked at"),
+                        "the default Rust panic hook is retained"
+                    );
+                    assert!(
+                        output.status.success(),
+                        "{phase}/{dir}: {stderr}\n{}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    assert_eq!(
+                        stderr
+                            .lines()
+                            .filter(|line| line
+                                .starts_with("rem: command trace disabled: recorder panicked"))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn open_failure_child() {
+            let Some(directory) = std::env::var_os("CT1_FAILED_OPEN_DIRECTORY") else {
+                return;
+            };
+            let directory = std::path::PathBuf::from(directory);
+            let missing = directory.join("no-device");
+            let expected = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&missing)
+                .unwrap_err();
+            let actual = LinuxSgTransport::open(&missing).err().unwrap();
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+            let expected = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&missing)
+                .unwrap_err();
+            let actual = LinuxSgTransport::open_rw(&missing).err().unwrap();
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+            assert_eq!(
+                std::fs::read_dir(directory.join("traces")).unwrap().count(),
+                0
+            );
+        }
+
+        #[test]
+        fn failed_device_opens_create_no_trace_and_preserve_errors() {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir(directory.path().join("traces")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transport::tests::command_trace_fr1::open_failure_child",
+                    "--nocapture",
+                ])
+                .env("REM_TRACE", directory.path().join("traces"))
+                .env_remove("REM_FIELD_TRACE")
+                .env("CT1_FAILED_OPEN_DIRECTORY", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(output.stderr.is_empty());
+        }
+    }
+
     #[test]
     fn fixture_transport_replays_in_order_and_logs_cdbs() {
         let mut t = FixtureTransport::new().with_responses([vec![0xaa, 0xbb], vec![0xcc]]);
@@ -719,6 +1294,8 @@ mod tests {
         let mut t = LinuxSgTransport {
             file,
             timeout_ms: TimeoutClass::Inquiry.duration_ms(),
+            trace: None,
+            device_index: 0,
         };
         assert_eq!(t.timeout_ms, 5_000);
         t.set_timeout_for(TimeoutClass::Move);
