@@ -138,7 +138,7 @@ pub(crate) mod test_support {
             let mut config = root.config();
             config.tape_pools.push(pool.clone());
             root.release();
-            let state =
+            let mut state =
                 StateHandle::open_with_config(root.paths().clone(), config.clone()).unwrap();
             for id in [T, B] {
                 state
@@ -163,10 +163,10 @@ pub(crate) mod test_support {
                                     lifecycle_ops: true,
                                     source: lib::GenerationSource::Operator,
                                 },
-                                pool: Some("admission".into()),
+                                pool: None,
                                 endpoint: None,
                                 adoption: None,
-                                pool_source: Some(lib::PoolSource::Operator(lib::Unit)),
+                                pool_source: None,
                                 operation: None,
                                 replaced_bot: None,
                             },
@@ -175,6 +175,14 @@ pub(crate) mod test_support {
                             v,
                         )
                     })
+                    .unwrap();
+                let generation = state
+                    .library_runtime()
+                    .tape_state(id)
+                    .unwrap()
+                    .assignment_generation;
+                state
+                    .assign_tape_pool(id, generation, Some(&pool.id))
                     .unwrap();
             }
             Self {

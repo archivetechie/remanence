@@ -264,29 +264,24 @@ async fn b7_projection_failure_preserves_startup_queue_and_read_errors() {
 
 #[tokio::test]
 async fn b7_selection_prefers_debt_but_keeps_pinned_identity_and_capacity() {
-    let root = tempfile::tempdir().unwrap();
-    let world = due_tape(root.path()).await;
+    let other = [0x11; 16];
+    let root = DurabilityRoot::with_tapes(
+        &[(TAPE, BARCODE), (other, "AAA001L9")],
+        &[TAPE, other],
+        true,
+    );
+    let world = model_world(BARCODE, true);
+    typed_due_tape(&root, world.clone()).await;
     let mut config = pool();
     config.selection_policy = remanence_state::PoolSelectionPolicyName::FillOldest;
-    let state = state(root.path());
-    let mut index = {
+    let state = root.api_state();
+    let index = {
         let mut index = state.catalog.write_handle();
         if let Some(pool) = &state.drive_pool {
             index.set_readiness_observer(pool.readiness_wake.clone());
         }
         index
     };
-    let other = [0x11; 16];
-    index
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: other,
-            voltag: "AAA001L9".into(),
-            block_size: BLOCK,
-            parity: ParityConfig::Scheme(scheme()),
-            force: false,
-        })
-        .unwrap();
-    index.project_tape_pool_membership(other, POOL).unwrap();
     let picked = crate::pool_write::select_tape_in_pool_for_write_session(
         &index,
         &config,
@@ -333,17 +328,21 @@ async fn b7_selection_prefers_debt_but_keeps_pinned_identity_and_capacity() {
         (encoded.blocks.len() as u64 + 1) * u64::from(BLOCK)
     );
     let db = rusqlite::Connection::open(&*state.index_path).unwrap();
-    // Leave only an Object-sized gap; the due sidecar must disqualify this tape.
+    // The inflated extent exceeds the pool watermark and excludes this tape.
+    let inflated_extent = (18_000_000_000_000u64 / u64::from(BLOCK) - 1).to_be_bytes();
     db.execute(
         "UPDATE tapes SET written_extent_lba = ? WHERE tape_uuid = ?",
-        rusqlite::params![
-            (18_000_000_000_000u64 / u64::from(BLOCK) - 1)
-                .to_be_bytes()
-                .as_slice(),
-            TAPE.as_slice()
-        ],
+        rusqlite::params![inflated_extent.as_slice(), TAPE.as_slice()],
     )
     .unwrap();
+    let observed_extent: Vec<u8> = db
+        .query_row(
+            "SELECT written_extent_lba FROM tapes WHERE tape_uuid = ?",
+            [TAPE.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(observed_extent.as_slice(), inflated_extent.as_slice());
     let picked = crate::pool_write::select_tape_in_pool_for_write_session(
         &index,
         &config,
@@ -358,8 +357,21 @@ async fn b7_selection_prefers_debt_but_keeps_pinned_identity_and_capacity() {
         rusqlite::params![debt.cursor.lba.to_be_bytes().as_slice(), TAPE.as_slice()],
     )
     .unwrap();
+    let restored_extent: Vec<u8> = db
+        .query_row(
+            "SELECT written_extent_lba FROM tapes WHERE tape_uuid = ?",
+            [TAPE.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        restored_extent.as_slice(),
+        debt.cursor.lba.to_be_bytes().as_slice()
+    );
     drop(index);
-    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+    let (tx, opened, thread) = root
+        .writer(open_model_library(world), selected(), |_, _| {})
+        .await;
     let id = opened.unwrap(); // real admission closes the prior debt
     let (reply, received) = oneshot::channel();
     tx.send(DriveCommand::Abort {
@@ -372,6 +384,8 @@ async fn b7_selection_prefers_debt_but_keeps_pinned_identity_and_capacity() {
     received.await.unwrap().unwrap();
     thread.join().unwrap();
     assert!(!summary(&state, TAPE).unwrap().closeout_due());
+    let settled = summary(&state, TAPE).unwrap();
+    assert_eq!(settled.protected, settled.total);
     let control = crate::pool_write::select_tape_in_pool_for_write_session(
         &state.index().unwrap(),
         &config,
@@ -1039,40 +1053,47 @@ async fn b7_fix_scan_skips_bad_entries_prunes_keys_and_reprojects_out_of_scope()
 #[tokio::test]
 async fn b7_fix_pool_skips_excluded_or_failed_preferred_drive_and_never_evicts_excluded_bay() {
     for excluded in [true, false] {
-        let root = tempfile::tempdir().unwrap();
-        let world = due_tape(root.path()).await;
-        let mut state = state(root.path());
         let other = [0xbc; 16];
+        let root = DurabilityRoot::with_tapes(
+            &[(TAPE, BARCODE), (other, "OTHER1L9")],
+            &[TAPE, other],
+            true,
+        );
+        let world = model_world(BARCODE, true);
+        typed_due_tape(&root, world.clone()).await;
+        let mut state = root.api_state();
+        // Seat a distinct real model drive before installing passive sender faults.
+        let bootstrap = crate::build_tape_bootstrap(
+            other,
+            BLOCK,
+            ParityConfig::Scheme(scheme()),
+            "2026-11-03T00:00:00Z",
+            "cu2fs",
+        );
+        let mut block = vec![0; BLOCK as usize];
+        write_bootstrap_block(&bootstrap, &mut block).unwrap();
+        let mut tape = VirtualTape::empty(18_000_000_000_000, BLOCK);
+        tape.records = vec![Record::Block(block), Record::Filemark];
+        tape.written_bytes = BLOCK.into();
+        tape.durable_frontier = 2;
         {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
+            let mut model = world.lock().unwrap();
+            model.drive_serials.insert(BAY + 1, "CU2FS-OTHER".into());
+            model.drive_states.insert(BAY + 1, Default::default());
+            model.drive_alert_flags.insert(BAY + 1, Default::default());
+            model.element_layout.drive_count += 1;
+            model.put_tape_in_drive(BAY + 1, "OTHER1L9", None, tape);
         }
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: other,
-            voltag: "OTHER1L9".into(),
-            block_size: BLOCK,
-            parity: ParityConfig::Scheme(scheme()),
-            force: false,
-        })
-        .unwrap();
-        {
-            let mut index = state.catalog.write_handle();
-            if let Some(pool) = &state.drive_pool {
-                index.set_readiness_observer(pool.readiness_wake.clone());
-            }
-            index
-        }
-        .project_tape_pool_membership(other, POOL)
+        let library = open_model_library(world.clone());
+        crate::drive_collection::observe_drive_catalog_from_libraries(
+            &mut root.state.write_handle(),
+            [library.library()],
+            &HashSet::from([LIBRARY.to_owned()]),
+        )
         .unwrap();
         let mut inventory = world.lock().unwrap().library_snapshot();
-        let mut healthy = inventory.drive_bays[0].clone();
-        healthy.element_address = BAY + 1;
-        healthy.loaded_tape = Some("OTHER1L9".into());
-        healthy.source_slot = None;
-        inventory.drive_bays.push(healthy);
+        // Keep the healthy second bay last for the excluded-only refusal below.
+        inventory.drive_bays.sort_by_key(|bay| bay.element_address);
         state.library_snapshot = Some(library_snapshot_cell(inventory.clone()));
         let (changer, mut changer_rx) = mpsc::channel(2);
         let (drive, mut drive_rx) = mpsc::channel(2);
@@ -1133,8 +1154,8 @@ async fn b7_fix_pool_skips_excluded_or_failed_preferred_drive_and_never_evicts_e
         open.await.unwrap().unwrap_err();
         assert!(changer_rx.try_recv().is_err());
         if excluded {
-            // Move the target to a slot and leave the excluded bay as the only
-            // physically evictable drive. It must not become an eviction target.
+            // Remove the healthy bay and fill the sole home slot. This refusal
+            // must leave both command channels empty.
             inventory.drive_bays.pop();
             inventory.slots[0].full = true;
             inventory.slots[0].cartridge = Some("OTHER1L9".into());

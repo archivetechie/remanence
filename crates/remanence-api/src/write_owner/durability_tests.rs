@@ -718,6 +718,7 @@ async fn write_close_release_empties_the_pools_session_map() {
 }
 
 /// Run one session handler, joining its thread after close or refusal.
+#[allow(dead_code)]
 async fn open_writer(
     root: &Path,
     library: remanence_library::LibraryHandle,
@@ -730,6 +731,7 @@ async fn open_writer(
 }
 
 /// Select fixture geometry without changing the normal durability scenario.
+#[allow(dead_code)]
 async fn open_writer_with_selection(
     root: &Path,
     library: remanence_library::LibraryHandle,

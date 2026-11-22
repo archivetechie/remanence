@@ -43,13 +43,13 @@ async fn b9_durable_checkpoint_receipts_survive_projection_failure() {
         .await
         .unwrap();
         let outcome = received.await.unwrap();
+        thread.join().unwrap();
         // The native log already holds the Committed group naming the object.
         let committed = native_records_in(&root.tape_dir())
             .iter()
             .filter(|r| matches!(r, NativeRecord::Committed(c) if c.object_count == 1))
             .count();
         assert_eq!(committed, 1, "the commit is durable in the tape log");
-        thread.join().unwrap();
         let ended = lifecycle.ended_writes.lock().unwrap()[&id].0.clone();
         // Design write-API rule 2: a durable commit is never reported as an error,
         // and the ended session carries the receipts of every commit record.

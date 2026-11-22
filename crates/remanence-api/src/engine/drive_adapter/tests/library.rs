@@ -134,6 +134,20 @@ fn placed_library_keeps_actual_endpoint_guards_and_source() {
                 .all(|(_, endpoint)| *endpoint == &expected_endpoint),
         "every native opening must use the placed library endpoint; found session IDs and endpoints: {openings:?}"
     );
+    // Every ending must name an earlier opening with the checked endpoint.
+    for (at, record) in records.iter().enumerate() {
+        if let Native::SessionEnded(end) = record {
+            assert!(
+                records[..at].iter().any(|record| matches!(record,
+                    Native::SessionOpened(open)
+                        if open.session_id == end.session_id
+                            && open.incarnation == end.incarnation
+                            && open.drive.endpoint == expected_endpoint
+                )),
+                "native ending has no earlier endpoint-checked opening: {end:?}"
+            );
+        }
+    }
     let session_id = *Uuid::from_slice(&session.session_id).unwrap().as_bytes();
     let (opened_at, opened) = records
         .iter()
