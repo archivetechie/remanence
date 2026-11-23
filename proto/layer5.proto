@@ -2249,6 +2249,22 @@ message SupersedeTailResponse {
   string required_confirmation = 2;
   bool completed = 3;
   uint64 tape_log_sequence = 4;
+  TornTailInspection inspection = 5;
+}
+
+// Read-only evidence from a torn tail at the committed boundary.
+message TornTailInspection {
+  string site = 1;
+  uint32 cursor_partition = 2;
+  uint64 cursor_lba = 3;
+  uint64 file_start_lba = 4;
+  uint64 failing_lba = 5;
+  uint64 blocks_read = 6;
+  string read_sense = 7;
+  optional uint64 accounted_bytes = 8;
+  optional uint64 host_bytes = 9;
+  string head = 10;
+  repeated string named_files = 11;
 }
 
 // Close the current uncovered parity range; an already protected tape is a no-op.

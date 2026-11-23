@@ -60,27 +60,36 @@ options and, on ZFS, the flush switches. `rem doctor` shows this as
 does not yet exist. On ZFS it adds an advisory `journal sync` row; `sync=disabled`
 means fsync can return before data reaches disk.
 
-Remanence makes its records durable with fsync, as a database does; it cannot
-test whether a disk keeps what it confirms. If a power cut loses the last
-journal records, nothing on tape is lost or overwritten. The next write to
-that tape can stop with `TailBeyondKnownState`. Recoverable files can be
-copied out with `rem tape restore --scan --out rescued` on a standalone
-drive. After that refusal, if this state shows no open session on the tape
-(its last session closed, or none opened since it was initialized here),
-`supersede-tail` refuses discard in this release: keep the tape closed for
-writing, start from a newer copy of the state directory that accounts for
-the data, or withdraw the tape by the [`rem tape
-retire`](reference-cli.md#rem-tape-retire) procedure (in home mode, pass
-this configuration's path with `--config`; parity closeout or a pending
-finalization can block retirement). Otherwise discard can proceed if
-recovery checks pass. In standalone home mode use `rem tape supersede-tail
---acknowledge-tape LABEL`; for an explicit drive add `--device PATH
---allow-device SERIAL`. In a library use `rem tape supersede-tail
---tape-uuid UUID --ack-tape-uuid UUID`.
-Its preview lists the objects and other findings it detected (a trailing
-torn fragment has no separate entry); confirm only after accounting for the
-whole suffix, then rerun an interrupted `put` whose sources still exist. A
-UPS, or a disk with power-loss protection, removes this power-cut exposure.
+Remanence makes its records durable with fsync, as a database does; it cannot test
+whether a disk keeps what it confirms. **Torn-tail READ refusal.** A power cut during
+a tape write can leave a torn tail. If `rem put` prints a sentence beginning `If the
+drive lost power during a write,`, run the inspection command it names. Its diagnostic
+begins `append suffix at LBA` or `tape identity invalidated`. An initial
+`supersede-tail` inspection changes nothing on tape and exits 1; discarding this tail
+is not available in this release, including with `--confirm-supersede`. Earlier checks
+can refuse before inspection. A newer state directory does not repair this READ
+failure; another write that meets it refuses again. The tail refusal itself leaves
+earlier files available for recovery. Try `rem tape restore --scan --out rescued` on a
+standalone drive, with `--private-key` for encrypted files. Discovery precedes
+extraction and can stop on another error, such as `03/11/00` while measuring
+filemarks. Where read admission permits, try `rem get` for known committed files. An
+incomplete candidate makes extraction exit 1; exit 0 covers only the candidates
+discovered. Check the report and rescued files before [`rem tape
+retire`](reference-cli.md#rem-tape-retire), whose conditions still apply. To write
+elsewhere, use another eligible tape; the
+[standalone](reference-cli.md#rem-put-standalone) and
+[library](reference-cli.md#rem-put-library) reference sections give the drive, guard
+and endpoint options. **Lost journal records.** If a power cut loses the last journal
+records, nothing on tape is lost or overwritten. The next write to that tape can stop
+with `TailBeyondKnownState`. For journal-record loss, start from a newer state
+directory that accounts for the data, or try recovery as described above. After
+`TailBeyondKnownState`, discard is refused in this release if the tape log has a
+latest commit and no open write session. If this state records no prior commit for the
+tape, or still shows an open write session, you can preview the suffix and confirm
+discard if the recovery checks pass. Keep a tape whose suffix cannot be discarded
+closed for writing, or follow the retirement procedure; account for the whole suffix
+before confirming any discard. A UPS, or a disk with power-loss protection, removes
+this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
@@ -551,23 +560,25 @@ That failure is counted as `StandaloneFenceUnrecorded` and stops further motion
 for the rest of the process.
 
 Release records your acknowledgement; it does not prove that the append point
-is safe. Every append checks the physical tail. `TailBeyondKnownState` means
-the tape holds data your local state does not record (complete files or only a
-torn fragment) beyond the position it knows. Restore a
-newer state backup, or rescue with `--scan`. Do not delete the tape logs in the
-state directory to make the refusal go away.
+is safe. Admission checks the physical tail when a write session opens;
+successive appends in that session do not rescan it. `TailBeyondKnownState` means
+the tape holds data your local state does not record beyond the position it
+knows. For that refusal, restore a newer state backup, or rescue with `--scan`.
+Do not delete the tape logs in the state directory to make the refusal go away.
+A lone readable fragment of an open session ending at physical end of data can
+instead be replaced by ordinary recovery without a preview.
 
 Tape fences for `append_admission_refused` and `session_suffix_contradiction`
 are not released by `rem tape quarantine release`. Tail recovery refuses a tape that
-contradicts its recorded session ending. If the state shows no open session on
-the tape (its last session closed, or none opened since it was initialized here),
-its unrecorded data cannot be discarded in this release:
+contradicts its recorded session ending. If admission reports
+`TailBeyondKnownState` and the tape log has a latest commit but no open write
+session, its unrecorded data cannot be discarded in this release:
 keep the tape closed for writing, withdraw it with `rem tape retire` and
 `--config` with this configuration's path, or start from a newer copy of the
 state directory. Retirement refuses while parity closeout is due.
 
-Otherwise, to deliberately discard that suffix after rescuing it, and only
-when its objects are known to be unneeded, run:
+For an ordinary suffix that passes the recovery checks, to deliberately discard
+it after rescuing it, and only when its objects are known to be unneeded, run:
 
 ```sh
 rem tape supersede-tail --acknowledge-tape HOME01
@@ -576,6 +587,13 @@ rem tape supersede-tail --acknowledge-tape HOME01
 The command lists what it discards and asks for `SUPERSEDE HOME01`. For a
 non-interactive run, add `--confirm-supersede "SUPERSEDE HOME01"`. This is an
 audited destructive decision, not a routine retry step.
+
+For a marked write-open refusal from a torn-tail READ, `put` adds the sentence
+beginning `If the drive lost power during a write,`. An initial eligible
+`supersede-tail` inspection changes nothing on the tape and exits 1, including
+with `--confirm-supersede`; earlier checks can refuse before inspection.
+Discarding this tail is not available in this release. See the [standalone reference](reference-cli.md#rem-tape-supersede-tail-standalone)
+for the output and the power-cut advice above for rescue and writing elsewhere.
 
 <!-- code-anchor: crates/remanence-api/src/catalogless_restore.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Recovery on another machine
@@ -680,10 +698,9 @@ not been written since the copy. The restored catalog does not list a tape's
 data written since the copy. Copy those files out with
 `rem tape restore --scan
 --out rescued`; do not discard the data unless its objects are known
-to be unneeded. If the restored state
-shows no open session on the tape (its last session closed, or none opened since
-it was initialized here), that data cannot be discarded in this release: keep
-the tape closed for writing, withdraw it with `rem tape retire`
+to be unneeded. If admission reports `TailBeyondKnownState` and the restored
+tape log has a latest commit but no open write session, that data cannot be
+discarded in this release: keep the tape closed for writing, withdraw it with `rem tape retire`
 and `--config` with this configuration's path, or start from a newer copy of
 the state directory.
 

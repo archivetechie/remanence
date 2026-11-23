@@ -311,7 +311,7 @@ impl MountedDrive {
         &mut self,
         acknowledge: &str,
         confirm: impl FnOnce(&str, &[String]) -> std::result::Result<(), String>,
-    ) -> std::result::Result<Vec<String>, crate::MountError> {
+    ) -> std::result::Result<crate::SupersedeTailOutcome, crate::MountError> {
         self.standalone_tail_recovery_admission()?;
         crate::standalone_write::supersede(
             &self.client,

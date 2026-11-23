@@ -20843,3 +20843,313 @@ struct TypedMagazineFixture {
     _state: StateHandle,
     _typed: crate::tests::TypedRoot,
 }
+
+/// Exercise the shared supersede service after the standalone actor's preparation.
+/// Returning wire-shaped values exposes both owned outcomes without widening production APIs.
+pub(crate) fn plr2a2a_service(
+    index: &mut CatalogIndex,
+    cfg: &TerminalWriteConfig,
+    drive: &mut DriveHandle,
+    tape_uuid: [u8; 16],
+    confirmation_supplied: bool,
+) -> Result<pb::SupersedeTailResponse, Status> {
+    let tape = index.get_tape(&tape_uuid).unwrap().unwrap();
+    let (size, _) = crate::pool_write::selected_tape_geometry(
+        &tape,
+        tape.pool_id.as_deref().unwrap_or("(unpooled)"),
+    )
+    .unwrap();
+    prepare_drive_for_write(
+        drive,
+        &tape_uuid,
+        size,
+        Uuid::new_v4(),
+        WriteMediaPolicy::RewritableObject,
+    )?;
+    let generation = drive.identity_generation();
+    match super::supersede_mounted_tail(
+        index,
+        cfg,
+        drive,
+        tape_uuid,
+        generation,
+        &Uuid::from_bytes(tape_uuid).to_string(),
+        AuditActor::System,
+        confirmation_supplied,
+        |_, _, _| panic!("inspection must return before confirmation"),
+    )? {
+        super::tail_recovery::SupersedeResult::Superseded(found) => Ok(pb::SupersedeTailResponse {
+            found,
+            completed: true,
+            ..Default::default()
+        }),
+        super::tail_recovery::SupersedeResult::InspectionOnly {
+            inspection,
+            sequence,
+        } => Ok(pb::SupersedeTailResponse {
+            inspection: Some(inspection),
+            tape_log_sequence: sequence,
+            ..Default::default()
+        }),
+    }
+}
+
+/// Count received decisions, including unapplied records, independently of actor bookkeeping.
+fn plr2a2a_daemon_recovery_tags(state: &StateHandle) -> Vec<remanence_state::library_log::Tag> {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+    let paths = state.paths();
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+    // The actor is settled at both observations. Replay a closed byte copy so the
+    // oracle does not contend with the live authority's exclusive library lease.
+    let copy = tempfile::tempdir().unwrap();
+    let mut copied = 0;
+    for entry in std::fs::read_dir(&paths.audit_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|ext| ext == "remlib") {
+            std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+            copied += 1;
+        }
+    }
+    assert!(copied > 0);
+    let mut tags = Vec::new();
+    let replay = store::replay_observed_with_received(
+        copy.path(),
+        state.library_runtime().manifest().library_uuid(),
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, _| {
+            if matches!(
+                record.tag(),
+                Tag::SupersedeTail | Tag::FenceRaised | Tag::FenceReleased | Tag::RecoveryRecorded
+            ) {
+                tags.push(record.tag());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    tags
+}
+
+/// Prime a real actor checkpoint, then retain an unended native owner across a modeled power cut.
+async fn plr2a2a_daemon_request(
+    ordinary: bool,
+    confirm: bool,
+) -> Result<pb::SupersedeTailResponse, Status> {
+    const BLOCK: u32 = 262144;
+    const TAPE: [u8; 16] = [0xd2; 16];
+    const BARCODE: &str = "PLR002L9";
+    const SERIAL: &str = "PLR2A2A-DRIVE";
+    let pool = TapePoolConfig {
+        id: "plr2a2a".into(),
+        scheme: None,
+        display_name: None,
+        copy_class: None,
+        content_class: None,
+        selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+        watermark_low: 0.9,
+        watermark_high: 0.95,
+        capacity_cap_bytes: None,
+        block_size_bytes: u64::from(BLOCK),
+        min_object_size_bytes: 0,
+    };
+    let (_typed, state) = typed_pooled_actor_fixture(&[(TAPE, BARCODE, pool.clone())]);
+    let bootstrap = BootstrapPayload {
+        scheme: None,
+        no_parity_flag: true,
+        filemark_map_digest: None,
+        tape_uuid: TAPE,
+        written_by_version: "test".into(),
+        written_at: "2026-11-23T00:00:00Z".into(),
+        sequence: 0,
+        block_size_bytes: BLOCK,
+        drive_compression: false,
+    };
+    let mut block = vec![0; BLOCK as usize];
+    write_bootstrap_block(&bootstrap, &mut block).unwrap();
+    let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK);
+    tape.records = vec![Record::Block(block)];
+    if !ordinary {
+        tape.records.push(Record::Filemark);
+    }
+    tape.written_bytes = u64::from(BLOCK);
+    let mut world = VirtualWorld::single_drive("PLR2A2A-LIB", 0x100, SERIAL, 0x400, 1);
+    world.put_tape_in_drive(0x100, BARCODE, Some(0x400), tape);
+    let world = Arc::new(Mutex::new(world));
+    let mut library = open_model_library(world.clone());
+    let serial = library.library().serial.clone();
+    let drive_uuid = state
+        .write_handle()
+        .observe_drive(DriveObservationInput {
+            serial: SERIAL.into(),
+            identity_source: "DvcidAndInquiry".into(),
+            vendor: None,
+            product: None,
+            firmware_rev: None,
+            managed: "rem".into(),
+            library_serial: Some(serial.clone()),
+            element_address: Some(0x100),
+            observed_at_utc: None,
+        })
+        .unwrap()
+        .drive_uuid;
+    let mut cfg = test_state_write_owner_config(
+        &state,
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.tape_pools = vec![pool.clone()];
+    cfg.checkpoint_max_objects = 1;
+    let drive = library.open_drive(0x100, &cfg.policy).unwrap();
+    let tx = spawn_drive_actor(0x100, drive, cfg);
+    let mut sequence = 0;
+    let mut cursor = 0;
+    if !ordinary {
+        let session =
+            open_actor_test_write_session(&tx, &pool, TAPE, &serial, BARCODE, &drive_uuid, SERIAL)
+                .await;
+        append_actor_test_file(
+            &tx,
+            session,
+            state.paths().state_dir.join("prime"),
+            "prime",
+            "prime",
+            b"committed prefix",
+        )
+        .await;
+        let (reply, response) = oneshot::channel();
+        tx.send(DriveCommand::Close {
+            session_id: session,
+            reply,
+        })
+        .await
+        .unwrap();
+        response.await.unwrap().unwrap();
+        settle_write_actor(&tx, session).await;
+        let authority = TapeAuthority::open(
+            state.paths().journal_dir.join("tapes"),
+            TAPE,
+            &state.paths().sqlite_path,
+        )
+        .unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        let snapshot = lease.freeze().unwrap();
+        cursor = snapshot.tape_summary().cursor.lba;
+        assert!(snapshot.tape_summary().object_count > 0);
+        lease
+            .open_session(
+                [0xc7; 16],
+                "2026-11-23T00:00:00Z".into(),
+                remanence_state::tape_log::SessionDrive {
+                    serial: SERIAL.into(),
+                    vendor: None,
+                    product: None,
+                    endpoint: remanence_state::library_log::DriveKey::Standalone(
+                        remanence_state::library_log::Standalone {
+                            drive_serial: SERIAL.into(),
+                        },
+                    ),
+                    drive_uuid: None,
+                },
+            )
+            .unwrap();
+        let snapshot = lease.freeze().unwrap();
+        sequence = snapshot.log_reference().0;
+        state.library_runtime().refresh_native(&snapshot).unwrap();
+        state.library_runtime().catch_up().unwrap();
+        drop(lease);
+        drop(authority);
+        let header = remanence_aead::RemObjectHeader::new_envelope(
+            BLOCK,
+            [1; 16],
+            32,
+            "00000000-0000-4000-8000-000000000001",
+            2048,
+        )
+        .unwrap()
+        .serialize()
+        .unwrap();
+        let mut first = vec![0; BLOCK as usize];
+        first[..128].copy_from_slice(&header);
+        let mut w = world.lock().unwrap();
+        let tape = w.tapes.get_mut(BARCODE).unwrap();
+        assert_eq!(tape.records.len() as u64, cursor);
+        tape.records.extend([
+            Record::Block(first),
+            Record::Block(vec![0x42; BLOCK as usize]),
+        ]);
+        let keep = tape.records.len();
+        w.drive_states.get_mut(&0x100).unwrap().profile =
+            remanence_chaos::model::DriveProfile::MeasuredHpLto6;
+        w.power_cut_during_write(0x100, keep).unwrap();
+    }
+    let before = if ordinary {
+        vec![]
+    } else {
+        plr2a2a_daemon_recovery_tags(&state)
+    };
+    let commands = world.lock().unwrap().command_log.len();
+    let (reply, response) = oneshot::channel();
+    tx.send(DriveCommand::SupersedeTail {
+        request: pb::SupersedeTailRequest {
+            tape_uuid: TAPE.to_vec(),
+            ack_tape_uuid: TAPE.to_vec(),
+            confirm_supersede: confirm.then(String::new),
+            expected_found: vec![],
+            observed_tape_log_sequence: None,
+        },
+        actor: AuditActor::System,
+        needs_drive_load: false,
+        library_serial: serial,
+        barcode: Some(BARCODE.into()),
+        source_slot: None,
+        drive_serial: Some(SERIAL.into()),
+        reply,
+    })
+    .await
+    .unwrap();
+    let result = response.await.unwrap();
+    settle_write_actor(&tx, Uuid::nil()).await;
+    if !ordinary {
+        assert!(world.lock().unwrap().command_log[commands..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19)));
+        assert_eq!(plr2a2a_daemon_recovery_tags(&state), before);
+        if let Ok(response) = &result {
+            assert_eq!(response.tape_log_sequence, sequence);
+            assert_eq!(response.inspection.as_ref().unwrap().cursor_lba, cursor);
+        }
+    }
+    result
+}
+#[tokio::test]
+async fn plr2a2a_t7_daemon_inspection() {
+    let response = plr2a2a_daemon_request(false, false).await.unwrap();
+    let inspection = response
+        .inspection
+        .expect("daemon actor must retain inspection");
+    assert_eq!(inspection.site, "open-scan");
+    assert_eq!(inspection.blocks_read, 2);
+    assert!(response.found.is_empty());
+    assert!(response.required_confirmation.is_empty());
+    assert!(!response.completed);
+}
+#[tokio::test]
+async fn plr2a2a_t9_daemon_empty_confirmation() {
+    let error = plr2a2a_daemon_request(false, true).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().starts_with("SupersedeInspectionOnly:"),
+        "{error}"
+    );
+}
+#[tokio::test]
+async fn plr2a2a_t8_daemon_ordinary_preview() {
+    let response = plr2a2a_daemon_request(true, false).await.unwrap();
+    assert!(response.inspection.is_none());
+    assert!(response.found.is_empty());
+    assert_eq!(response.required_confirmation, "SUPERSEDE PLR002L9");
+    assert!(!response.completed);
+    assert_eq!(response.tape_log_sequence, 0);
+}

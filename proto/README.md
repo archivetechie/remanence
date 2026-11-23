@@ -134,10 +134,24 @@ refused immediately with `FAILED_PRECONDITION` ("tape is sealed"). Matching retr
 of live or successful operations rejoin them.
 
 `SupersedeTailRequest.observed_tape_log_sequence = 5` is an optional uint64 on the
-wire and mandatory on confirmation. Preview returns the required value in
-`SupersedeTailResponse.tape_log_sequence = 4`. A stale value refuses with
-`TailPreviewStale`. `GetWriteSession` retains the ended session's durable receipts;
-there is no `SessionEndedDetails` status extension.
+wire and mandatory on ordinary tail-discard confirmation. An ordinary preview
+returns the required value in `SupersedeTailResponse.tape_log_sequence = 4`
+without requiring confirmation. A later ordinary discard request requires
+confirmation and that sequence; a stale value refuses with `TailPreviewStale`
+if earlier checks permit it to reach the sequence check.
+`SupersedeTailResponse.inspection = 5` (`TornTailInspection`) is present only for
+an inspection result: `found` and `required_confirmation` are empty, `completed`
+is false, and `tape_log_sequence` is the inspected log's sequence. Once earlier
+checks pass, a confirmation request probes the tail again before the ordinary
+sequence check; if it finds an eligible torn tail, the server refuses with
+`SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard`
+instead of returning an inspection, whether the initial response was an ordinary
+preview or an inspection that the client ignored. The CLIs print the eight-line
+inspection only for an initial inspection response; an ordinary preview followed
+by that server refusal exits 1 without those lines. While the ended session
+remains cached, `GetWriteSession` returns its checkpointed receipts. The daemon
+keeps at most 1,024 ended write sessions in this in-memory cache. There is no
+`SessionEndedDetails` status extension.
 
 ## Closeout obligation surfaces
 

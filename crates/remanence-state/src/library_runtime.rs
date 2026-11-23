@@ -1618,14 +1618,40 @@ impl LibraryRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        self.find_applied_supersede(&view, |value| value.at == at)
+    }
+    /// Find the applied acknowledgement for the fold's tape-incarnation/session key.
+    /// Pending source references are not applied acknowledgements.
+    pub fn supersede_for_session(
+        &self,
+        tape: lib::TapeRef,
+        session_id: lib::Id,
+    ) -> Result<Option<lib::SupersedeTail>, RuntimeError> {
+        let _dispatch = self.0.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let view = self
+            .0
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.find_applied_supersede(&view, |value| {
+            value.at.tape == tape && value.session_id == Some(session_id)
+        })
+    }
+    /// Replay the locked query's view, preserving the exact-prefix refusal rule.
+    fn find_applied_supersede(
+        &self,
+        view: &dyn lib::TapeView,
+        accepts: impl Fn(&lib::SupersedeTail) -> bool,
+    ) -> Result<Option<lib::SupersedeTail>, RuntimeError> {
         let mut found = None;
         let replay = self
             .0
             .authority
             .snapshot()?
-            .replay(&view, &mut |applied| {
+            .replay(view, &mut |applied| {
                 if let lib::BodyView::SupersedeTail(value) = applied.record().body_view() {
-                    if value.at == at {
+                    if accepts(value) {
                         found = Some(value.clone());
                     }
                 }

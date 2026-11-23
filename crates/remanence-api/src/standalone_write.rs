@@ -144,12 +144,22 @@ pub(crate) fn legacy_status(error: crate::engine::drive_adapter::ActorFailure) -
         error.status,
     ))
 }
+/// The standalone tail preview either permits superseding or reports an inspection only.
+#[derive(Debug)]
+pub enum SupersedeTailOutcome {
+    Superseded(Vec<String>),
+    InspectionOnly {
+        inspection: crate::pb::TornTailInspection,
+        tape_log_sequence: u64,
+    },
+}
+
 pub(crate) fn supersede(
     client: &crate::engine::drive_adapter::MountedCommands,
     state: &mut remanence_state::StateHandle,
     acknowledge: &str,
     confirm: impl FnOnce(&str, &[String]) -> Result<(), String>,
-) -> Result<Vec<String>, MountError> {
+) -> Result<SupersedeTailOutcome, MountError> {
     let uuid = client.tape_uuid();
     let row = state
         .catalog()
@@ -171,13 +181,19 @@ pub(crate) fn supersede(
     let preview = client
         .supersede_tail(request.clone())
         .map_err(legacy_status)?;
+    if let Some(inspection) = preview.inspection {
+        return Ok(SupersedeTailOutcome::InspectionOnly {
+            inspection,
+            tape_log_sequence: preview.tape_log_sequence,
+        });
+    }
     confirm(&preview.required_confirmation, &preview.found).map_err(refusal)?;
     request.confirm_supersede = Some(preview.required_confirmation);
     request.observed_tape_log_sequence = Some(preview.tape_log_sequence);
     request.expected_found = preview.found;
     client
         .supersede_tail(request)
-        .map(|reply| reply.found)
+        .map(|reply| SupersedeTailOutcome::Superseded(reply.found))
         .map_err(legacy_status)
 }
 

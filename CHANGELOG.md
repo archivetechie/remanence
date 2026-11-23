@@ -7,6 +7,32 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Unreleased
 
+- On a marked write-open refusal for a torn-tail READ, `rem put` preserves the
+  admission diagnostic and adds route-specific inspection guidance. A failure
+  during automatic finalization at write-open does not add the inspection sentence.
+  For an initial eligible inspection response, `rem tape supersede-tail` reports
+  an inspection, writes nothing to the tape, discards nothing and exits 1;
+  `--confirm-supersede` is refused locally with `SupersedeInspectionOnly`.
+  After an ordinary preview, if the probe before the sequence check finds an
+  eligible torn tail, the server refuses with `SupersedeInspectionOnly`. If the READ first
+  fails on the rescan after confirmation is validated, the caller gets admission's
+  diagnostic. Both failures exit 1 without the eight-line inspection. Discarding
+  this tail is not available in this release. The API carries `TornTailInspection`
+  in response field 5, with empty `found` and confirmation text, `completed=false` and the inspected
+  tape-log sequence; an eligible inspection refuses a wire confirmation.
+- When the drive's identity generation changes during append admission's check
+  of the tape end, the `tape identity invalidated` refusal carries an
+  `; admission evidence:` clause. It reports `phase=probe` or `phase=restoration`,
+  the returned error's kind, step target LBA, opcode, sense and timing, host
+  status, host and accounted byte counts, and retained post-transfer evidence
+  when present; missing values print `unavailable`. A probe error takes priority
+  over a restoration error. Elapsed time prints as `proof_elapsed_ms` with
+  `(probe start to returned error)` or `restoration_elapsed_ms` with
+  `(restoration start to returned error)`. If neither phase returns an error,
+  the clause is `; admission evidence: no probe or restoration error was returned`.
+  A failure reported as `append suffix at LBA` returns before the identity
+  check and keeps that diagnostic without this clause.
+
 - `REM_TRACE=<directory>` enables a private command trace with timings, raw sense and read/write run summaries in public builds.
 
 - SPACE now has its own 3,600 s command timeout; LOCATE and other command limits are unchanged.
@@ -99,10 +125,13 @@ per-release summaries.
   <UUID>` with gRPC `ABORTED` and the `remanence-busy-operation-bin` trailer.
   A BUSY `FinalizeTape` reply names the operation in `detail`. Pool selection
   logs its closeout waits and skip reasons at INFO.
-- Supersede confirmation requires the preview's tape-log sequence; stale
-  previews return `TailPreviewStale`. Crash-torn final files use the v2
-  `TornPrefix` identity, the SHA-256 of their observed fixed-size blocks,
-  re-proved before replacement. Live endings retain object or sidecar identities.
+- Ordinary tail-discard confirmation requires the preview's tape-log sequence;
+  stale confirmations that reach the sequence check return `TailPreviewStale`.
+  Tracked, block-aligned readable crash fragments ending at physical EOD without
+  a closing filemark use the v2 `TornPrefix` identity, the SHA-256 of their
+  observed fixed-size blocks; a later
+  named-suffix proof checks the block count and digest. Live endings retain
+  object or sidecar identities.
   Abort, failed append and ingress timeout add no abandonment filemark; a durable
   live ending raises no automatic tape-I/O fence.
 - A sealing session commits its finalization decision before replying and ends
@@ -401,11 +430,13 @@ per-release summaries.
   refuses the append, even a fragment or a filemark. An unrecorded complete
   object can refuse the write with `TailBeyondKnownState`, which closes the
   tape for writing. A contradiction with the recorded ending refuses with
-  `SessionSuffixContradiction`. `rem tape supersede-tail`, standalone or through
-  the daemon, lists what would be discarded, requires a typed confirmation, audits
-  the discarded object ids and rescans before writing. A session that abandons
-  its own pending batch writes one filemark at its last checkpoint before it
-  releases the drive.
+  `SessionSuffixContradiction`. For an eligible ordinary suffix without a
+  torn-tail READ, `rem tape supersede-tail`, standalone or through the daemon,
+  returns the preview's findings to the operator without requiring confirmation;
+  discard requires a typed confirmation and rescans before writing. The library
+  log's `SupersedeTail` records a native reference, an optional session and
+  digest, and a file count; an open session's tail identities are recorded in its
+  native ending. Abandoning a pending batch adds no abandonment filemark.
 - Initializing a cartridge that holds data, whether foreign, unrecognized or a
   retired Remanence tape, requires `--clobber-data` and the confirmation
   `CLOBBER <label>`, given as `--confirm-clobber "CLOBBER <label>"` or typed or

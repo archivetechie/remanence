@@ -1718,6 +1718,7 @@ fn acknowledge_typed_tail(
         generation,
         BARCODE,
         AuditActor::System,
+        false,
         |required, found, sequence| {
             recovery["preview"] = typed_tail_preview(required, found, sequence, receipts, &before);
             preview = Some((required.to_owned(), found.to_vec(), sequence));
@@ -1757,6 +1758,7 @@ fn acknowledge_typed_tail(
         generation,
         BARCODE,
         AuditActor::System,
+        true,
         |required, current, current_sequence| {
             if current_sequence != sequence || required != confirmation || current != found {
                 return Err("supersede preview changed before confirmation".into());
@@ -1764,10 +1766,17 @@ fn acknowledge_typed_tail(
             Ok(())
         },
     )
-    .map(|_| {
-        recovery["confirmed"] = true.into();
-    })
     .map_err(|status| typed_record_refusal("supersede", &status, receipts.is_empty()))
+    .and_then(|result| match result {
+        super::super::tail_recovery::SupersedeResult::Superseded(_) => {
+            recovery["confirmed"] = true.into();
+            Ok(())
+        }
+        _ => Err(typed_violation(
+            "supersede",
+            "confirmation returned inspection only",
+        )),
+    })
 }
 
 /// Describe a refusal without deciding whether its category or code is acceptable.

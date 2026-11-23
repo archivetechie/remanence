@@ -382,3 +382,153 @@ tape_catalog_dir="{0}/cache"
         );
     }
 }
+
+/// PLR-2a-1: the session lookup uses applied replay and the full lifetime key.
+#[test]
+fn t10_supersede_for_session_uses_applied_lifetime_key() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = StatePaths {
+        config_path: root.path().join("config"),
+        state_dir: root.path().join("state"),
+        audit_dir: root.path().join("library"),
+        journal_dir: root.path().join("native"),
+        sqlite_path: root.path().join("catalog.sqlite"),
+        tape_cache_dir: root.path().join("cache"),
+        calibration_dir: root.path().join("calibration"),
+    };
+    let guard = Arc::new(StateLockGuard::acquire(&paths.state_dir).unwrap());
+    let runtime = LibraryRuntime::open(&paths, true, guard).unwrap();
+    let tape = lib::TapeRef {
+        uuid: [0x41; 16],
+        incarnation: 1,
+    };
+    assert!(runtime
+        .supersede_for_session(tape, [0x51; 16])
+        .unwrap()
+        .is_none());
+    runtime
+        .append(|a, v| {
+            a.reprovision(
+                lib::Reprovision {
+                    pool_source: None,
+                    operation: None,
+                    replaced_bot: None,
+                    tape,
+                    predecessor: None,
+                    mode: lib::ProvisionMode::Initialize,
+                    label: None,
+                    label_provenance: None,
+                    parity_scheme: None,
+                    medium: lib::MediumSpec {
+                        family: lib::MediumFamily::Lto(lib::LtoGen::Lto9),
+                        usable_logical_bytes: 18_000_000_000_000,
+                        record_size: 262144,
+                        rerecord: true,
+                        lifecycle_ops: true,
+                        source: lib::GenerationSource::Operator,
+                    },
+                    pool: None,
+                    endpoint: None,
+                    adoption: None,
+                },
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer4,
+                v,
+            )
+        })
+        .unwrap();
+    let native =
+        crate::TapeAuthority::open_fixture(paths.journal_dir.join("tapes"), tape.uuid).unwrap();
+    let mut owner = native.acquire_exclusive().unwrap();
+    owner
+        .publish_report(&(&crate::checkpoint::tests::record(tape.uuid)).into())
+        .unwrap();
+    let frozen = owner.freeze().unwrap();
+    let session = frozen
+        .tape_summary()
+        .open_session
+        .as_ref()
+        .unwrap()
+        .session_id;
+    runtime.refresh_native(&frozen).unwrap();
+    let at = runtime.native_reference(&frozen).unwrap();
+    assert!(runtime.supersede_at(at.clone()).unwrap().is_none());
+    let expected = lib::SupersedeTail {
+        at: at.clone(),
+        operation: None,
+        session_id: Some(session),
+        preview_digest: Some(Sha256::digest([]).into()),
+        tail_file_count: 0,
+    };
+    let ack = runtime
+        .append(|a, v| {
+            a.supersede_tail(
+                expected.clone(),
+                lib::AuditActor::System,
+                lib::SourceLayer::Layer5,
+                v,
+            )
+        })
+        .unwrap();
+    let found = runtime.supersede_for_session(tape, session).unwrap();
+    assert!(found.is_some(), "applied acknowledgement must be present");
+    assert_eq!(found.unwrap(), expected);
+    assert!(runtime
+        .supersede_for_session(tape, [0x52; 16])
+        .unwrap()
+        .is_none());
+    assert!(runtime
+        .supersede_for_session(
+            lib::TapeRef {
+                incarnation: 2,
+                ..tape
+            },
+            session
+        )
+        .unwrap()
+        .is_none());
+    assert!(runtime
+        .supersede_for_session(
+            lib::TapeRef {
+                uuid: [0x42; 16],
+                ..tape
+            },
+            session
+        )
+        .unwrap()
+        .is_none());
+    let exact = runtime.supersede_at(at.clone()).unwrap();
+    assert!(exact.is_some());
+    assert_eq!(exact.unwrap(), expected);
+    let mut other_prefix = at.clone();
+    other_prefix.sequence += 1;
+    assert!(runtime.supersede_at(other_prefix).unwrap().is_none());
+    struct NotYet;
+    impl lib::TapeView for NotYet {
+        fn lookup(&self, _: &lib::TapeAt) -> Result<lib::TapeLookup, lib::FoldError> {
+            Ok(lib::TapeLookup::NotYet)
+        }
+    }
+    let replay = runtime
+        .0
+        .authority
+        .snapshot()
+        .unwrap()
+        .replay(&NotYet, &mut |_| Ok(()))
+        .unwrap();
+    assert!(
+        replay.refusal.is_none(),
+        "NotYet unexpectedly refused: {:?}",
+        replay.refusal
+    );
+    assert!(replay
+        .fold
+        .pending
+        .iter()
+        .any(|pending| pending.sequence == ack.sequence));
+    assert!(runtime
+        .find_applied_supersede(&NotYet, |value| value.at.tape == tape
+            && value.session_id == Some(session))
+        .unwrap()
+        .is_none());
+}

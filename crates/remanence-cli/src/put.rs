@@ -707,16 +707,22 @@ async fn open_write_session(
     };
     match client.open_write_session(request()).await {
         Ok(response) => Ok(response.into_inner().session_id),
+        // The daemon marks only UNAVAILABLE; wait_before_open_retry waits or retries
+        // only qualifying FAILED_PRECONDITION statuses. If the producer ever marks
+        // a retryable FAILED_PRECONDITION, restore the wait for that status.
+        Err(status) if !no_wait && remanence_api::status_marks_torn_tail(&status) => {
+            Err(crate::torn_tail_inspection::daemon_put_error(status))
+        }
         Err(status) if !no_wait => {
             wait_before_open_retry(channel, &status, err).await?;
             Ok(client
                 .open_write_session(request())
                 .await
-                .map_err(status_error)?
+                .map_err(crate::torn_tail_inspection::daemon_put_error)?
                 .into_inner()
                 .session_id)
         }
-        Err(status) => Err(status_error(status)),
+        Err(status) => Err(crate::torn_tail_inspection::daemon_put_error(status)),
     }
 }
 
@@ -1182,6 +1188,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        open_statuses: Mutex<std::collections::VecDeque<Status>>,
         records: Mutex<Vec<pb::ObjectRecord>>,
         aborted: AtomicBool,
         fail_appends_containing: Option<String>,
@@ -1222,6 +1229,9 @@ mod tests {
                     assert!(!target.allow_unpooled);
                 }
                 (expected, other) => panic!("unexpected target {other:?} (expected {expected:?})"),
+            }
+            if let Some(status) = self.0.open_statuses.lock().unwrap().pop_front() {
+                return Err(status);
             }
             Ok(Response::new(pb::WriteSession {
                 session_id: FAKE_SESSION.to_vec(),
@@ -1635,5 +1645,104 @@ mod tests {
         assert!(error.message.contains("poison"), "{}", error.message);
         assert!(error.message.contains("aborted"), "{}", error.message);
         assert!(state.aborted.load(Ordering::SeqCst), "abort was not sent");
+    }
+
+    /// Exercise all open refusal exits over a real in-memory gRPC channel.
+    fn scripted_open(statuses: Vec<Status>, no_wait: bool) -> (DaemonClientError, String) {
+        crate::daemon_runtime().unwrap().block_on(async {
+            let state = Arc::new(FakeState {
+                open_statuses: Mutex::new(statuses.into()),
+                ..Default::default()
+            });
+            let (client, server) = tokio::io::duplex(65536);
+            let task = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(
+                        pb::write_session_service_server::WriteSessionServiceServer::new(
+                            FakeWriteSessions(state.clone()),
+                        ),
+                    )
+                    .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(server)])),
+            );
+            let client = Arc::new(Mutex::new(Some(client)));
+            let channel = tonic::transport::Endpoint::from_static("http://in-memory")
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let client = client.lock().unwrap().take().expect("one connection");
+                    async { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(client)) }
+                }))
+                .await
+                .unwrap();
+            let mut client =
+                pb::write_session_service_client::WriteSessionServiceClient::new(channel.clone());
+            let mut err = Vec::new();
+            let error = open_write_session(
+                channel,
+                &mut client,
+                &PutTarget::Pool {
+                    pool_id: "solo".into(),
+                    library_uuid: vec![1; 16],
+                },
+                no_wait,
+                &mut err,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                state.open_statuses.lock().unwrap().is_empty(),
+                "all scripted requests consumed"
+            );
+            task.abort();
+            (error, String::from_utf8(err).unwrap())
+        })
+    }
+
+    fn marked_open_status(value: &'static str) -> Status {
+        let mut status = Status::unavailable("torn suffix");
+        status
+            .metadata_mut()
+            .insert("remanence-torn-tail", value.parse().unwrap());
+        status
+    }
+
+    fn assert_open_sentence(error: &DaemonClientError) {
+        assert_eq!(error.code, "unavailable");
+        assert_eq!(error.message, "daemon returned unavailable: torn suffix. If the drive lost power during a write, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid> --endpoint <endpoint>`, with the endpoint this command used (default `unix:/var/lib/rem/rem.sock`), inspects the tape's suffix at the committed boundary and reports what it finds.");
+    }
+
+    #[test]
+    fn plr2a2b_p1_marked_open_skips_wait() {
+        let (error, err) = scripted_open(vec![marked_open_status("inspect")], false);
+        assert_open_sentence(&error);
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn plr2a2b_p2_marked_open_no_wait() {
+        let (error, err) = scripted_open(vec![marked_open_status("future-value")], true);
+        assert_open_sentence(&error);
+        assert!(err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn plr2a2b_p3_marked_open_after_busy_retry() {
+        let (error, err) = scripted_open(
+            vec![
+                Status::failed_precondition("drive bay 256 is busy"),
+                marked_open_status("inspect"),
+            ],
+            false,
+        );
+        assert_open_sentence(&error);
+        assert_eq!(err, "open found a busy drive bay; retrying once after 1s\n");
+    }
+
+    #[test]
+    fn plr2a2b_p4_unmarked_open_unchanged() {
+        for no_wait in [false, true] {
+            let (error, err) = scripted_open(vec![Status::unavailable("torn suffix")], no_wait);
+            assert_eq!(error.code, "unavailable");
+            assert_eq!(error.message, "daemon returned unavailable: torn suffix");
+            assert!(err.is_empty(), "{err}");
+        }
     }
 }

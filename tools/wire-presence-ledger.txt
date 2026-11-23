@@ -52,8 +52,8 @@ ObservedEndpoint.kind                  discovery always emits library, standalon
 ObservedEndpoint.ownership             discovery emits library, standalone or unknown (library rows default to library), never empty; retain string compatibility, and readers must treat empty as unspecified, never as standalone ownership
 SupersedeTailRequest.tape_uuid          required; the RPC handler refuses empty or non-16-byte values via decode_uuid_bytes before dispatch
 SupersedeTailRequest.ack_tape_uuid      required; the RPC handler refuses empty or non-16-byte values via decode_uuid_bytes and rejects an acknowledgment unequal to tape_uuid
-SupersedeTailResponse.completed        every response sets it; false is the read-only preview without completed recovery, true is successful mutation, and errors return RPC status rather than an unknown boolean
-SupersedeTailResponse.required_confirmation every response carries the nonempty SUPERSEDE phrase generated for the tape label or UUID, including after completion; empty means no confirmation supplied and must not authorize recovery
+SupersedeTailResponse.completed        every response sets it; false is the read-only preview or inspection-only response without completed recovery, true is successful mutation, and errors return RPC status rather than an unknown boolean
+SupersedeTailResponse.required_confirmation ordinary previews and completed recovery carry the nonempty SUPERSEDE phrase for the tape label or UUID; inspection-only carries an empty phrase, which must not authorize recovery
 
 # Objects area, decided 2026-08-06. Derived from `objects` / `object_files`.
 ObjectRecord.object_id        primary key of the objects table
@@ -231,10 +231,19 @@ ReleaseTapeIoFenceRequest.acknowledgment  required; the handler refuses an empty
 ReleaseTapeIoFenceRequest.force           a request flag; false (unset) requests an ordinary release: a native_log_behind_projection fence is then refused with advice naming --force, and no other cause reads it
 
 CloseoutTapeRequest.tape_uuid required; decode_uuid_bytes refuses empty or non-16-byte values before dispatch
-SupersedeTailResponse.tape_log_sequence every preview and confirmation names the observed native log sequence; zero is the real empty-log generation
+SupersedeTailResponse.tape_log_sequence every preview and confirmation names the observed native log sequence; inspection-only carries the frozen snapshot sequence; zero is the real empty-log generation
 
 # B7 fix: Tape 23/25/26 and Drive 33/35/36 are now optional (no plain-scalar
 # ledger exception). Native zero/false is present; unknown authority is absent
 # with closeout_authority_error at 27/37. Timestamp 24/34 is absent for zero or
 # unknown debt. Vacant drives have no debt fields. closeout_retry_reason 28/38
 # is optional and does not alter the native debt predicate. Census pins these.
+
+TornTailInspection.site               always set when inspection is present; names open-first-read, open-scan or named-file
+TornTailInspection.cursor_partition   always set when inspection is present; zero is a real partition
+TornTailInspection.cursor_lba         always set when inspection is present; zero is a real committed LBA
+TornTailInspection.file_start_lba     always set when inspection is present; zero is a real file-start LBA
+TornTailInspection.failing_lba        always set when inspection is present; zero is a real failing LBA
+TornTailInspection.blocks_read        always set when inspection is present; zero is a real readable-block count
+TornTailInspection.read_sense         always set when inspection is present; empty means no current sense was decoded (qualifying evidence today always has one)
+TornTailInspection.head               always set when inspection is present; unknown means no kept block or an undecided identity; at a named site, unknown is used unless the head matches and a rendered first named file is available

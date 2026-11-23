@@ -527,6 +527,34 @@ where
     }
 }
 
+/// Save every successful preview before deciding whether finish may continue.
+fn save_crash_preview(
+    tape: Uuid,
+    evidence: &Path,
+    preview: &pb::SupersedeTailResponse,
+) -> AppResult<()> {
+    let mut value = json!({"tape_uuid":tape.to_string(),"sequence":preview.tape_log_sequence,
+        "found":preview.found,"confirmation":preview.required_confirmation});
+    if let Some(inspection) = &preview.inspection {
+        value["inspection"] = json!({
+            "site": inspection.site,
+            "cursor_partition": inspection.cursor_partition,
+            "cursor_lba": inspection.cursor_lba,
+            "file_start_lba": inspection.file_start_lba,
+            "failing_lba": inspection.failing_lba,
+            "blocks_read": inspection.blocks_read,
+            "read_sense": inspection.read_sense,
+            "accounted_bytes": inspection.accounted_bytes,
+            "host_bytes": inspection.host_bytes,
+            "head": inspection.head,
+            "named_files": inspection.named_files,
+        });
+        save(&evidence.join("crash-preview.json"), &value)?;
+        return Err(AppError::new("InspectionOnly: supersede-tail inspected a torn tail at the committed boundary; closeout not attempted; evidence in crash-preview.json"));
+    }
+    save(&evidence.join("crash-preview.json"), &value)
+}
+
 async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> {
     let mut catalog = pb::catalog_client::CatalogClient::new(channel.clone());
     if args.mode == "kill-mid-write" {
@@ -560,10 +588,7 @@ async fn finish(endpoint: &str, channel: Channel, args: &Args) -> AppResult<()> 
             Err(status) => return Err(status.into()),
         };
         if let Some(preview) = preview {
-            save(
-                &args.evidence.join("crash-preview.json"),
-                &json!({"tape_uuid":args.tape.to_string(),"sequence":preview.tape_log_sequence,"found":preview.found,"confirmation":preview.required_confirmation}),
-            )?;
+            save_crash_preview(args.tape, &args.evidence, &preview)?;
             if !preview.found.is_empty() {
                 let proof = read_json(&args.evidence.join("fault.json"))?;
                 let before = read_json(&args.evidence.join("before.json"))?;
@@ -1052,5 +1077,71 @@ mod tests {
     async fn gate_timeout_is_a_failure_and_never_a_media_claim() {
         let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
         assert!(wait_file(&path, Duration::from_millis(5)).await.is_err());
+    }
+
+    /// Inspect the actual evidence file on the refusal path.
+    #[test]
+    fn plr2a2b_f1_inspection_saved_before_refusal() {
+        let dir = closeout_test_dir("inspection");
+        let tape = Uuid::from_bytes([7; 16]);
+        let preview = pb::SupersedeTailResponse {
+            tape_log_sequence: 42,
+            inspection: Some(pb::TornTailInspection {
+                site: "named-file".into(),
+                cursor_partition: 1,
+                cursor_lba: 100,
+                file_start_lba: 100,
+                failing_lba: 102,
+                blocks_read: 2,
+                read_sense: "03/14/00".into(),
+                accounted_bytes: Some(0),
+                host_bytes: None,
+                head: "matches object first".into(),
+                named_files: vec!["object first".into()],
+            }),
+            ..Default::default()
+        };
+        let error = save_crash_preview(tape, &dir, &preview).unwrap_err();
+        assert_eq!(error.to_string(), "InspectionOnly: supersede-tail inspected a torn tail at the committed boundary; closeout not attempted; evidence in crash-preview.json");
+        let value = read_json(&dir.join("crash-preview.json")).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "tape_uuid": tape.to_string(), "sequence": 42, "found": [], "confirmation": "",
+                "inspection": {
+                    "site": "named-file", "cursor_partition": 1, "cursor_lba": 100,
+                    "file_start_lba": 100, "failing_lba": 102, "blocks_read": 2,
+                    "read_sense": "03/14/00", "accounted_bytes": 0, "host_bytes": null,
+                    "head": "matches object first", "named_files": ["object first"],
+                }
+            })
+        );
+        assert!(!dir.join("crash-ack.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ordinary previews keep the existing four-key evidence schema.
+    #[test]
+    fn plr2a2b_f2_ordinary_preview_saved() {
+        let dir = closeout_test_dir("ordinary-preview");
+        let tape = Uuid::from_bytes([8; 16]);
+        let preview = pb::SupersedeTailResponse {
+            tape_log_sequence: 43,
+            found: vec!["first".into()],
+            required_confirmation: "SUPERSEDE LABEL".into(),
+            ..Default::default()
+        };
+        save_crash_preview(tape, &dir, &preview).unwrap();
+        let value = read_json(&dir.join("crash-preview.json")).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "tape_uuid": tape.to_string(), "sequence": 43, "found": ["first"],
+                "confirmation": "SUPERSEDE LABEL",
+            })
+        );
+        assert!(value.get("inspection").is_none());
+        assert!(!dir.join("crash-ack.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

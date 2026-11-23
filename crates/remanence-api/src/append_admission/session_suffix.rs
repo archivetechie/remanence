@@ -78,6 +78,8 @@ pub(super) fn named_file(
     let start = drive.position()?.lba;
     let mut block = vec![0; size as usize];
     let mut first = None;
+    let mut kept_head = Vec::new();
+    let mut kept_bytes = 0;
     let mut digest = Sha256::new();
     let max = file
         .known_blocks
@@ -90,6 +92,12 @@ pub(super) fn named_file(
                 if first.is_none() {
                     first = Some(block.clone());
                 }
+                super::TornTailEvidence::keep_block(
+                    &mut kept_head,
+                    &mut kept_bytes,
+                    count,
+                    &block[..n],
+                );
                 digest.update(&block);
                 count += 1;
             }
@@ -99,7 +107,24 @@ pub(super) fn named_file(
                 ..
             }) => break true,
             Err(e) if e.is_physical_eod() => break false,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                let read = super::torn_tail_read(&e.outcome().evidence)
+                    .then(|| e.outcome().evidence.clone());
+                let mut error = AdmissionError::from(e);
+                if let Some(read) = read {
+                    let mut record = super::TornTailEvidence::partial(
+                        start,
+                        count,
+                        true,
+                        Vec::new(),
+                        kept_head,
+                        read,
+                    );
+                    record.head.observe_named(uuid, size, &file.identity);
+                    error = error.with_torn_tail(record);
+                }
+                return Err(error);
+            }
         }
     };
     if count < file.synchronized_blocks
@@ -152,4 +177,55 @@ pub(super) fn named_file(
         _ => return Err(contradiction("empty named file")),
     }
     Ok((mark, end))
+}
+
+impl super::TornTailHead {
+    /// Decide the named identity once at the failed READ, using only retained bytes.
+    fn observe_named(&mut self, uuid: &[u8; 16], size: u32, identity: &TailIdentity) {
+        use super::TornTailIdentity::{Differs, Matches, Undecided};
+        let Some(first) = self.blocks.first() else {
+            return;
+        };
+        self.identity = match identity {
+            TailIdentity::TornPrefix(_) => Undecided,
+            TailIdentity::Sidecar(expected) => {
+                match remanence_parity::sidecar::parse_sidecar_header_block(first, uuid) {
+                    Ok(header) if header.canonical_metadata_hash == *expected => Matches,
+                    Ok(_) => Differs {
+                        reason: "named sidecar identity differs",
+                    },
+                    Err(_) => Differs {
+                        reason: "named sidecar header is unrecognizable",
+                    },
+                }
+            }
+            TailIdentity::Object(expected) => {
+                if first.starts_with(b"REMO") {
+                    match first.get(..128).and_then(|bytes| bytes.try_into().ok()) {
+                        None => Differs {
+                            reason: "short object header",
+                        },
+                        Some(bytes) => match remanence_aead::RemObjectHeader::parse(bytes) {
+                            Ok(header)
+                                if header.object_id == *expected && header.chunk_size == size =>
+                            {
+                                Matches
+                            }
+                            Ok(_) => Differs {
+                                reason: "named object identity differs",
+                            },
+                            Err(_) => Differs {
+                                reason: "invalid object envelope header",
+                            },
+                        },
+                    }
+                } else {
+                    crate::catalogless_restore::parse_plain_identity(
+                        crate::catalogless_restore::HeadReader::new(&self.blocks),
+                    )
+                    .named(expected)
+                }
+            }
+        };
+    }
 }

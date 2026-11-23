@@ -991,12 +991,14 @@ pub(super) fn drive_loop(
                         generation,
                         &Uuid::from_bytes(tape_uuid).to_string(),
                         actor,
+                        request.confirm_supersede.is_some(),
                         |required, found, sequence| {
                             preview = Some(pb::SupersedeTailResponse {
                                 found: found.to_vec(),
                                 required_confirmation: required.into(),
                                 tape_log_sequence: sequence,
                                 completed: false,
+                                inspection: None,
                             });
                             if request.confirm_supersede.is_some()
                                 && request.observed_tape_log_sequence != Some(sequence)
@@ -1018,7 +1020,24 @@ pub(super) fn drive_loop(
                         },
                     );
                     match (result, preview) {
-                        (Ok(_), Some(mut response)) => {
+                        (
+                            Ok(super::tail_recovery::SupersedeResult::InspectionOnly {
+                                inspection,
+                                sequence,
+                            }),
+                            _,
+                        ) => Ok(crate::pb::SupersedeTailResponse {
+                            inspection: Some(inspection),
+                            found: Vec::new(),
+                            required_confirmation: String::new(),
+                            completed: false,
+                            tape_log_sequence: sequence,
+                        }),
+                        (
+                            Ok(super::tail_recovery::SupersedeResult::Superseded(found)),
+                            Some(mut response),
+                        ) => {
+                            response.found = found;
                             response.completed = true;
                             Ok(response)
                         }

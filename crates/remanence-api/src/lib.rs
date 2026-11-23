@@ -81,7 +81,9 @@ mod audit_query_service;
 mod auth;
 mod calibration;
 mod catalog_conversion;
-pub use append_admission::{admit_checkpointed_tape, admit_initialized_tape, AppendAdmission};
+pub use append_admission::{
+    admit_checkpointed_tape, admit_initialized_tape, status_marks_torn_tail, AppendAdmission,
+};
 #[cfg(test)]
 extern crate self as remanence_api;
 mod catalogless_restore;
@@ -109,7 +111,7 @@ pub(crate) mod tape_admission;
 pub use mount_support::{
     ChangerMount, MountBackend, MountEndpoint, MountError, MountTarget, MountedTape, OperatorMount,
 };
-pub use standalone_write::{MountedWriteResult, StandaloneFinalizeRequest};
+pub use standalone_write::{MountedWriteResult, StandaloneFinalizeRequest, SupersedeTailOutcome};
 mod object_fault;
 mod object_position;
 pub use object_position::{position_to_object, BotRelativeTapeFile, ObjectPositionOrigin};

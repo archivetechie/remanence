@@ -731,6 +731,7 @@ fn post_erase_read_refusal() {
     )
     .unwrap();
     let error = envelope["error"].as_str().unwrap();
+    let error = error.strip_suffix(". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>`, run with the same drive and state options as this command (such as `--config`, `--device` and `--allow-device`), inspects the tape's suffix at the committed boundary and reports what it finds.").expect("marked refusal carries inspection guidance");
     let clause = error.split_once(first).unwrap().1;
     let ms = clause
         .split_once("proof_elapsed_ms=")
@@ -773,6 +774,13 @@ fn assert_measured_clause(output: &Output, c: u64, expires: bool) {
     )
     .unwrap();
     let error = envelope["error"].as_str().unwrap();
+    let without_sentence = error.strip_suffix(". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>`, run with the same drive and state options as this command (such as `--config`, `--device` and `--allow-device`), inspects the tape's suffix at the committed boundary and reports what it finds.");
+    assert_eq!(
+        without_sentence.is_some(),
+        !expires,
+        "only a marked refusal carries inspection guidance"
+    );
+    let error = without_sentence.unwrap_or(error);
     let start = error
         .find("; admission evidence:")
         .expect("admission clause");
@@ -911,4 +919,63 @@ fn measured_post_erase_identify_and_first_file_remain_readable() {
         .command_log
         .iter()
         .any(|c| matches!(c.opcode, 0x0a | 0x8a | 0x10 | 0x80 | 0x19)));
+}
+
+/// A named torn file retains the log's file names in the failed inspection envelope.
+#[test]
+fn plr2a2b_u5_named_file_inspection() {
+    let f = repaired_fixture();
+    let world = measured_repaired(&f);
+    world
+        .lock()
+        .unwrap()
+        .drive_states
+        .get_mut(&BAY)
+        .unwrap()
+        .measured_timings
+        .read_at_short_erased_end_ms = 890_000;
+    let snapshot = native(&f.root, f.id);
+    let mut named = Vec::new();
+    snapshot
+        .visit_last_session_tail(|file| {
+            let TailIdentity::Object(id) = &file.identity else {
+                panic!("fixture has a named object")
+            };
+            named.push(format!("object {id}"));
+            Ok(())
+        })
+        .unwrap();
+    assert!(!named.is_empty());
+    let output = command(
+        &f.root,
+        &world,
+        &["tape", "supersede-tail", "--acknowledge-tape", TAPE],
+        None,
+    );
+    assert_eq!(output.code, ExitCode::from(1), "{output:?}");
+    let value: serde_json::Value = serde_json::from_str(
+        output
+            .out
+            .lines()
+            .rev()
+            .find(|line| line.starts_with('{'))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["status"], "inspection_only");
+    assert_eq!(value["result"]["inspection"]["site"], "named-file");
+    println!(
+        "U5 inspection site={}",
+        value["result"]["inspection"]["site"]
+    );
+    assert_eq!(
+        value["result"]["inspection"]["named_files"],
+        serde_json::json!(named)
+    );
+    assert!(!output
+        .trace
+        .commands
+        .iter()
+        .any(|c| matches!(c.cdb[0], 0x0a | 0x8a | 0x10 | 0x80 | 0x19)));
 }

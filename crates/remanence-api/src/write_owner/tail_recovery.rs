@@ -3,6 +3,33 @@ use remanence_library::{DriveHandle, DriveHandleSource};
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{AuditActor, SourceLayer};
 
+/// Recovery either completed the acknowledged discard or only inspected a torn tail.
+#[derive(Debug)]
+pub(crate) enum SupersedeResult {
+    Superseded(Vec<String>),
+    InspectionOnly {
+        inspection: crate::pb::TornTailInspection,
+        sequence: u64,
+    },
+}
+
+/// Bound operator-facing evidence without splitting UTF-8 or preserving controls.
+fn inspection_line(value: &str) -> String {
+    let mut line = String::new();
+    for ch in value.chars() {
+        let ch = if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            '?'
+        } else {
+            ch
+        };
+        if line.len() + ch.len_utf8() > 256 {
+            break;
+        }
+        line.push(ch);
+    }
+    line
+}
+
 /// Explicit recovery shared by standalone ownership and the library drive actor.
 /// Confirmation, rescan, source publication, and mutation all retain the same exclusive lease.
 #[allow(clippy::too_many_arguments)]
@@ -14,8 +41,9 @@ pub(crate) fn supersede_mounted_tail(
     identity_generation: u64,
     acknowledge: &str,
     actor: AuditActor,
+    confirmation_supplied: bool,
     confirm: impl FnOnce(&str, &[String], u64) -> Result<(), String>,
-) -> Result<Vec<String>, tonic::Status> {
+) -> Result<SupersedeResult, tonic::Status> {
     use crate::append_admission::{admit_append_boundary, context, AppendAuthority};
     use tonic::Status;
     let failure = |e: String| Status::failed_precondition(e);
@@ -208,6 +236,188 @@ pub(crate) fn supersede_mounted_tail(
             kind: crate::append_admission::AdmissionErrorKind::MissingBootstrapFilemark,
             ..
         }) => (Vec::new(), true, false),
+        Err(e) if e.torn_tail().is_some() => {
+            use crate::append_admission::{TornTailIdentity, TornTailSite};
+            use remanence_parity::TapeFileKind;
+            use remanence_state::tape_log::TailIdentity;
+
+            let record = e.torn_tail().expect("guarded torn-tail attachment");
+            if !record.delimiters.is_empty() {
+                return Err(failure(
+                    "CompleteFileAfterCommit: complete file after the committed boundary".into(),
+                ));
+            }
+            if !record.aligned {
+                return Err(failure(
+                    "TornTailGeometry: retained prefix is not block aligned".into(),
+                ));
+            }
+            let named = matches!(record.site, Some(TornTailSite::NamedFile { .. }));
+            if named {
+                if let TornTailIdentity::Differs { reason } = &record.head.identity {
+                    return Err(failure(format!(
+                        "TornTailForeignHead: {}",
+                        inspection_line(reason)
+                    )));
+                }
+            } else if record.head.bootstrap_magic == Some(true) {
+                return Err(failure(
+                    "TornTailForeignHead: bootstrap header at the committed boundary".into(),
+                ));
+            }
+            let ineligible = |reason: &str| failure(format!("TornTailIneligible: {reason}"));
+            let cursor = record
+                .cursor
+                .ok_or_else(|| ineligible("missing committed cursor"))?;
+            let site = match record.site {
+                Some(TornTailSite::OpenFirstRead) => "open-first-read",
+                Some(TornTailSite::OpenScan) => "open-scan",
+                Some(TornTailSite::NamedFile { .. }) => "named-file",
+                None => return Err(ineligible("missing inspection site")),
+            };
+            if last.is_none() {
+                return Err(ineligible("fresh or bootstrap authority"));
+            }
+            if repaired_tail {
+                return Err(ineligible("repair pending"));
+            }
+            let summary = snapshot.tape_summary();
+            let mut named_files = Vec::new();
+            let session_id = if named {
+                if summary.open_session.is_some() {
+                    return Err(ineligible("named file with an open session"));
+                }
+                let ending = summary
+                    .last_session_end
+                    .as_ref()
+                    .ok_or_else(|| ineligible("named file without an ended session"))?;
+                if ending.cursor.partition != cursor.partition || ending.cursor.lba != cursor.lba {
+                    return Err(ineligible(
+                        "ended session cursor differs from the committed boundary",
+                    ));
+                }
+                let mut first_torn_prefix = false;
+                snapshot
+                    .visit_session_tail(&mut |file| {
+                        if named_files.is_empty() {
+                            first_torn_prefix =
+                                matches!(file.identity, TailIdentity::TornPrefix(_));
+                        }
+                        let name = match &file.identity {
+                            TailIdentity::Object(id) => format!("object {id}"),
+                            TailIdentity::Sidecar(hash) => format!(
+                                "sidecar {}",
+                                hash[..8]
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<String>()
+                            ),
+                            TailIdentity::TornPrefix(_) => {
+                                format!("torn-prefix {} blocks", file.known_blocks)
+                            }
+                        };
+                        named_files.push(inspection_line(&name));
+                        Ok(())
+                    })
+                    .map_err(|error| failure(error.to_string()))?;
+                if first_torn_prefix {
+                    return Err(ineligible("first tail file is TornPrefix"));
+                }
+                if ending.synchronized_tail_blocks > 0 {
+                    return Err(ineligible("synchronized tail blocks exceed zero"));
+                }
+                if ending
+                    .proved_eod
+                    .is_some_and(|eod_lba| eod_lba != cursor.lba)
+                {
+                    return Err(ineligible("proved EOD differs from the committed boundary"));
+                }
+                // The preceding check returns for every other Some value, leaving only C's LBA.
+                if ending.proved_eod.is_some() && record.blocks_read > 0 {
+                    return Err(ineligible(
+                        "proved EOD at the committed boundary contradicts readable blocks",
+                    ));
+                }
+                ending.session_id
+            } else {
+                summary
+                    .open_session
+                    .as_ref()
+                    .ok_or_else(|| ineligible("open site without an open session"))?
+                    .session_id
+            };
+            if library.contradicted(tape_uuid) {
+                let message = format!(
+                    "TornTailContradicted: {}",
+                    crate::tape_admission::contradiction_text(tape_uuid, "supersede-tail")
+                );
+                tracing::warn!(%message, "torn-tail inspection refused");
+                return Err(failure(message));
+            }
+            if let Some(ack) = library
+                .supersede_for_session(
+                    lib::TapeRef {
+                        uuid: tape_uuid,
+                        incarnation: snapshot.log_reference().1,
+                    },
+                    session_id,
+                )
+                .map_err(|error| failure(error.to_string()))?
+            {
+                return Err(failure(format!(
+                    "TornTailAcknowledged: session acknowledged at tape-log sequence {}",
+                    ack.at.sequence
+                )));
+            }
+            if confirmation_supplied {
+                return Err(failure(
+                    "SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard".into(),
+                ));
+            }
+            let head = if named {
+                match (&record.head.identity, named_files.first()) {
+                    (TornTailIdentity::Matches, Some(first)) => format!("matches {first}"),
+                    _ => "unknown".into(),
+                }
+            } else if record.head.blocks.is_empty() {
+                "unknown".into()
+            } else {
+                match record.head.kind {
+                    Some(TapeFileKind::ParitySidecar) => "parity-sidecar".into(),
+                    Some(TapeFileKind::ParityMap) => "parity-map".into(),
+                    Some(TapeFileKind::Bootstrap) => "bootstrap".into(),
+                    Some(TapeFileKind::TapeIndexReplica) => "tape-index-replica".into(),
+                    Some(TapeFileKind::IndexSeparationExtent) => "index-separation-extent".into(),
+                    Some(TapeFileKind::Object) | None => match &record.head.identity {
+                        TornTailIdentity::Object { object_id, .. } => format!("object {object_id}"),
+                        TornTailIdentity::Unrecognised => "unrecognised".into(),
+                        TornTailIdentity::Invalid { reason } => format!("invalid: {reason}"),
+                        _ => "unknown".into(),
+                    },
+                }
+            };
+            return Ok(SupersedeResult::InspectionOnly {
+                inspection: crate::pb::TornTailInspection {
+                    site: site.into(),
+                    cursor_partition: cursor.partition,
+                    cursor_lba: cursor.lba,
+                    file_start_lba: record.file_start_lba,
+                    failing_lba: record.failing_lba,
+                    blocks_read: record.blocks_read,
+                    read_sense: record
+                        .read
+                        .current_sense()
+                        .map_or_else(String::new, |sense| {
+                            format!("{:02x}/{:02x}/{:02x}", sense.key, sense.asc, sense.ascq)
+                        }),
+                    accounted_bytes: record.read.transferred_bytes,
+                    host_bytes: record.read.host_transferred_bytes,
+                    head: inspection_line(&head),
+                    named_files,
+                },
+                sequence,
+            });
+        }
         Err(e) => return Err(failure(e.to_string())),
         Ok(_) if repaired_tail => (Vec::new(), false, false),
         Ok(_) if !suffix_fences.is_empty() || prior_empty_recovery => (Vec::new(), false, true),
@@ -314,7 +524,7 @@ pub(crate) fn supersede_mounted_tail(
                 })
                 .map_err(|e| failure(e.to_string()))?;
         }
-        return Ok(found);
+        return Ok(SupersedeResult::Superseded(found));
     }
     if sequence == 0 {
         lease
@@ -524,7 +734,7 @@ pub(crate) fn supersede_mounted_tail(
             })
             .map_err(|e| failure(e.to_string()))?;
     }
-    Ok(found)
+    Ok(SupersedeResult::Superseded(found))
 }
 
 /// Per-library test cut: parallel fixtures cannot consume another runtime's cut.
@@ -557,4 +767,15 @@ pub(crate) fn cut_after_recovery_effect(library: [u8; 16]) {
 #[cfg(test)]
 fn take_effect_cut(library: [u8; 16]) -> bool {
     effect_cuts().lock().unwrap().remove(&library)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Sanitize before truncating, and never retain part of a UTF-8 character.
+    #[test]
+    fn inspection_line_preserves_character_boundaries_and_replaces_separators() {
+        let ascii = "a".repeat(255);
+        assert_eq!(super::inspection_line(&format!("{ascii}界")), ascii);
+        assert_eq!(super::inspection_line("a\u{2028}b\u{2029}c\n"), "a?b?c?");
+    }
 }
