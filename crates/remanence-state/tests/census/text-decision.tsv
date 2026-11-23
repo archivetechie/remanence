@@ -8,7 +8,9 @@ crates/remanence-api/src/api_state.rs::live_status_response_inner::text-matches	
 crates/remanence-api/src/api_state.rs::record_drive_bytes::text-match	2
 crates/remanence-api/src/api_state.rs::resolve_drive_at_bay::text-equality	2
 crates/remanence-api/src/append_admission.rs::admit_append_boundary::text-starts_with	1
+crates/remanence-api/src/append_admission.rs::observe_open::text-starts_with	1
 crates/remanence-api/src/append_admission/session_suffix.rs::named_file::text-starts_with	1
+crates/remanence-api/src/append_admission/session_suffix.rs::observe_named::text-starts_with	1
 crates/remanence-api/src/append_request.rs::overlap_append_eligible::text-equality	1
 crates/remanence-api/src/audit_query_service.rs::audit_head_matches::text-equality	2
 crates/remanence-api/src/audit_query_service.rs::audit_head_matches::text-match	7
@@ -23,7 +25,8 @@ crates/remanence-api/src/catalog_conversion.rs::operation_state::text-match	6
 crates/remanence-api/src/catalog_conversion.rs::operation_to_proto::text-match	2
 crates/remanence-api/src/catalog_conversion.rs::scan_confidence::text-match	3
 crates/remanence-api/src/catalog_conversion.rs::tape_state::text-match	12
-crates/remanence-api/src/catalogless_restore.rs::prove_named_plain_identity::text-equality	2
+crates/remanence-api/src/catalogless_restore.rs::named_plain_id_matches::text-equality	1
+crates/remanence-api/src/catalogless_restore.rs::parse_plain_identity::text-equality	1
 crates/remanence-api/src/catalogless_restore.rs::restore_catalogless_selected::text-equality	3
 crates/remanence-api/src/catalogless_restore.rs::scan_append_suffix_observed::text-starts_with	1
 crates/remanence-api/src/closeout_obligation.rs::failed::text-equality	1

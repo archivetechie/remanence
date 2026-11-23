@@ -487,12 +487,14 @@ pub(crate) fn scan_append_suffix_observed(
     use sha2::{Digest, Sha256};
     let mut result = AppendSuffix::default();
     let mut lba = start_lba;
+    let mut delimiters = Vec::new();
     let mut block = vec![0; size as usize];
     let mut scanned = 0u64;
     let mut next_progress = 1u64 << 30;
     loop {
         let start = lba;
         let mut head = Vec::new();
+        let mut kept_head = Vec::new();
         let mut aligned = true;
         let mut blocks = 0;
         let mut digest = Sha256::new();
@@ -504,6 +506,13 @@ pub(crate) fn scan_append_suffix_observed(
                     }
                     if head.is_empty() {
                         head.extend_from_slice(&block[..n]);
+                    }
+                    if tail.is_some() {
+                        crate::append_admission::TornTailEvidence::keep_block(
+                            &mut kept_head,
+                            blocks,
+                            &block[..n],
+                        );
                     }
                     aligned &= n == size as usize;
                     digest.update(&block[..n]);
@@ -555,13 +564,24 @@ pub(crate) fn scan_append_suffix_observed(
                     ..
                 }) => {
                     lba = lba.checked_add(1).ok_or("suffix LBA overflow")?;
+                    delimiters.push(lba);
                     break false;
                 }
                 Err(e) if e.is_physical_eod() => break true,
                 Err(e) => {
-                    return Err(crate::append_admission::AdmissionError::new(
+                    let read = e.completion_evidence();
+                    let capture = tail.is_some() && crate::append_admission::torn_tail_read(&read);
+                    let mut error = crate::append_admission::AdmissionError::new(
                         crate::append_admission::AdmissionErrorKind::Io(e),
-                    ))
+                    );
+                    if capture {
+                        let mut record = crate::append_admission::TornTailEvidence::partial(
+                            start, blocks, aligned, delimiters, kept_head, read,
+                        );
+                        record.head.observe_open(tape_uuid, size);
+                        error = error.with_torn_tail(record);
+                    }
+                    return Err(error);
                 }
             }
         };
@@ -895,8 +915,159 @@ impl BlockRead for TapeCandidate<'_> {
     }
 }
 
-/// Read only the global PAX identity, skipping arbitrarily long other values in
-/// constant memory. A live partial header can end before its known ID appears.
+/// Result of parsing only the global PAX prefix, before interpreting its identity.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PlainIdentityPrefix {
+    Id(Vec<u8>),
+    NotHeader,
+    Invalid,
+    ShortHeader,
+    Exhausted,
+}
+impl PlainIdentityPrefix {
+    /// A bounded named head uses exactly the live parser's ID comparison.
+    pub(crate) fn named(self, expected: &str) -> crate::append_admission::TornTailIdentity {
+        use crate::append_admission::TornTailIdentity;
+        match self {
+            Self::ShortHeader | Self::Exhausted => TornTailIdentity::Undecided,
+            Self::Id(value) if named_plain_id_matches(&value, expected) => {
+                TornTailIdentity::Matches
+            }
+            _ => TornTailIdentity::Differs {
+                reason: "named object header differs",
+            },
+        }
+    }
+}
+
+/// The newline remains part of the identity, as in the original tape proof.
+fn named_plain_id_matches(value: &[u8], expected: &str) -> bool {
+    value == format!("{expected}\n").as_bytes()
+}
+
+/// Read the kept records without assuming that short records contain padding.
+pub(crate) struct HeadReader<'a> {
+    blocks: &'a [Vec<u8>],
+    offset: usize,
+}
+impl<'a> HeadReader<'a> {
+    pub(crate) fn new(blocks: &'a [Vec<u8>]) -> Self {
+        Self { blocks, offset: 0 }
+    }
+}
+impl Read for HeadReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self
+            .blocks
+            .first()
+            .is_some_and(|block| self.offset == block.len())
+        {
+            self.blocks = &self.blocks[1..];
+            self.offset = 0;
+        }
+        let Some(block) = self.blocks.first() else {
+            return Ok(0);
+        };
+        let n = out.len().min(block.len() - self.offset);
+        out[..n].copy_from_slice(&block[self.offset..self.offset + n]);
+        self.offset += n;
+        Ok(n)
+    }
+}
+
+/// Parse once over either a tape candidate or a bounded head, without tape policy.
+pub(crate) fn parse_plain_identity(mut source: impl Read) -> PlainIdentityPrefix {
+    use PlainIdentityPrefix::{Exhausted, Id, Invalid, NotHeader, ShortHeader};
+    let mut header = [0; 512];
+    if source.read_exact(&mut header).is_err() {
+        return ShortHeader;
+    }
+    let octal = |bytes: &[u8]| -> Option<u64> {
+        u64::from_str_radix(
+            std::str::from_utf8(bytes).ok()?.trim_matches(['\0', ' ']),
+            8,
+        )
+        .ok()
+    };
+    let Some(checksum) = octal(&header[148..156]) else {
+        return NotHeader;
+    };
+    let sum: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum();
+    if header[156] != b'g' || checksum != sum || &header[257..263] != b"ustar\0" {
+        return NotHeader;
+    }
+    let Some(mut remaining) = octal(&header[124..136]) else {
+        return Invalid;
+    };
+    while remaining > 0 {
+        let mut digits = 0u64;
+        let mut length = 0u64;
+        loop {
+            let mut byte = [0];
+            if source.read_exact(&mut byte).is_err() {
+                return Exhausted;
+            }
+            digits += 1;
+            if byte[0] == b' ' {
+                break;
+            }
+            if !byte[0].is_ascii_digit() || digits > 20 {
+                return Invalid;
+            }
+            let Some(next) = length
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(u64::from(byte[0] - b'0')))
+            else {
+                return Invalid;
+            };
+            length = next;
+        }
+        if length <= digits || length > remaining {
+            return Invalid;
+        }
+        let mut body = (&mut source).take(length - digits);
+        let mut prefix = [0; 20];
+        let wanted = b"REMANENCE.object_id=";
+        let n = prefix.len().min((length - digits) as usize);
+        if body.read_exact(&mut prefix[..n]).is_err() {
+            return Exhausted;
+        }
+        if prefix[..n].starts_with(wanted) {
+            let mut value = Vec::new();
+            if length - digits > 128 {
+                return Invalid;
+            }
+            value.extend_from_slice(&prefix[wanted.len()..n]);
+            if body.read_to_end(&mut value).is_err() {
+                return Invalid;
+            }
+            if body.limit() != 0 {
+                return Exhausted;
+            }
+            return Id(value);
+        }
+        if std::io::copy(&mut body, &mut std::io::sink()).is_err() {
+            return Invalid;
+        }
+        if body.limit() != 0 {
+            return Exhausted;
+        }
+        remaining -= length;
+    }
+    Invalid
+}
+
+/// Preserve live partial-proof semantics, including the candidate's separate probe error.
 pub(crate) fn prove_named_plain_identity(
     drive: &mut DriveHandle,
     start: u64,
@@ -913,99 +1084,11 @@ pub(crate) fn prove_named_plain_identity(
         )
     };
     let mut source = TapeCandidate::new(drive, start, blocks, size)?;
-    let mut header = [0; 512];
-    source.read_exact(&mut header).map_err(|_| bad())?;
-    let octal = |bytes: &[u8]| -> Option<u64> {
-        u64::from_str_radix(
-            std::str::from_utf8(bytes).ok()?.trim_matches(['\0', ' ']),
-            8,
-        )
-        .ok()
-    };
-    let checksum = octal(&header[148..156]).ok_or_else(bad)?;
-    let sum: u64 = header
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            if (148..156).contains(&i) {
-                32
-            } else {
-                u64::from(*b)
-            }
-        })
-        .sum();
-    if header[156] != b'g' || checksum != sum || &header[257..263] != b"ustar\0" {
-        return Err(bad());
+    match parse_plain_identity(&mut source) {
+        PlainIdentityPrefix::Id(value) if named_plain_id_matches(&value, expected) => Ok(()),
+        PlainIdentityPrefix::Exhausted if partial && source.probe_error.is_none() => Ok(()),
+        _ => Err(bad()),
     }
-    let mut remaining = octal(&header[124..136]).ok_or_else(bad)?;
-    while remaining > 0 {
-        let mut digits = 0u64;
-        let mut length = 0u64;
-        loop {
-            let mut byte = [0];
-            if source.read_exact(&mut byte).is_err() {
-                return if partial && source.probe_error.is_none() {
-                    Ok(())
-                } else {
-                    Err(bad())
-                };
-            }
-            digits += 1;
-            if byte[0] == b' ' {
-                break;
-            }
-            if !byte[0].is_ascii_digit() || digits > 20 {
-                return Err(bad());
-            }
-            length = length
-                .checked_mul(10)
-                .and_then(|n| n.checked_add(u64::from(byte[0] - b'0')))
-                .ok_or_else(bad)?;
-        }
-        if length <= digits || length > remaining {
-            return Err(bad());
-        }
-        let mut body = (&mut source).take(length - digits);
-        let mut prefix = [0; 20];
-        let wanted = b"REMANENCE.object_id=";
-        let n = prefix.len().min((length - digits) as usize);
-        if body.read_exact(&mut prefix[..n]).is_err() {
-            return if partial && source.probe_error.is_none() {
-                Ok(())
-            } else {
-                Err(bad())
-            };
-        }
-        if prefix[..n].starts_with(wanted) {
-            let mut value = Vec::new();
-            if length - digits > 128 {
-                return Err(bad());
-            }
-            value.extend_from_slice(&prefix[wanted.len()..n]);
-            body.read_to_end(&mut value).map_err(|_| bad())?;
-            if body.limit() != 0 {
-                return if partial && source.probe_error.is_none() {
-                    Ok(())
-                } else {
-                    Err(bad())
-                };
-            }
-            if value != format!("{expected}\n").as_bytes() {
-                return Err(bad());
-            }
-            return Ok(());
-        }
-        std::io::copy(&mut body, &mut std::io::sink()).map_err(|_| bad())?;
-        if body.limit() != 0 {
-            return if partial && source.probe_error.is_none() {
-                Ok(())
-            } else {
-                Err(bad())
-            };
-        }
-        remaining -= length;
-    }
-    Err(bad())
 }
 
 /// Keep the candidate alive while its borrowed drive experiences a real injected pipeline failure.

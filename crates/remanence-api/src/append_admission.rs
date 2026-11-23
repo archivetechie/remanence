@@ -52,11 +52,173 @@ pub(crate) struct AppendContext {
     pub terminal_prefix: Option<remanence_parity::TerminalPrefixPlan>,
 }
 
+/// Diagnostic location of the failing forward READ, completed only by admission.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TornTailSite {
+    OpenFirstRead,
+    OpenScan,
+    NamedFile { index: usize },
+}
+
+/// Identity decided from the kept prefix, without accepting the complete file.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TornTailIdentity {
+    Undecided,
+    Matches,
+    Differs {
+        reason: &'static str,
+    },
+    Object {
+        object_id: String,
+        chunk_size: Option<u32>,
+    },
+    Unrecognised,
+    Invalid {
+        reason: String,
+    },
+}
+
+/// Kept forward-read bytes, including a short first record, in physical order.
+#[derive(Debug)]
+pub(crate) struct TornTailHead {
+    pub(crate) blocks: Vec<Vec<u8>>,
+    pub(crate) kind: Option<remanence_parity::TapeFileKind>,
+    pub(crate) bootstrap_magic: Option<bool>,
+    pub(crate) identity: TornTailIdentity,
+}
+
+/// A partial attachment has no site or cursor until it returns through the funnel.
+#[derive(Debug)]
+pub(crate) struct TornTailEvidence {
+    pub(crate) site: Option<TornTailSite>,
+    pub(crate) cursor: Option<TapePosition>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
+    pub(crate) file_start_lba: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
+    pub(crate) blocks_read: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
+    pub(crate) failing_lba: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
+    pub(crate) aligned: bool,
+    pub(crate) delimiters: Vec<u64>,
+    pub(crate) head: TornTailHead,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
+    pub(crate) read: remanence_library::outcome::CompletionEvidence,
+}
+impl TornTailEvidence {
+    /// Keep only a prefix of whole returned records, with the first always retained.
+    pub(crate) fn keep_block(head: &mut Vec<Vec<u8>>, blocks_read: u64, block: &[u8]) {
+        if head.is_empty()
+            || (head.len() as u64 == blocks_read
+                && head.iter().map(Vec::len).sum::<usize>() + block.len() <= 4 * 1024 * 1024)
+        {
+            head.push(block.to_vec());
+        }
+    }
+    /// Build the arm-owned portion without querying a now-untrusted drive position.
+    pub(crate) fn partial(
+        start: u64,
+        blocks_read: u64,
+        aligned: bool,
+        delimiters: Vec<u64>,
+        head: Vec<Vec<u8>>,
+        read: remanence_library::outcome::CompletionEvidence,
+    ) -> Self {
+        Self {
+            site: None,
+            cursor: None,
+            file_start_lba: start,
+            blocks_read,
+            failing_lba: start + blocks_read,
+            aligned,
+            delimiters,
+            head: TornTailHead {
+                blocks: head,
+                kind: None,
+                bootstrap_magic: None,
+                identity: TornTailIdentity::Undecided,
+            },
+            read,
+        }
+    }
+}
+
+impl TornTailHead {
+    /// Observe only the kept prefix. This is never acceptance of a complete file.
+    pub(crate) fn observe_open(&mut self, uuid: &[u8; 16], size: u32) {
+        let Some(first) = self.blocks.first() else {
+            return;
+        };
+        let kind = remanence_parity::scan::classify_tape_file_head(first, uuid, size, false);
+        self.kind = Some(kind);
+        self.bootstrap_magic = Some(remanence_parity::bootstrap::has_bootstrap_magic(first));
+        if kind != remanence_parity::TapeFileKind::Object {
+            return;
+        }
+        self.identity = if first.starts_with(b"REMO") {
+            match first.get(..128).and_then(|bytes| bytes.try_into().ok()) {
+                None => TornTailIdentity::Invalid {
+                    reason: "short envelope header".into(),
+                },
+                Some(bytes) => match remanence_aead::RemObjectHeader::parse(bytes) {
+                    Ok(header) => TornTailIdentity::Object {
+                        object_id: header.object_id,
+                        chunk_size: Some(header.chunk_size),
+                    },
+                    Err(error) => TornTailIdentity::Invalid {
+                        reason: error.to_string(),
+                    },
+                },
+            }
+        } else {
+            use crate::catalogless_restore::{
+                parse_plain_identity, HeadReader, PlainIdentityPrefix,
+            };
+            match parse_plain_identity(HeadReader::new(&self.blocks)) {
+                PlainIdentityPrefix::ShortHeader | PlainIdentityPrefix::Exhausted => {
+                    TornTailIdentity::Undecided
+                }
+                PlainIdentityPrefix::NotHeader => TornTailIdentity::Unrecognised,
+                PlainIdentityPrefix::Invalid => TornTailIdentity::Invalid {
+                    reason: "invalid plaintext object prefix".into(),
+                },
+                PlainIdentityPrefix::Id(value) => match value.as_slice() {
+                    [payload @ .., b'\n']
+                        if !payload.is_empty() && !matches!(payload, [.., b'\n']) =>
+                    {
+                        match std::str::from_utf8(payload) {
+                            Ok(id) => TornTailIdentity::Object {
+                                object_id: id.into(),
+                                chunk_size: None,
+                            },
+                            Err(_) => TornTailIdentity::Invalid {
+                                reason: "plaintext object id is not UTF-8".into(),
+                            },
+                        }
+                    }
+                    _ => TornTailIdentity::Invalid {
+                        reason: "invalid plaintext object id terminator or payload".into(),
+                    },
+                },
+            }
+        };
+    }
+}
+
+/// Only the primary known READ completion with accounted zero bytes is evidence.
+pub(crate) fn torn_tail_read(read: &remanence_library::outcome::CompletionEvidence) -> bool {
+    read.opcode == Some(0x08)
+        && read.completion == remanence_library::outcome::Completion::Known
+        && read.current_medium_damage()
+        && read.transferred_bytes == Some(0)
+}
+
 /// Admission failures retain the failed probe even after restoration issues other commands.
 pub(crate) struct AdmissionError {
     pub(crate) kind: AdmissionErrorKind,
     outcome: Option<Box<remanence_library::outcome::ClassifiedOutcome>>,
     evidence: Option<Box<AdmissionEvidence>>,
+    torn_tail: Option<Box<TornTailEvidence>>,
 }
 impl std::fmt::Debug for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,12 +240,40 @@ impl std::error::Error for AdmissionError {
     }
 }
 impl AdmissionError {
+    /// Attach the evidence owned by one of the three eligible READ arms.
+    pub(crate) fn with_torn_tail(mut self, record: TornTailEvidence) -> Self {
+        self.torn_tail = Some(Box::new(record));
+        self
+    }
+    /// Supply authority context without changing the original refusal or its outcome.
+    pub(crate) fn complete_torn_tail(
+        &mut self,
+        site: TornTailSite,
+        cursor: TapePosition,
+        delimiters: &[u64],
+    ) {
+        if let Some(record) = &mut self.torn_tail {
+            record.site = Some(site);
+            record.cursor = Some(cursor);
+            record.delimiters.extend_from_slice(delimiters);
+        }
+    }
+    pub(crate) fn torn_tail(&self) -> Option<&TornTailEvidence> {
+        self.torn_tail
+            .as_deref()
+            .filter(|record| record.site.is_some() && record.cursor.is_some())
+    }
+    #[cfg(test)]
+    pub(crate) fn any_torn_tail(&self) -> Option<&TornTailEvidence> {
+        self.torn_tail.as_deref()
+    }
     /// Keep a private intermediate suffix fact pending until admission supplies its authority scope.
     pub(super) fn pending(kind: AdmissionErrorKind) -> Self {
         Self {
             kind,
             outcome: None,
             evidence: None,
+            torn_tail: None,
         }
     }
     /// Finish the final public admission error, never an intermediate diagnostic.
@@ -103,6 +293,7 @@ impl AdmissionError {
             kind,
             outcome: Some(Box::new(outcome)),
             evidence: None,
+            torn_tail: None,
         }
     }
 }
@@ -451,6 +642,8 @@ pub(crate) fn admit_append_boundary(
                     let mut failure = None;
                     let mut reached_eod = false;
                     let mut named_end = boundary.lba;
+                    let mut named_index = 0;
+                    let mut named_delimiters = Vec::new();
                     snapshot
                         .visit_session_tail(&mut |file| {
                             if reached_eod {
@@ -461,8 +654,17 @@ pub(crate) fn admit_append_boundary(
                                 .map(|(mark, lba)| {
                                     reached_eod = !mark;
                                     named_end = lba;
+                                    named_index += 1;
+                                    if mark {
+                                        named_delimiters.push(lba);
+                                    }
                                 })
-                                .map_err(|e| {
+                                .map_err(|mut e| {
+                                    e.complete_torn_tail(
+                                        TornTailSite::NamedFile { index: named_index },
+                                        ctx.boundary,
+                                        &named_delimiters,
+                                    );
                                     failure = Some(e);
                                     remanence_state::StateError::JournalReplayFailed(
                                         "session suffix proof failed".into(),
@@ -569,12 +771,30 @@ pub(crate) fn admit_append_boundary(
                     ..
                 }) => {}
                 Err(source) => {
-                    return Err(crate::append_admission::AdmissionError::new(
-                        crate::append_admission::AdmissionErrorKind::SuffixIo {
-                            start_lba: boundary.lba,
-                            source,
-                        },
-                    ))
+                    let read = source.completion_evidence();
+                    let capture = recovered_tail.is_some() && torn_tail_read(&read);
+                    let mut error = AdmissionError::new(AdmissionErrorKind::SuffixIo {
+                        start_lba: boundary.lba,
+                        source,
+                    });
+                    if capture {
+                        error = error.with_torn_tail(TornTailEvidence::partial(
+                            boundary.lba,
+                            0,
+                            true,
+                            Vec::new(),
+                            Vec::new(),
+                            read,
+                        ));
+                        error
+                            .torn_tail
+                            .as_mut()
+                            .expect("attached in this arm")
+                            .head
+                            .observe_open(&ctx.tape_uuid, ctx.block_size);
+                        error.complete_torn_tail(TornTailSite::OpenFirstRead, ctx.boundary, &[]);
+                    }
+                    return Err(error);
                 }
             };
             probe_target = Some(boundary.lba);
@@ -595,15 +815,19 @@ pub(crate) fn admit_append_boundary(
                 recovered_tail.as_ref(),
             )
             .map_err(|error| match error {
-                crate::append_admission::AdmissionError {
-                    kind: crate::append_admission::AdmissionErrorKind::Io(source),
+                AdmissionError {
+                    kind: AdmissionErrorKind::Io(source),
+                    torn_tail,
                     ..
-                } => crate::append_admission::AdmissionError::new(
-                    crate::append_admission::AdmissionErrorKind::SuffixIo {
+                } => {
+                    let mut error = AdmissionError::new(AdmissionErrorKind::SuffixIo {
                         start_lba: boundary.lba,
                         source,
-                    },
-                ),
+                    });
+                    error.torn_tail = torn_tail;
+                    error.complete_torn_tail(TornTailSite::OpenScan, ctx.boundary, &[]);
+                    error
+                }
                 other => other,
             })?;
             if recovered_tail.is_some() && suffix.unnameable {
@@ -700,7 +924,8 @@ pub(crate) fn admit_append_boundary(
                     ),
                 ),
             );
-            refusal.evidence = Some(Box::new(if let Err(error) = probe {
+            refusal.evidence = Some(Box::new(if let Err(mut error) = probe {
+                refusal.torn_tail = error.torn_tail.take();
                 AdmissionEvidence::Returned {
                     error,
                     phase: EvidencePhase::Probe,
@@ -819,6 +1044,9 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod evidence_tests;
 
+#[cfg(test)]
+mod torn_tail_tests;
+
 /// Admit a durable checkpoint boundary for low-level recovery tools.
 pub fn admit_checkpointed_tape(
     drive: &mut DriveHandle,
@@ -925,9 +1153,16 @@ pub(crate) fn daemon_admission_error(
         error.kind,
         AdmissionErrorKind::Io(_) | AdmissionErrorKind::SuffixIo { .. }
     ) {
-        return outcome
+        let mut status = outcome
             .retry
             .attach(tonic::Status::unavailable(error.to_string()));
+        if error.torn_tail().is_some() {
+            status.metadata_mut().insert(
+                "remanence-torn-tail",
+                tonic::metadata::MetadataValue::from_static("inspect"),
+            );
+        }
+        return status;
     }
     if let remanence_library::outcome::Effect::WriteFence(cause) = outcome.effect {
         let evidence = match &error {

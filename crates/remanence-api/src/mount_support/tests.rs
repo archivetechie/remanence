@@ -3582,3 +3582,151 @@ fn r3a_clean_mounted_close_has_no_native_tail() {
         "A3 requires stop and report on nonzero tail"
     );
 }
+
+/// PLR-2a-1 mounted entry: a committed prefix followed by a crashed native session.
+fn plr2a1_status(case: &str) -> tonic::Status {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    let root = tempfile::tempdir().unwrap();
+    let world = world();
+    set_rollback_bootstrap(&world, crate::ParityConfig::None);
+    let mut state = state(root.path());
+    append_for_rollback!(&mut state, &world, root.path(), "PLR-prime").unwrap();
+    let authority = remanence_state::TapeAuthority::open(
+        state.paths().journal_dir.join("tapes"),
+        UUID,
+        &state.paths().sqlite_path,
+    )
+    .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    let snapshot = lease.freeze().unwrap();
+    let cursor = snapshot.tape_summary().cursor.lba;
+    let next_file = snapshot.tape_summary().next_file;
+    assert!(!snapshot.tape_summary().closeout_due());
+    let id = "00000000-0000-4000-8000-000000000001";
+    let header = remanence_aead::RemObjectHeader::new_envelope(BLOCK, [1; 16], 32, id, 2048)
+        .unwrap()
+        .serialize()
+        .unwrap();
+    let mut first = vec![0; BLOCK as usize];
+    first[..128].copy_from_slice(&header);
+    lease
+        .open_session(
+            [0xc7; 16],
+            "2026-11-23T00:00:00Z".into(),
+            remanence_state::tape_log::SessionDrive {
+                serial: SERIAL.into(),
+                vendor: None,
+                product: None,
+                endpoint: remanence_state::library_log::DriveKey::Standalone(
+                    remanence_state::library_log::Standalone {
+                        drive_serial: SERIAL.into(),
+                    },
+                ),
+                drive_uuid: None,
+            },
+        )
+        .unwrap();
+    if case != "open" {
+        let files = if case == "named" {
+            vec![TailFile {
+                tape_file_number: next_file,
+                identity: TailIdentity::Object(id.into()),
+                known_blocks: 2,
+                unknown_blocks: 1,
+                filemark: TailFilemark::Absent,
+                synchronized_blocks: 0,
+                synchronized_filemark: false,
+            }]
+        } else {
+            vec![]
+        };
+        lease
+            .end_session(
+                [0xc7; 16],
+                "2026-11-23T00:00:01Z".into(),
+                SessionEndReason::DriveError,
+                None,
+                files.into_iter().map(Ok),
+            )
+            .unwrap();
+    }
+    let snapshot = lease.freeze().unwrap();
+    assert!(!snapshot.tape_summary().closeout_due());
+    state.library_runtime().refresh_native(&snapshot).unwrap();
+    state.library_runtime().catch_up().unwrap();
+    drop(lease);
+    drop(authority);
+    {
+        let mut world = world.lock().unwrap();
+        let tape = world.tapes.get_mut("HAND").unwrap();
+        assert_eq!(tape.records.len() as u64, cursor);
+        if case != "empty" {
+            tape.records.extend([
+                Record::Block(first),
+                Record::Block(vec![0x42; BLOCK as usize]),
+            ]);
+        }
+        let keep = tape.records.len();
+        world.drive_states.get_mut(&BAY).unwrap().profile =
+            remanence_chaos::model::DriveProfile::MeasuredHpLto6;
+        world.power_cut_during_write(BAY, keep).unwrap();
+    }
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, _reopen) = own_mount!(mount, mounted, state);
+    let status = actor.open_session("default").unwrap_err().status;
+    let _ = actor.finish();
+    status
+}
+fn plr2a1_normalized(text: &str) -> String {
+    let Some((left, right)) = text.split_once("proof_elapsed_ms=") else {
+        return text.into();
+    };
+    let (digits, rest) = right.split_once(' ').unwrap();
+    assert!(!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+    format!("{left}proof_elapsed_ms=<ms> {rest}")
+}
+#[test]
+fn plr2a1_baseline_mounted_observations() {
+    for (case, message, retry) in [
+        ("open", "append suffix at LBA 6: drive rejected the command: SCSI check condition (bytes_transferred=0): sense=[f0, 00, 03, 00, 04, 00, 00, 18, 00, 00, 00, 00, 11, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]", "media"),
+        ("named", "tape identity invalidated: proved generation 0, current generation 1; re-establish media proof before writing; admission evidence: phase=probe; kind=io; step_target_lba=6; opcode=0x08; sense=03/11/00; sense_timing=current; host_status=unavailable; host_bytes_transferred=0; bytes_transferred=0; proof_elapsed_ms=<ms> (probe start to returned error)", "transient"),
+        ("empty", "tape identity invalidated: proved generation 0, current generation 1; re-establish media proof before writing; admission evidence: phase=probe; kind=io; step_target_lba=6; opcode=0x08; sense=03/11/00; sense_timing=current; host_status=unavailable; host_bytes_transferred=0; bytes_transferred=0; proof_elapsed_ms=<ms> (probe start to returned error)", "transient"),
+    ] {
+        let status = plr2a1_status(case);
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{case}");
+        assert_eq!(plr2a1_normalized(status.message()), message, "{case}");
+        assert_eq!(status.metadata().get("remanence-retry").unwrap(), retry, "{case}");
+        if case == "empty" {
+            let keys: Vec<_> = status.metadata().keys().map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(key) => key.as_str(),
+                tonic::metadata::KeyRef::Binary(key) => key.as_str(),
+            }).collect();
+            assert_eq!(keys, ["remanence-retry"]);
+            assert!(status.metadata().get("remanence-torn-tail").is_none());
+        }
+    }
+}
+#[test]
+fn plr2a1_label_open() {
+    let status = plr2a1_status("open");
+    assert_eq!(
+        status
+            .metadata()
+            .get("remanence-torn-tail")
+            .map(|v| v.to_str().unwrap()),
+        Some("inspect")
+    );
+}
+#[test]
+fn plr2a1_label_named() {
+    let status = plr2a1_status("named");
+    assert_eq!(
+        status
+            .metadata()
+            .get("remanence-torn-tail")
+            .map(|v| v.to_str().unwrap()),
+        Some("inspect")
+    );
+}
