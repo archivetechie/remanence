@@ -356,19 +356,19 @@ under `fixes`.
 
 Remanence makes its records durable with fsync, as a database does; it cannot test
 whether a disk keeps what it confirms. **Torn-tail READ refusal.** A power cut during
-a tape write can leave a torn tail. A marked write-open refusal from `rem put` retains
-a diagnostic beginning `append suffix at LBA` or `tape identity invalidated` and adds
-a sentence beginning `If the drive lost power during a write,` naming the inspection
-command. An initial `supersede-tail` inspection changes nothing on tape and exits 1;
-discarding this tail is not available in this release, including with
-`--confirm-supersede`. Earlier checks can refuse before inspection. A newer state
-directory does not repair this READ failure; another write that meets it refuses
-again. The tail refusal itself leaves earlier files available for recovery. Try `rem
-tape restore --scan --out rescued` on a standalone drive, with `--private-key` for
-encrypted files. Discovery precedes extraction and can stop on another error, such as
-`03/11/00` while measuring filemarks. Where read admission permits, try `rem get` for
-known committed files. An incomplete candidate makes extraction exit 1; exit 0 covers
-only the candidates discovered. Check the report and rescued files before [`rem tape
+a tape write can leave a torn tail. If `rem put` prints a sentence beginning `If the
+drive lost power during a write,`, run the inspection command it names. Its diagnostic
+begins `append suffix at LBA` or `tape identity invalidated`. An initial
+`supersede-tail` inspection changes nothing on tape and exits 1; discarding this tail
+is not available in this release, including with `--confirm-supersede`. Earlier checks
+can refuse before inspection. A newer state directory does not repair this READ
+failure; another write that meets it refuses again. The tail refusal itself leaves
+earlier files available for recovery. Try `rem tape restore --scan --out rescued` on a
+standalone drive, with `--private-key` for encrypted files. Discovery precedes
+extraction and can stop on another error, such as `03/11/00` while measuring
+filemarks. Where read admission permits, try `rem get` for known committed files. An
+incomplete candidate makes extraction exit 1; exit 0 covers only the candidates
+discovered. Check the report and rescued files before [`rem tape
 retire`](#rem-tape-retire), whose conditions still apply. To write elsewhere, use
 another eligible tape; the [standalone](#rem-put-standalone) and
 [library](#rem-put-library) reference sections give the drive, guard and endpoint
@@ -376,12 +376,13 @@ options. **Lost journal records.** If a power cut loses the last journal records
 nothing on tape is lost or overwritten. The next write to that tape can stop with
 `TailBeyondKnownState`. For journal-record loss, start from a newer state directory
 that accounts for the data, or try recovery as described above. After
-`TailBeyondKnownState`, discard is refused in this release if this state shows a prior
-commit and no open session. With fresh authority, ordinary preview and confirmation
-apply if recovery checks pass. Keep a tape whose suffix cannot be discarded closed for
-writing, or follow the retirement procedure; account for the whole suffix before
-confirming any discard. A UPS, or a disk with power-loss protection, removes this
-power-cut exposure.
+`TailBeyondKnownState`, discard is refused in this release if the tape log has a
+latest commit and no open write session. If this state records no prior commit for the
+tape, or still shows an open write session, you can preview the suffix and confirm
+discard if the recovery checks pass. Keep a tape whose suffix cannot be discarded
+closed for writing, or follow the retirement procedure; account for the whole suffix
+before confirming any discard. A UPS, or a disk with power-loss protection, removes
+this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),
@@ -603,8 +604,8 @@ The diagnostic begins `append suffix at LBA` for the suffix READ, or
 the drive's identity generation changes during admission. The inspection sentence
 follows that clause. This marked `put` refusal exits 1 and writes its failed
 summary to stdout, or its summary and failure envelope to stdout with `--json`.
-Unmarked errors have no inspection sentence. If automatic terminal recovery fails
-during write-open, its finalizer error is forwarded without that sentence.
+Unmarked errors have no inspection sentence. A failure during automatic
+finalization at write-open does not add the inspection sentence.
 See [`rem tape supersede-tail` (standalone)](#rem-tape-supersede-tail-standalone)
 for inspection and ordinary discard outcomes. If standalone `rem tape finalize`
 meets this torn-tail record, it fails with admission's text and no inspection
@@ -829,14 +830,15 @@ line above without `error: `, and `result` containing `inspection`, `tape_uuid`,
 
 For an ordinary suffix, the initial preview lists the findings without requiring
 confirmation. Discard requires a second request with exact typed confirmation,
-the preview's tape-log sequence and matching findings, and a fresh tail probe.
-If that confirmation probe finds an eligible torn tail, the server refuses with
-`SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard`; the CLI
-exits 1 without printing the eight-line inspection. Earlier checks can refuse
-before the probe or the stale-sequence check. If admission reports
-`TailBeyondKnownState` after a prior commit and this state shows no open session
-on the tape (its last session closed, or none opened since it was initialized
-here), discard is refused in this release: keep the tape closed for writing,
+the preview's tape-log sequence and matching findings. If the probe before the
+sequence check finds an eligible torn tail, the server refuses with
+`SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard`.
+If the READ first fails on the rescan after confirmation is validated, the caller
+gets admission's diagnostic. Both failures exit 1 without the eight-line
+inspection. Earlier checks can refuse before the probe or the stale-sequence
+check. If admission reports
+`TailBeyondKnownState` and the tape log has a latest commit but no open write
+session, discard is refused in this release: keep the tape closed for writing,
 withdraw it with `rem tape retire` (pass `--config` with this configuration's
 path), or start from a newer copy of the state directory. Retirement refuses
 while parity closeout is due. A lone readable fragment of an open session that
@@ -899,9 +901,9 @@ fence library:<n> holds standalone drive <serial>; stop the daemon and run `rem 
 For releasable tape-fence causes, use the library form below. Tape fences for
 `append_admission_refused` or `session_suffix_contradiction` are not released by
 this command. Use `rem tape supersede-tail` where recovery applies; it refuses
-a contradicting recorded session ending or a state that shows no open session
-on the tape (its last session closed, or none opened since it was initialized
-here). Otherwise withdraw the tape with `rem tape retire` (pass
+a contradicting recorded session ending, and refuses discard after
+`TailBeyondKnownState` when the tape log has a latest commit and no open write
+session. Otherwise withdraw the tape with `rem tape retire` (pass
 `--config` with this configuration's path), or start from a newer copy of the
 state directory. Retirement refuses while parity closeout is due.
 
@@ -1544,9 +1546,9 @@ fields. The JSON schema of `list` is `rem.tape.quarantine.list.v1`.
 ids; `rem catalog tapes --json`, `rem top` and `rem daemon health --json` list
 those. Neither `append_admission_refused` nor `session_suffix_contradiction`
 is released. Use `rem tape supersede-tail` where recovery applies; it refuses
-a contradicting recorded session ending or a state that shows no open session
-on the tape (its last session closed, or none opened since it was initialized
-here). Otherwise withdraw the tape with `rem tape retire` or start
+a contradicting recorded session ending, and refuses discard after
+`TailBeyondKnownState` when the tape log has a latest commit and no open write
+session. Otherwise withdraw the tape with `rem tape retire` or start
 from a newer copy of the state directory. Retirement refuses while parity
 closeout is due. A releasable tape-I/O fence is released through the configured
 daemon socket after the operator's acknowledgement. Only an absent listener
@@ -1782,14 +1784,14 @@ in the standalone section belongs to standalone `--json`.
 
 For an ordinary suffix, the initial preview lists the findings without requiring
 confirmation. Discard requires a second request with exact typed confirmation,
-the preview's tape-log sequence and matching findings, and a fresh tail probe.
-If that confirmation probe finds an eligible torn tail, the server refuses with
-`SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard`; the CLI
-exits 1 without printing the eight-line inspection. Earlier checks can refuse
-before the probe or the stale-sequence check. If admission
-reports `TailBeyondKnownState` after a prior commit and this state shows no open
-session on the tape (its last session closed, or none opened since it was
-initialized here), discard is refused in this release; keep the tape closed for
+the preview's tape-log sequence and matching findings. If the probe before the
+sequence check finds an eligible torn tail, the server refuses with
+`SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard`.
+If the READ first fails on the rescan after confirmation is validated, the caller
+gets admission's diagnostic. Both failures exit 1 without the eight-line
+inspection. Earlier checks can refuse before the probe or the stale-sequence
+check. If admission reports `TailBeyondKnownState` and the tape log has a latest commit but no open
+write session, discard is refused in this release; keep the tape closed for
 writing, withdraw it with `rem tape retire`, or start from a newer copy of the
 state directory. Retirement refuses while parity closeout is due. To keep
 unlisted data in that journal-loss case, start from a newer copy of the state
@@ -2085,8 +2087,8 @@ The diagnostic begins `append suffix at LBA` for the suffix READ, or
 the drive's identity generation changes during admission; the inspection sentence
 follows that clause. With `--json`, the daemon client writes this message without
 `error: ` in a `rem.error.v1` envelope on stderr and exits 1. An unmarked error
-has no inspection sentence. If automatic terminal recovery fails during
-write-open, its finalizer error is forwarded without that sentence. The READ evidence and sites are
+has no inspection sentence. A failure during automatic finalization at
+write-open does not add the inspection sentence. The READ evidence and sites are
 described under [`rem put` (standalone)](#rem-put-standalone); inspection and
 ordinary discard are described under
 [`rem tape supersede-tail` (library)](#rem-tape-supersede-tail-library).

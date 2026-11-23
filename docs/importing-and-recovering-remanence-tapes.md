@@ -419,10 +419,9 @@ have a writable tape that the restored state knows and that the pool has not
 written since the copy. The restored catalog does not list a tape's data
 written since the copy. Do not discard that data unless its objects are
 known to be unneeded.
-If the restored state shows no open session on the tape (its last session
-closed, or none opened since it was initialized here), that data cannot be
-discarded in this release: keep the tape closed for writing, withdraw it
-with `rem tape retire`, or start from a newer copy of the state directory.
+If admission reports `TailBeyondKnownState` and the restored tape log has a
+latest commit but no open write session, that data cannot be discarded in this
+release: keep the tape closed for writing, withdraw it with `rem tape retire`, or start from a newer copy of the state directory.
 
 On a parity pool, if the restored tape log still owes closeout, retirement
 refuses with `CloseoutRequired`. Closeout stays refused under either
@@ -565,9 +564,8 @@ positions at the last committed cursor, possibly just after the bootstrap.
 To retry the interrupted object, the caller resubmits it from byte zero; a
 different next object can also be submitted after this recovery. Writing the next
 object replaces the uncommitted tail, and its delimiter follows its complete
-body; the catalog entry is committed separately at a checkpoint. A stock tar
-implementation therefore still sees one complete tar stream for the object,
-not two pieces that need Remanence-specific joining.
+body; the catalog entry is committed separately at a checkpoint. The plaintext
+object is one complete tar stream; decrypt an encrypted copy first.
 
 This cannot be done in place on WORM media, where the incomplete tail cannot be
 erased. Remanence admits ordinary object sessions only when the drive reports

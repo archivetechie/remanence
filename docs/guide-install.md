@@ -269,19 +269,19 @@ it in use.
 
 Remanence makes its records durable with fsync, as a database does; it cannot test
 whether a disk keeps what it confirms. **Torn-tail READ refusal.** A power cut during
-a tape write can leave a torn tail. A marked write-open refusal from `rem put` retains
-a diagnostic beginning `append suffix at LBA` or `tape identity invalidated` and adds
-a sentence beginning `If the drive lost power during a write,` naming the inspection
-command. An initial `supersede-tail` inspection changes nothing on tape and exits 1;
-discarding this tail is not available in this release, including with
-`--confirm-supersede`. Earlier checks can refuse before inspection. A newer state
-directory does not repair this READ failure; another write that meets it refuses
-again. The tail refusal itself leaves earlier files available for recovery. Try `rem
-tape restore --scan --out rescued` on a standalone drive, with `--private-key` for
-encrypted files. Discovery precedes extraction and can stop on another error, such as
-`03/11/00` while measuring filemarks. Where read admission permits, try `rem get` for
-known committed files. An incomplete candidate makes extraction exit 1; exit 0 covers
-only the candidates discovered. Check the report and rescued files before [`rem tape
+a tape write can leave a torn tail. If `rem put` prints a sentence beginning `If the
+drive lost power during a write,`, run the inspection command it names. Its diagnostic
+begins `append suffix at LBA` or `tape identity invalidated`. An initial
+`supersede-tail` inspection changes nothing on tape and exits 1; discarding this tail
+is not available in this release, including with `--confirm-supersede`. Earlier checks
+can refuse before inspection. A newer state directory does not repair this READ
+failure; another write that meets it refuses again. The tail refusal itself leaves
+earlier files available for recovery. Try `rem tape restore --scan --out rescued` on a
+standalone drive, with `--private-key` for encrypted files. Discovery precedes
+extraction and can stop on another error, such as `03/11/00` while measuring
+filemarks. Where read admission permits, try `rem get` for known committed files. An
+incomplete candidate makes extraction exit 1; exit 0 covers only the candidates
+discovered. Check the report and rescued files before [`rem tape
 retire`](reference-cli.md#rem-tape-retire), whose conditions still apply. To write
 elsewhere, use another eligible tape; the
 [standalone](reference-cli.md#rem-put-standalone) and
@@ -290,12 +290,13 @@ and endpoint options. **Lost journal records.** If a power cut loses the last jo
 records, nothing on tape is lost or overwritten. The next write to that tape can stop
 with `TailBeyondKnownState`. For journal-record loss, start from a newer state
 directory that accounts for the data, or try recovery as described above. After
-`TailBeyondKnownState`, discard is refused in this release if this state shows a prior
-commit and no open session. With fresh authority, ordinary preview and confirmation
-apply if recovery checks pass. Keep a tape whose suffix cannot be discarded closed for
-writing, or follow the retirement procedure; account for the whole suffix before
-confirming any discard. A UPS, or a disk with power-loss protection, removes this
-power-cut exposure.
+`TailBeyondKnownState`, discard is refused in this release if the tape log has a
+latest commit and no open write session. If this state records no prior commit for the
+tape, or still shows an open write session, you can preview the suffix and confirm
+discard if the recovery checks pass. Keep a tape whose suffix cannot be discarded
+closed for writing, or follow the retirement procedure; account for the whole suffix
+before confirming any discard. A UPS, or a disk with power-loss protection, removes
+this power-cut exposure.
 
 Never edit `queue/write_cache` or mount with `nobarrier`, `barrier=0`, f2fs
 `fsync_mode=nobarrier` or `checkpoint=disable` (including `checkpoint=disable:…`),

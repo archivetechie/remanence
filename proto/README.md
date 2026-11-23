@@ -148,8 +148,10 @@ sequence check; if it finds an eligible torn tail, the server refuses with
 instead of returning an inspection, whether the initial response was an ordinary
 preview or an inspection that the client ignored. The CLIs print the eight-line
 inspection only for an initial inspection response; an ordinary preview followed
-by that server refusal exits 1 without those lines. `GetWriteSession` retains the
-ended session's durable receipts; there is no `SessionEndedDetails` status extension.
+by that server refusal exits 1 without those lines. While the ended session
+remains cached, `GetWriteSession` returns its checkpointed receipts. The daemon
+keeps at most 1,024 ended write sessions in this in-memory cache. There is no
+`SessionEndedDetails` status extension.
 
 ## Closeout obligation surfaces
 

@@ -8,16 +8,17 @@ per-release summaries.
 ## Unreleased
 
 - On a marked write-open refusal for a torn-tail READ, `rem put` preserves the
-  admission diagnostic and adds route-specific inspection guidance. If automatic
-  terminal recovery fails during write-open, its finalizer error is forwarded
-  without that sentence. For an initial eligible inspection response,
-  `rem tape supersede-tail`
-  reports an inspection, writes nothing to the tape, discards nothing and exits 1;
-  `--confirm-supersede` is refused locally with `SupersedeInspectionOnly`. If a
-  confirmation probe after an ordinary preview finds an eligible torn tail, the
-  server refuses with `SupersedeInspectionOnly` and the CLI exits 1 without the
-  eight-line inspection. Discarding this tail is not available in this release. The API carries `TornTailInspection` in response field 5,
-  with empty `found` and confirmation text, `completed=false` and the inspected
+  admission diagnostic and adds route-specific inspection guidance. A failure
+  during automatic finalization at write-open does not add the inspection sentence.
+  For an initial eligible inspection response, `rem tape supersede-tail` reports
+  an inspection, writes nothing to the tape, discards nothing and exits 1;
+  `--confirm-supersede` is refused locally with `SupersedeInspectionOnly`.
+  After an ordinary preview, if the probe before the sequence check finds an
+  eligible torn tail, the server refuses with `SupersedeInspectionOnly`. If the READ first
+  fails on the rescan after confirmation is validated, the caller gets admission's
+  diagnostic. Both failures exit 1 without the eight-line inspection. Discarding
+  this tail is not available in this release. The API carries `TornTailInspection`
+  in response field 5, with empty `found` and confirmation text, `completed=false` and the inspected
   tape-log sequence; an eligible inspection refuses a wire confirmation.
 - When the drive's identity generation changes during append admission's check
   of the tape end, the `tape identity invalidated` refusal carries an
