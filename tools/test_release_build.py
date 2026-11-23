@@ -53,7 +53,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 command = line.strip()
             else:
                 continue
-            if "tools/release_build.sh" in command:
+            if command.strip() == "tools/release_build.sh":
                 jobs.append(job)
         self.assertEqual(jobs, ["build", "rebuild"])
 
@@ -150,6 +150,16 @@ for binary in ('rem', 'rem-debug', 'rem-daemon', 'rem-recover'):
         self.assertIn("cc stub version", result.stdout)
         self.assertIn("ld stub version", result.stdout)
         self.assertNotIn("second line", result.stdout)
+
+    def test_relative_cargo_home_ignores_cdpath(self):
+        with tempfile.TemporaryDirectory(prefix="cdpath ") as competing:
+            (Path(competing) / "ch").mkdir()
+            self.env["CARGO_HOME"] = "ch"
+            self.env["CDPATH"] = competing
+            result = self.run_build()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            record = json.loads(self.record.read_text())
+            self.assertEqual(record["CARGO_HOME"], str(self.cargo_home))
 
     def assert_override_refused(self, variable):
         self.env[variable] = "override"

@@ -342,7 +342,7 @@ to check the downloaded files yourself.
 
 Use Ubuntu 24.04 on x86-64; a fresh container such as `ubuntu:24.04` is the
 simplest starting point. Use no Cargo configuration or environment of your own
-that sets the compiler, linker, profile or target directory. Install rustup,
+that sets the compiler, linker, profile, target triple or target directory. Install rustup,
 then install `musl-tools`, `file`, `git` and the C build tools from Ubuntu's
 packages. Run the package commands as root in a container, omitting `sudo`.
 
@@ -356,16 +356,17 @@ rustup toolchain install 1.95.0 --target x86_64-unknown-linux-musl
 git clone https://github.com/archivetechie/remanence
 cd remanence
 git checkout v<VERSION>
-unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS REMANENCE_SOFTWARE_BUILD
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS REMANENCE_SOFTWARE_BUILD TARGET
 RUSTUP_TOOLCHAIN=1.95.0 tools/release_build.sh
 ```
 
 Replace `<VERSION>` with the release's version and `1.95.0` with its recorded
-toolchain version if different. Keep the tags in the git checkout: the build
-string includes `git describe --always --tags`, and a source archive without
-git metadata or a `REMANENCE_SOFTWARE_BUILD` override changes it. The script
-refuses non-blank `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` and
-`REMANENCE_SOFTWARE_BUILD`.
+toolchain version if different. Build from a git clone with its tags, because
+the build string includes `git describe --always --tags`; a clone without tags
+gives a different string. The script refuses to run outside a git checkout's
+root or with a non-blank `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or
+`REMANENCE_SOFTWARE_BUILD`. The recipe unsets `TARGET` because a non-empty
+value selects another target triple. The output directory is always `target/`.
 
 Unpack the operator archive and run `sha256sum` on its `bin/*`. Compare those
 four digests with the script's printed digests for `rem`, `rem-debug`,

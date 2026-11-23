@@ -570,7 +570,7 @@ per-release summaries.
   `remanence-<version>-x86_64-unknown-linux-musl.tar.gz` holds `rem`,
   `rem-debug`, `rem-daemon` and `rem-recover` with the README and `docs/`, and
   replaces `remanence-x86_64-linux.tar.gz`. The release workflow runs the
-  unpacked binaries before it publishes, and a manual run builds an
+  unpacked binaries before it publishes, and a manual run on a branch builds an
   unpublished preview. `docs/guide-install.md` covers installation and host
   setup.
 - Dependencies: `rustls` 0.23.46 for RUSTSEC-2026-0346, RUSTSEC-2026-0347,

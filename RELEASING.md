@@ -14,8 +14,9 @@ gates, builds statically linked (musl) binaries, and packs
 `remanence-<version>-x86_64-unknown-linux-musl.tar.gz`, which holds `rem`,
 `rem-debug`, `rem-daemon` and `rem-recover` with the README, the licensing
 files and `docs/`, and a separate `rem-recover` archive. A second job unpacks
-the archive on a clean runner, runs each binary in an empty root directory and
-checks that it reports the tag's version. The `rebuild` job builds the same
+the archive on a clean runner and runs each binary in an empty root directory:
+`rem`, `rem-debug` and `rem-daemon` must report the tag's version, and
+`rem-recover`, which has no version flag, must start. The `rebuild` job builds the same
 commit in another directory and stops publication if any of the four binary
 digests differs; the GitHub release is created, with the checksums and
 generated notes, only after both jobs pass. After publishing, `check-published`

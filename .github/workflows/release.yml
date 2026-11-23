@@ -289,7 +289,7 @@ jobs:
           while read -r checksum file; do
             file=${file#\*}
             listed["$file"]=1
-            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" < /dev/null
           done < SHA256SUMS
           shopt -s nullglob dotglob
           for file in *; do

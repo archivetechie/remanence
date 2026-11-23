@@ -21,7 +21,7 @@ done
 target=${TARGET:-x86_64-unknown-linux-musl}
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 mkdir -p "$cargo_home"
-CARGO_HOME=$(cd "$cargo_home" && pwd -P)
+CARGO_HOME=$(CDPATH='' cd -- "$cargo_home" && pwd -P)
 export CARGO_HOME
 
 sysroot=$(rustc --print sysroot)
