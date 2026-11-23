@@ -134,10 +134,16 @@ refused immediately with `FAILED_PRECONDITION` ("tape is sealed"). Matching retr
 of live or successful operations rejoin them.
 
 `SupersedeTailRequest.observed_tape_log_sequence = 5` is an optional uint64 on the
-wire and mandatory on confirmation. Preview returns the required value in
-`SupersedeTailResponse.tape_log_sequence = 4`. A stale value refuses with
-`TailPreviewStale`. `GetWriteSession` retains the ended session's durable receipts;
-there is no `SessionEndedDetails` status extension.
+wire and mandatory on ordinary tail-discard confirmation. An ordinary preview
+returns the required value in `SupersedeTailResponse.tape_log_sequence = 4`;
+a stale confirmation value refuses with `TailPreviewStale`.
+`SupersedeTailResponse.inspection = 5` (`TornTailInspection`) is present only for
+an inspection result: `found` and `required_confirmation` are empty, `completed`
+is false, and `tape_log_sequence` is the inspected log's sequence. A confirmation
+sent on the wire gets a fresh probe; if the same eligible torn-tail inspection
+recurs, the server refuses with `SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard`,
+including for a client that ignores `inspection`. `GetWriteSession` retains the
+ended session's durable receipts; there is no `SessionEndedDetails` status extension.
 
 ## Closeout obligation surfaces
 

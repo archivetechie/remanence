@@ -559,11 +559,13 @@ them.
 
 If the host stops while writing the body, the tail may hold some physical
 blocks but has no committed object delimiter and no catalog entry. On an open,
-parity-off, rewritable tape, the last durable tape log records the
-EOD after the previous complete object. After a restart, a new write session
-positions at that checkpoint EOD, and the caller sends the interrupted object
-again from byte zero. The rewrite replaces the uncommitted tail, and only the
-completed retry gets a filemark and enters the catalog. A stock tar
+parity-off, rewritable tape whose uncommitted suffix is a lone readable fragment
+ending at physical EOD, the last durable tape log records the EOD after the
+previous complete object. After a restart, if append admission proves that
+suffix eligible for replacement, a write session positions at that checkpoint
+EOD, and the caller sends the interrupted object again from byte zero. The rewrite
+replaces the uncommitted tail, and only the completed retry gets a filemark and
+enters the catalog. A stock tar
 implementation therefore still sees one complete tar stream for the object, not
 two pieces that need Remanence-specific joining.
 

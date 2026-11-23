@@ -245,10 +245,10 @@ promise. `rem-daemon` serves seven services:
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/index.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/library_runtime.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 Write sessions own parity epochs from open to end. The native log's
 `SessionOpened`, `SessionEnded`, and `ClosedOut` records select the next
-access's complete suffix proof. A crash-torn final file is identified by its
-observed-block SHA-256; live tails name Object or sidecar identities and bounded
-command outcomes. An accepted finalization plan takes priority over crash-tail
-recovery. Ordinary closeout never sets `FINAL_PARTIAL_EPOCH`.
+access's complete suffix proof. A readable crash-torn final fragment ending at
+physical EOD is identified by its observed-block SHA-256; live tails name Object
+or sidecar identities and bounded command outcomes. An accepted finalization plan
+takes priority over crash-tail recovery. Ordinary closeout never sets `FINAL_PARTIAL_EPOCH`.
 
 Clean close returns committed receipts before its short sidecar is written;
 the drive and tape lease remain held until closeout and ending are durable.
@@ -491,9 +491,9 @@ When those bounds differ, it records the exact EOD as a refinement of the same
 cursor raises a fence. An already exact ending needs no refinement record.
 This permits automatic recovery after buffered-tail loss; a crash tail
 containing a complete Object requires `rem tape supersede-tail` acknowledgement.
-A crash-only torn header prefix is named by its byte digest and must be proved
-exactly on the next access. Any due parity closeout runs before a new session
-opens. The retried Object starts from byte zero and has one trailing filemark.
+A readable crash-only torn header prefix ending at physical EOD is named by
+its byte digest and must be proved exactly on the next access. Any due parity
+closeout runs before a new session opens. The retried Object starts from byte zero and has one trailing filemark.
 A multi-member REM-OBJECT therefore stays one ordinary tar
 stream that standard tools can recover after a crash, and not two tape files
 that tar would have to join. Ordinary Object admission requires the drive to
