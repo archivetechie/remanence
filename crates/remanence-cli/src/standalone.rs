@@ -692,7 +692,24 @@ fn render_result(
             command: Tape::Finalize { .. }
         }
     ) && result.as_ref().is_ok_and(|v| v["finalized"] == false);
+    let inspection_error = match (&cli.command, &result) {
+        (
+            Command::Tape {
+                command:
+                    Tape::SupersedeTail {
+                        confirm_supersede, ..
+                    },
+            },
+            Ok(v),
+        ) if v.get("inspection").is_some() => Some(crate::torn_tail_inspection::refusal(
+            confirm_supersede.is_some(),
+        )),
+        _ => None,
+    };
     let value = match &result {
+        Ok(v) if inspection_error.is_some() => {
+            json!({"ok":false,"status":"inspection_only","error":inspection_error.unwrap(),"result":v})
+        }
         Ok(v) if incomplete_verification => {
             json!({"ok":false,"status":"failed","error":"full verification incomplete","result":v})
         }
@@ -716,6 +733,17 @@ fn render_result(
         let _ = writeln!(out, "{value}");
     } else {
         match &result {
+            Ok(v) if inspection_error.is_some() => {
+                let _ = write!(
+                    out,
+                    "{}",
+                    crate::torn_tail_inspection::render(
+                        v["tape_uuid"].as_str().unwrap_or_default(),
+                        &v["inspection"]
+                    )
+                );
+                let _ = writeln!(errors, "error: {}", inspection_error.unwrap());
+            }
             Ok(v) if matches!(cli.command, Command::Setup { .. }) => {
                 let _ = writeln!(
                     out,
@@ -775,7 +803,12 @@ fn render_result(
             Ok(_) => {}
         }
     }
-    if result.is_ok() && !incomplete_finalization && !incomplete_verification && !doctor_not_ready {
+    if result.is_ok()
+        && inspection_error.is_none()
+        && !incomplete_finalization
+        && !incomplete_verification
+        && !doctor_not_ready
+    {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

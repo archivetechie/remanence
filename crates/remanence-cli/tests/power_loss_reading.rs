@@ -1195,3 +1195,125 @@ fn measured_standalone_verification_initial_and_post_damage_refuse() {
         }
     }
 }
+
+/// An interrupted fourth put is reported as an inspection, never as a discard.
+fn plr2a2b_assert_inspection(output: &Output, expected_error: &str) -> serde_json::Value {
+    assert_eq!(output.code, ExitCode::from(1), "{output:?}");
+    let value = envelope(output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["status"], "inspection_only");
+    assert_eq!(value["error"], expected_error);
+    assert_eq!(value["result"]["mark_measured"], false);
+    assert_eq!(
+        value["result"]["inspection"]["named_files"],
+        serde_json::json!([])
+    );
+    assert_eq!(value["result"]["inspection"].as_object().unwrap().len(), 11);
+    assert!(!output.out.contains("discarded_object_ids"));
+    no_write(output);
+    value
+}
+
+#[test]
+fn plr2a2b_u1_json_inspection() {
+    let f = Fixture::new();
+    let world = f.reset_measured(true);
+    let output = command(
+        &f.root,
+        &world,
+        &["tape", "supersede-tail", "--acknowledge-tape", TAPE],
+    );
+    let value = plr2a2b_assert_inspection(
+        &output,
+        "inspection only: this build reports a torn tail and discards nothing",
+    );
+    let site = value["result"]["inspection"]["site"].as_str().unwrap();
+    println!("U1 inspection site={site}");
+    assert!(matches!(site, "open-scan" | "open-first-read"), "{value}");
+}
+
+#[test]
+fn plr2a2b_u2_json_inspection_refuses_confirmation() {
+    let f = Fixture::new();
+    let world = f.reset_measured(true);
+    let output = command(
+        &f.root,
+        &world,
+        &[
+            "tape",
+            "supersede-tail",
+            "--acknowledge-tape",
+            TAPE,
+            "--confirm-supersede",
+            "SUPERSEDE TAPE",
+        ],
+    );
+    plr2a2b_assert_inspection(
+        &output,
+        "SupersedeInspectionOnly: --confirm-supersede cannot discard a torn tail in this build",
+    );
+}
+
+#[test]
+fn plr2a2b_u3_human_inspection() {
+    let f = Fixture::new();
+    let world = f.reset_measured(true);
+    let state = remanence_state::StateHandle::open_from_config_file(config(&f.root)).unwrap();
+    let tape = state.catalog().get_tape_by_voltag(TAPE).unwrap().unwrap();
+    let uuid = uuid::Uuid::from_slice(&tape.tape_uuid).unwrap();
+    drop(state);
+    let output = run(
+        &f.root,
+        &world,
+        &[
+            "rem",
+            "--allow-untrusted-state-volume",
+            "tape",
+            "supersede-tail",
+            "--acknowledge-tape",
+            TAPE,
+            "--device",
+            DEVICE,
+            "--allow-device",
+            SERIAL,
+        ],
+        Arc::new(Mutex::new(None)),
+    );
+    assert_eq!(output.code, ExitCode::from(1), "{output:?}");
+    assert_eq!(
+        output.out.lines().next().unwrap(),
+        format!("Tape {uuid}: inspection only; nothing was written or discarded.")
+    );
+    assert_eq!(
+        output.out.lines().last().unwrap(),
+        "Whether a filemark or end-of-data mark follows the boundary was not measured."
+    );
+    assert_eq!(output.out.lines().count(), 8);
+    assert!(output.out.ends_with('\n'));
+    assert_eq!(
+        output.err.lines().last().unwrap(),
+        "error: inspection only: this build reports a torn tail and discards nothing"
+    );
+    no_write(&output);
+}
+
+#[test]
+fn plr2a2b_u4_put_guidance_preserves_suffix_diagnostic() {
+    let f = Fixture::new();
+    let world = f.reset_measured(true);
+    let path = f.root.join("plr2a2b-new-file.txt");
+    std::fs::write(&path, b"new put after the interrupted fourth put").unwrap();
+    let output = command(&f.root, &world, &["put", path.to_str().unwrap()]);
+    assert_eq!(output.code, ExitCode::from(1), "{output:?}");
+    let value = envelope(&output);
+    let sentence = ". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>` inspects the tape's end and reports what it finds.";
+    let error = value["result"]["summary"]["failed"]["error"]
+        .as_str()
+        .unwrap();
+    let original = error
+        .strip_suffix(sentence)
+        .expect("marked put carries inspection guidance");
+    assert!(original.contains("append suffix at LBA"), "{original}");
+    assert!(value["error"].as_str().unwrap().ends_with(sentence));
+    no_write(&output);
+}

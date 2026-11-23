@@ -2111,12 +2111,15 @@ fn gate2b_rejected_tail_remains_ineligible() {
             .iter()
             .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
         assert_eq!(fixture.world.lock().unwrap().tapes["HAND"].records, before);
-        let found = owner
+        let crate::SupersedeTailOutcome::Superseded(found) = owner
             .supersede_tail_confirmed("HAND", |_, found| {
                 assert!(!found.is_empty());
                 Ok(())
             })
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected superseded tail")
+        };
         assert!(!found.is_empty());
         assert!(owner
             .catalog_index()
@@ -2168,13 +2171,16 @@ fn fresh_missing_filemark_recovery_uses_typed_empty_prefix() {
             .pop();
         let manifest = state.library_runtime().manifest().clone();
         let mut owner = fixture.owner_with_recovery_observer(state, true);
-        let found = owner
+        let crate::SupersedeTailOutcome::Superseded(found) = owner
             .supersede_tail_confirmed("HAND", |confirmation, found| {
                 assert_eq!(confirmation, "SUPERSEDE HAND");
                 assert!(found.is_empty());
                 Ok(())
             })
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected superseded tail")
+        };
         assert!(found.is_empty());
         owner.finish().unwrap();
         let view =
@@ -2838,13 +2844,16 @@ fn standalone_contradiction_hold_blocks_tail_recovery_until_released() {
         .unwrap()
         .unwrap();
     assert_eq!(released.cause, lib::FenceCause::SessionSuffixContradiction);
-    let found = owner
+    let crate::SupersedeTailOutcome::Superseded(found) = owner
         .supersede_tail_confirmed("HAND", |request, found| {
             assert_eq!(request, "SUPERSEDE HAND");
             assert!(found.is_empty(), "{found:?}");
             Ok(())
         })
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("expected superseded tail")
+    };
     assert!(found.is_empty(), "{found:?}");
     assert!(fixture
         .index()

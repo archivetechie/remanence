@@ -1141,6 +1141,13 @@ pub(crate) fn tape_fence_detail(
     )
 }
 
+const TORN_TAIL_METADATA_KEY: &str = "remanence-torn-tail";
+
+/// Whether admission attached the torn-tail inspection label, regardless of its value.
+pub fn status_marks_torn_tail(status: &tonic::Status) -> bool {
+    status.metadata().contains_key(TORN_TAIL_METADATA_KEY)
+}
+
 /// A stale physical tail disables this tape alone. Probe failures without writes
 /// remain retryable and do not create durable quarantine or recovery state.
 pub(crate) fn daemon_admission_error(
@@ -1160,7 +1167,7 @@ pub(crate) fn daemon_admission_error(
             .attach(tonic::Status::unavailable(error.to_string()));
         if error.torn_tail().is_some() {
             status.metadata_mut().insert(
-                "remanence-torn-tail",
+                TORN_TAIL_METADATA_KEY,
                 tonic::metadata::MetadataValue::from_static("inspect"),
             );
         }

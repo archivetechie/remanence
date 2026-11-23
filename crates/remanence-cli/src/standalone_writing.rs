@@ -112,7 +112,14 @@ pub(super) fn dispatch(
                     }
                     match outcome.map_err(|error| {
                         output.tape_continuation = tape_continuation(&error);
-                        format!("{}: {error}", source.display())
+                        let message = format!("{}: {error}", source.display());
+                        if matches!(&error, remanence_api::MountError::Actor(failure)
+                            if remanence_api::status_marks_torn_tail(&failure.status))
+                        {
+                            crate::torn_tail_inspection::standalone_put_message(message)
+                        } else {
+                            message
+                        }
                     })? {
                         Ok((result, reason)) => {
                             render_written(result, reason, output, &mut objects)?;
@@ -158,7 +165,7 @@ pub(super) fn dispatch(
                 acknowledge_tape,
                 confirm_supersede,
             } => {
-                let discarded = backend.supersede_tail_confirmed(acknowledge_tape, |expected, found| {
+                let outcome = backend.supersede_tail_confirmed(acknowledge_tape, |expected, found| {
                         eprintln!("Tail to discard: {}", found.join(", "));
                         let confirmation = match confirm_supersede {
                             Some(value) => value.clone(),
@@ -177,7 +184,18 @@ pub(super) fn dispatch(
                         if confirmation != expected { return Err("supersede confirmation did not match".into()); }
                         Ok(())
                     }).map_err(err)?;
-                Ok(json!({"discarded_object_ids": discarded}))
+                match outcome {
+                    remanence_api::SupersedeTailOutcome::Superseded(discarded) => {
+                        Ok(json!({"discarded_object_ids": discarded}))
+                    }
+                    remanence_api::SupersedeTailOutcome::InspectionOnly {
+                        inspection,
+                        tape_log_sequence,
+                    } => Ok(
+                        json!({"tape_uuid": Uuid::from_bytes(uuid), "tape_log_sequence": tape_log_sequence,
+                            "inspection": crate::torn_tail_inspection::inspection_json(&inspection), "mark_measured": false}),
+                    ),
+                }
             }
             Tape::Finalize {
                 tape,

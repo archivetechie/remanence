@@ -2033,13 +2033,16 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
                 .supersede_tail_confirmed("HAND", |_, _| Err("no confirmation".into()))
                 .is_err());
             assert_eq!(dispatched_writes(&world), before);
-            let discarded = actor
+            let crate::SupersedeTailOutcome::Superseded(discarded) = actor
                 .supersede_tail_confirmed("HAND", |expected, found| {
                     assert_eq!(expected, "SUPERSEDE HAND");
                     assert_eq!(found, std::slice::from_ref(&b_id));
                     Ok(())
                 })
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("expected superseded tail")
+            };
             assert_eq!(discarded, std::slice::from_ref(&b_id));
             use remanence_state::authority::TapeAuthorityView as _;
             let authority = remanence_state::TapeAuthority::open(
@@ -2325,14 +2328,17 @@ fn bootstrap_without_filemark_can_be_explicitly_superseded() {
     let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
-    assert!(actor
+    let crate::SupersedeTailOutcome::Superseded(discarded) = actor
         .supersede_tail_confirmed("HAND", |expected, found| {
             assert_eq!(expected, "SUPERSEDE HAND");
             assert!(found.is_empty());
             Ok(())
         })
         .unwrap()
-        .is_empty());
+    else {
+        panic!("expected superseded tail")
+    };
+    assert!(discarded.is_empty());
     actor
         .write_checkpointed(request(root.path(), "after-bootstrap-recovery"))
         .unwrap();
@@ -4349,4 +4355,34 @@ fn plr2a2a_t1d_plaintext_line_separators() {
         inspection.head
     );
     assert_eq!(inspection.head, "object left?middle?界");
+}
+
+/// The standalone inspection must return before entering operator confirmation.
+#[test]
+fn plr2a2b_a1_standalone_inspection_skips_confirmation() {
+    let Plr2a2aFixture {
+        root,
+        world,
+        mut state,
+        sequence,
+        cursor,
+        ..
+    } = plr2a2a_fixture("open");
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, _reopen) = own_mount!(mount, mounted, state);
+    let outcome = actor
+        .supersede_tail_confirmed("HAND", |_, _| panic!("inspection reached confirmation"))
+        .unwrap();
+    let crate::SupersedeTailOutcome::InspectionOnly {
+        inspection,
+        tape_log_sequence,
+    } = outcome
+    else {
+        panic!("expected inspection only")
+    };
+    assert_eq!(tape_log_sequence, sequence);
+    assert_eq!(inspection.site, "open-scan");
+    assert_eq!(inspection.cursor_lba, cursor);
+    actor.finish().unwrap();
 }

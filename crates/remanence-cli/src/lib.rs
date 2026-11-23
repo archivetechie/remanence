@@ -113,6 +113,7 @@ mod tape_finalize;
 #[path = "dev/tape_image.rs"]
 mod tape_image;
 mod tape_supersede;
+mod torn_tail_inspection;
 // Test-only fixtures exercise operator inventory and recovery projections.
 #[cfg(test)]
 #[allow(dead_code)]
