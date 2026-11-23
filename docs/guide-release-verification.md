@@ -103,8 +103,14 @@ binary release when a version tag is pushed. Before it publishes, it requires
 the tag to be annotated, signed and verified by GitHub, to name a commit in
 the history of `main` whose CI run succeeded, and to match the workspace
 version. It repeats the formatting, lint and test checks and builds the four
-programs as static Linux binaries. It then unpacks the archive on a clean
-runner and runs each binary in an otherwise empty root directory. [Installing
+programs as static Linux binaries. A second build in another directory must
+produce the same four binary digests before publication. The workflow also
+unpacks the archive on a clean runner and runs each binary in an otherwise
+empty root directory. After publishing, the `check-published` job downloads the
+release and runs the checksum, attestation, tag-signature and source-commit
+checks below. [Rebuilding a release to
+compare](guide-install.md#rebuilding-a-release-to-compare) describes how to
+repeat the binary comparison from the tag. [Installing
 Remanence](guide-install.md#when-a-binary-release-is-published) lists the
 files such a release carries.
 
@@ -165,9 +171,15 @@ example `0.2.0`.
 ## What the checks do not promise
 
 The workflow pins its GitHub Actions and its Rust toolchain by exact
-reference. The runner images and the operating system's package repositories
-are maintained outside the project, so the records do not promise that a
-rebuild produces identical bytes. They record what the build used.
+reference, remaps build paths and requires identical bytes from two builds of
+the four binaries before publishing. A later rebuild needs the same source
+commit and tags, no build-string override, the same Rust toolchain, and the
+same C compiler, linker and musl. Ubuntu 24.04's packages can change between
+updates, and bundled SQLite embeds the GCC version. The build records name
+the runner image and its version, not the package versions; the build log
+prints the C compiler and linker versions. These checks do not promise a
+match with different tools or packages. [Rebuilding a release to
+compare](guide-install.md#rebuilding-a-release-to-compare) gives the procedure.
 
 A binary release is separate from the publication of the specifications and
 from their deposits. Checking a release says nothing about which revision of

@@ -7,6 +7,11 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Unreleased
 
+- Release builds remap source paths and run on Ubuntu 24.04. The workflow
+  builds the four binaries twice in separate directories, stops publication
+  if their SHA-256 digests differ, and checks the published release's
+  checksums, attestations, tag signature and source commit. The installation
+  guide describes rebuilding from the tag to compare binary digests.
 - On a marked write-open refusal for a torn-tail READ, `rem put` preserves the
   admission diagnostic and adds route-specific inspection guidance. A failure
   during automatic finalization at write-open does not add the inspection sentence.

@@ -23,7 +23,7 @@ env:
 jobs:
   build:
     name: Build static Linux binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
@@ -79,13 +79,7 @@ jobs:
           cargo test --workspace --locked
 
       - name: Build static binaries
-        run: |
-          cargo build --release --locked --target "$TARGET" \
-            -p remanence-cli -p remanence-daemon -p rem-recover \
-            --bin rem --bin rem-debug --bin rem-daemon --bin rem-recover
-          for bin in rem rem-debug rem-daemon rem-recover; do
-            file "target/$TARGET/release/$bin" | grep -E 'statically linked|static-pie linked'
-          done
+        run: tools/release_build.sh
 
       - name: Package and checksum artifacts
         env:
@@ -129,7 +123,7 @@ jobs:
   verify:
     name: Verify the archive on a clean runner
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
@@ -182,11 +176,66 @@ jobs:
           tar -C unpacked -xzf dist/rem-recover-x86_64-linux-musl.tar.gz
           cmp unpacked/rem-recover-x86_64-linux-musl/rem-recover "$root/bin/rem-recover"
 
+  rebuild:
+    name: Rebuild in a second directory and compare
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout source in a second directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: second-build-directory/remanence
+
+      - name: Install Rust and the musl target
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools file
+
+      - name: Build with a separate Cargo home
+        working-directory: second-build-directory/remanence
+        run: |
+          export CARGO_HOME="$RUNNER_TEMP/second-cargo-home"
+          tools/release_build.sh
+
+      - name: Download the first build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run download "$GITHUB_RUN_ID" --name release-dist --dir "$RUNNER_TEMP/first-build"
+
+      - name: Compare all four binaries
+        env:
+          ARCHIVE: ${{ needs.build.outputs.archive }}
+        run: |
+          set -euo pipefail
+          first="$RUNNER_TEMP/first-build"
+          tar -C "$first" -xzf "$first/$ARCHIVE.tar.gz"
+          second="second-build-directory/remanence/target/$TARGET/release"
+          differs=0
+          for bin in rem rem-debug rem-daemon rem-recover; do
+            first_digest=$(sha256sum "$first/$ARCHIVE/bin/$bin")
+            second_digest=$(sha256sum "$second/$bin")
+            printf '%s\n%s\n' "$first_digest" "$second_digest"
+            if [ "${first_digest%% *}" != "${second_digest%% *}" ]; then
+              echo "rebuild differs: $bin" >&2
+              differs=1
+            fi
+          done
+          exit "$differs"
+
   publish:
     name: Publish the GitHub release
-    needs: [build, verify]
+    needs: [build, verify, rebuild]
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: read
@@ -216,3 +265,49 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.json \
             dist/THIRD-PARTY-LICENSES.html dist/SHA256SUMS --verify-tag --generate-notes
+
+  check-published:
+    name: Check the published release as a user would
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download and verify the published release
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/published-release"
+          cd "$RUNNER_TEMP/published-release"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          sha256sum --strict -c SHA256SUMS
+          declare -A listed=([SHA256SUMS]=1)
+          while read -r checksum file; do
+            file=${file#\*}
+            listed["$file"]=1
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done < SHA256SUMS
+          shopt -s nullglob dotglob
+          for file in *; do
+            if [ -f "$file" ] && [ -z "${listed[$file]+present}" ]; then
+              echo "published file is not listed in SHA256SUMS: $file" >&2
+              exit 1
+            fi
+          done
+          oid=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          verification=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$oid" --jq '.verification | {verified, reason}')
+          printf '%s\n' "$verification"
+          if [ "$(jq -r '.verified' <<< "$verification")" != true ]; then
+            echo "GitHub has not verified the release tag signature" >&2
+            exit 1
+          fi
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$oid" --jq .object.sha)
+          source_sha=$(jq -er '.source_sha' release-manifest.json)
+          if [ "$source_sha" != "$tag_sha" ] || [ "$source_sha" != "$GITHUB_SHA" ]; then
+            echo "release-manifest.json source_sha differs from the tag commit or GITHUB_SHA" >&2
+            exit 1
+          fi

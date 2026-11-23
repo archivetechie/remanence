@@ -109,13 +109,14 @@ The binaries from `cargo build --release` are linked against the build host's
 GNU C library, and they run on hosts with the same or a newer version. For a
 host with an older C library, build statically linked binaries for the musl
 target instead. They load no shared library from the host, so the host's C
-library version does not matter. This is how the release workflow builds them.
+library version does not matter. Run `tools/release_build.sh` from the repository
+root to use the release workflow's own build. It remaps the Cargo, checkout and
+Rust standard-library source paths and prints the four binaries' SHA-256 digests.
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
-sudo apt install musl-tools        # Debian and Ubuntu: provides musl-gcc
-cargo build --release --locked --target x86_64-unknown-linux-musl \
-    -p remanence-cli -p remanence-daemon -p rem-recover
+sudo apt install musl-tools file   # Debian and Ubuntu: provides musl-gcc and file
+tools/release_build.sh
 ```
 
 The binaries are then in `target/x86_64-unknown-linux-musl/release/`.
@@ -329,6 +330,50 @@ carries these files:
 The binaries are statically linked against the musl C library and built with
 the default features, so `rem watch` is not in them. Before a release is
 published, the workflow unpacks the archive on a clean machine and runs each
-binary in an otherwise empty root directory. [Release
-verification](guide-release-verification.md) explains how to check the
-downloaded files against `SHA256SUMS` and the build attestation.
+binary in an otherwise empty root directory. It also builds the four binaries
+a second time in another directory, with a separate Cargo home, and stops the
+release if any binary differs. After publishing, its `check-published` job
+downloads the release and checks the checksums, attestations, tag signature and
+source commit. [Release
+verification](guide-release-verification.md#check-a-binary-release) explains how
+to check the downloaded files yourself.
+
+### Rebuilding a release to compare
+
+Use Ubuntu 24.04 on x86-64; a fresh container such as `ubuntu:24.04` is the
+simplest starting point. Use no Cargo configuration or environment of your own
+that sets the compiler, linker, profile or target directory. Install rustup,
+then install `musl-tools`, `file`, `git` and the C build tools from Ubuntu's
+packages. Run the package commands as root in a container, omitting `sudo`.
+
+Use the Rust toolchain named in the release's `build-remanence-linux.json`
+`rustc` field, with the musl target. This workflow uses 1.95.0:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential musl-tools file git
+rustup toolchain install 1.95.0 --target x86_64-unknown-linux-musl
+git clone https://github.com/archivetechie/remanence
+cd remanence
+git checkout v<VERSION>
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS REMANENCE_SOFTWARE_BUILD
+RUSTUP_TOOLCHAIN=1.95.0 tools/release_build.sh
+```
+
+Replace `<VERSION>` with the release's version and `1.95.0` with its recorded
+toolchain version if different. Keep the tags in the git checkout: the build
+string includes `git describe --always --tags`, and a source archive without
+git metadata or a `REMANENCE_SOFTWARE_BUILD` override changes it. The script
+refuses non-blank `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` and
+`REMANENCE_SOFTWARE_BUILD`.
+
+Unpack the operator archive and run `sha256sum` on its `bin/*`. Compare those
+four digests with the script's printed digests for `rem`, `rem-debug`,
+`rem-daemon` and `rem-recover`.
+
+A match depends on the same Rust toolchain and the same C compiler, linker
+and musl. The latter come from Ubuntu 24.04's packages and can change between
+package updates; bundled SQLite records the GCC version in the binary. The
+manifest's build `runner` field names the runner image and its version, not
+package versions. The release build's log prints the C compiler and linker
+versions reported by the script, so compare those when the digests differ.

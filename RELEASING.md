@@ -15,8 +15,12 @@ gates, builds statically linked (musl) binaries, and packs
 `rem-debug`, `rem-daemon` and `rem-recover` with the README, the licensing
 files and `docs/`, and a separate `rem-recover` archive. A second job unpacks
 the archive on a clean runner, runs each binary in an empty root directory and
-checks that it reports the tag's version. The GitHub release is created, with
-the checksums and generated notes, only after that job passes. A manual run of
+checks that it reports the tag's version. The `rebuild` job builds the same
+commit in another directory and stops publication if any of the four binary
+digests differs; the GitHub release is created, with the checksums and
+generated notes, only after both jobs pass. After publishing, `check-published`
+downloads the release and verifies its checksums, attestations, tag signature
+and source commit. A manual run of
 the workflow on a branch builds and verifies the same files as a workflow
 artifact and publishes nothing. The recovery archive is separate so
 an operator can preserve it with key escrow without depending on a full
