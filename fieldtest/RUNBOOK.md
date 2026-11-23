@@ -591,8 +591,17 @@ up. It writes random A and B objects to `fieldtest-a`, reads both back, and
 requires B to land on A's tape. Each source file is 64 MiB (4 MiB on a VTL),
 overridable with `FIELD_RESTORE_TAIL_MB`.
 
+The plan has no reset or init leg: it needs a kit home whose state is already
+in the current state format with appendable `fieldtest-a` media; on a fresh or
+older home, daemon start and `rem tape init` refuse ("predates the current
+tape-log format"), so first run `05-reset-state.sh` then `10-init-pools.sh`
+(`FIELD_INIT_ALLOW_REINIT=1` if this home already initialized those barcodes;
+see item 5), which reinitializes the scratch tapes.
+
 The home and `state/` must share a filesystem; before the first snapshot stop,
-free space must cover three times the state size plus 1 GiB. Before each
+free space on the home's filesystem must cover four times the state size plus
+1 GiB (the two saved copies and each restore's staged copy, kept until PASS);
+the copies must also pass the kit's disk guard on the spool's filesystem. Before each
 snapshot stop, any `data.closeout_debt` anywhere in the catalogue (or a missing
 key) causes FAIL with `current (nothing swapped)`, before that stop or snapshot.
 The leg stops cleanly to save `older` and `newer` copies under the state lock.
