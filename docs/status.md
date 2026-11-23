@@ -12,8 +12,9 @@ Remanence is alpha software. It has had limited operational testing, so do not
 make it the only copy of anything. 0.2.0 is the first binary release;
 [Installing Remanence](guide-install.md) also covers building from source.
 [Releases and versions](#releases-and-versions) explains the version numbers.
-When `rem put` is refused at a torn tail (a power cut during a write), the
-refusal names `rem tape supersede-tail` for the
+When `rem put` is refused at a write-open because the tape's recorded end is a
+torn tail (one possible cause is a power cut during a write), the refusal names
+`rem tape supersede-tail` for the
 [standalone](reference-cli.md#rem-tape-supersede-tail-standalone) or
 [library](reference-cli.md#rem-tape-supersede-tail-library) route.
 On an eligible tail, that command's first run prints its inspection, writes

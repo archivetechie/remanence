@@ -148,7 +148,7 @@ Rust standard-library source paths and prints the four binaries' SHA-256 digests
 ```sh
 rustup target add x86_64-unknown-linux-musl
 sudo apt install musl-tools file   # Debian and Ubuntu: provides musl-gcc and file
-tools/release_build.sh &&
+TARGET=x86_64-unknown-linux-musl tools/release_build.sh &&
     binary_dir=target/x86_64-unknown-linux-musl/release
 ```
 

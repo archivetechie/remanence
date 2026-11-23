@@ -422,7 +422,7 @@ succeeds. Replace `<SERIAL>` with your library's serial:
 
 ```sh
 sudo install -d /etc/rem &&
-sudo sh -c 'set -C; cat > /etc/rem/config.toml' <<'TOML' &&
+sudo sh -c '[ ! -e /etc/rem/config.toml ] && [ ! -L /etc/rem/config.toml ] && set -C && cat > /etc/rem/config.toml' <<'TOML' &&
 [daemon]
 state_dir = "/var/lib/rem"
 default_idle_timeout_seconds = 300
