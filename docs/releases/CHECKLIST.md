@@ -117,8 +117,9 @@ is forbidden. A manual run on a tag behaves like the tag push. The workflow:
 3. runs `cargo fmt --all --check`,
    `cargo clippy --workspace --all-targets --locked -- -D warnings` and
    `cargo test --workspace --locked` with Rust 1.95.0;
-4. builds `rem`, `rem-debug`, `rem-daemon` and `rem-recover` for
-   `x86_64-unknown-linux-musl` and checks that each is statically linked;
+4. runs `tools/release_build.sh` to build `rem`, `rem-debug`, `rem-daemon` and
+   `rem-recover` for `x86_64-unknown-linux-musl` with remapped paths, check that
+   each is statically linked, and print their SHA-256 digests;
 5. packages `remanence-<version>-x86_64-unknown-linux-musl.tar.gz`, with the
    four binaries under `bin/`, `README.md`, `LICENSING.md`,
    `LICENSE-APACHE-2.0`, `THIRD-PARTY-LICENSES.html` from `cargo about` 0.9.1
@@ -130,10 +131,18 @@ is forbidden. A manual run on a tag behaves like the tag push. The workflow:
    `SHA256SUMS`, unpacks the archive, and runs each binary in an otherwise
    empty root, where `rem`, `rem-debug` and `rem-daemon` must print the tag's
    version, or on a preview the workspace version, with `--version`;
-8. on a tag only, attests the files listed in `SHA256SUMS`; and
-9. on a tag only, creates the GitHub release with the two archives, the three
-   JSON files, `THIRD-PARTY-LICENSES.html` and `SHA256SUMS`, using GitHub's
-   generated notes.
+8. in the `rebuild` job, builds the same commit with `tools/release_build.sh`
+   in another directory and a separate Cargo home, compares all four binary
+   digests with the first archive, and stops publication if any differs;
+9. on a tag only, attests the files listed in `SHA256SUMS`;
+10. on a tag only, creates the GitHub release with the two archives, the three
+    JSON files, `THIRD-PARTY-LICENSES.html` and `SHA256SUMS`, using GitHub's
+    generated notes; and
+11. after publishing, runs `check-published` to download the release, check
+    every checksum and attestation, reject unlisted files, verify the tag
+    signature, and match the manifest's source commit to the tag and workflow.
+
+All five release jobs run on Ubuntu 24.04.
 
 - [ ] Watch the run to completion. *Not confirmed:* what to do when it fails
   part-way. Re-running the workflow suits a transient failure; a failure in
@@ -141,10 +150,11 @@ is forbidden. A manual run on a tag behaves like the tag push. The workflow:
 
 ## 7. After the release
 
-- [ ] Download the release files, run `sha256sum -c SHA256SUMS`, and verify
-  the attestations with GitHub's attestation tooling, as
-  [release verification](../guide-release-verification.md) describes.
-  *Not confirmed:* the exact verification command.
+- [ ] Confirm that the workflow's `check-published` job passes. It downloads
+  the release files, runs `sha256sum --strict -c SHA256SUMS`, verifies every
+  attestation and checks the tag signature and source commit, as
+  [release verification](../guide-release-verification.md#check-a-binary-release)
+  describes.
 - [ ] *Not confirmed:* replace the generated release notes with the final note.
 - [ ] *Not confirmed:* the Zenodo software record. The README says released
   versions are archived under concept DOI 10.5281/zenodo.21551570. RELEASING.md

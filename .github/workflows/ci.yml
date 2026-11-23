@@ -49,8 +49,8 @@ jobs:
           python3 -m unittest tools/test_check_guide.py
           python3 -m unittest tools/test_zenodo_deposit.py
 
-      - name: Test release evidence boundaries
-        run: python3 -m unittest discover -s tools -p 'test_release_evidence.py'
+      - name: Test the release tools
+        run: python3 -m unittest discover -s tools -p 'test_release_*.py'
 
       - name: Check formatting
         run: cargo fmt --all --check
