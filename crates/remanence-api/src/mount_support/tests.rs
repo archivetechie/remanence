@@ -3738,6 +3738,7 @@ struct Plr2a2aFixture {
     state: StateHandle,
     cursor: u64,
     sequence: u64,
+    acknowledged_sequence: Option<u64>,
 }
 const PLR2A2A_ID: &str = "00000000-0000-4000-8000-000000000001";
 const PLR2A2A_SECOND: &str = "00000000-0000-4000-8000-000000000002";
@@ -3778,8 +3779,10 @@ fn plr2a2a_fixture(case: &str) -> Plr2a2aFixture {
             },
         )
         .unwrap();
+    let acknowledgement_snapshot = (case == "acknowledged").then(|| lease.freeze().unwrap());
+    let mut acknowledged_sequence = None;
     let mut files = vec![];
-    if !matches!(case, "open" | "empty") {
+    if !matches!(case, "open" | "empty" | "plain-separators") {
         files.push(TailFile {
             tape_file_number: next_file,
             identity: if case == "torn-prefix" {
@@ -3833,7 +3836,11 @@ fn plr2a2a_fixture(case: &str) -> Plr2a2aFixture {
     runtime.refresh_native(&snapshot).unwrap();
     runtime.catch_up().unwrap();
     if case == "acknowledged" {
-        let at = runtime.native_reference(&snapshot).unwrap();
+        let at = runtime
+            .native_reference(acknowledgement_snapshot.as_ref().unwrap())
+            .unwrap();
+        assert_ne!(at.sequence, sequence);
+        acknowledged_sequence = Some(at.sequence);
         let mut bytes = Vec::new();
         for file in &files {
             lib::session_ack::write_preview_file(&mut bytes, file).unwrap();
@@ -3861,7 +3868,7 @@ fn plr2a2a_fixture(case: &str) -> Plr2a2aFixture {
                 .unwrap()
                 .at
                 .sequence,
-            sequence
+            at.sequence
         );
     }
     let native = state
@@ -3948,6 +3955,9 @@ fn plr2a2a_fixture(case: &str) -> Plr2a2aFixture {
         assert!(runtime.projection_lag(UUID).is_none());
     }
     let block = |id: &str| {
+        if case == "plain-separators" {
+            return plr2a2a_plain_separator_head();
+        }
         let header = remanence_aead::RemObjectHeader::new_envelope(BLOCK, [1; 16], 32, id, 2048)
             .unwrap()
             .serialize()
@@ -3988,6 +3998,7 @@ fn plr2a2a_fixture(case: &str) -> Plr2a2aFixture {
         state,
         cursor,
         sequence,
+        acknowledged_sequence,
     }
 }
 
@@ -4151,7 +4162,13 @@ fn plr2a2a_t3_refusals() {
         assert!(error.message().starts_with(name), "{case}: {error}");
         assert!(error.message().contains(detail), "{case}: {error}");
         if case == "acknowledged" {
-            assert!(error.message().contains(&f.sequence.to_string()));
+            assert_eq!(
+                error.message(),
+                format!(
+                    "TornTailAcknowledged: session acknowledged at tape-log sequence {}",
+                    f.acknowledged_sequence.unwrap()
+                )
+            );
         }
     }
 }
@@ -4214,6 +4231,7 @@ fn plr2a2a_standalone(confirm: bool) -> Result<crate::pb::SupersedeTailResponse,
         mut state,
         sequence,
         cursor,
+        ..
     } = plr2a2a_fixture("open");
     let paths = state.paths().clone();
     let library_uuid = state.library_runtime().manifest().library_uuid();
@@ -4294,4 +4312,41 @@ fn plr2a2a_t8_standalone_ordinary_preview() {
     assert!(!response.completed);
     assert_eq!(response.tape_log_sequence, 0);
     actor.finish().unwrap();
+}
+
+/// A short plaintext identity distinguishes line separators from valid multibyte text.
+const PLR2A2A_SEPARATOR_ID: &str = "left\u{2028}middle\u{2029}界";
+
+/// Retain a global PAX identity head followed by the fixture's existing torn suffix.
+fn plr2a2a_plain_separator_head() -> Vec<u8> {
+    let pax = remanence_format::pax::encode_pax_records(&BTreeMap::from([(
+        "REMANENCE.object_id".into(),
+        PLR2A2A_SEPARATOR_ID.into(),
+    )]))
+    .unwrap();
+    let header = remanence_format::tar::encode_header(
+        "global-pax",
+        pax.len() as u64,
+        remanence_format::tar::TYPE_PAX_GLOBAL,
+        0o644,
+    )
+    .unwrap();
+    let mut first = vec![0; BLOCK as usize];
+    first[..header.len()].copy_from_slice(&header);
+    first[header.len()..header.len() + pax.len()].copy_from_slice(&pax);
+    first
+}
+
+/// T1d: the service displays a plaintext Object identity on one line without losing UTF-8.
+#[test]
+fn plr2a2a_t1d_plaintext_line_separators() {
+    let mut f = plr2a2a_fixture("plain-separators");
+    let response = plr2a2a_call(&mut f, false).unwrap();
+    let inspection = response.inspection.unwrap();
+    assert!(
+        !inspection.head.contains(['\u{2028}', '\u{2029}']),
+        "inspection head contains a Unicode line separator: {:?}",
+        inspection.head
+    );
+    assert_eq!(inspection.head, "object left?middle?界");
 }

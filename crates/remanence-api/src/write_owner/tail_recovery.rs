@@ -17,7 +17,11 @@ pub(crate) enum SupersedeResult {
 fn inspection_line(value: &str) -> String {
     let mut line = String::new();
     for ch in value.chars() {
-        let ch = if ch.is_control() { '?' } else { ch };
+        let ch = if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            '?'
+        } else {
+            ch
+        };
         if line.len() + ch.len_utf8() > 256 {
             break;
         }
@@ -262,15 +266,21 @@ pub(crate) fn supersede_mounted_tail(
                 ));
             }
             let ineligible = |reason: &str| failure(format!("TornTailIneligible: {reason}"));
+            let cursor = record
+                .cursor
+                .ok_or_else(|| ineligible("missing committed cursor"))?;
+            let site = match record.site {
+                Some(TornTailSite::OpenFirstRead) => "open-first-read",
+                Some(TornTailSite::OpenScan) => "open-scan",
+                Some(TornTailSite::NamedFile { .. }) => "named-file",
+                None => return Err(ineligible("missing inspection site")),
+            };
             if last.is_none() {
                 return Err(ineligible("fresh or bootstrap authority"));
             }
             if repaired_tail {
                 return Err(ineligible("repair pending"));
             }
-            let cursor = record
-                .cursor
-                .ok_or_else(|| ineligible("missing committed cursor"))?;
             let summary = snapshot.tape_summary();
             let mut named_files = Vec::new();
             let session_id = if named {
@@ -322,6 +332,7 @@ pub(crate) fn supersede_mounted_tail(
                 {
                     return Err(ineligible("proved EOD differs from the committed boundary"));
                 }
+                // The preceding check returns for every other Some value, leaving only C's LBA.
                 if ending.proved_eod.is_some() && record.blocks_read > 0 {
                     return Err(ineligible(
                         "proved EOD at the committed boundary contradicts readable blocks",
@@ -363,12 +374,6 @@ pub(crate) fn supersede_mounted_tail(
                     "SupersedeInspectionOnly: torn-tail inspection cannot confirm a discard".into(),
                 ));
             }
-            let site = match record.site {
-                Some(TornTailSite::OpenFirstRead) => "open-first-read",
-                Some(TornTailSite::OpenScan) => "open-scan",
-                Some(TornTailSite::NamedFile { .. }) => "named-file",
-                None => return Err(ineligible("missing inspection site")),
-            };
             let head = if named {
                 match (&record.head.identity, named_files.first()) {
                     (TornTailIdentity::Matches, Some(first)) => format!("matches {first}"),
@@ -762,4 +767,15 @@ pub(crate) fn cut_after_recovery_effect(library: [u8; 16]) {
 #[cfg(test)]
 fn take_effect_cut(library: [u8; 16]) -> bool {
     effect_cuts().lock().unwrap().remove(&library)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Sanitize before truncating, and never retain part of a UTF-8 character.
+    #[test]
+    fn inspection_line_preserves_character_boundaries_and_replaces_separators() {
+        let ascii = "a".repeat(255);
+        assert_eq!(super::inspection_line(&format!("{ascii}界")), ascii);
+        assert_eq!(super::inspection_line("a\u{2028}b\u{2029}c\n"), "a?b?c?");
+    }
 }

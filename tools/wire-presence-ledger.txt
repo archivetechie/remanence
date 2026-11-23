@@ -246,4 +246,4 @@ TornTailInspection.file_start_lba     always set when inspection is present; zer
 TornTailInspection.failing_lba        always set when inspection is present; zero is a real failing LBA
 TornTailInspection.blocks_read        always set when inspection is present; zero is a real readable-block count
 TornTailInspection.read_sense         always set when inspection is present; empty means no current sense was decoded (qualifying evidence today always has one)
-TornTailInspection.head               always set when inspection is present; unknown explicitly represents an undecided head
+TornTailInspection.head               always set when inspection is present; unknown means no kept block or an undecided identity; at a named site, unknown is used unless the head matches and a rendered first named file is available
