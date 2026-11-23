@@ -591,18 +591,27 @@ up. It writes random A and B objects to `fieldtest-a`, reads both back, and
 requires B to land on A's tape. Each source file is 64 MiB (4 MiB on a VTL),
 overridable with `FIELD_RESTORE_TAIL_MB`.
 
-The leg stops cleanly to save `older` and `newer` copies of the daemon state,
-then restores `older`. It attempts C once, pinned to A's tape: the operator
+The home and `state/` must share a filesystem; before the first snapshot stop,
+free space must cover three times the state size plus 1 GiB. Before each
+snapshot stop, any `data.closeout_debt` anywhere in the catalogue (or a missing
+key) causes FAIL with `current (nothing swapped)`, before that stop or snapshot.
+The leg stops cleanly to save `older` and `newer` copies under the state lock.
+It stages and verifies each restore by manifest before moving state entries,
+retaining displaced entries until PASS. It restores `older` and attempts C
+once, pinned to A's tape: the operator
 should see `TailBeyondKnownState`, guidance to start from a newer copy of the
-state directory, and a successful read of A through the write fence. It puts
+state directory, a confirmed durable write fence on that tape, and a successful
+read of A through the fence. It puts
 back `newer` and tries the same pinned C again; C must commit on that tape,
-and B and C must read successfully. A PASS leaves the daemon up, no write
-fence, and removes the snapshots. Evidence is in `evidence/14-restore-tail/`.
+and B and C must read successfully. At its own PASS exit the leg leaves the
+daemon up, no write fence, and removes the snapshots. Evidence is in
+`evidence/14-restore-tail/`.
 
-A FAIL preserves the snapshots under `<home>/restore-tail/<timestamp-id>/`
-and names the state in place. If it names `older` or `live`, run no other plan
+A FAIL preserves any snapshots under `<home>/restore-tail/<timestamp-id>/`
+and names the state in place. If it names `older` or `partial`, run no other plan
 with that kit home: send the evidence pack. The snapshots stay on the host;
 the pack carries the leg's evidence and their location. An unexpected C result
 under `older` also leaves `OUTCOME` (`accepted` or `other`) beside both snapshots
-and in the leg's evidence directory. Do not put back another state copy after
-that result.
+and in the leg's evidence directory. On that FAIL the leg exits with the daemon
+up and does nothing more; the plan's teardown then stops the daemon as after
+any fatal leg. Do not put back another state copy after that result.
