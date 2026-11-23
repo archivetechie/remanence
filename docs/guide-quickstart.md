@@ -415,14 +415,14 @@ Both commands also take `--json`.
 <!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs crates/remanence-state/src/lock.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/read_session.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/api_state.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Running the daemon (requires hardware)
 
-The daemon reads a configuration file. Create the state directory, owned by
-the account that will run the daemon, and save a minimal configuration as
-`/etc/rem/config.toml`. Replace `<SERIAL>` with your library's serial:
+This section is for a fresh host. The daemon reads a configuration file;
+create `/etc/rem/config.toml` first, refusing an existing file, then create the
+state directory owned by the account that will run the daemon only if that
+succeeds. Replace `<SERIAL>` with your library's serial:
 
 ```sh
-sudo install -d -o "$USER" -m 0700 /var/lib/rem
-sudo install -d /etc/rem
-sudo tee /etc/rem/config.toml > /dev/null <<'TOML'
+sudo install -d /etc/rem &&
+sudo sh -c 'set -C; cat > /etc/rem/config.toml' <<'TOML' &&
 [daemon]
 state_dir = "/var/lib/rem"
 default_idle_timeout_seconds = 300
@@ -449,6 +449,7 @@ sqlite_path = "/var/lib/rem/rem-state.sqlite"
 [cache]
 tape_catalog_dir = "/var/lib/rem/tape-catalog"
 TOML
+sudo install -d -o "$USER" -m 0700 /var/lib/rem
 ```
 
 The daemon acts only on the libraries listed under `[[libraries]]`. A **tape

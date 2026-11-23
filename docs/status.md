@@ -12,10 +12,15 @@ Remanence is alpha software. It has had limited operational testing, so do not
 make it the only copy of anything. 0.2.0 is the first binary release;
 [Installing Remanence](guide-install.md) also covers building from source.
 [Releases and versions](#releases-and-versions) explains the version numbers.
-For a torn tail left by a power cut during a write, the refusal points to
-[`rem tape supersede-tail`](reference-cli.md#rem-tape-supersede-tail-standalone),
-which inspects that tail, prints its findings, writes nothing to the tape and
-exits 1 even with confirmation; repair for further writing is planned for 0.3.0.
+When `rem put` is refused at a torn tail (a power cut during a write), the
+refusal names `rem tape supersede-tail` for the
+[standalone](reference-cli.md#rem-tape-supersede-tail-standalone) or
+[library](reference-cli.md#rem-tape-supersede-tail-library) route.
+On an eligible tail, that command's first run prints its inspection, writes
+nothing to the tape and exits 1, even with confirmation. Other refusals,
+including eligibility checks, automatic finalization failures and a
+confirmation rescan, end without an inspection report. Repair for further
+writing is planned for 0.3.0.
 
 The parts that put bytes on tape and get them back are the most mature. A tape
 written today can be recovered without the catalog, without the daemon, and

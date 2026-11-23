@@ -9,7 +9,8 @@ The host preparation that follows is the same for both routes.
 
 ## Before you start
 
-The release archive needs a Linux x86-64 host, `tar` and `sha256sum`.
+The release route needs a Linux x86-64 host, `tar`, `sha256sum` and a GitHub CLI
+that supports `gh attestation verify`.
 For the source route, use a Linux host with:
 
 - `git` and a C compiler (`build-essential` on Debian and Ubuntu, `gcc` on
@@ -23,16 +24,26 @@ unless you add the optional feature described under
 
 ## Install the release
 
-Download `remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz` and `SHA256SUMS`
-from the [v0.2.0 GitHub release](https://github.com/archivetechie/remanence/releases/tag/v0.2.0).
-Check the download as [Release verification](guide-release-verification.md#check-a-binary-release)
-describes, downloading the other checksum-listed files for the complete check.
-After verification, extract the archive in an empty directory and enter it:
+Download every asset from the
+[v0.2.0 GitHub release](https://github.com/archivetechie/remanence/releases/tag/v0.2.0)
+once into a fresh empty directory:
 
 ```sh
-mkdir remanence-0.2.0
-cd remanence-0.2.0
-tar -xzf ../remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz
+mkdir remanence-0.2.0-download &&
+    cd remanence-0.2.0-download &&
+    gh release download v0.2.0 --repo archivetechie/remanence
+```
+
+Check these files as [Release verification](guide-release-verification.md#check-a-binary-release)
+describes, starting at its checksum step and using the files just downloaded.
+After verification, extract the main archive into a fresh empty directory,
+removing its top-level `remanence-0.2.0-x86_64-unknown-linux-musl/` directory:
+
+```sh
+mkdir unpacked &&
+    tar -xzf remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C unpacked &&
+    cd unpacked &&
+    binary_dir=bin
 ```
 
 The four programs are in `bin/`. Continue at [Install the binaries](#install-the-binaries).
@@ -46,7 +57,8 @@ For the source route, clone the repository, check out the release tag and build:
 git clone https://github.com/archivetechie/remanence
 cd remanence
 git checkout v0.2.0
-cargo build --release --locked
+cargo build --release --locked &&
+    binary_dir=target/release
 ```
 
 `--locked` makes Cargo use the exact dependency versions recorded in
@@ -87,19 +99,17 @@ cargo build -p remanence-cli --features fixtures --bin rem-dev
 
 ## Install the binaries
 
-Choose the directory for your route, from the extracted archive directory or
-the source checkout respectively, then copy the four programs into `/usr/local/bin`:
+From the extracted archive directory or source checkout for your chosen route,
+with `binary_dir` set by that route's commands, copy the four programs into
+`/usr/local/bin` and check the installed program only if installation succeeds:
 
 ```sh
-binary_dir=bin                # extracted release archive
-# binary_dir=target/release  # source build with cargo build --release
-# binary_dir=target/x86_64-unknown-linux-musl/release  # static source build below
 sudo install -m 0755 "$binary_dir/rem" "$binary_dir/rem-debug" \
-    "$binary_dir/rem-daemon" "$binary_dir/rem-recover" /usr/local/bin/
-rem --version
+    "$binary_dir/rem-daemon" "$binary_dir/rem-recover" /usr/local/bin/ &&
+    /usr/local/bin/rem --version
 ```
 
-`rem --version` prints `rem 0.2.0`. `rem-debug --version` and
+`/usr/local/bin/rem --version` prints `rem 0.2.0`. `rem-debug --version` and
 `rem-daemon --version` print the same version. `rem-recover` has no version
 flag; `rem-recover --help` confirms that it runs.
 
@@ -138,7 +148,8 @@ Rust standard-library source paths and prints the four binaries' SHA-256 digests
 ```sh
 rustup target add x86_64-unknown-linux-musl
 sudo apt install musl-tools file   # Debian and Ubuntu: provides musl-gcc and file
-tools/release_build.sh
+tools/release_build.sh &&
+    binary_dir=target/x86_64-unknown-linux-musl/release
 ```
 
 The binaries are then in `target/x86_64-unknown-linux-musl/release/`.
