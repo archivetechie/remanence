@@ -205,8 +205,9 @@ require_snapshot_space() {
   used="${used%%[[:space:]]*}"
   available="$(df -PB1 -- "$(fieldtest_home)" | awk 'NR==2 {print $4}')" || fail space 'cannot measure home free space'
   [[ "$used" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || fail space 'invalid state size or free space'
-  (( available >= 3 * used + 1073741824 )) || fail space 'snapshot space requires three times state size plus 1 GiB free'
-  record_step space PASS "home free bytes $available >= 3 * state bytes $used + 1 GiB"
+  (( available >= 4 * used + 1073741824 )) || fail space 'snapshot space requires four times state size plus 1 GiB free'
+  fieldtest_require_space "$((4 * used))" 'restore-tail state copies'
+  record_step space PASS "home free bytes $available >= 4 * state bytes $used + 1 GiB; state copies passed the kit disk guard"
 }
 
 locator_tape() {

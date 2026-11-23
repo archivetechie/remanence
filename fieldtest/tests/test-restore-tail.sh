@@ -210,7 +210,46 @@ if result.returncode == 0 and os.environ['RESTORE_CASE'] == 'j':
 sys.exit(result.returncode)
 '''
 
-cases = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'warn', 'stop-fail', 'start-fail',
+guard_stub = r'''#!/usr/bin/env python3
+"""Inject only the selected restore move, device mismatch, or free-space boundary."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+home = Path(os.environ['REMFIELD_HOME'])
+state = home / 'state'
+case = os.environ['RESTORE_CASE']
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+real = os.environ['RESTORE_REAL_' + name.upper()]
+if (name == 'mv' and case == 'l' and len(args) == 3 and args[0] == '--'
+        and Path(args[1]).parent.name == 'incoming-older' and Path(args[2]) == state):
+    counter = home / 'incoming-moves'
+    count = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(count))
+    if count == 2:
+        print('injected failure on second incoming-older move', file=sys.stderr)
+        sys.exit(1)
+if name == 'stat' and case == 'm' and args == ['-c', '%d', '--', str(state)]:
+    device = int(subprocess.check_output([real, '-c', '%d', '--', str(home)], text=True))
+    print(device + 1)
+    sys.exit(0)
+if name == 'df' and ((case == 'n' and args == ['-PB1', '--', str(home)])
+                     or (case == 'o' and args == ['-PB1', '--', str(home / 'spool')])):
+    used = int(subprocess.check_output([os.environ['RESTORE_REAL_DU'], '-sb', '--', str(state)], text=True).split()[0])
+    available = 1073741824 + 4 * used - 1
+    with (home / 'space-probes.jsonl').open('a') as stream:
+        stream.write(json.dumps(dict(used=used, available=available)) + '\n')
+    total = 2 * available
+    print('Filesystem 1-blocks Used Available Capacity Mounted on')
+    print(f'restore-test {total} {total - available} {available} 50% {args[-1]}')
+    sys.exit(0)
+os.execv(real, [real, *args])
+'''
+
+cases = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'warn', 'stop-fail', 'start-fail',
          'write-A', 'write-B', 'null-A', 'null-B', 'read-A', 'read-B', 'sha-A', 'sha-B',
          'read-A-older', 'sha-A-older', 'wrong-refusal-tape', 'missing-guidance',
          'newer-put-fail', 'newer-off-T', 'newer-empty', 'read-C', 'args',
@@ -228,6 +267,9 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
         (bins / name).chmod(0o755)
     (bins / 'cp').write_text(copy_stub)
     (bins / 'cp').chmod(0o755)
+    for name in ['mv', 'stat', 'df']:
+        (bins / name).write_text(guard_stub)
+        (bins / name).chmod(0o755)
     (kit_scripts / '03-bringup.sh').write_text(stub)
     (kit_scripts / '03-bringup.sh').chmod(0o755)
     for case in cases:
@@ -248,6 +290,8 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
         (state / '.hidden').chmod(0o640)
         (state / 'native-dir/file').write_bytes(b'native nested state')
         (state / 'native-link').symlink_to('native-dir')
+        if case == 'o':
+            (state / 'padding').write_bytes(b'\0' * 65536)
         (state / 'state.lock').touch()
         (home / 'lock-inode').write_text(str((state / 'state.lock').stat().st_ino))
         top = json.loads((scripts.parent / 'tests/fixtures/stop-top.json').read_text())
@@ -268,6 +312,10 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
                    FIELDTEST_LOCK_HELD='1', FIELD_RESTORE_TAIL_MB='0.001', RESTORE_CASE=case,
                    RESTORE_REAL_CP=shutil.which('cp'),
                    FIELD_MIN_FREE_GB='0', FIELD_MIN_FREE_PCT='0', PATH=f"{bins}:{os.environ['PATH']}")
+        for name in ['mv', 'stat', 'df', 'du']:
+            env['RESTORE_REAL_' + name.upper()] = shutil.which(name)
+        if case == 'o':
+            env['FIELD_MIN_FREE_GB'] = '1'
         for name in ['FIELDTEST_LIBRARY_SERIAL', 'FIELDTEST_FENCE_COUNTERS_FILE', 'REM_CHAOS_ENABLED', 'REM_CHAOS_ALLOW_REAL', 'REM_CHAOS_STATE']:
             env.pop(name, None)
         command = ['bash', str(kit_scripts / '14-restore-tail.sh')]
@@ -282,7 +330,9 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
             if case == 'f':
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
-        calls = [json.loads(line) for line in (home / 'calls.jsonl').read_text().splitlines()]
+        call_path = home / 'calls.jsonl'
+        call_text = '' if case == 'm' and not call_path.exists() else call_path.read_text()
+        calls = [json.loads(line) for line in call_text.splitlines()]
         events = [row['event'] for row in calls]
         records = [json.loads(line) for line in (home / 'evidence/records.jsonl').read_text().splitlines()]
         rows = [row for row in records if row['script'] == '14-restore-tail']
@@ -290,14 +340,16 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
         assert len(finals) == 1, (case, result, rows)
         assert (result.returncode == 0) == (case == 'a'), (case, result)
         assert finals[0]['status'] == ('PASS' if case == 'a' else 'FAIL'), (case, finals)
-        assert all(row['test_id'].startswith('restore-tail-') or row['test_id'] == 'media-budget' for row in rows), rows
+        assert all(row['test_id'].startswith('restore-tail-') or row['test_id'] == 'media-budget'
+                   or (case == 'o' and row['test_id'] == 'disk-guard') for row in rows), rows
         for row in rows:
             if row['detail_path']:
                 assert Path(row['detail_path']).exists(), (case, row)
         snapshots = list((home / 'restore-tail').glob('*'))
         newer_restore_cases = {'a', 'read-A-older', 'sha-A-older', 'newer-put-fail', 'newer-off-T', 'newer-empty', 'read-C'}
         puts = [row for row in calls if row['event'] == 'put-C']
-        known = json.loads((state / 'known.json').read_text())
+        if case != 'l':
+            known = json.loads((state / 'known.json').read_text())
         if case == 'a':
             assert events == ['list', 'pool-A', 'read-A', 'top', 'catalog', 'stop', 'start', 'pool-B', 'read-B',
                               'top', 'catalog', 'stop', 'start', 'put-C', 'top', 'read-A', 'catalog', 'stop', 'start',
@@ -348,6 +400,46 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
             assert len(snapshots) == 1 and (snapshots[0] / 'older').is_dir()
             assert not (snapshots[0] / 'newer').exists(), 'B off T advanced to newer snapshot'
             assert known == {T: 1, T2: 1}, known
+        if case == 'l':
+            assert len(snapshots) == 1, snapshots
+            snapshot = snapshots[0]
+            for name in ['older', 'newer', 'incoming-older', 'displaced-1']:
+                assert (snapshot / name).is_dir(), (case, name)
+            assert (home / 'incoming-moves').read_text() == '2'
+            context = ('state in place: partial (restoring older; daemon down; neither copy whole in state/); '
+                       f'incoming: {snapshot}/incoming-older; displaced: {snapshot}/displaced-1')
+            halt = 'run no other plan with this kit home; send the pack; the snapshots stay on the host'
+            for test_id in ['restore-tail-restore-older', 'restore-tail-final']:
+                failures = [row for row in rows if row['test_id'] == test_id and row['status'] == 'FAIL']
+                assert len(failures) == 1 and context in failures[0]['summary'] and halt in failures[0]['summary'], failures
+            assert not puts and events[-1] == 'stop', events
+            assert not (home / 'live').exists(), 'interrupted restore restarted daemon'
+            names = lambda directory: {path.name for path in directory.iterdir()}
+            assert names(snapshot / 'displaced-1') == names(snapshot / 'newer'), 'displaced entries differ from newer'
+            remaining = names(snapshot / 'incoming-older')
+            moved = names(state) - set(kit_files) - {'state.lock'}
+            assert moved and remaining and moved.isdisjoint(remaining), (moved, remaining)
+            assert moved | remaining == names(snapshot / 'older'), 'partial entries do not partition older'
+        if case == 'm':
+            assert not events, events
+            assert 'state and home must be on the same filesystem' in finals[0]['summary'], finals
+            assert 'snapshots: none yet' in finals[0]['summary'], finals
+        if case in {'n', 'o'}:
+            assert events == ['list', 'pool-A', 'read-A'], events
+            assert len(snapshots) == 1 and not list(snapshots[0].iterdir()), 'space refusal allowed a snapshot'
+            if case == 'n':
+                assert any(row['test_id'] == 'restore-tail-space' and row['status'] == 'FAIL'
+                           and 'four times' in row['summary'] for row in rows), rows
+            else:
+                assert any(row['test_id'] == 'disk-guard' and row['status'] == 'FAIL'
+                           and 'restore-tail state copies' in row['summary'] for row in rows), rows
+                probes = [json.loads(line) for line in (home / 'space-probes.jsonl').read_text().splitlines()]
+                assert len(probes) == 2, probes
+                payload_bytes = 8 * int(1048576 * 0.001)
+                assert probes[0]['available'] - payload_bytes >= 1073741824, probes
+                assert probes[1]['available'] - 4 * probes[1]['used'] == 1073741824 - 1, probes
+                print(f'MEASURE: kit floor payload estimate={payload_bytes}; spool probes={probes}')
+            assert not any(row['test_id'] == 'restore-tail-space' and row['status'] == 'PASS' for row in rows), rows
         if case in {'write-A', 'k', 'null-A', 'read-A', 'sha-A'}:
             assert 'stop' not in events and 'pool-B' not in events and not puts, events
         if case in {'write-B', 'null-B', 'read-B', 'sha-B'}:
@@ -379,8 +471,9 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
                     assert (saved / '.hidden').stat().st_mode & 0o777 == 0o640
                     assert (saved / 'native-link').is_symlink()
         assert all((state / name).read_bytes() == data for name, data in kit_files.items()), 'kit files changed'
-        assert (state / '.hidden').stat().st_mode & 0o777 == 0o640
-        assert (state / 'native-link').is_symlink()
+        if case != 'l':
+            assert (state / '.hidden').stat().st_mode & 0o777 == 0o640
+            assert (state / 'native-link').is_symlink()
         if puts:
             assert [r['event'] for r in calls if r['event'].startswith('pool-')] == ['pool-A', 'pool-B'], events
         if case in {'i', 'missing-debt'}:
@@ -401,16 +494,16 @@ with tempfile.TemporaryDirectory(prefix='restore-tail-') as temporary:
             assert (snapshots[0] / 'older').is_dir() and not (snapshots[0] / 'newer').exists()
             assert any(row['test_id'] == 'restore-tail-stop-newer' and row['status'] == 'FAIL' for row in rows), rows
             assert known[T] == 2 and (home / 'live').exists()
-        if case in {'i', 'j', 'k', 'missing-debt', 'debt-newer'}:
+        if case in {'i', 'j', 'k', 'm', 'n', 'o', 'missing-debt', 'debt-newer'}:
             assert 'state in place: current (nothing swapped)' in finals[0]['summary'], finals
         assert (state / 'state.lock').stat().st_ino == int((home / 'lock-inode').read_text()), 'state lock inode changed'
         if case != 'a' and finals[0]['summary'].find('snapshots:') >= 0:
-            if case not in {'write-A', 'k', 'null-A'}:
+            if case not in {'write-A', 'k', 'null-A', 'm'}:
                 assert 'T=' + uuid.UUID(T).hex in finals[0]['summary'], finals
             halt = 'run no other plan with this kit home; send the pack; the snapshots stay on the host'
             assert (halt in finals[0]['summary']) == ('state in place: older' in finals[0]['summary'] or 'state in place: partial (' in finals[0]['summary']), finals
         for row in rows:
-            if row['status'] == 'FAIL':
+            if row['status'] == 'FAIL' and not (case == 'o' and row['test_id'] == 'disk-guard'):
                 assert all(token in row['summary'] for token in ['state in place:', 'snapshots:', 'T=']), row
         print(f'PASS: restore-tail {case}')
 PY
