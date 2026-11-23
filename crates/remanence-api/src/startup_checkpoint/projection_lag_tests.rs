@@ -357,6 +357,7 @@ fn t4_tail_recovery_refuses_lag_before_catalog_admission() {
             1,
             "wrong-acknowledgment",
             AuditActor::System,
+            false,
             |_, _, _| panic!("refusal must precede confirmation and media I/O"),
         )
         .unwrap_err()

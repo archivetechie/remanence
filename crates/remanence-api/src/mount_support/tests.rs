@@ -3730,3 +3730,568 @@ fn plr2a1_label_named() {
         Some("inspect")
     );
 }
+
+/// Native session plus measured power-cut media; all seeding precedes the no-write baseline.
+struct Plr2a2aFixture {
+    root: tempfile::TempDir,
+    world: SharedVirtualWorld,
+    state: StateHandle,
+    cursor: u64,
+    sequence: u64,
+}
+const PLR2A2A_ID: &str = "00000000-0000-4000-8000-000000000001";
+const PLR2A2A_SECOND: &str = "00000000-0000-4000-8000-000000000002";
+
+fn plr2a2a_fixture(case: &str) -> Plr2a2aFixture {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::library_log as lib;
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let world = world();
+    set_rollback_bootstrap(&world, crate::ParityConfig::None);
+    let mut state = state(root.path());
+    append_for_rollback!(&mut state, &world, root.path(), "PLR-prime").unwrap();
+    let authority = remanence_state::TapeAuthority::open(
+        state.paths().journal_dir.join("tapes"),
+        UUID,
+        &state.paths().sqlite_path,
+    )
+    .unwrap();
+    let mut lease = authority.acquire_exclusive().unwrap();
+    let snapshot = lease.freeze().unwrap();
+    let cursor = snapshot.tape_summary().cursor.lba;
+    let next_file = snapshot.tape_summary().next_file;
+    assert!(!snapshot.tape_summary().closeout_due());
+    lease
+        .open_session(
+            [0xc7; 16],
+            "2026-11-23T00:00:00Z".into(),
+            remanence_state::tape_log::SessionDrive {
+                serial: SERIAL.into(),
+                vendor: None,
+                product: None,
+                endpoint: lib::DriveKey::Standalone(lib::Standalone {
+                    drive_serial: SERIAL.into(),
+                }),
+                drive_uuid: None,
+            },
+        )
+        .unwrap();
+    let mut files = vec![];
+    if !matches!(case, "open" | "empty") {
+        files.push(TailFile {
+            tape_file_number: next_file,
+            identity: if case == "torn-prefix" {
+                TailIdentity::TornPrefix([0; 32])
+            } else {
+                TailIdentity::Object(PLR2A2A_ID.into())
+            },
+            known_blocks: 2,
+            unknown_blocks: u64::from(!matches!(case, "first-cut" | "second-cut" | "torn-prefix")),
+            filemark: if matches!(case, "first-cut" | "second-cut") {
+                TailFilemark::Present
+            } else {
+                TailFilemark::Absent
+            },
+            synchronized_blocks: u64::from(case == "floor"),
+            synchronized_filemark: false,
+        });
+        if matches!(case, "first-cut" | "second-cut") {
+            files.push(TailFile {
+                tape_file_number: next_file + 1,
+                identity: TailIdentity::Object(PLR2A2A_SECOND.into()),
+                known_blocks: 2,
+                unknown_blocks: 1,
+                filemark: TailFilemark::Absent,
+                synchronized_blocks: 0,
+                synchronized_filemark: false,
+            });
+        }
+        lease
+            .end_session(
+                [0xc7; 16],
+                "2026-11-23T00:00:01Z".into(),
+                if case == "torn-prefix" {
+                    SessionEndReason::CrashRecovered
+                } else {
+                    SessionEndReason::DriveError
+                },
+                None,
+                files.iter().cloned().map(Ok),
+            )
+            .unwrap();
+        if matches!(case, "eod-away" | "eod-here") {
+            lease
+                .record_session_tail_eod(cursor + u64::from(case == "eod-away"))
+                .unwrap();
+        }
+    }
+    let snapshot = lease.freeze().unwrap();
+    let sequence = snapshot.log_reference().0;
+    let runtime = state.library_runtime();
+    runtime.refresh_native(&snapshot).unwrap();
+    runtime.catch_up().unwrap();
+    if case == "acknowledged" {
+        let at = runtime.native_reference(&snapshot).unwrap();
+        let mut bytes = Vec::new();
+        for file in &files {
+            lib::session_ack::write_preview_file(&mut bytes, file).unwrap();
+        }
+        runtime
+            .append(|a, v| {
+                a.supersede_tail(
+                    lib::SupersedeTail {
+                        at: at.clone(),
+                        operation: None,
+                        session_id: Some([0xc7; 16]),
+                        preview_digest: Some(Sha256::digest(bytes).into()),
+                        tail_file_count: files.len() as u64,
+                    },
+                    AuditActor::System,
+                    SourceLayer::Layer5,
+                    v,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            runtime
+                .supersede_for_session(at.tape, [0xc7; 16])
+                .unwrap()
+                .unwrap()
+                .at
+                .sequence,
+            sequence
+        );
+    }
+    let native = state
+        .paths()
+        .journal_dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()));
+    let retained = if case == "contradicted" {
+        // Route (a): retain the catalog-compatible prefix and cite only a later native record.
+        state.write_handle().project_tape_log(&snapshot).unwrap();
+        let retained = std::fs::read(&native).unwrap();
+        lease.record_session_tail_eod(cursor + 2).unwrap();
+        let later = lease.freeze().unwrap();
+        assert!(later.log_reference().0 > sequence);
+        runtime.refresh_native(&later).unwrap();
+        let at = runtime.native_reference(&later).unwrap();
+        runtime
+            .append(|a, v| {
+                a.verification_verdict(
+                    lib::VerificationVerdict {
+                        tape: at.tape,
+                        at: Some(at),
+                        outcome: lib::VerificationOutcome::VerifiedComplete,
+                        operation: [0x61; 16],
+                        damaged: lib::Bounded(vec![]),
+                        unprotected: None,
+                        modes: 1,
+                        edition_digest: None,
+                        progress: None,
+                    },
+                    AuditActor::System,
+                    SourceLayer::Layer4,
+                    v,
+                )
+            })
+            .unwrap();
+        Some(retained)
+    } else {
+        None
+    };
+    drop(runtime);
+    drop(lease);
+    drop(authority);
+    if case == "contradicted" {
+        let paths = state.paths().clone();
+        let config = state.config().clone();
+        let retained = retained.unwrap();
+        assert_ne!(std::fs::read(&native).unwrap(), retained);
+        drop(state);
+        std::fs::write(&native, &retained).unwrap();
+        state = StateHandle::open_with_config(paths, config).unwrap();
+        let runtime = state.library_runtime();
+        for fence in state
+            .catalog()
+            .tape_io_admission_conflicts(&UUID, None)
+            .unwrap()
+        {
+            let n = fence
+                .quarantine_id
+                .strip_prefix("library:")
+                .unwrap()
+                .parse()
+                .unwrap();
+            runtime
+                .append(|a, v| {
+                    a.fence_released(
+                        lib::FenceReleased {
+                            fence: n,
+                            evidence: "fixture isolates contradiction refusal".into(),
+                            forced: false,
+                            detail: lib::Bounded(vec![]),
+                        },
+                        AuditActor::System,
+                        SourceLayer::Layer4,
+                        v,
+                    )
+                })
+                .unwrap();
+        }
+        assert_eq!(std::fs::read(&native).unwrap(), retained);
+        // Success checks the saved projection-source digest against this native prefix.
+        state.write_handle().project_tape_log(&snapshot).unwrap();
+        assert!(runtime.contradicted(UUID));
+        assert!(runtime.projection_lag(UUID).is_none());
+    }
+    let block = |id: &str| {
+        let header = remanence_aead::RemObjectHeader::new_envelope(BLOCK, [1; 16], 32, id, 2048)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let mut first = vec![0; BLOCK as usize];
+        first[..128].copy_from_slice(&header);
+        first
+    };
+    {
+        let mut w = world.lock().unwrap();
+        let tape = w.tapes.get_mut("HAND").unwrap();
+        assert_eq!(tape.records.len() as u64, cursor);
+        if case != "empty" {
+            tape.records.extend([
+                Record::Block(block(if case == "foreign" {
+                    PLR2A2A_SECOND
+                } else {
+                    PLR2A2A_ID
+                })),
+                Record::Block(vec![0x42; BLOCK as usize]),
+            ]);
+        }
+        if case == "second-cut" {
+            tape.records.extend([
+                Record::Filemark,
+                Record::Block(block(PLR2A2A_SECOND)),
+                Record::Block(vec![0x42; BLOCK as usize]),
+            ]);
+        }
+        let keep = tape.records.len();
+        w.drive_states.get_mut(&BAY).unwrap().profile =
+            remanence_chaos::model::DriveProfile::MeasuredHpLto6;
+        w.power_cut_during_write(BAY, keep).unwrap();
+    }
+    Plr2a2aFixture {
+        root,
+        world,
+        state,
+        cursor,
+        sequence,
+    }
+}
+
+/// Read all native source bytes in deterministic filename order, including every library segment.
+fn plr2a2a_native_bytes(state: &StateHandle) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut paths = vec![state
+        .paths()
+        .journal_dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()))];
+    fn library_files(dir: &Path, paths: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                library_files(&path, paths);
+            } else if path.extension().is_some_and(|ext| ext == "remlib") {
+                paths.push(path);
+            }
+        }
+    }
+    library_files(&state.paths().audit_dir, &mut paths);
+    paths.sort();
+    assert!(paths.len() > 1, "library log must be included");
+    paths
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect()
+}
+
+/// Include standalone preparation in both the physical and native-log no-write oracles.
+fn plr2a2a_call(
+    f: &mut Plr2a2aFixture,
+    confirm: bool,
+) -> Result<crate::pb::SupersedeTailResponse, tonic::Status> {
+    let cfg = crate::write_owner::TerminalWriteConfig {
+        authority: crate::write_owner::TerminalAuthority::Typed(f.state.library_runtime().clone()),
+        io_memory: crate::io_memory::IoMemoryReservation::new(64 * 1024 * 1024).unwrap(),
+        mounted_endpoint: None,
+        checkpoint_journal_dir: f.state.paths().journal_dir.join("tapes"),
+    };
+    let mut drive = DriveHandle::open_standalone_with_transport(
+        Path::new(DEVICE),
+        Box::new(ModelTransport::new(
+            f.world.clone(),
+            DeviceRole::Drive { bay: BAY },
+        )),
+        &StaticAllowlist::new([DEVICE]),
+    )
+    .unwrap();
+    let before = plr2a2a_native_bytes(&f.state);
+    let commands = f.world.lock().unwrap().command_log.len();
+    let result = crate::write_owner::tests::plr2a2a_service(
+        &mut f.state.write_handle(),
+        &cfg,
+        &mut drive,
+        UUID,
+        confirm,
+    );
+    assert!(
+        f.world.lock().unwrap().command_log[commands..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19)),
+        "inspection dispatched a write opcode"
+    );
+    assert_eq!(
+        plr2a2a_native_bytes(&f.state),
+        before,
+        "inspection changed native source bytes"
+    );
+    result
+}
+
+#[test]
+fn plr2a2a_t1_open_inspection() {
+    for case in ["open", "empty"] {
+        let mut f = plr2a2a_fixture(case);
+        let response = plr2a2a_call(&mut f, false).unwrap();
+        assert!(!response.completed);
+        assert_eq!(response.tape_log_sequence, f.sequence);
+        let i = response.inspection.unwrap();
+        assert_eq!(
+            i.site,
+            if case == "open" {
+                "open-scan"
+            } else {
+                "open-first-read"
+            }
+        );
+        assert_eq!(i.cursor_partition, 0);
+        assert_eq!(i.cursor_lba, f.cursor);
+        assert_eq!(i.file_start_lba, f.cursor);
+        assert_eq!(i.blocks_read, if case == "open" { 2 } else { 0 });
+        assert_eq!(i.failing_lba, f.cursor + i.blocks_read);
+        assert_eq!(i.read_sense, "03/11/00");
+        assert_eq!(i.accounted_bytes, Some(0));
+        assert_eq!(i.host_bytes, Some(0));
+        assert_eq!(
+            i.head,
+            if case == "open" {
+                format!("object {PLR2A2A_ID}")
+            } else {
+                "unknown".into()
+            }
+        );
+        assert!(i.named_files.is_empty());
+    }
+}
+#[test]
+fn plr2a2a_t2_named_inspection() {
+    for case in ["named", "first-cut"] {
+        let mut f = plr2a2a_fixture(case);
+        let response = plr2a2a_call(&mut f, false).unwrap();
+        assert_eq!(response.tape_log_sequence, f.sequence);
+        let i = response.inspection.unwrap();
+        assert_eq!(i.site, "named-file");
+        assert_eq!(i.head, format!("matches object {PLR2A2A_ID}"));
+        let mut expected = vec![format!("object {PLR2A2A_ID}")];
+        if case == "first-cut" {
+            expected.push(format!("object {PLR2A2A_SECOND}"));
+        }
+        assert_eq!(i.named_files, expected);
+        assert_eq!(i.blocks_read, 2);
+        assert_eq!(i.failing_lba, f.cursor + 2);
+    }
+}
+#[test]
+fn plr2a2a_t2b_complete_file_refused() {
+    let mut f = plr2a2a_fixture("second-cut");
+    let error = plr2a2a_call(&mut f, false).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().starts_with("CompleteFileAfterCommit:"),
+        "{error}"
+    );
+}
+#[test]
+fn plr2a2a_t3_refusals() {
+    for (case, name, detail) in [
+        (
+            "foreign",
+            "TornTailForeignHead:",
+            "named object identity differs",
+        ),
+        ("torn-prefix", "TornTailIneligible:", "TornPrefix"),
+        ("floor", "TornTailIneligible:", "synchronized"),
+        ("eod-away", "TornTailIneligible:", "proved EOD differs"),
+        (
+            "eod-here",
+            "TornTailIneligible:",
+            "contradicts readable blocks",
+        ),
+        ("contradicted", "TornTailContradicted:", "supersede-tail"),
+        ("acknowledged", "TornTailAcknowledged:", "sequence"),
+    ] {
+        let mut f = plr2a2a_fixture(case);
+        let error = plr2a2a_call(&mut f, false).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{case}");
+        assert!(error.message().starts_with(name), "{case}: {error}");
+        assert!(error.message().contains(detail), "{case}: {error}");
+        if case == "acknowledged" {
+            assert!(error.message().contains(&f.sequence.to_string()));
+        }
+    }
+}
+#[test]
+fn plr2a2a_t4_confirmation_refused() {
+    let mut f = plr2a2a_fixture("open");
+    let error = plr2a2a_call(&mut f, true).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().starts_with("SupersedeInspectionOnly:"),
+        "{error}"
+    );
+}
+
+/// Compare all received recovery/fence decisions while allowing actor mount bookkeeping.
+fn plr2a2a_recovery_tags(
+    paths: &remanence_state::StatePaths,
+    library_uuid: [u8; 16],
+) -> Vec<remanence_state::library_log::Tag> {
+    use remanence_state::library_log::{native_view::NativeTapeView, store, Tag};
+    let view = NativeTapeView::probe(&paths.journal_dir.join("tapes"), &paths.sqlite_path).unwrap();
+    // The actor is settled at both observations. Replay a closed byte copy so the
+    // oracle does not contend with the live authority's exclusive library lease.
+    let copy = tempfile::tempdir().unwrap();
+    let mut copied = 0;
+    for entry in std::fs::read_dir(&paths.audit_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|ext| ext == "remlib") {
+            std::fs::copy(entry.path(), copy.path().join(entry.file_name())).unwrap();
+            copied += 1;
+        }
+    }
+    assert!(copied > 0);
+    let mut tags = Vec::new();
+    let replay = store::replay_observed_with_received(
+        copy.path(),
+        library_uuid,
+        &view,
+        &mut |_| Ok(()),
+        &mut |record, _| {
+            if matches!(
+                record.tag(),
+                Tag::SupersedeTail | Tag::FenceRaised | Tag::FenceReleased | Tag::RecoveryRecorded
+            ) {
+                tags.push(record.tag());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(replay.refusal.is_none(), "{:?}", replay.refusal);
+    tags
+}
+
+/// Send a first raw request through the mounted actor and retain its exact wire response.
+fn plr2a2a_standalone(confirm: bool) -> Result<crate::pb::SupersedeTailResponse, tonic::Status> {
+    let Plr2a2aFixture {
+        root,
+        world,
+        mut state,
+        sequence,
+        cursor,
+    } = plr2a2a_fixture("open");
+    let paths = state.paths().clone();
+    let library_uuid = state.library_runtime().manifest().library_uuid();
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, _reopen) = own_mount!(mount, mounted, state);
+    let before = plr2a2a_recovery_tags(&paths, library_uuid);
+    let commands = world.lock().unwrap().command_log.len();
+    let result = actor
+        .supersede_tail(crate::pb::SupersedeTailRequest {
+            tape_uuid: UUID.to_vec(),
+            ack_tape_uuid: UUID.to_vec(),
+            confirm_supersede: confirm.then(String::new),
+            expected_found: vec![],
+            observed_tape_log_sequence: None,
+        })
+        .map_err(|error| error.status);
+    assert!(world.lock().unwrap().command_log[commands..]
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x0a | 0x10 | 0x19)));
+    actor.finish().unwrap();
+    assert_eq!(plr2a2a_recovery_tags(&paths, library_uuid), before);
+    if let Ok(response) = &result {
+        assert_eq!(response.tape_log_sequence, sequence);
+        assert_eq!(response.inspection.as_ref().unwrap().cursor_lba, cursor);
+    }
+    result
+}
+#[test]
+fn plr2a2a_t6_standalone_inspection() {
+    let response = plr2a2a_standalone(false).unwrap();
+    let inspection = response
+        .inspection
+        .expect("standalone actor must retain inspection");
+    assert_eq!(inspection.site, "open-scan");
+    assert_eq!(inspection.blocks_read, 2);
+    assert!(response.found.is_empty());
+    assert!(response.required_confirmation.is_empty());
+    assert!(!response.completed);
+}
+#[test]
+fn plr2a2a_t9_standalone_empty_confirmation() {
+    let error = plr2a2a_standalone(true).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().starts_with("SupersedeInspectionOnly:"),
+        "{error}"
+    );
+}
+#[test]
+fn plr2a2a_t8_standalone_ordinary_preview() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let world = world();
+    world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("HAND")
+        .unwrap()
+        .records
+        .truncate(1);
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, _reopen) = own_mount!(mount, mounted, state);
+    let response = actor
+        .supersede_tail(crate::pb::SupersedeTailRequest {
+            tape_uuid: UUID.to_vec(),
+            ack_tape_uuid: UUID.to_vec(),
+            confirm_supersede: None,
+            expected_found: vec![],
+            observed_tape_log_sequence: None,
+        })
+        .unwrap();
+    assert!(response.inspection.is_none());
+    assert!(response.found.is_empty());
+    assert_eq!(response.required_confirmation, "SUPERSEDE HAND");
+    assert!(!response.completed);
+    assert_eq!(response.tape_log_sequence, 0);
+    actor.finish().unwrap();
+}

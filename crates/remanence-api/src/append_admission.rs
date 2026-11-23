@@ -92,17 +92,12 @@ pub(crate) struct TornTailHead {
 pub(crate) struct TornTailEvidence {
     pub(crate) site: Option<TornTailSite>,
     pub(crate) cursor: Option<TapePosition>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
     pub(crate) file_start_lba: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
     pub(crate) blocks_read: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
     pub(crate) failing_lba: u64,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
     pub(crate) aligned: bool,
     pub(crate) delimiters: Vec<u64>,
     pub(crate) head: TornTailHead,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by PLR-2a-2"))]
     pub(crate) read: remanence_library::outcome::CompletionEvidence,
 }
 impl TornTailEvidence {
