@@ -365,9 +365,9 @@ The reference implementation, Remanence, has a semantic version of its own.
 
 | Field | Value |
 | --- | --- |
-| Current value | The source is at 0.2.0, which has not been released. The only published release is v0.1.0, which contains the test-vector archive and no binaries. [What works, and what does not](status.md#releases-and-versions) gives the release history. |
+| Current value | Software 0.2.0, released 2026-11-23, is the first binary release. The earlier v0.1.0 release published only the test-vector archive. [What works, and what does not](status.md#releases-and-versions) gives the release history. |
 | Citation | Software concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570), Apache-2.0 |
-| How it relates | Not at all. Software versions and document versions move independently. The software conforms to whatever the documents say, and citing a format means citing its document, not a software release. |
+| How it relates | Not at all. Software versions and document versions move independently. The software is meant to conform to what the documents say, and where a release does not, its [status page](status.md#the-rem-parity-publication-copy) lists the difference; citing a format means citing its document, not a software release. |
 
 ## How this register is checked
 

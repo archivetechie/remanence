@@ -9,9 +9,19 @@ capabilities. The root [README](../README.md) has a shorter version.
 ## The short version
 
 Remanence is alpha software. It has had limited operational testing, so do not
-make it the only copy of anything. There is no binary release yet; you build
-it from source. [Releases and versions](#releases-and-versions) says what has
-been published and how the version numbers relate.
+make it the only copy of anything. 0.2.0 is the first binary release;
+[Installing Remanence](guide-install.md) also covers building from source.
+[Releases and versions](#releases-and-versions) explains the version numbers.
+When `rem put` is refused at a write-open because the tape's recorded end is a
+torn tail (one possible cause is a power cut during a write), the refusal names
+`rem tape supersede-tail` for the
+[standalone](reference-cli.md#rem-tape-supersede-tail-standalone) or
+[library](reference-cli.md#rem-tape-supersede-tail-library) route.
+On an eligible tail, that command's first run prints its inspection, writes
+nothing to the tape and exits 1, even with confirmation. Other refusals,
+including eligibility checks, automatic finalization failures and a
+confirmation rescan, end without an inspection report. Repair for further
+writing is planned for 0.3.0.
 
 The parts that put bytes on tape and get them back are the most mature. A tape
 written today can be recovered without the catalog, without the daemon, and
@@ -22,7 +32,8 @@ library-robotics operations.
 The format specifications are review drafts until they freeze on 31 July 2027.
 For REM-OBJECT and REM-ENCRYPT, the review checks whether the documents
 describe the implemented formats correctly. For REM-PARITY, the published copy
-does not yet describe the layout current software writes (see
+does not yet describe the layout current software writes, and current software
+differs in three rules from the in-progress text that does (see
 [below](#the-rem-parity-publication-copy)). A review finding could still change
 what goes on tape, and the promise that no tape a format validates will ever be
 invalidated takes effect only at the freeze. Treat material written during the
@@ -32,20 +43,25 @@ formats are final.
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml .github/workflows/release.yml crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Releases and versions
 
-There is no binary release of Remanence yet. The only published release is
-v0.1.0, and its only file is the conformance test-vector archive,
-`remanence-test-vectors.tar`. An earlier tag, v1.0.0, was withdrawn and
-renumbered to v0.1.0 because that number overstated the software's maturity;
-[CHANGELOG.md](../CHANGELOG.md) records why. To run Remanence you build it
-from source, as [Installing Remanence](guide-install.md) describes.
+0.2.0, released on 23 November 2026, is the first binary release. It is
+published on [GitHub Releases](https://github.com/archivetechie/remanence/releases/tag/v0.2.0)
+as statically linked Linux x86-64 binaries in
+`remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz`, with a separate recovery
+archive, checksums, build evidence and licenses. The workflow builds the
+binaries twice in separate directories and stops if they differ, then checks
+the published release. [Installing Remanence](guide-install.md) covers the
+release archive and the source route; [Release verification](guide-release-verification.md)
+lists the files and their GitHub attestations and explains how to check them.
 
-The source is at version 0.2.0. That is the workspace version in `Cargo.toml`,
-and it is what `rem --version`, `rem-debug --version` and
-`rem-daemon --version` print. Version 0.2.0 was prepared but never tagged or
-published, so a binary that reports 0.2.0 was built from source. The
-repository's release workflow builds statically linked Linux binaries when a
-release is tagged, and [Release verification](guide-release-verification.md)
-describes what such a release contains and how to check it.
+The earlier v0.1.0 release, on 7 August 2026, published only the conformance
+test-vector archive, `remanence-test-vectors.tar`. The withdrawn v1.0.0 release
+was renumbered to v0.1.0 and remains on GitHub marked superseded;
+[CHANGELOG.md](https://github.com/archivetechie/remanence/blob/v0.2.0/CHANGELOG.md)
+records the history.
+
+`rem --version`, `rem-debug --version` and `rem-daemon --version` report
+0.2.0. A source build reports the same workspace version; its audit build
+identity may differ from the release binaries'.
 
 The format specifications are versioned separately from the software and are
 at 1.0: REM-OBJECT Core Format 1.0, REM-ENCRYPT 1.0 and REM-PARITY 1.0.
@@ -84,7 +100,9 @@ The `rem-object-v1` object body and the REM-ENCRYPT encrypted representation
 match their review specifications and the pinned test vectors. Reed-Solomon
 sidecar parity, resuming a parity tape after an interruption, and recovery from
 the tape's terminal index without a catalog are implemented as the REM-PARITY
-revision in `specs/in-progress/` describes them. A sidecar is a tape file of
+revision in `specs/in-progress/` describes them, except for the three rules
+listed under [The REM-PARITY publication copy](#the-rem-parity-publication-copy).
+A sidecar is a tape file of
 parity data covering the blocks written before it. The terminal index is the
 closing inventory that finalization writes at the end of a tape.
 
@@ -157,9 +175,31 @@ The [glossary](reference-glossary.md) defines these terms. The REM-PARITY copy
 under `specs/publication/` (1.0.0-draft.2) and its frozen vectors describe
 `schema_major = 1`. Current software rejects tapes written by version 0.1.0,
 which use `schema_major = 1`, and an implementation written from the published
-text cannot read tapes written by current software. The text that matches
-current software is in `specs/in-progress/`. The publication copy and its
-vectors have not been updated to it yet.
+text cannot read tapes written by current software.
+
+The in-progress text in `specs/in-progress/` describes the record layout that
+current software writes. A review on 23 November 2026 found three of its rules
+that current software does not follow; each is to be resolved, in the code or
+in the text:
+
+- The filemark that ends a tape's bootstrap, at initialization or when a
+  bootstrap is rewritten. Writer rule W2 says that a filemark which reports
+  end-of-medium leaves the files it would cover uncommitted. Current software
+  does not check that report for this filemark.
+- Closeout parity over committed blocks read back from the tape. Rule W5
+  requires those blocks to be proved before parity is computed over them.
+  Current software computes the parity as it reads, compares the check value
+  afterwards, and on a mismatch discards the result and reads again, refusing
+  after a second mismatch, so no parity over unproved blocks is written.
+- A finalized tape whose sidecars protect a prefix and whose tail is
+  unprotected. Section 10.6 allows one when an operator has accepted it.
+  Current software refuses that operator-accepted finalization, and it rejects
+  a terminal index or replica that describes a sidecar-protected prefix
+  followed by an unprotected tail. Finalized tapes without parity are not
+  affected.
+
+The publication copy and its vectors have not been updated to the in-progress
+text yet.
 
 The specifications' concept DOIs are reserved and their first deposits are
 still pending. Until the matching text is published, keep the source material

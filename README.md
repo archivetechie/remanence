@@ -19,10 +19,10 @@ a tape layer underneath it.
 Website: [archivetech.org](https://archivetech.org), with an overview, the
 formats explained, and how to verify them.
 
-> Remanence is alpha software, and there is no binary release yet: you build it
-> from source. Do not use it as the only copy of anything. The three format
-> specifications are at version 1.0, which is separate from the software's
-> version. See [Status](#status).
+> Remanence is alpha software. 0.2.0 is the first binary release; see
+> [Installing Remanence](docs/guide-install.md). Do not use it as the only copy
+> of anything. The three format specifications are at version 1.0, which is
+> separate from the software's version. See [Status](#status).
 
 ## What it is
 
@@ -57,11 +57,12 @@ HPE MSL3040 library with LTO-9 drives.
 
 Remanence is alpha software. The implementation has not had enough operational
 testing to be trusted with material you cannot afford to lose, so expect
-defects and breaking changes. There is no binary release yet: the only
-published release, v0.1.0, contains the test vectors only, and the source is at
-version 0.2.0, which was never released.
+defects and breaking changes. 0.2.0, released on 23 November 2026, is the first
+binary release. [Installing Remanence](docs/guide-install.md) covers the release
+archive and building from source. The earlier v0.1.0 release contains the test
+vectors only.
 [Releases and versions](docs/status.md#releases-and-versions) has the detail,
-and [CHANGELOG.md](CHANGELOG.md) records the history, including the withdrawn
+and [CHANGELOG.md](https://github.com/archivetechie/remanence/blob/v0.2.0/CHANGELOG.md) records the history, including the withdrawn
 v1.0.0 tag.
 
 The format specifications are review drafts until they freeze on 31 July 2027.

@@ -2,33 +2,63 @@
 # Installing Remanence
 
 This page is for an operator who wants the Remanence binaries on a Linux host
-and the host ready for tape hardware. There is no binary release yet (see
-[Releases and versions](status.md#releases-and-versions)), so you build
-Remanence from source and then copy four programs into place. The host
-preparation that follows is the same however the binaries were built.
+and the host ready for tape hardware. Install the 0.2.0 release archive or
+build from source, then copy four programs into place. See
+[Releases and versions](status.md#releases-and-versions) for the release history.
+The host preparation that follows is the same for both routes.
 
 ## Before you start
 
-You need:
+The release route needs a Linux x86-64 host, `tar`, `sha256sum` and a GitHub CLI
+that supports `gh attestation verify`.
+For the source route, use a Linux host with:
 
-- a Linux host;
 - `git` and a C compiler (`build-essential` on Debian and Ubuntu, `gcc` on
   Fedora), which the bundled SQLite library and the TLS library need;
 - Rust 1.89 or newer, installed with [rustup](https://rustup.rs).
 
-The protobuf definitions of the daemon's API are compiled in-process during
-the build, so `protoc` is not needed. The build needs no other system packages
+For a source build, the protobuf definitions of the daemon's API are compiled
+in-process, so `protoc` is not needed. The build needs no other system packages
 unless you add the optional feature described under
 [Optional features](#optional-features).
 
+## Install the release
+
+Download every asset from the
+[v0.2.0 GitHub release](https://github.com/archivetechie/remanence/releases/tag/v0.2.0)
+once into a fresh empty directory:
+
+```sh
+mkdir remanence-0.2.0-download &&
+    cd remanence-0.2.0-download &&
+    gh release download v0.2.0 --repo archivetechie/remanence
+```
+
+Check these files as [Release verification](guide-release-verification.md#check-a-binary-release)
+describes, starting at its checksum step and using the files just downloaded.
+After verification, extract the main archive into a fresh empty directory,
+removing its top-level `remanence-0.2.0-x86_64-unknown-linux-musl/` directory:
+
+```sh
+mkdir unpacked &&
+    tar -xzf remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C unpacked &&
+    cd unpacked &&
+    binary_dir=bin
+```
+
+The four programs are in `bin/`. Continue at [Install the binaries](#install-the-binaries).
+They are statically linked; this route needs no Rust toolchain or C compiler.
+
 ## Build from source
 
-Clone the repository and build the release binaries:
+For the source route, clone the repository, check out the release tag and build:
 
 ```sh
 git clone https://github.com/archivetechie/remanence
 cd remanence
-cargo build --release --locked
+git checkout v0.2.0
+cargo build --release --locked &&
+    binary_dir=target/release
 ```
 
 `--locked` makes Cargo use the exact dependency versions recorded in
@@ -69,15 +99,17 @@ cargo build -p remanence-cli --features fixtures --bin rem-dev
 
 ## Install the binaries
 
-Copy the four programs into `/usr/local/bin`:
+From the extracted archive directory or source checkout for your chosen route,
+with `binary_dir` set by that route's commands, copy the four programs into
+`/usr/local/bin` and check the installed program only if installation succeeds:
 
 ```sh
-sudo install -m 0755 target/release/rem target/release/rem-debug \
-    target/release/rem-daemon target/release/rem-recover /usr/local/bin/
-rem --version
+sudo install -m 0755 "$binary_dir/rem" "$binary_dir/rem-debug" \
+    "$binary_dir/rem-daemon" "$binary_dir/rem-recover" /usr/local/bin/ &&
+    /usr/local/bin/rem --version
 ```
 
-`rem --version` prints `rem 0.2.0`. `rem-debug --version` and
+`/usr/local/bin/rem --version` prints `rem 0.2.0`. `rem-debug --version` and
 `rem-daemon --version` print the same version. `rem-recover` has no version
 flag; `rem-recover --help` confirms that it runs.
 
@@ -92,8 +124,8 @@ to your `PATH`:
 ```sh
 prefix=/opt/remanence
 sudo install -d "$prefix/bin"
-sudo install -m 0755 target/release/rem target/release/rem-debug \
-    target/release/rem-daemon target/release/rem-recover "$prefix/bin/"
+sudo install -m 0755 "$binary_dir/rem" "$binary_dir/rem-debug" \
+    "$binary_dir/rem-daemon" "$binary_dir/rem-recover" "$prefix/bin/"
 export PATH="$prefix/bin:$PATH"
 ```
 
@@ -116,7 +148,8 @@ Rust standard-library source paths and prints the four binaries' SHA-256 digests
 ```sh
 rustup target add x86_64-unknown-linux-musl
 sudo apt install musl-tools file   # Debian and Ubuntu: provides musl-gcc and file
-tools/release_build.sh
+TARGET=x86_64-unknown-linux-musl tools/release_build.sh &&
+    binary_dir=target/x86_64-unknown-linux-musl/release
 ```
 
 The binaries are then in `target/x86_64-unknown-linux-musl/release/`.
@@ -316,13 +349,13 @@ library, continue with
 
 ## When a binary release is published
 
-The repository's release workflow builds and publishes binaries when a
-release is tagged. None has been published yet. A release made by the workflow
-carries these files:
+0.2.0 is published on [GitHub Releases](https://github.com/archivetechie/remanence/releases/tag/v0.2.0).
+The release workflow builds and publishes binaries when a release is tagged.
+The release carries these files:
 
 | File | Contents |
 |---|---|
-| `remanence-<version>-x86_64-unknown-linux-musl.tar.gz` | `bin/rem`, `bin/rem-debug`, `bin/rem-daemon` and `bin/rem-recover`; the `README.md`, `LICENSING.md`, `LICENSE-APACHE-2.0` and `THIRD-PARTY-LICENSES.html` files; and the `docs/` directory as it stood at the release. |
+| `remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz` | `bin/rem`, `bin/rem-debug`, `bin/rem-daemon` and `bin/rem-recover`; the `README.md`, `LICENSING.md`, `LICENSE-APACHE-2.0` and `THIRD-PARTY-LICENSES.html` files; and the `docs/` directory as it stood at the release. |
 | `rem-recover-x86_64-linux-musl.tar.gz` | `rem-recover` alone, with its licenses, for keeping beside escrowed keys without a full installation. |
 | `SHA256SUMS` | The SHA-256 digest of every other file in the release. |
 | `release-manifest.json` and the other `.json` files | Build evidence: the source commit, the CI runs, the compiler and the artifact digests. |

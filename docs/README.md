@@ -127,7 +127,6 @@ specifications or its test vectors.
   that affect independent implementations.
 - [Software release checklist](releases/CHECKLIST.md): the maintainers' release
   procedure.
-- [Remanence 0.2.1 draft release note](releases/v0.2.1-draft.md): a draft, not
-  a published release.
+- [Remanence 0.2.0 release note](releases/v0.2.0.md).
 
 This page lists every document in this directory.

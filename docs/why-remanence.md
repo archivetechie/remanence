@@ -409,8 +409,8 @@ You probably want something else if:
 
 ## Status and maturity
 
-Remanence is alpha software, and there is no binary release yet; you build it
-from source. All five layers are implemented, including reading and writing
+Remanence is alpha software. [Install the 0.2.0 release or build from source](guide-install.md).
+All five layers are implemented, including reading and writing
 physical tape end to end. It has been tested on one library family and one
 drive generation, so restore and verify real material on your own hardware
 before relying on it. [What works, and what does not](status.md) gives the

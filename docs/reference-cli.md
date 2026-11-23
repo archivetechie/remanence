@@ -634,6 +634,11 @@ rem get [OPTIONS] --out <OUT> <OBJECT>
 
 The command stages each file on the destination filesystem and restores its recorded
 modification time. Given a path, it restores the newest committed version on the loaded tape.
+On success, stdout includes the stored whole-object digest, which covers ciphertext for
+an encrypted copy; `--private-key` decrypts before checking members.
+A member mismatch can expose plaintext digests on stderr (or stdout with `--json`),
+allowing anyone who sees them to check a guess at the file's content; the archive
+catalog holds the same plaintext digests.
 
 To restore `photos/notes.txt` into `restored`:
 
@@ -2190,14 +2195,17 @@ rem get [OPTIONS] --dest <DIR> <OBJECT>
 
 The daemon resolves the object format and streams each member's payload, so the client
 interprets no format. The daemon loads the copy's tape as needed and watches a
-media-readiness fence to completion. Every member is proved before it is published: bytes
-stream to a temporary file, are hashed as they land, and are renamed into place only when the
-hash matches the catalog's SHA-256 for that file. Member paths from the catalog are sanitized
-with the rules put applies on ingest (`..` is refused, absolute prefixes are stripped), so a
-restore never writes outside `--dest`.
+media-readiness fence to completion. Each member streams to a temporary file, is hashed
+as it lands, and is renamed into place when the hash matches the catalog's SHA-256 for
+that file. If the catalog has no digest for a member, the member is restored unverified
+with a warning; check such members independently before relying on them. Member paths
+from the catalog are sanitized with the rules put applies on ingest (`..` is refused,
+absolute prefixes are stripped). Restore into a fresh directory that only you can write
+to, because an existing symbolic link inside `--dest` can redirect a write outside it.
 
-On a digest mismatch nothing is published. The temporary file is kept for inspection, and
-the error names both hashes and the two possible causes: a damaged copy (treat it as
+On a digest mismatch the restore stops and the failed member's temporary file is removed.
+Members restored before it stay in place, including files that `--overwrite` replaced.
+The error names both hashes and the two possible causes: a damaged copy (treat it as
 suspect, read it again or verify the tape), or an encrypted object whose ciphertext this
 command does not decrypt. Restore encrypted objects with the `rem archive` tools and the
 private key.
@@ -2209,7 +2217,12 @@ rem get 1b4e28ba-2fa1-41d2-883f-0016d3cca427 --dest restored
 ```
 
 Progress goes to standard error; each member and a summary line go to standard output
-(values illustrative):
+(values illustrative). Each member's streamed bytes are hashed; success prints 12 hex
+digits of that digest on stdout, or the full digest with `--json`.
+For a plaintext member, both the 12-hex prefix and the full `--json` digest let anyone
+who sees them check a guess at its content. A mismatch prints both full digests on stderr,
+including the catalog's expected plaintext digest, which also permits content guesses;
+the archive catalog holds the same plaintext digests.
 
 ```text
 restoring 1 member (293.0 KiB) of object 1b4e28ba-2fa1-41d2-883f-0016d3cca427 from tape 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f file 13

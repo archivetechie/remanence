@@ -3,16 +3,17 @@
 
 This guide shows you how to check that files you downloaded from a Remanence
 release are the files the project published. It is for anyone who downloads a
-release: a reviewer checking the test vectors, or, once binaries are
-published, an operator installing them.
+release: a reviewer checking the test vectors or an operator installing binaries.
 
-There is no binary release of Remanence yet. The only published release is
-v0.1.0, and its only file is the conformance test-vector archive,
-`remanence-test-vectors.tar`. To run Remanence you build it from source, as
-[Installing Remanence](guide-install.md) describes, and
-[What works, and what does not](status.md#releases-and-versions) gives the
-release history. The first part of this guide checks the v0.1.0 archive. The
-second part describes the checks a binary release will support.
+0.2.0 is the first binary release, published on
+[GitHub Releases](https://github.com/archivetechie/remanence/releases/tag/v0.2.0)
+with statically linked Linux x86-64 binaries, checksums, build evidence and
+GitHub attestations of the checksum-listed files.
+[Installing Remanence](guide-install.md) covers installation and building from
+source; [What works, and what does not](status.md#releases-and-versions) gives
+the release history. The earlier v0.1.0 release published only the conformance
+test-vector archive, `remanence-test-vectors.tar`. The first part of this guide
+checks that archive; the second checks the binary release.
 
 ## Check the v0.1.0 test-vector archive
 
@@ -200,8 +201,8 @@ register](versioning-register.md) records that.
 
 ## Related pages
 
-- [Installing Remanence](guide-install.md): building from source, and the
-  files a binary release will carry.
+- [Installing Remanence](guide-install.md): installing the release archive or
+  building from source, and the files the binary release carries.
 - [The versioning register](versioning-register.md): every versioned
   component, including the vector archives.
 - [How the formats change](versioning-explained.md): why a vector archive is
