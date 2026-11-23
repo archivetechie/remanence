@@ -178,21 +178,24 @@ text cannot read tapes written by current software.
 
 The in-progress text in `specs/in-progress/` describes the record layout that
 current software writes. A review on 23 November 2026 found three of its rules
-that current software does not follow. Each is to be resolved, in the code or
-in the text, in 0.3.0:
+that current software does not follow; each is to be resolved, in the code or
+in the text:
 
-- The filemark that ends a tape's bootstrap, written at initialization or when
-  a bootstrap is rewritten. Writer rule W2 counts a filemark that reports
-  end-of-medium as not written; current software does not check that report
-  for this filemark. A drive is not expected to report end-of-medium at the
-  beginning of a tape.
-- Parity at closeout. Rule W5 requires the data to be proved before parity is
-  computed over it. Current software computes the parity first, discards it if
-  the proof fails, and refuses after a second failure, so no parity over
-  unproved data is written.
-- A finalized tape with an unprotected tail. Section 10.6 allows one when an
-  operator has accepted it. Current software never writes such a tape, and it
-  rejects a terminal index that records one.
+- The filemark that ends a tape's bootstrap, at initialization or when a
+  bootstrap is rewritten. Writer rule W2 says that a filemark which reports
+  end-of-medium leaves the files it would cover uncommitted. Current software
+  does not check that report for this filemark.
+- Closeout parity over committed blocks read back from the tape. Rule W5
+  requires those blocks to be proved before parity is computed over them.
+  Current software computes the parity as it reads, compares the check value
+  afterwards, and on a mismatch discards the result and reads again, refusing
+  after a second mismatch, so no parity over unproved blocks is written.
+- A finalized tape whose sidecars protect a prefix and whose tail is
+  unprotected. Section 10.6 allows one when an operator has accepted it.
+  Current software refuses that operator-accepted finalization, and it rejects
+  a terminal index or replica that describes a sidecar-protected prefix
+  followed by an unprotected tail. Finalized tapes without parity are not
+  affected.
 
 The publication copy and its vectors have not been updated to the in-progress
 text yet.
