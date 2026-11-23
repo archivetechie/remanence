@@ -494,8 +494,9 @@ on. A refused unsafe operation is a PASS.
 
 - Daemon window: `tmux attach -t remfield` (window `rem` = daemon log,
   window `top` = live console, window `work` = you).
-- Every script: `--help`, and `EVIDENCE_DIR`/`REMFIELD_HOME` env
-  overrides. All idempotent — rerunning is always safe.
+- Scripts generally offer `--help`, and `EVIDENCE_DIR`/`REMFIELD_HOME` env
+  overrides. `14-restore-tail.sh` takes no arguments; follow its failure
+  instructions below before reusing that kit home.
 - Something inexplicable: `evidence/` + `~/remfield/log/` capture
   everything; grab them and continue with the next phase.
 
@@ -581,3 +582,27 @@ separate daemon-held nonce or used as an authorization token.
 Kill requires the live marker and refuses expiry. The helper and verifier also
 refuse expiry, retaining the observed gate state in the evidence.
 Dry review packages refuse direct script entry as well as `run.sh`.
+
+## Restore an older copy of the state
+
+Run `run.sh plan/restore-tail.env` with appendable scratch media already in
+`fieldtest-a`. Leg `14-restore-tail.sh` takes no arguments and needs the daemon
+up. It writes random A and B objects to `fieldtest-a`, reads both back, and
+requires B to land on A's tape. Each source file is 64 MiB (4 MiB on a VTL),
+overridable with `FIELD_RESTORE_TAIL_MB`.
+
+The leg stops cleanly to save `older` and `newer` copies of the daemon state,
+then restores `older`. It attempts C once, pinned to A's tape: the operator
+should see `TailBeyondKnownState`, guidance to start from a newer copy of the
+state directory, and a successful read of A through the write fence. It puts
+back `newer` and tries the same pinned C again; C must commit on that tape,
+and B and C must read successfully. A PASS leaves the daemon up, no write
+fence, and removes the snapshots. Evidence is in `evidence/14-restore-tail/`.
+
+A FAIL preserves the snapshots under `<home>/restore-tail/<timestamp-id>/`
+and names the state in place. If it names `older` or `live`, run no other plan
+with that kit home: send the evidence pack. The snapshots stay on the host;
+the pack carries the leg's evidence and their location. An unexpected C result
+under `older` also leaves `OUTCOME` (`accepted` or `other`) beside both snapshots
+and in the leg's evidence directory. Do not put back another state copy after
+that result.

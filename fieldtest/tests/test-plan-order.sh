@@ -56,6 +56,26 @@ def check(legs, library, minimum):
             text = (root / 'scripts/35-read-rate.sh').read_text()
             assert '03-bringup.sh" --stop || fail' in text
             up = False
+        elif name == '14-restore-tail':
+            assert up, 'restore-tail needs daemon up on entry'
+            text = (root / 'scripts/14-restore-tail.sh').read_text()
+            main = text.split('main() {\n', 1)[1].split('\n}\n', 1)[0]
+            calls = [line.strip().split()[0] for line in main.splitlines()
+                     if line.strip().startswith(('stop_daemon ', 'start_daemon ', 'snapshot_state ', 'restore_state '))]
+            stopped = False
+            starts, restores = [], []
+            for i, call in enumerate(calls):
+                if call == 'stop_daemon':
+                    stopped = True
+                elif call == 'start_daemon':
+                    stopped = False
+                    starts.append(i)
+                else:
+                    assert stopped, 'restore-tail copy needs a preceding stop with no intervening start'
+                    if call == 'restore_state':
+                        restores.append(i)
+            assert starts and restores and starts[-1] > restores[-1], 'restore-tail last start must follow last restore'
+            up = True
         elif name in daemon_legs:
             assert up, f'{leg} needs daemon bring-up first'
         elif name in {'05-reset-state', '09-media-ready', '10-init-pools', '33-diag-capture'}:
