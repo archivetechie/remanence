@@ -26,7 +26,8 @@ library-robotics operations.
 The format specifications are review drafts until they freeze on 31 July 2027.
 For REM-OBJECT and REM-ENCRYPT, the review checks whether the documents
 describe the implemented formats correctly. For REM-PARITY, the published copy
-does not yet describe the layout current software writes (see
+does not yet describe the layout current software writes, and current software
+differs in three rules from the in-progress text that does (see
 [below](#the-rem-parity-publication-copy)). A review finding could still change
 what goes on tape, and the promise that no tape a format validates will ever be
 invalidated takes effect only at the freeze. Treat material written during the
@@ -93,7 +94,9 @@ The `rem-object-v1` object body and the REM-ENCRYPT encrypted representation
 match their review specifications and the pinned test vectors. Reed-Solomon
 sidecar parity, resuming a parity tape after an interruption, and recovery from
 the tape's terminal index without a catalog are implemented as the REM-PARITY
-revision in `specs/in-progress/` describes them. A sidecar is a tape file of
+revision in `specs/in-progress/` describes them, except for the three rules
+listed under [The REM-PARITY publication copy](#the-rem-parity-publication-copy).
+A sidecar is a tape file of
 parity data covering the blocks written before it. The terminal index is the
 closing inventory that finalization writes at the end of a tape.
 
@@ -166,9 +169,28 @@ The [glossary](reference-glossary.md) defines these terms. The REM-PARITY copy
 under `specs/publication/` (1.0.0-draft.2) and its frozen vectors describe
 `schema_major = 1`. Current software rejects tapes written by version 0.1.0,
 which use `schema_major = 1`, and an implementation written from the published
-text cannot read tapes written by current software. The text that matches
-current software is in `specs/in-progress/`. The publication copy and its
-vectors have not been updated to it yet.
+text cannot read tapes written by current software.
+
+The in-progress text in `specs/in-progress/` describes the record layout that
+current software writes. A review on 23 November 2026 found three of its rules
+that current software does not follow. Each is to be resolved, in the code or
+in the text, in 0.3.0:
+
+- The filemark that ends a tape's bootstrap, written at initialization or when
+  a bootstrap is rewritten. Writer rule W2 counts a filemark that reports
+  end-of-medium as not written; current software does not check that report
+  for this filemark. A drive is not expected to report end-of-medium at the
+  beginning of a tape.
+- Parity at closeout. Rule W5 requires the data to be proved before parity is
+  computed over it. Current software computes the parity first, discards it if
+  the proof fails, and refuses after a second failure, so no parity over
+  unproved data is written.
+- A finalized tape with an unprotected tail. Section 10.6 allows one when an
+  operator has accepted it. Current software never writes such a tape, and it
+  rejects a terminal index that records one.
+
+The publication copy and its vectors have not been updated to the in-progress
+text yet.
 
 The specifications' concept DOIs are reserved and their first deposits are
 still pending. Until the matching text is published, keep the source material
