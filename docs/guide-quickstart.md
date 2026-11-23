@@ -13,13 +13,15 @@ On tape, each object is one tape file, the run of blocks between two filemarks
 (the separators the drive records). On local disk, an object is an ordinary
 file, and it holds exactly the bytes that a tape write would store.
 
-The page was checked against the source at version 0.2.0. There is no binary
-release yet, so you build from source
-([Releases and versions](status.md#releases-and-versions) has the detail).
+The page was checked against the source at version 0.2.0. Install the 0.2.0
+release as [Installing Remanence](guide-install.md#install-the-release) describes.
+Alternatively, build from source below; [Releases and versions](status.md#releases-and-versions)
+has the release history.
 
 ## What you need
 
-- A Linux host with `git`, a C compiler and Rust 1.89 or newer.
+- A Linux x86-64 host for the release archive; a source build also needs
+  `git`, a C compiler and Rust 1.89 or newer.
   [Installing Remanence](guide-install.md#before-you-start) lists the packages.
 - `bsdtar` (the `libarchive-tools` package on Debian and Ubuntu, `bsdtar` on
   Fedora). The first part uses it to list an object's contents.
@@ -30,27 +32,31 @@ release yet, so you build from source
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 625f7044 -->
 ## Build
 
-Clone the repository, build it, and put the programs on your path for this
-shell:
+For the release route, install the four programs as
+[Installing Remanence](guide-install.md#install-the-binaries) describes, then
+create a working directory named `remanence` and enter it.
+For the source route, clone the repository, check out the release and build it,
+then put the programs on your path for this shell:
 
 ```sh
 git clone https://github.com/archivetechie/remanence
 cd remanence
+git checkout v0.2.0
 cargo build --release --locked
 export PATH="$PWD/target/release:$PATH"
 rem --version
 ```
 
-The first build takes a while. When it finishes, `rem --version` prints:
+The first source build takes a while. With either route, `rem --version` prints:
 
 ```text
 rem 0.2.0
 ```
 
-The build made four programs in `target/release/`: `rem` (the operator tool),
+The source build makes four programs in `target/release/`: `rem` (the operator tool),
 `rem-debug` (the break-glass tool), `rem-daemon` (the service that runs a
 library) and `rem-recover` (a recovery tool for encrypted objects). The rest of
-this page assumes the `export` line is in effect.
+this page assumes those programs are on your `PATH`.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 625f7044 -->
 ## First archive, no tape required
@@ -342,9 +348,10 @@ the group, then log out and back in:
 sudo usermod -aG tape "$USER"
 ```
 
-After logging in again, change to the checkout directory and repeat the
-`export` line from [Build](#build). Then give `rem` and `rem-daemon` the capability and check
-it:
+For the release route, follow [host preparation](guide-install.md#prepare-the-host-for-tape-hardware)
+for the installed binaries. For the source route, after logging in again,
+change to the checkout directory and repeat the `export` line from [Build](#build),
+then give the built programs the capability and check it:
 
 ```sh
 sudo setcap cap_sys_rawio+ep target/release/rem

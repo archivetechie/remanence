@@ -9,9 +9,13 @@ capabilities. The root [README](../README.md) has a shorter version.
 ## The short version
 
 Remanence is alpha software. It has had limited operational testing, so do not
-make it the only copy of anything. There is no binary release yet; you build
-it from source. [Releases and versions](#releases-and-versions) says what has
-been published and how the version numbers relate.
+make it the only copy of anything. 0.2.0 is the first binary release;
+[Installing Remanence](guide-install.md) also covers building from source.
+[Releases and versions](#releases-and-versions) explains the version numbers.
+For a torn tail left by a power cut during a write, the refusal points to
+[`rem tape supersede-tail`](reference-cli.md#rem-tape-supersede-tail-standalone),
+which inspects that tail, prints its findings, writes nothing to the tape and
+exits 1 even with confirmation; repair for further writing is planned for 0.3.0.
 
 The parts that put bytes on tape and get them back are the most mature. A tape
 written today can be recovered without the catalog, without the daemon, and
@@ -32,20 +36,25 @@ formats are final.
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml .github/workflows/release.yml crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Releases and versions
 
-There is no binary release of Remanence yet. The only published release is
-v0.1.0, and its only file is the conformance test-vector archive,
-`remanence-test-vectors.tar`. An earlier tag, v1.0.0, was withdrawn and
-renumbered to v0.1.0 because that number overstated the software's maturity;
-[CHANGELOG.md](../CHANGELOG.md) records why. To run Remanence you build it
-from source, as [Installing Remanence](guide-install.md) describes.
+0.2.0, released on 23 November 2026, is the first binary release. It is
+published on [GitHub Releases](https://github.com/archivetechie/remanence/releases/tag/v0.2.0)
+as statically linked Linux x86-64 binaries in
+`remanence-0.2.0-x86_64-unknown-linux-musl.tar.gz`, with a separate recovery
+archive, checksums, build evidence and licenses. The workflow builds the
+binaries twice in separate directories and stops if they differ, then checks
+the published release. [Installing Remanence](guide-install.md) covers the
+release archive and the source route; [Release verification](guide-release-verification.md)
+lists the files and their GitHub attestations and explains how to check them.
 
-The source is at version 0.2.0. That is the workspace version in `Cargo.toml`,
-and it is what `rem --version`, `rem-debug --version` and
-`rem-daemon --version` print. Version 0.2.0 was prepared but never tagged or
-published, so a binary that reports 0.2.0 was built from source. The
-repository's release workflow builds statically linked Linux binaries when a
-release is tagged, and [Release verification](guide-release-verification.md)
-describes what such a release contains and how to check it.
+The earlier v0.1.0 release, on 7 August 2026, published only the conformance
+test-vector archive, `remanence-test-vectors.tar`. The withdrawn v1.0.0 release
+was renumbered to v0.1.0 and remains on GitHub marked superseded;
+[CHANGELOG.md](https://github.com/archivetechie/remanence/blob/v0.2.0/CHANGELOG.md)
+records the history.
+
+`rem --version`, `rem-debug --version` and `rem-daemon --version` report
+0.2.0. A source build reports the same workspace version; its audit build
+identity may differ from the release binaries'.
 
 The format specifications are versioned separately from the software and are
 at 1.0: REM-OBJECT Core Format 1.0, REM-ENCRYPT 1.0 and REM-PARITY 1.0.

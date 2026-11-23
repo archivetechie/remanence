@@ -634,6 +634,11 @@ rem get [OPTIONS] --out <OUT> <OBJECT>
 
 The command stages each file on the destination filesystem and restores its recorded
 modification time. Given a path, it restores the newest committed version on the loaded tape.
+On success, stdout includes the stored whole-object digest, which covers ciphertext for
+an encrypted copy; `--private-key` decrypts before checking members.
+A member mismatch can expose plaintext digests on stderr (or stdout with `--json`),
+allowing anyone who sees them to check a guess at the file's content; the archive
+catalog holds the same plaintext digests.
 
 To restore `photos/notes.txt` into `restored`:
 
@@ -2209,7 +2214,11 @@ rem get 1b4e28ba-2fa1-41d2-883f-0016d3cca427 --dest restored
 ```
 
 Progress goes to standard error; each member and a summary line go to standard output
-(values illustrative):
+(values illustrative). Each member's streamed bytes are hashed; success prints 12 hex
+digits of that digest on stdout, or the full digest with `--json`.
+A mismatch prints both full digests on stderr, including the catalog's expected
+plaintext digest, which lets anyone who sees it check a guess at the file's content;
+the archive catalog holds the same plaintext digests.
 
 ```text
 restoring 1 member (293.0 KiB) of object 1b4e28ba-2fa1-41d2-883f-0016d3cca427 from tape 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f file 13

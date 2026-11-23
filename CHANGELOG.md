@@ -4,8 +4,9 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-state/src/authority_manifest.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/state/authority_reset.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/library_runtime/terminal.rs crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-state/src/library_log/store.rs crates/remanence-state/src/library_runtime/restart.rs crates/remanence-api/src/tape_verification.rs @ b00887a25e94ec016ace10ac726a3296346b0454 -->
 ## Unreleased
+
+## 0.2.0 — 2026-11-23
 
 - Release builds remap source paths and run on Ubuntu 24.04. The workflow
   builds the four binaries twice in separate directories, stops publication
@@ -447,7 +448,7 @@ per-release summaries.
   `CLOBBER <label>`, given as `--confirm-clobber "CLOBBER <label>"` or typed or
   piped on standard input. End of input without it is refused with a message
   that names the flag. This includes a retired cartridge that still carries its
-  old data, which 0.2.0 re-initialized without confirmation. Every
+  old data, which an earlier pre-release 0.2.0 build re-initialized without confirmation. Every
   initialization reads the Medium Partition mode page and refuses a partitioned
   cartridge, such as one formatted for LTFS, naming the `mt` command that makes
   it single-partition.
@@ -492,7 +493,7 @@ per-release summaries.
   `daemon_capabilities` and `observed_endpoints`. `FileRecord` and
   `AppendObjectStart` carry an optional `mtime`. `CartridgeFacts` gains
   `generation_source`, and its `cartridge_generation` is proto3 `optional`:
-  absent means the generation is unknown, where 0.2.0 sent an empty string to
+  absent means the generation is unknown, where an earlier pre-release 0.2.0 build sent an empty string to
   mean "derive from the voltag". Existing field numbers are unchanged.
 
 - READ and WRITE completions take the transferred count from valid sense data
@@ -508,9 +509,9 @@ per-release summaries.
 - Overlap-mode writes (`append_staging_mode = "overlap"`) to a newly
   initialized tape succeed from the first object. The overlap writer's position
   bookkeeping and the staged sink's IMMED filemark cursor count filemarks; in
-  0.2.0 they did not, and the first object failed.
+  earlier pre-release 0.2.0 builds they did not, and the first object failed.
 - An encrypted object that closes in a parity tape's first epoch records its
-  parity state. In 0.2.0 closing such an object failed.
+  parity state. In earlier pre-release 0.2.0 builds closing such an object failed.
 - When a catalog rebuild keeps a tape's committed-file watermark but loses the
   rows at a checkpoint's exact boundary, checkpoint replay repairs that prefix,
   including its last file, rather than treating it as a new append.
@@ -584,13 +585,7 @@ per-release summaries.
   to attach to a hardware report, and lists the limitations found in field
   testing.
 
-## 0.2.0 — not released
-
-Version 0.2.0 was prepared on 2026-10-15 but was never tagged or published.
-The changes below are in the source, as are those under Unreleased; no
-published release contains them.
-
-- Added a release workflow that builds prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) with build provenance attestation. No release made with it was published.
+- Pre-release history: added an earlier release workflow that builds prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) with build provenance attestation. No release made with it was published.
 
 - Wording pass over the REM-PARITY text that the recent clarifications touched.
   No requirement changes. Section 17 opens with the damage matrix as it now
