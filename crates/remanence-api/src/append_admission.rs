@@ -106,12 +106,18 @@ pub(crate) struct TornTailEvidence {
     pub(crate) read: remanence_library::outcome::CompletionEvidence,
 }
 impl TornTailEvidence {
-    /// Keep only a prefix of whole returned records, with the first always retained.
-    pub(crate) fn keep_block(head: &mut Vec<Vec<u8>>, blocks_read: u64, block: &[u8]) {
+    /// Keep a contiguous prefix, updating its byte count in constant work per record.
+    /// The first record is always retained, even if it alone exceeds the cap.
+    pub(crate) fn keep_block(
+        head: &mut Vec<Vec<u8>>,
+        kept_bytes: &mut usize,
+        blocks_read: u64,
+        block: &[u8],
+    ) {
         if head.is_empty()
-            || (head.len() as u64 == blocks_read
-                && head.iter().map(Vec::len).sum::<usize>() + block.len() <= 4 * 1024 * 1024)
+            || (head.len() as u64 == blocks_read && *kept_bytes + block.len() <= 4 * 1024 * 1024)
         {
+            *kept_bytes += block.len();
             head.push(block.to_vec());
         }
     }
@@ -771,13 +777,14 @@ pub(crate) fn admit_append_boundary(
                     ..
                 }) => {}
                 Err(source) => {
-                    let read = source.completion_evidence();
-                    let capture = recovered_tail.is_some() && torn_tail_read(&read);
+                    let read = (recovered_tail.is_some()
+                        && torn_tail_read(&source.outcome().evidence))
+                    .then(|| source.outcome().evidence.clone());
                     let mut error = AdmissionError::new(AdmissionErrorKind::SuffixIo {
                         start_lba: boundary.lba,
                         source,
                     });
-                    if capture {
+                    if let Some(read) = read {
                         error = error.with_torn_tail(TornTailEvidence::partial(
                             boundary.lba,
                             0,

@@ -79,6 +79,7 @@ pub(super) fn named_file(
     let mut block = vec![0; size as usize];
     let mut first = None;
     let mut kept_head = Vec::new();
+    let mut kept_bytes = 0;
     let mut digest = Sha256::new();
     let max = file
         .known_blocks
@@ -91,7 +92,12 @@ pub(super) fn named_file(
                 if first.is_none() {
                     first = Some(block.clone());
                 }
-                super::TornTailEvidence::keep_block(&mut kept_head, count, &block[..n]);
+                super::TornTailEvidence::keep_block(
+                    &mut kept_head,
+                    &mut kept_bytes,
+                    count,
+                    &block[..n],
+                );
                 digest.update(&block);
                 count += 1;
             }
@@ -102,10 +108,10 @@ pub(super) fn named_file(
             }) => break true,
             Err(e) if e.is_physical_eod() => break false,
             Err(e) => {
-                let read = e.completion_evidence();
-                let capture = super::torn_tail_read(&read);
+                let read = super::torn_tail_read(&e.outcome().evidence)
+                    .then(|| e.outcome().evidence.clone());
                 let mut error = AdmissionError::from(e);
-                if capture {
+                if let Some(read) = read {
                     let mut record = super::TornTailEvidence::partial(
                         start,
                         count,

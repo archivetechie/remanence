@@ -142,6 +142,11 @@ fn observe(case: &str) -> Observation {
         "first" | "named_empty" | "repaired" | "expired" | "ended_empty" => vec![],
         "plain" | "different_plain" => plain(SIZE as usize + 100)[..2].to_vec(),
         "cap" => plain(4 * 1024 * 1024 + SIZE as usize)[..19].to_vec(),
+        "short_record" => {
+            let mut blocks = remo();
+            blocks[1].truncate(37);
+            blocks
+        }
         "bootstrap" => vec![boot, vec![0x33; SIZE as usize]],
         _ => remo(),
     };
@@ -557,6 +562,29 @@ fn t2c_production_head_cap() {
     assert_eq!(e.head.blocks, plain(4 * 1024 * 1024 + SIZE as usize)[..16]);
     assert_eq!((e.blocks_read, e.failing_lba), (19, 21));
     assert_eq!(e.head.identity, TornTailIdentity::Undecided);
+    // Locate the complete PAX record in the actual readable fixture bytes, not the kept head.
+    let world = o.world.lock().unwrap();
+    let readable: Vec<u8> = world.tapes["TAIL"].records
+        [e.file_start_lba as usize..e.failing_lba as usize]
+        .iter()
+        .flat_map(|record| match record {
+            Record::Block(bytes) => bytes.iter().copied(),
+            Record::Filemark | Record::ZeroBlock(_) => {
+                panic!("the torn-object fixture must contain explicit byte blocks")
+            }
+        })
+        .collect();
+    let encoded = pax_id(format!("{ID}\n").as_bytes());
+    let id_record = &encoded[512..];
+    let record_start = readable
+        .windows(id_record.len())
+        .position(|bytes| bytes == id_record)
+        .expect("complete object-id PAX record, including its newline, is readable");
+    let record_end = record_start + id_record.len();
+    assert!(record_start >= 4 * 1024 * 1024);
+    assert!(record_end > 4 * 1024 * 1024 && record_end <= readable.len());
+    let last_id_lba = e.file_start_lba + (record_end as u64 - 1) / u64::from(SIZE);
+    assert!(last_id_lba < e.failing_lba);
 }
 #[test]
 fn t4_named_identity_and_carriage() {
@@ -761,5 +789,21 @@ fn t4_daemon_named_refusal_label() {
     assert_eq!(
         status.metadata().get("remanence-torn-tail").unwrap(),
         "inspect"
+    );
+}
+
+/// FR1: the production forward collector retains the exact length of a short record.
+#[test]
+fn fr1_open_scan_keeps_short_record() {
+    let o = observe("short_record");
+    let e = captured(&o);
+    assert_eq!(e.site, Some(TornTailSite::OpenScan));
+    assert_eq!(e.cursor.unwrap().lba, 2);
+    assert_eq!((e.file_start_lba, e.blocks_read, e.failing_lba), (2, 2, 4));
+    assert!(!e.aligned);
+    let expected = vec![remo().remove(0), vec![0x42; 37]];
+    assert_eq!(
+        e.head.blocks, expected,
+        "kept bytes must include the short record at its returned length"
     );
 }

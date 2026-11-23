@@ -495,6 +495,7 @@ pub(crate) fn scan_append_suffix_observed(
         let start = lba;
         let mut head = Vec::new();
         let mut kept_head = Vec::new();
+        let mut kept_bytes = 0;
         let mut aligned = true;
         let mut blocks = 0;
         let mut digest = Sha256::new();
@@ -510,6 +511,7 @@ pub(crate) fn scan_append_suffix_observed(
                     if tail.is_some() {
                         crate::append_admission::TornTailEvidence::keep_block(
                             &mut kept_head,
+                            &mut kept_bytes,
                             blocks,
                             &block[..n],
                         );
@@ -564,17 +566,20 @@ pub(crate) fn scan_append_suffix_observed(
                     ..
                 }) => {
                     lba = lba.checked_add(1).ok_or("suffix LBA overflow")?;
-                    delimiters.push(lba);
+                    if tail.is_some() {
+                        delimiters.push(lba);
+                    }
                     break false;
                 }
                 Err(e) if e.is_physical_eod() => break true,
                 Err(e) => {
-                    let read = e.completion_evidence();
-                    let capture = tail.is_some() && crate::append_admission::torn_tail_read(&read);
+                    let read = (tail.is_some()
+                        && crate::append_admission::torn_tail_read(&e.outcome().evidence))
+                    .then(|| e.outcome().evidence.clone());
                     let mut error = crate::append_admission::AdmissionError::new(
                         crate::append_admission::AdmissionErrorKind::Io(e),
                     );
-                    if capture {
+                    if let Some(read) = read {
                         let mut record = crate::append_admission::TornTailEvidence::partial(
                             start, blocks, aligned, delimiters, kept_head, read,
                         );
