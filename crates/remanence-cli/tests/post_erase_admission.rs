@@ -731,7 +731,7 @@ fn post_erase_read_refusal() {
     )
     .unwrap();
     let error = envelope["error"].as_str().unwrap();
-    let error = error.strip_suffix(". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>` inspects the tape's end and reports what it finds.").expect("marked refusal carries inspection guidance");
+    let error = error.strip_suffix(". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>`, run with the same drive and state options as this command (such as `--config`, `--device` and `--allow-device`), inspects the tape's suffix at the committed boundary and reports what it finds.").expect("marked refusal carries inspection guidance");
     let clause = error.split_once(first).unwrap().1;
     let ms = clause
         .split_once("proof_elapsed_ms=")
@@ -774,7 +774,7 @@ fn assert_measured_clause(output: &Output, c: u64, expires: bool) {
     )
     .unwrap();
     let error = envelope["error"].as_str().unwrap();
-    let without_sentence = error.strip_suffix(". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>` inspects the tape's end and reports what it finds.");
+    let without_sentence = error.strip_suffix(". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>`, run with the same drive and state options as this command (such as `--config`, `--device` and `--allow-device`), inspects the tape's suffix at the committed boundary and reports what it finds.");
     assert_eq!(
         without_sentence.is_some(),
         !expires,

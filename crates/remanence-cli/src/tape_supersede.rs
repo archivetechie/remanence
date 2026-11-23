@@ -421,17 +421,17 @@ mod tests {
         assert!(requests[0].expected_found.is_empty());
         assert_eq!(requests[0].tape_uuid, vec![7; 16]);
         assert_eq!(requests[0].ack_tape_uuid, vec![7; 16]);
-        assert_eq!(out, "Tape 07070707-0707-0707-0707-070707070707: inspection only; nothing was written or discarded.\n\
+        assert_eq!(out, "Tape 07070707-0707-0707-0707-070707070707: inspection only; this command wrote nothing to the tape and discarded nothing.\n\
 Site: open-scan.\n\
 Committed boundary: partition 2, block 100.\n\
-Torn file: starts at block 100; READ failed at block 102 after 2 blocks; sense 03/14/00.\n\
-Bytes accounted: 524288; bytes delivered to the host: unknown.\n\
-Head of the torn file: object header.\n\
-Files the log names after the boundary: none.\n\
+Suffix read: started at block 100; READ failed at block 102; blocks read successfully from the start: 2; sense 03/14/00.\n\
+Failed READ: bytes accounted 524288; bytes the host reported transferred unknown.\n\
+Head observed: object header.\n\
+Files the tape log names after the boundary (from the log, not read from the tape): none.\n\
 Whether a filemark or end-of-data mark follows the boundary was not measured.\n");
         assert_eq!(
             err,
-            "error: inspection only: this build reports a torn tail and discards nothing\n"
+            "error: inspection only: this build cannot discard this tail; this command changed nothing on the tape\n"
         );
         assert!(!out.contains("Tail to discard") && !err.contains("Tail to discard"));
     }
@@ -449,9 +449,14 @@ Whether a filemark or end-of-data mark follows the boundary was not measured.\n"
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].confirm_supersede, None);
         assert_eq!(err, "error: SupersedeInspectionOnly: --confirm-supersede cannot discard a torn tail in this build\n");
-        assert!(out.contains("sense none.\n"));
-        assert!(out.contains("Bytes accounted: unknown; bytes delivered to the host: 0.\n"));
-        assert!(out.contains("Files the log names after the boundary: first, second.\n"));
+        assert_eq!(out, "Tape 07070707-0707-0707-0707-070707070707: inspection only; this command wrote nothing to the tape and discarded nothing.\n\
+Site: open-scan.\n\
+Committed boundary: partition 2, block 100.\n\
+Suffix read: started at block 100; READ failed at block 102; blocks read successfully from the start: 2; sense none.\n\
+Failed READ: bytes accounted unknown; bytes the host reported transferred 0.\n\
+Head observed: object header.\n\
+Files the tape log names after the boundary (from the log, not read from the tape): first, second.\n\
+Whether a filemark or end-of-data mark follows the boundary was not measured.\n");
         assert!(!out.contains("Tail to discard") && !err.contains("Tail to discard"));
     }
 

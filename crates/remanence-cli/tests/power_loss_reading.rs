@@ -1210,6 +1210,7 @@ fn plr2a2b_assert_inspection(output: &Output, expected_error: &str) -> serde_jso
     );
     assert_eq!(value["result"]["inspection"].as_object().unwrap().len(), 11);
     assert!(!output.out.contains("discarded_object_ids"));
+    assert!(!output.err.contains("discarded_object_ids"));
     no_write(output);
     value
 }
@@ -1225,7 +1226,7 @@ fn plr2a2b_u1_json_inspection() {
     );
     let value = plr2a2b_assert_inspection(
         &output,
-        "inspection only: this build reports a torn tail and discards nothing",
+        "inspection only: this build cannot discard this tail; this command changed nothing on the tape",
     );
     let site = value["result"]["inspection"]["site"].as_str().unwrap();
     println!("U1 inspection site={site}");
@@ -1282,7 +1283,7 @@ fn plr2a2b_u3_human_inspection() {
     assert_eq!(output.code, ExitCode::from(1), "{output:?}");
     assert_eq!(
         output.out.lines().next().unwrap(),
-        format!("Tape {uuid}: inspection only; nothing was written or discarded.")
+        format!("Tape {uuid}: inspection only; this command wrote nothing to the tape and discarded nothing.")
     );
     assert_eq!(
         output.out.lines().last().unwrap(),
@@ -1292,7 +1293,7 @@ fn plr2a2b_u3_human_inspection() {
     assert!(output.out.ends_with('\n'));
     assert_eq!(
         output.err.lines().last().unwrap(),
-        "error: inspection only: this build reports a torn tail and discards nothing"
+        "error: inspection only: this build cannot discard this tail; this command changed nothing on the tape"
     );
     no_write(&output);
 }
@@ -1306,7 +1307,7 @@ fn plr2a2b_u4_put_guidance_preserves_suffix_diagnostic() {
     let output = command(&f.root, &world, &["put", path.to_str().unwrap()]);
     assert_eq!(output.code, ExitCode::from(1), "{output:?}");
     let value = envelope(&output);
-    let sentence = ". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>` inspects the tape's end and reports what it finds.";
+    let sentence = ". If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>`, run with the same drive and state options as this command (such as `--config`, `--device` and `--allow-device`), inspects the tape's suffix at the committed boundary and reports what it finds.";
     let error = value["result"]["summary"]["failed"]["error"]
         .as_str()
         .unwrap();
@@ -1316,4 +1317,27 @@ fn plr2a2b_u4_put_guidance_preserves_suffix_diagnostic() {
     assert!(original.contains("append suffix at LBA"), "{original}");
     assert!(value["error"].as_str().unwrap().ends_with(sentence));
     no_write(&output);
+}
+
+/// An explicitly empty confirmation is still refused on the standalone route.
+#[test]
+fn plr2a2b_u2b_json_inspection_refuses_empty_confirmation() {
+    let f = Fixture::new();
+    let world = f.reset_measured(true);
+    let output = command(
+        &f.root,
+        &world,
+        &[
+            "tape",
+            "supersede-tail",
+            "--acknowledge-tape",
+            TAPE,
+            "--confirm-supersede",
+            "",
+        ],
+    );
+    plr2a2b_assert_inspection(
+        &output,
+        "SupersedeInspectionOnly: --confirm-supersede cannot discard a torn tail in this build",
+    );
 }

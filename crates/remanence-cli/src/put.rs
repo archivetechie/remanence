@@ -707,6 +707,9 @@ async fn open_write_session(
     };
     match client.open_write_session(request()).await {
         Ok(response) => Ok(response.into_inner().session_id),
+        // The daemon marks only UNAVAILABLE; wait_before_open_retry waits or retries
+        // only qualifying FAILED_PRECONDITION statuses. If the producer ever marks
+        // a retryable FAILED_PRECONDITION, restore the wait for that status.
         Err(status) if !no_wait && remanence_api::status_marks_torn_tail(&status) => {
             Err(crate::torn_tail_inspection::daemon_put_error(status))
         }
@@ -1703,7 +1706,7 @@ mod tests {
 
     fn assert_open_sentence(error: &DaemonClientError) {
         assert_eq!(error.code, "unavailable");
-        assert_eq!(error.message, "daemon returned unavailable: torn suffix. If the drive lost power during a write, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` inspects the tape's end and reports what it finds.");
+        assert_eq!(error.message, "daemon returned unavailable: torn suffix. If the drive lost power during a write, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid> --endpoint <endpoint>`, with the endpoint this command used (default `unix:/var/lib/rem/rem.sock`), inspects the tape's suffix at the committed boundary and reports what it finds.");
     }
 
     #[test]

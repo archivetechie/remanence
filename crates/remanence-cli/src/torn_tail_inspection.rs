@@ -2,11 +2,10 @@
 use remanence_api::pb;
 use serde_json::{json, Value};
 
-const E_INSPECT: &str = "inspection only: this build reports a torn tail and discards nothing";
+const E_INSPECT: &str = "inspection only: this build cannot discard this tail; this command changed nothing on the tape";
 const E_CONFIRM: &str =
     "SupersedeInspectionOnly: --confirm-supersede cannot discard a torn tail in this build";
-const STANDALONE_PUT: &str = "If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>` inspects the tape's end and reports what it finds.";
-const DAEMON_PUT: &str = "If the drive lost power during a write, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` inspects the tape's end and reports what it finds.";
+const STANDALONE_PUT: &str = "If the drive lost power during a write, `rem tape supersede-tail --acknowledge-tape <label|uuid>`, run with the same drive and state options as this command (such as `--config`, `--device` and `--allow-device`), inspects the tape's suffix at the committed boundary and reports what it finds.";
 
 pub(crate) fn refusal(confirmation_supplied: bool) -> &'static str {
     if confirmation_supplied {
@@ -53,13 +52,13 @@ pub(crate) fn render(tape: &str, inspection: &Value) -> String {
         .join(", ");
     let named = if named.is_empty() { "none" } else { &named };
     format!(
-        "Tape {tape}: inspection only; nothing was written or discarded.\n\
+        "Tape {tape}: inspection only; this command wrote nothing to the tape and discarded nothing.\n\
          Site: {}.\n\
          Committed boundary: partition {}, block {}.\n\
-         Torn file: starts at block {}; READ failed at block {} after {} blocks; sense {sense}.\n\
-         Bytes accounted: {}; bytes delivered to the host: {}.\n\
-         Head of the torn file: {}.\n\
-         Files the log names after the boundary: {named}.\n\
+         Suffix read: started at block {}; READ failed at block {}; blocks read successfully from the start: {}; sense {sense}.\n\
+         Failed READ: bytes accounted {}; bytes the host reported transferred {}.\n\
+         Head observed: {}.\n\
+         Files the tape log names after the boundary (from the log, not read from the tape): {named}.\n\
          Whether a filemark or end-of-data mark follows the boundary was not measured.\n",
         text("site"),
         inspection["cursor_partition"],
@@ -86,7 +85,11 @@ pub(crate) fn daemon_put_error(status: tonic::Status) -> crate::DaemonClientErro
     let marked = remanence_api::status_marks_torn_tail(&status);
     let mut error = crate::status_error(status);
     if marked {
-        error.message = decorate_put(error.message, DAEMON_PUT);
+        let sentence = format!(
+            "If the drive lost power during a write, `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid> --endpoint <endpoint>`, with the endpoint this command used (default `{}`), inspects the tape's suffix at the committed boundary and reports what it finds.",
+            crate::DEFAULT_DAEMON_ENDPOINT,
+        );
+        error.message = decorate_put(error.message, &sentence);
     }
     error
 }
