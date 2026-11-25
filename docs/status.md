@@ -9,7 +9,8 @@ capabilities. The root [README](../README.md) has a shorter version.
 ## The short version
 
 Remanence is alpha software. It has had limited operational testing, so do not
-make it the only copy of anything. 0.2.0 is the first binary release;
+make it the only copy of anything. [The road to beta and 1.0](#the-road-to-beta-and-10)
+lists the conditions for each later label. 0.2.0 is the first binary release;
 [Installing Remanence](guide-install.md) also covers building from source.
 [Releases and versions](#releases-and-versions) explains the version numbers.
 When `rem put` is refused at a write-open because the tape's recorded end is a
@@ -394,3 +395,70 @@ and a clean-room recovery drill: a reader written from the specifications alone,
 without the source, though not by an independent organization. The software
 around them is younger than the formats it implements. Restore and verify real
 material on your own hardware before relying on either.
+
+## The road to beta and 1.0
+
+Remanence is called alpha because it has run on one family of virtual libraries
+and one model of physical library with one drive generation, it is not yet in
+production use anywhere, and faults are still being found. Each later label is
+tied to written conditions, so that a change of label can be checked against
+them rather than simply declared. Neither list sets a date; this page reports
+each condition as it is met.
+
+### Beta
+
+Beta will mean that Remanence is safe to hold one copy among several, on the
+hardware this page lists as tested. It requires all of the following.
+
+1. **Production use.** One deployment runs Remanence in production for 30
+   consecutive days of scheduled tape writing and read-back with no fault that
+   loses or damages data, and a restore of real material from those tapes is
+   checked against the original.
+2. **Recovery after a power loss during a write.** The first repair for a tape
+   whose drive lost power before an end-of-data mark was written is released
+   ([issue #78](https://github.com/archivetechie/remanence/issues/78)).
+3. **A second drive maker and generation.** In a library, 0.2.0 takes a drive's
+   LTO generation from its product name and does not recognise IBM's product
+   names (`ULT3580-…`), so it does not choose an IBM drive to initialize or
+   write a tape. This was found with an emulated drive; no physical IBM drive
+   has been tested. The condition is met when that is fixed and a drive of a
+   second generation passes a scripted write, read-back and restore.
+4. **A stability promise.** Within 0.x, the command-line interface, the
+   configuration file and the daemon's API change only with a written
+   migration note in the release that changes them.
+5. **No open fault that loses or damages data** at the time of the change.
+
+### 1.0
+
+1.0 will mean that Remanence can be trusted to hold an archive's long-term
+copies. Reaching it is mostly a matter of time and independent evidence rather
+than of features. It requires all of the following.
+
+1. **A long production record.** About six months of production use after
+   beta, including a re-read of the oldest tapes in which every tape reads clean
+   or has its faults repaired from another copy. The re-read is the evidence
+   that a tape written months earlier can still be read.
+2. **Recovery from the tapes alone.** On a fresh machine without a catalog,
+   everything is rebuilt from the tapes and the keys, the time it takes is
+   recorded, and a sample is restored and checked. A reader built from the
+   specifications by someone outside the project
+   ([issue #5](https://github.com/archivetechie/remanence/issues/5)) takes the
+   place of today's clean-room drill, which was written without the source but
+   within the project.
+3. **Use beyond the project.** At least one outside organization runs Remanence
+   in production, and drives of at least two makers and three generations are
+   in regular use.
+4. **Independent review of what protects the data.** An outside security review
+   covers the encryption and the handling of keys, since an archive whose keys
+   are lost is lost with them. The
+   [formal verification status](formal-verification-status.md) matches the
+   code, either because the extractions that are out of step are brought back
+   in line or because the claims they support are narrowed.
+5. **Upgrades proven.** At least two upgrades from one release to the next are
+   carried out in production under the stability promise, without rewriting
+   anything on tape.
+6. **A clean recent record.** Three months pass with no fault that loses or
+   damages data.
+7. **The formats frozen first.** 1.0 does not come before the specifications
+   freeze on 31 July 2027, because a format change made in review would break
+   the promise a 1.0 makes.
